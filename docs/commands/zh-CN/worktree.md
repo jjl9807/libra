@@ -15,14 +15,14 @@ libra worktree move <src> <dest>
 libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
-libra worktree repair
+libra worktree repair [<path>]
 ```
 
 ## 说明
 
 `libra worktree` 管理共享同一个仓库数据库和对象存储的多个工作树。这允许你同时拥有同一仓库的多个 checkout，适用于同时处理多个分支、编辑代码时运行构建，或隔离测试更改。
 
-每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；运行 `libra worktree repair` 检查。）
+每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；运行 `libra worktree repair` 检查。）registry 文件 `worktrees.json` 自 v0.19.57 起带版本号（`schema_version: 2`）：每个 linked 条目持久化其 stable `worktree_id`；旧 v1 文件在首个**变更类** worktree 命令时就地升级（id 从各 gitdir 回填，`worktree list` 等无锁读取不会重写文件）；旧版二进制在数据库层被拒绝，无法误读或重写 v2 文件。
 
 Worktree 元数据持久化在 `.libra` 存储目录内的 `worktrees.json` 文件中。每个条目记录文件系统路径、它是否是主工作树、锁定状态，以及可选锁定原因。状态文件通过临时文件重命名原子写入，以防损坏。
 
@@ -34,17 +34,27 @@ Worktree 元数据持久化在 `.libra` 存储目录内的 `worktrees.json` 文�
 
 在给定文件系统路径创建新的 linked worktree。
 
-| 参数 | 说明 |
-|------|------|
-| `<path>` | 新 worktree 的文件系统路径。可以是相对路径或绝对路径。目录不存在时会创建。不得位于 `.libra` 存储内部，不得已经注册，如果已存在则必须为空。 |
+| 参数 / 标志 | 说明 |
+|-------------|------|
+| `<path>` | 新 worktree 的文件系统路径,可相对可绝对;目录不存在时自动创建;不得位于 `.libra` 存储内、不得已注册、存在时必须为空。 |
+| `<branch-or-commit>` | 可选目标。已存在的 branch 会被**附着**检出(任一 worktree——包括当前——已检出该 branch 时在任何副作用前拒绝);其余按 commit-ish 解析并以**分离 HEAD** 播种、内容取自该 commit。branch 不存在时 fail-closed:Git 的 remote-branch DWIM、`worktree.guessRemote`、`--track`/`--no-track` 首期 deferred。 |
+| `--detach` | 即使目标是 branch 也分离 HEAD(branch 仍可被其它 worktree 检出)。 |
+| `-b, --create-branch <NEW_BRANCH>` | 在 `<branch-or-commit>`(默认:源 worktree HEAD)处创建新 branch 并检出;branch 已存在时拒绝(`-B`/`--force` deferred);后续任何失败会完整回滚——不留 branch-only 残留。 |
+
+不带目标时,新 worktree 以**源 commit 的分离 HEAD** 创建——与 Git 默认(以路径 basename 创建并检出新 branch)有意不同。`--lock`、`--orphan`、`--no-checkout` 首期 deferred;锁定请用独立的 `worktree lock` 子命令。
 
 ```bash
-# 为 feature 分支创建新 worktree
+# 源 commit 处分离(Libra 默认)
 libra worktree add ../my-feature
-libra --json worktree add ../my-feature
 
-# 使用绝对路径创建
-libra worktree add /tmp/libra-test
+# 检出既有 branch
+libra worktree add ../fix-1 hotfix
+
+# 在 commit-ish 处分离
+libra worktree add --detach ../probe v1.2.0
+
+# 从起点创建新 branch 并检出
+libra worktree add -b topic ../topic main
 ```
 
 ### 子命令：`list`
@@ -107,7 +117,7 @@ libra --json worktree move ../my-feature ../my-feature-v2
 
 ### 子命令：`prune`
 
-从注册表中移除磁盘目录已不存在的 worktrees。主 worktree 和已锁定 worktree 永远不会被 prune。
+从注册表移除磁盘目录已不存在的 worktree。只有 stat 返回 NotFound 的路径才算缺失——权限错误或未挂载卷绝不会把 worktree 判为缺失。主 worktree、已锁定 worktree、tombstone 条目（由 repair 处理）以及存在进行中 rebase/cherry-pick/bisect 的 scope 绝不会被 prune。被 prune 条目的 scoped 状态清理失败时,条目保留为 `tombstone`(输出 `tombstoned` 字段)由 `libra worktree repair` 重试。
 
 ```bash
 libra worktree prune
@@ -116,7 +126,7 @@ libra --machine worktree prune
 
 ### 子命令：`remove`
 
-从状态文件注销 worktree。默认情况下，磁盘目录会被有意保留，以避免破坏性行为。传入 `--delete-dir` 可获得 Git 风格行为：只有脏状态检查通过后，目录才会被删除。不能移除主 worktree 或已锁定 worktree。
+移除 worktree。默认（保留目录）自 v0.19.58 起为**分离（detach）**：registry 条目转入 `detached_from_registry` 状态，其 scoped 数据库状态（HEAD、reflog、layer/sparse/dirty 行）全部保留，gitdir 中的标记使该目录内的一切命令 fail-closed 并给出 re-add/删除提示；用 `libra worktree add <path>` 重新挂接（按 registry 持久化 id 校验目录身份），或用 `--delete-dir` 完成删除。传入 `--delete-dir` 为 Git 风格行为：脏状态检查通过后删除目录并 fsync 父目录，然后才清理 scoped 数据库状态；清理失败会保留 `tombstone` 条目由 `libra worktree repair` 重试。不能移除主 worktree、已锁定 worktree,或存在进行中 rebase/cherry-pick/bisect 的 worktree。
 
 | 参数 / 标志 | 说明 |
 |-------------|------|
@@ -174,11 +184,15 @@ JSON / machine 输出信封：
 
 ### 子命令：`repair`
 
-修复 worktree 元数据：移除重复条目（相同规范路径），并确保恰好存在一个主 worktree 条目。只有实际做出更改时才写入状态文件。
+修复 worktree 元数据。不带参数时：移除重复条目（相同规范路径）、确保恰好存在一个主 worktree 条目，并运行 W3 lifecycle 恢复引擎——确定性回放中断的 add/move/remove/prune intent journal（恢复过程绝不删除目录）、重试 tombstone 条目的 scoped 清理、按 registry 重建 detached 标记与 SQL lifecycle 镜像；只有实际做出更改时才写入状态文件。
+
+带路径参数时（registry v2，自 v0.19.57）：依据 registry 中持久化的 stable id 恢复该 **linked** worktree 的 gitdir 身份——重写缺失或损坏的 `.libra/worktree_id`，并恢复缺失或损坏（空/不可读）的 `commondir` 指针（指向本仓库共享存储）。身份永远来自 registry，绝不猜测；`commondir` 有效地指向**另一个**存储时会被拒绝（绝不悄悄改挂仓库），且拒绝时不产生任何写入。未注册路径与主 worktree 会被拒绝；registry 仍为 legacy v1 格式时（无持久化身份）同样拒绝——先运行一次不带参数的 `libra worktree repair` 完成升级后重试。
 
 ```bash
 libra worktree repair
 libra --json worktree repair
+libra worktree repair ../experiment
+libra --json worktree repair ../experiment
 ```
 
 ## 常用命令
@@ -363,7 +377,26 @@ No worktrees to prune
   "ok": true,
   "command": "worktree.repair",
   "data": {
-    "changed": true
+    "changed": true,
+    "journal_recovered": 1,
+    "tombstones_cleaned": 1,
+    "tombstones_pending": 0,
+    "notes": ["completed interrupted remove of '/abs/path/wt'"]
+  }
+}
+```
+
+**带路径的 `worktree.repair`**：
+
+```json
+{
+  "ok": true,
+  "command": "worktree.repair",
+  "data": {
+    "path": "/abs/path/to/experiment",
+    "worktree_id": "1f0c…",
+    "worktree_id_restored": true,
+    "commondir_restored": true
   }
 }
 ```
@@ -374,7 +407,7 @@ No worktrees to prune
 
 Git 通过一组文件系统结构跟踪 worktree：主 `.git/worktrees/` 目录包含每个 worktree 的目录，里面有 `gitdir`、`HEAD` 和 `commondir` 文件，每个 linked worktree 又有一个指回去的 `.git` 文件（不是目录）。这种方式与 Git 基于文件的架构强耦合，并要求在多个位置之间仔细交叉引用。
 
-Libra 在共享存储目录中使用单个 `worktrees.json` 文件。这有几个优势：所有 worktree 元数据位于一个可查询位置；状态通过临时文件重命名原子写入；格式也便于人类和 AI agent 检查。每个 linked worktree 的 `.libra` 符号链接回共享存储，比 Git 的双向指针系统更简单。代价是 JSON 文件成为单一事实来源，必须保持一致，因此存在 `repair`。
+Libra 在共享存储目录中使用单个 `worktrees.json` 文件。这有几个优势：所有 worktree 元数据位于一个可查询位置；状态通过临时文件重命名原子写入；格式也便于人类和 AI agent 检查。每个 linked worktree 拥有自己真实的 `.libra` gitdir（内含指回共享存储的 `commondir` 指针与稳定 `worktree_id`，不是符号链接），比 Git 的双向指针系统更简单。代价是 JSON 文件成为单一事实来源，必须保持一致，因此存在 `repair`。
 
 ### 为什么 lock 上有 `--reason`？
 
@@ -382,7 +415,7 @@ Git 的 `git worktree lock` 也支持 `--reason`，Libra 保留了这一点。�
 
 ### 为什么 `remove` 不删除磁盘目录？
 
-删除文件是不可撤销的破坏性操作。Libra 的 `remove` 只从 JSON 状态文件注销 worktree，保留目录本身。这是有意的安全选择：用户可以在确认不再需要后检查并手动删除目录。如果 worktree 包含未提交工作，这也能防止意外数据丢失。Git 的 `git worktree remove` 默认会删除目录，这曾导致工作丢失。
+删除文件是不可撤销的破坏性操作。Libra 默认的 `remove` 改为**分离**：目录、其 scoped 数据库状态与身份全部保留,条目转入 `detached_from_registry` 状态,目录被冻结(其中一切命令 fail-closed 并提示 re-add/删除)。这是有意的安全选择:用户可用 `worktree add` 重新挂接,或确认后用 `--delete-dir` 完成删除。如果 worktree 包含未提交工作,这也能防止意外数据丢失。Git 的 `git worktree remove` 默认会删除目录,这曾导致工作丢失。
 
 ### 为什么 `move` 拒绝已锁定 worktree？
 
@@ -396,20 +429,20 @@ Git 的 `git worktree lock` 也支持 `--reason`，Libra 保留了这一点。�
 
 | 操作 | Libra | Git | jj |
 |------|-------|-----|----|
-| 创建 worktree | `worktree add <path>` | `worktree add <path> [<branch>]` | `workspace add <path>` |
-| 在分支上创建 | 不支持 | `worktree add <path> <branch>` | `workspace add <path>`（然后 `jj edit`） |
-| 创建 detached | 不支持 | `worktree add --detach <path> <commit>` | N/A |
+| 创建 worktree | `worktree add <path> [<branch-or-commit>]`（无目标：源 commit 分离） | `worktree add <path> [<branch>]` | `workspace add <path>` |
+| 在分支上创建 | `worktree add <path> <branch>`（附着；任一处已检出即拒；无 DWIM） | `worktree add <path> <branch>` | `workspace add <path>`（然后 `jj edit`） |
+| 创建 detached | `worktree add --detach <path> [<commit>]`（`add <path> <commit>` 亦可） | `worktree add --detach <path> <commit>` | N/A |
 | 列出 worktrees | `worktree list` | `worktree list [--porcelain]` | `workspace list` |
 | 锁定 | `worktree lock <path> [--reason]` | `worktree lock [--reason] <worktree>` | N/A |
 | 解锁 | `worktree unlock <path>` | `worktree unlock <worktree>` | N/A |
 | 移动 | `worktree move <src> <dest>` | `worktree move <worktree> <new-path>` | N/A |
 | Prune | `worktree prune` | `worktree prune [--dry-run]` | N/A（自动） |
-| Remove | `worktree remove <path>`（仅注册表） | `worktree remove [--force] <worktree>`（删除目录） | `workspace forget <name>` |
-| Repair | `worktree repair` | `worktree repair [<path>...]` | N/A |
+| Remove | `worktree remove <path>`（分离——目录与状态保留、冻结） | `worktree remove [--force] <worktree>`（删除目录） | `workspace forget <name>` |
+| Repair | `worktree repair [<path>]` | `worktree repair [<path>...]` | N/A |
 | 别名 | `wt` | N/A | N/A |
-| 每个 worktree 一个分支 | 不支持 | 自动（新分支或已有分支） | 自动（新 working copy commit） |
+| 每个 worktree 一个分支 | `-b <new> [<start>]` 显式创建（全回滚；无 basename 默认） | 自动（新分支或已有分支） | 自动（新 working copy commit） |
 | 存储 | JSON 文件（`worktrees.json`） | 文件系统结构（`.git/worktrees/`） | Operation log |
-| Worktree 链接 | 指向共享 `.libra` 的符号链接 | 指向 `gitdir` 的 `.git` 文件 | 指向共享 `.jj` 的符号链接 |
+| Worktree 链接 | 真实本地 `.libra` gitdir，内含指向共享存储的 `commondir` 指针（legacy 布局为符号链接） | 指向 `gitdir` 的 `.git` 文件 | 指向共享 `.jj` 的符号链接 |
 
 注意：jj 使用术语 "workspace" 而不是 "worktree"。每个 workspace 会自动获得自己的 working copy commit，并且 workspaces 记录在 operation log 中。jj workspaces 比 Git worktrees 更简单，因为 jj 基于变更的模型不需要为每个 workspace 单独管理分支。
 

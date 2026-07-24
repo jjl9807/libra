@@ -4,6 +4,121 @@
 
 ### Changed
 
+- **Canonical `worktree add` targets: branch, commit, `--detach`, `-b`
+  (v0.19.59, plan-20260714 Part C §C.7, W3 slice 2)**: `worktree add
+  <path> [<branch-or-commit>]` checks an existing branch out ATTACHED
+  (refused before any side effect when any worktree — including the
+  invoking one — already has it out), or seeds a DETACHED worktree
+  populated from a resolved commit-ish; `--detach` forces detachment for
+  branch targets (the branch stays free); `-b <new> [<start>]` creates
+  and checks out a new branch with full rollback on any later failure
+  (no branch-only or orphan-registry residue), refusing an existing name.
+  A nonexistent branch fails closed — Git's remote-branch DWIM,
+  `worktree.guessRemote`, `--track`/`--no-track`, `-B`/`--force`,
+  `--lock`, `--orphan`, and `--no-checkout` are deferred and declared in
+  COMPATIBILITY.md. The no-target default (detached at the source
+  commit, intentionally different from Git's basename-branch default)
+  is unchanged. Re-attach and already-registered paths refuse checkout
+  arguments instead of silently ignoring them.
+
+- **Worktree lifecycle: detach instead of drop, tombstones, and a durable
+  intent journal (v0.19.58, plan-20260714 Part C §C.7, W3 slice 1b)**:
+  `worktree remove` (keep-dir) now DETACHES — the registry entry moves to
+  `detached_from_registry`, the worktree's scoped DB rows are preserved
+  (previously they were GC'd, leaving a directory that still operated but
+  lost its HEAD), and a gitdir marker fail-closes every command inside the
+  directory with a re-add/delete hint. `worktree add <path>` re-attaches a
+  detached worktree after verifying its gitdir identity against the
+  registry's persisted id. `--delete-dir` deletes + fsyncs the parent
+  BEFORE cleaning scoped rows; a cleanup failure keeps a `tombstone` entry
+  that `worktree repair` retries. Both modes refuse while a
+  rebase/cherry-pick/bisect is in progress; `prune` treats only a NotFound
+  stat as missing (permission errors never classify a worktree as
+  missing) and skips tombstones and active-sequencer scopes. add, move,
+  remove, and prune record a durable intent-journal row (migration
+  2026072402) before mutating; `worktree repair` rolls interrupted
+  operations forward or back deterministically (never deleting
+  directories), and the migration's down path refuses while any
+  detached/tombstone/journal state exists. `worktree list` reports each
+  entry's lifecycle state.
+
+- **Worktree registry v2 with persisted identities and `worktree repair
+  <path>` (v0.19.57, plan-20260714 Part C §C.7, W3 slice 1a)**:
+  `worktrees.json` moves to `{schema_version: 2, entries: [...]}` and each
+  linked entry now PERSISTS its stable `worktree_id`. A legacy v1 file is
+  upgraded in place under the registry lock by the first MUTATING worktree
+  command (ids backfilled from each worktree's gitdir, all v1 fields
+  preserved; lockless readers like `worktree list` never rewrite it);
+  every worktree command applies pending migrations before touching the
+  registry, so the 2026072401 capability marker refuses pre-v2 binaries at
+  connect time before they can misread or rewrite the v2 file, and the
+  renamed top-level key makes a v1 parser fail closed as a second belt.
+  Parsing discriminates on the top-level shape and validates the v2
+  identity invariants (main has no id, linked entries must have one), so
+  hybrid/malformed files are refused instead of reinterpreted.
+  `worktree repair <path>` restores a linked worktree's missing or corrupt
+  `.libra/worktree_id` and `commondir` from the registry's persisted id —
+  never a guess — so the worktree maps back to its own scoped
+  HEAD/index/stash state; a commondir validly pointing at a different
+  storage is refused without touching either file, unregistered paths, the
+  main worktree, and a still-v1 registry (no persisted identities — run the
+  no-arg repair once to upgrade) are refused, `worktree list` prefers the
+  persisted id,
+  and the identity-corruption hints now point at the path form.
+
+- **gc/repack run in multi-worktree repositories via the typed GC root
+  inventory (v0.19.56, plan-20260714 Part C §C.4.3, W2 final slice)**: the
+  versioned `GC_OBJECT_SOURCE_INVENTORY` accounts for every persistent
+  OID-bearing store as a traced reachability root or a documented non-root,
+  a schema-scan guard test fails any future OID column that ships
+  un-inventoried, and the W0 multi-worktree prune/repack skips are lifted.
+  New root classes fix real data-loss holes that also affected
+  single-worktree repositories: note blobs (`notes.blob` is their only
+  anchor), undo view snapshots (`operation_view_ref.target_oid`), AI capture
+  checkpoints (`agent_checkpoint` OIDs), in-progress merge/revert/rebase-aux
+  sidecar OIDs, and per-worktree `FETCH_HEAD` tips are now kept alive by
+  `maintenance run` gc/repack. Unreadable roots still fail the walk closed —
+  pruning never proceeds against a partial root set.
+- **`merge-file` backups are worktree-local (v0.19.55, plan-20260714 Part C
+  §C.4.3, W2 slice 3)**: the in-place backup of `<current>` moves from the
+  shared `.libra/merge-file-backup/` into the acting worktree's local gitdir
+  — two worktrees merging same-named files no longer overwrite or clean up
+  each other's conflict backups (main's location is unchanged since its
+  local gitdir IS `.libra`).
+- **The stash stack protocol is worktree-aware (v0.19.54, plan-20260714
+  Part C §C.4.3, W2 slice 2)**: the stack (`refs/stash` + reflog) stays
+  deliberately repository-shared — an entry pushed in one worktree lists,
+  applies, and pops from any other — while `push`/`apply`/`pop` snapshot and
+  mutate ONLY the acting worktree's own index/workdir (fixing the former
+  common-storage index/parent-workdir reads that made a linked `stash push`
+  report "No local changes to save"). Stash object reads now go through the
+  storage-backed loader (loose AND packed): previously every stash flow read
+  loose objects only, so a HEAD that arrived via clone/pull (in a pack) made
+  `stash push` silently no-op — an unreadable HEAD commit now reports
+  "changed" (fail-safe) instead of masquerading as a clean tree. `pull
+  --rebase --autostash` pops EXACTLY the entry it pushed (located by commit
+  id, applied by hash) — a shared-stack top that moved concurrently can no
+  longer make it apply and delete another worktree's stash. Every stack mutation serializes on a
+  cross-platform `stash-stack.lock`; `pop` and `stash branch` delete their
+  applied entry through the single by-id CAS `do_drop` (a concurrent stack
+  change keeps the entry and reports — never deletes the wrong entry, never
+  rolls back the successful apply); `stash branch` preflights the
+  branch-name collision and switches HEAD via the fallible API. The W0
+  linked-worktree guards on `stash` and `pull --rebase --autostash` are
+  lifted — no command remains refused in a linked worktree on
+  repository-global-state grounds.
+- **rerere `MERGE_RR` is worktree-local (v0.19.53, plan-20260714 Part C
+  §C.4.3, W2 slice 1)**: the currently-tracked-conflicts list moves from the
+  shared `.libra/rerere/MERGE_RR` into each worktree's local gitdir
+  (`<local_gitdir>/MERGE_RR`), so one worktree's `rerere clear`/auto-update
+  can no longer drop, stage, or record another worktree's current
+  conflicts; the reusable resolution cache
+  (`.libra/rerere/<id>/{preimage,postimage}`) stays repository-shared — a
+  resolution recorded in one worktree still replays in any other. A legacy
+  shared `MERGE_RR` follows the ambiguous-sidecar rules: a linked scope
+  never reads it, a single-worktree main reads it and migrates it on first
+  write, and once linked worktrees exist it is ignored with a notice and
+  left untouched for the worktree doctor (W3).
 - **The sparse view is worktree-scoped (v0.19.52, plan-20260714 Part C
   §C.4.1.1, W1 advisory slice 3)**: migration `2026072304` re-keys
   `sparse_view` to UNIQUE(worktree_id, ordinal) and re-projects the

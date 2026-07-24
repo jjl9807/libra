@@ -27,7 +27,7 @@ mod legacy;
 // `worktree-fuse` feature routed compilation through this file or directly
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
-pub(crate) use legacy::run_list_worktrees;
+pub(crate) use legacy::{WorktreeError, WorktreeState, acquire_registry_lock, run_list_worktrees};
 
 const FUSE_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 const FUSE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -58,9 +58,16 @@ pub enum WorktreeSubcommand {
     Add {
         /// Filesystem path at which to create the new worktree.
         path: String,
+        /// Existing branch to check out, or a commit-ish for a detached
+        /// HEAD (canonical non-FUSE surface, W3 §C.7).
+        target: Option<String>,
+        /// Detach HEAD in the new worktree even for a branch target
+        /// (non-FUSE surface).
+        #[clap(long)]
+        detach: bool,
         #[clap(short = 'f', long, help = "Use FUSE overlay worktree mode (Unix only)")]
         fuse: bool,
-        #[clap(long, help = "Checkout this branch in the new worktree")]
+        #[clap(long, help = "Checkout this branch in the new worktree (FUSE mode)")]
         branch: Option<String>,
         #[clap(
             short = 'b',
@@ -71,7 +78,7 @@ pub enum WorktreeSubcommand {
         #[clap(
             long,
             conflicts_with = "create_branch",
-            help = "Base ref for --create-branch"
+            help = "Base ref for --create-branch (FUSE mode)"
         )]
         from: Option<String>,
         #[clap(long, help = "Use privileged mount mode")]
@@ -119,7 +126,14 @@ pub enum WorktreeSubcommand {
         )]
         cleanup: bool,
     },
-    Repair,
+    /// Repair worktree metadata, attempting to recover from inconsistencies.
+    /// With a path, restores that linked worktree's gitdir identity
+    /// (`.libra/worktree_id` + `commondir`) from the registry's persisted
+    /// stable id (registry v2, W3 §C.7).
+    Repair {
+        /// Linked worktree whose gitdir identity should be restored.
+        path: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -238,11 +252,30 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     let command = args.command;
     if !matches!(&command, WorktreeSubcommand::Umount { .. }) {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
+        // §C.7 ordering (same as the legacy entry point): apply pending
+        // migrations — including the registry-v2 capability marker — before
+        // any registry IO, and refuse a future-schema database gracefully.
+        // The fuse-native list path reads the legacy registry directly, so
+        // the guarantee must hold here too, not only via legacy delegation.
+        crate::internal::db::get_db_conn_instance_for_path(&crate::utils::path::database())
+            .await
+            .map_err(|source| {
+                CliError::fatal(format!(
+                    "cannot open the repository database before touching the worktree \
+                     registry: {source}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        // Bare boundary (config-first, same as legacy): refused before any
+        // registry IO.
+        legacy::reject_bare_repository().await?;
     }
 
     match command {
         WorktreeSubcommand::Add {
             path,
+            target,
+            detach,
             fuse,
             branch,
             create_branch,
@@ -251,19 +284,30 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             allow_other,
         } => {
             if !fuse {
-                if branch.is_some() || create_branch.is_some() || from.is_some() {
-                    return Err(CliError::command_usage(
-                        "--branch/--create-branch/--from require --fuse",
-                    ));
+                // --branch/--from stay FUSE-only; the canonical surface uses
+                // the positional target and -b/--create-branch (forwarded).
+                if branch.is_some() || from.is_some() {
+                    return Err(CliError::command_usage("--branch/--from require --fuse"));
                 }
                 legacy::execute_safe(
                     legacy::WorktreeArgs {
-                        command: legacy::WorktreeSubcommand::Add { path },
+                        command: legacy::WorktreeSubcommand::Add {
+                            path,
+                            target,
+                            detach,
+                            new_branch: create_branch,
+                        },
                     },
                     output,
                 )
                 .await
             } else {
+                if target.is_some() || detach {
+                    return Err(CliError::command_usage(
+                        "the positional <BRANCH-OR-COMMIT> and --detach are not supported \
+                         with --fuse; use --branch/--create-branch/--from",
+                    ));
+                }
                 add_fuse_worktree(path, branch, create_branch, from, privileged, allow_other)
                     .await
                     .map_err(|e| CliError::fatal(e.to_string()))
@@ -336,15 +380,21 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             )
             .await
         }
-        WorktreeSubcommand::Repair => {
-            repair_fuse_worktrees().map_err(|e| CliError::fatal(e.to_string()))?;
+        WorktreeSubcommand::Repair { path } => {
+            // Core registry first: a corrupt/zero-byte core registry must
+            // fail the command BEFORE any fuse metadata is mutated.
+            let run_fuse_repair = path.is_none();
             legacy::execute_safe(
                 legacy::WorktreeArgs {
-                    command: legacy::WorktreeSubcommand::Repair,
+                    command: legacy::WorktreeSubcommand::Repair { path },
                 },
                 output,
             )
-            .await
+            .await?;
+            if run_fuse_repair {
+                repair_fuse_worktrees().map_err(|e| CliError::fatal(e.to_string()))?;
+            }
+            Ok(())
         }
     }
 }
@@ -629,6 +679,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 locked: entry.locked,
                 lock_reason: entry.lock_reason.clone(),
                 exists: Path::new(&entry.path).exists(),
+                state: "active",
             });
         }
         return emit_json_data("worktree.list", &result, output);
@@ -650,6 +701,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 locked: entry.locked,
                 lock_reason: entry.lock_reason.clone(),
                 exists: Path::new(&entry.path).exists(),
+                state: "active",
             });
         }
         print!("{}", legacy::format_worktree_porcelain(&all).await);

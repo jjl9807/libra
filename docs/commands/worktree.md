@@ -15,14 +15,14 @@ libra worktree move <src> <dest>
 libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
-libra worktree repair
+libra worktree repair [<path>]
 ```
 
 ## Description
 
 `libra worktree` manages multiple working trees that share a single repository database and object store. This allows you to have several checkouts of the same repository simultaneously, which is useful for working on multiple branches at once, running builds while editing code, or testing changes in isolation.
 
-Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.)
+Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.) The registry file `worktrees.json` is versioned (`schema_version: 2` since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the v2 file.
 
 Worktree metadata is persisted in a `worktrees.json` file inside the `.libra` storage directory. Each entry tracks the filesystem path, whether it is the main worktree, its lock status, and an optional lock reason. The state file is written atomically via a temporary file rename to prevent corruption.
 
@@ -34,17 +34,31 @@ When a new worktree is added and HEAD points to a commit, the worktree is automa
 
 Create a new linked worktree at the given filesystem path.
 
-| Argument | Description |
-|----------|-------------|
+| Argument / Flag | Description |
+|-----------------|-------------|
 | `<path>` | Filesystem path for the new worktree. Can be relative or absolute. The directory is created if it does not exist. Must not be inside `.libra` storage, must not already be registered, and must be empty if it exists. |
+| `<branch-or-commit>` | Optional target. An existing branch is checked out ATTACHED (refused before any side effect if any worktree — including the invoking one — already has it out). Anything else must resolve as a commit-ish and seeds a DETACHED worktree populated from that commit. A nonexistent branch fails closed: Git's remote-branch DWIM, `worktree.guessRemote`, and `--track`/`--no-track` are deferred. |
+| `--detach` | Detach HEAD even when the target names a branch (the branch stays free for checkout elsewhere). |
+| `-b, --create-branch <NEW_BRANCH>` | Create `NEW_BRANCH` at `<branch-or-commit>` (default: the source worktree's HEAD) and check it out. Refused if the branch already exists (`-B`/`--force` are deferred); any later failure rolls the branch back — no branch-only residue. |
+
+Without a target the new worktree is created **detached at the source
+commit** — intentionally different from Git's default (which creates a
+branch named after the path basename). `--lock`, `--orphan`, and
+`--no-checkout` are deferred; use the separate `worktree lock` subcommand.
 
 ```bash
-# Create a new worktree for a feature branch
+# Detached at the source commit (Libra's default)
 libra worktree add ../my-feature
 libra --json worktree add ../my-feature
 
-# Create using absolute path
-libra worktree add /tmp/libra-test
+# Check an existing branch out
+libra worktree add ../fix-1 hotfix
+
+# Detached at a commit-ish (tag, sha, branch tip)
+libra worktree add --detach ../probe v1.2.0
+
+# Create a new branch from a start point and check it out
+libra worktree add -b topic ../topic main
 ```
 
 ### Subcommand: `list`
@@ -65,8 +79,9 @@ libra --machine worktree list
 ```
 
 Structured output uses the `worktree.list` command envelope. Each entry reports
-`kind`, `path`, `is_main`, `locked`, `lock_reason`, and whether the path currently
-exists on disk.
+`kind`, `path`, `is_main`, `locked`, `lock_reason`, whether the path currently
+exists on disk, the persisted `worktree_id`, and the lifecycle `state`
+(`active`, `detached_from_registry`, or `tombstone` — see `remove`).
 
 ### Subcommand: `lock`
 
@@ -115,7 +130,13 @@ libra --json worktree move ../my-feature ../my-feature-v2
 
 ### Subcommand: `prune`
 
-Remove worktrees from the registry whose directories no longer exist on disk. The main worktree and locked worktrees are never pruned.
+Remove worktrees from the registry whose directories no longer exist on disk.
+Only a path whose stat fails with NotFound counts as missing — a permission
+error or an unmounted volume never classifies a worktree as missing. The main
+worktree, locked worktrees, tombstone entries (repair's job), and scopes with
+an in-progress rebase/cherry-pick/bisect are never pruned. If a pruned
+entry's scoped-state cleanup fails, the entry is kept as a `tombstone` for
+`libra worktree repair` to retry (reported in the `tombstoned` field).
 
 ```bash
 libra worktree prune
@@ -124,11 +145,22 @@ libra --machine worktree prune
 
 ### Subcommand: `remove`
 
-Unregister a worktree from the state file. By default the directory on disk
-is intentionally left untouched to avoid destructive behavior. Pass
-`--delete-dir` for Git-style behavior — the directory is removed only after
-a dirty-state check passes. Cannot remove the main worktree or a locked
-worktree.
+Remove a worktree. By default (keep-dir) the directory on disk is
+intentionally left untouched — since v0.19.58 this DETACHES the worktree:
+the registry entry moves to the `detached_from_registry` state, its scoped
+database state (HEAD, index metadata, reflog, layer/sparse/dirty rows) is
+preserved, and a marker in the worktree's gitdir makes every command run
+inside the directory fail closed with a re-add/delete hint. Re-attach it
+with `libra worktree add <path>` (the directory's identity is verified
+against the registry's persisted id) or finish the removal with
+`--delete-dir`.
+
+Pass `--delete-dir` for Git-style behavior — the directory is removed only
+after a dirty-state check passes, the parent directory entry is fsynced,
+and only then the scoped database state is cleaned. If that cleanup fails,
+a `tombstone` entry remains and `libra worktree repair` retries it. Cannot
+remove the main worktree, a locked worktree, or one with an in-progress
+rebase/cherry-pick/bisect.
 
 | Argument / Flag | Description |
 |-----------------|-------------|
@@ -151,8 +183,9 @@ fatal: cannot delete dirty worktree '../dirty-feature' (uncommitted changes)
 ```
 
 Behavior intentionally differs from Git: Git's default deletes the directory.
-Libra keeps it by default to prevent accidental data loss; `--delete-dir`
-restores Git-like semantics opt-in. See
+Libra keeps it by default (as a frozen, re-attachable detached worktree) to
+prevent accidental data loss; `--delete-dir` restores Git-like semantics
+opt-in. See
 [`COMPATIBILITY.md`](../../COMPATIBILITY.md) and
 [`compatibility/worktree-surface.md`](../development/commands/worktree.md)
 for the rationale.
@@ -194,11 +227,15 @@ JSON / machine output envelope:
 
 ### Subcommand: `repair`
 
-Repair worktree metadata by removing duplicate entries (same canonical path) and ensuring exactly one main worktree entry exists. Only writes the state file if changes are actually made.
+Repair worktree metadata. Without an argument, removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed.
+
+With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair` once to upgrade it, then retry.
 
 ```bash
 libra worktree repair
 libra --json worktree repair
+libra worktree repair ../experiment
+libra --json worktree repair ../experiment
 ```
 
 ## Common Commands
@@ -227,6 +264,9 @@ libra wt remove ../experiment-v2
 
 # Fix inconsistent worktree metadata
 libra wt repair
+
+# Restore a linked worktree's gitdir identity from the registry
+libra wt repair ../experiment
 ```
 
 ## Human Output
@@ -385,7 +425,26 @@ single-line JSON.
   "ok": true,
   "command": "worktree.repair",
   "data": {
-    "changed": true
+    "changed": true,
+    "journal_recovered": 1,
+    "tombstones_cleaned": 1,
+    "tombstones_pending": 0,
+    "notes": ["completed interrupted remove of '/abs/path/wt'"]
+  }
+}
+```
+
+**`worktree.repair` with a path**:
+
+```json
+{
+  "ok": true,
+  "command": "worktree.repair",
+  "data": {
+    "path": "/abs/path/to/experiment",
+    "worktree_id": "1f0c…",
+    "worktree_id_restored": true,
+    "commondir_restored": true
   }
 }
 ```
@@ -396,7 +455,7 @@ single-line JSON.
 
 Git tracks worktrees through a combination of filesystem structure: the main `.git/worktrees/` directory contains per-worktree directories with `gitdir`, `HEAD`, and `commondir` files, and each linked worktree has a `.git` file (not directory) pointing back. This approach is tightly coupled to Git's file-based architecture and requires careful cross-referencing between multiple locations.
 
-Libra uses a single `worktrees.json` file in the shared storage directory. This provides several advantages: all worktree metadata is in one queryable location, state is written atomically (via temp-file rename), and the format is trivially inspectable by both humans and AI agents. The symlink from each linked worktree's `.libra` back to the shared storage is simpler than Git's bidirectional pointer system. The trade-off is that the JSON file is a single point of truth that must be kept consistent, which is why `repair` exists.
+Libra uses a single `worktrees.json` file in the shared storage directory. This provides several advantages: all worktree metadata is in one queryable location, state is written atomically (via temp-file rename), and the format is trivially inspectable by both humans and AI agents. Each linked worktree's real `.libra` gitdir holds a one-way `commondir` pointer back to the shared storage (plus its stable `worktree_id`), which is simpler than Git's bidirectional pointer system. The trade-off is that the JSON file is a single point of truth that must be kept consistent, which is why `repair` exists.
 
 ### Why `--reason` on lock?
 
@@ -404,7 +463,7 @@ Git's `git worktree lock` also supports `--reason`, and Libra preserves this. Lo
 
 ### Why does `remove` not delete directories on disk?
 
-Deleting files is a destructive operation that cannot be undone. Libra's `remove` only unregisters the worktree from the JSON state file, leaving the directory intact. This is a deliberate safety choice: the user can inspect and manually delete the directory when they are confident it is no longer needed. This also prevents accidental data loss if a worktree contains uncommitted work. Git's `git worktree remove` does delete the directory by default, which has been a source of lost work.
+Deleting files is a destructive operation that cannot be undone. Libra's default `remove` DETACHES the worktree instead: the directory, its scoped database state, and its identity stay intact while the entry moves to `detached_from_registry` and the directory is frozen (every command inside it fails closed with a re-add/delete hint). This is a deliberate safety choice: the user can re-attach with `worktree add`, or finish the removal with `--delete-dir` once confident nothing is needed. It also prevents accidental data loss if a worktree contains uncommitted work. Git's `git worktree remove` deletes the directory by default, which has been a source of lost work.
 
 ### Why does `move` reject locked worktrees?
 
@@ -418,20 +477,20 @@ When creating a linked worktree, Libra restores content from the HEAD commit rat
 
 | Operation | Libra | Git | jj |
 |-----------|-------|-----|----|
-| Create worktree | `worktree add <path>` | `worktree add <path> [<branch>]` | `workspace add <path>` |
-| Create on branch | Not supported | `worktree add <path> <branch>` | `workspace add <path>` (then `jj edit`) |
-| Create detached | Not supported | `worktree add --detach <path> <commit>` | N/A |
+| Create worktree | `worktree add <path> [<branch-or-commit>]` (no target: detached at source commit) | `worktree add <path> [<branch>]` | `workspace add <path>` |
+| Create on branch | `worktree add <path> <branch>` (attached; refused if checked out anywhere; no DWIM) | `worktree add <path> <branch>` | `workspace add <path>` (then `jj edit`) |
+| Create detached | `worktree add --detach <path> [<commit>]` (also `add <path> <commit>`) | `worktree add --detach <path> <commit>` | N/A |
 | List worktrees | `worktree list` | `worktree list [--porcelain]` | `workspace list` |
 | Lock | `worktree lock <path> [--reason]` | `worktree lock [--reason] <worktree>` | N/A |
 | Unlock | `worktree unlock <path>` | `worktree unlock <worktree>` | N/A |
 | Move | `worktree move <src> <dest>` | `worktree move <worktree> <new-path>` | N/A |
 | Prune | `worktree prune` | `worktree prune [--dry-run]` | N/A (automatic) |
-| Remove | `worktree remove <path>` (registry only) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
-| Repair | `worktree repair` | `worktree repair [<path>...]` | N/A |
+| Remove | `worktree remove <path>` (detaches — directory + state kept, frozen) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
+| Repair | `worktree repair [<path>]` | `worktree repair [<path>...]` | N/A |
 | Alias | `wt` | N/A | N/A |
-| Branch per worktree | Not supported | Automatic (new branch or existing) | Automatic (new working copy commit) |
+| Branch per worktree | `-b <new> [<start>]` explicit (full rollback; no basename default) | Automatic (new branch or existing) | Automatic (new working copy commit) |
 | Storage | JSON file (`worktrees.json`) | Filesystem structure (`.git/worktrees/`) | Operation log |
-| Worktree link | Symlink to shared `.libra` | `.git` file pointing to `gitdir` | Symlink to shared `.jj` |
+| Worktree link | Real local `.libra` gitdir with a `commondir` pointer to shared storage (legacy layouts: symlink) | `.git` file pointing to `gitdir` | Symlink to shared `.jj` |
 
 Note: jj uses the term "workspace" instead of "worktree". Each workspace automatically gets its own working copy commit, and workspaces are tracked in the operation log. jj workspaces are simpler than Git worktrees because jj's change-based model does not require separate branch management per workspace.
 

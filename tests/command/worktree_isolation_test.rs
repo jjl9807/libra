@@ -170,15 +170,17 @@ fn corrupt_commondir_fails_closed_not_phantom_repo() {
         "a corrupt commondir must fail closed, not operate on a phantom repo"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // The failure happens at path resolution (repo-not-found), NOT by routing
-    // the DB lookup at a phantom `<wt>/.libra/libra.db` — the pre-fix symptom.
+    // The failure happens at path resolution, NOT by routing the DB lookup
+    // at a phantom `<wt>/.libra/libra.db` — the pre-fix symptom. Since
+    // W3-s1b the resolver's own diagnosis surfaces VERBATIM (LBR-REPO-003 +
+    // the repair hint) instead of being masked as repo-not-found.
     assert!(
         !stderr.contains(".libra/libra.db"),
         "must not route db lookups at the phantom local gitdir: {stderr}"
     );
     assert!(
-        stderr.contains("LBR-REPO-001") || stderr.contains("not a libra repository"),
-        "fails closed at repo resolution: {stderr}"
+        stderr.contains("Error-Code: LBR-REPO-003") && stderr.contains("worktree repair"),
+        "fails closed with the actionable corrupt-commondir diagnosis: {stderr}"
     );
 }
 
@@ -255,17 +257,13 @@ fn same_branch_is_refused_across_worktrees() {
     );
 }
 
-/// Part C W0 (§C.11 transition guards): the states whose stores are still
-/// repository-global — the stash stack, the dirty cache, and the layer/sparse
-/// tables — must fail closed in a linked worktree until W1/W2 make them
-/// worktree-scoped. The guard fires before any side effect, so no
-/// remote/network is needed. (`fetch` was un-guarded in W1 once `FETCH_HEAD`
-/// became worktree-local — see `fetch_uses_worktree_local_fetch_head`; `pull`
-/// in merge mode was un-guarded once merge state was scoped — only its
-/// `--rebase` mode still refuses, asserted below on a branch-attached
-/// worktree since the mode is resolved after HEAD.)
+/// Part C §C.11 transition-guard retirement ledger: every store that W0
+/// fail-closed in linked worktrees has been scoped (dirty/layer/sparse in
+/// W1, the stash stack protocol + pull's autostash wrap in W2), so ALL the
+/// formerly guarded commands now run in a linked worktree. This test pins
+/// the lifted contract — none of them may hit a linked-worktree guard.
 #[test]
-fn repository_global_state_commands_refused_in_linked_worktree() {
+fn formerly_guarded_commands_run_in_linked_worktree() {
     let repo = repo_with_feature();
     let main = repo.path();
     let parent = tempfile::tempdir().expect("wt parent");
@@ -275,54 +273,29 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         "worktree add",
     );
 
-    // Part C W1 final lift: `pull --rebase` itself is no longer refused in a
-    // linked worktree (rebase state is scoped). Only the `--autostash` combo
-    // stays guarded — its legacy wrap uses the repository-global stash stack.
+    // Part C W2 final lift: `pull --rebase` AND its `--autostash` combo run
+    // in a linked worktree — the autostash wrap uses the W2 stack-lock +
+    // CAS protocol on the shared stash stack.
     assert_cli_success(
         &run_libra_command(&["switch", "feature"], &wt),
         "wt switch feature",
     );
-    let rebase_pull = run_libra_command(&["pull", "--rebase"], &wt);
-    assert!(
-        !String::from_utf8_lossy(&rebase_pull.stderr).contains("linked worktree"),
-        "pull --rebase must not hit the linked-worktree guard anymore: {}",
-        String::from_utf8_lossy(&rebase_pull.stderr)
-    );
-    let autostash_pull = run_libra_command(&["pull", "--rebase", "--autostash"], &wt);
-    assert_ne!(
-        autostash_pull.status.code(),
-        Some(0),
-        "pull --rebase --autostash must fail closed in a linked worktree"
-    );
-    assert!(
-        String::from_utf8_lossy(&autostash_pull.stderr).contains("linked worktree"),
-        "the autostash combo fails with the linked-worktree guard: {}",
-        String::from_utf8_lossy(&autostash_pull.stderr)
-    );
-
-    let cases: &[&[&str]] = &[&["stash", "list"]];
-    for argv in cases {
-        let out = run_libra_command(argv, &wt);
-        assert_ne!(
-            out.status.code(),
-            Some(0),
-            "{argv:?} must fail closed in a linked worktree"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
+    for argv in [
+        vec!["pull", "--rebase"],
+        vec!["pull", "--rebase", "--autostash"],
+        vec!["stash", "list"],
+    ] {
+        let out = run_libra_command(&argv, &wt);
         assert!(
-            stderr.contains("linked worktree"),
-            "{argv:?} should fail with the linked-worktree guard, got: {stderr}"
+            !String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+            "{argv:?} must not hit the linked-worktree guard anymore: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
-    // The SAME commands succeed in the main worktree (guard is main-only).
-    assert_cli_success(
-        &run_libra_command(&["stash", "list"], main),
-        "stash list works in main",
-    );
-    // W1 §C.4.1.1: the dirty cache, the layer registry, and the sparse view
-    // are worktree-scoped now — all run in a linked worktree against their
-    // own rows.
+    // W1/W2 §C.4: the dirty cache, the layer registry, the sparse view, and
+    // the stash stack protocol are worktree-aware now — all run in a linked
+    // worktree.
     assert_cli_success(
         &run_libra_command(&["dirty", "--list"], &wt),
         "dirty --list runs in a linked worktree since W1",
@@ -334,6 +307,90 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
     assert_cli_success(
         &run_libra_command(&["sparse-view", "status"], &wt),
         "sparse-view status runs in a linked worktree since W1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["stash", "list"], &wt),
+        "stash list runs in a linked worktree since W2",
+    );
+}
+
+/// W2 §C.4.3: the stash STACK is deliberately repository-shared (an entry
+/// pushed in one worktree lists and applies in another), while push/pop
+/// snapshot and mutate only the ACTING worktree's index/workdir; `stash
+/// branch` preflights the branch collision before touching anything.
+#[test]
+fn stash_stack_is_shared_with_scoped_snapshots() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("stash-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Dirty a TRACKED file in the linked worktree and stash there.
+    let tracked = std::fs::read_dir(&wt)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().is_file())
+        .expect("tracked file in wt")
+        .path();
+    let original = std::fs::read_to_string(&tracked).unwrap();
+    std::fs::write(&tracked, "stashed-from-wt\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], &wt), "wt stash push");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        original,
+        "push restores the LINKED worktree's file"
+    );
+
+    // The shared stack lists the entry from MAIN...
+    let listed = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&listed, "main stash list");
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the stack is repository-shared"
+    );
+    // ...and `stash branch` with a COLLIDING name refuses up front, keeping
+    // the entry and both worktrees untouched.
+    let collided = run_libra_command(&["stash", "branch", "feature"], main);
+    assert_ne!(
+        collided.status.code(),
+        Some(0),
+        "stash branch preflights the existing-branch collision"
+    );
+    let listed = run_libra_command(&["stash", "list"], main);
+    assert!(
+        !String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "the refused branch kept the entry"
+    );
+
+    // Pop in MAIN: the change materializes in MAIN's workdir (the acting
+    // scope), the linked worktree stays clean, and the entry is CAS-dropped.
+    let main_file = main.join(
+        tracked
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("file name"),
+    );
+    assert_cli_success(&run_libra_command(&["stash", "pop"], main), "main pop");
+    assert_eq!(
+        std::fs::read_to_string(&main_file).unwrap(),
+        "stashed-from-wt\n",
+        "pop applies to the ACTING worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        original,
+        "the linked worktree is untouched by main's pop"
+    );
+    let listed = run_libra_command(&["stash", "list"], &wt);
+    assert_cli_success(&listed, "wt stash list");
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout).trim(),
+        "",
+        "the CAS pop removed the entry from the shared stack"
     );
 }
 
@@ -632,7 +689,7 @@ fn fast_import_refuses_branch_checked_out_elsewhere() {
 /// lands, `maintenance run --task gc` must skip the loose-object prune in a
 /// multi-worktree repository rather than delete objects it cannot see.
 #[test]
-fn gc_skips_prune_in_multi_worktree_repo() {
+fn gc_and_repack_run_in_multi_worktree_repo_keeping_private_roots() {
     let repo = repo_with_feature();
     let main = repo.path();
     let parent = tempfile::tempdir().expect("wt parent");
@@ -656,13 +713,17 @@ fn gc_skips_prune_in_multi_worktree_repo() {
     .to_string();
     assert!(!oid.is_empty(), "hashed the staged blob");
 
-    // GC from the MAIN worktree must skip the prune (not delete the blob).
+    // W2 §C.4.3: gc RUNS in a multi-worktree repository (the W0 skip is
+    // lifted) — the linked worktree's private index is a reachability root.
+    // Age every loose object past the prune grace window first, so survival
+    // below proves the ROOT, not the freshness belt.
+    backdate_loose_objects(main);
     let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
     assert_cli_success(&gc, "maintenance gc");
     let text = String::from_utf8_lossy(&gc.stdout) + String::from_utf8_lossy(&gc.stderr);
     assert!(
-        text.contains("linked worktree"),
-        "gc should report skipping the prune for linked worktrees: {text}"
+        !text.contains("skipped loose-object prune"),
+        "the multi-worktree gc skip is lifted: {text}"
     );
 
     // The staged-only blob must still be readable (no data loss).
@@ -684,8 +745,8 @@ fn gc_skips_prune_in_multi_worktree_repo() {
         "the linked worktree's staged blob must not be reported unreachable: {fsck_text}"
     );
 
-    // The incremental-repack task has the same gap (it rebuilds one pack from
-    // the reachable set and deletes the old packs), so it must skip too.
+    // incremental-repack runs too (same lifted skip); the staged-only blob
+    // must still be readable afterwards (it is in the consolidated root set).
     let repack = run_libra_command(
         &["maintenance", "run", "--task", "incremental-repack"],
         main,
@@ -694,9 +755,44 @@ fn gc_skips_prune_in_multi_worktree_repo() {
     let repack_text =
         String::from_utf8_lossy(&repack.stdout) + String::from_utf8_lossy(&repack.stderr);
     assert!(
-        repack_text.contains("linked worktree"),
-        "incremental-repack should skip in a multi-worktree repo: {repack_text}"
+        !repack_text.contains("skipped repack: this repository has linked worktrees"),
+        "the multi-worktree repack skip is lifted: {repack_text}"
     );
+    let cat = run_libra_command(&["cat-file", "-p", &oid], main);
+    assert_cli_success(&cat, "staged-only blob survives repack");
+}
+
+/// Age every loose object file past the gc prune grace window so a test can
+/// prove ROOT-based survival rather than freshness-based survival.
+pub(crate) fn backdate_loose_objects(repo: &std::path::Path) {
+    // POSIX `touch -t [[CC]YY]MMDDhhmm` (portable, unlike GNU `-d`).
+    let stamp = (chrono::Utc::now() - chrono::Duration::hours(2))
+        .format("%Y%m%d%H%M")
+        .to_string();
+    let objects = repo.join(".libra/objects");
+    let shards = std::fs::read_dir(&objects).expect("read objects dir");
+    for shard in shards {
+        let shard = shard.expect("objects shard entry");
+        if !shard.path().is_dir() || shard.file_name() == "pack" {
+            continue;
+        }
+        let files = std::fs::read_dir(shard.path()).expect("read objects shard");
+        for file in files {
+            let file = file.expect("loose object entry");
+            let status = std::process::Command::new("touch")
+                .arg("-t")
+                .arg(&stamp)
+                .arg(file.path())
+                .status()
+                .expect("spawn touch");
+            assert!(
+                status.success(),
+                "backdating '{}' must succeed (a silently-fresh object would let the \
+                 grace window mask a missing root)",
+                file.path().display()
+            );
+        }
+    }
 }
 
 /// Part C §C.4.3: transient editor buffers live in each worktree's OWN gitdir.
@@ -1256,13 +1352,26 @@ fn readded_worktree_does_not_inherit_bisect_session() {
         "bisect start",
     );
 
-    // Remove the worktree MID-BISECT, clear its directory, and re-add at the
-    // same path (same deterministic worktree id).
-    assert_cli_success(
-        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
-        "worktree remove",
+    // W3-s1b (§C.7): a worktree with an ACTIVE bisect refuses BOTH remove
+    // modes — detaching would strand the session behind the fail-closed
+    // gate, deleting would destroy it.
+    let refused = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "remove must refuse mid-bisect: {}",
+        String::from_utf8_lossy(&refused.stderr)
     );
-    fs::remove_dir_all(&wt).expect("clear removed worktree dir");
+    assert_cli_success(
+        &run_libra_command(&["bisect", "reset"], &wt),
+        "bisect reset before removal",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "remove", "--delete-dir", wt.to_str().unwrap()],
+            main,
+        ),
+        "worktree remove --delete-dir",
+    );
     assert_cli_success(
         &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
         "worktree re-add",
@@ -1593,12 +1702,13 @@ fn remove_gcs_private_head_rows() {
     );
 }
 
-/// W1 §C.4.1.1: removing a worktree purges its dirty-cache rows AND meta —
-/// a later re-add (fresh worktree_id) never inherits or leaks stale scope
-/// rows.
+/// W3-s1b (§C.7): keep-dir remove DETACHES and preserves the scope's rows
+/// (the directory still holds the user's state); only `--delete-dir` (and
+/// prune of a missing path) purges them. The add-time strict sweep still
+/// guarantees a fresh re-add never inherits stale rows.
 #[test]
 #[serial_test::serial]
-fn worktree_remove_purges_dirty_scope_rows() {
+fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
     let repo = repo_with_feature();
     let main = repo.path();
     let wt_root = tempfile::tempdir().expect("wt root");
@@ -1617,12 +1727,18 @@ fn worktree_remove_purges_dirty_scope_rows() {
         "linked manual mark",
     );
 
+    // W3-s1b (§C.7): keep-dir remove DETACHES — the directory and its scoped
+    // rows are preserved (deleting the rows would leave a directory that
+    // still operates but lost its HEAD); `--delete-dir` purges them.
     assert_cli_success(
         &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
-        "worktree remove",
+        "worktree remove (detach)",
+    );
+    assert!(
+        wt.join(".libra").join("detached_from_registry").exists(),
+        "detach writes the fail-closed marker"
     );
 
-    // In-process: no linked-scope rows survive in either dirty table.
     let _guard = libra::utils::test::ChangeDirGuard::new(main);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -1638,7 +1754,41 @@ fn worktree_remove_purges_dirty_scope_rows() {
                 .expect("count")
                 .expect("row");
             let count: i64 = row.try_get_by_index(0).expect("count value");
-            assert_eq!(count, 0, "{table} keeps no removed-scope rows");
+            assert!(count > 0, "{table} PRESERVES the detached scope's rows");
+        }
+    });
+    drop(_guard);
+
+    // Re-add then --delete-dir: the destructive path purges the rows.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "re-attach",
+    );
+    // The re-attached worktree is dirty (dirt.txt); clean it so --delete-dir
+    // passes its dirty gate.
+    std::fs::remove_file(wt.join("dirt.txt")).expect("drop dirt");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "remove", "--delete-dir", wt.to_str().unwrap()],
+            main,
+        ),
+        "worktree remove --delete-dir",
+    );
+    let _guard = libra::utils::test::ChangeDirGuard::new(main);
+    rt.block_on(async {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db = libra::internal::db::get_db_conn_instance().await;
+        for table in ["working_dirty", "working_dirty_meta"] {
+            let row = db
+                .query_one(Statement::from_string(
+                    db.get_database_backend(),
+                    format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
+                ))
+                .await
+                .expect("count")
+                .expect("row");
+            let count: i64 = row.try_get_by_index(0).expect("count value");
+            assert_eq!(count, 0, "{table} keeps no rows after --delete-dir");
         }
     });
 }
@@ -1810,11 +1960,8 @@ fn sparse_view_is_worktree_scoped() {
 /// therefore both land in the registry (no load-modify-write lost update,
 /// and a second add's strict pre-seed sweep can never run between another
 /// add's seed and registry commit).
-#[cfg(unix)]
 #[test]
 fn registry_mutators_serialize_on_worktrees_lock() {
-    use std::os::unix::io::AsRawFd;
-
     /// Kill-and-reap on every exit path — an assertion failure must never
     /// leave a spawned add running against a removed temp repository.
     struct ChildGuard(std::process::Child);
@@ -1841,11 +1988,9 @@ fn registry_mutators_serialize_on_worktrees_lock() {
         .truncate(false)
         .open(&lock_path)
         .expect("open registry lock");
-    assert_eq!(
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
-        0,
-        "test takes the registry lock"
-    );
+    // std file locking mirrors the production guard cross-platform (flock
+    // on Unix, LockFileEx on Windows) — the test itself needs no cfg gate.
+    lock_file.lock().expect("test takes the registry lock");
     let spawn_add = |wt: &std::path::Path| {
         ChildGuard(
             base_libra_command(&["worktree", "add", wt.to_str().unwrap()], main)
@@ -1884,11 +2029,7 @@ fn registry_mutators_serialize_on_worktrees_lock() {
         );
     }
 
-    assert_eq!(
-        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
-        0,
-        "test releases the registry lock"
-    );
+    lock_file.unlock().expect("test releases the registry lock");
     for (wt, mut child) in children {
         let status = child.0.wait().expect("wait add");
         assert!(
@@ -2116,4 +2257,1790 @@ fn worktree_remove_purges_layer_scope_rows() {
             "{table} keeps only the retained (kept-dir) scope's row after prune"
         );
     }
+}
+
+/// Registry v2 (plan-20260714 §C.7): a legacy v1 `{ worktrees: [...] }` file
+/// is durably upgraded on first touch — rewritten as
+/// `{ schema_version: 2, entries: [...] }` with each linked entry's STABLE id
+/// backfilled from its gitdir — while preserving every v1 field.
+#[test]
+fn registry_v1_file_upgrades_to_v2_with_backfilled_ids() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-v1up");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let gitdir_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("linked gitdir id")
+        .trim()
+        .to_string();
+
+    // Downgrade the registry file to the v1 shape by hand.
+    let registry = main.join(".libra").join("worktrees.json");
+    let v2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry")).expect("v2 json");
+    assert_eq!(v2["schema_version"], 2, "fresh registry is v2");
+    let v1_entries: Vec<serde_json::Value> = v2["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry["path"],
+                "is_main": entry["is_main"],
+                "locked": entry["locked"],
+                "lock_reason": entry["lock_reason"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&serde_json::json!({ "worktrees": v1_entries }))
+            .expect("serialize v1"),
+    )
+    .expect("write v1 registry");
+
+    // A LOCKLESS reader (list) reads the v1 file through the in-memory
+    // upgrade — with correct ids via the gitdir fallback — but must NOT
+    // rewrite it (an unlocked writer could overwrite a concurrent locked
+    // mutation).
+    let v1_bytes = std::fs::read(&registry).expect("v1 bytes");
+    let list = run_libra_command(&["worktree", "list", "--json"], main);
+    assert_cli_success(&list, "worktree list after v1 downgrade");
+    let listed = parse_json_stdout(&list);
+    let entries = listed["data"]["worktrees"]
+        .as_array()
+        .expect("list entries");
+    let linked = entries
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .expect("linked entry listed");
+    assert_eq!(
+        linked["worktree_id"].as_str(),
+        Some(gitdir_id.as_str()),
+        "listed id survives the v1 round-trip"
+    );
+    assert_eq!(
+        std::fs::read(&registry).expect("registry after list"),
+        v1_bytes,
+        "a lockless reader never rewrites the registry"
+    );
+
+    // The first MUTATING command (here: no-arg repair, which loads under the
+    // registry lock) performs the durable upgrade.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair drives the durable upgrade",
+    );
+
+    let upgraded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read upgraded registry"))
+            .expect("upgraded json");
+    assert_eq!(upgraded["schema_version"], 2, "file rewritten as v2");
+    let upgraded_entries = upgraded["entries"].as_array().expect("v2 entries");
+    assert_eq!(upgraded_entries.len(), 2, "both entries preserved");
+    let upgraded_linked = upgraded_entries
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .expect("linked entry persisted");
+    assert_eq!(
+        upgraded_linked["worktree_id"].as_str(),
+        Some(gitdir_id.as_str()),
+        "stable id backfilled from the gitdir during the upgrade"
+    );
+    assert!(
+        upgraded.get("worktrees").is_none(),
+        "legacy top-level key does not survive"
+    );
+}
+
+/// `worktree repair <path>` (§C.7): restores a linked worktree's deleted
+/// `.libra/worktree_id` and `commondir` from the registry's PERSISTED id, so
+/// the worktree maps back to ITS OWN scoped rows (never a fresh synthesized
+/// scope and never main's).
+#[test]
+fn worktree_repair_path_restores_identity_from_registry() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-repair");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "switch in linked worktree",
+    );
+    let gitdir = wt.join(".libra");
+    let original_id = std::fs::read_to_string(gitdir.join("worktree_id"))
+        .expect("original id")
+        .trim()
+        .to_string();
+    let original_commondir =
+        std::fs::read_to_string(gitdir.join("commondir")).expect("original commondir");
+
+    // Simulate identity loss: both gitdir pointer files vanish.
+    std::fs::remove_file(gitdir.join("worktree_id")).expect("drop id file");
+    std::fs::remove_file(gitdir.join("commondir")).expect("drop commondir");
+
+    let repaired = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&repaired, "worktree repair <path>");
+    let payload = parse_json_stdout(&repaired);
+    assert_eq!(
+        payload["data"]["worktree_id"].as_str(),
+        Some(original_id.as_str()),
+        "repair restores the persisted id, not a fresh synthesis"
+    );
+    assert_eq!(payload["data"]["worktree_id_restored"], true);
+    assert_eq!(payload["data"]["commondir_restored"], true);
+
+    let restored_id = std::fs::read_to_string(gitdir.join("worktree_id"))
+        .expect("restored id")
+        .trim()
+        .to_string();
+    assert_eq!(restored_id, original_id);
+    let restored_commondir =
+        std::fs::read_to_string(gitdir.join("commondir")).expect("restored commondir");
+    assert_eq!(
+        restored_commondir.trim(),
+        original_commondir.trim(),
+        "commondir points back at the shared storage"
+    );
+
+    // The repaired worktree still resolves ITS OWN scope: HEAD stays on
+    // `feature`, proving the id did not silently change.
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        head, "feature",
+        "repaired worktree keeps its own HEAD scope"
+    );
+
+    // Idempotent second run: nothing left to restore.
+    let second = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&second, "second repair run");
+    let payload = parse_json_stdout(&second);
+    assert_eq!(payload["data"]["worktree_id_restored"], false);
+    assert_eq!(payload["data"]["commondir_restored"], false);
+
+    // A CORRUPT (empty) commondir — the exact state the storage resolver
+    // fails closed on — is restored too, not just a missing file.
+    std::fs::write(gitdir.join("commondir"), "").expect("corrupt commondir");
+    let third = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&third, "repair of a corrupt commondir");
+    let payload = parse_json_stdout(&third);
+    assert_eq!(payload["data"]["commondir_restored"], true);
+    let healed = std::fs::read_to_string(gitdir.join("commondir")).expect("healed commondir");
+    assert_eq!(healed.trim(), original_commondir.trim());
+
+    // A RELATIVE pointer that resolves (against the gitdir) to THIS
+    // repository's storage is recognized as correct — not misclassified as
+    // foreign against the caller's cwd.
+    std::fs::write(gitdir.join("commondir"), "../../.libra\n").expect("relative commondir");
+    let relative = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        main,
+    );
+    assert_cli_success(&relative, "repair with a valid relative commondir");
+    let payload = parse_json_stdout(&relative);
+    assert_eq!(
+        payload["data"]["commondir_restored"], false,
+        "a valid relative pointer is not foreign and needs no restore"
+    );
+
+    // A VALID pointer at a DIFFERENT storage is refused — and the refusal
+    // must be side-effect free: NEITHER gitdir file may change, even when
+    // the worktree_id also needs restoring.
+    let other = tempfile::tempdir().expect("other storage");
+    let foreign_pointer = format!("{}\n", other.path().display());
+    std::fs::write(gitdir.join("commondir"), &foreign_pointer).expect("foreign commondir");
+    std::fs::write(gitdir.join("worktree_id"), "stale-or-corrupt\n").expect("stale id");
+    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "repair must refuse to re-home a worktree pointing at another storage"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gitdir.join("commondir")).expect("commondir after refusal"),
+        foreign_pointer,
+        "refusal leaves commondir byte-for-byte unchanged"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gitdir.join("worktree_id")).expect("id after refusal"),
+        "stale-or-corrupt\n",
+        "refusal leaves worktree_id byte-for-byte unchanged"
+    );
+}
+
+/// `worktree repair <path>` refuses unregistered paths and the main worktree
+/// instead of guessing identities (§C.7 fail-closed).
+#[test]
+fn worktree_repair_path_refuses_main_and_unregistered() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+
+    let main_refused = run_libra_command(&["worktree", "repair", main.to_str().unwrap()], main);
+    assert!(
+        !main_refused.status.success(),
+        "repair <main> must be refused"
+    );
+
+    let stranger = main.join("never-registered");
+    std::fs::create_dir_all(&stranger).expect("mkdir");
+    let unregistered = run_libra_command(&["worktree", "repair", stranger.to_str().unwrap()], main);
+    assert!(
+        !unregistered.status.success(),
+        "repair on an unregistered path must be refused"
+    );
+}
+
+/// §C.7 ordering: every worktree command applies pending repository
+/// migrations — including the registry-v2 capability marker (2026072401) —
+/// BEFORE any `worktrees.json` read or rewrite. A repo whose database predates
+/// the marker gains it from a plain `worktree list`, so an old binary is
+/// refused at connect time no matter which command first touches the v2 file.
+#[tokio::test]
+async fn worktree_commands_apply_capability_marker_before_registry_io() {
+    use libra::internal::db::migration::builtin_runner;
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+
+    // Re-open the pre-v2 window: roll back ONLY the capability marker.
+    {
+        let conn = Database::connect(&db_url).await.expect("connect repo db");
+        let rolled = builtin_runner()
+            .expect("builtin runner")
+            .rollback_to(&conn, 2026072304)
+            .await
+            .expect("roll back capability marker");
+        assert_eq!(rolled, vec![2026072402, 2026072401]);
+        conn.close().await.expect("close");
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "list"], main),
+        "worktree list on a pre-marker database",
+    );
+
+    let conn = Database::connect(&db_url).await.expect("reconnect repo db");
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
+             AND name = 'worktree_registry_capability'"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("count row");
+    let count: i32 = row.try_get_by_index(0).expect("count");
+    assert_eq!(
+        count, 1,
+        "the preflight re-applied the capability marker before registry IO"
+    );
+}
+
+/// v2 identity invariants (§C.7): a v2 registry whose linked entry lost its
+/// persisted id is CORRUPT — readers and mutators refuse it (never silently
+/// falling back to the mutable gitdir) until the explicit no-arg
+/// `worktree repair` deterministically heals and persists it.
+#[test]
+fn v2_identity_invariant_violations_refuse_until_explicit_repair() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-invariant");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let gitdir_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("linked gitdir id")
+        .trim()
+        .to_string();
+
+    // Corrupt the v2 registry: strip the linked entry's persisted id.
+    let registry = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    for entry in doc["entries"].as_array_mut().expect("entries") {
+        if entry["is_main"] == false {
+            entry.as_object_mut().expect("entry").remove("worktree_id");
+        }
+    }
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("write corrupt registry");
+
+    // Both a lockless reader and a locked mutator refuse, pointing at repair.
+    let list = run_libra_command(&["worktree", "list"], main);
+    assert!(
+        !list.status.success(),
+        "list refuses the corrupt v2 registry"
+    );
+    let lock = run_libra_command(
+        &["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
+        main,
+    );
+    assert!(
+        !lock.status.success(),
+        "mutators refuse the corrupt v2 registry"
+    );
+    let stderr = String::from_utf8_lossy(&lock.stderr);
+    assert!(
+        stderr.contains("worktree repair"),
+        "refusal directs at the explicit repair: {stderr}"
+    );
+
+    // The explicit no-arg repair heals deterministically (gitdir backfill).
+    let repaired = run_libra_command(&["--json", "worktree", "repair"], main);
+    assert_cli_success(&repaired, "no-arg repair heals the invariants");
+    let payload = parse_json_stdout(&repaired);
+    assert_eq!(
+        payload["data"]["changed"], true,
+        "heal is reported as a change"
+    );
+
+    let healed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read healed registry"))
+            .expect("healed json");
+    let linked = healed["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["is_main"] == false)
+        .expect("linked entry");
+    assert_eq!(
+        linked["worktree_id"].as_str(),
+        Some(gitdir_id.as_str()),
+        "heal backfills the id from the gitdir"
+    );
+
+    // Mutators work again.
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
+            main,
+        ),
+        "mutators run after the heal",
+    );
+}
+
+/// A zero-byte registry is a torn write, not a fresh repository: readers and
+/// mutators fail closed and NOTHING reinitializes or overwrites it — a silent
+/// main-only rewrite would drop every linked entry.
+#[test]
+fn zero_byte_registry_fails_closed_everywhere() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-torn");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let registry = main.join(".libra").join("worktrees.json");
+    std::fs::write(&registry, b"").expect("truncate registry");
+
+    for argv in [
+        vec!["worktree", "list"],
+        vec!["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
+        vec!["worktree", "repair"],
+        vec!["worktree", "repair", wt.to_str().unwrap()],
+    ] {
+        let out = run_libra_command(&argv, main);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must fail closed on a zero-byte registry"
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(&registry)
+            .expect("registry still present")
+            .len(),
+        0,
+        "nothing may reinitialize or overwrite the torn registry"
+    );
+}
+
+/// `worktree repair <path>` refuses a legacy v1 registry outright: v1 carries
+/// no persisted identities, so restoring from it would launder a freshly
+/// synthesized id into the gitdir. The explicit no-arg repair upgrade comes
+/// first, then the path form works.
+#[test]
+fn worktree_repair_path_refuses_v1_registry_until_upgrade() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-v1-repair");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Downgrade the registry to the v1 shape.
+    let registry = main.join(".libra").join("worktrees.json");
+    let v2: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry")).expect("v2 json");
+    let v1_entries: Vec<serde_json::Value> = v2["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry["path"],
+                "is_main": entry["is_main"],
+                "locked": entry["locked"],
+                "lock_reason": entry["lock_reason"],
+            })
+        })
+        .collect();
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&serde_json::json!({ "worktrees": v1_entries }))
+            .expect("serialize v1"),
+    )
+    .expect("write v1 registry");
+
+    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "path repair must refuse a v1 registry"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("legacy v1"),
+        "refusal explains the v1 state: {stderr}"
+    );
+
+    // The explicit upgrade, then the path form works.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "no-arg repair upgrades the registry",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main),
+        "path repair works on the upgraded registry",
+    );
+}
+
+/// §C.7: the repository root is the AUTHORITATIVE main. A malformed v1
+/// registry that marks a LINKED entry as main (or omits the main entirely)
+/// must never durably crown the linked worktree during the upgrade — the
+/// root is restored as main and the linked entry stays linked with its id.
+#[test]
+fn v1_upgrade_never_crowns_a_linked_entry_as_main() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let canonical_main = main.canonicalize().expect("canonical main");
+    let wt = main.join("wt-crown");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let gitdir_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("linked gitdir id")
+        .trim()
+        .to_string();
+    let canonical_wt = wt.canonicalize().expect("canonical wt");
+    let registry = main.join(".libra").join("worktrees.json");
+
+    // Case 1: multi-main v1 — the linked entry is (wrongly) marked main too.
+    // Case 2: mainless v1 — ONLY the linked entry exists.
+    let multi_main = serde_json::json!({ "worktrees": [
+        {"path": canonical_main.to_string_lossy(), "is_main": true,
+         "locked": false, "lock_reason": null},
+        {"path": canonical_wt.to_string_lossy(), "is_main": true,
+         "locked": false, "lock_reason": null},
+    ]});
+    let mainless = serde_json::json!({ "worktrees": [
+        {"path": canonical_wt.to_string_lossy(), "is_main": false,
+         "locked": false, "lock_reason": null},
+    ]});
+    for (label, doc) in [("multi-main", multi_main), ("mainless", mainless)] {
+        std::fs::write(
+            &registry,
+            serde_json::to_vec_pretty(&doc).expect("serialize"),
+        )
+        .expect("write malformed v1");
+        assert_cli_success(
+            &run_libra_command(&["worktree", "repair"], main),
+            "upgrade via no-arg repair",
+        );
+        let upgraded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).expect("read upgraded"))
+                .expect("upgraded json");
+        let entries = upgraded["entries"].as_array().expect("entries");
+        let mains: Vec<_> = entries.iter().filter(|e| e["is_main"] == true).collect();
+        assert_eq!(mains.len(), 1, "{label}: exactly one main");
+        assert_eq!(
+            mains[0]["path"].as_str(),
+            Some(canonical_main.to_string_lossy().as_ref()),
+            "{label}: the repository root is main, never the linked path"
+        );
+        let linked = entries
+            .iter()
+            .find(|e| e["path"].as_str() == Some(canonical_wt.to_string_lossy().as_ref()))
+            .expect("linked entry survives");
+        assert_eq!(linked["is_main"], false, "{label}: linked stays linked");
+        assert_eq!(
+            linked["worktree_id"].as_str(),
+            Some(gitdir_id.as_str()),
+            "{label}: linked id backfilled from ITS OWN gitdir"
+        );
+    }
+}
+
+/// Part C bare boundary (§C.4.1): a bare repository has no working trees —
+/// the entire worktree family refuses with the stable `LBR-REPO-003` before
+/// any registry IO (no worktrees.json may appear).
+#[test]
+fn bare_repository_refuses_worktree_family() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bare = dir.path().join("repo.git");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", bare.to_str().unwrap()], dir.path()),
+        "init --bare",
+    );
+
+    let wt_target = dir.path().join("wt-from-bare");
+    for argv in [
+        vec!["worktree", "list"],
+        vec!["worktree", "add", wt_target.to_str().unwrap()],
+        vec!["worktree", "repair"],
+    ] {
+        let out = run_libra_command(&argv, &bare);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must be refused in a bare repository"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "stable LBR-REPO-003 refusal for {argv:?}: {stderr}"
+        );
+    }
+    assert!(
+        !bare.join("worktrees.json").exists(),
+        "no registry may be created in a bare repository"
+    );
+    assert!(!wt_target.exists(), "no worktree directory may be created");
+
+    // Adversarial layout: a bare repository whose directory is literally
+    // named `.libra` defeats any basename heuristic — the recorded
+    // `core.bare` config must still refuse it.
+    let disguised_parent = dir.path().join("disguised");
+    std::fs::create_dir_all(&disguised_parent).expect("mkdir");
+    let disguised = disguised_parent.join(".libra");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", disguised.to_str().unwrap()], dir.path()),
+        "init --bare .libra",
+    );
+    for cwd in [&disguised, &disguised_parent] {
+        let out = run_libra_command(&["worktree", "list"], cwd);
+        assert!(
+            !out.status.success(),
+            "worktree list from {cwd:?} must be refused for a .libra-named bare repo"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "config-first classifier refuses the disguised bare repo: {stderr}"
+        );
+    }
+    assert!(!disguised.join("worktrees.json").exists());
+
+    // Every git boolean spelling of core.bare=true must classify as bare —
+    // `yes`/`on`/`1` are as bare as `true` (fail-open here would let the
+    // disguised layout through).
+    for spelling in ["yes", "on", "1"] {
+        assert_cli_success(
+            &run_libra_command(&["config", "core.bare", spelling], &disguised),
+            "set core.bare spelling",
+        );
+        let out = run_libra_command(&["worktree", "list"], &disguised);
+        assert!(
+            !out.status.success(),
+            "core.bare={spelling} must still classify as bare"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "core.bare={spelling}: {stderr}"
+        );
+
+        // The SHARED classifier must hold beyond the worktree family:
+        // `status` refuses a bare repository on the same spellings.
+        let status_out = run_libra_command(&["status"], &disguised);
+        assert!(
+            !status_out.status.success(),
+            "status must refuse a bare repo with core.bare={spelling}"
+        );
+        let status_stderr = String::from_utf8_lossy(&status_out.stderr);
+        assert!(
+            status_stderr
+                .lines()
+                .any(|line| line.trim() == "Error-Code: LBR-REPO-003"),
+            "status bare refusal for core.bare={spelling}: {status_stderr}"
+        );
+    }
+
+    // An unparseable core.bare fails CLOSED (refusal, not fall-through).
+    assert_cli_success(
+        &run_libra_command(&["config", "core.bare", "maybe"], &disguised),
+        "set invalid core.bare",
+    );
+    let out = run_libra_command(&["worktree", "list"], &disguised);
+    assert!(
+        !out.status.success(),
+        "an unparseable core.bare must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.trim() == "Error-Code: LBR-CLI-002"),
+        "unparseable core.bare pins LBR-CLI-002: {stderr}"
+    );
+}
+
+/// W3-s1b (§C.7): a detached worktree is FROZEN — every command inside it
+/// fails closed with a re-add/delete hint — and `worktree add` re-attaches
+/// it with its own scoped state intact (HEAD stays where it was).
+#[test]
+fn detached_worktree_fails_closed_until_reattach() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-detach");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "switch in linked worktree",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "detach",
+    );
+
+    // Frozen: reads and writes both refuse with the actionable hint.
+    for argv in [
+        vec!["status"],
+        vec!["log", "--oneline"],
+        vec!["switch", "main"],
+    ] {
+        let out = run_libra_command(&argv, &wt);
+        assert!(
+            !out.status.success(),
+            "{argv:?} must fail closed in a detached worktree"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("detached"),
+            "refusal explains the detached state for {argv:?}: {stderr}"
+        );
+    }
+
+    // Repeat keep-dir remove refuses (already detached).
+    let again = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    assert!(!again.status.success(), "double detach refused");
+
+    // Re-attach restores the SAME scope: HEAD is still `feature`.
+    let readd = run_libra_command(&["--json", "worktree", "add", wt.to_str().unwrap()], main);
+    assert_cli_success(&readd, "re-attach");
+    let payload = parse_json_stdout(&readd);
+    assert_eq!(payload["data"]["reattached"], true);
+    assert!(
+        !wt.join(".libra").join("detached_from_registry").exists(),
+        "marker lifted on re-attach"
+    );
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, "feature", "re-attached worktree resumes ITS OWN HEAD");
+}
+
+/// Re-attach refuses an identity mismatch: a directory recreated at the
+/// same path with a different (or missing) gitdir id is never adopted.
+#[test]
+fn reattach_refuses_identity_mismatch() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-swap");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "detach",
+    );
+    std::fs::write(wt.join(".libra").join("worktree_id"), "someone-else\n").expect("swap identity");
+    let refused = run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "re-attach must refuse a swapped identity"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("does not match"),
+        "identity mismatch explained: {stderr}"
+    );
+}
+
+/// W3-s1b crash matrix (§C.7): an interrupted `remove --delete-dir` —
+/// simulated by planting the journal row and deleting the directory by
+/// hand — is completed by `worktree repair`: scoped rows purged, entry
+/// dropped, journal resolved.
+#[tokio::test]
+async fn worktree_remove_delete_crash_repair() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-crash");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "seed scoped HEAD row",
+    );
+    let canonical_wt = wt.canonicalize().expect("canonical wt");
+    let worktree_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+
+    // Simulate the crash window: intent recorded, directory deleted, but
+    // neither the scoped cleanup nor the registry update happened.
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect repo db");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES ('remove', '{worktree_id}', '{{\"path\":\"{}\",\"delete_dir\":true}}', 0);",
+            canonical_wt.to_string_lossy().replace('\\', "/")
+        ),
+    ))
+    .await
+    .expect("plant journal row");
+    conn.close().await.expect("close");
+    std::fs::remove_dir_all(&wt).expect("simulate deleted dir");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair completes the interrupted remove",
+    );
+
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    for (query, what) in [
+        (
+            format!(
+                "SELECT COUNT(*) FROM reference WHERE worktree_id = '{worktree_id}' AND \
+                 kind = 'Head'"
+            ),
+            "scoped HEAD rows purged",
+        ),
+        (
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+            "journal resolved",
+        ),
+        (
+            "SELECT COUNT(*) FROM worktree_lifecycle".to_string(),
+            "no lifecycle residue",
+        ),
+    ] {
+        let row = conn
+            .query_one(Statement::from_string(backend, query))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        assert_eq!(count, 0, "{what}");
+    }
+
+    let list = run_libra_command(&["worktree", "list", "--json"], main);
+    assert_cli_success(&list, "list after repair");
+    let listed = parse_json_stdout(&list);
+    assert!(
+        !listed["data"]["worktrees"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some(canonical_wt.to_string_lossy().as_ref())),
+        "entry dropped after the completed remove"
+    );
+}
+
+/// §C.7: prune only acts on paths PROVEN missing — a stat failure that is
+/// not NotFound (here: a permission-denied parent) must not classify the
+/// worktree as missing.
+#[cfg(unix)]
+#[test]
+fn prune_does_not_treat_permission_error_as_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nix_effective_root() {
+        eprintln!("skipped (running as root; permission bits are not enforced)");
+        return;
+    }
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("guarded");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Make the parent unreadable: stat on the worktree path now fails with
+    // EACCES, not NotFound.
+    let mut perms = std::fs::metadata(parent.path())
+        .expect("meta")
+        .permissions();
+    perms.set_mode(0o000);
+    std::fs::set_permissions(parent.path(), perms).expect("chmod 000");
+
+    let prune = run_libra_command(&["--json", "worktree", "prune"], main);
+
+    // Restore before asserting so cleanup works even on failure.
+    let mut restore = std::fs::metadata(parent.path())
+        .map(|m| m.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o755));
+    restore.set_mode(0o755);
+    std::fs::set_permissions(parent.path(), restore).expect("chmod back");
+
+    assert_cli_success(&prune, "prune with unreadable entry");
+    let payload = parse_json_stdout(&prune);
+    assert_eq!(
+        payload["data"]["pruned_count"], 0,
+        "a permission error must not classify the worktree as missing"
+    );
+}
+
+#[cfg(unix)]
+fn nix_effective_root() -> bool {
+    // SAFETY: geteuid has no preconditions and returns a plain integer.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `worktree remove --delete-dir .` run from INSIDE the target: the command
+/// must move its own cwd out before deleting, complete cleanly, and leave
+/// no journal/lifecycle residue.
+#[tokio::test]
+async fn remove_delete_dir_dot_from_inside_worktree() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-self-delete");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let out = run_libra_command(&["worktree", "remove", "--delete-dir", "."], &wt);
+    assert!(
+        out.status.success(),
+        "remove --delete-dir . from inside the worktree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt.exists(), "directory deleted");
+
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect repo db");
+    let backend = conn.get_database_backend();
+    for (query, what) in [
+        (
+            "SELECT COUNT(*) FROM worktree_intent_journal",
+            "journal resolved",
+        ),
+        (
+            "SELECT COUNT(*) FROM worktree_lifecycle",
+            "no lifecycle residue",
+        ),
+    ] {
+        let row = conn
+            .query_one(Statement::from_string(backend, query.to_string()))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        assert_eq!(count, 0, "{what}");
+    }
+}
+
+/// Move-recovery ambiguity (§C.7): when the crash window leaves BOTH paths
+/// present (destination recreated by someone else) or BOTH missing, repair
+/// must KEEP the journal row and report — resolving would abandon a
+/// registry pointing at an unrelated directory.
+#[tokio::test]
+async fn move_crash_ambiguous_states_keep_journal() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-move-src");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let canonical_wt = wt.canonicalize().expect("canonical src");
+    let dest = main.join("wt-move-dest");
+    let worktree_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let plant = |payload: String| {
+        let db_url = db_url.clone();
+        let worktree_id = worktree_id.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            conn.execute(Statement::from_string(
+                backend,
+                format!(
+                    "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
+                     created_at) VALUES ('move', '{worktree_id}', '{payload}', 0);"
+                ),
+            ))
+            .await
+            .expect("plant journal row");
+            conn.close().await.expect("close");
+        }
+    };
+    let journal_count = || {
+        let db_url = db_url.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            let row = conn
+                .query_one(Statement::from_string(
+                    backend,
+                    "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+                ))
+                .await
+                .expect("query")
+                .expect("row");
+            let count: i64 = row.try_get_by_index(0).expect("count");
+            conn.close().await.expect("close");
+            count
+        }
+    };
+
+    // Case 1: Present/Present — entry registered at src, dest recreated.
+    std::fs::create_dir_all(&dest).expect("recreate dest");
+    let payload = format!(
+        "{{\"src\":\"{}\",\"dest\":\"{}\"}}",
+        canonical_wt.to_string_lossy(),
+        dest.to_string_lossy()
+    );
+    plant(payload.clone()).await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with ambiguous move (present/present)",
+    );
+    assert_eq!(
+        journal_count().await,
+        1,
+        "present/present ambiguity keeps the journal row"
+    );
+
+    // Case 2: Missing/Missing — both directories gone.
+    std::fs::remove_dir_all(&dest).expect("drop dest");
+    std::fs::remove_dir_all(&wt).expect("drop src");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with ambiguous move (missing/missing)",
+    );
+    assert_eq!(
+        journal_count().await,
+        1,
+        "missing/missing ambiguity keeps the journal row"
+    );
+
+    // Cleanup so the repo is not left with a pending journal (settle the
+    // move as never-started: restore src and remove dest).
+    std::fs::create_dir_all(wt.join(".libra")).expect("restore src shell");
+    std::fs::write(
+        wt.join(".libra").join("worktree_id"),
+        format!("{worktree_id}\n"),
+    )
+    .expect("restore id");
+    std::fs::write(
+        wt.join(".libra").join("commondir"),
+        format!("{}\n", main.join(".libra").display()),
+    )
+    .expect("restore commondir");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair settles the never-started move",
+    );
+    assert_eq!(
+        journal_count().await,
+        0,
+        "journal resolved once unambiguous"
+    );
+}
+
+/// Move recovery is IDENTITY-bound (§C.7): a stale move journal for
+/// worktree X must never rename X's directory onto a path now occupied by
+/// a DIFFERENT registry entry (here: a tombstone Y at the old destination).
+/// The row is kept and nothing moves.
+#[tokio::test]
+async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let x = main.join("wt-move-x");
+    let y = main.join("wt-move-y");
+    for wt in [&x, &y] {
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+            "worktree add",
+        );
+    }
+    let x_canonical = x.canonicalize().expect("canonical x");
+    let y_canonical = y.canonicalize().expect("canonical y");
+    let x_id = std::fs::read_to_string(x.join(".libra").join("worktree_id"))
+        .expect("x id")
+        .trim()
+        .to_string();
+    let y_id = std::fs::read_to_string(y.join(".libra").join("worktree_id"))
+        .expect("y id")
+        .trim()
+        .to_string();
+
+    // Turn Y into a tombstone: mark the registry entry, mirror the row,
+    // delete the directory.
+    let registry = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    for entry in doc["entries"].as_array_mut().expect("entries") {
+        if entry["path"].as_str() == Some(y_canonical.to_string_lossy().as_ref()) {
+            entry["state"] = serde_json::json!("tombstone");
+        }
+    }
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("write registry");
+    std::fs::remove_dir_all(&y).expect("delete y dir");
+
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, \
+             updated_at) VALUES ('{y_id}', 'tombstone', '{}', 0, 0);",
+            y_canonical.to_string_lossy()
+        ),
+    ))
+    .await
+    .expect("mirror row");
+    // Stale move journal for X targeting Y's (now-tombstoned) path.
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES ('move', '{x_id}', '{{\"src\":\"{}\",\"dest\":\"{}\"}}', 0);",
+            x_canonical.to_string_lossy(),
+            y_canonical.to_string_lossy()
+        ),
+    ))
+    .await
+    .expect("plant move journal");
+    conn.close().await.expect("close");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a foreign-destination move journal",
+    );
+
+    // X untouched, journal kept, no rename onto Y's path.
+    assert!(x.is_dir(), "X's directory stays at its source");
+    assert!(!y.exists(), "nothing was renamed onto the tombstoned path");
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = row.try_get_by_index(0).expect("count");
+    assert_eq!(count, 1, "the ambiguous move journal row survives");
+}
+
+/// Stale re-attach journals must never unfreeze a LATER detach at the same
+/// path (linked ids are deterministic, so a delete/re-add/re-detach cycle
+/// reuses the id): repair rolls the stale intent back, the entry stays
+/// frozen, and the marker survives.
+#[tokio::test]
+async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-stale-reattach");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let canonical_wt = wt.canonicalize().expect("canonical wt");
+    let worktree_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+
+    // The worktree is CURRENTLY detached (a later detach the stale journal
+    // must not betray).
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "detach",
+    );
+
+    // Plant a stale re-attach journal (as if an earlier `worktree add`
+    // crashed after verification but its resolution was lost).
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let conn = Database::connect(&db_url).await.expect("connect");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        format!(
+            "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
+             VALUES ('add', '{worktree_id}', '{{\"path\":\"{}\",\"reattach\":true}}', 0);",
+            canonical_wt.to_string_lossy()
+        ),
+    ))
+    .await
+    .expect("plant stale reattach journal");
+    conn.close().await.expect("close");
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a stale reattach journal",
+    );
+
+    // Still frozen: marker present, registry still detached, and commands
+    // inside the directory still refuse.
+    assert!(
+        wt.join(".libra").join("detached_from_registry").exists(),
+        "the later detach stays frozen"
+    );
+    let status = run_libra_command(&["status"], &wt);
+    assert!(!status.status.success(), "directory remains fail-closed");
+    let registry = main.join(".libra").join("worktrees.json");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    let entry = doc["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["path"].as_str() == Some(canonical_wt.to_string_lossy().as_ref()))
+        .expect("entry present");
+    assert_eq!(
+        entry["state"].as_str(),
+        Some("detached_from_registry"),
+        "registry stays detached"
+    );
+
+    // The stale row itself resolved as rolled back.
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = row.try_get_by_index(0).expect("count");
+    assert_eq!(count, 0, "stale reattach intent resolved as rolled back");
+}
+
+/// W3-s2 (§C.7): `worktree add <path> <branch>` checks the branch out in
+/// the new worktree (attached HEAD), and the branch is then held — no
+/// other worktree can switch to it.
+#[test]
+fn worktree_add_with_branch_attaches() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-branch");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap(), "feature"], main),
+        "worktree add <path> <branch>",
+    );
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, "feature", "new worktree is ATTACHED to the branch");
+
+    // The branch is now held by the new worktree.
+    let refused = run_libra_command(&["switch", "feature"], main);
+    assert!(
+        !refused.status.success(),
+        "main cannot switch to a branch held by the new worktree"
+    );
+}
+
+/// Branch targets already checked out ANYWHERE refuse before side effects:
+/// no directory, no registry change (matrix:
+/// worktree_add_branch_collision_has_zero_side_effects covers `-b` too).
+#[test]
+fn worktree_add_branch_collision_has_zero_side_effects() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let main_branch = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], main).stdout,
+    )
+    .trim()
+    .to_string();
+    let registry = main.join(".libra").join("worktrees.json");
+    // Materialize the registry (a locked no-op mutator) so the byte
+    // comparison below has a baseline.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "initialize registry",
+    );
+    let registry_before = std::fs::read(&registry).expect("registry before");
+
+    // Checking out the branch the CURRENT worktree holds is refused.
+    let wt = main.join("wt-collision");
+    let refused = run_libra_command(
+        &["worktree", "add", wt.to_str().unwrap(), &main_branch],
+        main,
+    );
+    assert!(!refused.status.success(), "current-branch target refused");
+    assert!(!wt.exists(), "no directory is created on refusal");
+
+    // `-b` with an existing branch name is refused (no -B/--force).
+    let refused = run_libra_command(
+        &["worktree", "add", "-b", "feature", wt.to_str().unwrap()],
+        main,
+    );
+    assert!(!refused.status.success(), "-b collision refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("already exists"),
+        "collision explained: {stderr}"
+    );
+    assert!(!wt.exists(), "no directory is created on -b collision");
+    assert_eq!(
+        std::fs::read(&registry).expect("registry after"),
+        registry_before,
+        "registry byte-identical after refusals"
+    );
+
+    // A nonexistent target fails closed (no DWIM) with zero side effects.
+    let refused = run_libra_command(
+        &["worktree", "add", wt.to_str().unwrap(), "no-such-thing"],
+        main,
+    );
+    assert!(!refused.status.success(), "unknown target fails closed");
+    assert!(!wt.exists());
+
+    // -b together with --detach is a usage error.
+    let refused = run_libra_command(
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "-b",
+            "brand-new",
+            wt.to_str().unwrap(),
+        ],
+        main,
+    );
+    assert!(!refused.status.success(), "-b with --detach refused");
+}
+
+/// `worktree add <path> <commit>` and `--detach <path> <branch>` both seed
+/// a DETACHED worktree at the resolved commit; a detached branch target is
+/// NOT held (other worktrees can still check the branch out).
+#[test]
+fn worktree_add_commit_and_detach_are_detached() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+
+    // Grow one extra commit so HEAD and feature diverge in content.
+    std::fs::write(main.join("second.txt"), "2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], main),
+        "commit",
+    );
+    let feature_tip =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], main).stdout)
+            .trim()
+            .to_string();
+
+    // Explicit commit target: detached at THAT commit, populated from it.
+    let wt_commit = main.join("wt-at-commit");
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "add", wt_commit.to_str().unwrap(), &feature_tip],
+            main,
+        ),
+        "worktree add <path> <commit>",
+    );
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt_commit).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(head, feature_tip, "detached at the requested commit");
+    assert!(
+        !wt_commit.join("second.txt").exists(),
+        "populated from the target commit, not the source HEAD"
+    );
+
+    // --detach with a BRANCH target: same tip, branch not held.
+    let wt_detach = main.join("wt-detached-branch");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                wt_detach.to_str().unwrap(),
+                "feature",
+            ],
+            main,
+        ),
+        "worktree add --detach <path> <branch>",
+    );
+    let abbrev = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt_detach).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(abbrev, "HEAD", "--detach forces a detached HEAD");
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt_detach),
+        "the branch stays free for checkout (detached add does not hold it)",
+    );
+}
+
+/// `worktree add -b <new> <path> [<start>]` creates the branch at the
+/// start point and attaches the new worktree to it.
+#[test]
+fn worktree_add_new_branch_from_start_point() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let feature_tip =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], main).stdout)
+            .trim()
+            .to_string();
+
+    let wt = main.join("wt-new-branch");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "topic-x",
+                wt.to_str().unwrap(),
+                "feature",
+            ],
+            main,
+        ),
+        "worktree add -b <new> <path> <start>",
+    );
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, "topic-x", "attached to the created branch");
+    let tip = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "topic-x"], main).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(tip, feature_tip, "created at the requested start point");
+}
+
+/// `-b` full-rollback regression (§C.7): a populate failure (objects made
+/// unreadable) on a SIBLING target must roll back the created branch, the
+/// directory, and the registry — no branch-only or orphan residue, and the
+/// invoker's cwd-based storage resolution must survive the rollback.
+#[test]
+fn worktree_add_new_branch_rolls_back_on_populate_failure() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let sibling_parent = tempfile::tempdir().expect("sibling parent");
+    let wt = sibling_parent.path().join("wt-populate-fail");
+
+    // Make populate fail deterministically: drop every loose object so the
+    // restore step cannot read the seed commit's tree.
+    let objects = main.join(".libra").join("objects");
+    for entry in std::fs::read_dir(&objects).expect("objects dir") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() == 2 && entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path()).expect("drop loose fan-out dir");
+        }
+    }
+
+    let out = run_libra_command(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "doomed-topic",
+            wt.to_str().unwrap(),
+            "feature",
+        ],
+        main,
+    );
+    assert!(
+        !out.status.success(),
+        "populate must fail with unreadable objects: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Branch rolled back — no branch-only residue.
+    let rev = run_libra_command(&["rev-parse", "doomed-topic"], main);
+    assert!(
+        !rev.status.success(),
+        "created branch must be rolled back on populate failure"
+    );
+    // No directory, no registry entry.
+    assert!(!wt.exists(), "sibling target directory rolled back");
+    let registry = main.join(".libra").join("worktrees.json");
+    if let Ok(bytes) = std::fs::read(&registry) {
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("registry json");
+        assert!(
+            !doc["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| {
+                    entry["path"]
+                        .as_str()
+                        .is_some_and(|p| p.contains("wt-populate-fail"))
+                }),
+            "no orphan registry entry"
+        );
+    }
+}
+
+/// Concurrent `worktree add -b <same-name>` (§C.7): exactly ONE attempt may
+/// win — the loser refuses under the branch-attach lock instead of
+/// silently overwriting the branch row and double-attaching.
+#[test]
+fn concurrent_add_same_new_branch_single_winner() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt_a = main.join("wt-race-a");
+    let wt_b = main.join("wt-race-b");
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let spawn = |wt: &std::path::Path| {
+        std::process::Command::new(libra)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "raced-topic",
+                wt.to_str().unwrap(),
+                "feature",
+            ])
+            .current_dir(main)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn add")
+    };
+    let child_a = spawn(&wt_a);
+    let child_b = spawn(&wt_b);
+    let out_a = child_a.wait_with_output().expect("wait a");
+    let out_b = child_b.wait_with_output().expect("wait b");
+
+    let successes = [&out_a, &out_b]
+        .iter()
+        .filter(|out| out.status.success())
+        .count();
+    assert_eq!(
+        successes,
+        1,
+        "exactly one -b attempt may win\na: {}\nb: {}",
+        String::from_utf8_lossy(&out_a.stderr),
+        String::from_utf8_lossy(&out_b.stderr)
+    );
+
+    // The branch is attached in exactly one registered worktree.
+    let list = run_libra_command(&["worktree", "list", "--porcelain"], main);
+    assert_cli_success(&list, "list after race");
+    let porcelain = String::from_utf8_lossy(&list.stdout);
+    let attached = porcelain
+        .lines()
+        .filter(|line| line.trim() == "branch refs/heads/raced-topic")
+        .count();
+    assert_eq!(attached, 1, "branch attached exactly once:\n{porcelain}");
+}
+
+/// Crash window between `-b` branch creation and publication (§C.7): the
+/// add journal carries the branch identity, so repair rolls the branch
+/// back tip-conditionally — and REFUSES to delete it once the tip moved.
+#[tokio::test]
+async fn interrupted_add_new_branch_crash_repair() {
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let feature_tip =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "feature"], main).stdout)
+            .trim()
+            .to_string();
+    let wt = main.join("wt-crash-b");
+    let wt_id = "deadbeef-crash-b";
+
+    // Simulate: journal row written, branch created, nothing published.
+    assert_cli_success(
+        &run_libra_command(&["branch", "crash-topic", "feature"], main),
+        "create the orphan branch by hand",
+    );
+    let db_url = format!(
+        "sqlite://{}?mode=rwc",
+        main.join(".libra/libra.db").display()
+    );
+    let plant = |payload: String| {
+        let db_url = db_url.clone();
+        async move {
+            let conn = Database::connect(&db_url).await.expect("connect");
+            let backend = conn.get_database_backend();
+            conn.execute(Statement::from_string(
+                backend,
+                format!(
+                    "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
+                     created_at) VALUES ('add', '{wt_id}', '{payload}', 0);"
+                ),
+            ))
+            .await
+            .expect("plant journal");
+            conn.close().await.expect("close");
+        }
+    };
+    plant(format!(
+        "{{\"path\":\"{}\",\"create_branch\":{{\"name\":\"crash-topic\",\"start\":\"{feature_tip}\"}}}}",
+        wt.to_string_lossy()
+    ))
+    .await;
+
+    // Lock-failure leg first: with the branch-attach lock unacquirable
+    // (the lock path is a DIRECTORY), repair must fail closed — branch and
+    // journal both survive.
+    let lock_path = main.join(".libra").join("branch-attach.lock");
+    std::fs::create_dir_all(&lock_path).expect("block the lock path");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with an unacquirable attach lock",
+    );
+    let kept = run_libra_command(&["rev-parse", "crash-topic"], main);
+    assert!(
+        kept.status.success(),
+        "lock failure must not delete the branch"
+    );
+    {
+        let conn = Database::connect(&db_url).await.expect("connect");
+        let backend = conn.get_database_backend();
+        let row = conn
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        conn.close().await.expect("close");
+        assert_eq!(count, 1, "journal kept while the lock is unacquirable");
+    }
+    std::fs::remove_dir_all(&lock_path).expect("unblock the lock path");
+
+    // Probe-failure leg: an injected attachment-lookup fault must also fail
+    // closed — branch and journal both survive.
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let faulted = std::process::Command::new(libra)
+        .args(["worktree", "repair"])
+        .env("LIBRA_TEST_FAULT", "branch-attach-probe")
+        .current_dir(main)
+        .output()
+        .expect("faulted repair");
+    assert!(faulted.status.success(), "faulted repair still succeeds");
+    let kept = run_libra_command(&["rev-parse", "crash-topic"], main);
+    assert!(
+        kept.status.success(),
+        "an attachment-probe failure must not delete the branch"
+    );
+    {
+        let conn = Database::connect(&db_url).await.expect("connect");
+        let backend = conn.get_database_backend();
+        let row = conn
+            .query_one(Statement::from_string(
+                backend,
+                "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        let count: i64 = row.try_get_by_index(0).expect("count");
+        conn.close().await.expect("close");
+        assert_eq!(count, 1, "journal kept while the probe faults");
+    }
+
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair rolls the orphan branch back",
+    );
+    let gone = run_libra_command(&["rev-parse", "crash-topic"], main);
+    assert!(!gone.status.success(), "orphan -b branch rolled back");
+
+    // Tip-moved variant: the branch points at a NEWER commit than the
+    // journaled start tip (as if someone committed on it post-crash).
+    std::fs::write(main.join("bump.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "bump.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "bump", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "crash-topic-2", "HEAD"], main),
+        "create second branch at the moved tip",
+    );
+    plant(format!(
+        "{{\"path\":\"{}\",\"create_branch\":{{\"name\":\"crash-topic-2\",\"start\":\"{feature_tip}\"}}}}",
+        wt.to_string_lossy()
+    ))
+    .await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair"], main),
+        "repair with a moved tip",
+    );
+    let kept = run_libra_command(&["rev-parse", "crash-topic-2"], main);
+    assert!(
+        kept.status.success(),
+        "a moved tip is never deleted by recovery"
+    );
+    let conn = Database::connect(&db_url).await.expect("reconnect");
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let count: i64 = row.try_get_by_index(0).expect("count");
+    assert_eq!(
+        count, 1,
+        "the tip-moved journal row is kept for manual review"
+    );
+}
+
+/// Fail-closed attachment probes (§C.7): an injected HEAD-query failure
+/// refuses canonical `worktree add <branch>` (no side effects) and
+/// `switch <branch>` — a transient DB error must never read as "the
+/// branch is free".
+#[test]
+fn injected_probe_fault_refuses_attach_and_switch() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let libra = env!("CARGO_BIN_EXE_libra");
+
+    let wt = main.join("wt-probe-fault");
+    let add = std::process::Command::new(libra)
+        .args(["worktree", "add", wt.to_str().unwrap(), "feature"])
+        .env("LIBRA_TEST_FAULT", "branch-attach-probe")
+        .current_dir(main)
+        .output()
+        .expect("faulted add");
+    assert!(!add.status.success(), "faulted add must refuse");
+    assert!(!wt.exists(), "faulted add leaves no directory");
+
+    // A detached worktree trying to switch onto the branch under the fault.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "detached worktree add",
+    );
+    let switch = std::process::Command::new(libra)
+        .args(["switch", "feature"])
+        .env("LIBRA_TEST_FAULT", "branch-attach-probe")
+        .current_dir(&wt)
+        .output()
+        .expect("faulted switch");
+    assert!(!switch.status.success(), "faulted switch must refuse");
+    let head = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        head, "HEAD",
+        "worktree stays detached after the refused switch"
+    );
 }
