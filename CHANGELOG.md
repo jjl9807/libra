@@ -4,6 +4,38 @@
 
 ### Changed
 
+- **Legacy-layout detection and `repair --migrate-layout` (v0.19.60,
+  plan-20260714 Part C §C.6, W3 slice 3)**: `worktree list` now reports a
+  per-entry `layout` (`main`/`linked-v2`/`legacy-symlink`/`missing`/
+  `corrupt`, JSON field + porcelain `layout` line). In a legacy
+  shared-`.libra` symlink worktree, read-only commands keep working but
+  the worktree-state mutation surface refuses with `LBR-REPO-003` and a
+  migrate hint (mutating there would move MAIN's HEAD/index).
+  `worktree repair --migrate-layout [--dry-run] [<path>]` migrates legacy
+  worktrees from the main worktree via a journaled, identity-checked
+  state machine (migration 2026072403): prepared journal-stamped gitdir,
+  atomic renames with the legacy link kept as a backup until
+  verification, detached HEAD at the shared snapshot, private index
+  rebuilt from that commit — working files untouched, shared staged
+  state never copied; unmerged shared index or an active main sequencer
+  refuses before any rename, and `worktree repair` recovers every crash
+  window by identity, keeping materials on any mismatch.
+
+- **Register the Claude Code `PreToolUse` hook (v0.19.60,
+  plan-20260713 DR-00)**: `libra agent enable --agent claude` now
+  installs a forward for `PreToolUse` in addition to `PostToolUse`, both
+  routed to `libra hooks claude tool-use`. This aligns the installer with
+  the config already documented in `docs/commands/hooks.md`; the parser
+  already mapped both events to `LifecycleEventKind::ToolUse`, so the
+  change is installer-only. A `ToolUse` event refreshes `agent_session`
+  liveness on the capture/traces path and writes **no** checkpoint
+  (checkpoints materialize only at `Stop`/`SessionEnd`), and it does not
+  touch the AiIntent `tool_use_count` stream (installed Claude hooks use
+  the AgentTraces path). No `Subagent*` boundary event is registered, so
+  Claude's on-disk sub-agent content stays `unresolved` (DR-06). Existing
+  five-event installs gain the PreToolUse forward on the next
+  `enable`/upsert; user-owned hooks are preserved.
+
 - **Canonical `worktree add` targets: branch, commit, `--detach`, `-b`
   (v0.19.59, plan-20260714 Part C §C.7, W3 slice 2)**: `worktree add
   <path> [<branch-or-commit>]` checks an existing branch out ATTACHED
