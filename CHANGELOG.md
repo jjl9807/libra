@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Agent workspace association + lease store (v0.19.61,
+  plan-20260714 Part C §C.8, W4 slice 1)**: a new `workspace_record`
+  table (migration `2026072501`) and internal `WorkspaceStore` service
+  give linked worktrees, task copy/FUSE worktrees, and future remote
+  workspaces one queryable association layer — and one place that
+  coordinates their *writers*. A linked workspace's lease identity is
+  `(repo_id, worktree_id)` and the canonical path is unique across every
+  live workspace, both enforced by partial unique indexes: `acquire`
+  writes first and maps the resulting conflict onto `LBR-AGENT-022`
+  ("lease held"), so two agents racing for one worktree — or one
+  directory reached through a `.`/`..`, trailing-separator, or symlink
+  alias — can never both publish a record. `repo_id` is never taken from
+  the caller: it comes from the repository's own `libra.repoid` through a
+  `RepoIdentity` token (a padded or empty value is refused as corrupt
+  metadata rather than normalized, so the SQL guard and the Rust reader
+  can never disagree), it is resolved before the transaction opens so
+  every mutating transaction stays write-first (a read-then-write
+  transaction hands the loser a transient "database is locked" instead
+  of the stable refusal), and a rewritten identity fails closed while
+  workspaces of the previous identity are still live or awaiting
+  recovery instead of silently reopening the uniqueness namespace.
+  Rows stranded by a rewrite stay reachable: a bounded, keyset-paginated
+  recovery listing is the only read that can see them, and adopting one
+  re-homes it onto the current identity with its state, owner and fence
+  intact. Workspace paths must be absolute, are resolved entirely by the
+  kernel (so `link/../ws` cannot alias its way past the index), and
+  require a resolvable parent, so a directory that does not exist yet
+  cannot be claimed twice through a dangling symlink; publishing a
+  workspace as `active` additionally requires the directory to exist,
+  since `provisioning` is what covers materialization. The worktree
+  registry now shares that kernel-first path resolution, so
+  `worktree add a/link/../wt` lands where the kernel says it does
+  instead of at a lexically collapsed path. Renew/activate/release are
+  owner + monotonic-fence conditional writes: after a doctor reclaim
+  mints a higher fence, the previous owner's calls refuse with
+  `LBR-AGENT-023` instead of releasing (or clobbering) the new owner's
+  lease. An expired lease is never stolen implicitly — only the
+  doctor/scavenger reclaim path takes it over, and only once the
+  deadline has passed — while a human using a linked worktree takes no
+  lease at all and is never locked out. Failed provisioning or cleanup
+  marks the record `orphaned` (identity freed, row kept for diagnosis
+  and bounded scavenging) and a released record frees its identity for a
+  fresh acquire with a new workspace id. The table stores association
+  IDs only — no prompts, transcripts, or tool payloads — and listings are
+  keyset-paginated (default 50, cap 500). The rollback of `2026072501`
+  refuses while any non-terminal workspace exists, which is also how live
+  leases block the deeper `2026072402` rollback. No user-facing command
+  surface yet: the runtime/CLI wiring lands in the following W4 slices.
+
 ### Changed
 
 - **Legacy-layout detection and `repair --migrate-layout` (v0.19.60,

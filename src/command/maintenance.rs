@@ -1971,6 +1971,12 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[(&str, &str, GcSourceStatus, &str)] = &[
         "AI session base commit",
     ),
     (
+        "workspace_record",
+        "base_commit",
+        GcSourceStatus::TracedRoot,
+        "workspace sync-back baseline (W4 §C.8)",
+    ),
+    (
         "operation_view",
         "head_target",
         GcSourceStatus::TracedRoot,
@@ -2116,6 +2122,13 @@ async fn collect_registered_store_roots(
             "agent_session",
             "SELECT parent_commit FROM agent_session",
             &["parent_commit"],
+            CellMode::StrictOid,
+        ),
+        (
+            "workspace_record",
+            "SELECT base_commit FROM workspace_record WHERE base_commit IS NOT NULL \
+             AND state IN ('provisioning', 'active', 'releasing', 'orphaned')",
+            &["base_commit"],
             CellMode::StrictOid,
         ),
     ];

@@ -2533,7 +2533,11 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
             .rollback_to(&conn, 2026072304)
             .await
             .expect("roll back capability marker");
-        assert_eq!(rolled, vec![2026072403, 2026072402, 2026072401]);
+        // Newest first. `2026072501` (the W4 workspace record) rolls back
+        // cleanly here because a fresh repository holds no workspace lease —
+        // its own down guard refuses once one exists, which is also what keeps
+        // a live lease from being rolled through the deeper guards.
+        assert_eq!(rolled, vec![2026072501, 2026072403, 2026072402, 2026072401]);
         conn.close().await.expect("close");
     }
 

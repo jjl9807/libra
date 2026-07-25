@@ -11,8 +11,8 @@
 -- repair` retries tombstone cleanup and resolves stale intents; re-add or
 -- `worktree remove --delete-dir` settles detached directories; finish or
 -- abort in-progress rebase/cherry-pick/bisect runs in their worktrees —
--- then retry. (Workspace leases are a W4 surface and will join this guard
--- with that slice.)
+-- then retry. (Workspace leases are guarded by 2026072501's own down,
+-- which every rollback below this version passes through first.)
 --
 -- `bisect_state` is created lazily at first use, and bare test databases
 -- may lack the sequencer tables entirely — create empty shells so the

@@ -7,7 +7,7 @@
 use std::{
     collections::HashSet,
     env, fs, io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use clap::{Parser, Subcommand};
@@ -1065,62 +1065,12 @@ fn resolve_path(path: impl AsRef<Path>, role: &'static str) -> WorktreeResult<Pa
 /// For non-existing paths, this resolves the deepest existing ancestor and
 /// appends the remaining lexical components. This keeps persisted worktree
 /// paths stable even when intermediate parents do not exist yet.
-fn normalize_abs_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(Path::new(comp.as_os_str())),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
-                }
-            }
-            Component::Normal(part) => out.push(part),
-        }
-    }
-    out
-}
-
+///
+/// Delegates to [`util::canonicalize_deepest_existing`] — the registry and the
+/// workspace/lease store (§C.8) MUST agree on what "the same directory" means,
+/// so there is exactly one implementation.
 fn canonicalize<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
-    let p = path.as_ref();
-    let joined = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        util::cur_dir().join(p)
-    };
-    let normalized = normalize_abs_path(&joined);
-
-    let mut current = normalized.as_path();
-    let mut remainder = PathBuf::new();
-    loop {
-        if current.exists() {
-            let mut canonical = fs::canonicalize(current)?;
-            if !remainder.as_os_str().is_empty() {
-                canonical.push(&remainder);
-            }
-            return Ok(canonical);
-        }
-
-        let Some(parent) = current.parent() else {
-            break;
-        };
-
-        if let Some(name) = current.file_name() {
-            remainder = if remainder.as_os_str().is_empty() {
-                PathBuf::from(name)
-            } else {
-                PathBuf::from(name).join(remainder)
-            };
-            current = parent;
-            continue;
-        }
-
-        break;
-    }
-
-    Ok(normalized)
+    util::canonicalize_deepest_existing(path)
 }
 
 /// Ensure the registry designates EXACTLY ONE main entry. In the standard

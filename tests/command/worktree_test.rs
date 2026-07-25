@@ -721,6 +721,54 @@ async fn test_worktree_add_normalizes_missing_parent_with_dotdot() {
         .expect("worktree remove should succeed");
 }
 
+/// `..` after a SYMLINK must be resolved the way the kernel resolves it:
+/// with `a/link -> b/sub`, `worktree add a/link/../wt` belongs at `b/wt`.
+/// A lexical `..` pass would pop `link` and silently create the worktree at
+/// `a/wt` — a directory the user never named (plan-20260714 §C.7/§C.8: the
+/// registry and the workspace store must agree on what "the same directory"
+/// is, and both key on this resolution).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_worktree_add_resolves_dotdot_through_symlinked_parent() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+
+    fs::create_dir_all(repo_dir.path().join("a")).unwrap();
+    fs::create_dir_all(repo_dir.path().join("b/sub")).unwrap();
+    std::os::unix::fs::symlink(
+        repo_dir.path().join("b/sub"),
+        repo_dir.path().join("a/link"),
+    )
+    .unwrap();
+
+    exec_worktree(&["add", "a/link/../wt_symlink"])
+        .await
+        .expect("worktree add should succeed");
+
+    let expected = repo_dir
+        .path()
+        .join("b/wt_symlink")
+        .canonicalize()
+        .expect("the worktree must be created where the kernel resolves the path");
+    let state = read_worktree_state();
+    let entry = state
+        .entries
+        .iter()
+        .find(|w| w.path.ends_with("wt_symlink"))
+        .expect("state should contain the added worktree");
+    assert_eq!(
+        entry.path,
+        expected.to_string_lossy().as_ref(),
+        "the registry must record the kernel-resolved path, not a lexical one"
+    );
+    assert!(
+        !repo_dir.path().join("a/wt_symlink").exists(),
+        "a lexically collapsed path must never be created"
+    );
+}
+
 #[tokio::test]
 #[serial]
 /// Adding with `../` must still allow later `lock/unlock/remove .` from inside that worktree.

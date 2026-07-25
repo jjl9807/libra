@@ -131,6 +131,8 @@ structured report is always present.
 | `128` | `LBR-AGENT-019` | `internal` | Local anti-resurrection tombstone blocked historical import | re-importing a provider session after local session erasure without an explicit audited restore |
 | `128` | `LBR-AGENT-020` | `internal` | Transcript source lacks a valid provider-root or trusted-export authorization proof | attempting to import through a symlink or an untrusted exporter |
 | `128` | `LBR-AGENT-021` | `internal` | Requested captured-agent session is absent from both the session catalog and local erasure tombstones | `libra agent graph unknown-session` |
+| `128` | `LBR-AGENT-022` | `internal` | Agent workspace lease refused: another live workspace record already claims the linked worktree identity or the canonical directory | two agents requesting a writable lease on the same linked worktree, or on an alias of an already-leased path |
+| `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after `libra worktree doctor` reclaimed the expired lease |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 ## Stable Codes By Category
@@ -219,6 +221,8 @@ structured report is always present.
 | `LBR-AGENT-019` | Local anti-resurrection tombstone blocked historical import until an explicit audited restore |
 | `LBR-AGENT-020` | Transcript source lacks a valid provider-root or trusted-export authorization proof |
 | `LBR-AGENT-021` | Requested captured-agent session does not exist in this repository |
+| `LBR-AGENT-022` | Another live workspace record already leases this linked worktree or directory |
+| `LBR-AGENT-023` | The presented workspace lease owner/fence is stale; the lease was reclaimed or already released |
 
 ### Unsupported
 

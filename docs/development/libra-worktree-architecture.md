@@ -284,6 +284,57 @@ worktree。
 `worktree remove` 行为更保守，也对那些关联检出中可能存在
 未提交工作的 AI 辅助工作流更友好。
 
+## Workspace 关联与 lease（plan-20260714 §C.8，W4）
+
+仓库关联 worktree 与 Agent 任务 worktree 之前没有统一的
+事实源：谁在写哪个工作区、某个目录是否已经有 owner，
+只能靠各自的运行时自己记账。W4-s1（v0.19.61）引入
+`workspace_record` 表（迁移 `2026072501`）与
+[`src/internal/workspace.rs`](../../src/internal/workspace.rs)
+的 `WorkspaceStore`，把 linked worktree、task copy/FUSE
+worktree 与未来的 remote workspace 收敛到一层可查询的
+关联记录，并在同一处协调它们的**写者**：
+
+- **仲裁者是数据库，不是应用层。** linked workspace 的
+  lease 身份是 `(repo_id, worktree_id)`，canonical 路径在
+  全部 live workspace（`provisioning`/`active`/`releasing`）
+  内唯一，两者都由 partial unique index 保证；`acquire`
+  是一条写语句，唯一冲突映射为稳定错误
+  `LBR-AGENT-022`。先查后写的选举存在竞态窗口，会让两个
+  acquire 同时为一个目录发布记录，因此不采用。
+- **每次 lease 变更都是 owner + 单调 fence 条件写。**
+  doctor 以更高 fence 回收后，旧 owner 的 renew/activate/
+  release/abandon 一律匹配零行并返回 `LBR-AGENT-023`，
+  不可能释放或覆盖新 owner 的 lease。
+- **过期不等于可抢占。** 只有 doctor/scavenger 的回收路径
+  能在超时后接管；收养 orphan 以 `releasing` 进入（表示
+  “我来拆除”），live 记录在接管后保持原有生命周期状态。
+- **人类不受影响。** 人类使用 linked worktree 不申请 lease，
+  也就不会被该表锁死；记录只在 Agent/automation 申请时产生。
+- **只存关联 ID。** 表中没有 prompt、transcript 或工具负载；
+  列表接口按 keyset 分页（默认 50、上限 500）。
+
+`repo_id` 只来自仓库自身的 `libra.repoid`（`RepoIdentity`
+token，带首尾空白或空值按 corrupt 元数据拒绝而非规范化），
+并在事务开启前解析——写事务必须 write-first，否则两个并发
+acquire 会在 SQLite 锁升级上互相拒绝（SQLITE_BUSY）而拿不到
+稳定的 lease-held 结果。identity 被改写且旧 identity 仍有
+未结算记录时，新注册 fail-closed，避免唯一索引的 `repo_id`
+前缀重开命名空间、让旧记录不可见也不可回收。
+
+工作区路径必须是绝对路径、完全交由内核解析（`link/../ws`
+这类符号链接穿越不会被词法折叠到别的目录），且父目录必须
+可解析（悬空符号链接拒绝）。需要注意其边界：存储的是注册
+时刻的 canonical **字符串**身份，因此 bind mount、同一设备的
+第二个挂载点、大小写不敏感卷的不同拼写，或注册后被重新指向
+的叶子目录，仍可能产生两条记录——这与 worktree registry 的
+口径一致，也符合 §C.8「lease 只协调 Agent/runtime owner，
+不取代 filesystem lock」的定位。
+
+本切片只交付 schema 与服务；TaskWorktree/AgentRuntime 生命
+周期接线、Code control sidecar 隔离、配置统一 resolver 与
+`libra agent workspace list/show` 机器接口在后续 W4 切片。
+
 ## 当前取舍
 
 Libra 的设计针对 Agent 执行做了优化，因此它有意
