@@ -3556,6 +3556,7 @@ fn default_tui_runtime_context(
             network_access: NetworkAccess::from_legacy_bool(network_access),
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         },
     };
 

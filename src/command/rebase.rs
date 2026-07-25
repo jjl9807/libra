@@ -2061,11 +2061,15 @@ async fn run_sandboxed_rebase_exec(
 
     let cwd = util::working_dir();
     let sandbox = ToolSandboxContext {
+        // The exec command is explicit user CLI input (not repo content) and
+        // may legitimately run nested VCS operations (`libra add`/`commit`),
+        // so `.libra` metadata must stay writable; network remains denied.
         policy: SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![cwd.clone()],
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: true,
         },
         permissions: SandboxPermissions::UseDefault,
     };
