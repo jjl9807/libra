@@ -306,6 +306,16 @@ pub enum StableErrorCode {
     /// `libra agent graph` was given a session id absent from both the live
     /// capture catalog and the local erasure tombstone catalog.
     AgentGraphSessionUnknown,
+    /// An Agent workspace lease could not be acquired: another live workspace
+    /// record already claims the linked worktree identity or the canonical
+    /// directory (plan-20260714 §C.8 W4). A lease conflict is an Agent-runtime
+    /// coordination refusal — deliberately NOT a branch-conflict code, so
+    /// agents can tell the two apart (§C.13).
+    AgentWorkspaceLeaseHeld,
+    /// A workspace lease mutation presented an owner/fence that no longer
+    /// matches the stored lease — a doctor/scavenger reclaim took it over with
+    /// a higher fence, or the record already settled (plan-20260714 §C.8 W4).
+    AgentWorkspaceLeaseLost,
     /// The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`)
     /// is unreadable, corrupt, or written by an unsupported schema version
     /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
@@ -376,6 +386,8 @@ impl StableErrorCode {
             Self::AgentImportErased => "LBR-AGENT-019",
             Self::AgentTranscriptAuthorizationMissing => "LBR-AGENT-020",
             Self::AgentGraphSessionUnknown => "LBR-AGENT-021",
+            Self::AgentWorkspaceLeaseHeld => "LBR-AGENT-022",
+            Self::AgentWorkspaceLeaseLost => "LBR-AGENT-023",
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
         }
     }
@@ -436,7 +448,9 @@ impl StableErrorCode {
             | Self::AgentImportPartialBatch
             | Self::AgentImportErased
             | Self::AgentTranscriptAuthorizationMissing
-            | Self::AgentGraphSessionUnknown => CliErrorCategory::Internal,
+            | Self::AgentGraphSessionUnknown
+            | Self::AgentWorkspaceLeaseHeld
+            | Self::AgentWorkspaceLeaseLost => CliErrorCategory::Internal,
         }
     }
 
@@ -604,6 +618,12 @@ impl StableErrorCode {
             }
             Self::AgentGraphSessionUnknown => {
                 "The requested captured-agent session does not exist in this repository."
+            }
+            Self::AgentWorkspaceLeaseHeld => {
+                "Another live workspace record already leases this linked worktree or directory."
+            }
+            Self::AgentWorkspaceLeaseLost => {
+                "The presented workspace lease owner/fence is stale; the lease was reclaimed or already released."
             }
             Self::UpgradeSettingsInvalid => {
                 "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
@@ -2055,6 +2075,8 @@ mod tests {
                 "LBR-AGENT-020",
             ),
             (StableErrorCode::AgentGraphSessionUnknown, "LBR-AGENT-021"),
+            (StableErrorCode::AgentWorkspaceLeaseHeld, "LBR-AGENT-022"),
+            (StableErrorCode::AgentWorkspaceLeaseLost, "LBR-AGENT-023"),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -2199,6 +2221,8 @@ mod tests {
             StableErrorCode::AgentImportErased,
             StableErrorCode::AgentTranscriptAuthorizationMissing,
             StableErrorCode::AgentGraphSessionUnknown,
+            StableErrorCode::AgentWorkspaceLeaseHeld,
+            StableErrorCode::AgentWorkspaceLeaseLost,
         ] {
             assert_eq!(variant.category(), CliErrorCategory::Internal);
         }

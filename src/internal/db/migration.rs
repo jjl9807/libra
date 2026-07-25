@@ -1078,6 +1078,24 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072402_worktree_lifecycle_journal.sql"),
             include_str!("../../../sql/migrations/2026072402_worktree_lifecycle_journal_down.sql"),
         ),
+        // plan-20260714 Part C W3-s3 (§C.6): admit the 'migrate' op (plus a
+        // stage column for its state machine) into the intent journal via a
+        // RENAME rebuild. Down refuses while any migrate intent exists.
+        sql_migration(
+            2026072403,
+            "worktree_migrate_intent",
+            include_str!("../../../sql/migrations/2026072403_worktree_migrate_intent.sql"),
+            include_str!("../../../sql/migrations/2026072403_worktree_migrate_intent_down.sql"),
+        ),
+        // plan-20260714 Part C W4-s1 (§C.8): the unified workspace
+        // association + lease record. Down refuses while any non-terminal
+        // workspace (live lease / orphan awaiting the scavenger) exists.
+        sql_migration(
+            2026072501,
+            "workspace_record",
+            include_str!("../../../sql/migrations/2026072501_workspace_record.sql"),
+            include_str!("../../../sql/migrations/2026072501_workspace_record_down.sql"),
+        ),
     ]
 }
 
@@ -1323,9 +1341,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 40);
+        assert_eq!(runner.len(), 42);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072402));
+        assert_eq!(runner.max_registered_version(), Some(2026072501));
     }
 
     #[test]

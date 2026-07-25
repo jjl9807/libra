@@ -278,6 +278,8 @@ pub async fn run_repo_hook_with_io(
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            // Hooks are repo-content-controlled code: metadata stays read-only.
+            allow_metadata_writes: false,
         },
         permissions: SandboxPermissions::UseDefault,
     };

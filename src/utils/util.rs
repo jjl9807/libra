@@ -307,6 +307,20 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     // inside it fails closed (its scoped state is preserved but frozen)
     // until it is re-added or deleted. Checked only for LINKED worktrees
     // (marker next to an existing commondir).
+    // W3-s3 (§C.6.2): a mid-migration worktree (journal-stamped
+    // `migrate-marker` still present) is FROZEN for every other process —
+    // work created there could be overwritten by the recovery re-seed. The
+    // migrating/repairing process itself holds a process-local bypass.
+    if gitdir.join("migrate-marker").exists() && !migration_gate_bypassed() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "this worktree has an unfinished layout migration; run `libra worktree \
+                 repair` from the main worktree ('{}')",
+                gitdir.display()
+            ),
+        ));
+    }
     if gitdir.join("detached_from_registry").exists() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -505,6 +519,45 @@ pub fn storage_path() -> PathBuf {
 /// Deterministic fault injection for cold recovery/guard paths (R0-8
 /// style): active only when `LIBRA_TEST_FAULT` names the site. Never set in
 /// production.
+/// W3-s3 (§C.6.1): true when the CURRENT worktree uses the pre-isolation
+/// LEGACY layout — its `.libra` is a symlink straight at the common storage,
+/// so HEAD/index are shared with main. Read-only commands may proceed (no
+/// regression), but worktree-state mutations must refuse and direct at
+/// `repair --migrate-layout` (committing here would silently move MAIN's
+/// HEAD).
+pub fn is_legacy_symlink_worktree() -> bool {
+    let Ok((_, workdir, _gitdir)) = try_get_paths_full(None) else {
+        return false;
+    };
+    fs::symlink_metadata(workdir.join(ROOT_DIR))
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+static MIGRATION_GATE_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII bypass for the mid-migration freeze: held ONLY by the migration
+/// engine / repair recovery in this process (single migration at a time
+/// under the registry lock), so its own seeding/verification can resolve
+/// storage while every other process stays frozen out.
+pub struct MigrationGateBypass;
+
+impl Drop for MigrationGateBypass {
+    fn drop(&mut self) {
+        MIGRATION_GATE_BYPASS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn bypass_migration_gate() -> MigrationGateBypass {
+    MIGRATION_GATE_BYPASS.store(true, std::sync::atomic::Ordering::SeqCst);
+    MigrationGateBypass
+}
+
+fn migration_gate_bypassed() -> bool {
+    MIGRATION_GATE_BYPASS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn fault_injected(site: &str) -> bool {
     std::env::var("LIBRA_TEST_FAULT").is_ok_and(|value| value == site)
 }
@@ -690,6 +743,91 @@ pub fn try_workdir_to_absolute(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     Ok(try_working_dir()?.join(path.as_ref()))
 }
 
+/// Collapse `.` / `..` components lexically, without touching the filesystem.
+///
+/// `..` never escapes above the filesystem root or a Windows prefix, so the
+/// result stays inside the same volume. Symlinks are NOT resolved — pair this
+/// with [`canonicalize_deepest_existing`] when two spellings of the same
+/// directory must compare equal.
+pub fn normalize_abs_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new(comp.as_os_str())),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Never allow `..` to escape above filesystem root/prefix.
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// Canonical, absolute spelling of `path` for the worktree registry
+/// (plan-20260714 Part C §C.7). Path aliases (`a/../b`, a symlinked parent, a
+/// trailing slash) must collapse onto one string, or the registry would treat
+/// one directory as two entries.
+///
+/// Relative inputs resolve against the process cwd. An EXISTING path goes
+/// through [`fs::canonicalize`], so symlinks and `..` are applied in the
+/// kernel's order; only for a path that does not exist yet does it fall back to
+/// canonicalizing the deepest existing ancestor and appending the remaining
+/// lexical components, keeping a persisted path stable across the directory's
+/// creation.
+///
+/// The workspace/lease store (§C.8) needs the same answer but cannot accept the
+/// lexical fallback — a not-yet-created leaf behind a dangling symlink has no
+/// provable identity — so it uses its own stricter resolver. The two agree
+/// exactly for every path that exists, which is what keeps a registered
+/// worktree and its workspace record pointing at one directory.
+pub fn canonicalize_deepest_existing(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let path = path.as_ref();
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cur_dir().join(path)
+    };
+    // Ask the KERNEL first, and keep asking it about shorter and shorter
+    // prefixes of the ORIGINAL path — never a lexically collapsed copy.
+    // Collapsing `..` before resolution is wrong wherever a symlink precedes
+    // it: with `/r/a/link -> /r/b/sub`, `/r/a/link/../new` really lives at
+    // `/r/b/new`, but popping `link` lexically yields `/r/a/new` — a different
+    // directory that a `worktree add` would then create.
+    let mut current = joined.as_path();
+    let mut remainder = PathBuf::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(current) {
+            let mut resolved = canonical;
+            if !remainder.as_os_str().is_empty() {
+                resolved.push(&remainder);
+            }
+            return Ok(resolved);
+        }
+
+        // `file_name()` is None for a component that is `..` or a bare root:
+        // there is nothing to peel off, so no true resolution exists.
+        let (Some(parent), Some(name)) = (current.parent(), current.file_name()) else {
+            break;
+        };
+        remainder = if remainder.as_os_str().is_empty() {
+            PathBuf::from(name)
+        } else {
+            PathBuf::from(name).join(remainder)
+        };
+        current = parent;
+    }
+
+    // Nothing along the path resolves (a fully missing tree, or a `..` at the
+    // boundary). Fall back to the lexical reading — the best available answer
+    // when the filesystem has no opinion.
+    Ok(normalize_abs_path(&joined))
+}
+
 /// Judge if the path is a sub path of the parent path
 /// - Not check existence
 /// - `true` if path == parent
@@ -698,27 +836,6 @@ where
     P: AsRef<Path>,
     B: AsRef<Path>,
 {
-    fn normalize_abs_path(path: &Path) -> PathBuf {
-        use std::path::Component;
-
-        let mut out = PathBuf::new();
-        for comp in path.components() {
-            match comp {
-                Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-                Component::RootDir => out.push(Path::new(comp.as_os_str())),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    // Never allow `..` to escape above filesystem root/prefix.
-                    if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                        out.pop();
-                    }
-                }
-                Component::Normal(part) => out.push(part),
-            }
-        }
-        out
-    }
-
     // Avoid panics and avoid depending on a valid current directory when inputs are absolute.
     let path_abs = if path.as_ref().is_absolute() {
         normalize_abs_path(path.as_ref())
@@ -2238,6 +2355,38 @@ mod test {
         internal::{db::get_db_conn_instance, head::Head, model::reference, tag as internal_tag},
         utils::test,
     };
+
+    /// `..` after a symlink must be resolved by the kernel, for an existing
+    /// path AND for a leaf that does not exist yet: with `a/link -> b/sub`,
+    /// `a/link/../new` is `b/new`, not `a/new`. Getting this wrong makes
+    /// `worktree add` create a directory somewhere the user never named.
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_resolves_parent_traversal_through_symlinks() {
+        let dir = tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("a")).expect("mkdir a");
+        std::fs::create_dir_all(root.join("b").join("sub")).expect("mkdir b/sub");
+        std::fs::create_dir(root.join("b").join("existing")).expect("mkdir b/existing");
+        std::os::unix::fs::symlink(root.join("b").join("sub"), root.join("a").join("link"))
+            .expect("symlink");
+
+        // Existing target.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../existing")).expect("canonical"),
+            root.join("b").join("existing")
+        );
+        // Leaf that does not exist yet — the parent still resolves.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../new")).expect("canonical"),
+            root.join("b").join("new")
+        );
+        // Two levels of missing leaf below the resolvable parent.
+        assert_eq!(
+            canonicalize_deepest_existing(root.join("a/link/../new/deeper")).expect("canonical"),
+            root.join("b").join("new").join("deeper")
+        );
+    }
 
     #[test]
     fn is_valid_refname_matches_git_check_ref_format() {

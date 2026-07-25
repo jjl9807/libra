@@ -3192,6 +3192,7 @@ mod tests {
             network_access: NetworkAccess::Full,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
 
         let denied = parse_network_access("[sandbox.network]\nmode = \"denied\"")
@@ -3210,6 +3211,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let allowlist = parse_network_access(
             "[sandbox.network]\n\
@@ -3239,6 +3241,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let requirement = shell_exec_approval_requirement(
             AskForApproval::OnRequest,
@@ -3260,6 +3263,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let requirement = shell_exec_approval_requirement(
             AskForApproval::OnRequest,
@@ -3300,6 +3304,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let requirement = shell_exec_approval_requirement(
             AskForApproval::UnlessTrusted,
@@ -3323,6 +3328,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let requirement = shell_exec_approval_requirement(
             AskForApproval::Never,
@@ -3509,6 +3515,7 @@ mod tests {
                 network_access: NetworkAccess::Denied,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
+                allow_metadata_writes: false,
             },
             permissions: SandboxPermissions::default(),
         };
@@ -3578,6 +3585,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
         let sandbox_context = ToolSandboxContext {
             policy,
@@ -3772,6 +3780,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
+            allow_metadata_writes: false,
         };
 
         let (sandbox_label, network_access, writable_roots) = approval_request_context(
@@ -3821,6 +3830,7 @@ mod tests {
             network_access: NetworkAccess::Denied,
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
+            allow_metadata_writes: false,
         };
 
         let upgrade = requested_network_access_upgrade(
@@ -3929,6 +3939,7 @@ mod tests {
                             network_access: NetworkAccess::Denied,
                             exclude_tmpdir_env_var: false,
                             exclude_slash_tmp: false,
+                            allow_metadata_writes: false,
                         },
                         permissions: SandboxPermissions::UseDefault,
                     }),
@@ -4107,6 +4118,7 @@ mod tests {
                     network_access: NetworkAccess::Denied,
                     exclude_tmpdir_env_var: false,
                     exclude_slash_tmp: false,
+                    allow_metadata_writes: false,
                 },
                 permissions: SandboxPermissions::UseDefault,
             }),
@@ -4436,6 +4448,7 @@ mod tests {
                             network_access: NetworkAccess::Denied,
                             exclude_tmpdir_env_var: false,
                             exclude_slash_tmp: false,
+                            allow_metadata_writes: false,
                         },
                         permissions: SandboxPermissions::UseDefault,
                     }),
