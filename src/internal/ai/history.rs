@@ -6365,6 +6365,29 @@ mod tests {
 
     use super::*;
 
+    async fn drain_rejected_cleanup_in_invocation_scope(manager: &HistoryManager) -> Result<()> {
+        // Production cleanup runs under the CLI invocation-local object-index
+        // scope. Direct unit-test calls must model that boundary so unrelated
+        // tests using the process-wide fallback queue cannot consume this
+        // operation's finite drain budget.
+        crate::utils::client_storage::ClientStorage::with_background_index_failure_scope(
+            manager.drain_rejected_checkpoint_cleanup_jobs(),
+        )
+        .await
+    }
+
+    async fn repair_expired_marker_in_invocation_scope(
+        manager: &HistoryManager,
+        session_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        crate::utils::client_storage::ClientStorage::with_background_index_failure_scope(
+            manager.repair_expired_traces_inflight_marker(session_id, attempt_id, now_ms),
+        )
+        .await
+    }
+
     /// W2 §C.4.3 end-to-end unblock: an `i64::MAX`-dated marker row blocks
     /// the listing fail-closed, and `agent doctor --repair`'s retirement
     /// entry point RETIRES it (the drain classifies untrustworthy rows as
@@ -6404,10 +6427,10 @@ mod tests {
             Arc::new(db.clone()),
             "refs/libra/traces",
         );
-        let retired = history
-            .repair_expired_traces_inflight_marker("sess-max", "attempt-max", now)
-            .await
-            .expect("doctor repair retires the untrustworthy marker");
+        let retired =
+            repair_expired_marker_in_invocation_scope(&history, "sess-max", "attempt-max", now)
+                .await
+                .expect("doctor repair retires the untrustworthy marker");
         assert!(retired, "the marker row was fully retired");
 
         let live = list_live_traces_inflight_markers(&db, now)
@@ -7408,8 +7431,7 @@ mod tests {
         write_traces_inflight_marker(&*db_conn, &expired)
             .await
             .expect("expire unrelated marker");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain persisted cleanup after live peer exits");
         assert!(
@@ -7447,8 +7469,7 @@ mod tests {
             .await
             .expect("write unresolved preclaim marker");
 
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("retire unresolved preclaim without deleting payload");
         let oid_text = oid.to_string();
@@ -7513,8 +7534,7 @@ mod tests {
             )
             .await
             .expect("cleanup with reflog root");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain reflog-root cleanup job");
         assert!(
@@ -7566,8 +7586,7 @@ mod tests {
             )
             .await
             .expect("cleanup with index root");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain index-root cleanup job");
         assert!(
@@ -7632,8 +7651,8 @@ mod tests {
             .await
             .expect("seed malformed durable cleanup marker");
 
-        let error = traces_manager(&dir, db_conn)
-            .drain_rejected_checkpoint_cleanup_jobs()
+        let manager = traces_manager(&dir, db_conn);
+        let error = drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect_err("malformed cleanup marker must fail closed");
         let message = format!("{error:#}");
@@ -7666,14 +7685,14 @@ mod tests {
         let manager = traces_manager(&dir, db_conn.clone());
 
         assert!(
-            manager
-                .repair_expired_traces_inflight_marker(
-                    "expired-session",
-                    "expired-attempt",
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await
-                .expect("repair expired empty marker")
+            repair_expired_marker_in_invocation_scope(
+                &manager,
+                "expired-session",
+                "expired-attempt",
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .expect("repair expired empty marker")
         );
         assert!(
             list_all_traces_inflight_markers(&*db_conn)
@@ -7758,8 +7777,7 @@ mod tests {
                 .exists(),
             "fail-closed cleanup deleted a candidate"
         );
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("non-destructive marker retirement must not read an unrelated corrupt ref");
         assert!(
@@ -8062,8 +8080,7 @@ mod tests {
             )
             .await
             .expect("annotated tag reachability should protect candidate");
-        manager
-            .drain_rejected_checkpoint_cleanup_jobs()
+        drain_rejected_cleanup_in_invocation_scope(&manager)
             .await
             .expect("drain annotated-tag cleanup job");
         assert!(

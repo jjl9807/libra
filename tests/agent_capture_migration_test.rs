@@ -4,7 +4,7 @@
 //! these tests pin: fresh-DB up, legacy-DB compatibility, and `up → down → up`
 //! idempotency.
 
-use libra::internal::db::migration::{MigrationRunner, builtin_migrations};
+use libra::internal::db::migration::{MigrationRunner, builtin_migrations, run_builtin_migrations};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, ExecResult, Statement,
 };
@@ -58,6 +58,14 @@ fn registered_runner() -> MigrationRunner {
             .expect("builtin migrations must register clean");
     }
     runner
+}
+
+fn registered_versions_after(target: i64) -> Vec<i64> {
+    builtin_migrations()
+        .into_iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version > target)
+        .collect()
 }
 
 /// Replay the legacy bootstrap SQL the way `establish_connection` does on
@@ -131,16 +139,9 @@ async fn agent_capture_rollback_drops_tables_and_indexes_only() {
         .rollback_to(&conn, 2026050302)
         .await
         .expect("rollback_to(2026050302)");
-    assert_eq!(
-        rolled_back,
-        vec![
-            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
-            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
-            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
-            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601, 2026050501,
-            2026050303
-        ]
-    );
+    let mut expected_rolled_back = registered_versions_after(2026050302);
+    expected_rolled_back.reverse();
+    assert_eq!(rolled_back, expected_rolled_back);
 
     // agent_capture artifacts gone.
     assert!(!table_exists(&conn, "agent_session").await);
@@ -230,13 +231,9 @@ async fn agent_checkpoint_paging_up_down_up_round_trip() {
         .rollback_to(&conn, 2026070801)
         .await
         .expect("rollback_to(2026070801)");
-    assert_eq!(
-        rolled,
-        vec![
-            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
-            2026071301, 2026070803, 2026070802,
-        ]
-    );
+    let mut expected_rolled = registered_versions_after(2026070801);
+    expected_rolled.reverse();
+    assert_eq!(rolled, expected_rolled);
     for index in paging_indexes {
         assert!(
             !index_exists(&conn, index).await,
@@ -254,13 +251,7 @@ async fn agent_checkpoint_paging_up_down_up_round_trip() {
     // (2026071301) migrations, all of which rolled off when we rewound to
     // 2026070801 above.
     let reapplied = runner.run_pending(&conn).await.expect("up #2");
-    assert_eq!(
-        reapplied,
-        vec![
-            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071406, 2026071407,
-        ]
-    );
+    assert_eq!(reapplied, registered_versions_after(2026070801));
     for index in paging_indexes {
         assert!(
             index_exists(&conn, index).await,
@@ -282,8 +273,9 @@ async fn agent_capture_parent_commit_is_nullable_after_migration() {
     // created by the legacy bootstrap. Replay it so the FK declaration is
     // satisfiable when SQLite enforces it on INSERT.
     run_legacy_bootstrap(&conn).await;
-    let runner = registered_runner();
-    runner.run_pending(&conn).await.expect("run_pending");
+    run_builtin_migrations(&conn)
+        .await
+        .expect("run canonical built-in migrations");
 
     let backend = conn.get_database_backend();
     // Seed an agent_session that the FK'd checkpoint can hang off of.
@@ -339,9 +331,7 @@ async fn agent_capture_compatible_with_legacy_bootstrap() {
     // SQL — `run_pending` must apply cleanly on top of it.
     run_legacy_bootstrap(&conn).await;
 
-    let runner = registered_runner();
-    let applied = runner
-        .run_pending(&conn)
+    let applied = run_builtin_migrations(&conn)
         .await
         .expect("run_pending on legacy bootstrap");
     assert!(applied.contains(&2026050303));

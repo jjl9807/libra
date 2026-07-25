@@ -4,6 +4,23 @@
 
 ### Changed
 
+- **Internal: self-maintaining migration rollback expectations and
+  cleanup-test scope isolation (v0.19.61)**:
+  `tests/agent_capture_migration_test.rs` now derives its expected
+  rollback/reapply version lists from `builtin_migrations()` via a
+  `registered_versions_after` helper instead of repeating hardcoded
+  version lists, so landing a new migration no longer requires editing
+  this file, and two call sites use the canonical
+  `run_builtin_migrations` helper rather than a hand-built
+  `MigrationRunner`. The authoritative pinned full-list guard in
+  `tests/db_migration_test.rs` (literal versions plus
+  `max_registered_version`) is unchanged. The `history.rs` unit tests
+  for rejected-checkpoint cleanup and inflight-marker repair now run
+  through `ClientStorage::with_background_index_failure_scope`,
+  matching the CLI invocation-local object-index failure scope so an
+  unrelated test cannot consume another operation's finite drain
+  budget. Test-only; no behavior change.
+
 - **Register the Claude Code `PreToolUse` hook (v0.19.60,
   plan-20260713 DR-00)**: `libra agent enable --agent claude` now
   installs a forward for `PreToolUse` in addition to `PostToolUse`, both
