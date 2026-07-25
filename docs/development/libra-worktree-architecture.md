@@ -331,9 +331,18 @@ acquire 会在 SQLite 锁升级上互相拒绝（SQLITE_BUSY）而拿不到
 口径一致，也符合 §C.8「lease 只协调 Agent/runtime owner，
 不取代 filesystem lock」的定位。
 
-本切片只交付 schema 与服务；TaskWorktree/AgentRuntime 生命
-周期接线、Code control sidecar 隔离、配置统一 resolver 与
-`libra agent workspace list/show` 机器接口在后续 W4 切片。
+W4-s2（v0.19.62）接上调度器的 task worktree 生命周期：物化成功
+后（绝不在此之前）发布 `active` 记录，owner 是「task + 进程」的
+lease；sync-back 先续租再回写，lease 已被回收就 fail-closed——
+把 task worktree 的改动重放进主工作区，恰恰是 lease 要阻止的
+双写；拆除先进 `releasing`（目录移除期间身份仍被占用），成功后
+`released`，清理失败则 `orphaned` 留给 scavenger。非仓库目录
+依然可以有 task worktree（没有可关联的仓库，就不产生记录），
+但仓库存在却无法登记时 provisioning 直接失败。
+
+后续 W4 切片：sub-agent workspace 记录、Code control sidecar
+（token/info/lock/socket/PID）按 scope 隔离、Code/Agent 配置统一
+resolver 与 `libra agent workspace list/show` 机器接口。
 
 ## 当前取舍
 

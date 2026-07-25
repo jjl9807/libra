@@ -320,6 +320,13 @@ impl AcquireRequest {
         self
     }
 
+    /// Publish in an explicit initial state (only `provisioning` or `active`
+    /// are legal, and `active` requires the directory to exist already).
+    pub fn with_initial_state(mut self, state: WorkspaceState) -> Self {
+        self.initial_state = state;
+        self
+    }
+
     /// Attach the base commit / branch this workspace started from.
     pub fn with_base(mut self, base_commit: Option<String>, branch: Option<String>) -> Self {
         self.base_commit = base_commit;

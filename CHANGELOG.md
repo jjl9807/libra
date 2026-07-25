@@ -4,6 +4,27 @@
 
 ### Added
 
+- **Task worktrees take a workspace lease (v0.19.62,
+  plan-20260714 Part C §C.8, W4 slice 2)**: the scheduler's task
+  worktrees are now first-class workspaces. Provisioning publishes an
+  `active` `workspace_record` for the materialized directory — after
+  materialization, never before, so a crashed provision leaves no fake
+  active record — associated with the task id and owned by a lease
+  scoped to that task and process. Sync-back RENEWS that lease first
+  and fails closed if it was reclaimed: replaying a task worktree's
+  changes into the main workspace while a doctor has handed the
+  workspace to someone else is exactly the double-write the lease
+  exists to prevent. Teardown moves the record to `releasing` before
+  touching the filesystem (so nothing claims the directory
+  mid-removal), settles it as `released` on success, and marks it
+  `orphaned` when cleanup fails, leaving the scavenger a record instead
+  of a silent leak. Two parallel task attempts get independent
+  workspace ids, paths and lease owners. A working directory that is
+  not a Libra repository still gets a task worktree — there is nothing
+  to associate it with, so no record is published — while a repository
+  whose database cannot be claimed fails provisioning rather than
+  running unregistered.
+
 - **Agent workspace association + lease store (v0.19.61,
   plan-20260714 Part C §C.8, W4 slice 1)**: a new `workspace_record`
   table (migration `2026072501`) and internal `WorkspaceStore` service
