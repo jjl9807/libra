@@ -91,9 +91,10 @@ use crate::internal::ai::providers::fake::FAKE_DEFAULT_MODEL;
 use crate::{
     cli_error,
     command::code_control_files::{
-        ControlInfo, ControlLockError, ControlLockGuard, ControlPaths, acquire_control_lock,
-        cleanup_control_files, ensure_control_token_file, resolve_control_paths,
-        write_control_info,
+        CONTROL_INFO_VERSION, ControlInfo, ControlLockError, ControlLockGuard, ControlPaths,
+        ControlScope, ControlScopePolicy, acquire_control_lock, cleanup_control_files,
+        ensure_control_token_file, ensure_scope_takeover_allowed, repo_has_linked_evidence,
+        resolve_control_paths, resolve_control_scope, write_control_info,
     },
     internal::{
         ai::{
@@ -1747,6 +1748,11 @@ struct ControlRuntimeConfig {
     cleanup_token: bool,
     info_written: AtomicBool,
     started_at: chrono::DateTime<Utc>,
+    /// This process's control scope (§C.8 W4), stamped into `control.json`
+    /// and re-checked before any overwrite of an existing info file.
+    scope: ControlScope,
+    /// Linked-worktree evidence snapshot for the legacy-ambiguity rule.
+    linked_evidence: bool,
 }
 
 impl ControlRuntimeConfig {
@@ -1780,8 +1786,22 @@ impl ControlRuntimeConfig {
             return Ok(());
         }
 
+        // §C.8 W4: never overwrite another scope's control file. Observe mode
+        // holds no lock, so this pre-write check is its only takeover gate;
+        // for write mode it re-validates under the already-held lock.
+        ensure_scope_takeover_allowed(
+            &self.paths.info,
+            &self.scope,
+            ControlScopePolicy::Worktree,
+            self.linked_evidence,
+        )
+        .map_err(|error| {
+            CliError::conflict(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        })?;
+
         let info = ControlInfo {
-            version: 1,
+            version: CONTROL_INFO_VERSION,
             mode: self.mode_name().to_string(),
             pid: std::process::id(),
             base_url,
@@ -1789,6 +1809,10 @@ impl ControlRuntimeConfig {
             working_dir: working_dir.to_path_buf(),
             thread_id,
             started_at: self.started_at,
+            repo_id: Some(self.scope.repo_id.clone()),
+            worktree_id: self.scope.worktree_id.clone(),
+            workspace_id: self.scope.workspace_id.clone(),
+            lease_fence: self.scope.lease_fence,
         };
         write_control_info(&self.paths.info, &info).map_err(|error| {
             CliError::fatal(format!(

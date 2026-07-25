@@ -563,6 +563,34 @@ impl RepoIdentity {
         Ok(Self(value))
     }
 
+    /// [`RepoIdentity::resolve`], but lazily mints `libra.repoid` for a legacy
+    /// repository that never had one (pre-`init`-stamping histories).
+    ///
+    /// Minting happens ONLY when the key is entirely absent — an existing
+    /// value, even the legacy `"unknown-repo"` placeholder, is returned via
+    /// the strict [`RepoIdentity::resolve`] path so this helper can never
+    /// fork the identity away from what the workspace store and the cloud
+    /// prefix logic already observed. Callers that must not create state
+    /// (read-only doctor paths) should keep calling [`RepoIdentity::resolve`].
+    pub async fn resolve_or_init<C: ConnectionTrait>(conn: &C) -> WorkspaceResult<Self> {
+        let existing = ConfigKv::get_with_conn(conn, "libra.repoid")
+            .await
+            .map_err(|error| {
+                WorkspaceError::ReadFailed(format!("cannot read the repository identity: {error}"))
+            })?;
+        if existing.is_none() {
+            let minted = uuid::Uuid::new_v4().to_string();
+            ConfigKv::set_with_conn(conn, "libra.repoid", &minted, false)
+                .await
+                .map_err(|error| {
+                    WorkspaceError::WriteFailed(format!(
+                        "cannot initialize the repository identity (libra.repoid): {error}"
+                    ))
+                })?;
+        }
+        Self::resolve(conn).await
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
