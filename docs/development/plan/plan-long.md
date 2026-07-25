@@ -64,7 +64,26 @@
 | 2026-07-17 | 13 | GitButler、Sapling、Jujutsu 快进；其余已是最新；首次纳入 Grok Build | 无优先级变化 |
 | 2026-07-16 | 12 | 10 个快进/已最新，2 个 `blocked-dirty` | 无优先级变化 |
 
-**本次结论：无长期优先级变化。** GitButler `5a3a59cea146` 本轮是命名收纳与 API 迁移：将 `squash2`/`move2`/`commit2`/`rub`/`stage`/`unstage` 旧命令收纳为 `squash`/`move`/`uncommit`/`amend`，用 `but-branches` 替代 `but-cherry-apply`，新增 `but-github/src/stacks.rs` 堆叠 PR 支持，继续强化 LR-03/LR-04 的“先稳定身份再建交互外壳”顺序和 LR-08 的 stacked review 证据。Grok Build `6e386420825b` 新增 `shell_env_policy.rs`（可配置的环境变量继承策略，默认 inherit-all）、`hook_write_deny.rs`（sandbox hook 写入拒绝与路径身份验证）、task coordinator 与 `version_policy.rs`，分别强化 SB-02 的 shell 环境隔离、mutation 边界和版本策略证据，但其默认 inherit-all 与 Libra SB-02 的 env_clear 要求方向相反，不构成新的 VCS LR。Jujutsu `732bbc0d2629` 仅 3 个提交（`run` 冲突保留修复、copies 多父级 rename、revset 重构），不改变 LR-02/LR-05 判断。Sapling `2d413f4cbd1c` 重构 EdenFS TreeInode/InodeMap 并新增 worktree add 与 restricted tree caching 测试，仍只支持 LR-09 的既有顺序。Lore `9664606f5a47` 仅修复 credential JWT 并新增 auth/path 测试。Agenta 与 Entire CLI 本轮仍为会话/前端/错误处理变化，不涉及 VCS 能力。本轮的重大变化在 Libra 自身：自 v0.19.52 推进至 v0.19.63，Part C W2 全部入库（v0.19.53–v0.19.56：rerere/stash/merge-file-backup/gc roots）、worktree registry v2 与持久化身份（v0.19.57）、lifecycle detach/tombstone 与 durable intent journal（v0.19.58）、canonical add targets（v0.19.59）、legacy layout 检测与 `repair --migrate-layout`（v0.19.60）、Agent workspace association 与 lease store（v0.19.61–v0.19.62，migration 2026072501）。LR-01 的 W1–W2、registry v2、legacy 迁移和 Agent lease 均已交付，剩余完整崩溃矩阵、parallel lanes（依赖 LR-03/LR-04）。其余 LR 状态与长期优先级不变。
+**本次结论：无长期优先级变化。**
+
+竞品方面：
+
+- **GitButler `5a3a59cea146`**：本轮是命名收纳与 API 迁移--将 `squash2`/`move2`/`commit2`/`rub`/`stage`/`unstage` 旧命令收纳为 `squash`/`move`/`uncommit`/`amend`，用 `but-branches` 替代 `but-cherry-apply`，新增 `but-github/src/stacks.rs` 堆叠 PR 支持。继续强化 LR-03/LR-04 的“先稳定身份再建交互外壳”顺序和 LR-08 的 stacked review 证据。
+- **Grok Build `6e386420825b`**：新增 `shell_env_policy.rs`（可配置环境变量继承策略，默认 inherit-all）、`hook_write_deny.rs`（sandbox hook 写入拒绝与路径身份验证）、task coordinator 与 `version_policy.rs`，分别强化 SB-02 的 shell 环境隔离、mutation 边界和版本策略证据。但其默认 inherit-all 与 Libra SB-02 的 env_clear 要求方向相反，不构成新的 VCS LR。
+- **Jujutsu `732bbc0d2629`**：仅 3 个提交（`run` 冲突保留修复、copies 多父级 rename、revset 重构），不改变 LR-02/LR-05 判断。
+- **Sapling `2d413f4cbd1c`**：重构 EdenFS TreeInode/InodeMap 并新增 worktree add 与 restricted tree caching 测试，仍只支持 LR-09 的既有顺序。
+- **Lore `9664606f5a47`**：仅修复 credential JWT 并新增 auth/path 测试。
+- **Agenta 与 Entire CLI**：本轮仍为会话/前端/错误处理变化，不涉及 VCS 能力。
+
+Libra 自身方面：
+
+- 自 v0.19.52 推进至 v0.19.63（`be73801`）。
+- Part C W2 全部入库（v0.19.53–v0.19.56）：rerere、stash、merge-file-backup、gc roots。
+- Worktree registry v2 与持久化身份（v0.19.57）；lifecycle detach/tombstone 与 durable intent journal（v0.19.58）；canonical add targets（v0.19.59）。
+- Legacy layout 检测与 `repair --migrate-layout`（v0.19.60）。
+- Agent workspace association 与 lease store（v0.19.61–v0.19.62，migration `2026072501`）。
+- LR-01 的 W1–W2、registry v2、legacy 迁移和 Agent lease 均已交付，剩余完整崩溃矩阵与 parallel lanes（依赖 LR-03/LR-04）。
+- 其余 LR 状态与长期优先级不变。
 
 ## 规划原则
 
