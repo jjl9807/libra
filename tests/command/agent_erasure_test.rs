@@ -242,12 +242,14 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     );
 }
 
-/// A0-10 local tombstone contract: `erase_session_local` is a self-contained
-/// LOCAL tombstone. It succeeds with no D1/R2 cloud mirror configured (cloud
-/// tombstone propagation is an explicit, documented deferral — see
-/// `docs/development/tracing/agent.md` "还未实现的功能" row), and re-erasing a
-/// session that is already gone is idempotent (the tombstone is stable — a
-/// deleted session is never revived by a second erase).
+/// A0-10 local tombstone contract, upgraded for PD-03 propagation: the
+/// tombstone `erase_session_local` writes locally is exactly the row
+/// `libra cloud sync` later publishes to D1 (`agent_kind` +
+/// `provider_session_id` identity, `erased_session_id`, an `erased_at`
+/// timestamp), so this test pins those propagation-carrying fields. The
+/// erase itself still succeeds with no D1/R2 mirror configured, and
+/// re-erasing an already-gone session is idempotent (a deleted session
+/// is never revived by a second erase).
 #[tokio::test]
 async fn agent_erasure_local_tombstone() {
     let repo = tempfile::tempdir().expect("repo tempdir");
@@ -309,6 +311,21 @@ async fn agent_erasure_local_tombstone() {
         .await,
         1,
         "local import tombstone must survive deletion of agent_session"
+    );
+    // PD-03: the tombstone row carries everything the cloud publication
+    // needs — the provider identity key and a positive erased_at.
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_tombstone \
+             WHERE erased_session_id = 'sess-tomb' \
+               AND agent_kind = 'claude_code' \
+               AND provider_session_id = 'provider-sess-tomb' \
+               AND erased_at > 0"
+        )
+        .await,
+        1,
+        "the tombstone carries the propagation identity and timestamp"
     );
     assert_eq!(
         count(

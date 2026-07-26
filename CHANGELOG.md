@@ -4,6 +4,27 @@
 
 ### Fixed
 
+### Added (PD-03)
+
+- **Session-erasure cloud tombstone propagation (plan-20260714
+  PD-03)**: `libra cloud sync` now publishes the local
+  `agent_import_tombstone` rows (written by `erase_session_local`) to a
+  new D1 `agent_import_tombstone` table under the same generation fence
+  as the capture catalog — an idempotent fenced UPSERT (newest
+  `erased_at` wins, known fingerprints kept) followed by a cascade
+  delete of the erased session's mirror rows (claims → revisions →
+  links → checkpoints → session). `libra cloud restore` is
+  tombstone-first: erased sessions and their companions never restore,
+  and the tombstones are persisted locally on the restoring machine so
+  a later import cannot resurrect the session there either; pre-PD-03
+  remotes without the table restore unchanged (read-only tolerance).
+  Repeated deletes and restores are idempotent, and the audit log stays
+  outside regular GC as before. The only remaining deferral is R2
+  physical payload deletion. Verified end-to-end against a real D1
+  endpoint (`agent_cloud_tombstone_test`, now asserting propagation);
+  the A0-10 doc-guard flipped to pin the new facts.
+
+
 - **PD-09 adversarial-review batch (19 confirmed findings)**: the mbox
   envelope test is now ctime-shaped (prose `From …` lines never
   false-split; timezone/UUCP-suffixed envelopes split correctly) and

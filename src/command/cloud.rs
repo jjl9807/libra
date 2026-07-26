@@ -37,8 +37,8 @@ use crate::{
         d1_client::{
             AgentCaptureGenerationManifest, AgentCaptureGenerationRow,
             AgentCaptureRestoreCatalogRows, AgentCheckpointPruneTombstoneRow, AgentCheckpointV2Row,
-            AgentSessionV2Row, AgentSubagentContentClaimRow, AgentSubagentContentRevisionRow,
-            AgentSubagentLinkRow, D1Client, ObjectIndexRow,
+            AgentImportTombstoneRow, AgentSessionV2Row, AgentSubagentContentClaimRow,
+            AgentSubagentContentRevisionRow, AgentSubagentLinkRow, D1Client, ObjectIndexRow,
         },
         error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, ProgressMode, emit_json_data},
@@ -2278,8 +2278,43 @@ struct AgentCaptureSnapshot {
     revisions: Vec<AgentSubagentContentRevisionRow>,
     links: Vec<AgentSubagentLinkRow>,
     prune_tombstones: Vec<AgentCheckpointPruneTombstoneRow>,
+    /// PD-03 session-erasure tombstones from the local
+    /// `agent_import_tombstone` table.
+    import_tombstones: Vec<AgentImportTombstoneRow>,
     required_oids: HashSet<String>,
     traces_head: Option<String>,
+}
+
+/// PD-03: union local and remote session tombstones, keeping the newest
+/// `erased_at` (and any known fingerprint) per provider identity —
+/// delete/restore replays stay idempotent.
+fn merge_import_tombstones(
+    local: &[AgentImportTombstoneRow],
+    remote: &[AgentImportTombstoneRow],
+) -> Vec<AgentImportTombstoneRow> {
+    let mut merged: std::collections::BTreeMap<(String, String), AgentImportTombstoneRow> =
+        std::collections::BTreeMap::new();
+    for row in remote.iter().chain(local.iter()) {
+        let key = (row.agent_kind.clone(), row.provider_session_id.clone());
+        match merged.get_mut(&key) {
+            None => {
+                merged.insert(key, row.clone());
+            }
+            Some(existing) => {
+                if row.erased_at > existing.erased_at {
+                    let fingerprint = existing
+                        .source_fingerprint
+                        .clone()
+                        .or_else(|| row.source_fingerprint.clone());
+                    *existing = row.clone();
+                    existing.source_fingerprint = row.source_fingerprint.clone().or(fingerprint);
+                } else if existing.source_fingerprint.is_none() {
+                    existing.source_fingerprint = row.source_fingerprint.clone();
+                }
+            }
+        }
+    }
+    merged.into_values().collect()
 }
 
 fn agent_capture_catalog_row_count(snapshot: &AgentCaptureSnapshot) -> CloudResult<usize> {
@@ -2287,6 +2322,7 @@ fn agent_capture_catalog_row_count(snapshot: &AgentCaptureSnapshot) -> CloudResu
         snapshot.sessions.len(),
         snapshot.checkpoints.len(),
         snapshot.prune_tombstones.len(),
+        snapshot.import_tombstones.len(),
         snapshot.claims.len(),
         snapshot.revisions.len(),
         snapshot.links.len(),
@@ -2677,10 +2713,48 @@ async fn load_agent_capture_catalog_snapshot(
         .map_err(|error| CloudError::Generic(format!("decode traces snapshot head: {error}")))?
         .flatten();
 
+    let import_tombstone_present = txn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_import_tombstone' LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .map_err(|error| CloudError::Generic(format!("query import-tombstone schema: {error}")))?
+        .is_some();
+    let import_tombstones = if import_tombstone_present {
+        let tombstone_rows = load_local_capture_pages(
+            &txn,
+            "SELECT agent_kind, provider_session_id, erased_session_id,
+                    source_fingerprint, erased_at
+             FROM agent_import_tombstone ORDER BY agent_kind, provider_session_id",
+            Vec::new(),
+            "agent import tombstone",
+            &mut remaining_restore_rows,
+        )
+        .await?;
+        tombstone_rows
+            .into_iter()
+            .map(|row| {
+                Ok(AgentImportTombstoneRow {
+                    agent_kind: row.try_get_by("agent_kind")?,
+                    provider_session_id: row.try_get_by("provider_session_id")?,
+                    erased_session_id: row.try_get_by("erased_session_id")?,
+                    source_fingerprint: row.try_get_by("source_fingerprint")?,
+                    erased_at: row.try_get_by("erased_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sea_orm::DbErr>>()
+            .map_err(|error| CloudError::Generic(format!("decode import tombstones: {error}")))?
+    } else {
+        Vec::new()
+    };
     let mut snapshot = AgentCaptureSnapshot {
         sessions,
         checkpoints,
         prune_tombstones,
+        import_tombstones,
         traces_head,
         ..AgentCaptureSnapshot::default()
     };
@@ -3755,6 +3829,12 @@ async fn sync_agent_capture_tables_inner(
                 error.message
             ))
         })?;
+    d1_client
+        .ensure_agent_import_tombstone_table()
+        .await
+        .map_err(|error| {
+            CloudError::D1(format!("ensure agent import tombstones: {}", error.message))
+        })?;
     if subagent_content_present {
         d1_client
             .ensure_agent_subagent_content_tables()
@@ -3806,11 +3886,49 @@ async fn sync_agent_capture_tables_inner(
         sessions: remote_sessions,
         checkpoints: remote_checkpoints,
         prune_tombstones: remote_prune_tombstones,
+        import_tombstones: remote_import_tombstones,
         claims: remote_claims,
         revisions: remote_revisions,
         links: remote_links,
         remaining_rows: _,
     } = remote_catalog;
+    // PD-03: the effective tombstone set is the UNION of local and remote
+    // (newest erased_at per provider identity), and every remote catalog
+    // row belonging to an erased session id is dropped BEFORE conflict/
+    // effective-set computation — the publish cascade deletes the same
+    // rows remotely, so the post-publish verification stays coherent.
+    let merged_import_tombstones =
+        merge_import_tombstones(&snapshot.import_tombstones, &remote_import_tombstones);
+    let erased_session_ids: HashSet<&str> = merged_import_tombstones
+        .iter()
+        .map(|row| row.erased_session_id.as_str())
+        .collect();
+    let remote_sessions: Vec<AgentSessionV2Row> = remote_sessions
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .collect();
+    let erased_checkpoint_ids: HashSet<&str> = remote_checkpoints
+        .iter()
+        .filter(|row| erased_session_ids.contains(row.session_id.as_str()))
+        .map(|row| row.checkpoint_id.as_str())
+        .collect();
+    let remote_checkpoints: Vec<AgentCheckpointV2Row> = remote_checkpoints
+        .iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .cloned()
+        .collect();
+    let remote_claims: Vec<AgentSubagentContentClaimRow> = remote_claims
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.parent_session_id.as_str()))
+        .collect();
+    let remote_revisions: Vec<AgentSubagentContentRevisionRow> = remote_revisions
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.checkpoint_id.as_str()))
+        .collect();
+    let remote_links: Vec<AgentSubagentLinkRow> = remote_links
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.content_checkpoint_id.as_str()))
+        .collect();
     validate_agent_capture_companions(
         &remote_checkpoints,
         &remote_claims,
@@ -4065,11 +4183,22 @@ async fn sync_agent_capture_tables_inner(
                 CloudError::D1(format!("sync subagent claim batch: {}", error.message))
             })?;
     }
+    // PD-03: the session tombstones publish LAST so their cascade delete
+    // is final regardless of what earlier batches upserted.
+    for rows in agent_capture_batches(&merged_import_tombstones) {
+        d1_client
+            .sync_agent_import_tombstones_batch(repo_id, &publish_token, rows)
+            .await
+            .map_err(|error| {
+                CloudError::D1(format!("sync agent import tombstones: {}", error.message))
+            })?;
+    }
 
     let AgentCaptureRestoreCatalogRows {
         sessions: completed_sessions,
         checkpoints: completed_checkpoints,
         prune_tombstones: _,
+        import_tombstones: _,
         claims: completed_claims,
         revisions: completed_revisions,
         links: completed_links,
@@ -4560,8 +4689,80 @@ async fn restore_agent_capture_from_d1_inner(
         render_human,
     )
     .await?;
+    // PD-03: propagate the remote session tombstones to THIS machine, so
+    // a later local import cannot resurrect a session erased elsewhere.
+    persist_local_import_tombstones(db_conn, &rows.import_tombstones).await?;
     store_local_agent_capture_cloud_base(db_conn, repo_id, remote_generation).await?;
     Ok(AgentCaptureRestoreOutcome::GenerationInstalled)
+}
+
+/// PD-03: UPSERT restored session tombstones into the local
+/// `agent_import_tombstone` table (same idempotent shape the local erase
+/// writes: newest `erased_at` wins, known fingerprints are kept). A
+/// legacy local schema without the table skips with a warning — the
+/// restore itself already filtered the erased rows.
+async fn persist_local_import_tombstones(
+    db_conn: &sea_orm::DatabaseConnection,
+    tombstones: &[AgentImportTombstoneRow],
+) -> CloudResult<()> {
+    use sea_orm::{ConnectionTrait, Statement, Value};
+
+    if tombstones.is_empty() {
+        return Ok(());
+    }
+    let backend = db_conn.get_database_backend();
+    let table_present = db_conn
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'agent_import_tombstone' LIMIT 1",
+            [],
+        ))
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!("query local import-tombstone schema: {error}"))
+        })?
+        .is_some();
+    if !table_present {
+        emit_warning(
+            "local agent_import_tombstone table absent — restored erasure fences were \
+             not persisted locally; upgrade libra and rerun `libra cloud restore`",
+        );
+        return Ok(());
+    }
+    for row in tombstones {
+        db_conn
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO agent_import_tombstone (
+                    tombstone_id, agent_kind, provider_session_id,
+                    erased_session_id, source_fingerprint, erased_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
+                    erased_session_id = excluded.erased_session_id,
+                    source_fingerprint = COALESCE(
+                        excluded.source_fingerprint,
+                        agent_import_tombstone.source_fingerprint
+                    ),
+                    erased_at = MAX(agent_import_tombstone.erased_at, excluded.erased_at)",
+                [
+                    uuid::Uuid::new_v4().to_string().into(),
+                    row.agent_kind.clone().into(),
+                    row.provider_session_id.clone().into(),
+                    row.erased_session_id.clone().into(),
+                    Value::from(row.source_fingerprint.clone()),
+                    row.erased_at.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                CloudError::Generic(format!(
+                    "persist restored session tombstone for {}/{}: {error}",
+                    row.agent_kind, row.provider_session_id
+                ))
+            })?;
+    }
+    Ok(())
 }
 
 async fn load_remote_agent_capture_rows(
@@ -4573,6 +4774,7 @@ async fn load_remote_agent_capture_rows(
         sessions,
         checkpoints,
         prune_tombstones: _,
+        import_tombstones,
         claims,
         revisions,
         links,
@@ -4590,10 +4792,42 @@ async fn load_remote_agent_capture_rows(
                 error.message
             ))
         })?;
+    // PD-03 tombstone-first: an erased session never restores, even when
+    // a stale mirror still carries its rows.
+    let erased_session_ids: HashSet<&str> = import_tombstones
+        .iter()
+        .map(|row| row.erased_session_id.as_str())
+        .collect();
+    let erased_checkpoint_ids: HashSet<String> = checkpoints
+        .iter()
+        .filter(|row| erased_session_ids.contains(row.session_id.as_str()))
+        .map(|row| row.checkpoint_id.clone())
+        .collect();
+    let sessions: Vec<AgentSessionV2Row> = sessions
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .collect();
+    let checkpoints: Vec<AgentCheckpointV2Row> = checkpoints
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.session_id.as_str()))
+        .collect();
+    let claims: Vec<AgentSubagentContentClaimRow> = claims
+        .into_iter()
+        .filter(|row| !erased_session_ids.contains(row.parent_session_id.as_str()))
+        .collect();
+    let revisions: Vec<AgentSubagentContentRevisionRow> = revisions
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.checkpoint_id.as_str()))
+        .collect();
+    let links: Vec<AgentSubagentLinkRow> = links
+        .into_iter()
+        .filter(|row| !erased_checkpoint_ids.contains(row.content_checkpoint_id.as_str()))
+        .collect();
     Ok((
         AgentCaptureSnapshot {
             sessions,
             checkpoints,
+            import_tombstones,
             claims,
             revisions,
             links,
@@ -5550,6 +5784,34 @@ async fn restore_legacy_capture_refs_if_unowned(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn merge_import_tombstones_keeps_newest_and_fingerprints() {
+        use crate::utils::d1_client::AgentImportTombstoneRow;
+
+        let row = |erased_at: i64, fp: Option<&str>| AgentImportTombstoneRow {
+            agent_kind: "claude_code".to_string(),
+            provider_session_id: "prov-1".to_string(),
+            erased_session_id: format!("sess-{erased_at}"),
+            source_fingerprint: fp.map(str::to_string),
+            erased_at,
+        };
+        // Newest erased_at wins; an older row's fingerprint survives when
+        // the newer one lacks it.
+        let merged = super::merge_import_tombstones(&[row(5, None)], &[row(3, Some("aa"))]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].erased_at, 5);
+        assert_eq!(merged[0].erased_session_id, "sess-5");
+        assert_eq!(merged[0].source_fingerprint.as_deref(), Some("aa"));
+        // Distinct provider identities stay distinct.
+        let mut other = row(7, None);
+        other.provider_session_id = "prov-2".to_string();
+        let merged = super::merge_import_tombstones(&[row(5, None)], &[other]);
+        assert_eq!(merged.len(), 2);
+        // Idempotent under replay: merging the merged set changes nothing.
+        let replay = super::merge_import_tombstones(&merged, &merged);
+        assert_eq!(replay, merged);
+    }
+
     use std::{env, ffi::OsString, fs, sync::Arc};
 
     use git_internal::internal::object::types::ObjectType;

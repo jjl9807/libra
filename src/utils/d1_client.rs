@@ -1513,6 +1513,34 @@ impl D1Client {
         Ok(())
     }
 
+    /// PD-03: session-erasure tombstones on D1 (delete/restore
+    /// idempotent, `erased_at` monotone under replays).
+    pub async fn ensure_agent_import_tombstone_table(&self) -> Result<(), D1Error> {
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_import_tombstone (
+                repo_id TEXT NOT NULL,
+                agent_kind TEXT NOT NULL,
+                provider_session_id TEXT NOT NULL,
+                erased_session_id TEXT NOT NULL,
+                source_fingerprint TEXT,
+                erased_at INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (repo_id, agent_kind, provider_session_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_d1_agent_import_tombstone_session
+             ON agent_import_tombstone (repo_id, erased_session_id)",
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Generation fence for the multi-request agent-capture mirror. A writer
     /// publishes under a unique token; takeover advances the generation and
     /// fences every older request in the same SQL statement that applies rows.
@@ -1945,6 +1973,23 @@ impl D1Client {
         .await
     }
 
+    async fn list_agent_import_tombstones_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentImportTombstoneRow>, D1Error> {
+        self.collect_agent_capture_pages_with_budget(
+            "SELECT agent_kind, provider_session_id, erased_session_id,
+                    source_fingerprint, erased_at
+             FROM agent_import_tombstone WHERE repo_id = ?1
+             ORDER BY agent_kind, provider_session_id LIMIT ?2 OFFSET ?3",
+            repo_id,
+            "agent import tombstone",
+            remaining_rows,
+        )
+        .await
+    }
+
     async fn collect_agent_capture_pages<T: for<'de> Deserialize<'de>>(
         &self,
         sql: &str,
@@ -2012,6 +2057,14 @@ impl D1Client {
         let prune_tombstones = self
             .list_agent_checkpoint_prune_tombstones_with_budget(repo_id, &mut remaining_rows)
             .await?;
+        // Pre-PD-03 remotes have no tombstone table; restore is a
+        // read-only consumer and must not create it.
+        let import_tombstones = if self.agent_import_tombstone_table_exists().await? {
+            self.list_agent_import_tombstones_with_budget(repo_id, &mut remaining_rows)
+                .await?
+        } else {
+            Vec::new()
+        };
         let (claims, revisions, links) = if include_subagent_content {
             (
                 self.list_agent_subagent_content_claims_with_budget(repo_id, &mut remaining_rows)
@@ -2031,6 +2084,7 @@ impl D1Client {
             sessions,
             checkpoints,
             prune_tombstones,
+            import_tombstones,
             claims,
             revisions,
             links,
@@ -2086,6 +2140,12 @@ impl D1Client {
     /// legacy-writer barriers or adopts rows.
     pub async fn agent_capture_generation_table_exists(&self) -> Result<bool, D1Error> {
         self.remote_table_exists("agent_capture_generation").await
+    }
+
+    /// PD-03: whether the remote carries the session-erasure tombstone
+    /// table (absent on pre-PD-03 remotes; restore must stay read-only).
+    pub async fn agent_import_tombstone_table_exists(&self) -> Result<bool, D1Error> {
+        self.remote_table_exists("agent_import_tombstone").await
     }
 
     async fn agent_capture_v2_projection_is_ready(&self) -> Result<bool, D1Error> {
@@ -2540,10 +2600,126 @@ impl D1Client {
         Ok(())
     }
 
-    /// Create the durable M5 subagent-content companion tables in D1.
-    /// Transient reservation owner/lease/attempt fields are intentionally not
-    /// mirrored; restore always reconstructs an idle claim with the same
-    /// monotonic revision/fence high-water marks.
+    /// PD-03: publish session-erasure tombstones under the generation
+    /// fence, then cascade-delete every mirror row of each erased
+    /// session (claims -> revisions -> links -> checkpoints -> the
+    /// session itself). Idempotent: replays keep the newest `erased_at`.
+    pub async fn sync_agent_import_tombstones_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentImportTombstoneRow],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_import_tombstone (
+                repo_id, agent_kind, provider_session_id, erased_session_id,
+                source_fingerprint, erased_at, synced_at
+            )
+            SELECT ?1, json_extract(value, '$.agent_kind'),
+                   json_extract(value, '$.provider_session_id'),
+                   json_extract(value, '$.erased_session_id'),
+                   json_extract(value, '$.source_fingerprint'),
+                   CAST(json_extract(value, '$.erased_at') AS INTEGER),
+                   CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+            ON CONFLICT(repo_id, agent_kind, provider_session_id) DO UPDATE SET
+                erased_session_id = excluded.erased_session_id,
+                source_fingerprint = COALESCE(
+                    excluded.source_fingerprint,
+                    agent_import_tombstone.source_fingerprint
+                ),
+                erased_at = MAX(agent_import_tombstone.erased_at, excluded.erased_at),
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "agent import tombstone",
+        )
+        .await?;
+
+        // Cascade under the same fence. Every statement keeps the
+        // Publishing-mode graph valid so an interrupted generation can be
+        // taken over: mutable claims first, then immutable revisions and
+        // associations, then checkpoints, then the session row.
+        for sql in [
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_content_claim
+              WHERE repo_id = ?1
+                AND parent_session_id IN (
+                    SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_content_revision
+              WHERE repo_id = ?1
+                AND checkpoint_id IN (
+                    SELECT checkpoint_id FROM agent_capture_checkpoint_v2
+                    WHERE repo_id = ?1 AND session_id IN (
+                        SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_link
+              WHERE repo_id = ?1
+                AND content_checkpoint_id IN (
+                    SELECT checkpoint_id FROM agent_capture_checkpoint_v2
+                    WHERE repo_id = ?1 AND session_id IN (
+                        SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_capture_checkpoint_v2
+              WHERE repo_id = ?1
+                AND session_id IN (
+                    SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_capture_session_v2
+              WHERE repo_id = ?1
+                AND session_id IN (
+                    SELECT json_extract(value, '$.erased_session_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+        ] {
+            let statement = Self::agent_capture_json_batch_statement(
+                sql,
+                repo_id,
+                publish_token,
+                rows,
+                "agent import tombstone cascade",
+            )?;
+            // Cascade deletes remove however many mirror rows exist (often
+            // zero on a replay) — no per-row change-count expectation.
+            self.execute(&statement.sql, statement.params).await?;
+        }
+        Ok(())
+    }
+
     pub async fn ensure_agent_subagent_content_tables(&self) -> Result<(), D1Error> {
         self.execute(
             r#"
@@ -2630,6 +2806,10 @@ impl D1Client {
         Ok(())
     }
 
+    /// Create the durable M5 subagent-content companion tables in D1.
+    /// Transient reservation owner/lease/attempt fields are intentionally not
+    /// mirrored; restore always reconstructs an idle claim with the same
+    /// monotonic revision/fence high-water marks.
     pub async fn upsert_agent_subagent_content_claim(
         &self,
         repo_id: &str,
@@ -4005,6 +4185,18 @@ pub struct AgentCheckpointPruneTombstoneRow {
     pub pruned_at: i64,
 }
 
+/// PD-03: a SESSION-level erasure tombstone mirrored to D1. Keyed by the
+/// provider identity `(agent_kind, provider_session_id)` — the same
+/// anti-resurrection key `erase_session_local` writes locally.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentImportTombstoneRow {
+    pub agent_kind: String,
+    pub provider_session_id: String,
+    pub erased_session_id: String,
+    pub source_fingerprint: Option<String>,
+    pub erased_at: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct AgentCheckpointIdRow {
     checkpoint_id: String,
@@ -4076,6 +4268,8 @@ pub struct AgentCaptureRestoreCatalogRows {
     pub sessions: Vec<AgentSessionV2Row>,
     pub checkpoints: Vec<AgentCheckpointV2Row>,
     pub prune_tombstones: Vec<AgentCheckpointPruneTombstoneRow>,
+    /// PD-03 session-erasure tombstones (tombstone-first on restore).
+    pub import_tombstones: Vec<AgentImportTombstoneRow>,
     pub claims: Vec<AgentSubagentContentClaimRow>,
     pub revisions: Vec<AgentSubagentContentRevisionRow>,
     pub links: Vec<AgentSubagentLinkRow>,

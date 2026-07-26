@@ -73,33 +73,33 @@ fn agent_doc_tracks_schema_versioning_and_retention_policy() {
 
 #[test]
 fn agent_doc_declares_cloud_tombstone_deferred() {
-    // A0-10 doc-guard. Ground truth (verified against src/command/cloud.rs):
-    // the D1/R2 agent-capture MIRROR is live — `libra cloud sync` upserts
-    // agent_session/agent_checkpoint to D1 on every sync and `libra cloud
-    // restore` reads them back. Ordinary checkpoint retention now propagates
-    // a D1 prune fence and removes capture-catalog rows. What remains DEFERRED
-    // under the compatibility term "delete/tombstone propagation" is session
-    // erasure plus R2 physical deletion: a local `erase_session_local` does
-    // not delete the remote session, so restore can REVIVE it. The doc must
-    // preserve that distinction.
+    // A0-10 doc-guard, FLIPPED with plan-20260714 PD-03: session-erasure
+    // tombstones now PROPAGATE — `libra cloud sync` publishes
+    // `agent_import_tombstone` to D1 under the generation fence and
+    // cascade-deletes the erased session's mirror rows; `libra cloud
+    // restore` is tombstone-first (an erased session never restores) and
+    // persists the fences locally. The only remaining deferral is R2
+    // physical payload deletion. The doc must state the new facts and
+    // may no longer claim restore revives erased sessions.
     for required in [
         "cloud mirror tombstone propagation for agent capture data",
-        "delete/tombstone propagation",
-        "普通 checkpoint retention",
-        "复活已本地擦除的 session",
+        "session erasure tombstone 传播已随 plan-20260714 PD-03 落地",
+        "sync_agent_import_tombstones_batch",
+        "persist_local_import_tombstones",
+        "tombstone 优先",
+        "R2 物理删除",
         // Positive truth: the mirror IS live via cloud sync/restore.
         "libra cloud sync",
         "libra cloud restore",
     ] {
         assert!(
             AGENT_DOC.contains(required),
-            "agent.md must keep declaring the mirror live + delete/tombstone propagation deferred: {required}",
+            "agent.md must declare session-tombstone propagation live and R2 deletion deferred: {required}",
         );
     }
 
     for forbidden in [
-        // The old, factually wrong claims that the mirror does not exist /
-        // is not enabled / only lands after some future "introduction".
+        // The old, factually wrong claims that the mirror does not exist.
         "当前未启用 D1/R2 agent capture mirror",
         "未启用 D1/R2 mirror",
         "未启用 cloud mirror",
@@ -108,16 +108,19 @@ fn agent_doc_declares_cloud_tombstone_deferred() {
         "cloud mirror 启用后",
         "尚无 D1 mirror",
         "没有 D1 mirror",
-        // Overclaiming that the deferred propagation is done.
-        "delete/tombstone propagation 已实现",
+        // Post-PD-03: restore can no longer revive an erased session, so
+        // the old warning wording must not survive anywhere.
+        "复活已本地擦除",
+        "会复活已擦除",
+        "不传播 tombstone",
+        "tombstone 也不上传",
     ] {
         assert!(
             !AGENT_DOC.contains(forbidden),
-            "agent.md must not regress to a false/overclaimed cloud-mirror statement: {forbidden}",
+            "agent.md still carries a stale pre-PD-03 tombstone claim: {forbidden}",
         );
     }
 }
-
 #[test]
 fn agent_doc_tracks_code_agent_runtime_source_of_truth() {
     assert!(
