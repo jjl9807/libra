@@ -153,6 +153,11 @@ pub struct InvestigateRunRequest {
     pub investigator_timeout: Duration,
     pub allow_full_copy: bool,
     pub claude_max_budget_usd: String,
+    /// PD-02 checkpoint scope: when set, every drive pass materializes
+    /// the checkpoint's content (`<run_dir>/checkpoint-input/`) as the
+    /// investigators' whole workspace instead of a worktree snapshot.
+    /// Persisted into the run state so resumes keep the scope.
+    pub checkpoint_input: Option<crate::internal::ai::checkpoint_input::CheckpointInputSpec>,
 }
 
 impl InvestigateRunRequest {
@@ -175,6 +180,7 @@ impl InvestigateRunRequest {
             investigator_timeout: DEFAULT_INVESTIGATOR_TIMEOUT,
             allow_full_copy: true,
             claude_max_budget_usd: DEFAULT_CLAUDE_REVIEW_MAX_BUDGET_USD.to_string(),
+            checkpoint_input: None,
         }
     }
 }
@@ -374,6 +380,15 @@ pub async fn run_investigate(
         request.quorum,
         &request.starting_sha,
     )?;
+    if let Some(spec) = &request.checkpoint_input {
+        // PD-02: persist the scope with the run so `investigate continue`
+        // re-materializes the SAME checkpoint and can never fall back to
+        // the current worktree.
+        let spec = spec.clone();
+        store.update_state(&run_id_str, move |state| {
+            state.checkpoint_input = Some(spec);
+        })?;
+    }
 
     let span = tracing::info_span!(
         "agent.investigate.run",
@@ -612,57 +627,93 @@ async fn drive(
     let remaining_budget = run_budget_cap.saturating_sub(elapsed_since_start);
 
     // ---- Mandatory isolated workspace (copy backend pinned). ----
-    let fuse_state = FuseProvisionState::default();
-    let _ = fuse_state.disable_first_time();
-    let isolation = WorkspaceIsolationConfig {
-        fuse_state,
-        sessions_root: store.sessions_root().to_path_buf(),
-        allow_full_copy,
-    };
-    let repo_root = repo_root.to_path_buf();
-    let ws_key = AgentRunId::new();
-    let ws_thread = ws_key.0;
-    let materialized = tokio::task::spawn_blocking(move || {
-        materialize_isolated_workspace(&repo_root, ws_thread, ws_key, &isolation)
-    })
-    .await;
-    let workspace = match materialized {
-        Ok(Ok(workspace)) => workspace,
-        Ok(Err(err)) => {
-            return finalize_terminal(
-                store,
-                run_id,
-                &run_dir,
-                &mut state,
-                InvestigateTerminalState::Error,
-                redaction,
-                Some(format!("workspace materialization failed: {err}")),
-                started,
-            );
+    // Checkpoint scope (PD-02): the investigators' workspace is the
+    // checkpoint's own materialized content inside the run directory —
+    // no worktree snapshot exists at all, and resumes re-materialize
+    // from the persisted spec.
+    let mut guard;
+    let workspace_root;
+    if let Some(spec) = state.checkpoint_input.clone() {
+        let storage = repo_root.join(crate::utils::util::ROOT_DIR);
+        match crate::internal::ai::checkpoint_input::materialize_checkpoint_input(
+            &storage, &spec, &run_dir,
+        ) {
+            Ok(root) => {
+                guard = InvestigateWorkspaceGuard { workspace: None };
+                workspace_root = root;
+            }
+            Err(err) => {
+                return finalize_terminal(
+                    store,
+                    run_id,
+                    &run_dir,
+                    &mut state,
+                    InvestigateTerminalState::Error,
+                    redaction,
+                    Some(format!("checkpoint input materialization failed: {err}")),
+                    started,
+                );
+            }
         }
-        Err(join_err) => {
-            return finalize_terminal(
-                store,
-                run_id,
-                &run_dir,
-                &mut state,
-                InvestigateTerminalState::Error,
-                redaction,
-                Some(format!(
-                    "workspace materialization task panicked: {join_err}"
-                )),
-                started,
-            );
-        }
-    };
-    let mut guard = InvestigateWorkspaceGuard {
-        workspace: Some(workspace),
-    };
-    let workspace_root = guard
-        .workspace
-        .as_ref()
-        .map(|ws| ws.root().to_path_buf())
-        .unwrap_or_default();
+    } else {
+        let fuse_state = FuseProvisionState::default();
+        let _ = fuse_state.disable_first_time();
+        let isolation = WorkspaceIsolationConfig {
+            fuse_state,
+            sessions_root: store.sessions_root().to_path_buf(),
+            allow_full_copy,
+        };
+        let repo_root = repo_root.to_path_buf();
+        let ws_key = AgentRunId::new();
+        let ws_thread = ws_key.0;
+        let materialized = tokio::task::spawn_blocking(move || {
+            materialize_isolated_workspace(&repo_root, ws_thread, ws_key, &isolation)
+        })
+        .await;
+        let workspace = match materialized {
+            Ok(Ok(workspace)) => workspace,
+            Ok(Err(err)) => {
+                return finalize_terminal(
+                    store,
+                    run_id,
+                    &run_dir,
+                    &mut state,
+                    InvestigateTerminalState::Error,
+                    redaction,
+                    Some(format!("workspace materialization failed: {err}")),
+                    started,
+                );
+            }
+            Err(join_err) => {
+                return finalize_terminal(
+                    store,
+                    run_id,
+                    &run_dir,
+                    &mut state,
+                    InvestigateTerminalState::Error,
+                    redaction,
+                    Some(format!(
+                        "workspace materialization task panicked: {join_err}"
+                    )),
+                    started,
+                );
+            }
+        };
+        guard = InvestigateWorkspaceGuard {
+            workspace: Some(workspace),
+        };
+        workspace_root = guard
+            .workspace
+            .as_ref()
+            .map(|ws| ws.root().to_path_buf())
+            .unwrap_or_default();
+    }
+    // Record on BOTH the persisted file (so an orphaned-run cancel can
+    // release the directory mid-run) and the in-memory state this drive
+    // later finalizes with (whole-file overwrite — losing the field at
+    // finalization would hide the materialized root from post-run
+    // consumers).
+    state.workspace_root = Some(workspace_root.display().to_string());
     store.update_state(run_id, |state| {
         state.workspace_root = Some(workspace_root.display().to_string());
     })?;

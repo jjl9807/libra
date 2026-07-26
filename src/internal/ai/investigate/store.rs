@@ -287,6 +287,13 @@ pub struct InvestigateRunState {
     /// investigators spawn so an orphaned run can be cleaned up).
     #[serde(default)]
     pub workspace_root: Option<String>,
+    /// PD-02 checkpoint scope: when set, every drive pass (including
+    /// `investigate continue` resumes) materializes THIS checkpoint's
+    /// content as the investigators' whole workspace instead of a
+    /// worktree snapshot. Persisted so a resume can never silently fall
+    /// back to reviewing the current worktree.
+    #[serde(default)]
+    pub checkpoint_input: Option<crate::internal::ai::checkpoint_input::CheckpointInputSpec>,
 }
 
 impl InvestigateRunState {
@@ -501,6 +508,7 @@ impl InvestigateRunStore {
             terminal_state: None,
             cancel_requested: false,
             workspace_root: None,
+            checkpoint_input: None,
         };
         let manifest = InvestigateManifest {
             schema_version: INVESTIGATE_MANIFEST_SCHEMA_VERSION,

@@ -39,8 +39,14 @@ reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中
   `clean [--run <id>|--all]`。全局 `--json` 输出结构化 envelope。
 - `target_scope` 推导（纯函数，单测钉死）：默认 `HEAD~1..HEAD`；
   `--since <rev>` → `<rev>..HEAD`；`--checkpoint <id>` → `checkpoint:<id>`
-  （checkpoint 物化未实现前 fail-closed 拒绝执行，避免在 checkpoint 标签下
-  静默 review 当前工作区——codex A7 R4 裁定）。
+  （PD-02 已落地：命令层先经 `checkpoint.rs::resolve_checkpoint_input_spec`
+  解析并验证 checkpoint——不存在/树非法/blob 不在本地对象库时在创建任何 run
+  之前 fail-closed；随后 runner 把 checkpoint 的整个 inner tree 以只读文件
+  物化到 `<run_dir>/checkpoint-input/`（`internal::ai::checkpoint_input`，
+  单文件 64 MiB / 总量 256 MiB 上限，路径组件消毒防逃逸），并把该目录作为
+  reviewer 的**全部** workspace——完全不物化 worktree 快照，scoped prompt
+  明确声明这是捕获的 transcript 而非仓库快照，transcript 内容按不可信数据
+  对待。物化产物在 run 目录内，与 run 共享 retention/orphan-release 面）。
   scope 只是记录在 state/manifest 中的人类可读标签；prompt 用 spotlighting
   定界把它作为数据（非指令）注入固定指令文本。
 - 输出与错误契约：全部经 `OutputConfig` / `emit_json_data` / `CliError`；

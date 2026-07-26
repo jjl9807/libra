@@ -62,6 +62,7 @@ EXAMPLES:
     libra investigate start --topic \"why is startup slow\" --agent codex        Start a round-robin investigation with one agent
     libra investigate start --topic \"auth bug\" --agent codex --agent claude-code  Round-robin across two agents (strict, one at a time)
     libra investigate start --topic \"leak\" --agent codex --max-turns 8 --quorum 2  Bound turns and require 2 concluding agents
+    libra investigate start --topic \"replay\" --agent codex --checkpoint <id>   Investigate a captured checkpoint's transcript (read-only input)
     libra investigate list                                     List investigate runs, newest first (default 50 per page)
     libra investigate list --limit 10 --cursor <token>        Next keyset page (token = previous page's next_cursor)
     libra investigate show <run_id>                           State, stances and sanitized findings
@@ -146,6 +147,14 @@ pub struct InvestigateStartArgs {
     /// the run to reach quorum (default: the number of agents).
     #[arg(long, value_name = "N")]
     pub quorum: Option<u32>,
+    /// Scope the investigation to the content captured by an agent
+    /// checkpoint (see `libra agent checkpoint list`): the investigators'
+    /// workspace is the checkpoint's materialized transcript/metadata
+    /// (read-only), never the current worktree. A missing or
+    /// non-materializable checkpoint fails closed before any run is
+    /// created.
+    #[arg(long, value_name = "ID")]
+    pub checkpoint: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -470,11 +479,20 @@ async fn start(args: InvestigateStartArgs, output: &OutputConfig) -> CliResult<(
             )
         })?;
 
+    // PD-02 checkpoint scope: resolve and validate BEFORE any run side
+    // effect — an unknown or non-materializable checkpoint fails closed
+    // with no run residue. The validated spec makes the materialized
+    // checkpoint content the investigators' entire workspace.
+    let checkpoint_input = match args.checkpoint.as_deref() {
+        Some(id) => Some(super::checkpoint::resolve_checkpoint_input_spec(id).await?),
+        None => None,
+    };
+
     let sources: Vec<InvestigatorSource> = agents
         .iter()
         .map(|slug| InvestigatorSource::Builtin { slug: slug.clone() })
         .collect();
-    let request = InvestigateRunRequest::new(
+    let mut request = InvestigateRunRequest::new(
         repo_root,
         args.topic.clone(),
         starting_sha,
@@ -482,6 +500,7 @@ async fn start(args: InvestigateStartArgs, output: &OutputConfig) -> CliResult<(
         max_turns,
         quorum,
     );
+    request.checkpoint_input = checkpoint_input;
 
     // A0-04: acquire a shared run-level admission slot (the same queue
     // `libra review` uses). Over `agent.max_concurrent_runs` this blocks in

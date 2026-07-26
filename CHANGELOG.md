@@ -4,6 +4,27 @@
 
 ### Added
 
+- **Checkpoint-scoped review/investigate (plan-20260714 PD-02)**:
+  `libra review --agent <slug> --checkpoint <id>` and
+  `libra investigate start --topic <text> --agent <slug> --checkpoint
+  <id>` now run against a captured agent checkpoint instead of failing
+  closed. The reviewers'/investigators' whole workspace is the
+  checkpoint's own content — `metadata.json`, an optional
+  `manifest.json`, and the transcript files — materialized READ-ONLY
+  under the run directory (`<run_dir>/checkpoint-input/`, per-file
+  64 MiB / 256 MiB total caps, path-component sanitization). No
+  repository snapshot is materialized at all, so a scoped run can only
+  consume the named checkpoint, and the scoped prompt frames the
+  content as a captured transcript whose text is untrusted data — never
+  a worktree diff. A missing checkpoint, malformed checkpoint tree, or
+  content absent from the local object store fails closed BEFORE any
+  run is created (no run residue). The investigate scope persists in
+  the run state, so `investigate continue` re-materializes the SAME
+  checkpoint and can never fall back to the current worktree; the
+  materialization shares the run's retention (`review/investigate
+  clean`) and orphan-release surface, and `agent doctor` reports zero
+  new findings for scoped runs.
+
 - **`status` io_blocked partial contract, frozen warning schema, exit
   arbitration, and the non-UTF-8 posture (plan-20260714 R0-8/R0-9)**: a
   path `status` cannot inspect (EACCES/I-O failure) is no longer
