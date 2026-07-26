@@ -600,3 +600,40 @@ fn git_binary_rename_mode_patches_apply_with_libra_am() {
         assert_eq!(mode & 0o111, 0o111, "mode-only patch applied: {mode:o}");
     }
 }
+
+/// PD-09 ④ gate: real `git format-patch --attach` multipart output
+/// applies with `libra am`. Skips when git is not installed.
+#[test]
+fn git_format_patch_attach_applies_with_libra_am() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the --attach round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-attach-source");
+    fixture.git_commit(&source, "base\n", "base");
+    fixture.git_commit(&source, "base\nattached from git\n", "git attach change");
+    let patch = fixture.git_success(&source, &["format-patch", "-1", "--attach", "--stdout"]);
+    let patch_path = fixture.root.join("git-attach.patch");
+    fs::write(&patch_path, &patch.stdout).expect("write git attach mail");
+
+    let target = fixture.init_libra("libra-attach-target");
+    fixture.libra_commit(&target, "base\n", "base");
+    fixture.libra_success(
+        &target,
+        &["am", patch_path.to_str().expect("utf8 mail path")],
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("file.txt")).expect("result"),
+        "base\nattached from git\n"
+    );
+    assert!(
+        String::from_utf8_lossy(&fixture.libra_success(&target, &["log", "-1"]).stdout)
+            .contains("git attach change")
+    );
+}

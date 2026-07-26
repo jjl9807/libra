@@ -4,6 +4,17 @@
 
 ### Added
 
+- **`am`/`mailinfo` MIME multipart mails (plan-20260714 PD-09 ④)**: the
+  shared mail parser now handles `multipart/mixed`/`alternative`
+  containers (nested, bounded depth) — parts split on the declared
+  boundary, every supported text part (`text/plain`, `text/x-patch`,
+  `text/x-diff`) decodes with its own transfer encoding
+  (7bit/8bit/base64/quoted-printable) and concatenates in order, HTML
+  alternatives and binary attachments are skipped, and a multipart mail
+  with no supported text part fails closed. `format-patch --attach`
+  output — Libra's own and real Git's (git-gated round-trip) — now
+  applies directly with `libra am`.
+
 - **`am -3`/`--3way` three-way fallback (plan-20260714 PD-09 ③)**: a
   text patch that does not apply falls back to a three-way merge — the
   base is the `index` header's old blob resolved from the local

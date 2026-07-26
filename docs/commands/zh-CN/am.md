@@ -29,7 +29,13 @@ quoting。`-` 从标准输入读取一封邮件或一个 mbox（最多出现一�
 变更（可执行位直接写入工作树并暂存）。所有扩展目标都经过同一 path-safety
 检查。
 
-最小 mail parser 接受 UTF-8、single-part 邮件，以及 `7bit`、`8bit`、`binary`、quoted-printable、base64 transfer encoding。它读取 `From:`、`Date:`、`Subject:`，清理前导 `[PATCH ...]`，支持标准 in-body `From:` 覆盖，并从 `---` 分隔线之后提取文本 `diff --git`。UTF-8/US-ASCII 的 RFC 2047 `B`/`Q` encoded word 会被解码。
+mail parser 接受 UTF-8 邮件与 `7bit`、`8bit`、`binary`、quoted-printable、
+base64 transfer encoding——single-part `text/plain`，或 MIME multipart 容器
+（`multipart/mixed`/`alternative`，嵌套有深度上限）：按声明的 boundary 切分，
+每个受支持的 text part（`text/plain`、`text/x-patch`、`text/x-diff`）按各自的
+transfer encoding 解码并按序拼接，HTML alternative 与二进制附件被跳过，没有任何
+受支持 text part 的 multipart 邮件 fail-closed。因此 `format-patch --attach`
+的输出可直接应用。它读取 `From:`、`Date:`、`Subject:`，清理前导 `[PATCH ...]`，支持标准 in-body `From:` 覆盖，并从 `---` 分隔线之后提取文本 `diff --git`。UTF-8/US-ASCII 的 RFC 2047 `B`/`Q` encoded word 会被解码。
 
 每个目标都会拒绝绝对路径、空/`.`/`..` 路径组件、NUL、`.libra/` 和已有 symlink 路径组件。单封邮件中的所有文件会先全部试应用，再进行第一次写入。文件替换使用原子 rename；内容补丁保留已有 permission bits。
 
@@ -83,4 +89,4 @@ libra am --abort
 
 ## 当前限制
 
-尚未达到完整 Git `am` parity。当前不接受 MIME multipart/attachment，也不公开 Git 的完整 flag 集（`--signoff`、`--keep`、`--scissors` 等）。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
+尚未达到完整 Git `am` parity。当前不公开 Git 的完整 flag 集（`--signoff`、`--keep`、`--scissors` 等）。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。

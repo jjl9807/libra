@@ -38,8 +38,15 @@ same commit), `copy from`/`copy to`, and mode-only `old mode`/`new mode`
 changes (the executable bit is applied to the worktree and staged
 directly). Every extended target passes the same path-safety checks.
 
-The minimal mail parser accepts UTF-8, single-part messages with `7bit`, `8bit`,
-`binary`, quoted-printable, or base64 transfer encoding. It reads `From:`,
+The mail parser accepts UTF-8 messages with `7bit`, `8bit`, `binary`,
+quoted-printable, or base64 transfer encoding — single-part `text/plain`,
+or MIME multipart containers (`multipart/mixed`/`alternative`, nested up
+to a bounded depth): parts are split on the declared boundary, every
+supported text part (`text/plain`, `text/x-patch`, `text/x-diff`) is
+decoded with its own transfer encoding and concatenated in order, HTML
+alternatives and binary attachments are skipped, and a multipart mail
+with no supported text part fails closed. `format-patch --attach` output
+therefore applies directly. It reads `From:`,
 `Date:`, and `Subject:`, removes a leading `[PATCH ...]` subject marker, honors
 the standard in-body `From:` override, and extracts the text `diff --git`
 section after the `---` separator. UTF-8/US-ASCII RFC 2047 `B` and `Q` encoded
@@ -112,6 +119,6 @@ libra am --abort
 
 ## Current limitations
 
-This is not yet full Git `am` parity. It does not accept MIME
-multipart/attached patches or Git's wider flag set (`--signoff`, `--keep`, `--scissors`, and others). Applypatch/commit hooks are not run. The shared parser is also
+This is not yet full Git `am` parity. It does not expose Git's wider
+flag set (`--signoff`, `--keep`, `--scissors`, and others). Applypatch/commit hooks are not run. The shared parser is also
 available as the standalone [`libra mailinfo`](mailinfo.md) command.

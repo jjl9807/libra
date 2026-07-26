@@ -1301,3 +1301,126 @@ fn three_way_without_local_base_keeps_plain_conflict() {
         "worktree untouched without a resolvable base"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PD-09 ④: MIME multipart / attachment mails
+// ---------------------------------------------------------------------------
+
+/// Libra's own `format-patch --attach` output (multipart/mixed with a
+/// text/x-patch attachment) round-trips through `libra am`.
+#[test]
+fn multipart_attach_self_roundtrip_applies() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("file.txt", "base\n", "base");
+    fixture.commit_file("file.txt", "base\nattached\n", "attached change");
+    let mail = fixture.success(
+        &fixture.repo,
+        &["format-patch", "-1", "--attach", "--stdout"],
+    );
+    let text = String::from_utf8_lossy(&mail.stdout).into_owned();
+    assert!(text.contains("multipart/mixed"), "{text}");
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], text.as_bytes());
+    assert_success(&["am", "-"], &out);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("result"),
+        "base\nattached\n"
+    );
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("attached change"),
+        "attached mail committed"
+    );
+}
+
+/// multipart/alternative: the HTML part is skipped, the text part (with
+/// the patch) applies; a base64 text attachment decodes per-part.
+#[test]
+fn multipart_alternative_skips_html_and_decodes_base64_part() {
+    use base64::Engine as _;
+
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("file.txt", "alpha\n", "base");
+
+    let patch_part = "\
+patch body message\n\
+---\n\
+ file.txt | 1 +\n\
+ 1 file changed, 1 insertion(+)\n\
+\n\
+diff --git a/file.txt b/file.txt\n\
+index 0000000..1111111 100644\n\
+--- a/file.txt\n\
++++ b/file.txt\n\
+@@ -1 +1,2 @@\n \
+alpha\n\
++beta\n";
+    let encoded_patch = base64::engine::general_purpose::STANDARD.encode(patch_part);
+    // Wrap base64 to 60-char lines like real mailers.
+    let wrapped: String = encoded_patch
+        .as_bytes()
+        .chunks(60)
+        .map(|chunk| format!("{}\n", std::str::from_utf8(chunk).unwrap()))
+        .collect();
+    let mail = format!(
+        "From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001\n\
+         From: Crafted Author <crafted@example.com>\n\
+         Date: Thu, 1 Jan 2026 00:00:00 +0000\n\
+         Subject: [PATCH] alternative parts\n\
+         Content-Type: multipart/alternative; boundary=\"=-=alt boundary=-=\"\n\
+         \n\
+         preamble to be ignored\n\
+         --=-=alt boundary=-=\n\
+         Content-Type: text/html; charset=utf-8\n\
+         \n\
+         <p>HTML that must never be parsed as a patch</p>\n\
+         --=-=alt boundary=-=\n\
+         Content-Type: text/plain; charset=utf-8\n\
+         Content-Transfer-Encoding: base64\n\
+         \n\
+         {wrapped}\
+         --=-=alt boundary=-=--\n"
+    );
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], mail.as_bytes());
+    assert_success(&["am", "-"], &out);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("result"),
+        "alpha\nbeta\n"
+    );
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(text.contains("patch body message"), "{text}");
+    assert!(!text.contains("HTML"), "html part never leaks: {text}");
+}
+
+/// A multipart mail whose only parts are unsupported (binary/html)
+/// fails closed with an actionable message.
+#[test]
+fn multipart_without_text_part_fails_closed() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("file.txt", "alpha\n", "base");
+    let mail = "\
+From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001\n\
+From: Crafted Author <crafted@example.com>\n\
+Date: Thu, 1 Jan 2026 00:00:00 +0000\n\
+Subject: [PATCH] no text part\n\
+Content-Type: multipart/mixed; boundary=\"bb\"\n\
+\n\
+--bb\n\
+Content-Type: application/octet-stream\n\
+Content-Transfer-Encoding: base64\n\
+\n\
+AAAA\n\
+--bb--\n";
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], mail.as_bytes());
+    assert!(!out.status.success(), "no text part must fail closed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no supported text part"),
+        "actionable refusal: {stderr}"
+    );
+}
