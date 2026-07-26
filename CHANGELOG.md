@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added (Part C W4)
+
+- **`libra agent workspace list|show` (plan-20260714 Part C W4 machine
+  interface)**: the read-only surface over the W4 workspace registry —
+  keyset-paginated `list` (`workspace_id` ASC, default limit 50 capped
+  at 500, opaque `next_cursor`, repeatable `--state` filters) and a
+  by-id `show`, both emitting frozen schema-v1 records (kind, state,
+  owner, lease fence/expiry, canonical path, task/session
+  associations). Lease mutation stays internal to the agent runtime
+  services.
+
 ### Fixed
 
 ### Added (PD-03)

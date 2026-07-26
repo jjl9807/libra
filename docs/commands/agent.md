@@ -18,6 +18,8 @@ libra agent checkpoint <subcommand>
 libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
+libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
+libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
 ```
@@ -27,6 +29,17 @@ libra agent rpc <subcommand>
 `libra agent` manages Libra's external-agent capture surface. It installs and
 removes provider hooks, reports captured session/checkpoint state, exposes
 read-only diagnostics, and can push `refs/libra/traces` to a remote.
+
+`libra agent workspace list|show` is the read-only machine interface over
+the workspace registry (`workspace_record`): every linked worktree, task
+worktree, or remote workspace an agent runtime has associated, with its
+lifecycle state (`provisioning`/`active`/`releasing`/`released`/
+`orphaned`), owner, lease fence/expiry, and canonical path. `list` uses
+keyset pagination (`workspace_id` ascending; default `--limit 50`, capped
+at 500; round-trip `next_cursor` verbatim) and accepts repeatable
+`--state` filters; `show <workspace-id>` returns one frozen
+schema-v1 record. Lease mutation is never exposed here — it stays inside
+the agent runtime's internal services.
 
 The supported roster is `claude-code`, `codex` and `opencode` (first batch),
 and all three are hook-installable: `claude-code` writes `.claude/settings.json`,
