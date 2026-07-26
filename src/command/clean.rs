@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 use clap::Parser;
@@ -13,7 +13,9 @@ use crate::utils::{
     error::{CliError, CliResult, StableErrorCode},
     ignore::{self, IgnorePolicy},
     output::{OutputConfig, emit_json_data},
-    path, util, worktree,
+    path,
+    pathspec::PathspecSet,
+    util, worktree,
 };
 
 const CLEAN_EXAMPLES: &str = "\
@@ -49,7 +51,9 @@ pub struct CleanArgs {
     /// Exclude files matching the given pattern (can be repeated)
     #[clap(short = 'e', long = "exclude", value_name = "pattern")]
     pub exclude: Vec<String>,
-    /// Limit cleaning to paths matching the given pathspecs (file or directory prefix match)
+    /// Limit cleaning to paths matching the given pathspecs (shared engine:
+    /// glob, `:(exclude)`, `:(top)`, `:(icase)`, `:(literal)`, `:(glob)`,
+    /// subdirectory-relative semantics — same matcher as ls-files/status)
     #[clap(value_name = "pathspec")]
     pub pathspec: Vec<String>,
 }
@@ -100,7 +104,41 @@ pub async fn execute(args: CleanArgs) {
 /// fails.
 pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
-    let clean_output = run_clean(args).map_err(clean_cli_error)?;
+
+    // PD-07: compile <pathspec>... through the shared engine (same matcher
+    // semantics as ls-files/status, add/rm parity for write commands). The
+    // compile happens before any filesystem work so invalid magic fails
+    // closed, and the empty string stays rejected — under a full-tree
+    // fallback it would silently widen the DELETION set.
+    let pathspecs = if args.pathspec.is_empty() {
+        None
+    } else {
+        if args.pathspec.iter().any(|raw| raw.is_empty()) {
+            return Err(clean_cli_error(CleanError::InvalidArgs(
+                "empty string is not a valid pathspec".to_string(),
+            )));
+        }
+        let current_dir = std::env::current_dir()
+            .map_err(|error| clean_cli_error(CleanError::ResolveWorkdir(error.to_string())))?;
+        let workdir = util::working_dir();
+        let ignore_case = crate::utils::path_case::effective_ignore_case()
+            .await
+            .map_err(|error| clean_cli_error(CleanError::ResolveWorkdir(error.to_string())))?;
+        Some(
+            PathspecSet::from_workdir_with_default_icase(
+                &args.pathspec,
+                &current_dir,
+                &workdir,
+                ignore_case,
+            )
+            .map_err(|error| {
+                clean_cli_error(CleanError::InvalidArgs(error.to_string()))
+                    .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob")
+            })?,
+        )
+    };
+
+    let clean_output = run_clean(args, pathspecs).map_err(clean_cli_error)?;
 
     if output.is_json() {
         emit_json_data("clean", &clean_output, output)?;
@@ -117,7 +155,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
     Ok(())
 }
 
-fn run_clean(args: CleanArgs) -> Result<CleanOutput, CleanError> {
+fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOutput, CleanError> {
     if !args.force && !args.dry_run {
         return Err(CleanError::MissingMode);
     }
@@ -128,13 +166,6 @@ fn run_clean(args: CleanArgs) -> Result<CleanOutput, CleanError> {
             "cannot use -x and -X together".to_string(),
         ));
     }
-
-    // Validate pathspec arguments early so invalid input fails before filesystem work.
-    let normalized_pathspecs: Vec<PathBuf> = args
-        .pathspec
-        .iter()
-        .map(|ps| validate_pathspec(ps))
-        .collect::<Result<Vec<_>, _>>()?;
 
     let index_path = path::index();
     let index = match Index::load(&index_path) {
@@ -208,13 +239,13 @@ fn run_clean(args: CleanArgs) -> Result<CleanOutput, CleanError> {
         });
     }
 
-    // Apply <pathspec>... limiting (file or directory prefix match).
-    if !normalized_pathspecs.is_empty() {
-        untracked.retain(|path| {
-            normalized_pathspecs
-                .iter()
-                .any(|ps| path == ps || path.starts_with(ps))
-        });
+    // PD-07: apply <pathspec>... limiting through the shared engine. The
+    // SAME filtered list feeds both the -n preview and the -f deletion pass
+    // below, so the preview set is definitionally the deletion set; a
+    // pathspec (including `:(exclude)` magic) can only NARROW the
+    // untracked-only candidate list built above, never widen it.
+    if let Some(pathspecs) = &pathspecs {
+        untracked.retain(|path| pathspecs.matches_path(path));
     }
 
     if untracked.is_empty() {
@@ -341,32 +372,6 @@ fn find_untracked_dirs(index: &Index, policy: IgnorePolicy) -> Result<Vec<PathBu
 
     scan_dir(&workdir, &workdir, index, policy, &mut untracked_dirs)?;
     Ok(untracked_dirs)
-}
-
-/// Validate a clean pathspec: must be non-empty, relative, and free of `..`
-/// or root components so it cannot escape the working tree.
-fn validate_pathspec(pathspec: &str) -> Result<PathBuf, CleanError> {
-    if pathspec.is_empty() {
-        return Err(CleanError::InvalidArgs(
-            "clean pathspec must not be empty".to_string(),
-        ));
-    }
-
-    let path = Path::new(pathspec);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(CleanError::InvalidArgs(format!(
-            "invalid clean pathspec '{pathspec}': use a relative path without '..'"
-        )));
-    }
-
-    Ok(path.to_path_buf())
 }
 
 /// Check if a path matches an exclude pattern using glob-style matching.

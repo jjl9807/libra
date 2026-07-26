@@ -15,7 +15,7 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 
 默认情况下，只移除文件，并遵守共享 Git/Libra ignore 来源（忽略文件会被跳过）：`.gitignore`、`.git/info/exclude`、`core.excludesFile` 与 `.libraignore`——就近目录优先，同目录 `.libraignore` 高于 `.gitignore`；完整优先级见 [check-ignore.md](check-ignore.md)。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
 
-可选 pathspec 会将 clean 候选限制为匹配的未跟踪文件或目录前缀。这是 `clean` 当前使用的字面前缀匹配器；`:(exclude)` / `:(glob)` 等共享 pathspec magic 尚未对删除路径启用。
+可选 pathspec 通过共享 pathspec 引擎限制 clean 候选——与 `ls-files`/`status` 及写命令（`add`/`rm`/`restore`）同一 matcher：glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)` 与子目录相对语义。删除面按构造保持安全：候选恒为 untracked-only，exclusion magic 只能收窄集合，`-n` 预览集与 `-f` 实删集完全相同，空字符串 pathspec 被拒绝而不会扩大为全树。
 
 ## 选项
 
@@ -27,7 +27,7 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 | Include ignored | `-x` | | 移除未跟踪文件，**包括**被 ignore 规则匹配的文件。 |
 | Only ignored | `-X` | | **仅**移除被 ignore 规则匹配的未跟踪文件。 |
 | Exclude | `-e` | `--exclude <pattern>` | 添加额外排除模式；可重复。 |
-| Pathspec | | 位置参数 | 将候选限制为匹配文件或目录前缀。`clean` 尚未启用共享 pathspec magic。 |
+| Pathspec | | 位置参数 | 通过共享 pathspec 引擎限制候选（glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)`、子目录相对语义）。exclusion 只会收窄删除集。 |
 | JSON | | `--json` | 输出结构化 JSON（见下方）。 |
 | Quiet | | `--quiet` | 抑制所有人类可读 stdout。 |
 
@@ -162,7 +162,7 @@ Git 的交互式 clean 模式会显示菜单来选择文件。Libra 面向 AI �
 | 交互模式 | 不支持 | `-i` | N/A |
 | Quiet 模式 | `--quiet` | `-q` / `--quiet` | N/A |
 | JSON 输出 | `--json` | 不支持 | N/A |
-| Pathspec 过滤 | 字面文件/目录前缀 pathspec | `<pathspec>...` | N/A |
+| Pathspec 过滤 | 共享 pathspec 引擎（glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)`） | `<pathspec>...` | N/A |
 | Require force 配置 | 始终要求 | `clean.requireForce`（默认 true） | N/A |
 
 注意：jj 没有 `clean` 命令，因为其工作副本模型会自动跟踪所有文件，未跟踪文件不是 jj 数据模型中的概念。

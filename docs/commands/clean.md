@@ -28,10 +28,13 @@ removed. Every candidate path is canonicalized and verified to reside
 inside the worktree root before deletion, preventing symlink-escape
 attacks.
 
-Optional pathspecs limit cleaning to matching untracked files or directory
-prefixes. This is the current literal prefix matcher used by `clean`; shared
-pathspec magic such as `:(exclude)` / `:(glob)` is not enabled for deletion
-paths yet.
+Optional pathspecs limit cleaning through the shared pathspec engine — the
+same matcher `ls-files`/`status` and the write commands (`add`/`rm`/`restore`)
+use: glob patterns, `:(exclude)`, `:(top)`, `:(icase)`, `:(literal)`,
+`:(glob)`, and subdirectory-relative semantics. Deletion stays safe by
+construction: candidates are always untracked-only, exclusion magic can only
+narrow the set, the `-n` preview set is exactly the `-f` deletion set, and an
+empty-string pathspec is rejected rather than widening to the whole tree.
 
 ## Options
 
@@ -43,7 +46,7 @@ paths yet.
 | Include ignored | `-x` | | Remove untracked files **including** those matched by ignore rules. |
 | Only ignored | `-X` | | Remove **only** untracked files that are matched by ignore rules. |
 | Exclude | `-e` | `--exclude <pattern>` | Add an extra exclusion pattern; may be repeated. |
-| Pathspec | | positional | Limit candidates to matching files or directory prefixes. Shared pathspec magic is not enabled for `clean` yet. |
+| Pathspec | | positional | Limit candidates through the shared pathspec engine (glob, `:(exclude)`, `:(top)`, `:(icase)`, `:(literal)`, `:(glob)`, subdirectory-relative). Exclusions only narrow the deletion set. |
 | JSON | | `--json` | Emit structured JSON output (see below). |
 | Quiet | | `--quiet` | Suppress all human-readable stdout. |
 
@@ -206,7 +209,7 @@ safety guarantees while restoring parity with `git clean`.
 | Interactive mode | Not supported | `-i` | N/A |
 | Quiet mode | `--quiet` | `-q` / `--quiet` | N/A |
 | JSON output | `--json` | Not supported | N/A |
-| Pathspec filter | Literal file/directory prefix pathspecs | `<pathspec>...` | N/A |
+| Pathspec filter | Shared pathspec engine (glob, `:(exclude)`, `:(top)`, `:(icase)`, `:(literal)`, `:(glob)`) | `<pathspec>...` | N/A |
 | Require force config | Always required | `clean.requireForce` (default true) | N/A |
 
 Note: jj does not have a `clean` command because its working-copy model
