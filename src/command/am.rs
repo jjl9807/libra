@@ -10,7 +10,10 @@ use std::{collections::HashSet, fs, str::FromStr};
 use clap::Parser;
 use git_internal::{
     hash::ObjectHash,
-    internal::{index::Index, object::commit::Commit},
+    internal::{
+        index::{Index, IndexEntry},
+        object::commit::Commit,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -363,6 +366,7 @@ async fn apply_remaining(
                 );
             }
         };
+        let mode_overrides = prepared.mode_overrides();
         prepared.write().map_err(|detail| {
             am_state_error(format!("cannot apply '{}': {detail}", mail.source))
                 .with_hint("fix and stage the affected paths, then run 'libra am --continue'")
@@ -375,6 +379,7 @@ async fn apply_remaining(
             .with_hint("run 'libra am --abort' to restore the original branch"));
         }
         stage_targets(&mail.targets).await?;
+        stage_mode_overrides(&mode_overrides)?;
         ensure_resolution_staged(&mail.targets).await?;
         applied.push(commit_current(state, mail).await?);
         if state.payload.current < state.payload.patches.len()
@@ -611,6 +616,54 @@ async fn recovery_state_is_pristine(targets: &[String]) -> CliResult<bool> {
 
 fn test_failpoint_enabled(name: &str) -> bool {
     std::env::var_os("LIBRA_TEST").is_some() && std::env::var_os(name).is_some()
+}
+
+/// PD-09 ②: force the index modes a patch's `old mode`/`new mode`/`new
+/// file mode` headers demand. The regular add path cannot do this — a
+/// mode-only flip leaves content unchanged, so the worktree-change scan
+/// never re-stages the file.
+fn stage_mode_overrides(overrides: &[(String, u32)]) -> CliResult<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    let index_path = path::index();
+    let mut index = Index::load(&index_path)
+        .map_err(|error| am_state_error(format!("failed to load the index for am: {error}")))?;
+    let workdir = util::working_dir();
+    let mut changed = false;
+    for (target, mode) in overrides {
+        let Some((current_mode, hash)) = index.get(target, 0).map(|entry| (entry.mode, entry.hash))
+        else {
+            continue;
+        };
+        // Only regular blobs carry an executable bit.
+        if current_mode & 0o170000 != 0o100000 {
+            continue;
+        }
+        let wanted = if mode & 0o111 != 0 {
+            0o100755
+        } else {
+            0o100644
+        };
+        if current_mode == wanted {
+            continue;
+        }
+        let mut updated = IndexEntry::new_from_file(std::path::Path::new(target), hash, &workdir)
+            .map_err(|error| {
+            am_state_error(format!(
+                "failed to restage mode for am target '{target}': {error}"
+            ))
+        })?;
+        updated.mode = wanted;
+        index.update(updated);
+        changed = true;
+    }
+    if changed {
+        index.save(&index_path).map_err(|error| {
+            am_state_error(format!("failed to save index mode changes for am: {error}"))
+        })?;
+    }
+    Ok(())
 }
 
 async fn stage_targets(targets: &[String]) -> CliResult<()> {

@@ -859,3 +859,301 @@ fn stdin_mbox_conflict_state_persists_and_aborts() {
         "diverged\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PD-09 ②: binary / rename / copy / mode-only patch sections
+// ---------------------------------------------------------------------------
+
+/// Compose a minimal format-patch-shaped mail around raw diff sections.
+fn craft_mail(subject: &str, sections: &str) -> String {
+    format!(
+        "From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001\n\
+         From: Crafted Author <crafted@example.com>\n\
+         Date: Thu, 1 Jan 2026 00:00:00 +0000\n\
+         Subject: [PATCH] {subject}\n\
+         \n\
+         ---\n\
+         {sections}\
+         -- \n\
+         2.43.0\n"
+    )
+}
+
+const TEST_B85: &[u8; 85] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~";
+
+/// Test-side encoder for a `GIT binary patch` forward hunk (zlib deflate
+/// + git base85 with per-line length chars), mirroring git's writer.
+fn binary_hunk(kind: &str, payload: &[u8]) -> String {
+    use std::io::Write as _;
+
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(payload).expect("deflate payload");
+    let deflated = encoder.finish().expect("finish deflate");
+
+    let mut out = format!("GIT binary patch\n{kind} {}\n", payload.len());
+    for chunk in deflated.chunks(52) {
+        let len_char = if chunk.len() <= 26 {
+            (b'A' + chunk.len() as u8 - 1) as char
+        } else {
+            (b'a' + chunk.len() as u8 - 27) as char
+        };
+        out.push(len_char);
+        for group in chunk.chunks(4) {
+            let mut buf = [0u8; 4];
+            buf[..group.len()].copy_from_slice(group);
+            let mut acc = u32::from_be_bytes(buf);
+            let mut chars = [0u8; 5];
+            for slot in (0..5).rev() {
+                chars[slot] = TEST_B85[(acc % 85) as usize];
+                acc /= 85;
+            }
+            out.push_str(std::str::from_utf8(&chars).expect("ascii"));
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
+fn delta_varint(mut value: u64, out: &mut Vec<u8>) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// A git pack delta that copies `copy_len` bytes from the base start and
+/// then inserts `tail`.
+fn git_delta(base: &[u8], copy_len: usize, tail: &[u8]) -> Vec<u8> {
+    let mut delta = Vec::new();
+    delta_varint(base.len() as u64, &mut delta);
+    delta_varint((copy_len + tail.len()) as u64, &mut delta);
+    // Copy op: offset 0 (no offset bytes), size in one byte (bit 0x10).
+    assert!(copy_len > 0 && copy_len < 256, "test copy fits one byte");
+    delta.push(0x80 | 0x10);
+    delta.push(copy_len as u8);
+    // Insert ops in <=127-byte chunks.
+    for chunk in tail.chunks(127) {
+        delta.push(chunk.len() as u8);
+        delta.extend_from_slice(chunk);
+    }
+    delta
+}
+
+/// Binary literal patch: a new file materializes byte-identical content
+/// (NUL bytes included), then a delta patch rewrites its tail.
+#[test]
+fn binary_literal_and_delta_patches_apply() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("file.txt", "base\n", "base");
+
+    let payload: Vec<u8> = (0u8..=255).cycle().take(700).collect();
+    let add = craft_mail(
+        "add binary blob",
+        &format!(
+            "diff --git a/blob.bin b/blob.bin\n\
+             new file mode 100644\n\
+             index 0000000..1111111\n\
+             {}",
+            binary_hunk("literal", &payload)
+        ),
+    );
+    let mail_path = fixture.root.join("binary-add.patch");
+    fs::write(&mail_path, &add).expect("write binary mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "binary-add"], &out);
+    assert_eq!(
+        fs::read(fixture.repo.join("blob.bin")).expect("blob written"),
+        payload,
+        "literal payload lands byte-identical"
+    );
+
+    // Delta: keep the first 128 bytes, replace the rest.
+    let tail: Vec<u8> = b"DELTA-TAIL".iter().copied().cycle().take(90).collect();
+    let delta = git_delta(&payload, 128, &tail);
+    let mut expected = payload[..128].to_vec();
+    expected.extend_from_slice(&tail);
+    let edit = craft_mail(
+        "rewrite binary blob",
+        &format!(
+            "diff --git a/blob.bin b/blob.bin\n\
+             index 1111111..2222222 100644\n\
+             {}",
+            binary_hunk("delta", &delta)
+        ),
+    );
+    let mail_path = fixture.root.join("binary-delta.patch");
+    fs::write(&mail_path, &edit).expect("write delta mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "binary-delta"], &out);
+    assert_eq!(
+        fs::read(fixture.repo.join("blob.bin")).expect("blob rewritten"),
+        expected,
+        "delta result matches copy+insert reconstruction"
+    );
+}
+
+/// A pure rename section moves the file; a rename with hunks moves AND
+/// edits; the rename source deletion is staged in the same commit.
+#[test]
+fn rename_sections_move_and_edit() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("old-name.txt", "alpha\nbeta\n", "base");
+
+    let pure = craft_mail(
+        "pure rename",
+        "diff --git a/old-name.txt b/new-name.txt\n\
+         similarity index 100%\n\
+         rename from old-name.txt\n\
+         rename to new-name.txt\n",
+    );
+    let mail_path = fixture.root.join("rename-pure.patch");
+    fs::write(&mail_path, &pure).expect("write rename mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "rename-pure"], &out);
+    assert!(
+        !fixture.repo.join("old-name.txt").exists(),
+        "source removed"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("new-name.txt")).expect("dest exists"),
+        "alpha\nbeta\n"
+    );
+    // The commit records both sides (source deletion staged too).
+    let show = fixture.success(&fixture.repo, &["show", "--name-status", "HEAD"]);
+    let text = String::from_utf8_lossy(&show.stdout).into_owned();
+    assert!(text.contains("old-name.txt"), "{text}");
+    assert!(text.contains("new-name.txt"), "{text}");
+
+    let edited = craft_mail(
+        "rename with edit",
+        "diff --git a/new-name.txt b/final-name.txt\n\
+         similarity index 66%\n\
+         rename from new-name.txt\n\
+         rename to final-name.txt\n\
+         --- a/new-name.txt\n\
+         +++ b/final-name.txt\n\
+         @@ -1,2 +1,2 @@\n \
+         alpha\n\
+         -beta\n\
+         +gamma\n",
+    );
+    let mail_path = fixture.root.join("rename-edit.patch");
+    fs::write(&mail_path, &edited).expect("write rename-edit mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "rename-edit"], &out);
+    assert!(!fixture.repo.join("new-name.txt").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("final-name.txt")).expect("dest exists"),
+        "alpha\ngamma\n"
+    );
+}
+
+/// A copy section duplicates the source (which stays) and a mode-only
+/// section flips the executable bit without content changes.
+#[test]
+fn copy_and_mode_only_sections_apply() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("tool.sh", "#!/bin/sh\necho ok\n", "base");
+
+    let copy = craft_mail(
+        "copy the tool",
+        "diff --git a/tool.sh b/tool-copy.sh\n\
+         similarity index 100%\n\
+         copy from tool.sh\n\
+         copy to tool-copy.sh\n",
+    );
+    let mail_path = fixture.root.join("copy.patch");
+    fs::write(&mail_path, &copy).expect("write copy mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "copy"], &out);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("tool.sh")).expect("source stays"),
+        "#!/bin/sh\necho ok\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("tool-copy.sh")).expect("copy exists"),
+        "#!/bin/sh\necho ok\n"
+    );
+
+    let chmod = craft_mail(
+        "make the tool executable",
+        "diff --git a/tool.sh b/tool.sh\n\
+         old mode 100644\n\
+         new mode 100755\n",
+    );
+    let mail_path = fixture.root.join("mode.patch");
+    fs::write(&mail_path, &chmod).expect("write mode mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "mode-only"], &out);
+    let mode = fs::metadata(fixture.repo.join("tool.sh"))
+        .expect("stat tool")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "executable bit set: {mode:o}");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("tool.sh")).expect("content unchanged"),
+        "#!/bin/sh\necho ok\n"
+    );
+}
+
+/// The path-safety refusal surface does not shrink for the new section
+/// kinds: rename destinations still reject escapes and `.libra`.
+#[test]
+fn extended_sections_keep_path_safety() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("safe.txt", "content\n", "base");
+
+    for (label, to) in [("escape", "../escape.txt"), ("internal", ".libra/hook.sh")] {
+        let mail = craft_mail(
+            "hostile rename",
+            &format!(
+                "diff --git a/safe.txt b/{to}\n\
+                 similarity index 100%\n\
+                 rename from safe.txt\n\
+                 rename to {to}\n"
+            ),
+        );
+        let mail_path = fixture.root.join(format!("hostile-{label}.patch"));
+        fs::write(&mail_path, &mail).expect("write hostile mail");
+        let out = fixture.run(
+            &fixture.repo,
+            &["am", mail_path.to_str().expect("utf8 path")],
+        );
+        assert!(!out.status.success(), "{label}: hostile rename must fail");
+        assert!(
+            fixture.repo.join("safe.txt").exists(),
+            "{label}: source untouched after refusal"
+        );
+    }
+}

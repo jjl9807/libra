@@ -522,3 +522,81 @@ fn git_format_patch_stdout_mbox_applies_with_libra_am_stdin() {
     assert!(log.contains("mbox change one"), "{log}");
     assert!(log.contains("mbox change two"), "{log}");
 }
+
+/// PD-09 ② gate: real `git format-patch --binary` output — binary add,
+/// rename, and a mode flip — applies with `libra am`. Skips when git is
+/// not installed.
+#[test]
+fn git_binary_rename_mode_patches_apply_with_libra_am() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the extended-patch round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-ext-source");
+    fixture.git_commit(&source, "base\n", "base");
+
+    // Commit 1: add a binary blob (NUL bytes force binary detection).
+    let payload: Vec<u8> = (0u8..=255).cycle().take(600).collect();
+    fs::write(source.join("blob.bin"), &payload).expect("write binary blob");
+    fixture.git_success(&source, &["add", "blob.bin"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "add binary"]);
+    // Commit 2: rename the text file.
+    fixture.git_success(&source, &["mv", "file.txt", "renamed.txt"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "rename text"]);
+    // Commit 3: chmod-only.
+    let sh = source.join("run.sh");
+    fs::write(&sh, "#!/bin/sh\n").expect("write script");
+    fixture.git_success(&source, &["add", "run.sh"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "add script"]);
+    fixture.git_success(&source, &["update-index", "--chmod=+x", "run.sh"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "make script executable"]);
+
+    let out_dir = fixture.root.join("ext-patches");
+    fixture.git_success(
+        &source,
+        &[
+            "format-patch",
+            "--binary",
+            "-o",
+            out_dir.to_str().expect("utf8 out dir"),
+            "HEAD~4..HEAD",
+        ],
+    );
+    let patches = sorted_files(&out_dir);
+    assert_eq!(patches.len(), 4, "four exported mails");
+
+    let target = fixture.init_libra("libra-ext-target");
+    fixture.libra_commit(&target, "base\n", "base");
+    let mut args: Vec<&str> = vec!["am"];
+    let paths: Vec<String> = patches
+        .iter()
+        .map(|path| path.to_str().expect("utf8 patch").to_string())
+        .collect();
+    args.extend(paths.iter().map(String::as_str));
+    fixture.libra_success(&target, &args);
+
+    assert_eq!(
+        fs::read(target.join("blob.bin")).expect("binary applied"),
+        payload
+    );
+    assert!(!target.join("file.txt").exists(), "rename removed source");
+    assert_eq!(
+        fs::read_to_string(target.join("renamed.txt")).expect("rename dest"),
+        "base\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(target.join("run.sh"))
+            .expect("script stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "mode-only patch applied: {mode:o}");
+    }
+}

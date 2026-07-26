@@ -30,6 +30,14 @@ is persisted in the sequencer state, so `--continue` / `--skip` /
 Multi-message sources are position-labelled `<source>#<n>` in output and
 state.
 
+Beyond plain text diffs, mails may carry git extended sections: `GIT
+binary patch` payloads (both `literal` and `delta`, decoded from base85 +
+zlib with bounded inflation), `rename from`/`rename to` (with or without
+content hunks — the source deletion and the destination are staged in the
+same commit), `copy from`/`copy to`, and mode-only `old mode`/`new mode`
+changes (the executable bit is applied to the worktree and staged
+directly). Every extended target passes the same path-safety checks.
+
 The minimal mail parser accepts UTF-8, single-part messages with `7bit`, `8bit`,
 `binary`, quoted-printable, or base64 transfer encoding. It reads `From:`,
 `Date:`, and `Subject:`, removes a leading `[PATCH ...]` subject marker, honors
@@ -96,9 +104,6 @@ libra am --abort
 ## Current limitations
 
 This is not yet full Git `am` parity. It does not accept MIME
-multipart/attached patches, binary patches, rename-only or mode-only
-patches, or Git's wider flag set (`-3`/`--3way`, `--signoff`, `--keep`,
-`--scissors`, and others). Existing
-file permissions are retained for content patches, but mail mode changes are
-not applied. Applypatch/commit hooks are not run. The shared parser is also
+multipart/attached patches or Git's wider flag set (`-3`/`--3way`,
+`--signoff`, `--keep`, `--scissors`, and others). Applypatch/commit hooks are not run. The shared parser is also
 available as the standalone [`libra mailinfo`](mailinfo.md) command.

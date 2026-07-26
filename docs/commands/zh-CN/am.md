@@ -22,6 +22,13 @@ quoting。`-` 从标准输入读取一封邮件或一个 mbox（最多出现一�
 `--continue` / `--skip` / `--abort`。多邮件来源在输出与状态中带位置标签
 `<source>#<n>`。
 
+除纯文本 diff 外，邮件还可携带 git 扩展 section：`GIT binary patch`
+载荷（`literal` 与 `delta` 两种，base85 + zlib 解码并有界解压）、
+`rename from`/`rename to`（带或不带内容 hunks——源删除与目标在同一提交中
+一并暂存）、`copy from`/`copy to`，以及仅改 mode 的 `old mode`/`new mode`
+变更（可执行位直接写入工作树并暂存）。所有扩展目标都经过同一 path-safety
+检查。
+
 最小 mail parser 接受 UTF-8、single-part 邮件，以及 `7bit`、`8bit`、`binary`、quoted-printable、base64 transfer encoding。它读取 `From:`、`Date:`、`Subject:`，清理前导 `[PATCH ...]`，支持标准 in-body `From:` 覆盖，并从 `---` 分隔线之后提取文本 `diff --git`。UTF-8/US-ASCII 的 RFC 2047 `B`/`Q` encoded word 会被解码。
 
 每个目标都会拒绝绝对路径、空/`.`/`..` 路径组件、NUL、`.libra/` 和已有 symlink 路径组件。单封邮件中的所有文件会先全部试应用，再进行第一次写入。文件替换使用原子 rename；内容补丁保留已有 permission bits。
@@ -69,4 +76,4 @@ libra am --abort
 
 ## 当前限制
 
-尚未达到完整 Git `am` parity。当前不接受 MIME multipart/attachment、binary patch、仅 rename 或仅 mode 的补丁，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。内容补丁会保留已有文件权限，但不会应用邮件中的 mode change。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
+尚未达到完整 Git `am` parity。当前不接受 MIME multipart/attachment，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。

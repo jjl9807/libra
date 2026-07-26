@@ -4,6 +4,22 @@
 
 ### Added
 
+- **`am`/`apply` binary, rename, copy, and mode-only patches
+  (plan-20260714 PD-09 ②)**: the shared apply seam now understands git
+  extended sections beyond plain text hunks — `GIT binary patch`
+  payloads (both `literal` and `delta`, decoded from git base85 + zlib
+  with bounded inflation and delta-op bounds checks), `rename
+  from`/`rename to` (with or without content hunks; the source deletion
+  and destination land in the same commit), `copy from`/`copy to`, and
+  mode-only `old mode`/`new mode` changes (the executable bit is
+  applied to the worktree AND staged directly, since a content-equal
+  flip is invisible to the worktree-change scan). Every extended target
+  passes the unchanged path-safety surface (absolute/`..`/`.libra`/
+  symlink components refused — hostile rename destinations included).
+  `apply --check` validates the same extended sections. Verified
+  against real `git format-patch --binary` output (binary add, rename,
+  chmod-only) via the git-gated round-trip suite.
+
 - **`am` stdin and mbox input (plan-20260714 PD-09 ①)**: `libra am -`
   reads one mail or a whole mbox from standard input (allowed at most
   once, bounded by the shared 64 MiB series cap), and any input — file
