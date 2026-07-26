@@ -204,10 +204,15 @@ renames pair the index with the worktree — but only when the `status.renameUnt
 (a Libra extension, strict boolean, default `false`) is enabled, because every unstaged "new"
 path is an untracked file. With the default, a tracked→untracked move renders as `D` + `??`,
 matching Git, and no unstaged rename record is produced. When the extension is enabled,
-destination candidates currently come from the untracked listing that status itself computes,
-so `-uno` hides all candidates and a collapsed untracked directory hides the files inside it
-— the independent bounded worktree probe that decouples pairing from display settings is the
-upcoming R0-3 slice of plan-20260714 Part B. Detection runs on
+destination candidates come from an independent bounded worktree probe (R0-3): `-uno` and
+collapsed untracked directories hide DISPLAY markers but never the probe, candidates are
+qualified by the same tracked/ignore layering as the display scan (tracked paths, case-fold
+aliases, unmerged stages, and ignored paths never qualify), and a call-global dual budget
+(50k enumerated entries / 10k qualified destinations) bounds the walk — tripping it keeps
+partial pairing and surfaces a structured `probe_truncated` warning. A directory whose only
+candidates were all consumed by renames loses its `? dir/` marker; truncated or blocked
+probes conservatively keep markers. An unreadable path fails the whole status closed
+(`LBR-IO-001`) — "cannot inspect" never silently degrades into "no rename". Detection runs on
 repository-root-relative paths, so renames are found correctly even when `status` is invoked
 from a subdirectory.
 

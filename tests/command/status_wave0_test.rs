@@ -1898,3 +1898,262 @@ async fn api_warning_survives_await() {
         );
     }
 }
+
+// ── R0-3: bounded rename-destination probe (§B.3.1–§B.3.2, §B.3.5) ──────────
+
+/// Repo with a committed file moved on disk (worktree move: index keeps the
+/// old path, the new path is untracked).
+fn repo_with_worktree_move(dest: &str) -> tempfile::TempDir {
+    let repo = create_repo_with_committed_file("moved-src.txt", "probe rename content\nline two\n");
+    if let Some(parent) = std::path::Path::new(dest).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(repo.path().join(parent)).unwrap();
+    }
+    fs::rename(repo.path().join("moved-src.txt"), repo.path().join(dest)).unwrap();
+    repo
+}
+
+fn enable_rename_untracked(repo: &Path) {
+    let cfg = run_libra_command(&["config", "status.renameUntracked", "true"], repo);
+    assert_cli_success(&cfg, "enable renameUntracked");
+}
+
+/// Without the `status.renameUntracked` extension the probe NEVER runs: an
+/// unreadable directory that would block the probe does not fail status,
+/// and the move stays `D` + `??` (Git parity).
+#[test]
+fn probe_skipped_when_untracked_disabled() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo_with_worktree_move("dest.txt");
+    let locked = repo.path().join("locked-dir");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = status_stdout(repo.path(), &["status"]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        out.contains("deleted:") && !out.contains("renamed:"),
+        "default stays D + ?? without probing: {out}"
+    );
+}
+
+/// With renames disabled (`--no-renames`) the probe never runs even under
+/// the extension — the unreadable directory cannot fail status.
+#[test]
+fn probe_skipped_when_renames_disabled() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    let locked = repo.path().join("locked-dir");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = run_libra_command(&["status", "--no-renames"], repo.path());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_cli_success(&out, "status --no-renames with locked dir");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!text.contains("renamed:"), "no probe, no rename: {text}");
+}
+
+/// `-uno` hides untracked DISPLAY but never the probe: the rename still
+/// pairs (§B.3.1.1 item 5) …
+#[test]
+fn rename_untracked_true_uno_probe_success() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    let out = status_stdout(repo.path(), &["status", "-uno"]);
+    assert!(
+        out.contains("renamed:") && out.contains("dest.txt"),
+        "-uno must not hide probe destinations: {out}"
+    );
+}
+
+/// … and the probe never injects `?`/`??` markers under `-uno`.
+#[test]
+fn rename_untracked_true_uno_no_question_mark() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    fs::write(repo.path().join("unrelated.txt"), "loose\n").unwrap();
+    let out = status_stdout(repo.path(), &["status", "--short", "-uno"]);
+    assert!(
+        !out.lines().any(|l| l.starts_with("??")),
+        "-uno keeps every ?? marker hidden: {out}"
+    );
+    assert!(out.contains(" -> "), "rename still pairs under -uno: {out}");
+}
+
+/// An exclude-only pathspec set keeps the probe rooted at the repository
+/// root (§B.3.1.1 item 2) — the rename still pairs.
+#[test]
+fn probe_roots_exclude_only_repo_root() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    let out = status_stdout(repo.path(), &["status", "--", ":(exclude)unrelated"]);
+    assert!(
+        out.contains("renamed:") && out.contains("dest.txt"),
+        "exclude-only specs must not shrink the probe: {out}"
+    );
+}
+
+/// §B.3.1.2: a tracked path never qualifies as a rename destination — a
+/// deletion plus a modified tracked file must not pair.
+#[test]
+fn probe_dest_rejects_tracked_path() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let body = "probe rename content\nline two\n";
+    fs::write(repo.path().join("a.txt"), body).unwrap();
+    fs::write(repo.path().join("b.txt"), "different original\n").unwrap();
+    let add = run_libra_command(&["add", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&add, "stage both");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit both");
+    enable_rename_untracked(repo.path());
+    fs::remove_file(repo.path().join("a.txt")).unwrap();
+    fs::write(repo.path().join("b.txt"), body).unwrap(); // tracked, now identical
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        !out.contains("renamed:") && out.contains("deleted:"),
+        "a tracked path must never be a destination: {out}"
+    );
+}
+
+/// §B.3.1.2: an ignored path never qualifies as a rename destination.
+#[test]
+fn probe_dest_rejects_ignored() {
+    let repo = repo_with_worktree_move("dest.ign");
+    enable_rename_untracked(repo.path());
+    fs::write(repo.path().join(".libraignore"), "*.ign\n").unwrap();
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        !out.contains("renamed:") && out.contains("deleted:"),
+        "ignored candidates stay out of pairing: {out}"
+    );
+}
+
+/// §B.3.2: the enumeration budget bounds a wide directory — status still
+/// succeeds, reports the truncation warning, and never hangs.
+#[test]
+fn probe_budget_bounds_wide_directory() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    for i in 0..24 {
+        fs::write(repo.path().join(format!("noise-{i:02}.txt")), "noise\n").unwrap();
+    }
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET", "5")],
+    );
+    assert_cli_success(&out, "truncated probe still succeeds");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|x| x["code"] == "probe_truncated")),
+        "truncation surfaces as a structured warning: {doc}"
+    );
+}
+
+/// The probe never descends into `.libra`/`.git` metadata directories.
+#[test]
+fn probe_never_enters_libra_or_git_metadata() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    // Plant an identical-content decoy inside a fake .git directory.
+    fs::create_dir_all(repo.path().join("sub/.git")).unwrap();
+    fs::write(
+        repo.path().join("sub/.git/decoy.txt"),
+        "probe rename content\nline two\n",
+    )
+    .unwrap();
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("dest.txt") && !out.contains("decoy"),
+        "metadata directories are never probed: {out}"
+    );
+}
+
+/// A directory symlink is a LEAF for the probe (never recursed).
+#[test]
+fn probe_directory_symlink_is_leaf() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    fs::create_dir(repo.path().join("real-dir")).unwrap();
+    fs::write(
+        repo.path().join("real-dir/inner.txt"),
+        "probe rename content\nline two\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("real-dir", repo.path().join("dir-link")).unwrap();
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && !out.contains("dir-link/inner.txt"),
+        "symlinked directories are leaves, not recursion points: {out}"
+    );
+}
+
+/// §B.3.5: when the probe is complete and a directory's only candidate was
+/// consumed by a rename, the `? dir/` marker collapses …
+#[test]
+fn probe_complete_consumes_dir_marker() {
+    let repo = repo_with_worktree_move("newdir/dest.txt");
+    enable_rename_untracked(repo.path());
+    let out = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(out.contains(" -> "), "the move pairs: {out}");
+    assert!(
+        !out.contains("?? newdir/"),
+        "a fully-consumed directory loses its marker: {out}"
+    );
+}
+
+/// … while a truncated probe conservatively keeps the marker.
+#[test]
+fn probe_truncated_keeps_dir_marker() {
+    let repo = repo_with_worktree_move("newdir/dest.txt");
+    enable_rename_untracked(repo.path());
+    for i in 0..24 {
+        fs::write(repo.path().join(format!("noise-{i:02}.txt")), "noise\n").unwrap();
+    }
+    let out = run_libra_command_with_stdin_and_env(
+        &["status", "--short"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET", "3")],
+    );
+    assert_cli_success(&out, "truncated probe still succeeds");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("?? newdir/"),
+        "a truncated probe keeps directory markers: {text}"
+    );
+}
+
+/// R0-3 conservative narrowing: a blocked probe path fails the whole status
+/// closed (LBR-IO-001) — "cannot inspect" never degrades into "no rename".
+/// (R0-8 relaxes JSON to the io_blocked[] partial contract.)
+#[test]
+fn probe_dir_eacces_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    let locked = repo.path().join("locked-dir");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let out = run_libra_command(&["status"], repo.path());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!out.status.success(), "blocked probe fails closed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-IO-001"),
+        "blocked probe carries the stable code: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

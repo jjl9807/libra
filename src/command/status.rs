@@ -458,6 +458,9 @@ pub struct StatusWarning {
 pub enum StatusWarningCode {
     SimilarityBudgetExceeded,
     RenameLimitProductSkipped,
+    /// §B.3.2: the rename-destination probe tripped a budget; partial
+    /// destinations still pair, but detection may be incomplete.
+    ProbeTruncated,
     DirtyCacheLockStolen,
     DirtyCacheStaleFallback,
     DirtyCacheConcurrentInvalidate,
@@ -989,14 +992,89 @@ async fn collect_status_data(
         // which may only be consumed as rename destinations under the
         // `status.renameUntracked` extension. Skipping detection keeps a
         // tracked→untracked move rendered as `D` + `??`.
-        if extras.rename_untracked {
-            detect_renames_in_changes(
+        //
+        // R0-3: under the extension, DESTINATIONS come from the bounded
+        // probe (§B.3.1.1–§B.3.2) — decoupled from the untracked display
+        // scan (`-uno` hides markers, never the probe) and qualified by the
+        // same tracked/ignore layering. The probe only runs when there is a
+        // deleted side to pair against.
+        if extras.rename_untracked
+            && !unstaged.deleted.is_empty()
+            && let Some(index_ref) = maybe_index.as_ref()
+        {
+            let workdir = util::working_dir();
+            let compiled_pathspecs = if args.pathspec.is_empty() {
+                None
+            } else {
+                Some(
+                    PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &workdir)
+                        .map_err(pathspec_error_to_cli)?,
+                )
+            };
+            let tracked_paths = crate::command::status_untracked_paths::TrackedPaths::from_index(
+                index_ref,
+                ignore_case,
+            );
+            let filter = crate::command::status_probe::DestinationFilter {
+                workdir: &workdir,
+                index: index_ref,
+                tracked: &tracked_paths,
+                pathspecs: compiled_pathspecs.as_ref(),
+            };
+            let roots =
+                crate::command::status_probe::pathspec_probe_roots(compiled_pathspecs.as_ref());
+            let outcome = crate::command::status_probe::probe_rename_destinations(
+                &roots,
+                &filter,
+                crate::command::status_probe::ProbeLimits::effective(),
+            );
+            // R0-3 conservative narrowing (documented; R0-8 relaxes JSON to
+            // the io_blocked[] partial contract): any blocked probe path
+            // fails the whole status closed — "cannot inspect" must never
+            // silently degrade into "no rename".
+            if let Some(first) = outcome.io_blocked.first() {
+                return Err(CliError::fatal(format!(
+                    "cannot probe rename destinations: failed to read '{}' ({} path(s) blocked)",
+                    first.path.display(),
+                    outcome.io_blocked.len()
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("fix the unreadable path permissions, or rerun with --no-renames"));
+            }
+            if let Some(kind) = outcome.truncated {
+                warnings.push(StatusWarning {
+                    code: StatusWarningCode::ProbeTruncated,
+                    message: format!(
+                        "rename-destination probe truncated: {} budget exhausted; rename detection may be incomplete",
+                        match kind {
+                            crate::command::status_probe::ProbeBudgetKind::Enumeration => "enumeration",
+                            crate::command::status_probe::ProbeBudgetKind::Destination => "destination",
+                        }
+                    ),
+                    source: StatusWarningSource::RenameDetect,
+                });
+            }
+            // Detection runs on the probe's destination set (display base);
+            // consumed destinations then collapse their display rows and
+            // `? dir/` markers (§B.3.5).
+            let destinations_display: Vec<PathBuf> = outcome
+                .destinations
+                .iter()
+                .map(util::workdir_to_current)
+                .collect();
+            let consumed = detect_renames_with_destinations(
                 &mut unstaged,
                 &config,
                 RenameBlobSide::Known(&index_blobs),
-                RenameBlobSide::Worktree,
+                &destinations_display,
                 &mut unstaged_rename_details,
                 &mut warnings,
+            );
+            crate::command::status_probe::collapse_untracked_markers(
+                &mut unstaged.new,
+                &destinations_display,
+                &consumed,
+                outcome.truncated.is_none(),
             );
         }
     }
@@ -1299,6 +1377,65 @@ fn warnings_from_rename_stats(
             source: StatusWarningSource::RenameDetect,
         });
     }
+}
+
+/// R0-3: run unstaged rename detection against an EXPLICIT destination list
+/// (the bounded probe's output, display base) instead of the untracked
+/// display set. Matched pairs land in `changes.renamed`; the returned set
+/// holds the consumed destinations for §B.3.5 marker collapse.
+fn detect_renames_with_destinations(
+    changes: &mut Changes,
+    config: &rename_detect::RenameDetectConfig,
+    old_side: RenameBlobSide<'_>,
+    destinations_display: &[PathBuf],
+    details: &mut RenameDetails,
+    warnings: &mut Vec<StatusWarning>,
+) -> HashSet<PathBuf> {
+    let mut consumed_new: HashSet<PathBuf> = HashSet::new();
+    if changes.deleted.is_empty() || destinations_display.is_empty() {
+        return consumed_new;
+    }
+    let mut worktree_budget = rename_detect::WorktreeReadBudget::with_defaults();
+    let snapshot = rename_detect::RenameSnapshot {
+        old_map: build_rename_side(&changes.deleted, &old_side, &mut worktree_budget),
+        new_map: build_rename_side(
+            destinations_display,
+            &RenameBlobSide::Worktree,
+            &mut worktree_budget,
+        ),
+    };
+    let mut source = StatusContentSource {
+        old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
+        new_is_worktree: true,
+        objects: rename_detect::ObjectReadBudget::with_defaults(),
+        worktree: worktree_budget,
+    };
+    let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    warnings_from_rename_stats(&outcome.stats, warnings);
+    if outcome.matches.is_empty() {
+        return consumed_new;
+    }
+
+    let mut consumed_old: HashSet<PathBuf> = HashSet::new();
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for m in &outcome.matches {
+        let old_display = util::workdir_to_current(&m.old);
+        let new_display = util::workdir_to_current(&m.new);
+        consumed_old.insert(old_display.clone());
+        consumed_new.insert(new_display.clone());
+        details.insert(
+            (old_display.clone(), new_display.clone()),
+            (m.score_percent(), m.exact),
+        );
+        renamed.push((old_display, new_display));
+    }
+    changes.deleted.retain(|p| !consumed_old.contains(p));
+    changes.new.retain(|p| !consumed_new.contains(p));
+    changes.deleted.sort();
+    changes.new.sort();
+    renamed.sort_by(|a, b| a.1.cmp(&b.1));
+    changes.renamed.extend(renamed);
+    consumed_new
 }
 
 fn detect_renames_in_changes(
@@ -2449,8 +2586,12 @@ fn render_human_status(
         }
     }
 
-    // Unstaged changes (modified + deleted)
-    if !data.unstaged.deleted.is_empty() || !data.unstaged.modified.is_empty() {
+    // Unstaged changes (modified + deleted + renamed — a probe-paired
+    // unstaged rename can be the section's ONLY content, §B.3.1)
+    if !data.unstaged.deleted.is_empty()
+        || !data.unstaged.modified.is_empty()
+        || !data.unstaged.renamed.is_empty()
+    {
         writeln!(buffer, "Changes not staged for commit:").map_err(write_error)?;
         writeln!(
             buffer,
