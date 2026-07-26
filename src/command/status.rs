@@ -865,6 +865,15 @@ struct StatusData {
     /// `core.quotePath` (§B.6.6): escape non-ASCII bytes in human-short and
     /// non-`-z` porcelain paths (default true, Git parity).
     quote_path: bool,
+    /// §B.3.3/§B.6.0.1: paths the base scan or the rename probe could not
+    /// inspect (workdir-relative, sorted, deduplicated). Text formats fail
+    /// closed on any entry; JSON reports the partial result plus
+    /// `data.io_blocked[]` with `is_clean = false`.
+    io_blocked: Vec<crate::command::status_probe::IoBlockedEvent>,
+    /// Whether the BASE scan (tracked dirty + untracked enumeration) hit an
+    /// I/O block — `data.base_scan_complete` is its negation; probe blocks
+    /// only affect `rename_detection_complete`.
+    base_scan_blocked: bool,
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
@@ -904,6 +913,8 @@ impl StatusData {
             || !self.unstaged.is_empty()
             || self.merge_state.is_some()
             || !self.unmerged.is_empty()
+            // §B.6.0.1: "cannot inspect" must never report clean.
+            || !self.io_blocked.is_empty()
     }
 }
 
@@ -963,6 +974,8 @@ async fn collect_status_data(
         .into_iter()
         .map(util::workdir_to_current)
         .collect();
+    let mut io_blocked = worktree.io_blocked;
+    let base_scan_blocked = !io_blocked.is_empty();
     let mut maybe_index = Some(worktree.index);
 
     // Resolve rename detection (§B.5). Precedence: CLI flags always win —
@@ -1048,19 +1061,11 @@ async fn collect_status_data(
                 &filter,
                 crate::command::status_probe::ProbeLimits::effective(),
             );
-            // R0-3 conservative narrowing (documented; R0-8 relaxes JSON to
-            // the io_blocked[] partial contract): any blocked probe path
-            // fails the whole status closed — "cannot inspect" must never
-            // silently degrade into "no rename".
-            if let Some(first) = outcome.io_blocked.first() {
-                return Err(CliError::fatal(format!(
-                    "cannot probe rename destinations: failed to read '{}' ({} path(s) blocked)",
-                    first.path.display(),
-                    outcome.io_blocked.len()
-                ))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-                .with_hint("fix the unreadable path permissions, or rerun with --no-renames"));
-            }
+            // §B.3.2 merge rules (R0-8): blocked probe paths accumulate into
+            // `data.io_blocked` — text formats fail closed at render time,
+            // JSON keeps pairing and reports the partial contract.
+            let probe_blocked = !outcome.io_blocked.is_empty();
+            io_blocked.extend(outcome.io_blocked.iter().cloned());
             if let Some(kind) = outcome.truncated {
                 warnings.push(StatusWarning {
                     code: StatusWarningCode::ProbeTruncated,
@@ -1070,6 +1075,19 @@ async fn collect_status_data(
                             crate::command::status_probe::ProbeBudgetKind::Enumeration => "enumeration",
                             crate::command::status_probe::ProbeBudgetKind::Destination => "destination",
                         }
+                    ),
+                    source: StatusWarningSource::RenameDetect,
+                });
+            }
+            if outcome.encoding_skipped > 0 {
+                // §B.6.1 / DEFER-02: non-UTF-8 names keep their base `??`
+                // rows but sit out rename scoring until R0.5 — one
+                // deduplicated warning covers every skipped candidate.
+                warnings.push(StatusWarning {
+                    code: StatusWarningCode::RenamePathEncodingUnsupported,
+                    message: format!(
+                        "rename detection skipped {} candidate(s) with non-UTF-8 names; their untracked/base status is unaffected",
+                        outcome.encoding_skipped
                     ),
                     source: StatusWarningSource::RenameDetect,
                 });
@@ -1094,7 +1112,7 @@ async fn collect_status_data(
                 &mut unstaged.new,
                 &destinations_display,
                 &consumed,
-                outcome.truncated.is_none(),
+                outcome.truncated.is_none() && !probe_blocked,
             );
         }
     }
@@ -1166,6 +1184,13 @@ async fn collect_status_data(
         unstaged_rename_details,
         warnings,
         quote_path: extras.quote_path,
+        io_blocked: {
+            let mut events = io_blocked;
+            events.sort_by(|a, b| a.path.cmp(&b.path));
+            events.dedup_by(|a, b| a.path == b.path);
+            events
+        },
+        base_scan_blocked,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
     Ok(data)
@@ -1909,6 +1934,21 @@ async fn run_status_scan_locked_inner(
         .with_hint("re-run 'libra status --scan' once the concurrent operation finishes"));
     }
 
+    // §B.3.3 dirty-cache guard: an I/O-blocked scan must not write ANY
+    // cache content — an unreadable path is "cannot tell", and caching the
+    // partial snapshot would prune NEW rows or confirm DELETED ones that
+    // were merely unreadable. Text formats fail closed below anyway; JSON
+    // reports the partial result while the previous snapshot stays intact.
+    if !data.io_blocked.is_empty() {
+        return Err(CliError::fatal(format!(
+            "cannot rebuild the dirty cache: {} path(s) could not be inspected (first: '{}')",
+            data.io_blocked.len(),
+            data.io_blocked[0].path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+        .with_hint("fix the unreadable path permissions and re-run 'libra status --scan'")
+        .with_hint("the previous dirty-cache snapshot was left untouched"));
+    }
     let rows = snapshot_rows(&staged_raw, &unstaged_raw)?;
     let row_count = rows.len();
     let db = get_db_conn_instance().await;
@@ -1968,6 +2008,23 @@ async fn run_status_scan_locked_inner(
 /// Classify a manual (`kind='unknown'`) mark against the index, bounded and
 /// panic-free (deliberately no `Index::is_modified`, which panics on missing
 /// entries/files): returns the effective kind, or `None` when clean.
+/// §B.3.3 revalidation tri-state: `NotFound` is the only proof of absence —
+/// any other metadata error means "cannot tell" and must neither prune a
+/// cached NEW row nor confirm a cached DELETED row.
+enum CachedPathState {
+    Exists,
+    Gone,
+    Blocked,
+}
+
+fn cached_path_state(abs: &Path) -> CachedPathState {
+    match abs.symlink_metadata() {
+        Ok(_) => CachedPathState::Exists,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => CachedPathState::Gone,
+        Err(_) => CachedPathState::Blocked,
+    }
+}
+
 fn classify_manual_mark(
     index: &Index,
     workdir: &std::path::Path,
@@ -2097,6 +2154,16 @@ async fn run_status_cache_mode(
                     unstaged.new.push(native);
                     continue;
                 };
+                if verify
+                    && matches!(
+                        cached_path_state(&workdir.join(&native)),
+                        CachedPathState::Blocked
+                    )
+                {
+                    // Unreadable: keep the cached fact, write nothing.
+                    unstaged.new.push(native);
+                    continue;
+                }
                 let still = !verify
                     || (workdir.join(&native).symlink_metadata().is_ok()
                         && !index.tracked(path_str, 0));
@@ -2115,6 +2182,11 @@ async fn run_status_cache_mode(
                     continue;
                 };
                 let abs = workdir.join(&native);
+                if verify && matches!(cached_path_state(&abs), CachedPathState::Blocked) {
+                    // Unreadable: keep the cached fact, write nothing.
+                    unstaged.modified.push(native);
+                    continue;
+                }
                 let still = !verify || {
                     index.tracked(path_str, 0)
                         && abs.symlink_metadata().is_ok()
@@ -2137,9 +2209,15 @@ async fn run_status_cache_mode(
                     unstaged.deleted.push(native);
                     continue;
                 };
+                let state = cached_path_state(&workdir.join(&native));
+                if verify && matches!(state, CachedPathState::Blocked) {
+                    // Unreadable is NOT proof of deletion (§B.6.0.1): keep
+                    // the cached fact, write nothing — never confirm.
+                    unstaged.deleted.push(native);
+                    continue;
+                }
                 let still = !verify
-                    || (index.tracked(path_str, 0)
-                        && workdir.join(&native).symlink_metadata().is_err());
+                    || (index.tracked(path_str, 0) && matches!(state, CachedPathState::Gone));
                 if still {
                     unstaged.deleted.push(native);
                     if verify {
@@ -2302,6 +2380,8 @@ async fn run_status_cache_mode(
         unstaged_rename_details: RenameDetails::new(),
         warnings: Vec::new(),
         quote_path: extras.quote_path,
+        io_blocked: Vec::new(),
+        base_scan_blocked: false,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
 
@@ -2385,6 +2465,20 @@ async fn render_status_to_writer(
     output: &OutputConfig,
     writer: &mut impl Write,
 ) -> CliResult<()> {
+    // §B.3.3/§B.6.0.1 delivery matrix: human/short/porcelain fail CLOSED on
+    // any I/O-blocked path — no partial dirty/porcelain body is ever
+    // printed. Only JSON/API may report the partial result (io_blocked[]).
+    if !data.io_blocked.is_empty() && !output.is_json() {
+        let first = &data.io_blocked[0];
+        return Err(CliError::fatal(format!(
+            "cannot inspect '{}' ({} path(s) blocked); status output would be incomplete",
+            first.path.display(),
+            data.io_blocked.len()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+        .with_hint("fix the unreadable path permissions and retry")
+        .with_hint("use --json to inspect the partial result with data.io_blocked[]"));
+    }
     let write_error =
         |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     let mut buffer = Vec::new();
@@ -2438,7 +2532,8 @@ async fn render_status_to_writer(
             if args.ignored && !data.ignored_files.is_empty() {
                 for file in &data.ignored_files {
                     if args.null_terminated {
-                        write!(&mut buffer, "!! {}", file.display()).map_err(write_error)?;
+                        write!(&mut buffer, "!! ").map_err(write_error)?;
+                        write_raw_path(&mut buffer, file).map_err(write_error)?;
                         buffer.push(b'\0');
                     } else {
                         writeln!(&mut buffer, "!! {}", file.display()).map_err(write_error)?;
@@ -2488,7 +2583,8 @@ async fn render_status_to_writer(
         if args.ignored {
             for file in &data.ignored_files {
                 if args.null_terminated {
-                    write!(&mut buffer, "!! {}", file.display()).map_err(write_error)?;
+                    write!(&mut buffer, "!! ").map_err(write_error)?;
+                    write_raw_path(&mut buffer, file).map_err(write_error)?;
                     buffer.push(b'\0');
                 } else {
                     writeln!(&mut buffer, "!! {}", file.display()).map_err(write_error)?;
@@ -3071,6 +3167,106 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
     push_renames(&data.unstaged.renamed, &data.unstaged_rename_details, false);
     renames.sort_by(|a, b| a["to"].as_str().cmp(&b["to"].as_str()));
 
+    // §B.6.0.1 io_blocked[] public contract: escaped repo-relative display
+    // (same quoting as non-`-z` porcelain), lossless raw bytes for
+    // non-UTF-8 paths, the KNOWN staged component only, the reason
+    // taxonomy, and the staged rename pair when one is known. Sorted by raw
+    // path, deduplicated. Every entry also emits a worktree-family warning.
+    let mut warnings_json = data.warnings.clone();
+    let mut io_blocked_json: Vec<serde_json::Value> = Vec::new();
+    for event in &data.io_blocked {
+        let display = quote_pathname(&event.path, data.quote_path);
+        let raw_base64: serde_json::Value = match event.path.to_str() {
+            Some(_) => serde_json::Value::Null,
+            None => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt;
+
+                    use base64::Engine as _;
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(event.path.as_os_str().as_bytes()),
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    serde_json::Value::Null
+                }
+            }
+        };
+        let event_display_path = util::workdir_to_current(&event.path);
+        let staged_component = if data.staged.modified.contains(&event_display_path) {
+            serde_json::json!("M")
+        } else if data.staged.new.contains(&event_display_path) {
+            serde_json::json!("A")
+        } else if data.staged.deleted.contains(&event_display_path) {
+            serde_json::json!("D")
+        } else if data
+            .staged
+            .renamed
+            .iter()
+            .any(|(_, new)| new == &event_display_path)
+        {
+            serde_json::json!("R")
+        } else {
+            serde_json::Value::Null
+        };
+        let rename = data
+            .staged
+            .renamed
+            .iter()
+            .find(|(_, new)| new == &event_display_path)
+            .map(|pair| {
+                let score = data
+                    .staged_rename_details
+                    .get(pair)
+                    .map(|(pct, _)| *pct)
+                    .unwrap_or(100);
+                serde_json::json!({
+                    "from": pair.0.display().to_string(),
+                    "to": pair.1.display().to_string(),
+                    "score": score,
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        let (reason, warning_code) = match event.reason {
+            crate::command::status_probe::IoBlockedReason::PermissionDenied => (
+                "permission_denied",
+                StatusWarningCode::WorktreePermissionDenied,
+            ),
+            crate::command::status_probe::IoBlockedReason::IoError => {
+                ("io_error", StatusWarningCode::WorktreeReadFailed)
+            }
+        };
+        warnings_json.push(StatusWarning {
+            code: warning_code,
+            message: format!("cannot inspect '{display}': {reason}"),
+            source: StatusWarningSource::Worktree,
+        });
+        io_blocked_json.push(serde_json::json!({
+            "path": { "display": display, "raw_base64": raw_base64 },
+            "staged": staged_component,
+            "reason": reason,
+            "rename": rename,
+        }));
+    }
+    // §B.6.0.1: rename detection is complete only when nothing degraded it —
+    // no probe truncation/blocks and no engine skip/limit/budget warnings.
+    let rename_detection_complete = data.io_blocked.is_empty()
+        && !data.warnings.iter().any(|w| {
+            matches!(
+                w.code,
+                StatusWarningCode::ProbeTruncated
+                    | StatusWarningCode::RenameLimitProductSkipped
+                    | StatusWarningCode::SimilarityBudgetExceeded
+                    | StatusWarningCode::MetadataUnavailable
+                    | StatusWarningCode::MetadataBudgetExceeded
+                    | StatusWarningCode::WorktreeReadFailed
+                    | StatusWarningCode::RenamePathEncodingUnsupported
+            )
+        });
+
     let head = match &data.head {
         Head::Branch(name) => serde_json::json!({"type": "branch", "name": name}),
         Head::Detached(hash) => {
@@ -3112,8 +3308,12 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
         ),
         "untracked": paths_to_json(&data.unstaged.new),
         "ignored": paths_to_json(&data.ignored_files),
-        "warnings": data.warnings,
+        "warnings": warnings_json,
         "renames": renames,
+        "io_blocked": io_blocked_json,
+        "base_scan_complete": !data.base_scan_blocked,
+        "rename_detection_complete": rename_detection_complete,
+        "complete": !data.base_scan_blocked && rename_detection_complete,
         "is_clean": !data.is_dirty(),
     });
 
@@ -3174,7 +3374,8 @@ fn output_porcelain_with_unmerged(
                 unstaged: y,
             } => {
                 if null_terminated {
-                    write!(writer, "{x}{y} {}", path.display()).map_err(write_err)?;
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    write_raw_path(writer, &path).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                 } else {
                     writeln!(writer, "{x}{y} {}", quote_pathname(&path, quote_path))
@@ -3188,9 +3389,10 @@ fn output_porcelain_with_unmerged(
                 unstaged: y,
             } => {
                 if null_terminated {
-                    write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    write_raw_path(writer, &new).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
-                    write!(writer, "{}", old.display()).map_err(write_err)?;
+                    write_raw_path(writer, &old).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                 } else {
                     writeln!(
@@ -3384,9 +3586,9 @@ fn write_rename_porcelain_v2(
     )
     .map_err(write_err)?;
     if null_terminated {
-        write!(writer, "{}", new.display()).map_err(write_err)?;
+        write_raw_path(writer, new).map_err(write_err)?;
         writer.write_all(b"\0").map_err(write_err)?;
-        write!(writer, "{}", old.display()).map_err(write_err)?;
+        write_raw_path(writer, old).map_err(write_err)?;
         writer.write_all(b"\0").map_err(write_err)?;
     } else {
         write!(
@@ -3485,7 +3687,8 @@ fn output_porcelain_v2(
         }
         if staged_status == '?' && unstaged_status == '?' {
             if null_terminated {
-                write!(writer, "? {}", file.display()).map_err(write_err)?;
+                write!(writer, "? ").map_err(write_err)?;
+                write_raw_path(writer, &file).map_err(write_err)?;
             } else {
                 write!(writer, "? {}", quote_pathname(&file, quote_path)).map_err(write_err)?;
             }
@@ -3526,14 +3729,9 @@ fn output_porcelain_v2(
             "N...".to_string()
         };
 
-        let path_field = if null_terminated {
-            file.display().to_string()
-        } else {
-            quote_pathname(&file, quote_path)
-        };
         write!(
             writer,
-            "1 {}{} {} {} {} {} {} {} {}",
+            "1 {}{} {} {} {} {} {} {} ",
             staged_status,
             unstaged_status,
             sub,
@@ -3542,19 +3740,23 @@ fn output_porcelain_v2(
             format_mode(mode_worktree),
             hash_head,
             hash_index,
-            path_field
         )
         .map_err(write_err)?;
         if null_terminated {
+            // `1` rows always carry UTF-8 index paths today, but the `-z`
+            // wire format is raw bytes by contract.
+            write_raw_path(writer, &file).map_err(write_err)?;
             writer.write_all(b"\0").map_err(write_err)?;
         } else {
+            write!(writer, "{}", quote_pathname(&file, quote_path)).map_err(write_err)?;
             writer.write_all(b"\n").map_err(write_err)?;
         }
     }
 
     for file in ignored {
         if null_terminated {
-            write!(writer, "! {}", file.display()).map_err(write_err)?;
+            write!(writer, "! ").map_err(write_err)?;
+            write_raw_path(writer, file).map_err(write_err)?;
         } else {
             write!(writer, "! {}", quote_pathname(file, quote_path)).map_err(write_err)?;
         }
@@ -3863,13 +4065,43 @@ pub async fn output_short_format(
 /// 0x7F are additionally escaped as octal `\ooo` only under
 /// `core.quotePath=true` (the default, matching Git). A path needing any
 /// escape is wrapped in double quotes; `-z` output never calls this.
+/// Write a path under `-z` as RAW OS bytes (Git parity: `-z` never quotes,
+/// and on Unix a non-UTF-8 name keeps its exact bytes on the wire). Non-Unix
+/// platforms fall back to the platform's stable `display()` encoding.
+fn write_raw_path(writer: &mut impl Write, path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        writer.write_all(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        write!(writer, "{}", path.display())
+    }
+}
+
 pub(crate) fn quote_pathname(path: &Path, quote_path: bool) -> String {
+    // Escape the RAW OS path bytes (Unix), not a lossy `display()` copy, so
+    // a non-UTF-8 name renders its true bytes (`\377`) instead of U+FFFD
+    // replacement bytes. On non-Unix `display()` is the platform's stable
+    // encoding.
+    #[cfg(unix)]
+    let bytes: &[u8] = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
     let display = path.display().to_string();
-    let bytes = display.as_bytes();
+    #[cfg(not(unix))]
+    let bytes: &[u8] = display.as_bytes();
+    // Non-UTF-8 bytes are always octal-escaped regardless of core.quotePath:
+    // the unquoted fast path must return valid UTF-8 (§B.6.6 readable
+    // escaping; `-z` is the raw-bytes surface).
+    let escape_high = quote_path || std::str::from_utf8(bytes).is_err();
     let needs_escape =
-        |b: u8| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || (quote_path && b >= 0x80);
+        |b: u8| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || (escape_high && b >= 0x80);
     if !bytes.iter().copied().any(needs_escape) {
-        return display;
+        return String::from_utf8_lossy(bytes).into_owned();
     }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
     out.push(b'"');
@@ -3880,16 +4112,16 @@ pub(crate) fn quote_pathname(path: &Path, quote_path: bool) -> String {
             b'\r' => out.extend_from_slice(b"\\r"),
             b'"' => out.extend_from_slice(b"\\\""),
             b'\\' => out.extend_from_slice(b"\\\\"),
-            _ if b < 0x20 || b == 0x7f || (quote_path && b >= 0x80) => {
+            _ if b < 0x20 || b == 0x7f || (escape_high && b >= 0x80) => {
                 out.extend_from_slice(format!("\\{b:03o}").as_bytes());
             }
             _ => out.push(b),
         }
     }
     out.push(b'"');
-    // INVARIANT: escapes are pure ASCII and pass-through bytes come from a
-    // valid UTF-8 string, so the result is valid UTF-8; the lossy fallback
-    // only guards against future edits breaking that.
+    // INVARIANT: escapes are pure ASCII; bytes >= 0x80 pass through only
+    // when the input was verified valid UTF-8, so the result is valid UTF-8.
+    // The lossy fallback only guards against future edits breaking that.
     String::from_utf8(out)
         .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
@@ -3921,7 +4153,8 @@ async fn output_short_format_with_config(
                 unstaged: y,
             } => {
                 if null_terminated {
-                    write!(writer, "{x}{y} {}", path.display()).map_err(write_err)?;
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    write_raw_path(writer, &path).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                 } else {
                     let quoted = quote_pathname(&path, quote_path);
@@ -3942,9 +4175,10 @@ async fn output_short_format_with_config(
             } => {
                 if null_terminated {
                     // `XY SP <new> NUL <old> NUL` (§B.6.1), raw path bytes.
-                    write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    write_raw_path(writer, &new).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
-                    write!(writer, "{}", old.display()).map_err(write_err)?;
+                    write_raw_path(writer, &old).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                 } else {
                     let q_old = quote_pathname(&old, quote_path);

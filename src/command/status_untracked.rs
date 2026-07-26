@@ -20,11 +20,31 @@ pub(crate) struct StatusWorktreeChanges {
     pub(crate) unstaged: Changes,
     pub(crate) ignored_files: Vec<PathBuf>,
     pub(crate) index: Index,
+    /// §B.3.3 accumulator protocol: paths the scan could not inspect
+    /// (workdir-relative). Text formats fail closed on any entry; JSON
+    /// reports the partial result plus `data.io_blocked[]`.
+    pub(crate) io_blocked: Vec<crate::command::status_probe::IoBlockedEvent>,
 }
 
 struct WorkdirScan {
     untracked: Vec<PathBuf>,
     ignored: Vec<PathBuf>,
+    io_blocked: Vec<crate::command::status_probe::IoBlockedEvent>,
+}
+
+fn io_blocked_event(
+    path: &Path,
+    error: &io::Error,
+) -> crate::command::status_probe::IoBlockedEvent {
+    use crate::command::status_probe::{IoBlockedEvent, IoBlockedReason};
+    IoBlockedEvent {
+        path: path.to_path_buf(),
+        reason: if error.kind() == io::ErrorKind::PermissionDenied {
+            IoBlockedReason::PermissionDenied
+        } else {
+            IoBlockedReason::IoError
+        },
+    }
 }
 
 pub(crate) fn collect_status_worktree_changes(
@@ -39,11 +59,14 @@ pub(crate) fn collect_status_worktree_changes(
         source,
     })?;
     let tracked = TrackedPaths::from_index(&index, ignore_case);
-    let mut unstaged = collect_tracked_worktree_changes(&workdir, &index, tracked.files())?;
+    let mut io_blocked: Vec<crate::command::status_probe::IoBlockedEvent> = Vec::new();
+    let mut unstaged =
+        collect_tracked_worktree_changes(&workdir, &index, tracked.files(), &mut io_blocked)?;
     let mut ignored_files = Vec::new();
 
     if !matches!(untracked_mode, UntrackedFiles::No) {
-        let scan = scan_workdir(&workdir, &index, &tracked, untracked_mode, include_ignored)?;
+        let mut scan = scan_workdir(&workdir, &index, &tracked, untracked_mode, include_ignored)?;
+        io_blocked.append(&mut scan.io_blocked);
         unstaged.new = if matches!(untracked_mode, UntrackedFiles::Normal) {
             collapse_untracked_directories(scan.untracked, &tracked)
         } else {
@@ -56,10 +79,13 @@ pub(crate) fn collect_status_worktree_changes(
         };
     }
 
+    io_blocked.sort_by(|a, b| a.path.cmp(&b.path));
+    io_blocked.dedup_by(|a, b| a.path == b.path);
     Ok(StatusWorktreeChanges {
         unstaged,
         ignored_files,
         index,
+        io_blocked,
     })
 }
 
@@ -100,6 +126,7 @@ fn collect_tracked_worktree_changes(
     workdir: &Path,
     index: &Index,
     tracked_files: &[PathBuf],
+    io_blocked: &mut Vec<crate::command::status_probe::IoBlockedEvent>,
 ) -> Result<Changes, StatusError> {
     let mut changes = Changes::default();
     for file in tracked_files {
@@ -109,29 +136,33 @@ fn collect_tracked_worktree_changes(
         let file_abs = workdir.join(file);
         // A tracked path that is genuinely gone is a deletion; but a real I/O
         // error (permission denied, I/O failure) only means "can't tell" — it
-        // must NOT be reported as a deletion (§B.6.0.1). Fail closed instead,
-        // so `commit -a`/`status` never records a spurious removal.
+        // must NOT be reported as a deletion NOR fabricated as clean
+        // (§B.6.0.1/§B.3.3): record the event, keep everything already
+        // collected, and continue with the remaining tracked files. Text
+        // formats fail closed at render time; JSON reports the partial
+        // result with `data.io_blocked[]`.
         match file_abs.symlink_metadata() {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 changes.deleted.push(file.clone());
                 continue;
             }
             Err(source) => {
-                return Err(StatusError::WorktreeRead {
-                    path: file_abs.clone(),
-                    source,
-                });
+                io_blocked.push(io_blocked_event(file, &source));
+                continue;
             }
             Ok(_) => {}
         }
         if index.is_modified(file_str, 0, workdir) {
-            let file_hash =
-                calc_file_blob_hash(&file_abs).map_err(|source| StatusError::FileHash {
-                    path: file_abs.clone(),
-                    source,
-                })?;
-            if !index.verify_hash(file_str, 0, &file_hash) {
-                changes.modified.push(file.clone());
+            match calc_file_blob_hash(&file_abs) {
+                Ok(file_hash) => {
+                    if !index.verify_hash(file_str, 0, &file_hash) {
+                        changes.modified.push(file.clone());
+                    }
+                }
+                Err(source) => {
+                    io_blocked.push(io_blocked_event(file, &source));
+                    continue;
+                }
             }
         }
     }
@@ -148,21 +179,46 @@ fn scan_workdir(
     let mut scan = WorkdirScan {
         untracked: Vec::new(),
         ignored: Vec::new(),
+        io_blocked: Vec::new(),
     };
     let mut pending_dirs = vec![workdir.to_path_buf()];
 
     while let Some(dir) = pending_dirs.pop() {
-        for entry in std::fs::read_dir(&dir).map_err(|source| list_error(&dir, source))? {
-            let entry = entry.map_err(|source| list_error(&dir, source))?;
+        let dir_rel = dir.strip_prefix(workdir).unwrap_or(&dir).to_path_buf();
+        let reader = match std::fs::read_dir(&dir) {
+            Ok(reader) => reader,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                // §B.3.3: record and continue with the remaining pending
+                // directories — never drop what earlier siblings collected.
+                scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
+                continue;
+            }
+        };
+        for entry in reader {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
+                    continue;
+                }
+            };
             let path = entry.path();
             let name = entry.file_name();
             if name == OsStr::new(util::ROOT_DIR) || name == OsStr::new(util::GIT_DIR) {
                 continue;
             }
 
-            let file_type = entry
-                .file_type()
-                .map_err(|source| list_error(&dir, source))?;
+            let entry_rel = path.strip_prefix(workdir).unwrap_or(&path).to_path_buf();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    scan.io_blocked.push(io_blocked_event(&entry_rel, &source));
+                    continue;
+                }
+            };
             let relative = path
                 .strip_prefix(workdir)
                 .map_err(|err| list_error(&dir, io::Error::other(err.to_string())))?
@@ -220,13 +276,16 @@ fn scan_file(
     relative: &Path,
     include_ignored: bool,
 ) -> Result<(), StatusError> {
-    let file_str = relative
-        .to_str()
-        .ok_or_else(|| StatusError::InvalidPathEncoding {
-            path: relative.to_path_buf(),
-        })?;
-    let tracked =
-        index.tracked(file_str, 0) || tracked_paths.same_file_case_alias(workdir, relative);
+    // §B.6.1: a non-UTF-8 name can never be an index entry (index paths are
+    // UTF-8 strings), so it is untracked by construction — base `??`/ignored
+    // classification proceeds on the raw path and the whole status must NOT
+    // fail (rename candidacy is skipped separately with a warning).
+    let tracked = match relative.to_str() {
+        Some(file_str) => {
+            index.tracked(file_str, 0) || tracked_paths.same_file_case_alias(workdir, relative)
+        }
+        None => false,
+    };
     if util::check_gitignore(workdir, path) {
         if include_ignored && !tracked {
             scan.ignored.push(relative.to_path_buf());

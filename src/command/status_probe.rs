@@ -83,10 +83,8 @@ impl IoBlockedReason {
 #[derive(Debug, Clone)]
 pub(crate) struct IoBlockedEvent {
     pub(crate) path: PathBuf,
-    /// Reason taxonomy (§B.6.0.1). R0-3's conservative narrowing fails the
-    /// whole status closed before rendering, so only R0-8's io_blocked[]
-    /// JSON contract will read this field.
-    #[allow(dead_code)]
+    /// Reason taxonomy (§B.6.0.1), consumed by the io_blocked[] JSON
+    /// contract (R0-8) and its worktree-family warning mapping.
     pub(crate) reason: IoBlockedReason,
 }
 
@@ -107,6 +105,10 @@ pub(crate) struct ProbeOutcome {
     pub(crate) truncated: Option<ProbeBudgetKind>,
     /// Every I/O failure encountered (path-sorted, deduplicated).
     pub(crate) io_blocked: Vec<IoBlockedEvent>,
+    /// Candidates skipped because their name is not valid UTF-8 (R0 scope:
+    /// they keep their base `??` behavior but never join rename scoring —
+    /// surfaced as one `rename_path_encoding_unsupported` warning).
+    pub(crate) encoding_skipped: u64,
 }
 
 /// Derive the probe roots from the positive pathspecs (§B.3.1.1) —
@@ -157,15 +159,18 @@ impl DestinationFilter<'_> {
     /// §B.3.1.2: keep a probed path only when it matches the pathspec set,
     /// is not tracked (including a case-fold alias), not unmerged, and not
     /// ignored.
-    fn qualifies(&self, relative: &Path, absolute: &Path) -> bool {
+    fn qualifies(&self, relative: &Path, absolute: &Path, encoding_skipped: &mut u64) -> bool {
         if let Some(set) = self.pathspecs
             && !set.matches_path(relative)
         {
             return false;
         }
         let Some(rel_str) = relative.to_str() else {
-            // Non-UTF-8 paths stay out of rename candidacy (base D/A/`??`
-            // behavior is unaffected, §B.6.1).
+            // Non-UTF-8 paths stay out of rename candidacy in R0 (DEFER-02);
+            // base D/A/`??` behavior is unaffected (§B.6.1) and the skip is
+            // counted for one deduplicated
+            // `rename_path_encoding_unsupported` warning.
+            *encoding_skipped += 1;
             return false;
         };
         if self.index.tracked(rel_str, 0)
@@ -214,7 +219,7 @@ pub(crate) fn probe_rename_destinations(
                     outcome.truncated = Some(ProbeBudgetKind::Enumeration);
                     break 'roots;
                 }
-                if filter.qualifies(root, &root_abs) {
+                if filter.qualifies(root, &root_abs, &mut outcome.encoding_skipped) {
                     if outcome.destinations.len() >= limits.max_qualified_destinations {
                         outcome.truncated = Some(ProbeBudgetKind::Destination);
                         break 'roots;
@@ -285,7 +290,7 @@ pub(crate) fn probe_rename_destinations(
                     }
                 };
                 if meta.file_type().is_symlink() || meta.is_file() {
-                    if filter.qualifies(&relative, &absolute) {
+                    if filter.qualifies(&relative, &absolute, &mut outcome.encoding_skipped) {
                         if outcome.destinations.len() >= limits.max_qualified_destinations {
                             outcome.truncated = Some(ProbeBudgetKind::Destination);
                             break;

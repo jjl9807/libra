@@ -4,6 +4,34 @@
 
 ### Added
 
+- **`status` io_blocked partial contract, frozen warning schema, exit
+  arbitration, and the non-UTF-8 posture (plan-20260714 R0-8/R0-9)**: a
+  path `status` cannot inspect (EACCES/I-O failure) is no longer
+  fabricated as a deletion or as clean — text formats fail closed with
+  `LBR-IO-001` naming the first blocked path, while `--json` succeeds
+  and reports the partial result through `data.io_blocked[]`
+  (`{path:{display,raw_base64},staged,reason,rename}`, raw-byte-sorted
+  and deduplicated) plus `base_scan_complete` /
+  `rename_detection_complete` / `complete`; `is_clean` is `false` and
+  `--exit-code` reports dirty while anything is blocked, a blocked
+  `--scan` refuses to replace the dirty cache, and `--check-dirty`
+  keeps rows it cannot re-verify. Structured warnings now use one
+  frozen `{code, message, source}` schema (sources
+  `rename_detect`/`metadata`/`worktree`/`cache`, codes documented in
+  `docs/commands/status.md`), object-read faults during rename scoring
+  (missing/corrupt/unavailable objects, budget caps) skip only the
+  dependent inexact candidates with deduplicated
+  `metadata_unavailable`/`metadata_budget_exceeded` warnings, and exit
+  arbitration is fatal ≻ 9 (`--exit-code-on-warning`) ≻ 1 (dirty) ≻ 0
+  on every output path — including the dirty-cache stale-fallback
+  path. Non-UTF-8 path names never fail `status` anymore: the base
+  `??` row is kept (RAW OS bytes on the `-z` wire on Unix — short and
+  porcelain v1/v2 `-z` records now write exact path bytes — and
+  octal-escaped readable display elsewhere, including
+  `io_blocked[].path.display`), while rename candidacy alone is
+  skipped with a `rename_path_encoding_unsupported` warning
+  (non-UTF-8 rename scoring stays a deferred extension).
+
 - **`status` short/porcelain path quoting + public entry API
   (plan-20260714 R0-6/R0-7)**: `core.quotePath` is honored through the
   strict local→global→system cascade (strict Git boolean, default

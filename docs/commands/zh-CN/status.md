@@ -115,7 +115,7 @@ libra status --no-column
 
 设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。CLI 接受 Git 完整 raw 语法——裸整数按 `0.<digits>` 读取（`505` 即 50.5%）、`N%` 为字面百分比（`100%` 仅 exact）、支持小数（`0.8`）;`0`/裸形式回到 50% 默认。三种拼写 `--no-renames` / `--renames` / `--find-renames[=N]` 按 argv 顺序真正 last-one-wins（`--no-renames --find-renames=80` 会以 80% 重新启用）。`-z` 另有 Git 对齐的 `--null` 长别名；裸 `-z`/`--null` 无显式格式时强制 porcelain v1,与 `--long`/缓存模式组合 fail-closed。嵌入 API 的 `find_renames: Option<u8>` 保持较窄的 0–100 百分比（已记录收窄——CLI 语法为完整表面）。
 
-renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限与相似度比较预算的有界 inexact spanhash 扫描。上限由 `status.renameLimit`（回退到 `diff.renameLimit`）经严格 local → global → system 级联决定：非负整数，`0` 关闭上限，默认 1000（对齐 Git）；非法值在任何输出前 fail-closed，超限只跳过 exhaustive 阶段并给出结构化 `rename_limit_product_skipped` 警告。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树——但仅在 `status.renameUntracked` 配置（Libra 扩展，严格布尔，默认 `false`）启用时才会检测，因为 unstaged 的"新"路径都是未跟踪文件。默认关闭时，已跟踪→未跟踪的移动按 Git 语义呈现为 `D` + `??`，不产生 unstaged rename 记录。启用扩展后，destination 候选来自独立的有界 worktree probe（R0-3）：`-uno` 与折叠的 untracked 目录只隐藏**显示**标记、绝不隐藏 probe；候选按与显示扫描同一 tracked/ignore 分层做资格（tracked 路径、case-fold 别名、unmerged stage 与 ignored 路径一律不入围）；调用级双预算（枚举 50k / 合格目的地 10k）为遍历定界——触顶保留部分配对并给出结构化 `probe_truncated` 警告。目录下候选全部被 rename 消费时其 `? dir/` 标记被折叠移除；truncated 或阻塞的 probe 保守保留标记。不可读路径使整个 status fail-closed（`LBR-IO-001`）——「无法检查」绝不静默降级为「无 rename」。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
+renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限与相似度比较预算的有界 inexact spanhash 扫描。上限由 `status.renameLimit`（回退到 `diff.renameLimit`）经严格 local → global → system 级联决定：非负整数，`0` 关闭上限，默认 1000（对齐 Git）；非法值在任何输出前 fail-closed，超限只跳过 exhaustive 阶段并给出结构化 `rename_limit_product_skipped` 警告。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树——但仅在 `status.renameUntracked` 配置（Libra 扩展，严格布尔，默认 `false`）启用时才会检测，因为 unstaged 的"新"路径都是未跟踪文件。默认关闭时，已跟踪→未跟踪的移动按 Git 语义呈现为 `D` + `??`，不产生 unstaged rename 记录。启用扩展后，destination 候选来自独立的有界 worktree probe（R0-3）：`-uno` 与折叠的 untracked 目录只隐藏**显示**标记、绝不隐藏 probe；候选按与显示扫描同一 tracked/ignore 分层做资格（tracked 路径、case-fold 别名、unmerged stage 与 ignored 路径一律不入围）；调用级双预算（枚举 50k / 合格目的地 10k）为遍历定界——触顶保留部分配对并给出结构化 `probe_truncated` 警告。目录下候选全部被 rename 消费时其 `? dir/` 标记被折叠移除；truncated 或阻塞的 probe 保守保留标记。不可读路径绝不静默降级为「无 rename」：文本格式以 `LBR-IO-001` fail-closed，`--json` 则通过 `data.io_blocked[]` 报告部分结果（见下文 *io_blocked 部分结果契约*）。名字不是合法 UTF-8 的 destination 保留其基础 `??` 行，但在本版本中完全不参与 rename 评分，并给出一条 `rename_path_encoding_unsupported` 警告（非 UTF-8 候选评分为延后扩展）。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
 
 renames 在每种格式中都以 Git 兼容记录呈现：human 长格式为 `renamed: <old> -> <new>`；`--short` 为 `R  <old> -> <new>`（`-z` 下为 `XY SP <new> NUL <old> NUL`）；`--porcelain=v2` 为单条 `2 R<score> … <new>\t<old>` 记录，带真实的 HEAD/index/工作树 mode 与 hash；`--json` 为顶层 `renames[]` 数组（`{from, to, score, exact, staged, unstaged}`）——绝不将端点渲染为两条独立的 `R`/`1 R` 行。当 rename 目标随后在工作树被修改或删除时，该状态并入记录的第二个 XY 列（`RM` / `RD`，与 Git 一致）；被删除目标在 porcelain v2 中的 `mW` 为 `000000`。
 
@@ -126,7 +126,33 @@ libra status --find-renames=75
 
 ### 警告与退出码仲裁
 
-rename 引擎降级以结构化警告呈现：`rename_limit_product_skipped`（单侧超过 per-side 上限，跳过 inexact 匹配）与 `similarity_budget_exceeded`（inexact 阶段被丢弃），source 均为 `rename_detect`；以及 dirty-cache 降级三码 `dirty_cache_lock_stolen`、`dirty_cache_stale_fallback`、`dirty_cache_concurrent_invalidate`，source 为 `cache`。human/short/porcelain 模式在 stderr 打印 `warning: …`（`--quiet` 也不抑制诊断）；`--json` 把它们放入 `data.warnings[]`（`{code, message, source}`），所有成功运行 stderr 保持干净；唯一例外是 JSON envelope 自身遭遇非 EPIPE 的 stdout 写失败——此时待投递警告会刷到 stderr 而非静默丢失。开启全局 `--exit-code-on-warning` 时，警告以退出码 9 优先于 `--exit-code` 的 dirty 退出码 1，覆盖所有输出模式。
+每条结构化警告都是从同一冻结 schema 取出的 `{code, message, source}` 三元组——不存在绕过 schema 的 stderr-only 通道：
+
+| Code | Source | 含义 |
+|------|--------|------|
+| `rename_limit_product_skipped` | `rename_detect` | 单侧超过 per-side rename 上限；跳过 exhaustive inexact 阶段 |
+| `similarity_budget_exceeded` | `rename_detect` | 相似度比较预算耗尽；inexact 阶段被丢弃 |
+| `probe_truncated` | `rename_detect` | rename destination probe 触顶（枚举/目的地预算）；配对为部分结果 |
+| `rename_path_encoding_unsupported` | `rename_detect` | 非 UTF-8 名字的候选不参与 rename 评分（基础 `??`/`D` 行不受影响） |
+| `metadata_unavailable` | `metadata` | 仓库对象缺失、损坏或不可用；依赖它的 inexact 候选被跳过 |
+| `metadata_budget_exceeded` | `metadata` | 内容读取预算或单对象大小上限触顶；剩余候选被跳过 |
+| `worktree_read_failed` | `worktree` | 工作树读取失败（I/O 错误）；受影响路径在 `data.io_blocked[]` 中或其 rename 候选被跳过 |
+| `worktree_permission_denied` | `worktree` | 路径无法检查（EACCES）；该路径在 `data.io_blocked[]` 中 |
+| `worktree_io_timeout` | `worktree` | 工作树读取超时 |
+| `dirty_cache_lock_stolen` | `cache` | 另一 scan 抢占了 dirty-cache 锁；结果未持久化 |
+| `dirty_cache_stale_fallback` | `cache` | dirty 缓存缺失/陈旧；降级为完整 status |
+| `dirty_cache_concurrent_invalidate` | `cache` | 并发写者在读取途中使缓存失效 |
+
+human/short/porcelain 模式在 stderr 打印 `warning: …`（`--quiet` 也不抑制诊断）；`--json` 把它们放入 `data.warnings[]`，所有成功运行 stderr 保持干净；唯一例外是 JSON envelope 自身遭遇非 EPIPE 的 stdout 写失败——此时待投递警告会刷到 stderr 而非静默丢失。开启全局 `--exit-code-on-warning` 时，警告以退出码 9 优先于 `--exit-code` 的 dirty 退出码 1，覆盖所有输出模式；fatal 错误（128/129）永远优先于两者。完整优先级为 **fatal ≻ 9（on-warning）≻ 1（dirty，含非空 `io_blocked`）≻ 0**，所有输出模式经由同一仲裁路径解析。
+
+### io_blocked 部分结果契约
+
+扫描**无法检查**的路径（权限拒绝、I/O 失败）既不是删除也不是干净——伪造任一都会破坏下游自动化（`commit -a` 记录伪删除、脏检查误报干净）。因此：
+
+- **文本格式**（human/short/porcelain）以 `LBR-IO-001` fail-closed，指出第一个受阻路径与总数，并提示用 `--json` 查看部分结果。
+- **`--json`** 正常成功并报告部分结果：每个受阻路径都出现在 `data.io_blocked[]` 中，形态为 `{path: {display, raw_base64}, staged, reason, rename}`——`display` 是转义后的仓库相对形式（与非 `-z` porcelain 同一 quoting）；名字不是合法 UTF-8 时 `raw_base64` 承载精确 OS 字节（否则为 `null`）；`staged` 为已知的 staged 分量（`"M"`/`"A"`/`"D"`/`"R"` 或 `null`）；`reason` 为 `"permission_denied"` 或 `"io_error"`；已知受影响的 staged rename 对时 `rename` 为 `{from, to, score}`。条目按 raw 路径字节升序排序并去重；每条同时产生一条 `worktree_*` 警告。
+- 基础扫描受阻时 `data.base_scan_complete` 为 `false`；任何 rename 配对降级（probe 截断/受阻、引擎跳过、预算、编码跳过）都使 `data.rename_detection_complete` 为 `false`；`data.complete` 是两者的 AND。`io_blocked` 非空期间 `is_clean` 恒为 `false`，`--exit-code` 按 dirty 报告（退出码 1）。
+- dirty-cache 扩展从不持久化疑点：受阻的 `--scan` 拒绝替换缓存，`--check-dirty` 复验时保留无法重新验证的行。
 
 
 ### `--renames` / `--no-renames`
@@ -344,9 +370,15 @@ Detached HEAD：
 - 未配置 tracking 分支或 HEAD detached 时，`upstream` 为 `null`
 - 远程 tracking 分支不再存在时，`upstream.gone` 为 `true`
 - `gone` 为 `true` 时，`upstream.ahead` / `upstream.behind` 为 `null`
-- 只有 staged、unstaged、untracked、unmerged 列表都为空且没有全局 merge
-  状态时，`is_clean` 才为 `true`
+- 只有 staged、unstaged、untracked、unmerged 列表都为空、没有全局 merge
+  状态、**且** `io_blocked` 为空时，`is_clean` 才为 `true`（「无法检查」永远不是干净）
 - 新初始化且无提交的仓库中，`has_commits` 为 `false`
+- `staged.renamed` / `unstaged.renamed` 以 `"old -> new"` 字符串列出 rename 对；顶层
+  `renames[]` 数组承载结构化记录（`{from, to, score, exact, staged, unstaged}`），按目标排序
+- `warnings[]` 承载结构化 `{code, message, source}` 警告（见*警告与退出码仲裁*）
+- `io_blocked[]` 列出扫描无法检查的路径（见 *io_blocked 部分结果契约*）；
+  `base_scan_complete`、`rename_detection_complete` 及两者 AND 的 `complete`
+  报告是否发生任何降级
 - `stash_entries`（可选，整数）：仅在传递 `--show-stash` 时存在。统计 stash 栈上的条目（匹配 `libra stash list`），可为 `0`。没有 `--show-stash` 时完全省略，因此 JSON 消费者可以区分“未查询 stash 子系统”和“已查询 stash 子系统，返回零”；也就是说，该字段的*存在*表示显式 opt-in，而不是表示存在 stashed work。
 
 ## 设计理由
@@ -385,7 +417,7 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 | 长格式 | `git status --long`（默认） | N/A | `libra status --long`（默认） |
 | 短格式 | `git status -s` / `--short` | N/A（始终短） | `libra status -s` / `--short` |
 | Porcelain v1 | `git status --porcelain` | N/A | `libra status --porcelain` |
-| Porcelain v2 | `git status --porcelain=v2` | N/A | `libra status --porcelain v2`（v1 语义） |
+| Porcelain v2 | `git status --porcelain=v2` | N/A | `libra status --porcelain v2` |
 | 短格式中的分支信息 | `git status -sb` | 始终显示 | `libra status -sb`（`--short --branch`） |
 | 显示 stash 数量 | `git status --show-stash` | N/A | `libra status --show-stash`（标准模式） |
 | 显示被忽略文件 | `git status --ignored` | N/A | `libra status --ignored` |
@@ -408,6 +440,8 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 
 `--exit-code` 启用适合脚本的静默脏状态检查。与 `--quiet` 组合时不会产生输出，只通过退出码表示仓库状态。
 
+非空 `io_blocked` 集合对 `--exit-code` 计为脏。开启全局 `--exit-code-on-warning` 时，任何结构化警告改以退出码 9 结束；所有输出模式的完整仲裁优先级为 **fatal（128/129）≻ 9（on-warning）≻ 1（dirty）≻ 0**。
+
 ## 错误处理
 
 每个 `StatusError` 变体都会映射到显式 `StableErrorCode`。
@@ -423,7 +457,8 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 
 ## 兼容性说明
 
-- `--porcelain v2` 被接受，但当前产生 v1 格式输出；使用 `--json` 获取完整结构化数据
+- `--porcelain v2` 输出真实的 v2 行语法（带 mode/hash 列的 `1`/`2`/`u`/`?`/`!` 记录）；`--json` 仍是更丰富的结构化表面
+- `-z` 下 Unix porcelain v1/v2 写出 RAW OS 路径字节（不 quote，非 UTF-8 名字无损）；非 `-z` 格式按 `core.quotePath` quoting 规则对非 UTF-8 字节做八进制转义。非 UTF-8 名字绝不使 status 失败——它保留基础 `??` 行，仅不参与 rename 评分（附 `rename_path_encoding_unsupported` 警告）
 - jj 的 `jj status` 始终使用短格式，并且不区分已暂存与未暂存更改（jj 没有暂存区）
 - 通过 `--find-renames[=<n>]` 及 `--renames`/`--no-renames` 开关支持重命名检测；不暴露 Git 的短别名 `-M`
 - 支持 `--column` 列对齐显示；`--no-column`（等价于 `--column=never`）经 clap `overrides_with` 撤销先前的 `--column`（最后出现者生效），status 默认非列式故单独使用为 no-op

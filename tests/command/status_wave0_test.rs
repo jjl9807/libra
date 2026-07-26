@@ -2211,3 +2211,528 @@ fn cached_conflicts_with_rename_flags() {
         );
     }
 }
+
+// ── R0-8: io_blocked partial contract (§B.3.3, §B.6.0.1) ─────────────────────
+
+/// A repo whose `locked/` directory holds a COMMITTED file and is then made
+/// unreadable — the tracked scan hits EACCES on the file inside, producing a
+/// genuine io_blocked event (an empty unreadable dir is conservatively
+/// reported as an untracked marker instead).
+fn repo_with_locked_tracked_dir() -> tempfile::TempDir {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir(repo.path().join("locked")).unwrap();
+    fs::write(repo.path().join("locked/inside.txt"), "tracked\n").unwrap();
+    let add = run_libra_command(&["add", "locked/inside.txt"], repo.path());
+    assert_cli_success(&add, "stage locked file");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit locked file");
+    lock_dir(&repo.path().join("locked"));
+    repo
+}
+
+fn lock_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+}
+
+fn unlock_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// An I/O-blocked path with no other change: JSON reports `is_clean: false`
+/// ("cannot inspect" is never clean) plus the blocked entry and its
+/// worktree-family warning.
+#[test]
+fn json_io_blocked_is_clean_false() {
+    let repo = repo_with_locked_tracked_dir();
+    let locked = repo.path().join("locked");
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    unlock_dir(&locked);
+    assert_cli_success(&out, "json status with blocked dir");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert_eq!(doc["data"]["is_clean"], false, "{doc}");
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|b| !b.is_empty()),
+        "{doc}"
+    );
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|x| x["code"] == "worktree_permission_denied")),
+        "{doc}"
+    );
+}
+
+/// `--exit-code` treats an I/O block as dirty → exit 1 (JSON path).
+#[test]
+fn exit_code_ioblocked_is_one() {
+    let repo = repo_with_locked_tracked_dir();
+    let locked = repo.path().join("locked");
+    let out = run_libra_command(&["--json", "status", "--exit-code"], repo.path());
+    unlock_dir(&locked);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "io_blocked counts as dirty for --exit-code: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The io_blocked[] entry object shape and the completeness fields are a
+/// public contract (§B.6.0.1).
+#[test]
+fn json_io_blocked_schema_snapshot() {
+    let repo = repo_with_locked_tracked_dir();
+    let locked = repo.path().join("locked");
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    unlock_dir(&locked);
+    assert_cli_success(&out, "json status with blocked dir");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let entry = &doc["data"]["io_blocked"][0];
+    assert_eq!(
+        entry
+            .as_object()
+            .map(|o| {
+                let mut keys: Vec<_> = o.keys().cloned().collect();
+                keys.sort();
+                keys
+            })
+            .expect("entry object"),
+        vec!["path", "reason", "rename", "staged"],
+        "entry key set is frozen: {doc}"
+    );
+    assert_eq!(entry["path"]["display"], "locked", "{doc}");
+    assert!(
+        doc["data"]["io_blocked"].as_array().is_some_and(|b| b
+            .iter()
+            .any(|e| e["path"]["display"] == "locked/inside.txt")),
+        "the tracked file inside records its own event: {doc}"
+    );
+    assert_eq!(entry["path"]["raw_base64"], serde_json::Value::Null);
+    assert_eq!(entry["staged"], serde_json::Value::Null);
+    assert_eq!(entry["reason"], "permission_denied");
+    assert_eq!(entry["rename"], serde_json::Value::Null);
+    assert_eq!(doc["data"]["base_scan_complete"], false, "{doc}");
+    assert_eq!(doc["data"]["rename_detection_complete"], false, "{doc}");
+    assert_eq!(doc["data"]["complete"], false, "{doc}");
+}
+
+/// §B.3.3 accumulator: siblings collected before/after a blocked directory
+/// survive into the JSON untracked list.
+#[test]
+fn main_scan_ioblocked_keeps_prior_sibling_json() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    fs::write(repo.path().join("aa-loose.txt"), "kept\n").unwrap();
+    fs::write(repo.path().join("zz-loose.txt"), "kept too\n").unwrap();
+    let locked = repo.path().join("mm-locked");
+    fs::create_dir(&locked).unwrap();
+    lock_dir(&locked);
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    unlock_dir(&locked);
+    assert_cli_success(&out, "json status keeps siblings");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let untracked = doc["data"]["untracked"].as_array().expect("untracked");
+    assert!(
+        untracked.iter().any(|p| p == "aa-loose.txt")
+            && untracked.iter().any(|p| p == "zz-loose.txt"),
+        "siblings survive a blocked directory: {doc}"
+    );
+}
+
+/// §B.3.3 tracked-scan accumulator: an unreadable tracked file records an
+/// io_blocked entry while other tracked changes stay reported.
+#[test]
+fn tracked_scan_eacces_partial_json() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("readable.txt"), "one\n").unwrap();
+    fs::write(repo.path().join("blocked.txt"), "two\n").unwrap();
+    let add = run_libra_command(&["add", "readable.txt", "blocked.txt"], repo.path());
+    assert_cli_success(&add, "stage both");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit both");
+    fs::write(repo.path().join("readable.txt"), "one edited\n").unwrap();
+    fs::write(repo.path().join("blocked.txt"), "two edited\n").unwrap();
+    fs::set_permissions(
+        repo.path().join("blocked.txt"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    fs::set_permissions(
+        repo.path().join("blocked.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_cli_success(&out, "json partial tracked scan");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|p| p == "readable.txt")),
+        "the readable modification stays reported: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|e| e["path"]["display"] == "blocked.txt")),
+        "the unreadable file records an io_blocked entry: {doc}"
+    );
+}
+
+/// §B.3.3 dirty-cache guard: an I/O-blocked `--scan` writes NOTHING — the
+/// previous snapshot survives verbatim.
+#[test]
+#[serial]
+fn ioblocked_scan_does_not_replace_dirty_cache() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    fs::write(repo.path().join("cached-new.txt"), "snapshot row\n").unwrap();
+    let scan = run_libra_command(&["status", "--scan"], repo.path());
+    assert_cli_success(&scan, "initial scan");
+
+    // Change the worktree AND block a directory, then try to re-scan.
+    fs::remove_file(repo.path().join("cached-new.txt")).unwrap();
+    let locked = repo.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    lock_dir(&locked);
+    let rescan = run_libra_command(&["status", "--scan"], repo.path());
+    unlock_dir(&locked);
+    fs::remove_dir(&locked).unwrap();
+    assert!(!rescan.status.success(), "blocked scan must fail closed");
+    assert!(
+        String::from_utf8_lossy(&rescan.stderr).contains("LBR-IO-001"),
+        "blocked scan carries the stable code"
+    );
+
+    // The previous snapshot is intact: the cached view still lists the row
+    // recorded by the FIRST scan.
+    let cached = run_libra_command(&["--json", "status", "--cached"], repo.path());
+    assert_cli_success(&cached, "cached view after failed rescan");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&cached.stdout)).expect("json");
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "cached-new.txt")),
+        "the pre-block snapshot survives verbatim: {doc}"
+    );
+}
+
+/// §B.3.3 dirty-cache guard: `--check-dirty` never prunes a NEW row or
+/// confirms a DELETED row whose path merely became unreadable.
+#[test]
+#[serial]
+fn check_dirty_ioblocked_does_not_mutate_cache() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    fs::create_dir(repo.path().join("sub")).unwrap();
+    fs::write(repo.path().join("sub/cached-new.txt"), "row\n").unwrap();
+    let scan = run_libra_command(&["status", "--scan"], repo.path());
+    assert_cli_success(&scan, "initial scan");
+
+    // The NEW row's parent becomes unreadable: revalidation must keep it.
+    lock_dir(&repo.path().join("sub"));
+    let check = run_libra_command(&["--json", "status", "--check-dirty"], repo.path());
+    unlock_dir(&repo.path().join("sub"));
+    assert_cli_success(&check, "check-dirty with blocked parent");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&check.stdout)).expect("json");
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "sub/cached-new.txt")),
+        "an unreadable NEW row survives revalidation: {doc}"
+    );
+
+    // And the cache still holds it afterwards (nothing was pruned).
+    let cached = run_libra_command(&["--json", "status", "--cached"], repo.path());
+    assert_cli_success(&cached, "cached view after blocked check-dirty");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&cached.stdout)).expect("json");
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "sub/cached-new.txt")),
+        "the cache row was neither pruned nor rewritten: {doc}"
+    );
+}
+
+// ── R0-8: object-read fault injection, non-UTF-8 contract, cache-fallback
+//    exit arbitration (§B.4.1, §B.6.1, §B.5) ─────────────────────────────────
+
+/// Stage an inexact rename pair, then break the OLD side's blob in the object
+/// store with `mutilate`. Detection must skip only that candidate (D + A stay
+/// truthful, no rename) and surface one deduplicated `metadata_unavailable`
+/// warning; the JSON contract reports `rename_detection_complete: false` with
+/// an intact base scan.
+fn assert_object_fault_skips_inexact_only(mutilate: impl FnOnce(&Path)) {
+    let old_body = "object fault line one\nline two\nline three\nline four\n";
+    let repo = create_repo_with_committed_file("old.txt", old_body);
+    // Locate the old blob's loose object file before breaking it.
+    let ls = run_libra_command(&["ls-tree", "HEAD"], repo.path());
+    assert_cli_success(&ls, "ls-tree HEAD");
+    let listing = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let hash = listing
+        .lines()
+        .find(|l| l.ends_with("old.txt"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .expect("old.txt blob hash in ls-tree output")
+        .to_string();
+    let object_file = repo
+        .path()
+        .join(".libra/objects")
+        .join(&hash[0..2])
+        .join(&hash[2..]);
+    assert!(object_file.exists(), "loose object at {object_file:?}");
+
+    // Inexact pair: same shape, one line changed (score < 100, > 50%).
+    fs::remove_file(repo.path().join("old.txt")).unwrap();
+    fs::write(
+        repo.path().join("new.txt"),
+        "object fault line one\nline two CHANGED\nline three\nline four\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage inexact move");
+
+    mutilate(&object_file);
+
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&out, "json status with broken object");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let staged = &doc["data"]["staged"];
+    assert!(
+        staged["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "old.txt"))
+            && staged["new"]
+                .as_array()
+                .is_some_and(|n| n.iter().any(|p| p == "new.txt")),
+        "base D + A survive the fault: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["renames"],
+        serde_json::json!([]),
+        "the affected candidate is skipped, not guessed: {doc}"
+    );
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|x| x["code"] == "metadata_unavailable")),
+        "one deduplicated metadata warning: {doc}"
+    );
+    assert_eq!(doc["data"]["base_scan_complete"], true, "{doc}");
+    assert_eq!(doc["data"]["rename_detection_complete"], false, "{doc}");
+}
+
+/// §B.4.1 Missing: a deleted loose object only skips its inexact candidate.
+#[test]
+fn object_read_missing_blob_skips_inexact_only() {
+    assert_object_fault_skips_inexact_only(|object_file| {
+        fs::remove_file(object_file).unwrap();
+    });
+}
+
+/// §B.4.1 Corrupt: garbage object bytes only skip the dependent candidate.
+#[test]
+fn object_read_corrupt_blob_skips_inexact_only() {
+    assert_object_fault_skips_inexact_only(|object_file| {
+        fs::write(object_file, b"this is not a zlib object payload").unwrap();
+    });
+}
+
+/// §B.5: the dirty-cache stale-fallback warning obeys the same 9 ≻ 1 exit
+/// arbitration as every other path — `--check-dirty` with no cache degrades
+/// with `dirty_cache_stale_fallback`, and `--exit-code-on-warning` beats the
+/// dirty exit in both text and JSON modes.
+#[test]
+fn exit_warning_over_dirty_cache_fallback() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    fs::write(repo.path().join("plain.txt"), "content changed\n").unwrap();
+
+    // Text: warning on stderr, exit 9 over dirty 1.
+    let text = run_libra_command(
+        &[
+            "--exit-code-on-warning",
+            "status",
+            "--check-dirty",
+            "--exit-code",
+        ],
+        repo.path(),
+    );
+    assert_eq!(
+        text.status.code(),
+        Some(9),
+        "cache-fallback warning exit 9 over dirty 1: {}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("dirty cache"),
+        "stale-fallback warning delivered on stderr: {stderr}"
+    );
+
+    // JSON: warning rides in data.warnings[], stderr stays clean, same 9.
+    let json = run_libra_command(
+        &[
+            "--json",
+            "--exit-code-on-warning",
+            "status",
+            "--check-dirty",
+            "--exit-code",
+        ],
+        repo.path(),
+    );
+    assert_eq!(json.status.code(), Some(9), "json cache-fallback exit 9");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json.stdout)).expect("json envelope");
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|x| x["code"] == "dirty_cache_stale_fallback")),
+        "{doc}"
+    );
+    assert!(
+        json.stderr.is_empty(),
+        "json mode keeps stderr clean: {:?}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+
+    // Without --exit-code-on-warning the dirty exit 1 still wins.
+    let plain = run_libra_command(&["status", "--check-dirty", "--exit-code"], repo.path());
+    assert_eq!(plain.status.code(), Some(1), "dirty exit stays 1");
+}
+
+/// §B.6.1 / DEFER-02: a non-UTF-8 name keeps its base `??` row (status must
+/// NOT fail) but sits out rename scoring, surfacing one
+/// `rename_path_encoding_unsupported` warning and
+/// `rename_detection_complete: false`.
+#[test]
+#[cfg(unix)]
+fn non_utf8_path_skips_rename_not_status() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let body = "probe rename content\nline two\n";
+    let repo = create_repo_with_committed_file("moved-src.txt", body);
+    enable_rename_untracked(repo.path());
+    fs::remove_file(repo.path().join("moved-src.txt")).unwrap();
+    let twin = repo.path().join(OsStr::from_bytes(b"nu\xff-dest.txt"));
+    fs::write(&twin, body).unwrap();
+
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&out, "json status with non-UTF-8 twin");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["unstaged"]["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
+        "base D preserved: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["renames"],
+        serde_json::json!([]),
+        "non-UTF-8 candidate never pairs in R0: {doc}"
+    );
+    assert!(
+        doc["data"]["warnings"].as_array().is_some_and(|w| w
+            .iter()
+            .any(|x| x["code"] == "rename_path_encoding_unsupported")),
+        "{doc}"
+    );
+    assert_eq!(doc["data"]["rename_detection_complete"], false, "{doc}");
+
+    // Short format renders the raw bytes octal-escaped (never fails, never
+    // replacement-mangled): `?? "nu\377-dest.txt"`.
+    let short = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&short, "short status with non-UTF-8 name");
+    let text = String::from_utf8_lossy(&short.stdout).into_owned();
+    assert!(
+        text.contains(r#"?? "nu\377-dest.txt""#),
+        "octal-escaped raw bytes in short display: {text}"
+    );
+}
+
+/// §B.6.7: Unix porcelain v1/v2 `-z` keep the RAW path bytes on the wire —
+/// no quoting, no lossy replacement.
+#[test]
+#[cfg(unix)]
+fn porcelain_z_non_utf8_base_status_raw_bytes() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(
+        repo.path().join(OsStr::from_bytes(b"raw\xff.txt")),
+        "payload\n",
+    )
+    .unwrap();
+
+    let v1 = run_libra_command(&["status", "--porcelain", "-z"], repo.path());
+    assert_cli_success(&v1, "porcelain v1 -z");
+    assert!(
+        v1.stdout
+            .windows(b"?? raw\xff.txt\0".len())
+            .any(|w| w == b"?? raw\xff.txt\0"),
+        "v1 -z carries the raw bytes: {:?}",
+        String::from_utf8_lossy(&v1.stdout)
+    );
+
+    let v2 = run_libra_command(&["status", "--porcelain=v2", "-z"], repo.path());
+    assert_cli_success(&v2, "porcelain v2 -z");
+    assert!(
+        v2.stdout
+            .windows(b"? raw\xff.txt\0".len())
+            .any(|w| w == b"? raw\xff.txt\0"),
+        "v2 -z carries the raw bytes: {:?}",
+        String::from_utf8_lossy(&v2.stdout)
+    );
+}
+
+/// §B.6.0.1: an io_blocked event on a non-UTF-8 path is reversible — the
+/// display field carries the octal-escaped readable form and `raw_base64`
+/// carries the exact OS bytes.
+#[test]
+#[cfg(unix)]
+fn json_io_blocked_non_utf8_path_reversible() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    let blocked = repo.path().join(OsStr::from_bytes(b"blk\xff"));
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("inner.txt"), "hidden\n").unwrap();
+    lock_dir(&blocked);
+
+    // `-uall` descends into untracked directories, so the unreadable
+    // non-UTF-8 dir produces a genuine read_dir event.
+    let out = run_libra_command(&["--json", "status", "-uall"], repo.path());
+    unlock_dir(&blocked);
+    assert_cli_success(&out, "json status -uall with non-UTF-8 blocked dir");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let entries = doc["data"]["io_blocked"].as_array().expect("io_blocked");
+    let entry = entries
+        .iter()
+        .find(|e| e["path"]["raw_base64"] != serde_json::Value::Null)
+        .unwrap_or_else(|| panic!("one non-UTF-8 io_blocked entry: {doc}"));
+    assert_eq!(
+        entry["path"]["display"], r#""blk\377""#,
+        "octal-escaped display: {doc}"
+    );
+    // base64("blk\xff") — decodes back to the exact OS bytes.
+    assert_eq!(entry["path"]["raw_base64"], "Ymxr/w==", "{doc}");
+    assert_eq!(entry["reason"], "permission_denied", "{doc}");
+}
