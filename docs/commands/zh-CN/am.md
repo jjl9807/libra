@@ -41,6 +41,19 @@ transfer encoding 解码并按序拼接，HTML alternative 与二进制附件被
 
 工作树写入前会先持久化 sequencer 状态。每个成功提交会在同一个 SQLite transaction 中移动 branch、写 reflog，并推进或清除 `am` 位置。`--continue` / `--skip` 会拒绝 tip 已在 sequencer 之外移动的分支。如果中断发生在状态保存后、当前邮件尚未写入前（包括两次 commit 之间），`--continue` 会重试该邮件。`--abort` 恢复原始 branch tip、index 和 tracked 工作树；如果中断发生在新文件写入后、stage 前，也会清理该新文件目标。
 
+## Hooks
+
+applypatch hook 族从 `.libra/hooks` 经沙箱化 repo-hook runner 运行（与 commit
+hooks 同一契约；`LIBRA_NO_HOOKS=1` 可旁路）：
+
+- `applypatch-msg <msg-file>`——在任何工作树写入之前。拟提交信息写入当前
+  worktree 的 `COMMIT_EDITMSG`（唯一可写 hook 文件）；hook 可原地编辑；非零
+  退出拒绝该邮件，series 保持可恢复。
+- `pre-applypatch`——工作树写入并暂存之后、提交之前；非零退出使 series 带着
+  已暂存改动暂停。它同样把关决议后的 `--continue` 提交（Git `--resolved`
+  语义）；`applypatch-msg` 不会在该路径重跑。
+- `post-applypatch`——提交之后；advisory（失败只警告，绝不使已应用邮件失败）。
+
 ## 冲突恢复
 
 使用 `-3`/`--3way` 时，无法应用的文本补丁会回退到三方合并：base 取 `index`
@@ -89,4 +102,4 @@ libra am --abort
 
 ## 当前限制
 
-尚未达到完整 Git `am` parity。当前不公开 Git 的完整 flag 集（`--signoff`、`--keep`、`--scissors` 等）。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
+尚未达到完整 Git `am` parity。当前不公开 Git 的完整 flag 集（`--signoff`、`--keep`、`--scissors` 等）。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。

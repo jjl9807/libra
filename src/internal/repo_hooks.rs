@@ -39,6 +39,9 @@ pub enum RepoHook {
     PreMergeCommit,
     PostMerge,
     PostRewrite,
+    ApplypatchMsg,
+    PreApplypatch,
+    PostApplypatch,
 }
 
 impl RepoHook {
@@ -53,6 +56,9 @@ impl RepoHook {
             Self::PreMergeCommit => "pre-merge-commit",
             Self::PostMerge => "post-merge",
             Self::PostRewrite => "post-rewrite",
+            Self::ApplypatchMsg => "applypatch-msg",
+            Self::PreApplypatch => "pre-applypatch",
+            Self::PostApplypatch => "post-applypatch",
         }
     }
 }

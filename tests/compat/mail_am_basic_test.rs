@@ -1424,3 +1424,134 @@ AAAA\n\
         "actionable refusal: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PD-09 ⑤: applypatch-msg / pre-applypatch / post-applypatch hooks
+// ---------------------------------------------------------------------------
+
+fn install_hook(fixture: &CliFixture, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hooks = fixture.repo.join(".libra").join("hooks");
+    fs::create_dir_all(&hooks).expect("create hooks dir");
+    let path = hooks.join(name);
+    fs::write(&path, script).expect("write hook");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+}
+
+fn remove_hook(fixture: &CliFixture, name: &str) {
+    let _ = fs::remove_file(fixture.repo.join(".libra").join("hooks").join(name));
+}
+
+fn one_patch_series(fixture: &CliFixture) -> PathBuf {
+    let base = fixture.commit_file("file.txt", "base\n", "base");
+    fixture.commit_file("file.txt", "base\nhooked\n", "hooked change");
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 1);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    patches[0].clone()
+}
+
+/// `applypatch-msg` may rewrite the proposed message; a non-zero exit
+/// refuses the mail BEFORE any worktree write, leaving a resumable
+/// series.
+#[test]
+fn applypatch_msg_hook_edits_message_and_gates() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = one_patch_series(&fixture);
+    let path = patch.to_str().expect("utf8 patch");
+
+    install_hook(
+        &fixture,
+        "applypatch-msg",
+        "#!/bin/sh\nprintf '\\nHook-Edited: yes\\n' >> \"$1\"\n",
+    );
+    let out = fixture.run(&fixture.repo, &["am", path]);
+    assert_success(&["am", "edit-hook"], &out);
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(text.contains("Hook-Edited: yes"), "edited message: {text}");
+
+    // Refusal: state saved, worktree untouched, --abort restores.
+    let tip = fixture.rev_parse("HEAD");
+    fixture.success(&fixture.repo, &["reset", "--hard", "HEAD~1"]);
+    install_hook(&fixture, "applypatch-msg", "#!/bin/sh\nexit 1\n");
+    let refused = fixture.run(&fixture.repo, &["am", path]);
+    assert!(!refused.status.success(), "hook refusal fails the mail");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("applypatch-msg hook refused"),
+        "actionable refusal: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("untouched"),
+        "base\n",
+        "refusal happens before any worktree write"
+    );
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+    let _ = tip;
+}
+
+/// `pre-applypatch` gates the commit AFTER the worktree write; removing
+/// the hook lets `--continue` finish the paused mail.
+#[test]
+fn pre_applypatch_gate_blocks_commit_then_continue_finishes() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = one_patch_series(&fixture);
+    let path = patch.to_str().expect("utf8 patch");
+    let tip_before = fixture.rev_parse("HEAD");
+
+    install_hook(&fixture, "pre-applypatch", "#!/bin/sh\nexit 1\n");
+    let out = fixture.run(&fixture.repo, &["am", path]);
+    assert!(!out.status.success(), "pre-applypatch refusal pauses");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pre-applypatch hook refused"),
+        "actionable refusal: {stderr}"
+    );
+    assert_eq!(
+        fixture.rev_parse("HEAD"),
+        tip_before,
+        "no commit while the gate refuses"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("written"),
+        "base\nhooked\n",
+        "the worktree write already happened"
+    );
+
+    remove_hook(&fixture, "pre-applypatch");
+    let done = fixture.success(&fixture.repo, &["am", "--continue"]);
+    let _ = done;
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("hooked change"),
+        "resolved mail committed after the gate lifts"
+    );
+}
+
+/// `post-applypatch` is advisory: a failing hook warns but never fails
+/// the applied mail.
+#[test]
+fn post_applypatch_failure_is_advisory() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = one_patch_series(&fixture);
+    let path = patch.to_str().expect("utf8 patch");
+
+    install_hook(&fixture, "post-applypatch", "#!/bin/sh\nexit 7\n");
+    let out = fixture.run(&fixture.repo, &["am", path]);
+    assert_success(&["am", "advisory-hook"], &out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("post-applypatch") && stderr.contains("exited with code 7"),
+        "advisory warning surfaces: {stderr}"
+    );
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("hooked change"),
+        "the mail still committed"
+    );
+}

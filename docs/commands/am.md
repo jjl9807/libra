@@ -66,6 +66,23 @@ retries that mail. `--abort` resets the original branch tip, index, and tracked
 worktree, and also removes a new-file target left by an interruption before it
 was staged.
 
+## Hooks
+
+The applypatch hook family runs from `.libra/hooks` through the
+sandboxed repository-hook runner (same contract as the commit hooks;
+`LIBRA_NO_HOOKS=1` bypasses):
+
+- `applypatch-msg <msg-file>` — before any worktree write. The proposed
+  commit message is written to the worktree's `COMMIT_EDITMSG` (the one
+  writable hook file); the hook may edit it in place, and a non-zero
+  exit refuses the mail with the series left resumable.
+- `pre-applypatch` — after the worktree write and staging, before the
+  commit; a non-zero exit pauses the series with the changes staged.
+  It also gates the resolved `--continue` commit (Git's `--resolved`
+  semantics); `applypatch-msg` does not re-run there.
+- `post-applypatch` — after the commit; advisory (failures warn, never
+  fail the applied mail).
+
 ## Conflict recovery
 
 With `-3`/`--3way`, a text patch that does not apply falls back to a
@@ -120,5 +137,5 @@ libra am --abort
 ## Current limitations
 
 This is not yet full Git `am` parity. It does not expose Git's wider
-flag set (`--signoff`, `--keep`, `--scissors`, and others). Applypatch/commit hooks are not run. The shared parser is also
+flag set (`--signoff`, `--keep`, `--scissors`, and others). The shared parser is also
 available as the standalone [`libra mailinfo`](mailinfo.md) command.

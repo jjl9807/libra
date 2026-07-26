@@ -4,6 +4,17 @@
 
 ### Added
 
+- **`am` applypatch hooks (plan-20260714 PD-09 ⑤ — PD-09 complete)**:
+  `applypatch-msg` (may edit the proposed commit message via the
+  worktree `COMMIT_EDITMSG`, non-zero refuses the mail before any
+  worktree write), `pre-applypatch` (gates the commit after write +
+  stage, including the resolved `--continue` path), and
+  `post-applypatch` (advisory) now run from `.libra/hooks` through the
+  sandboxed repository-hook runner. Every refusal leaves the saved
+  series resumable (`--continue`/`--skip`/`--abort`), and
+  `LIBRA_NO_HOOKS=1` bypasses. This closes the last PD-09 slice: am's
+  deferred surface is down to Git's wider flag set.
+
 - **`am`/`mailinfo` MIME multipart mails (plan-20260714 PD-09 ④)**: the
   shared mail parser now handles `multipart/mixed`/`alternative`
   containers (nested, bounded depth) — parts split on the declared

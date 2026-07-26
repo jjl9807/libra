@@ -33,6 +33,9 @@ use crate::{
         branch::Branch,
         head::Head,
         reflog::{ReflogAction, ReflogContext, with_reflog},
+        repo_hooks::{
+            RepoHook, replay_repo_hook_output, run_advisory_repo_hook, run_repo_hook_with_io,
+        },
         sequencer::{self, AmSequenceState},
         tree_plumbing,
     },
@@ -304,7 +307,13 @@ async fn continue_am(output: &OutputConfig) -> CliResult<AmOutput> {
     }
     ensure_resolution_staged(&mail.targets).await?;
 
+    // PD-09 ⑤: the resolved-continue commit passes the same
+    // `pre-applypatch` gate as a clean apply (Git's --resolved path);
+    // `applypatch-msg` does not re-run — the message was settled when
+    // the mail was first processed.
+    run_pre_applypatch_hook(&mail, output).await?;
     let first = commit_current(&mut state, mail).await?;
+    run_advisory_repo_hook(RepoHook::PostApplypatch, &[], None, output).await;
     let mut applied = vec![first];
     applied.extend(apply_remaining(&mut state, output).await?);
     Ok(AmOutput {
@@ -361,12 +370,25 @@ async fn abort_am(output: &OutputConfig) -> CliResult<AmOutput> {
 
 async fn apply_remaining(
     state: &mut AmState,
-    _output: &OutputConfig,
+    output: &OutputConfig,
 ) -> CliResult<Vec<AppliedMail>> {
     let mut applied = Vec::new();
     while state.payload.current < state.payload.patches.len() {
         ensure_expected_head(state).await?;
-        let mail = state.payload.patches[state.payload.current].clone();
+        let mut mail = state.payload.patches[state.payload.current].clone();
+        // PD-09 ⑤: `applypatch-msg` may edit the proposed commit message
+        // and gates the mail BEFORE any worktree write; the state was
+        // saved already, so a refusal leaves a resumable series.
+        if let Some(edited) = run_applypatch_msg_hook(&mail, output).await? {
+            if edited.trim().is_empty() {
+                return Err(am_hook_error(
+                    RepoHook::ApplypatchMsg,
+                    &mail,
+                    "the hook emptied the commit message".to_string(),
+                ));
+            }
+            mail.message = edited;
+        }
         let resolver: crate::command::apply::BaseBlobResolver<'_> = &resolve_local_base_blob;
         let prepared = match prepare_patch_opts(
             &mail.patch,
@@ -413,7 +435,11 @@ async fn apply_remaining(
         stage_targets(&mail.targets).await?;
         stage_mode_overrides(&mode_overrides)?;
         ensure_resolution_staged(&mail.targets).await?;
+        // PD-09 ⑤: `pre-applypatch` inspects the applied+staged result and
+        // gates the commit; `post-applypatch` is advisory like Git's.
+        run_pre_applypatch_hook(&mail, output).await?;
         applied.push(commit_current(state, mail).await?);
+        run_advisory_repo_hook(RepoHook::PostApplypatch, &[], None, output).await;
         if state.payload.current < state.payload.patches.len()
             && test_failpoint_enabled("LIBRA_TEST_AM_FAIL_AFTER_COMMIT")
         {
@@ -648,6 +674,126 @@ async fn recovery_state_is_pristine(targets: &[String]) -> CliResult<bool> {
 
 fn test_failpoint_enabled(name: &str) -> bool {
     std::env::var_os("LIBRA_TEST").is_some() && std::env::var_os(name).is_some()
+}
+
+/// PD-09 ⑤ `applypatch-msg`: the proposed commit message is written to
+/// the worktree's `COMMIT_EDITMSG` (the one writable hook file), the
+/// hook may edit it in place, and a non-zero exit refuses the mail.
+/// Returns the possibly-edited message when the hook ran.
+async fn run_applypatch_msg_hook(
+    mail: &MailPatch,
+    output: &OutputConfig,
+) -> CliResult<Option<String>> {
+    let message_path = util::try_get_worktree_gitdir(None)
+        .map(|gitdir| gitdir.join("COMMIT_EDITMSG"))
+        .map_err(|error| {
+            am_state_error(format!(
+                "failed to locate the worktree metadata directory for am hooks: {error}"
+            ))
+        })?;
+    let Some(message_path_str) = message_path.to_str() else {
+        return Err(am_state_error(format!(
+            "commit message path '{}' is not valid UTF-8",
+            message_path.display()
+        )));
+    };
+    crate::utils::atomic_write::write_atomic(&message_path, mail.message.as_bytes(), false)
+        .map_err(|error| {
+            am_state_error(format!(
+                "failed to write the am commit message file '{}': {error}",
+                message_path.display()
+            ))
+        })?;
+    let hook_output = run_repo_hook_with_io(
+        RepoHook::ApplypatchMsg,
+        &[message_path_str.to_string()],
+        None,
+        Some(&message_path),
+    )
+    .await
+    .map_err(|error| am_hook_error(RepoHook::ApplypatchMsg, mail, error.to_string()))?;
+    let Some(hook_output) = hook_output else {
+        return Ok(None);
+    };
+    replay_repo_hook_output(&hook_output, output)
+        .map_err(|detail| am_hook_error(RepoHook::ApplypatchMsg, mail, detail))?;
+    if hook_output.timed_out {
+        return Err(am_hook_error(
+            RepoHook::ApplypatchMsg,
+            mail,
+            format!(
+                "hook '{}' exceeded the 15 minute timeout",
+                hook_output.path.display()
+            ),
+        ));
+    }
+    if hook_output.exit_code != 0 {
+        return Err(am_hook_error(
+            RepoHook::ApplypatchMsg,
+            mail,
+            format!(
+                "hook '{}' exited with code {}",
+                hook_output.path.display(),
+                hook_output.exit_code
+            ),
+        ));
+    }
+    let edited = fs::read_to_string(&message_path).map_err(|error| {
+        am_state_error(format!(
+            "failed to read the am commit message file '{}': {error}",
+            message_path.display()
+        ))
+    })?;
+    Ok(Some(edited))
+}
+
+/// PD-09 ⑤ `pre-applypatch`: no arguments, gates the commit after the
+/// worktree write + staging. A refusal pauses the series with the
+/// applied changes staged, exactly like a conflict resolution stop.
+async fn run_pre_applypatch_hook(mail: &MailPatch, output: &OutputConfig) -> CliResult<()> {
+    let hook_output = run_repo_hook_with_io(RepoHook::PreApplypatch, &[], None, None)
+        .await
+        .map_err(|error| am_hook_error(RepoHook::PreApplypatch, mail, error.to_string()))?;
+    let Some(hook_output) = hook_output else {
+        return Ok(());
+    };
+    replay_repo_hook_output(&hook_output, output)
+        .map_err(|detail| am_hook_error(RepoHook::PreApplypatch, mail, detail))?;
+    if hook_output.timed_out {
+        return Err(am_hook_error(
+            RepoHook::PreApplypatch,
+            mail,
+            format!(
+                "hook '{}' exceeded the 15 minute timeout",
+                hook_output.path.display()
+            ),
+        ));
+    }
+    if hook_output.exit_code != 0 {
+        return Err(am_hook_error(
+            RepoHook::PreApplypatch,
+            mail,
+            format!(
+                "hook '{}' exited with code {}",
+                hook_output.path.display(),
+                hook_output.exit_code
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A gating am hook refused the current mail: the sequencer state is
+/// already saved, so the series pauses with the usual resume verbs.
+fn am_hook_error(hook: RepoHook, mail: &MailPatch, detail: String) -> CliError {
+    CliError::fatal(format!(
+        "{} hook refused mail '{}': {detail}",
+        hook.as_str(),
+        mail.source
+    ))
+    .with_stable_code(StableErrorCode::RepoStateInvalid)
+    .with_hint("fix the hook (or bypass with LIBRA_NO_HOOKS=1), then run 'libra am --continue'")
+    .with_hint("or run 'libra am --skip' / 'libra am --abort'")
 }
 
 /// PD-09 ②: force the index modes a patch's `old mode`/`new mode`/`new
