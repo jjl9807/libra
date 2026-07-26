@@ -12,10 +12,10 @@
 //! filesystem or the object store.
 //!
 //! `diff` currently consumes only [`similarity_score`]; the snapshot/engine
-//! surface is wired into `status` by slices R0-2/R0-4 (plan-20260714 §B.8).
-//! The module-wide `dead_code` allow below MUST be removed in R0-4 — it only
-//! exists so this engine slice can land reviewed and unit-tested first.
-#![allow(dead_code)]
+//! surface is live in `status` (staged + config-gated unstaged sides, R0-2/
+//! R0-4), which owns the [`ObjectReadBudget`]/[`WorktreeReadBudget`]
+//! instances and threads them through both the exact-stage OID streaming and
+//! the inexact content reads.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -76,7 +76,11 @@ pub(crate) enum BlobEvidence {
     KnownObjectId { oid: ObjectHash },
     /// OID streamed from the worktree during this status/diff call.
     ComputedWorktreeThisCall { oid: ObjectHash },
-    /// No trustworthy OID; exact pairing is forbidden.
+    /// No trustworthy OID; exact pairing is forbidden. Not yet constructed
+    /// by the live `status` sides (HEAD/index carry known OIDs and worktree
+    /// OIDs are streamed this call) — R0-3's untracked rename destinations
+    /// are the intended producer.
+    #[allow(dead_code)]
     Unknown,
 }
 
@@ -883,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_pairs_without_content_reads() {
+    fn known_oid_exact_does_not_read_blob() {
         let data = b"identical content\n";
         let snap = snapshot(
             &[("a.txt", regular(known(data), data.len() as u64))],
@@ -1363,5 +1367,68 @@ mod tests {
         assert_eq!(m(EXACT_SCORE).score_percent(), 100);
         assert_eq!(m(59999).score_percent(), 99, "§B.9: 59999→99 floor");
         assert_eq!(m(30000).score_percent(), 50);
+    }
+
+    /// §B.4.1 designated test: the object-read budget and the worktree-read
+    /// budget hold fully independent counters — exhausting one never blocks
+    /// the other, and each cap (per-item, total, slot/task) reports through
+    /// its own skip reason. Symlink reads keep the worktree side free of any
+    /// repository/attribute dependency.
+    #[cfg(unix)]
+    #[test]
+    fn object_budget_independent_of_worktree_budget() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = dir.path().join("small.link");
+        let big = dir.path().join("big.link");
+        std::os::unix::fs::symlink("abc", &small).expect("small symlink");
+        std::os::unix::fs::symlink("0123456789", &big).expect("big symlink");
+
+        // An exhausted OBJECT budget (zero object slots) refuses up front...
+        let mut objects = ObjectReadBudget::new(1024, 1024, 0, Duration::from_secs(30));
+        assert!(matches!(
+            objects.read_blob(&oid_of(b"whatever")),
+            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+        ));
+
+        // ...while a worktree budget still reads through its own counters.
+        let mut worktree = WorktreeReadBudget::new(4, 1024, 2, Duration::from_secs(30));
+        assert!(matches!(
+            worktree.read_worktree_blob(&small),
+            ContentOutcome::Content(_)
+        ));
+        // Worktree per-file cap trips as TooLarge (not BudgetExceeded)...
+        assert!(matches!(
+            worktree.read_worktree_blob(&big),
+            ContentOutcome::Skipped(SkipReason::TooLarge)
+        ));
+        // ...and the task cap trips as BudgetExceeded on the third task.
+        assert!(matches!(
+            worktree.read_worktree_blob(&small),
+            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+        ));
+
+        // The exhausted worktree budget leaves a fresh object budget's
+        // pre-checks untouched: only ITS zero-slot/zero-byte/deadline caps
+        // refuse, proving there is no shared pool between the two.
+        let mut fresh_zero_total = ObjectReadBudget::new(1024, 0, 8, Duration::from_secs(30));
+        assert!(matches!(
+            fresh_zero_total.read_blob(&oid_of(b"whatever")),
+            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+        ));
+        let mut fresh_expired = ObjectReadBudget::new(1024, 1024, 8, Duration::ZERO);
+        assert!(matches!(
+            fresh_expired.read_blob(&oid_of(b"whatever")),
+            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+        ));
+
+        // Worktree total-byte cap is likewise its own counter: a fresh
+        // budget with a tiny total refuses the big symlink as TooLarge.
+        let mut tiny_total = WorktreeReadBudget::new(1024, 4, 8, Duration::from_secs(30));
+        assert!(matches!(
+            tiny_total.read_worktree_blob(&big),
+            ContentOutcome::Skipped(SkipReason::TooLarge)
+        ));
     }
 }

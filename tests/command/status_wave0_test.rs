@@ -1052,3 +1052,331 @@ fn normalize_ignores_diff_pathspec_status() {
     let ours = run_libra_command(&["status", "--find-renames", "a.txt"], repo.path());
     assert_cli_success(&ours, "status bare --find-renames keeps the pathspec");
 }
+
+// ── R0-2 residuals: designated snapshot/evidence tests ───────────────────────
+
+/// A repository with no HEAD commit (unborn branch) must not crash rename
+/// detection: everything staged is a plain `new file`, the JSON `renames[]`
+/// array is empty, and the run succeeds.
+#[test]
+fn no_head_staged_rename() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("fresh.txt"), "no head yet\n").unwrap();
+    let add = run_libra_command(&["add", "fresh.txt"], repo.path());
+    assert_cli_success(&add, "stage file on unborn HEAD");
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("new file") && out.contains("fresh.txt") && !out.contains("renamed:"),
+        "unborn-HEAD staging must render as a plain add: {out}"
+    );
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    assert_eq!(
+        doc["data"]["renames"].as_array().map(Vec::len),
+        Some(0),
+        "no rename entries can exist without a HEAD side: {json}"
+    );
+}
+
+/// §B.5 delivery matrix: JSON paths are repository-root-relative even when
+/// `status` runs from a subdirectory, and the score/exactness lookup still
+/// resolves (no silent 100/exact fallback).
+#[test]
+fn json_repo_relative_from_subdir() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir(repo.path().join("sub")).unwrap();
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    fs::write(repo.path().join("sub/a.txt"), &base).unwrap();
+    let add = run_libra_command(&["add", "sub/a.txt"], repo.path());
+    assert_cli_success(&add, "stage subdir file");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit subdir file");
+    let mv = run_libra_command(&["mv", "sub/a.txt", "sub/b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv in subdir");
+    // Make the rename inexact so a details-map miss (which would fall back
+    // to score=100/exact=true) is detectable.
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("sub/b.txt"), edited).unwrap();
+    let add = run_libra_command(&["add", "sub/b.txt"], repo.path());
+    assert_cli_success(&add, "restage edited moved file");
+
+    let out = status_stdout(&repo.path().join("sub"), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&out).expect("json status");
+    let renames = doc["data"]["renames"]
+        .as_array()
+        .expect("renames array present");
+    let entry = renames
+        .iter()
+        .find(|r| r["to"] == "sub/b.txt")
+        .unwrap_or_else(|| panic!("rename entry must be repo-relative: {out}"));
+    assert_eq!(entry["from"], "sub/a.txt", "from is repo-relative: {out}");
+    assert_eq!(
+        entry["exact"], false,
+        "edited rename must be inexact: {out}"
+    );
+    let score = entry["score"].as_u64().expect("score");
+    assert!(
+        (50..100).contains(&score),
+        "inexact score must come from the real details map, got {score}: {out}"
+    );
+    // The staged change set is repo-relative too.
+    let staged = doc["data"]["staged"]["renamed"]
+        .as_array()
+        .expect("staged renamed");
+    assert!(
+        staged
+            .iter()
+            .any(|p| p["from"] == "sub/a.txt" && p["to"] == "sub/b.txt"),
+        "staged.renamed must be repo-relative: {out}"
+    );
+}
+
+/// §B.4.1 empty-file rule end-to-end: an empty file pairs EXACT (same OID)
+/// on a pure move, but never joins inexact scoring — an empty source plus a
+/// non-empty replacement stays a delete + add.
+#[test]
+fn rename_empty_file_exact_pair_only() {
+    // Pure move of an empty file: exact rename.
+    let repo = create_repo_with_committed_file("empty.txt", "");
+    let mv = run_libra_command(&["mv", "empty.txt", "renamed-empty.txt"], repo.path());
+    assert_cli_success(&mv, "mv empty file");
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("renamed-empty.txt"),
+        "empty-file pure move must pair exactly by OID: {out}"
+    );
+
+    // Empty source + non-empty destination: no inexact pairing.
+    let repo = create_repo_with_committed_file("empty.txt", "");
+    let rm = run_libra_command(&["rm", "empty.txt"], repo.path());
+    assert_cli_success(&rm, "delete empty file");
+    fs::write(repo.path().join("full.txt"), "now with content\n").unwrap();
+    let add = run_libra_command(&["add", "full.txt"], repo.path());
+    assert_cli_success(&add, "stage replacement");
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        !out.contains("renamed:"),
+        "an empty file must never pair inexactly: {out}"
+    );
+    assert!(
+        out.contains("deleted:") && out.contains("new file"),
+        "the endpoints stay a delete + add: {out}"
+    );
+}
+
+/// GC-02 hash-kind neutrality: rename detection (exact and inexact) works
+/// identically in a SHA-256 repository.
+#[test]
+fn rename_sha256_repo_detected() {
+    let repo = tempdir().expect("temp repo");
+    fs::create_dir_all(repo.path()).unwrap();
+    let init = run_libra_command(&["init", "--object-format", "sha256"], repo.path());
+    assert_cli_success(&init, "init sha256 repo");
+    configure_identity_via_cli(repo.path());
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    fs::write(repo.path().join("wide.txt"), &base).unwrap();
+    let add = run_libra_command(&["add", "wide.txt"], repo.path());
+    assert_cli_success(&add, "stage sha256 fixture");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit sha256 fixture");
+
+    // Exact rename.
+    let mv = run_libra_command(&["mv", "wide.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "mv in sha256 repo");
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("moved.txt"),
+        "sha256 exact rename must be detected: {out}"
+    );
+
+    // Inexact rename after a small edit.
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage edited sha256 file");
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("moved.txt"),
+        "sha256 inexact rename must be detected: {out}"
+    );
+}
+
+// ── R0-5 residuals: porcelain v2 rename record field pins (§B.6.4) ───────────
+
+/// Parse the first `2 …` record of a porcelain v2 dump into whitespace
+/// fields (paths carry no spaces in these fixtures, so `new`/`old` land at
+/// indices 9/10).
+fn first_v2_record(out: &str) -> Vec<String> {
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("expected a porcelain v2 rename record: {out}"));
+    line.split_whitespace().map(str::to_string).collect()
+}
+
+/// Staged inexact rename with a mode flip: every metadata field of the
+/// `2 R.` record is pinned against fixture-known modes and OIDs
+/// (§B.6.4 field order `2 <xy> <sub> <mH> <mI> <mW> <hH> <hI> R<pct>
+/// <new>\t<old>`).
+#[test]
+fn porcelain_v2_staged_rename_mode_hash_fields() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let head_oid = {
+        let out = run_libra_command(&["rev-parse", "HEAD:orig.txt"], repo.path());
+        assert_cli_success(&out, "rev-parse HEAD:orig.txt");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), &edited).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            repo.path().join("moved.txt"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage edited moved file");
+    // Fixture truth for the index side from ls-files --stage.
+    let stage = {
+        let out = run_libra_command(&["ls-files", "--stage"], repo.path());
+        assert_cli_success(&out, "ls-files --stage");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let stage_line = stage
+        .lines()
+        .find(|l| l.ends_with("moved.txt"))
+        .unwrap_or_else(|| panic!("staged entry for moved.txt: {stage}"));
+    let stage_fields: Vec<&str> = stage_line.split_whitespace().collect();
+    let (index_mode, index_oid) = (stage_fields[0], stage_fields[1]);
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let fields = first_v2_record(&out);
+    assert_eq!(fields[1], "R.", "staged-only rename xy: {out}");
+    assert_eq!(fields[2], "N...", "ordinary entry sub field: {out}");
+    assert_eq!(fields[3], "100644", "mH is the committed mode: {out}");
+    assert_eq!(fields[4], index_mode, "mI matches ls-files --stage: {out}");
+    assert_eq!(fields[5], index_mode, "mW matches the on-disk mode: {out}");
+    assert_eq!(fields[6], head_oid, "hH is the HEAD blob: {out}");
+    assert_eq!(fields[7], index_oid, "hI matches ls-files --stage: {out}");
+    assert_ne!(fields[6], fields[7], "content edit keeps hH != hI: {out}");
+    let pct: u32 = fields[8]
+        .strip_prefix('R')
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("score field R<pct>: {out}"));
+    assert!((50..100).contains(&pct), "inexact score in range: {out}");
+    assert_eq!(fields[9], "moved.txt", "new path first: {out}");
+    assert_eq!(fields[10], "orig.txt", "old path second: {out}");
+}
+
+/// Unstaged-only rename (`.R`, `status.renameUntracked=true`): Git copies the
+/// index fields into the HEAD columns — hH == hI == the REAL index OID and
+/// mH == mI == the real mode; the all-zero fallback must fail this test.
+#[test]
+fn porcelain_v2_unstaged_dot_r_hash_fixup() {
+    let repo = create_repo_with_committed_file("a.txt", "hash fixup content\nsecond line\n");
+    let cfg = run_libra_command(&["config", "status.renameUntracked", "true"], repo.path());
+    assert_cli_success(&cfg, "enable renameUntracked");
+    let index_oid = {
+        let out = run_libra_command(&["rev-parse", "HEAD:a.txt"], repo.path());
+        assert_cli_success(&out, "rev-parse HEAD:a.txt");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    // Pure worktree move: index keeps a.txt, disk has b.txt.
+    fs::rename(repo.path().join("a.txt"), repo.path().join("b.txt")).unwrap();
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let fields = first_v2_record(&out);
+    assert_eq!(fields[1], ".R", "unstaged-only rename xy: {out}");
+    assert_eq!(fields[3], "100644", "mH copies the index mode: {out}");
+    assert_eq!(fields[4], "100644", "mI is the index mode: {out}");
+    assert_eq!(fields[5], "100644", "mW is the real worktree mode: {out}");
+    assert_eq!(fields[6], index_oid, "hH copies the index OID: {out}");
+    assert_eq!(fields[7], index_oid, "hI is the index OID: {out}");
+    assert_eq!(fields[8], "R100", "pure move is exact: {out}");
+    assert_eq!(fields[9], "b.txt", "new path first: {out}");
+    assert_eq!(fields[10], "a.txt", "old path second: {out}");
+}
+
+/// A staged rename chained with a worktree rename produces exactly two v2
+/// records (`R.` old→mid, `.R` mid→new), two short-format lines, and two
+/// JSON entries — never a merged or dropped hop.
+#[test]
+fn chain_rename_two_records() {
+    let repo = create_repo_with_committed_file("a.txt", "chain rename content\nsecond line\n");
+    let cfg = run_libra_command(&["config", "status.renameUntracked", "true"], repo.path());
+    assert_cli_success(&cfg, "enable renameUntracked");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "staged hop a->b");
+    fs::rename(repo.path().join("b.txt"), repo.path().join("c.txt")).unwrap();
+
+    let v2 = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let records: Vec<&str> = v2.lines().filter(|l| l.starts_with("2 ")).collect();
+    assert_eq!(records.len(), 2, "exactly two rename records: {v2}");
+    assert!(
+        records
+            .iter()
+            .any(|r| r.contains(" R. ") && r.ends_with("b.txt\ta.txt")),
+        "staged hop a->b: {v2}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.contains(" .R ") && r.ends_with("c.txt\tb.txt")),
+        "worktree hop b->c: {v2}"
+    );
+
+    let short = status_stdout(repo.path(), &["status", "--short"]);
+    let arrows = short.lines().filter(|l| l.contains(" -> ")).count();
+    assert_eq!(arrows, 2, "two short-format rename lines: {short}");
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames array");
+    assert_eq!(renames.len(), 2, "two JSON rename entries: {json}");
+    assert!(
+        renames
+            .iter()
+            .any(|r| r["from"] == "a.txt" && r["to"] == "b.txt" && r["staged"] == true)
+    );
+    assert!(
+        renames
+            .iter()
+            .any(|r| r["from"] == "b.txt" && r["to"] == "c.txt" && r["unstaged"] == true)
+    );
+}
+
+/// Porcelain v2 under `-z`: the rename record ends `… R<pct> <new> NUL <old>
+/// NUL` with no trailing newline after the final NUL (§B.6.4).
+#[test]
+fn porcelain_v2_z_rename_record_nul_paths() {
+    let repo = create_repo_with_committed_file("a.txt", "nul separated rename\nsecond line\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain=v2", "-z"]);
+    assert!(
+        out.contains("R100 b.txt\0a.txt\0"),
+        "-z rename paths are NUL separated, new first: {out:?}"
+    );
+    assert!(
+        !out.contains("b.txt\ta.txt"),
+        "-z must not fall back to the TAB form: {out:?}"
+    );
+    assert!(
+        out.ends_with('\0') && !out.ends_with("\0\n"),
+        "records are NUL terminated with no trailing newline: {out:?}"
+    );
+}

@@ -1167,8 +1167,15 @@ impl rename_detect::RenameContentSource for StatusContentSource {
 fn build_rename_side(
     paths: &[PathBuf],
     side: &RenameBlobSide<'_>,
+    worktree_budget: &mut rename_detect::WorktreeReadBudget,
 ) -> HashMap<PathBuf, rename_detect::BlobRef> {
     use rename_detect::{BlobEvidence, BlobKind, BlobRef};
+    // §B.4.1: the empty blob is recognizable by OID alone, so HEAD/index
+    // sides can carry `size = Some(0)` (the engine's empty-file inexact
+    // skip) without any object read; the constant follows the process hash
+    // kind.
+    let empty_blob_oid =
+        git_internal::internal::object::blob::Blob::from_content_bytes(Vec::new()).id;
     let mut map = HashMap::new();
     for path in paths {
         let repo_key = util::to_workdir_path(path);
@@ -1180,7 +1187,7 @@ fn build_rename_side(
                 BlobRef {
                     kind: BlobKind::from_mode(mode),
                     mode,
-                    size: None,
+                    size: (oid == empty_blob_oid).then_some(0),
                     evidence: BlobEvidence::KnownObjectId { oid },
                 }
             }
@@ -1191,13 +1198,18 @@ fn build_rename_side(
                     Ok(_) => (BlobKind::Regular, 0o100644),
                     Err(_) => continue,
                 };
-                let Ok(oid) = calc_file_blob_hash(&abs) else {
+                // §B.3.4: worktree OID computation streams through the SAME
+                // read budget that later feeds inexact content reads, so a
+                // pathological candidate set cannot bypass the caps via the
+                // exact stage (LFS paths hash the pointer blob, matching
+                // what the index records).
+                let Ok((oid, size)) = worktree_budget.worktree_blob_oid_and_size(&abs) else {
                     continue;
                 };
                 BlobRef {
                     kind,
                     mode,
-                    size: None,
+                    size: Some(size),
                     evidence: BlobEvidence::ComputedWorktreeThisCall { oid },
                 }
             }
@@ -1252,15 +1264,19 @@ fn detect_renames_in_changes(
     if changes.deleted.is_empty() || changes.new.is_empty() {
         return;
     }
+    // One worktree read budget covers the WHOLE batch: exact-stage OID
+    // streaming during snapshot building and the inexact content reads below
+    // draw from the same caps (§B.3.4).
+    let mut worktree_budget = rename_detect::WorktreeReadBudget::with_defaults();
     let snapshot = rename_detect::RenameSnapshot {
-        old_map: build_rename_side(&changes.deleted, &old_side),
-        new_map: build_rename_side(&changes.new, &new_side),
+        old_map: build_rename_side(&changes.deleted, &old_side, &mut worktree_budget),
+        new_map: build_rename_side(&changes.new, &new_side, &mut worktree_budget),
     };
     let mut source = StatusContentSource {
         old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
         new_is_worktree: matches!(new_side, RenameBlobSide::Worktree),
         objects: rename_detect::ObjectReadBudget::with_defaults(),
-        worktree: rename_detect::WorktreeReadBudget::with_defaults(),
+        worktree: worktree_budget,
     };
     let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
     warnings_from_rename_stats(&outcome.stats, warnings);
@@ -2255,9 +2271,19 @@ fn data_with_repo_root_paths(data: &StatusData) -> StatusData {
                 .collect(),
         }
     }
+    fn details(details: &RenameDetails) -> RenameDetails {
+        details
+            .iter()
+            .map(|((from, to), value)| ((convert(from), convert(to)), *value))
+            .collect()
+    }
     let mut rooted = data.clone();
     rooted.staged = changes(&data.staged);
     rooted.unstaged = changes(&data.unstaged);
+    // Keep the score/exactness lookup keys aligned with the converted rename
+    // pairs, or JSON emission from a subdirectory would miss every detail.
+    rooted.staged_rename_details = details(&data.staged_rename_details);
+    rooted.unstaged_rename_details = details(&data.unstaged_rename_details);
     rooted.unmerged = data
         .unmerged
         .iter()
@@ -2731,6 +2757,12 @@ fn warning_exit(output: &OutputConfig, warnings: &[StatusWarning]) -> Option<Cli
 }
 
 fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value {
+    // §B.5 delivery matrix: porcelain and JSON paths are ALWAYS
+    // repository-root-relative, regardless of the invocation subdirectory.
+    // Collection stays cwd-relative (pathspec filtering depends on it), so
+    // the JSON payload converts here — identity when cwd is the repo root.
+    let rooted = data_with_repo_root_paths(data);
+    let data = &rooted;
     let paths_to_json = |paths: &[PathBuf]| -> Vec<serde_json::Value> {
         paths
             .iter()
