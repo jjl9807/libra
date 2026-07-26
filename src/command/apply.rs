@@ -33,6 +33,9 @@ pub(crate) const MAX_PATCH_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug)]
 pub(crate) struct PreparedPatch {
     files: Vec<PreparedFile>,
+    /// PD-09 ③: targets whose three-way fallback left conflict markers
+    /// in the prepared content. Empty on a clean preparation.
+    conflicted: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -57,6 +60,13 @@ pub(crate) enum PatchPreparationError {
 impl PreparedPatch {
     pub(crate) fn targets(&self) -> Vec<String> {
         self.files.iter().map(|file| file.target.clone()).collect()
+    }
+
+    /// PD-09 ③: targets whose prepared content carries three-way
+    /// conflict markers (the caller decides whether to write them and
+    /// pause, or treat the patch as failed).
+    pub(crate) fn conflicted(&self) -> &[String] {
+        &self.conflicted
     }
 
     /// PD-09 ②: surviving targets whose git mode the patch changes.
@@ -241,9 +251,28 @@ pub(crate) fn prepare_patch(
     strip: u32,
     workdir: &Path,
 ) -> Result<PreparedPatch, PatchPreparationError> {
+    prepare_patch_opts(patch_text, strip, workdir, None)
+}
+
+/// A resolver from a (possibly abbreviated) blob id in an `index` header
+/// to the blob's bytes, when locally present (PD-09 ③).
+pub(crate) type BaseBlobResolver<'a> = &'a dyn Fn(&str) -> Option<Vec<u8>>;
+
+/// [`prepare_patch`] with an optional three-way fallback: when a text
+/// section does not apply and `resolve_base` finds the `index` header's
+/// old blob locally, ours/base/theirs are merged instead — a clean merge
+/// applies silently, a conflicting one keeps conflict markers in the
+/// prepared content and records the target in `conflicted`.
+pub(crate) fn prepare_patch_opts(
+    patch_text: &str,
+    strip: u32,
+    workdir: &Path,
+    resolve_base: Option<BaseBlobResolver<'_>>,
+) -> Result<PreparedPatch, PatchPreparationError> {
     let invalid = PatchPreparationError::Invalid;
     let mut order: Vec<String> = Vec::new();
     let mut results: HashMap<String, SectionEntry> = HashMap::new();
+    let mut conflicted: Vec<String> = Vec::new();
 
     // Load a target's current bytes: the in-memory chain first, then disk.
     // `must_exist` distinguishes modify-style reads from new-file probes.
@@ -318,8 +347,12 @@ pub(crate) fn prepare_patch(
             let to_abs = validate_patch_target(&to, workdir).map_err(invalid)?;
             let (base, permissions) = load_base(&results, &from, &from_abs)?;
             assert_absent(&results, &to, &to_abs)?;
-            let (content, mode) =
-                apply_section_content(&section, &headers, base, &to).map_err(map_reason)?;
+            let (content, mode, section_conflicted) =
+                apply_section_content(&section, &headers, base, &to, resolve_base)
+                    .map_err(map_reason)?;
+            if section_conflicted {
+                conflicted.push(to.clone());
+            }
             if !results.contains_key(&from) {
                 order.push(from.clone());
             }
@@ -351,8 +384,12 @@ pub(crate) fn prepare_patch(
             let to_abs = validate_patch_target(&to, workdir).map_err(invalid)?;
             let (base, permissions) = load_base(&results, &from, &from_abs)?;
             assert_absent(&results, &to, &to_abs)?;
-            let (content, mode) =
-                apply_section_content(&section, &headers, base, &to).map_err(map_reason)?;
+            let (content, mode, section_conflicted) =
+                apply_section_content(&section, &headers, base, &to, resolve_base)
+                    .map_err(map_reason)?;
+            if section_conflicted {
+                conflicted.push(to.clone());
+            }
             if !results.contains_key(&to) {
                 order.push(to.clone());
             }
@@ -407,8 +444,12 @@ pub(crate) fn prepare_patch(
             load_base(&results, &target, &absolute)?
         };
 
-        let (content, mode) =
-            apply_section_content(&section, &headers, base, &target).map_err(map_reason)?;
+        let (content, mode, section_conflicted) =
+            apply_section_content(&section, &headers, base, &target, resolve_base)
+                .map_err(map_reason)?;
+        if section_conflicted {
+            conflicted.push(target.clone());
+        }
         if is_deletion && !content.is_empty() {
             return Err(PatchPreparationError::DoesNotApply(format!(
                 "deletion patch did not remove all content from '{target}'"
@@ -441,7 +482,7 @@ pub(crate) fn prepare_patch(
             })
         })
         .collect();
-    Ok(PreparedPatch { files })
+    Ok(PreparedPatch { files, conflicted })
 }
 
 /// Map a section-application failure string onto the preparation error
@@ -461,13 +502,15 @@ enum SectionApplyError {
 
 /// Produce a section's final bytes from `base`: text hunks through the
 /// diffy engine (UTF-8 required), binary sections through the literal /
-/// delta decoder. Returns the bytes plus the git-mode override.
+/// delta decoder. Returns the bytes, the git-mode override, and whether
+/// the three-way fallback left conflict markers in the bytes.
 fn apply_section_content(
     section: &str,
     headers: &SectionHeaders,
     base: Vec<u8>,
     target: &str,
-) -> Result<(Vec<u8>, Option<u32>), SectionApplyError> {
+    resolve_base: Option<BaseBlobResolver<'_>>,
+) -> Result<(Vec<u8>, Option<u32>, bool), SectionApplyError> {
     let mode = headers
         .new_mode
         .or(headers.new_file_mode)
@@ -497,11 +540,11 @@ fn apply_section_content(
                 })?
             }
         };
-        return Ok((bytes, mode));
+        return Ok((bytes, mode, false));
     }
     if !headers.has_hunks {
         // Pure rename/copy without content edits.
-        return Ok((base, mode));
+        return Ok((base, mode, false));
     }
     let base_text = String::from_utf8(base).map_err(|_| {
         SectionApplyError::DoesNotApply(format!(
@@ -510,10 +553,37 @@ fn apply_section_content(
     })?;
     let patch = diffy::Patch::from_str(section)
         .map_err(|error| SectionApplyError::Invalid(format!("malformed patch: {error}")))?;
-    let result = diffy::apply(&base_text, &patch).map_err(|_| {
-        SectionApplyError::DoesNotApply(format!("patch does not apply to '{target}'"))
-    })?;
-    Ok((result.into_bytes(), mode))
+    match diffy::apply(&base_text, &patch) {
+        Ok(result) => Ok((result.into_bytes(), mode, false)),
+        Err(_) => {
+            // PD-09 ③: three-way fallback — merge ours (current content)
+            // against the patch applied to the RECORDED base blob. Only a
+            // locally resolvable `index` old id enables it; anything
+            // missing keeps the plain does-not-apply refusal.
+            let fallback = resolve_base
+                .zip(headers.index_old.as_deref())
+                .and_then(|(resolver, old_id)| resolver(old_id))
+                .and_then(|base_bytes| String::from_utf8(base_bytes).ok())
+                .and_then(|recorded_base| {
+                    diffy::apply(&recorded_base, &patch)
+                        .ok()
+                        .map(|theirs| (recorded_base, theirs))
+                });
+            let Some((recorded_base, theirs)) = fallback else {
+                return Err(SectionApplyError::DoesNotApply(format!(
+                    "patch does not apply to '{target}'"
+                )));
+            };
+            match diffy::merge_bytes(
+                recorded_base.as_bytes(),
+                base_text.as_bytes(),
+                theirs.as_bytes(),
+            ) {
+                Ok(merged) => Ok((merged, mode, false)),
+                Err(conflict) => Ok((conflict, mode, true)),
+            }
+        }
+    }
 }
 
 /// Return every safe target named by a patch without reading the worktree.
@@ -592,6 +662,9 @@ struct SectionHeaders {
     copy_from: Option<String>,
     copy_to: Option<String>,
     binary: Option<BinaryHunk>,
+    /// `index <old>..<new>[ <mode>]` blob ids (possibly abbreviated) —
+    /// the three-way fallback's base/theirs anchors (PD-09 ③).
+    index_old: Option<String>,
     /// A content-less `Binary files … differ` marker.
     binary_marker: bool,
     /// The section carries `--- `/`+++ ` unified content hunks.
@@ -701,6 +774,16 @@ fn parse_section_headers(section: &str, strip: u32) -> Result<SectionHeaders, St
             break;
         } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
             headers.binary_marker = true;
+        } else if let Some(rest) = line.strip_prefix("index ")
+            && let Some((old_id, _)) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|ids| ids.split_once(".."))
+            && !old_id.is_empty()
+            && old_id.bytes().all(|b| b.is_ascii_hexdigit())
+            && !old_id.bytes().all(|b| b == b'0')
+        {
+            headers.index_old = Some(old_id.to_string());
         }
         // `index`, `similarity index`, `dissimilarity index`, mail noise —
         // ignored.
@@ -956,6 +1039,47 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
         return Err("delta result is smaller than declared".into());
     }
     Ok(result)
+}
+
+/// PD-09 ③: resolve a (possibly abbreviated) blob id from an `index`
+/// header against the LOCAL loose-object store and return the blob's
+/// bytes. Abbreviations resolve only when unambiguous; anything not
+/// locally present returns `None` (the caller keeps the plain refusal).
+pub(crate) fn resolve_local_base_blob(oid_prefix: &str) -> Option<Vec<u8>> {
+    let storage = util::try_get_storage_path(None).ok()?;
+    let full = resolve_loose_object_prefix(&storage, oid_prefix)?;
+    let (bytes, truncated) =
+        crate::utils::object::read_git_object_bounded(&storage, &full, MAX_PATCH_BYTES as u64)
+            .ok()?;
+    (!truncated).then_some(bytes)
+}
+
+fn resolve_loose_object_prefix(
+    storage: &Path,
+    prefix: &str,
+) -> Option<git_internal::hash::ObjectHash> {
+    use std::str::FromStr;
+
+    if prefix.len() < 4 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if let Ok(full) = git_internal::hash::ObjectHash::from_str(prefix) {
+        return Some(full);
+    }
+    let fanout = storage.join("objects").join(&prefix[..2]);
+    let rest = &prefix[2..];
+    let mut matched: Option<String> = None;
+    for entry in fs::read_dir(fanout).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(rest) {
+            if matched.is_some() {
+                return None; // ambiguous
+            }
+            matched = Some(format!("{}{name}", &prefix[..2]));
+        }
+    }
+    git_internal::hash::ObjectHash::from_str(&matched?).ok()
 }
 
 /// Split a (possibly multi-file) unified diff into per-file sections. Git-style

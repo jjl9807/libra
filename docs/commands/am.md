@@ -7,7 +7,7 @@ and `Date:` metadata while using the current Libra identity as committer.
 ## Synopsis
 
 ```text
-libra am <patch|mbox|-> ...
+libra am [-3] <patch|mbox|-> ...
 libra am --continue
 libra am --skip
 libra am --abort
@@ -61,9 +61,18 @@ was staged.
 
 ## Conflict recovery
 
-This minimal version does not synthesize three-way conflict markers. When a
-patch does not apply, it leaves the current branch tip unchanged and keeps the
-series resumable:
+With `-3`/`--3way`, a text patch that does not apply falls back to a
+three-way merge: the base is the `index` header's old blob resolved from
+the local object store (abbreviated ids resolve only when unambiguous),
+theirs is the patch applied to that base, ours is the current content. A
+clean merge applies silently; a conflicting one writes `<<<<<<<` markers
+into the worktree and pauses the series (resolve, stage, `--continue`).
+A base that is not locally present keeps the plain refusal — the
+fallback never fabricates content. The `-3` choice persists in the saved
+series state, so resumes keep the same semantics.
+
+Without `-3`, when a patch does not apply the command leaves the current
+branch tip unchanged and keeps the series resumable:
 
 1. resolve the affected paths manually;
 2. stage only paths named by the current patch with `libra add`;
@@ -104,6 +113,5 @@ libra am --abort
 ## Current limitations
 
 This is not yet full Git `am` parity. It does not accept MIME
-multipart/attached patches or Git's wider flag set (`-3`/`--3way`,
-`--signoff`, `--keep`, `--scissors`, and others). Applypatch/commit hooks are not run. The shared parser is also
+multipart/attached patches or Git's wider flag set (`--signoff`, `--keep`, `--scissors`, and others). Applypatch/commit hooks are not run. The shared parser is also
 available as the standalone [`libra mailinfo`](mailinfo.md) command.

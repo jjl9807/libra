@@ -21,8 +21,8 @@ use crate::{
     command::{
         add::{AddArgs, run_add},
         apply::{
-            MAX_PATCH_BYTES, PatchPreparationError, patch_targets, prepare_patch,
-            validate_patch_target,
+            MAX_PATCH_BYTES, PatchPreparationError, patch_targets, prepare_patch_opts,
+            resolve_local_base_blob, validate_patch_target,
         },
         commit::create_commit_signatures,
         mailinfo::{invalid_mail, parse_mail, validate_author},
@@ -53,6 +53,7 @@ EXAMPLES:
     libra am 0001.patch 0002.patch       Apply a mail series in order
     libra am series.mbox                 Apply every message of an mbox in order
     libra format-patch --stdout base.. | libra am -   Apply an mbox from stdin
+    libra am -3 series.mbox              Fall back to three-way merge on conflicts
     libra am --continue                  Commit a staged conflict resolution
     libra am --skip                      Skip the current mail
     libra am --abort                     Restore the pre-am branch tip";
@@ -90,6 +91,13 @@ pub struct AmArgs {
         conflicts_with_all = ["patches", "continue_am", "skip"]
     )]
     pub abort: bool,
+
+    /// When a patch does not apply, fall back to a three-way merge using
+    /// the blob baselines recorded in its `index` headers (PD-09 ③).
+    /// A conflicting merge writes conflict markers and pauses like any
+    /// other am conflict; the choice persists for the whole series.
+    #[clap(short = '3', long = "3way", conflicts_with_all = ["continue_am", "skip", "abort"])]
+    pub three_way: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,6 +114,10 @@ struct MailPatch {
 struct AmPayload {
     patches: Vec<MailPatch>,
     current: usize,
+    /// PD-09 ③: the series was started with `-3/--3way`; resumes keep
+    /// the same fallback semantics.
+    #[serde(default)]
+    three_way: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -233,13 +245,13 @@ pub async fn execute_safe(args: AmArgs, output: &OutputConfig) -> CliResult<()> 
             return Err(CliError::conflict("an am operation is already in progress")
                 .with_hint("use 'libra am --continue', '--skip', or '--abort'"));
         }
-        start_am(&args.patches, output).await?
+        start_am(&args.patches, args.three_way, output).await?
     };
 
     render_output(&result, output)
 }
 
-async fn start_am(paths: &[String], output: &OutputConfig) -> CliResult<AmOutput> {
+async fn start_am(paths: &[String], three_way: bool, output: &OutputConfig) -> CliResult<AmOutput> {
     let patches = read_mail_patches(paths)?;
     ensure_clean_start(&patches).await?;
     let head_name = current_branch_name().await?;
@@ -258,6 +270,7 @@ async fn start_am(paths: &[String], output: &OutputConfig) -> CliResult<AmOutput
         payload: AmPayload {
             patches,
             current: 0,
+            three_way,
         },
     };
     state.save().await?;
@@ -354,7 +367,13 @@ async fn apply_remaining(
     while state.payload.current < state.payload.patches.len() {
         ensure_expected_head(state).await?;
         let mail = state.payload.patches[state.payload.current].clone();
-        let prepared = match prepare_patch(&mail.patch, 1, &util::working_dir()) {
+        let resolver: crate::command::apply::BaseBlobResolver<'_> = &resolve_local_base_blob;
+        let prepared = match prepare_patch_opts(
+            &mail.patch,
+            1,
+            &util::working_dir(),
+            state.payload.three_way.then_some(resolver),
+        ) {
             Ok(prepared) => prepared,
             Err(PatchPreparationError::DoesNotApply(detail)) => {
                 return Err(am_conflict(&mail, detail));
@@ -367,11 +386,24 @@ async fn apply_remaining(
             }
         };
         let mode_overrides = prepared.mode_overrides();
+        let conflicted = prepared.conflicted().to_vec();
         prepared.write().map_err(|detail| {
             am_state_error(format!("cannot apply '{}': {detail}", mail.source))
                 .with_hint("fix and stage the affected paths, then run 'libra am --continue'")
                 .with_hint("or run 'libra am --abort' to restore the original branch")
         })?;
+        if !conflicted.is_empty() {
+            // PD-09 ③: the three-way fallback left conflict markers in the
+            // worktree. Pause exactly like a plain conflict — the state was
+            // saved before any write, so resolve + `--continue` resumes.
+            return Err(am_conflict(
+                &mail,
+                format!(
+                    "three-way merge left conflicts in: {} (resolve the <<<<<<< markers)",
+                    conflicted.join(", ")
+                ),
+            ));
+        }
         if test_failpoint_enabled("LIBRA_TEST_AM_FAIL_AFTER_WRITE") {
             return Err(am_state_error(
                 "test-injected am interruption after worktree write".to_string(),

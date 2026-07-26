@@ -4,6 +4,18 @@
 
 ### Added
 
+- **`am -3`/`--3way` three-way fallback (plan-20260714 PD-09 ③)**: a
+  text patch that does not apply falls back to a three-way merge — the
+  base is the `index` header's old blob resolved from the local
+  loose-object store (abbreviated ids resolve only when unambiguous),
+  theirs is the patch applied to that base, ours is the current
+  content. A clean merge applies silently; a conflicting one writes
+  `<<<<<<<` markers into the worktree and pauses under the existing
+  sequencer semantics (resolve + `--continue`, or `--skip`/`--abort`).
+  A base that is not locally present keeps the plain refusal — the
+  fallback never fabricates content — and the `-3` choice persists in
+  the saved series state across resumes.
+
 - **`am`/`apply` binary, rename, copy, and mode-only patches
   (plan-20260714 PD-09 ②)**: the shared apply seam now understands git
   extended sections beyond plain text hunks — `GIT binary patch`

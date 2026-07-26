@@ -1157,3 +1157,147 @@ fn extended_sections_keep_path_safety() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PD-09 ③: `-3` three-way fallback
+// ---------------------------------------------------------------------------
+
+/// Build a repo where the exported patch no longer applies (context
+/// drifted) and return the patch path. The patch edits line 3 of a
+/// 5-line file; the target then rewrites line 1 (disjoint → clean
+/// three-way) or line 3 (overlapping → conflict).
+fn three_way_fixture(fixture: &CliFixture, target_edit: &str) -> PathBuf {
+    let base = fixture.commit_file(
+        "file.txt",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n",
+        "base",
+    );
+    fixture.commit_file(
+        "file.txt",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nEIGHT\nnine\n",
+        "patch three",
+    );
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 1);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    // Diverge the target so the exported hunk's context no longer
+    // matches at line 3's neighborhood.
+    fixture.commit_file("file.txt", target_edit, "diverge");
+    patches[0].clone()
+}
+
+/// Disjoint drift: plain am fails, `-3` merges both edits cleanly.
+#[test]
+fn three_way_merges_disjoint_drift() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    // The drift sits INSIDE the exported hunk's context window (line 5,
+    // three lines above the patched line 8) so the plain apply fails,
+    // while two clean separating lines let the three-way merge succeed.
+    let patch = three_way_fixture(
+        &fixture,
+        "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\neight\nnine\n",
+    );
+    let path = patch.to_str().expect("utf8 patch");
+
+    let plain = fixture.run(&fixture.repo, &["am", path]);
+    assert!(!plain.status.success(), "plain am must conflict");
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+
+    let merged = fixture.run(&fixture.repo, &["am", "-3", path]);
+    assert_success(&["am", "-3"], &merged);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("merged"),
+        "one\ntwo\nthree\nfour\nFIVE\nsix\nseven\nEIGHT\nnine\n",
+        "both sides of the disjoint drift survive"
+    );
+}
+
+/// Overlapping drift: `-3` writes conflict markers, pauses, and the
+/// resolved series continues to a commit.
+#[test]
+fn three_way_conflict_pauses_with_markers_then_continues() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = three_way_fixture(
+        &fixture,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCHANGED-EIGHT\nnine\n",
+    );
+    let path = patch.to_str().expect("utf8 patch");
+
+    let out = fixture.run(&fixture.repo, &["am", "-3", path]);
+    assert!(!out.status.success(), "overlapping drift conflicts");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("three-way merge left conflicts"),
+        "{stderr}"
+    );
+    let content = fs::read_to_string(fixture.repo.join("file.txt")).expect("marked file");
+    assert!(
+        content.contains("<<<<<<<"),
+        "conflict markers present: {content}"
+    );
+
+    // Resolve, stage only the patch's path, continue.
+    fs::write(
+        fixture.repo.join("file.txt"),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nRESOLVED\nnine\n",
+    )
+    .expect("resolve");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    let done = fixture.success(&fixture.repo, &["am", "--continue"]);
+    let _ = done;
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains("patch three"),
+        "resolved mail committed"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("final"),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nRESOLVED\nnine\n"
+    );
+}
+
+/// An unresolvable base (bogus index ids) keeps the plain refusal — the
+/// fallback never fabricates content.
+#[test]
+fn three_way_without_local_base_keeps_plain_conflict() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = three_way_fixture(
+        &fixture,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCHANGED-EIGHT\nnine\n",
+    );
+    let text = fs::read_to_string(&patch).expect("read patch");
+    // Corrupt the index header's old id so no local blob can match.
+    let corrupted: String = text
+        .lines()
+        .map(|line| {
+            if line.starts_with("index ") {
+                "index ffffffffff..ffffffffff 100644".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let path = fixture.root.join("bogus-base.patch");
+    fs::write(&path, corrupted).expect("write corrupted patch");
+
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", "-3", path.to_str().expect("utf8 path")],
+    );
+    assert!(!out.status.success(), "no base -> still a conflict");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not apply"),
+        "plain refusal (no fabricated merge): {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("untouched"),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCHANGED-EIGHT\nnine\n",
+        "worktree untouched without a resolvable base"
+    );
+}

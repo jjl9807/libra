@@ -5,7 +5,7 @@
 ## 用法
 
 ```text
-libra am <patch|mbox|-> ...
+libra am [-3] <patch|mbox|-> ...
 libra am --continue
 libra am --skip
 libra am --abort
@@ -37,7 +37,14 @@ quoting。`-` 从标准输入读取一封邮件或一个 mbox（最多出现一�
 
 ## 冲突恢复
 
-此最小版本不会生成三方 conflict marker。补丁无法应用时，当前 branch tip 不动，并保留可恢复的 series：
+使用 `-3`/`--3way` 时，无法应用的文本补丁会回退到三方合并：base 取 `index`
+头记录的旧 blob（从本地对象库解析；缩写 id 仅在无歧义时解析），theirs 为补丁
+应用到该 base 的结果，ours 为当前内容。合并干净则静默应用；有冲突则把
+`<<<<<<<` 标记写入工作树并暂停 series（解决、暂存、`--continue`）。base 不在
+本地时保持普通拒绝——回退绝不伪造内容。`-3` 的选择持久化在 series 状态中，
+恢复时语义不变。
+
+不使用 `-3` 时，补丁无法应用则当前 branch tip 不动，并保留可恢复的 series：
 
 1. 手工解决受影响路径；
 2. 用 `libra add` 只 stage 当前补丁包含的路径；
@@ -76,4 +83,4 @@ libra am --abort
 
 ## 当前限制
 
-尚未达到完整 Git `am` parity。当前不接受 MIME multipart/attachment，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
+尚未达到完整 Git `am` parity。当前不接受 MIME multipart/attachment，也不公开 Git 的完整 flag 集（`--signoff`、`--keep`、`--scissors` 等）。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
