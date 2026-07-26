@@ -7,7 +7,7 @@ and `Date:` metadata while using the current Libra identity as committer.
 ## Synopsis
 
 ```text
-libra am <patch>...
+libra am <patch|mbox|-> ...
 libra am --continue
 libra am --skip
 libra am --abort
@@ -19,7 +19,16 @@ A new series requires a local branch with an existing commit and no staged or
 tracked working-tree changes. Unrelated untracked files are preserved, but any
 existing non-index path that a mail would touch—including an ignored path—is
 rejected before sequencer state is saved. The aggregate mail input is limited
-to 64 MiB and 10,000 files.
+to 64 MiB and 10,000 mails.
+
+Each input may be a single mail or an mbox: a file (or stdin) whose first
+line is an mbox `From ` envelope line is split into its messages, applied
+in order, and mboxrd `>From ` body quoting is undone. `-` reads one mail
+or mbox from standard input (allowed at most once); the full mail content
+is persisted in the sequencer state, so `--continue` / `--skip` /
+`--abort` work for stdin-sourced series exactly like file-sourced ones.
+Multi-message sources are position-labelled `<source>#<n>` in output and
+state.
 
 The minimal mail parser accepts UTF-8, single-part messages with `7bit`, `8bit`,
 `binary`, quoted-printable, or base64 transfer encoding. It reads `From:`,
@@ -72,6 +81,9 @@ libra format-patch -o outgoing origin/main..HEAD
 libra switch target
 libra am outgoing/0001-*.patch outgoing/0002-*.patch
 
+# Pipe a whole series as one mbox
+libra format-patch --stdout origin/main..HEAD | libra am -
+
 # Resolve a stopped patch
 $EDITOR src/lib.rs
 libra add src/lib.rs
@@ -83,10 +95,10 @@ libra am --abort
 
 ## Current limitations
 
-This is the P2-01 minimal surface, not full Git `am` parity. It does not accept
-stdin, mbox files containing multiple messages, MIME multipart/attached
-patches, binary patches, rename-only or mode-only patches, or Git's wider flag
-set (`-3`/`--3way`, `--signoff`, `--keep`, `--scissors`, and others). Existing
+This is not yet full Git `am` parity. It does not accept MIME
+multipart/attached patches, binary patches, rename-only or mode-only
+patches, or Git's wider flag set (`-3`/`--3way`, `--signoff`, `--keep`,
+`--scissors`, and others). Existing
 file permissions are retained for content patches, but mail mode changes are
 not applied. Applypatch/commit hooks are not run. The shared parser is also
 available as the standalone [`libra mailinfo`](mailinfo.md) command.

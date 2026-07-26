@@ -48,6 +48,8 @@ pub const AM_EXAMPLES: &str = "\
 EXAMPLES:
     libra am 0001-fix.patch              Apply one format-patch mail
     libra am 0001.patch 0002.patch       Apply a mail series in order
+    libra am series.mbox                 Apply every message of an mbox in order
+    libra format-patch --stdout base.. | libra am -   Apply an mbox from stdin
     libra am --continue                  Commit a staged conflict resolution
     libra am --skip                      Skip the current mail
     libra am --abort                     Restore the pre-am branch tip";
@@ -55,7 +57,10 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = AM_EXAMPLES)]
 pub struct AmArgs {
-    /// Plain-text format-patch mail files, applied in order.
+    /// Plain-text format-patch mail files, applied in order. A file whose
+    /// first line is an mbox `From ` envelope is split into its messages
+    /// (mboxrd quoting undone); `-` reads one mail or mbox from stdin
+    /// (at most once).
     #[clap(
         value_name = "PATCH",
         required_unless_present_any = ["continue_am", "skip", "abort"]
@@ -640,13 +645,22 @@ fn read_mail_patches(paths: &[String]) -> CliResult<Vec<MailPatch>> {
             "am accepts at most {MAX_MAILS} patch files"
         )));
     }
+    if paths.iter().filter(|path| path.as_str() == "-").count() > 1 {
+        return Err(CliError::command_usage(
+            "stdin ('-') can be given at most once",
+        ));
+    }
     let mut total = 0usize;
     let mut patches = Vec::with_capacity(paths.len());
     for source in paths {
-        let bytes = fs::read(source).map_err(|error| {
-            CliError::fatal(format!("cannot read mail patch '{source}': {error}"))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?;
+        let bytes = if source == "-" {
+            read_mail_stdin()?
+        } else {
+            fs::read(source).map_err(|error| {
+                CliError::fatal(format!("cannot read mail patch '{source}': {error}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+        };
         total = total.checked_add(bytes.len()).ok_or_else(|| {
             CliError::fatal("mail patch input size overflow")
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
@@ -662,24 +676,128 @@ fn read_mail_patches(paths: &[String]) -> CliResult<Vec<MailPatch>> {
             CliError::fatal(format!("mail patch '{source}' is not valid UTF-8"))
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         })?;
-        let parsed = parse_mail(source, &text)?;
-        let author = parsed.author();
-        let message = parsed.commit_message();
-        let targets = patch_targets(&parsed.apply_patch, 1)
-            .map_err(|detail| invalid_mail(source, &detail))?;
-        if targets.is_empty() {
-            return Err(invalid_mail(source, "mail patch contains no file changes"));
+        // PD-09 ①: an input whose first line is an mbox envelope carries a
+        // whole message series; anything else stays one single mail
+        // (byte-identical to the pre-mbox behavior).
+        let messages = split_mbox(&text);
+        let labelled = messages.len() > 1;
+        for (index, message) in messages.iter().enumerate() {
+            let label = if labelled {
+                format!("{source}#{}", index + 1)
+            } else {
+                source.to_string()
+            };
+            if patches.len() >= MAX_MAILS {
+                return Err(CliError::command_usage(format!(
+                    "am accepts at most {MAX_MAILS} mails per invocation"
+                )));
+            }
+            let parsed = parse_mail(&label, message)?;
+            let author = parsed.author();
+            let commit_message = parsed.commit_message();
+            let targets = patch_targets(&parsed.apply_patch, 1)
+                .map_err(|detail| invalid_mail(&label, &detail))?;
+            if targets.is_empty() {
+                return Err(invalid_mail(&label, "mail patch contains no file changes"));
+            }
+            patches.push(MailPatch {
+                source: label,
+                author,
+                author_date: parsed.author_date,
+                message: commit_message,
+                patch: parsed.apply_patch,
+                targets,
+            });
         }
-        patches.push(MailPatch {
-            source: source.to_string(),
-            author,
-            author_date: parsed.author_date,
-            message,
-            patch: parsed.apply_patch,
-            targets,
-        });
     }
     Ok(patches)
+}
+
+/// Read one mail (or mbox) from stdin, bounded by the shared patch-series
+/// byte cap so a hostile pipe cannot balloon memory.
+fn read_mail_stdin() -> CliResult<Vec<u8>> {
+    use std::io::Read;
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_PATCH_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            CliError::fatal(format!("cannot read mail patch from stdin: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    if bytes.len() > MAX_PATCH_BYTES {
+        return Err(CliError::fatal(format!(
+            "mail patch series exceeds the {} MiB limit",
+            MAX_PATCH_BYTES / (1024 * 1024)
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    Ok(bytes)
+}
+
+/// Split raw mail text into individual messages (PD-09 ①). Only input
+/// whose FIRST line is an mbox `From ` envelope line is treated as an
+/// mbox: every later envelope line starts a new message and mboxrd
+/// `>From` quoting is undone per message. Any other input is exactly one
+/// message, untouched.
+fn split_mbox(text: &str) -> Vec<String> {
+    let first_line = text.split_inclusive('\n').next().unwrap_or("");
+    if !is_mbox_from_line(first_line.trim_end_matches(['\n', '\r'])) {
+        return vec![text.to_string()];
+    }
+    let mut messages: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        if is_mbox_from_line(line.trim_end_matches(['\n', '\r'])) && !current.is_empty() {
+            messages.push(unquote_mboxrd(&current));
+            current.clear();
+        }
+        current.push_str(line);
+    }
+    if !current.is_empty() {
+        messages.push(unquote_mboxrd(&current));
+    }
+    messages
+}
+
+/// Conservative mbox envelope test (the `git mailsplit` shape): `From `
+/// followed by one token and a date-ish tail whose last field is a
+/// 4-digit year. Matches `git format-patch`'s
+/// `From <oid> Mon Sep 17 00:00:00 2001` and classic mboxes while never
+/// matching commit-message prose (which `format-patch` mboxrd-quotes as
+/// `>From ` anyway).
+fn is_mbox_from_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("From ") else {
+        return false;
+    };
+    let mut fields = rest.split_whitespace();
+    if fields.next().is_none() {
+        return false;
+    }
+    let tail: Vec<&str> = fields.collect();
+    tail.len() >= 4
+        && tail
+            .last()
+            .is_some_and(|year| year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Undo mboxrd body quoting: a line of one-or-more `>` directly followed
+/// by `From ` loses exactly one `>` (the writer added it so body text
+/// could never be mistaken for an envelope).
+fn unquote_mboxrd(message: &str) -> String {
+    message
+        .split_inclusive('\n')
+        .map(|line| {
+            let stripped = line.trim_start_matches('>');
+            if line.len() > stripped.len() && stripped.starts_with("From ") {
+                &line[1..]
+            } else {
+                line
+            }
+        })
+        .collect()
 }
 
 async fn load_state_or_error() -> CliResult<AmState> {

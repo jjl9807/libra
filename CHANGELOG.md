@@ -4,6 +4,20 @@
 
 ### Added
 
+- **`am` stdin and mbox input (plan-20260714 PD-09 ①)**: `libra am -`
+  reads one mail or a whole mbox from standard input (allowed at most
+  once, bounded by the shared 64 MiB series cap), and any input — file
+  or stdin — whose first line is an mbox `From ` envelope is split into
+  its messages and applied in order. The envelope test is conservative
+  (`From ` + token + a date tail ending in a 4-digit year, the
+  `git format-patch` shape), mboxrd `>From ` body quoting is undone,
+  and multi-message sources are position-labelled `<source>#<n>` in
+  output and sequencer state. The full mail content persists in the
+  sequencer state, so a stdin-sourced series supports `--continue` /
+  `--skip` / `--abort` exactly like file-sourced ones. Verified with a
+  real `git format-patch --stdout` → `libra am -` round-trip gate
+  (skips when git is absent).
+
 - **Checkpoint-scoped review/investigate (plan-20260714 PD-02)**:
   `libra review --agent <slug> --checkpoint <id>` and
   `libra investigate start --topic <text> --agent <slug> --checkpoint

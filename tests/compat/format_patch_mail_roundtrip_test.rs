@@ -459,3 +459,66 @@ fn ignore_if_in_upstream_suppresses_patch_equivalent_commits() {
         "equivalent patch was not suppressed"
     );
 }
+
+/// PD-09 ① gate: real `git format-patch --stdout` mbox piped into
+/// `libra am -`. Skips (never fails) when git is not installed.
+#[test]
+fn git_format_patch_stdout_mbox_applies_with_libra_am_stdin() {
+    if Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipped (install git to run the format-patch mbox round-trip gate)");
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-mbox-source");
+    fixture.git_commit(&source, "base\n", "base");
+    fixture.git_commit(&source, "base\none\n", "mbox change one");
+    fixture.git_commit(&source, "base\none\ntwo\n", "mbox change two");
+    let mbox = fixture.git_success(&source, &["format-patch", "--stdout", "HEAD~2..HEAD"]);
+
+    let target = fixture.init_libra("libra-mbox-target");
+    fixture.libra_commit(&target, "base\n", "base");
+
+    use std::{io::Write, process::Stdio};
+    let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
+    command
+        .args(["am", "-"])
+        .current_dir(&target)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &fixture.home)
+        .env("USERPROFILE", &fixture.home)
+        .env("XDG_CONFIG_HOME", fixture.home.join(".config"))
+        .env(
+            "LIBRA_CONFIG_GLOBAL_DB",
+            fixture.home.join(".libra").join("config.db"),
+        )
+        .env("LIBRA_TEST", "1")
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn libra am -");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(&mbox.stdout)
+        .expect("write mbox to stdin");
+    let out = child.wait_with_output().expect("wait for libra am");
+    assert_success("libra", &["am", "-"], &out);
+
+    assert_eq!(
+        fs::read_to_string(target.join("file.txt")).expect("read result"),
+        "base\none\ntwo\n"
+    );
+    let log = String::from_utf8_lossy(&fixture.libra_success(&target, &["log", "-2"]).stdout)
+        .into_owned();
+    assert!(log.contains("mbox change one"), "{log}");
+    assert!(log.contains("mbox change two"), "{log}");
+}

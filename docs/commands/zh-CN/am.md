@@ -5,7 +5,7 @@
 ## 用法
 
 ```text
-libra am <patch>...
+libra am <patch|mbox|-> ...
 libra am --continue
 libra am --skip
 libra am --abort
@@ -13,7 +13,14 @@ libra am --abort
 
 ## 行为
 
-新 series 必须在已有提交的本地分支上启动，并且不能有 staged 或 tracked 工作树改动。无关的 untracked 文件会保留；但只要任一邮件会触及已有的 non-index 路径（包括 ignored 路径），命令就会在保存 sequencer 状态前拒绝。邮件总输入上限为 64 MiB，文件数上限为 10,000。
+新 series 必须在已有提交的本地分支上启动，并且不能有 staged 或 tracked 工作树改动。无关的 untracked 文件会保留；但只要任一邮件会触及已有的 non-index 路径（包括 ignored 路径），命令就会在保存 sequencer 状态前拒绝。邮件总输入上限为 64 MiB，邮件数上限为 10,000。
+
+每个输入可以是单封邮件或一个 mbox：首行是 mbox `From ` envelope 行的文件（或
+stdin）会被切分为其中的每封邮件、按序应用，并撤销 mboxrd 的 `>From ` 正文
+quoting。`-` 从标准输入读取一封邮件或一个 mbox（最多出现一次）；完整邮件内容
+持久化在 sequencer 状态中，因此来自 stdin 的 series 与文件 series 一样支持
+`--continue` / `--skip` / `--abort`。多邮件来源在输出与状态中带位置标签
+`<source>#<n>`。
 
 最小 mail parser 接受 UTF-8、single-part 邮件，以及 `7bit`、`8bit`、`binary`、quoted-printable、base64 transfer encoding。它读取 `From:`、`Date:`、`Subject:`，清理前导 `[PATCH ...]`，支持标准 in-body `From:` 覆盖，并从 `---` 分隔线之后提取文本 `diff --git`。UTF-8/US-ASCII 的 RFC 2047 `B`/`Q` encoded word 会被解码。
 
@@ -48,6 +55,9 @@ libra format-patch -o outgoing origin/main..HEAD
 libra switch target
 libra am outgoing/0001-*.patch outgoing/0002-*.patch
 
+# 把整个 series 作为一个 mbox 管道输入
+libra format-patch --stdout origin/main..HEAD | libra am -
+
 # 解决停止的补丁
 $EDITOR src/lib.rs
 libra add src/lib.rs
@@ -59,4 +69,4 @@ libra am --abort
 
 ## 当前限制
 
-这是 P2-01 最小 surface，不是完整 Git `am`。当前不接受 stdin、单个 mbox 内的多封邮件、MIME multipart/attachment、binary patch、仅 rename 或仅 mode 的补丁，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。内容补丁会保留已有文件权限，但不会应用邮件中的 mode change。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。
+尚未达到完整 Git `am` parity。当前不接受 MIME multipart/attachment、binary patch、仅 rename 或仅 mode 的补丁，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。内容补丁会保留已有文件权限，但不会应用邮件中的 mode change。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。

@@ -661,3 +661,201 @@ fn json_output_and_help_expose_the_minimal_surface() {
         applied_fixture.rev_parse("HEAD")
     );
 }
+
+// ---------------------------------------------------------------------------
+// PD-09 ①: stdin `-` and mbox splitting
+// ---------------------------------------------------------------------------
+
+impl CliFixture {
+    /// Run `libra` with `input` piped to stdin.
+    fn run_stdin(&self, cwd: &Path, args: &[&str], input: &[u8]) -> Output {
+        use std::{io::Write, process::Stdio};
+
+        let mut command = self.command(cwd, args);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn libra with stdin");
+        child
+            .stdin
+            .take()
+            .expect("stdin piped")
+            .write_all(input)
+            .expect("write stdin payload");
+        child.wait_with_output().expect("wait for libra")
+    }
+
+    /// A two-commit series exported as one mbox string (the `.patch`
+    /// files each begin with an mbox `From ` envelope line, so
+    /// concatenation IS the mbox).
+    fn two_message_mbox(&self) -> (String, String) {
+        let base = self.commit_file("file.txt", "base\n", "base");
+        self.commit_file("file.txt", "base\nfirst\n", "mbox first change");
+        self.commit_file("file.txt", "base\nfirst\nsecond\n", "mbox second change");
+        let patches = self.format_series(&base);
+        assert_eq!(patches.len(), 2, "two exported mails");
+        let mbox: String = patches
+            .iter()
+            .map(|path| fs::read_to_string(path).expect("read exported mail"))
+            .collect();
+        assert!(
+            mbox.starts_with("From "),
+            "exported mails carry the mbox envelope: {mbox}"
+        );
+        // Rewind to base so the series can be re-applied.
+        self.success(&self.repo, &["reset", "--hard", &base]);
+        (mbox, base)
+    }
+}
+
+/// A FILE whose first line is an mbox envelope is split into its
+/// messages and applied in order — one commit per message.
+#[test]
+fn mbox_file_applies_every_message_in_order() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let (mbox, _base) = fixture.two_message_mbox();
+    let mbox_path = fixture.root.join("series.mbox");
+    fs::write(&mbox_path, &mbox).expect("write mbox");
+
+    let out = fixture.run(
+        &fixture.repo,
+        &["--json", "am", mbox_path.to_str().expect("utf8 mbox path")],
+    );
+    assert_success(&["am", "series.mbox"], &out);
+    let doc: Value = serde_json::from_str(stdout_trim(&out).as_str()).expect("am json");
+    let applied = doc["data"]["applied"].as_array().expect("applied array");
+    assert_eq!(applied.len(), 2, "{doc}");
+    assert_eq!(applied[0]["subject"], "mbox first change", "{doc}");
+    assert_eq!(applied[1]["subject"], "mbox second change", "{doc}");
+    let source = applied[0]["source"].as_str().expect("source label");
+    assert!(
+        source.ends_with("series.mbox#1"),
+        "multi-message sources are position-labelled: {source}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("result"),
+        "base\nfirst\nsecond\n"
+    );
+}
+
+/// `libra am -` reads the same mbox from stdin.
+#[test]
+fn stdin_mbox_applies_every_message() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let (mbox, _base) = fixture.two_message_mbox();
+
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], mbox.as_bytes());
+    assert_success(&["am", "-"], &out);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("result"),
+        "base\nfirst\nsecond\n"
+    );
+    let log = fixture.success(&fixture.repo, &["log", "--oneline", "-2"]);
+    let text = stdout_trim(&log);
+    assert!(text.contains("mbox second change"), "{text}");
+    assert!(text.contains("mbox first change"), "{text}");
+}
+
+/// A single non-mbox mail on stdin keeps the plain single-message path.
+#[test]
+fn stdin_single_mail_without_envelope_applies() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let (mbox, _base) = fixture.two_message_mbox();
+    // Strip the envelope line and keep only the FIRST message: a plain
+    // RFC-2822 mail without any mbox framing.
+    let first = mbox
+        .split_inclusive('\n')
+        .take_while(|line| {
+            !line.starts_with("From ") || line == &mbox.split_inclusive('\n').next().unwrap()
+        })
+        .collect::<String>();
+    let single = first
+        .split_once('\n')
+        .map(|(_, rest)| rest.to_string())
+        .expect("strip envelope");
+
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], single.as_bytes());
+    assert_success(&["am", "-"], &out);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("result"),
+        "base\nfirst\n"
+    );
+}
+
+/// `-` may be given at most once.
+#[test]
+fn stdin_twice_is_rejected() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("file.txt", "base\n", "base");
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-", "-"], b"");
+    assert_failure(&out, "stdin ('-') can be given at most once");
+}
+
+/// mboxrd body quoting is undone: a commit-message line the writer
+/// quoted as `>From ` comes back as `From ` in the recorded message.
+#[test]
+fn mboxrd_from_quoting_is_undone_in_the_commit_message() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("file.txt", "base\n", "base");
+    fixture.commit_file("file.txt", "base\nquoted\n", "quoted change");
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 1);
+    let mail = fs::read_to_string(&patches[0]).expect("read exported mail");
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    // Inject an mboxrd-quoted body line into the commit message section
+    // (between the headers blank line and the `---` separator).
+    let injected = mail.replacen("\n\n---\n", "\n\n>From here on, quoting matters.\n---\n", 1);
+    assert_ne!(injected, mail, "the fixture mail must carry a message slot");
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], injected.as_bytes());
+    assert_success(&["am", "-"], &out);
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(
+        text.contains("From here on, quoting matters."),
+        "mboxrd quote removed: {text}"
+    );
+    assert!(
+        !text.contains(">From here on"),
+        "no stray quote survives: {text}"
+    );
+}
+
+/// Sequencer state created from STDIN content persists: a conflicting
+/// first message pauses the run even though `-` cannot be re-read (the
+/// full mail bytes live in the saved state), and `--abort` restores the
+/// pre-am tip.
+#[test]
+fn stdin_mbox_conflict_state_persists_and_aborts() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let (mbox, _base) = fixture.two_message_mbox();
+    // Diverge so message 1's context ("base") no longer matches.
+    let diverged = fixture.commit_file("file.txt", "diverged\n", "diverge");
+
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], mbox.as_bytes());
+    assert!(!out.status.success(), "conflicting mbox pauses the run");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains("am --abort") || stderr.contains("conflict"),
+        "actionable conflict guidance: {stderr}"
+    );
+
+    let abort = fixture.success(&fixture.repo, &["am", "--abort"]);
+    let _ = abort;
+    assert_eq!(
+        fixture.rev_parse("HEAD"),
+        diverged,
+        "abort restores the tip"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("worktree restored"),
+        "diverged\n"
+    );
+}
