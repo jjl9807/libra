@@ -88,9 +88,56 @@ impl PreparedPatch {
         for file in self.files {
             match file.content {
                 Some(content) => {
+                    // Symlink sections materialize as REAL symlinks whose
+                    // target is the patched content (git mode 120000).
+                    if file.mode.is_some_and(|mode| mode & 0o170000 == 0o120000) {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStrExt;
+                            match fs::remove_file(&file.absolute) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                                Err(error) => {
+                                    return Err(format!(
+                                        "failed to replace symlink target '{}': {error}",
+                                        file.target
+                                    ));
+                                }
+                            }
+                            let target_path = Path::new(std::ffi::OsStr::from_bytes(&content));
+                            std::os::unix::fs::symlink(target_path, &file.absolute).map_err(
+                                |error| {
+                                    format!("failed to create symlink '{}': {error}", file.target)
+                                },
+                            )?;
+                            continue;
+                        }
+                        #[cfg(not(unix))]
+                        return Err(format!(
+                            "symlink patch '{}' is not supported on this platform",
+                            file.target
+                        ));
+                    }
                     write_atomic(&file.absolute, &content, false).map_err(|error| {
                         format!("failed to write patched file '{}': {error}", file.target)
                     })?;
+                    // A brand-new file (no preserved permissions) gets the
+                    // conventional umask-derived mode like git, instead of
+                    // the temp file's private 0600.
+                    #[cfg(unix)]
+                    if file.permissions.is_none() {
+                        use std::os::unix::fs::PermissionsExt;
+                        let executable = file.mode.is_some_and(|mode| mode & 0o111 != 0);
+                        let base = if executable { 0o777 } else { 0o666 };
+                        let mode = base & !process_umask();
+                        fs::set_permissions(&file.absolute, fs::Permissions::from_mode(mode))
+                            .map_err(|error| {
+                                format!(
+                                    "failed to set mode on new patched file '{}': {error}",
+                                    file.target
+                                )
+                            })?;
+                    }
                     if let Some(permissions) = file.permissions {
                         fs::set_permissions(&file.absolute, permissions).map_err(|error| {
                             format!(
@@ -137,6 +184,19 @@ impl PreparedPatch {
             }
         }
         Ok(())
+    }
+}
+
+/// Read the process umask without changing it (set-and-restore, the
+/// only portable POSIX read).
+#[cfg(unix)]
+fn process_umask() -> u32 {
+    // INVARIANT: umask(2) cannot fail; the immediate restore keeps the
+    // process value unchanged.
+    unsafe {
+        let current = libc::umask(0);
+        libc::umask(current);
+        current as u32
     }
 }
 
@@ -289,19 +349,36 @@ pub(crate) fn prepare_patch_opts(
                 ))),
             };
         }
-        let permissions = fs::symlink_metadata(absolute)
-            .map_err(|error| {
-                PatchPreparationError::DoesNotApply(format!(
-                    "cannot inspect patch target '{target}': {error}"
-                ))
-            })?
-            .permissions();
-        let bytes = fs::read(absolute).map_err(|error| {
+        let metadata = fs::symlink_metadata(absolute).map_err(|error| {
             PatchPreparationError::DoesNotApply(format!(
-                "cannot read patch target '{target}': {error}"
+                "cannot inspect patch target '{target}': {error}"
             ))
         })?;
-        Ok((bytes, Some(permissions)))
+        // A symlink's patchable content is its TARGET path, never the
+        // linked-to file's bytes.
+        let bytes = if metadata.file_type().is_symlink() {
+            let link = fs::read_link(absolute).map_err(|error| {
+                PatchPreparationError::DoesNotApply(format!(
+                    "cannot read symlink patch target '{target}': {error}"
+                ))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                link.as_os_str().as_bytes().to_vec()
+            }
+            #[cfg(not(unix))]
+            {
+                link.display().to_string().into_bytes()
+            }
+        } else {
+            fs::read(absolute).map_err(|error| {
+                PatchPreparationError::DoesNotApply(format!(
+                    "cannot read patch target '{target}': {error}"
+                ))
+            })?
+        };
+        Ok((bytes, Some(metadata.permissions())))
     }
 
     fn assert_absent(
@@ -412,8 +489,51 @@ pub(crate) fn prepare_patch_opts(
         let absolute =
             validate_patch_target(&target, workdir).map_err(PatchPreparationError::Invalid)?;
 
-        // Mode-only change: `old mode`/`new mode` with no content at all.
+        // Content-less sections: empty-file creation/deletion (git emits
+        // no hunks for a zero-byte file) and mode-only changes.
         if !headers.has_hunks && headers.binary.is_none() {
+            if let Some(new_file_mode) = headers.new_file_mode {
+                if new_file_mode & 0o170000 == 0o120000 {
+                    return Err(invalid(format!(
+                        "empty symlink patch for '{target}' carries no target"
+                    )));
+                }
+                assert_absent(&results, &target, &absolute)?;
+                if !results.contains_key(&target) {
+                    order.push(target.clone());
+                }
+                results.insert(
+                    target,
+                    SectionEntry {
+                        absolute,
+                        content: Some(Vec::new()),
+                        permissions: None,
+                        mode: Some(new_file_mode),
+                    },
+                );
+                continue;
+            }
+            if headers.deleted_file_mode.is_some() {
+                let (bytes, _permissions) = load_base(&results, &target, &absolute)?;
+                if !bytes.is_empty() {
+                    return Err(PatchPreparationError::DoesNotApply(format!(
+                        "deletion patch did not remove all content from '{target}'"
+                    )));
+                }
+                if !results.contains_key(&target) {
+                    order.push(target.clone());
+                }
+                results.insert(
+                    target,
+                    SectionEntry {
+                        absolute,
+                        content: None,
+                        permissions: None,
+                        mode: None,
+                    },
+                );
+                continue;
+            }
             let (Some(_old), Some(new_mode)) = (headers.old_mode, headers.new_mode) else {
                 return Err(invalid(format!(
                     "patch section for '{target}' carries no content and no mode change"
@@ -456,6 +576,9 @@ pub(crate) fn prepare_patch_opts(
             )));
         }
 
+        // A later content section on the same path must not drop an
+        // earlier section's mode override (chained chmod + edit).
+        let mode = mode.or_else(|| results.get(&target).and_then(|entry| entry.mode));
         if !results.contains_key(&target) {
             order.push(target.clone());
         }
@@ -514,7 +637,7 @@ fn apply_section_content(
     let mode = headers
         .new_mode
         .or(headers.new_file_mode)
-        .filter(|mode| mode & 0o170000 == 0o100000);
+        .filter(|mode| matches!(mode & 0o170000, 0o100000 | 0o120000));
     if let Some(binary) = &headers.binary {
         let bytes = match binary {
             BinaryHunk::Literal { size, data } => {
@@ -532,6 +655,23 @@ fn apply_section_content(
                         "binary delta for '{target}' declares {size} bytes but carries {}",
                         data.len()
                     )));
+                }
+                // Preimage verification (git parity): a delta generated
+                // from a different base of the SAME length would corrupt
+                // silently — the `index` header's old blob id must match
+                // the current content.
+                if let Some(expected) = headers.index_old.as_deref() {
+                    let actual = git_internal::internal::object::blob::Blob::from_content_bytes(
+                        base.clone(),
+                    )
+                    .id
+                    .to_string();
+                    if !actual.starts_with(expected) {
+                        return Err(SectionApplyError::DoesNotApply(format!(
+                            "current content of '{target}' does not match the binary patch's \
+                             recorded preimage {expected}"
+                        )));
+                    }
                 }
                 apply_git_delta(&base, data).map_err(|reason| {
                     SectionApplyError::DoesNotApply(format!(
@@ -812,12 +952,19 @@ fn parse_diff_git_sides(
     let Some((left, right)) = rest.split_once(" b/") else {
         return Ok((None, None));
     };
+    if strip == 0 {
+        // git -p0 uses the header names verbatim (`a/x`, `b/x`), matching
+        // how the same run's `---`/`+++` hunk names resolve.
+        let old = Some(strip_header_path(left, 0)?);
+        let new = Some(strip_header_path(&format!("b/{right}"), 0)?);
+        return Ok((old, new));
+    }
     let old = left.strip_prefix("a/").map(str::to_string);
     let old = match old {
-        Some(path) => Some(strip_header_path(&path, strip.saturating_sub(1))?),
+        Some(path) => Some(strip_header_path(&path, strip - 1)?),
         None => None,
     };
-    let new = Some(strip_header_path(right, strip.saturating_sub(1))?);
+    let new = Some(strip_header_path(right, strip - 1)?);
     Ok((old, new))
 }
 
@@ -1039,6 +1186,22 @@ fn apply_git_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
         return Err("delta result is smaller than declared".into());
     }
     Ok(result)
+}
+
+/// PD-09 ③: every `index` header old-blob id named by the patch, for
+/// callers that pre-resolve bases through the FULL object store
+/// (packs included) before invoking [`prepare_patch_opts`].
+pub(crate) fn patch_index_old_ids(patch_text: &str, strip: u32) -> Vec<String> {
+    let mut ids = Vec::new();
+    for section in split_file_patches(patch_text) {
+        if let Ok(headers) = parse_section_headers(&section, strip)
+            && let Some(old_id) = headers.index_old
+            && !ids.contains(&old_id)
+        {
+            ids.push(old_id);
+        }
+    }
+    ids
 }
 
 /// PD-09 ③: resolve a (possibly abbreviated) blob id from an `index`

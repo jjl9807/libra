@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **PD-09 adversarial-review batch (19 confirmed findings)**: the mbox
+  envelope test is now ctime-shaped (prose `From …` lines never
+  false-split; timezone/UUCP-suffixed envelopes split correctly) and
+  body `>From ` quoting is preserved byte-for-byte (git-default mboxo
+  reading). The apply seam gains git parity on: empty-file
+  creation/deletion patches, umask-derived modes for new files (no more
+  0600), real symlink materialization for `120000` sections (including
+  symlink-content bases), delta preimage verification against the
+  `index` header's old blob id (a same-size modified base now refuses
+  instead of corrupting), chained same-path sections keeping earlier
+  mode overrides, and `-p0` keeping `diff --git` header names verbatim.
+  `am -3` pre-resolves base blobs through the full object store (packed
+  objects and abbreviated ids now work in clones), a conflicted pause
+  stages the mail's mode overrides and persists the applypatch-msg
+  hook's message edit so `--continue` commits both, a pause flag makes
+  an unstaged "resolution" error out instead of silently re-clobbering
+  the file with markers, and `am --abort` refuses to hard-reset away
+  commits made on top of the paused state. Multipart parsing accepts
+  RFC 2046 transport padding on boundary lines, empty-header parts, and
+  quoted `;` inside Content-Type parameters. (One accepted limitation
+  documented in review: the hook message file shares the worktree
+  `COMMIT_EDITMSG` slot.)
+
 ### Added
 
 - **`am` applypatch hooks (plan-20260714 PD-09 ⑤ — PD-09 complete)**:

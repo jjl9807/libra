@@ -797,9 +797,11 @@ fn stdin_twice_is_rejected() {
 }
 
 /// mboxrd body quoting is undone: a commit-message line the writer
-/// quoted as `>From ` comes back as `From ` in the recorded message.
+/// quoted as `>From ` stays byte-for-byte (git-default mboxo reading),
+/// and a prose `From …` body line (no ctime-shaped date) never splits
+/// the mbox.
 #[test]
-fn mboxrd_from_quoting_is_undone_in_the_commit_message() {
+fn mbox_body_from_lines_are_preserved_and_never_split() {
     let fixture = CliFixture::new();
     fixture.init_repo();
     let base = fixture.commit_file("file.txt", "base\n", "base");
@@ -809,21 +811,56 @@ fn mboxrd_from_quoting_is_undone_in_the_commit_message() {
     let mail = fs::read_to_string(&patches[0]).expect("read exported mail");
     fixture.success(&fixture.repo, &["reset", "--hard", &base]);
 
-    // Inject an mboxrd-quoted body line into the commit message section
-    // (between the headers blank line and the `---` separator).
-    let injected = mail.replacen("\n\n---\n", "\n\n>From here on, quoting matters.\n---\n", 1);
+    // Inject a quoted `>From ` line AND a prose `From …` line ending in
+    // four digits (the shape the old loose heuristic false-split on).
+    let injected = mail.replacen(
+        "\n\n---\n",
+        "\n\n>From here on, quoting matters.\nFrom my reading of RFC 9110\n---\n",
+        1,
+    );
     assert_ne!(injected, mail, "the fixture mail must carry a message slot");
     let out = fixture.run_stdin(&fixture.repo, &["am", "-"], injected.as_bytes());
     assert_success(&["am", "-"], &out);
     let log = fixture.success(&fixture.repo, &["log", "-1"]);
     let text = String::from_utf8_lossy(&log.stdout).into_owned();
     assert!(
-        text.contains("From here on, quoting matters."),
-        "mboxrd quote removed: {text}"
+        text.contains(">From here on, quoting matters."),
+        "the quoted line survives byte-for-byte like git: {text}"
     );
     assert!(
-        !text.contains(">From here on"),
-        "no stray quote survives: {text}"
+        text.contains("From my reading of RFC 9110"),
+        "a prose From line never splits the mail: {text}"
+    );
+}
+
+/// Real-world MTA envelopes carry timezone suffixes after the year; the
+/// splitter must not silently drop the messages that follow.
+#[test]
+fn mbox_envelope_with_timezone_suffix_still_splits() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let (mbox, _base) = fixture.two_message_mbox();
+    // Rewrite every envelope line to the UUCP/MTA shape with a timezone.
+    let rewritten: String = mbox
+        .lines()
+        .map(|line| {
+            if line.starts_with("From ") && line.contains(':') {
+                "From dev@example.com Wed Jun 30 21:49:08 1993 -0400".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], rewritten.as_bytes());
+    assert_success(&["am", "-"], &out);
+    let log = fixture.success(&fixture.repo, &["log", "--oneline", "-2"]);
+    let text = stdout_trim(&log);
+    assert!(text.contains("mbox first change"), "{text}");
+    assert!(
+        text.contains("mbox second change"),
+        "the second message is not silently dropped: {text}"
     );
 }
 
@@ -983,12 +1020,19 @@ fn binary_literal_and_delta_patches_apply() {
     let delta = git_delta(&payload, 128, &tail);
     let mut expected = payload[..128].to_vec();
     expected.extend_from_slice(&tail);
+    // The delta's preimage id must MATCH the current content (the apply
+    // seam verifies it like git); an unrelated id must refuse.
+    let payload_oid =
+        git_internal::internal::object::blob::Blob::from_content_bytes(payload.clone())
+            .id
+            .to_string();
     let edit = craft_mail(
         "rewrite binary blob",
         &format!(
             "diff --git a/blob.bin b/blob.bin\n\
-             index 1111111..2222222 100644\n\
+             index {}..2222222 100644\n\
              {}",
+            &payload_oid[..7],
             binary_hunk("delta", &delta)
         ),
     );
@@ -1004,6 +1048,32 @@ fn binary_literal_and_delta_patches_apply() {
         expected,
         "delta result matches copy+insert reconstruction"
     );
+
+    // A delta whose recorded preimage does not match the CURRENT content
+    // must refuse instead of corrupting silently.
+    let stale = craft_mail(
+        "stale delta",
+        &format!(
+            "diff --git a/blob.bin b/blob.bin\n\
+             index {}..3333333 100644\n\
+             {}",
+            &payload_oid[..7],
+            binary_hunk("delta", &git_delta(&expected, 16, b"XX"))
+        ),
+    );
+    let mail_path = fixture.root.join("binary-stale.patch");
+    fs::write(&mail_path, &stale).expect("write stale mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert!(!out.status.success(), "stale preimage must refuse");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("recorded preimage"),
+        "actionable preimage refusal: {stderr}"
+    );
+    fixture.success(&fixture.repo, &["am", "--abort"]);
 }
 
 /// A pure rename section moves the file; a rename with hunks moves AND
@@ -1553,5 +1623,266 @@ fn post_applypatch_failure_is_advisory() {
     assert!(
         String::from_utf8_lossy(&log.stdout).contains("hooked change"),
         "the mail still committed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PD-09 adversarial-review regression pins
+// ---------------------------------------------------------------------------
+
+/// Review #4/#5/#6: empty-file creation applies (git emits no hunks),
+/// new files get umask-derived permissions (not the temp file's 0600),
+/// and `new file mode 120000` materializes a REAL symlink.
+#[test]
+fn empty_file_umask_and_symlink_sections_apply() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("file.txt", "base\n", "base");
+
+    let mail = craft_mail(
+        "empty file, exec file and symlink",
+        "diff --git a/keep/.gitkeep b/keep/.gitkeep\n\
+         new file mode 100644\n\
+         index 0000000..e69de29\n\
+         diff --git a/run.sh b/run.sh\n\
+         new file mode 100755\n\
+         index 0000000..1111111\n\
+         --- /dev/null\n\
+         +++ b/run.sh\n\
+         @@ -0,0 +1 @@\n\
+         +#!/bin/sh\n\
+         diff --git a/link.txt b/link.txt\n\
+         new file mode 120000\n\
+         index 0000000..2222222\n\
+         --- /dev/null\n\
+         +++ b/link.txt\n\
+         @@ -0,0 +1 @@\n\
+         +file.txt\n\
+         \\ No newline at end of file\n",
+    );
+    let mail_path = fixture.root.join("mixed-new.patch");
+    fs::write(&mail_path, &mail).expect("write mixed mail");
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", mail_path.to_str().expect("utf8 path")],
+    );
+    assert_success(&["am", "mixed-new"], &out);
+
+    // Empty file exists and is empty.
+    assert_eq!(
+        fs::read(fixture.repo.join("keep/.gitkeep")).expect("empty file"),
+        Vec::<u8>::new()
+    );
+    // New files carry umask-derived modes: group/other readable under
+    // any sane umask (022/002), never the private 0600/0700.
+    let keep_mode = fs::metadata(fixture.repo.join("keep/.gitkeep"))
+        .expect("stat keep")
+        .permissions()
+        .mode();
+    assert_ne!(keep_mode & 0o044, 0, "group/other readable: {keep_mode:o}");
+    let run_mode = fs::metadata(fixture.repo.join("run.sh"))
+        .expect("stat run.sh")
+        .permissions()
+        .mode();
+    assert_ne!(run_mode & 0o111, 0, "exec bit: {run_mode:o}");
+    assert_ne!(run_mode & 0o044, 0, "group/other readable: {run_mode:o}");
+    // The symlink is a real symlink pointing at the patched target.
+    let meta = fs::symlink_metadata(fixture.repo.join("link.txt")).expect("lstat link");
+    assert!(meta.file_type().is_symlink(), "materialized as a symlink");
+    assert_eq!(
+        fs::read_link(fixture.repo.join("link.txt")).expect("read link"),
+        std::path::PathBuf::from("file.txt")
+    );
+    // And it round-trips through the commit as mode 120000.
+    let show = fixture.success(&fixture.repo, &["show", "--name-status", "HEAD"]);
+    let text = String::from_utf8_lossy(&show.stdout).into_owned();
+    assert!(text.contains("link.txt"), "{text}");
+}
+
+/// Review #10/#12: when a -3 mail pauses on conflict, the applypatch-msg
+/// hook's edit and the mail's chmod section BOTH survive into the
+/// `--continue` commit.
+#[test]
+fn conflict_continue_keeps_hook_edit_and_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("tool.sh", "#!/bin/sh\n", "add tool");
+    let patch = three_way_fixture(
+        &fixture,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCHANGED-EIGHT\nnine\n",
+    );
+    // Extend the conflicting mail with a chmod section for tool.sh —
+    // INSIDE the patch body (before the `-- ` signature trailer, which
+    // the mail parser strips).
+    let raw = fs::read_to_string(&patch).expect("read mail");
+    let mail = raw.replacen(
+        "\n-- \n",
+        "\ndiff --git a/tool.sh b/tool.sh\nold mode 100644\nnew mode 100755\n-- \n",
+        1,
+    );
+    assert_ne!(
+        mail, raw,
+        "the exported mail must carry a signature trailer"
+    );
+    let mail_path = fixture.root.join("conflict-chmod.patch");
+    fs::write(&mail_path, &mail).expect("write mail");
+    install_hook(
+        &fixture,
+        "applypatch-msg",
+        "#!/bin/sh\nprintf '\\nHook-Stamp: kept\\n' >> \"$1\"\n",
+    );
+
+    let out = fixture.run(
+        &fixture.repo,
+        &["am", "-3", mail_path.to_str().expect("utf8 path")],
+    );
+    assert!(!out.status.success(), "conflicting mail pauses");
+
+    // Resolve the conflicted file, stage it, continue.
+    fs::write(
+        fixture.repo.join("file.txt"),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nRESOLVED\nnine\n",
+    )
+    .expect("resolve");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    fixture.success(&fixture.repo, &["am", "--continue"]);
+
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(
+        text.contains("Hook-Stamp: kept"),
+        "hook edit survives the pause: {text}"
+    );
+    let mode = fs::metadata(fixture.repo.join("tool.sh"))
+        .expect("stat tool")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "chmod survives the pause: {mode:o}");
+    // The chmod is IN the commit, not just the worktree.
+    let show = fixture.success(&fixture.repo, &["show", "--raw", "HEAD"]);
+    let raw = String::from_utf8_lossy(&show.stdout).into_owned();
+    assert!(raw.contains("100755"), "committed tree mode: {raw}");
+}
+
+/// Review #13: resolving a -3 conflict by restoring HEAD content must
+/// NOT silently re-apply the mail and re-clobber the file with markers.
+#[test]
+fn conflict_continue_with_nothing_staged_errors_instead_of_reclobbering() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = three_way_fixture(
+        &fixture,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCHANGED-EIGHT\nnine\n",
+    );
+    let path = patch.to_str().expect("utf8 patch");
+    let out = fixture.run(&fixture.repo, &["am", "-3", path]);
+    assert!(!out.status.success(), "conflicting mail pauses");
+
+    // "Resolve" by restoring the exact HEAD content (nothing to stage).
+    fixture.success(&fixture.repo, &["restore", "file.txt"]);
+    let retry = fixture.run(&fixture.repo, &["am", "--continue"]);
+    assert!(!retry.status.success(), "nothing staged is an error");
+    let stderr = String::from_utf8_lossy(&retry.stderr);
+    assert!(
+        stderr.contains("no staged resolution"),
+        "actionable guidance instead of a silent re-clobber: {stderr}"
+    );
+    assert!(
+        !fs::read_to_string(fixture.repo.join("file.txt"))
+            .expect("file intact")
+            .contains("<<<<<<<"),
+        "the restored file is not re-clobbered with markers"
+    );
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+}
+
+/// Review #11: `am --abort` refuses to hard-reset away commits made ON
+/// TOP of the paused state, while the backward-rescue reset keeps the
+/// historical restore behavior (pinned elsewhere).
+#[test]
+fn abort_refuses_to_discard_descendant_commits() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let patch = three_way_fixture(
+        &fixture,
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nCHANGED-EIGHT\nnine\n",
+    );
+    let path = patch.to_str().expect("utf8 patch");
+    let out = fixture.run(&fixture.repo, &["am", "-3", path]);
+    assert!(!out.status.success(), "conflicting mail pauses");
+
+    // The user commits the resolution manually (forgetting --continue).
+    fs::write(
+        fixture.repo.join("file.txt"),
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\nRESOLVED\nnine\n",
+    )
+    .expect("resolve");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    fixture.success(&fixture.repo, &["commit", "-m", "manual resolution"]);
+    let manual = fixture.rev_parse("HEAD");
+
+    let abort = fixture.run(&fixture.repo, &["am", "--abort"]);
+    assert!(!abort.status.success(), "descendant tip is protected");
+    let stderr = String::from_utf8_lossy(&abort.stderr);
+    assert!(
+        stderr.contains("refusing to discard"),
+        "actionable refusal: {stderr}"
+    );
+    assert_eq!(
+        fixture.rev_parse("HEAD"),
+        manual,
+        "the manual resolution commit survives"
+    );
+    // Clean up per the hint: move back to the paused tip, then abort.
+    fixture.success(&fixture.repo, &["reset", "--hard", "HEAD~1"]);
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+}
+
+/// Review #14/#15/#16: multipart edge shapes — boundary transport
+/// padding, an empty-header part, and quoted `;` inside Content-Type
+/// parameters — all parse like git.
+#[test]
+fn multipart_edge_shapes_parse() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("file.txt", "alpha\n", "base");
+
+    let mail = "From 1111111111111111111111111111111111111111 Mon Sep 17 00:00:00 2001\n\
+From: Crafted Author <crafted@example.com>\n\
+Date: Thu, 1 Jan 2026 00:00:00 +0000\n\
+Subject: [PATCH] multipart edges\n\
+Content-Type: multipart/mixed; name=\"x;boundary=zzz\"; boundary=\"real b\"\n\
+\n\
+preamble\n\
+--real b \n\
+\n\
+edge shapes message\n\
+---\n\
+ file.txt | 1 +\n\
+ 1 file changed, 1 insertion(+)\n\
+\n\
+diff --git a/file.txt b/file.txt\n\
+index 0000000..1111111 100644\n\
+--- a/file.txt\n\
++++ b/file.txt\n\
+@@ -1 +1,2 @@\n alpha\n\
++beta\n\
+--real b--\t\n\
+epilogue is ignored\n";
+    let out = fixture.run_stdin(&fixture.repo, &["am", "-"], mail.as_bytes());
+    assert_success(&["am", "multipart-edges"], &out);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("result"),
+        "alpha\nbeta\n"
+    );
+    let log = fixture.success(&fixture.repo, &["log", "-1"]);
+    let text = String::from_utf8_lossy(&log.stdout).into_owned();
+    assert!(
+        text.contains("edge shapes message"),
+        "empty-header part body survives: {text}"
     );
 }

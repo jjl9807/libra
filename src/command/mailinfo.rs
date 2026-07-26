@@ -406,10 +406,20 @@ fn extract_text_body(
     }
     let mut collected = String::new();
     for part in split_multipart(encoded, &boundary)? {
-        let (raw_part_headers, part_body) = match part.split_once("\n\n") {
-            Some((headers, body)) => (headers, body),
-            // A headerless part is implicit text/plain.
-            None => ("", part.as_str()),
+        // RFC 2046: a part may have an EMPTY header section — its content
+        // starts right after a leading blank line. Detect that before the
+        // generic headers/body split so a body paragraph break is never
+        // mis-read as the header separator.
+        let (raw_part_headers, part_body) = if let Some(body) = part.strip_prefix('\n') {
+            ("", body)
+        } else if let Some(body) = part.strip_prefix("\r\n") {
+            ("", body)
+        } else {
+            match part.split_once("\n\n") {
+                Some((headers, body)) => (headers, body),
+                // A headerless part is implicit text/plain.
+                None => ("", part.as_str()),
+            }
         };
         let part_headers = parse_headers(raw_part_headers)?;
         let part_type = header(&part_headers, "content-type").unwrap_or("text/plain");
@@ -447,10 +457,30 @@ fn push_text_part(collected: &mut String, part: &str) {
     collected.push_str(part);
 }
 
+/// Split a Content-Type header's `;`-separated parameters WITHOUT
+/// breaking inside quoted values (`name="a;b"`), per RFC 2045 §5.1.
+fn split_ct_params(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'"' => in_quotes = !in_quotes,
+            b';' if !in_quotes => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
 fn media_type_of(content_type: &str) -> String {
-    content_type
-        .split(';')
-        .next()
+    split_ct_params(content_type)
+        .first()
+        .copied()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
@@ -459,7 +489,7 @@ fn media_type_of(content_type: &str) -> String {
 /// Extract a `name=value` parameter from a Content-Type header,
 /// stripping optional quotes.
 fn content_type_parameter(value: &str, name: &str) -> Option<String> {
-    for parameter in value.split(';').skip(1) {
+    for parameter in split_ct_params(value).into_iter().skip(1) {
         let Some((candidate, parameter_value)) = parameter.trim().split_once('=') else {
             continue;
         };
@@ -480,7 +510,11 @@ fn split_multipart(body: &str, boundary: &str) -> Result<Vec<String>, String> {
     let mut parts: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
     for line in body.split_inclusive('\n') {
-        let bare = line.trim_end_matches(['\n', '\r']);
+        // RFC 2046 §5.1.1: a boundary delimiter line may carry trailing
+        // transport padding (spaces/tabs) before the CRLF.
+        let bare = line
+            .trim_end_matches(['\n', '\r'])
+            .trim_end_matches([' ', '\t']);
         if bare == close {
             if let Some(part) = current.take() {
                 parts.push(trim_part_delimiter_newline(part));
@@ -520,7 +554,8 @@ fn trim_part_delimiter_newline(mut part: String) -> String {
 }
 
 fn validate_content_type(value: &str) -> Result<(), String> {
-    let media_type = value.split(';').next().unwrap_or_default().trim();
+    let binding = media_type_of(value);
+    let media_type = binding.as_str();
     if !media_type.eq_ignore_ascii_case("text/plain") {
         return Err(format!(
             "unsupported Content-Type '{media_type}'; expected text/plain or a multipart container"
@@ -530,7 +565,7 @@ fn validate_content_type(value: &str) -> Result<(), String> {
 }
 
 fn validate_text_charset(value: &str) -> Result<(), String> {
-    for parameter in value.split(';').skip(1) {
+    for parameter in split_ct_params(value).into_iter().skip(1) {
         let Some((name, parameter_value)) = parameter.trim().split_once('=') else {
             continue;
         };

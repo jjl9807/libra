@@ -66,8 +66,8 @@ EXAMPLES:
 pub struct AmArgs {
     /// Plain-text format-patch mail files, applied in order. A file whose
     /// first line is an mbox `From ` envelope is split into its messages
-    /// (mboxrd quoting undone); `-` reads one mail or mbox from stdin
-    /// (at most once).
+    /// (body content preserved byte-for-byte); `-` reads one mail or mbox
+    /// from stdin (at most once).
     #[clap(
         value_name = "PATCH",
         required_unless_present_any = ["continue_am", "skip", "abort"]
@@ -121,6 +121,11 @@ struct AmPayload {
     /// the same fallback semantics.
     #[serde(default)]
     three_way: bool,
+    /// The current mail paused with conflict markers written (#13): a
+    /// pristine-looking worktree on `--continue` then means "resolution
+    /// not staged", never "silently re-apply and re-clobber".
+    #[serde(default)]
+    paused_in_conflict: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -274,6 +279,7 @@ async fn start_am(paths: &[String], three_way: bool, output: &OutputConfig) -> C
             patches,
             current: 0,
             three_way,
+            paused_in_conflict: false,
         },
     };
     state.save().await?;
@@ -297,7 +303,7 @@ async fn continue_am(output: &OutputConfig) -> CliResult<AmOutput> {
     ensure_state_branch(&state).await?;
     ensure_expected_head(&state).await?;
     let mail = state.payload.patches[state.payload.current].clone();
-    if recovery_state_is_pristine(&mail.targets).await? {
+    if !state.payload.paused_in_conflict && recovery_state_is_pristine(&mail.targets).await? {
         let applied = apply_remaining(&mut state, output).await?;
         return Ok(AmOutput {
             action: "continue".to_string(),
@@ -312,6 +318,7 @@ async fn continue_am(output: &OutputConfig) -> CliResult<AmOutput> {
     // `applypatch-msg` does not re-run — the message was settled when
     // the mail was first processed.
     run_pre_applypatch_hook(&mail, output).await?;
+    state.payload.paused_in_conflict = false;
     let first = commit_current(&mut state, mail).await?;
     run_advisory_repo_hook(RepoHook::PostApplypatch, &[], None, output).await;
     let mut applied = vec![first];
@@ -332,6 +339,7 @@ async fn skip_am(output: &OutputConfig) -> CliResult<AmOutput> {
     cleanup_untracked_patch_targets(&current_targets)?;
 
     state.payload.current += 1;
+    state.payload.paused_in_conflict = false;
     if state.payload.current == state.payload.patches.len() {
         sequencer::clear_am()
             .await
@@ -354,6 +362,30 @@ async fn skip_am(output: &OutputConfig) -> CliResult<AmOutput> {
 async fn abort_am(output: &OutputConfig) -> CliResult<AmOutput> {
     let state = load_state_or_error().await?;
     ensure_state_branch(&state).await?;
+    // #11: never hard-reset AWAY commits made on top of the paused
+    // sequencer state (e.g. a manual `libra commit` of the resolution) —
+    // like `git am --abort`, a descendant tip is protected. Any other
+    // movement (e.g. a rescue reset backwards) keeps the historical
+    // restore-to-pre-am behavior.
+    let current_head = Head::current_commit_result()
+        .await
+        .map_err(|error| am_state_error(format!("failed to resolve HEAD commit: {error}")))?
+        .ok_or_else(|| am_state_error("HEAD disappeared during am".to_string()))?;
+    if current_head != state.expected_head
+        && crate::internal::merge_base::is_ancestor(&state.expected_head, &current_head)
+            .unwrap_or(false)
+    {
+        return Err(CliError::fatal(
+            "the branch gained commits since am paused; refusing to discard them with a \
+             hard reset",
+        )
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint(format!(
+            "keep them: move the branch back to the paused tip first ('libra reset --hard {}'), then re-run 'libra am --abort' or '--skip'",
+            short_display_hash(&state.expected_head.to_string())
+        ))
+        .with_hint("the new commits stay reachable via the reflog either way"));
+    }
     let current_targets = state.payload.patches[state.payload.current].targets.clone();
     let restored = state.head_orig.to_string();
     reset_hard(&restored, output).await?;
@@ -376,6 +408,15 @@ async fn apply_remaining(
     while state.payload.current < state.payload.patches.len() {
         ensure_expected_head(state).await?;
         let mut mail = state.payload.patches[state.payload.current].clone();
+        // PD-09 ③ (#9): pre-resolve every `index` old-blob id through the
+        // FULL object store (packs included, abbreviations expanded via
+        // object search) so the three-way fallback also works in cloned /
+        // repacked repos where nothing is loose.
+        let resolved_bases = if state.payload.three_way {
+            resolve_three_way_bases(&mail.patch).await
+        } else {
+            std::collections::HashMap::new()
+        };
         // PD-09 ⑤: `applypatch-msg` may edit the proposed commit message
         // and gates the mail BEFORE any worktree write; the state was
         // saved already, so a refusal leaves a resumable series.
@@ -387,9 +428,22 @@ async fn apply_remaining(
                     "the hook emptied the commit message".to_string(),
                 ));
             }
-            mail.message = edited;
+            if edited != mail.message {
+                // Persist the hook's edit with the series so a later
+                // `--continue` (after a conflict pause) commits the SAME
+                // message instead of silently reverting the edit.
+                mail.message = edited.clone();
+                state.payload.patches[state.payload.current].message = edited;
+                state.save().await?;
+            }
         }
-        let resolver: crate::command::apply::BaseBlobResolver<'_> = &resolve_local_base_blob;
+        let map_resolver = |oid: &str| -> Option<Vec<u8>> {
+            resolved_bases
+                .get(oid)
+                .cloned()
+                .or_else(|| resolve_local_base_blob(oid))
+        };
+        let resolver: crate::command::apply::BaseBlobResolver<'_> = &map_resolver;
         let prepared = match prepare_patch_opts(
             &mail.patch,
             1,
@@ -416,8 +470,15 @@ async fn apply_remaining(
         })?;
         if !conflicted.is_empty() {
             // PD-09 ③: the three-way fallback left conflict markers in the
-            // worktree. Pause exactly like a plain conflict — the state was
-            // saved before any write, so resolve + `--continue` resumes.
+            // worktree. Stage the patch's mode overrides NOW (a chmod
+            // section must not be dropped from the eventual `--continue`
+            // commit), mark the pause so a resolution that happens to
+            // restore HEAD content is treated as "nothing staged" instead
+            // of silently re-applying the mail, then pause exactly like a
+            // plain conflict.
+            stage_mode_overrides(&mode_overrides)?;
+            state.payload.paused_in_conflict = true;
+            state.save().await?;
             return Err(am_conflict(
                 &mail,
                 format!(
@@ -438,6 +499,7 @@ async fn apply_remaining(
         // PD-09 ⑤: `pre-applypatch` inspects the applied+staged result and
         // gates the commit; `post-applypatch` is advisory like Git's.
         run_pre_applypatch_hook(&mail, output).await?;
+        state.payload.paused_in_conflict = false;
         applied.push(commit_current(state, mail).await?);
         run_advisory_repo_hook(RepoHook::PostApplypatch, &[], None, output).await;
         if state.payload.current < state.payload.patches.len()
@@ -674,6 +736,29 @@ async fn recovery_state_is_pristine(targets: &[String]) -> CliResult<bool> {
 
 fn test_failpoint_enabled(name: &str) -> bool {
     std::env::var_os("LIBRA_TEST").is_some() && std::env::var_os(name).is_some()
+}
+
+/// PD-09 ③ (#9): resolve every `index` old-blob id of one mail through
+/// the full object store — packed objects included, abbreviated ids
+/// expanded via object search when unambiguous. Misses are simply
+/// absent from the map (the loose-scan fallback still runs).
+async fn resolve_three_way_bases(patch_text: &str) -> std::collections::HashMap<String, Vec<u8>> {
+    use crate::command::apply::patch_index_old_ids;
+
+    let mut bases = std::collections::HashMap::new();
+    let storage = util::objects_storage();
+    for oid_prefix in patch_index_old_ids(patch_text, 1) {
+        let candidates = storage.search(&oid_prefix).await;
+        let [oid] = candidates.as_slice() else {
+            continue; // missing or ambiguous — leave unresolved
+        };
+        if let Ok(bytes) = storage.get(oid)
+            && bytes.len() <= MAX_PATCH_BYTES
+        {
+            bases.insert(oid_prefix, bytes);
+        }
+    }
+    bases
 }
 
 /// PD-09 ⑤ `applypatch-msg`: the proposed commit message is written to
@@ -970,9 +1055,10 @@ fn read_mail_stdin() -> CliResult<Vec<u8>> {
 
 /// Split raw mail text into individual messages (PD-09 ①). Only input
 /// whose FIRST line is an mbox `From ` envelope line is treated as an
-/// mbox: every later envelope line starts a new message and mboxrd
-/// `>From` quoting is undone per message. Any other input is exactly one
-/// message, untouched.
+/// mbox: every later envelope line starts a new message. Body content is
+/// preserved byte-for-byte — like `git am`'s default (mboxo) reading, a
+/// quoted `>From ` line is NOT unquoted, and the strict ctime-shaped
+/// envelope test keeps prose `From …` lines inside their message.
 fn split_mbox(text: &str) -> Vec<String> {
     let first_line = text.split_inclusive('\n').next().unwrap_or("");
     if !is_mbox_from_line(first_line.trim_end_matches(['\n', '\r'])) {
@@ -982,23 +1068,22 @@ fn split_mbox(text: &str) -> Vec<String> {
     let mut current = String::new();
     for line in text.split_inclusive('\n') {
         if is_mbox_from_line(line.trim_end_matches(['\n', '\r'])) && !current.is_empty() {
-            messages.push(unquote_mboxrd(&current));
-            current.clear();
+            messages.push(std::mem::take(&mut current));
         }
         current.push_str(line);
     }
     if !current.is_empty() {
-        messages.push(unquote_mboxrd(&current));
+        messages.push(current);
     }
     messages
 }
 
-/// Conservative mbox envelope test (the `git mailsplit` shape): `From `
-/// followed by one token and a date-ish tail whose last field is a
-/// 4-digit year. Matches `git format-patch`'s
-/// `From <oid> Mon Sep 17 00:00:00 2001` and classic mboxes while never
-/// matching commit-message prose (which `format-patch` mboxrd-quotes as
-/// `>From ` anyway).
+/// mbox envelope test matching `git mailsplit`'s `is_from_line` shape:
+/// `From ` + a sender token + a ctime-like date tail — an `hh:mm:ss`
+/// time token immediately followed by a 4-digit year, with trailing
+/// timezone/UUCP tokens allowed after the year. Ordinary
+/// commit-message prose (`From my reading of RFC 9110`) has no time
+/// token and never splits.
 fn is_mbox_from_line(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("From ") else {
         return false;
@@ -1010,25 +1095,23 @@ fn is_mbox_from_line(line: &str) -> bool {
     let tail: Vec<&str> = fields.collect();
     tail.len() >= 4
         && tail
-            .last()
-            .is_some_and(|year| year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
+            .windows(2)
+            .any(|pair| is_time_of_day_token(pair[0]) && is_year_token(pair[1]))
 }
 
-/// Undo mboxrd body quoting: a line of one-or-more `>` directly followed
-/// by `From ` loses exactly one `>` (the writer added it so body text
-/// could never be mistaken for an envelope).
-fn unquote_mboxrd(message: &str) -> String {
-    message
-        .split_inclusive('\n')
-        .map(|line| {
-            let stripped = line.trim_start_matches('>');
-            if line.len() > stripped.len() && stripped.starts_with("From ") {
-                &line[1..]
-            } else {
-                line
-            }
-        })
-        .collect()
+fn is_time_of_day_token(token: &str) -> bool {
+    let parts: Vec<&str> = token.split(':').collect();
+    parts.len() == 3
+        && (1..=2).contains(&parts[0].len())
+        && parts[1].len() == 2
+        && parts[2].len() == 2
+        && parts
+            .iter()
+            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_year_token(token: &str) -> bool {
+    token.len() == 4 && token.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 async fn load_state_or_error() -> CliResult<AmState> {

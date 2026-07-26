@@ -22,8 +22,12 @@ rejected before sequencer state is saved. The aggregate mail input is limited
 to 64 MiB and 10,000 mails.
 
 Each input may be a single mail or an mbox: a file (or stdin) whose first
-line is an mbox `From ` envelope line is split into its messages, applied
-in order, and mboxrd `>From ` body quoting is undone. `-` reads one mail
+line is an mbox `From ` envelope line is split into its messages and
+applied in order. The envelope test is ctime-shaped (an `hh:mm:ss` time
+token followed by a 4-digit year, trailing timezone tokens allowed), so
+commit-message prose like `From my reading of RFC 9110` never splits a
+mail, and body content — including `>From ` quoting — is preserved
+byte-for-byte like git's default (mboxo) reading. `-` reads one mail
 or mbox from standard input (allowed at most once); the full mail content
 is persisted in the sequencer state, so `--continue` / `--skip` /
 `--abort` work for stdin-sourced series exactly like file-sourced ones.

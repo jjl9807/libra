@@ -16,8 +16,10 @@ libra am --abort
 新 series 必须在已有提交的本地分支上启动，并且不能有 staged 或 tracked 工作树改动。无关的 untracked 文件会保留；但只要任一邮件会触及已有的 non-index 路径（包括 ignored 路径），命令就会在保存 sequencer 状态前拒绝。邮件总输入上限为 64 MiB，邮件数上限为 10,000。
 
 每个输入可以是单封邮件或一个 mbox：首行是 mbox `From ` envelope 行的文件（或
-stdin）会被切分为其中的每封邮件、按序应用，并撤销 mboxrd 的 `>From ` 正文
-quoting。`-` 从标准输入读取一封邮件或一个 mbox（最多出现一次）；完整邮件内容
+stdin）会被切分为其中的每封邮件、按序应用。envelope 判定为 ctime 形状
+（`hh:mm:ss` 时间 token 后紧跟 4 位年份，年份后允许时区/UUCP 尾巴），因此
+`From my reading of RFC 9110` 这类正文散文绝不会切开邮件；正文内容（包括
+`>From ` quoting）按 git 默认（mboxo）读取方式逐字节保留。`-` 从标准输入读取一封邮件或一个 mbox（最多出现一次）；完整邮件内容
 持久化在 sequencer 状态中，因此来自 stdin 的 series 与文件 series 一样支持
 `--continue` / `--skip` / `--abort`。多邮件来源在输出与状态中带位置标签
 `<source>#<n>`。
