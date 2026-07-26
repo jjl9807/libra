@@ -716,9 +716,11 @@ fn gc_expired_stderr_logs(
 /// This deliberately does NOT delete the objectized findings blob or drop its
 /// `object_index` row: those are ordinary content-addressed git objects that
 /// may be byte-identical to a blob reachable from a branch, index, reflog, or
-/// another run. Reclaiming a content-addressed object safely requires repo-wide
-/// reachability analysis (a future `libra gc`), so per-run findings retention
-/// only removes the run directory and leaves the shared object store intact.
+/// another run. Repo-level reclamation is `libra maintenance run --task gc`'s
+/// job (PD-04): its reachability walk keeps live-run manifest OIDs alive and
+/// prunes orphaned findings blobs TOGETHER with their `object_index` rows, so
+/// per-run retention here only removes the run directory and leaves the
+/// shared object store intact.
 async fn gc_expired_findings_runs(
     sessions_root: &Path,
     cutoff: DateTime<Utc>,

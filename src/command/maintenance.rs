@@ -163,6 +163,11 @@ pub struct TaskResult {
     pub objects_packed: usize,
     pub refs_packed: usize,
     pub packs_repacked: usize,
+    /// PD-04: `object_index` catalogue rows dropped (or, under `--dry-run`,
+    /// that would be dropped) alongside pruned unreachable loose objects, so
+    /// cloud sync never re-advertises a deleted blob.
+    #[serde(default)]
+    pub object_index_rows_removed: u64,
     pub message: String,
 }
 
@@ -266,6 +271,7 @@ async fn run_tasks(
                     objects_packed: 0,
                     refs_packed: 0,
                     packs_repacked: 0,
+                    object_index_rows_removed: 0,
                     message: e.to_string(),
                 });
             }
@@ -353,6 +359,7 @@ async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
         objects_packed: 0,
         refs_packed: 0,
         packs_repacked: 0,
+        object_index_rows_removed: 0,
         message,
     })
 }
@@ -395,6 +402,7 @@ async fn run_gc(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "skipped loose-object prune: this store is shared (other repos borrow from                       it via alternates); have borrowers run 'libra alternates remove' first"
                 .to_string(),
         });
@@ -444,6 +452,7 @@ async fn run_gc(
                 objects_packed: 0,
                 refs_packed: 0,
                 packs_repacked: 0,
+                object_index_rows_removed: 0,
                 message: format!(
                     "deferred loose-object prune: {live_ordinary} live traces-inflight \
                      marker(s) — an agent write is in flight and may hold uncataloged \
@@ -468,6 +477,7 @@ async fn run_gc(
     let now = std::time::SystemTime::now();
 
     let mut removed = 0;
+    let mut pruned_oids: Vec<String> = Vec::new();
     for (hash_str, obj_path) in &all_loose {
         if let Some(hash) = parse_object_hash(hash_str)
             && !reachable.contains(&hash)
@@ -489,6 +499,7 @@ async fn run_gc(
                         &format!("  would remove unreachable object {hash_str}"),
                     );
                 }
+                pruned_oids.push(hash_str.clone());
             } else {
                 if let Err(e) = fs::remove_file(obj_path) {
                     // A concurrent cache eviction may have removed it first —
@@ -501,6 +512,7 @@ async fn run_gc(
                     }
                 }
                 removed += 1;
+                pruned_oids.push(hash_str.clone());
             }
         }
     }
@@ -510,10 +522,46 @@ async fn run_gc(
         let _ = cleanup_empty_dirs(&path::objects());
     }
 
-    let message = if dry_run {
-        format!("would remove {} unreachable loose objects", removed)
+    // PD-04: reclaim the `object_index` catalogue rows of the pruned blobs
+    // in the SAME pass (idempotent — OIDs without a row delete nothing), so
+    // cloud sync stops advertising deleted objects. Under `--dry-run` the
+    // matching rows are only counted. Content-addressed agent findings
+    // blobs reach this point exclusively through the reachability walk: a
+    // blob anchored by any ref, index, sidecar, or live agent-run manifest
+    // never becomes a prune candidate, so shared bytes stay alive.
+    let object_index_rows_removed = if pruned_oids.is_empty() {
+        0
     } else {
-        format!("removed {} unreachable loose objects", removed)
+        let db_conn = db::get_db_conn_instance().await;
+        if dry_run {
+            crate::utils::client_storage::count_object_index_rows_with_conn(&db_conn, &pruned_oids)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to count object_index rows for pruned objects: {e}"
+                    ))
+                })?
+        } else {
+            crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &pruned_oids)
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to remove object_index rows for pruned objects: {e}"
+                    ))
+                })?
+        }
+    };
+
+    let message = if dry_run {
+        format!(
+            "would remove {} unreachable loose objects and {} object-index rows",
+            pruned_oids.len(),
+            object_index_rows_removed
+        )
+    } else {
+        format!(
+            "removed {removed} unreachable loose objects and {object_index_rows_removed} object-index rows"
+        )
     };
 
     Ok(TaskResult {
@@ -523,6 +571,7 @@ async fn run_gc(
         objects_packed: 0,
         refs_packed: 0,
         packs_repacked: 0,
+        object_index_rows_removed,
         message,
     })
 }
@@ -548,6 +597,7 @@ async fn run_loose_objects(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: format!(
                 "only {} loose objects (threshold: {}), skipping",
                 loose.len(),
@@ -598,6 +648,7 @@ async fn run_loose_objects(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "no old loose objects to pack".to_string(),
         });
     }
@@ -610,6 +661,7 @@ async fn run_loose_objects(
             objects_packed: old_loose.len(),
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: format!("would pack {} old loose objects", old_loose.len()),
         });
     }
@@ -635,6 +687,7 @@ async fn run_loose_objects(
                     objects_packed: 0,
                     refs_packed: 0,
                     packs_repacked: 0,
+                    object_index_rows_removed: 0,
                     message: "no old loose objects to pack".to_string(),
                 });
             }
@@ -676,6 +729,7 @@ async fn run_loose_objects(
         objects_packed: packed,
         refs_packed: 0,
         packs_repacked: 0,
+        object_index_rows_removed: 0,
         message: format!("packed {packed} old loose objects into {pack_name}"),
     })
 }
@@ -699,6 +753,7 @@ async fn run_pack_refs(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "no refs/heads directory".to_string(),
         });
     }
@@ -715,6 +770,7 @@ async fn run_pack_refs(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "no loose refs to pack".to_string(),
         });
     }
@@ -729,6 +785,7 @@ async fn run_pack_refs(
             objects_packed: 0,
             refs_packed: refs.len(),
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: format!("would pack {} refs into packed-refs", refs.len()),
         });
     }
@@ -778,6 +835,7 @@ async fn run_pack_refs(
         objects_packed: 0,
         refs_packed: removed_count,
         packs_repacked: 0,
+        object_index_rows_removed: 0,
         message: format!("packed {removed_count} refs"),
     })
 }
@@ -804,6 +862,7 @@ async fn run_incremental_repack(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "skipped repack: this store is shared (other repos borrow from it via \
                       alternates); have borrowers run 'libra alternates remove' first"
                 .to_string(),
@@ -818,6 +877,7 @@ async fn run_incremental_repack(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "no pack directory".to_string(),
         });
     }
@@ -846,6 +906,7 @@ async fn run_incremental_repack(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: format!(
                 "only {} pack files (threshold: {}), skipping",
                 packs.len(),
@@ -862,6 +923,7 @@ async fn run_incremental_repack(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: packs.len(),
+            object_index_rows_removed: 0,
             message: format!("would repack {} pack files", packs.len()),
         });
     }
@@ -891,6 +953,7 @@ async fn run_incremental_repack(
                     objects_packed: 0,
                     refs_packed: 0,
                     packs_repacked: 0,
+                    object_index_rows_removed: 0,
                     message: "no objects to repack".to_string(),
                 });
             }
@@ -918,6 +981,7 @@ async fn run_incremental_repack(
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "aborted old-pack deletion: concurrent repository activity created new \
                       reachability roots during the repack; the consolidated pack was kept \
                       (harmless duplicate data) — re-run when the repository is quiescent"
@@ -988,6 +1052,7 @@ async fn run_incremental_repack(
         objects_packed: repacked,
         refs_packed: 0,
         packs_repacked: packs.len(),
+        object_index_rows_removed: 0,
         message,
     })
 }
@@ -1009,6 +1074,7 @@ async fn run_commit_graph(
         objects_packed: 0,
         refs_packed: 0,
         packs_repacked: 0,
+        object_index_rows_removed: 0,
         message: msg.to_string(),
     };
 
@@ -1034,6 +1100,7 @@ async fn run_commit_graph(
     if dry_run {
         return Ok(TaskResult {
             objects_packed: count,
+            object_index_rows_removed: 0,
             message: format!("would write commit-graph for {count} commits"),
             ..skip("")
         });
@@ -1049,6 +1116,7 @@ async fn run_commit_graph(
 
     Ok(TaskResult {
         objects_packed: count,
+        object_index_rows_removed: 0,
         message: format!("wrote commit-graph for {count} commits"),
         ..skip("")
     })
@@ -1249,6 +1317,7 @@ async fn run_prefetch(
         objects_packed: 0,
         refs_packed: 0,
         packs_repacked: 0,
+        object_index_rows_removed: 0,
         message: msg.to_string(),
     };
 
@@ -1265,6 +1334,7 @@ async fn run_prefetch(
     if dry_run {
         return Ok(TaskResult {
             refs_packed: remotes.len(),
+            object_index_rows_removed: 0,
             message: format!("would prefetch from {} remote(s)", remotes.len()),
             ..skip("")
         });
@@ -1284,6 +1354,7 @@ async fn run_prefetch(
     if fetched == 0 && !failures.is_empty() {
         return Ok(TaskResult {
             success: false,
+            object_index_rows_removed: 0,
             message: format!("prefetch failed: {}", failures.join("; ")),
             ..skip("")
         });
@@ -1299,6 +1370,7 @@ async fn run_prefetch(
     };
     Ok(TaskResult {
         refs_packed: fetched,
+        object_index_rows_removed: 0,
         message,
         ..skip("")
     })
@@ -2888,6 +2960,7 @@ mod tests {
             objects_packed: 0,
             refs_packed: 0,
             packs_repacked: 0,
+            object_index_rows_removed: 0,
             message: "removed 5 objects".to_string(),
         };
         let json = serde_json::to_string(&result).unwrap();

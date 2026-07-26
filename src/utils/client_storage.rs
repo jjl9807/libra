@@ -2142,6 +2142,68 @@ pub(crate) async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
     Ok(deleted)
 }
 
+/// Count the `object_index` rows [`remove_object_index_rows_with_conn`]
+/// WOULD delete for `oids` — the `--dry-run` preview counterpart (PD-04).
+/// Mirrors the delete predicate exactly (same repo-id resolution, same
+/// chunking) and shares its boundary behavior: empty input or a missing
+/// `object_index` table count as zero.
+pub(crate) async fn count_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    oids: &[String],
+) -> Result<u64, DbErr> {
+    if oids.is_empty() {
+        return Ok(0);
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+    let repo_id = match conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+    {
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    };
+    const COUNT_CHUNK: usize = 200;
+    let mut total = 0_u64;
+    for chunk in oids.chunks(COUNT_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM object_index WHERE repo_id = ? AND o_id IN ({placeholders})"
+        );
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::from(repo_id.clone()));
+        values.extend(chunk.iter().map(|oid| Value::from(oid.clone())));
+        if let Some(row) = conn
+            .query_one(Statement::from_sql_and_values(backend, sql, values))
+            .await?
+        {
+            total += row.try_get_by::<i64, _>("n")? as u64;
+        }
+    }
+    Ok(total)
+}
+
 #[async_trait]
 impl Storage for ClientStorage {
     async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError> {

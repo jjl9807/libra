@@ -853,3 +853,201 @@ fn gc_runs_multi_worktree_and_keeps_private_and_registered_roots() {
         String::from_utf8_lossy(&cached.stdout)
     );
 }
+
+// ── PD-04: repo-level findings-blob reachability GC ─────────────────────────
+
+/// Resolve the repo id exactly like the object_index writer/delete predicate.
+async fn object_index_repo_id(conn: &sea_orm::DatabaseConnection) -> String {
+    use sea_orm::{ConnectionTrait, Statement};
+    let row = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("query libra.repoid");
+    match row {
+        Some(row) => {
+            let value: String = row.try_get_by("value").expect("decode repoid");
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
+        }
+        None => "unknown-repo".to_string(),
+    }
+}
+
+async fn insert_object_index_row(conn: &sea_orm::DatabaseConnection, repo_id: &str, oid: &str) {
+    use sea_orm::{ConnectionTrait, Statement};
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT OR IGNORE INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
+         VALUES (?, 'agent_findings', 1, ?, 0, 0)",
+        [oid.into(), repo_id.into()],
+    ))
+    .await
+    .expect("insert object_index row");
+}
+
+async fn object_index_row_count(
+    conn: &sea_orm::DatabaseConnection,
+    repo_id: &str,
+    oid: &str,
+) -> i64 {
+    use sea_orm::{ConnectionTrait, Statement};
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM object_index WHERE repo_id = ? AND o_id = ?",
+            [repo_id.into(), oid.into()],
+        ))
+        .await
+        .expect("count object_index rows")
+        .expect("count row present");
+    row.try_get_by("n").expect("decode count")
+}
+
+fn loose_object_file(repo: &std::path::Path, oid: &str) -> std::path::PathBuf {
+    repo.join(".libra")
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..])
+}
+
+/// PD-04 designated test: repo-level reachability GC reclaims an orphaned
+/// findings blob together with its `object_index` row, while a byte-shared
+/// blob reachable from a commit keeps both its object and its row;
+/// `--dry-run` only counts, and a second run is a no-op.
+#[tokio::test]
+#[serial]
+async fn agent_object_gc_findings_reachability() {
+    let repo = create_committed_repo_via_cli();
+
+    // Orphan findings blob: written loose, referenced by nothing.
+    fs::write(repo.path().join("orphan-findings.md"), "orphan findings\n").unwrap();
+    let hashed = run_libra_command(&["hash-object", "-w", "orphan-findings.md"], repo.path());
+    assert_cli_success(&hashed, "hash-object -w orphan findings");
+    let orphan_oid = String::from_utf8_lossy(&hashed.stdout).trim().to_string();
+    fs::remove_file(repo.path().join("orphan-findings.md")).unwrap();
+
+    // Shared blob: the committed file's content — reachable from HEAD.
+    let shared = run_libra_command(&["rev-parse", "HEAD:tracked.txt"], repo.path());
+    let shared_oid = if shared.status.success() {
+        String::from_utf8_lossy(&shared.stdout).trim().to_string()
+    } else {
+        // Fixture file name differs across helpers; fall back to ls-files.
+        let ls = run_libra_command(&["ls-files", "--stage"], repo.path());
+        assert_cli_success(&ls, "ls-files --stage");
+        String::from_utf8_lossy(&ls.stdout)
+            .split_whitespace()
+            .nth(1)
+            .expect("staged blob oid")
+            .to_string()
+    };
+    assert_ne!(orphan_oid, shared_oid);
+
+    // Register BOTH blobs in object_index as agent findings.
+    let db_url = format!(
+        "sqlite://{}",
+        repo.path().join(".libra").join("libra.db").display()
+    );
+    let conn = sea_orm::Database::connect(&db_url).await.expect("open db");
+    let repo_id = object_index_repo_id(&conn).await;
+    insert_object_index_row(&conn, &repo_id, &orphan_oid).await;
+    insert_object_index_row(&conn, &repo_id, &shared_oid).await;
+
+    // Age the orphan past the prune grace window (backdate its mtime).
+    let orphan_file = loose_object_file(repo.path(), &orphan_oid);
+    assert!(orphan_file.exists(), "orphan loose object on disk");
+    let touch = std::process::Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&orphan_file)
+        .status()
+        .expect("spawn touch");
+    assert!(touch.success(), "backdate orphan object");
+
+    // Dry-run: counts both sides, deletes nothing.
+    let dry = run_libra_command(
+        &["maintenance", "run", "--dry-run", "--task", "gc"],
+        repo.path(),
+    );
+    assert_cli_success(&dry, "gc dry-run");
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_out.contains("would remove 1 unreachable loose objects and 1 object-index rows"),
+        "dry-run counts blob + row: {dry_out}"
+    );
+    assert!(orphan_file.exists(), "dry-run must not delete the blob");
+    assert_eq!(
+        object_index_row_count(&conn, &repo_id, &orphan_oid).await,
+        1
+    );
+
+    // Real run: orphan blob AND its row are reclaimed; shared survives.
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert_cli_success(&gc, "gc real run");
+    let gc_out = String::from_utf8_lossy(&gc.stdout);
+    assert!(
+        gc_out.contains("removed 1 unreachable loose objects and 1 object-index rows"),
+        "real run reports blob + row: {gc_out}"
+    );
+    assert!(!orphan_file.exists(), "orphan blob reclaimed");
+    assert_eq!(
+        object_index_row_count(&conn, &repo_id, &orphan_oid).await,
+        0
+    );
+    assert!(
+        loose_object_file(repo.path(), &shared_oid).exists(),
+        "reachable shared blob survives"
+    );
+    assert_eq!(
+        object_index_row_count(&conn, &repo_id, &shared_oid).await,
+        1,
+        "reachable blob keeps its object_index row"
+    );
+
+    // Idempotent: nothing left to reclaim.
+    let again = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert_cli_success(&again, "gc idempotent run");
+    assert!(
+        String::from_utf8_lossy(&again.stdout)
+            .contains("removed 0 unreachable loose objects and 0 object-index rows"),
+        "second run is a no-op"
+    );
+}
+
+/// GC-08 performance floor: the gc reachability walk plus prune preview over
+/// a >10k-loose-object repository completes within a generous wall-clock
+/// bound (no full-tree rescans or N+1 storage round-trips).
+#[tokio::test]
+#[serial]
+async fn gc_ten_thousand_objects_within_budget() {
+    use libra::utils::test::ChangeDirGuard;
+
+    let repo = create_committed_repo_via_cli();
+    {
+        let _hash_guard = set_hash_kind_for_test(HashKind::Sha1);
+        let _guard = ChangeDirGuard::new(repo.path());
+        for i in 0..10_500u32 {
+            let blob = git_internal::internal::object::blob::Blob::from_content(&format!(
+                "perf blob {i}\n"
+            ));
+            libra::command::save_object(&blob, &blob.id).expect("save perf blob");
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let out = run_libra_command(
+        &["maintenance", "run", "--dry-run", "--task", "gc"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "gc dry-run over 10k objects");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "gc over 10k loose objects must stay within the wall-clock budget, took {elapsed:?}"
+    );
+}
