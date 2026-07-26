@@ -699,6 +699,34 @@ fn json_warnings_schema_snapshot() {
     assert_eq!(budget, "similarity_budget_exceeded");
     for (code, name) in [
         (
+            libra::command::status::StatusWarningCode::ProbeTruncated,
+            "probe_truncated",
+        ),
+        (
+            libra::command::status::StatusWarningCode::MetadataUnavailable,
+            "metadata_unavailable",
+        ),
+        (
+            libra::command::status::StatusWarningCode::MetadataBudgetExceeded,
+            "metadata_budget_exceeded",
+        ),
+        (
+            libra::command::status::StatusWarningCode::WorktreeReadFailed,
+            "worktree_read_failed",
+        ),
+        (
+            libra::command::status::StatusWarningCode::WorktreePermissionDenied,
+            "worktree_permission_denied",
+        ),
+        (
+            libra::command::status::StatusWarningCode::WorktreeIoTimeout,
+            "worktree_io_timeout",
+        ),
+        (
+            libra::command::status::StatusWarningCode::RenamePathEncodingUnsupported,
+            "rename_path_encoding_unsupported",
+        ),
+        (
             libra::command::status::StatusWarningCode::DirtyCacheLockStolen,
             "dirty_cache_lock_stolen",
         ),
@@ -2156,4 +2184,30 @@ fn probe_dir_eacces_fail_closed() {
         "blocked probe carries the stable code: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ── R0-8: cache-mode × rename-flag clap exclusivity (§B.5) ───────────────────
+
+/// `--cached`/`--check-dirty` never run rename detection, so combining them
+/// with any rename spelling is a clap usage error (fail-closed before any
+/// cache read).
+#[test]
+fn cached_conflicts_with_rename_flags() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    for combo in [
+        vec!["status", "--cached", "--renames"],
+        vec!["status", "--cached", "--no-renames"],
+        vec!["status", "--cached", "--find-renames=75"],
+        vec!["status", "--check-dirty", "--renames"],
+        vec!["status", "--check-dirty", "--no-renames"],
+        vec!["status", "--check-dirty", "--find-renames=75"],
+    ] {
+        let out = run_libra_command(&combo, repo.path());
+        assert!(!out.status.success(), "{combo:?} must be a usage error");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot be used with"),
+            "{combo:?} reports the clap conflict: {stderr}"
+        );
+    }
 }

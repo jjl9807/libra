@@ -13,6 +13,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "api_warning_survives_await",
     "bare_null_emits_porcelain_v1",
     "bare_z_emits_porcelain_v1",
+    "cached_conflicts_with_rename_flags",
     "chain_rename_default_untracked_d_and_question",
     "chain_rename_two_records",
     "cluster_stops_at_value_option",

@@ -141,13 +141,13 @@ pub struct StatusArgs {
     /// a missing/stale cache degrades to the full reconcile with a hint.
     /// NOTE: unrelated to Git's `--cached` (= the index) — this reads Libra's
     /// `working_dirty` SQLite cache.
-    #[clap(long = "cached", conflicts_with_all = ["check_dirty", "scan", "porcelain", "short", "ignored"])]
+    #[clap(long = "cached", conflicts_with_all = ["check_dirty", "scan", "porcelain", "short", "ignored", "renames", "no_renames", "find_renames"])]
     pub cached: bool,
 
     /// Libra extension (lore.md 1.1): re-verify ONLY the cached dirty set
     /// (O(dirty paths)) — rows re-verified clean are pruned; nothing new is
     /// discovered. Degrades to the full reconcile when the cache is stale.
-    #[clap(long = "check-dirty", conflicts_with_all = ["cached", "scan", "porcelain", "short", "ignored"])]
+    #[clap(long = "check-dirty", conflicts_with_all = ["cached", "scan", "porcelain", "short", "ignored", "renames", "no_renames", "find_renames"])]
     pub check_dirty: bool,
 
     /// Libra extension (lore.md 1.1): run the normal full status AND rebuild
@@ -461,6 +461,22 @@ pub enum StatusWarningCode {
     /// §B.3.2: the rename-destination probe tripped a budget; partial
     /// destinations still pair, but detection may be incomplete.
     ProbeTruncated,
+    /// §B.3.4: repository-object reads for inexact scoring were skipped
+    /// (missing/corrupt/unavailable objects); affected candidates dropped.
+    MetadataUnavailable,
+    /// §B.3.4: an object/worktree read budget (size or count) was hit;
+    /// affected candidates dropped, detection may be incomplete.
+    MetadataBudgetExceeded,
+    /// §B.3.3: a worktree read failed (I/O) during optional rename content
+    /// reads; the affected candidate was dropped.
+    WorktreeReadFailed,
+    /// §B.6.0.1 reason taxonomy (R0-8 io_blocked contract).
+    WorktreePermissionDenied,
+    /// §B.6.0.1 reason taxonomy (R0-8 io_blocked contract).
+    WorktreeIoTimeout,
+    /// §B.6.1: a non-UTF-8 path was skipped as a rename candidate (its base
+    /// D/A/`??` rows are unaffected).
+    RenamePathEncodingUnsupported,
     DirtyCacheLockStolen,
     DirtyCacheStaleFallback,
     DirtyCacheConcurrentInvalidate,
@@ -473,6 +489,10 @@ pub enum StatusWarningCode {
 pub enum StatusWarningSource {
     RenameDetect,
     Cache,
+    /// Repository-object reads (§B.3.4 metadata side).
+    Metadata,
+    /// Worktree reads (§B.3.3/§B.3.4 worktree side).
+    Worktree,
 }
 
 /// Resolve the Git-compatible `status.*` config defaults (plan-20260708
@@ -1375,6 +1395,51 @@ fn warnings_from_rename_stats(
                 "rename detection discarded the inexact pass: similarity comparison budget exceeded"
                     .to_string(),
             source: StatusWarningSource::RenameDetect,
+        });
+    }
+    // §B.3.4: content-read skips surface as deduplicated warnings — object
+    // problems on the metadata side, worktree I/O on the worktree side,
+    // budget/size caps as the budget family. Affected candidates were
+    // dropped; the base status stays truthful.
+    use rename_detect::SkipReason;
+    let count = |reasons: &[SkipReason]| -> u64 {
+        reasons
+            .iter()
+            .filter_map(|r| stats.content_skips.get(r))
+            .sum()
+    };
+    let unavailable = count(&[
+        SkipReason::ObjectMissing,
+        SkipReason::ObjectCorrupt,
+        SkipReason::ObjectUnavailable,
+    ]);
+    if unavailable > 0 {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::MetadataUnavailable,
+            message: format!(
+                "rename detection skipped {unavailable} candidate(s): repository objects missing, corrupt, or unavailable"
+            ),
+            source: StatusWarningSource::Metadata,
+        });
+    }
+    let budget = count(&[SkipReason::TooLarge, SkipReason::BudgetExceeded]);
+    if budget > 0 {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::MetadataBudgetExceeded,
+            message: format!(
+                "rename detection skipped {budget} candidate(s): content-read budget or size cap reached"
+            ),
+            source: StatusWarningSource::Metadata,
+        });
+    }
+    let io_failed = count(&[SkipReason::IoFailed]);
+    if io_failed > 0 {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::WorktreeReadFailed,
+            message: format!(
+                "rename detection skipped {io_failed} candidate(s): worktree reads failed"
+            ),
+            source: StatusWarningSource::Worktree,
         });
     }
 }
@@ -4894,5 +4959,40 @@ mod test {
                 .iter()
                 .all(|w| matches!(w.source, StatusWarningSource::RenameDetect))
         );
+    }
+
+    #[test]
+    fn content_skips_map_to_metadata_and_worktree_warnings() {
+        use rename_detect::SkipReason;
+        let mut stats = rename_detect::RenameDetectStats::default();
+        stats.content_skips.insert(SkipReason::ObjectMissing, 2);
+        stats.content_skips.insert(SkipReason::ObjectCorrupt, 1);
+        stats.content_skips.insert(SkipReason::TooLarge, 3);
+        stats.content_skips.insert(SkipReason::BudgetExceeded, 4);
+        stats.content_skips.insert(SkipReason::IoFailed, 5);
+        let mut warnings = Vec::new();
+        warnings_from_rename_stats(&stats, &mut warnings);
+        assert_eq!(warnings.len(), 3);
+        assert!(warnings.iter().any(|w| matches!(
+            (&w.code, &w.source),
+            (
+                StatusWarningCode::MetadataUnavailable,
+                StatusWarningSource::Metadata
+            )
+        ) && w.message.contains("3 candidate(s)")));
+        assert!(warnings.iter().any(|w| matches!(
+            (&w.code, &w.source),
+            (
+                StatusWarningCode::MetadataBudgetExceeded,
+                StatusWarningSource::Metadata
+            )
+        ) && w.message.contains("7 candidate(s)")));
+        assert!(warnings.iter().any(|w| matches!(
+            (&w.code, &w.source),
+            (
+                StatusWarningCode::WorktreeReadFailed,
+                StatusWarningSource::Worktree
+            )
+        ) && w.message.contains("5 candidate(s)")));
     }
 }
