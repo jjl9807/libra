@@ -1380,3 +1380,189 @@ fn porcelain_v2_z_rename_record_nul_paths() {
         "records are NUL terminated with no trailing newline: {out:?}"
     );
 }
+
+// ── R0-7 residuals: renameLimit cascade + JSON score contracts ───────────────
+
+/// Build a repo with two committed files whose basenames do NOT recur on the
+/// destination side, forcing rename pairing through the bounded exhaustive
+/// stage (the per-side renameLimit's only gate).
+fn repo_with_two_exhaustive_candidates() -> tempfile::TempDir {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let base_a: String = (0..40).map(|i| format!("alpha {i}\n")).collect();
+    let base_b: String = (0..40).map(|i| format!("beta {i}\n")).collect();
+    fs::write(repo.path().join("a1.txt"), &base_a).unwrap();
+    fs::write(repo.path().join("a2.txt"), &base_b).unwrap();
+    let add = run_libra_command(&["add", "a1.txt", "a2.txt"], repo.path());
+    assert_cli_success(&add, "stage exhaustive fixtures");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit exhaustive fixtures");
+    // Delete both and stage differently named, lightly edited replacements.
+    let rm = run_libra_command(&["rm", "a1.txt", "a2.txt"], repo.path());
+    assert_cli_success(&rm, "delete old side");
+    fs::write(
+        repo.path().join("b1.txt"),
+        base_a.replace("alpha 5\n", "alpha five\n"),
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("b2.txt"),
+        base_b.replace("beta 5\n", "beta five\n"),
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "b1.txt", "b2.txt"], repo.path());
+    assert_cli_success(&add, "stage new side");
+    repo
+}
+
+/// `status.renameLimit` cascades (falling back to `diff.renameLimit`, CLI
+/// semantics: 0 = uncapped) and gates ONLY the exhaustive stage (§B.5).
+#[test]
+fn rename_limit_config_cascade() {
+    // status.renameLimit=1 skips the 2×2 exhaustive stage with the warning.
+    let repo = repo_with_two_exhaustive_candidates();
+    let cfg = run_libra_command(&["config", "status.renameLimit", "1"], repo.path());
+    assert_cli_success(&cfg, "set status.renameLimit");
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    assert_eq!(doc["data"]["renames"].as_array().map(Vec::len), Some(0));
+    assert!(
+        json.contains("rename_limit_product_skipped"),
+        "limit warning surfaces: {json}"
+    );
+
+    // diff.renameLimit is the fallback when the status key is absent...
+    let repo = repo_with_two_exhaustive_candidates();
+    let cfg = run_libra_command(&["config", "diff.renameLimit", "1"], repo.path());
+    assert_cli_success(&cfg, "set diff.renameLimit");
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    assert!(
+        json.contains("rename_limit_product_skipped"),
+        "diff.renameLimit fallback applies: {json}"
+    );
+
+    // ...and status.renameLimit wins over it; 0 disables the cap entirely.
+    let cfg = run_libra_command(&["config", "status.renameLimit", "0"], repo.path());
+    assert_cli_success(&cfg, "override with status.renameLimit=0");
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    assert_eq!(
+        doc["data"]["renames"].as_array().map(Vec::len),
+        Some(2),
+        "status.renameLimit=0 uncaps and wins over diff.renameLimit: {json}"
+    );
+    assert!(!json.contains("rename_limit_product_skipped"), "{json}");
+
+    // Invalid values fail closed before any output.
+    let cfg = run_libra_command(&["config", "status.renameLimit", "banana"], repo.path());
+    assert_cli_success(&cfg, "set invalid status.renameLimit");
+    let out = run_libra_command(&["status"], repo.path());
+    assert!(
+        !out.status.success(),
+        "invalid renameLimit must fail closed"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("status.renameLimit"),
+        "failure names the key: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// JSON chain contract: a staged inexact rename whose destination is also
+/// modified in the worktree (`RM` in short form) keeps ONE renames[] entry
+/// with the real partial score plus the unstaged modification listed
+/// separately.
+#[test]
+fn json_rename_rm_partial_chain() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), &edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage edited moved file");
+    // Worktree-only edit on top of the staged rename destination.
+    fs::write(
+        repo.path().join("moved.txt"),
+        edited.replace("line 9\n", "line nine\n"),
+    )
+    .unwrap();
+
+    let short = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(
+        short.lines().any(|l| l.starts_with("RM ")),
+        "short form renders RM: {short}"
+    );
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames array");
+    assert_eq!(renames.len(), 1, "one rename entry: {json}");
+    let entry = &renames[0];
+    assert_eq!(entry["from"], "orig.txt");
+    assert_eq!(entry["to"], "moved.txt");
+    assert_eq!(entry["exact"], false);
+    let score = entry["score"].as_u64().expect("score");
+    assert!((50..100).contains(&score), "partial score: {json}");
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .expect("unstaged modified")
+            .iter()
+            .any(|p| p == "moved.txt"),
+        "worktree edit listed as unstaged modification: {json}"
+    );
+}
+
+/// Spanhash similarity is line-multiset based: a fully reordered file scores
+/// internal 60000 → JSON `score: 100` while staying `exact: false` (the
+/// OIDs differ).
+#[test]
+fn json_inexact_reordered_score_100() {
+    let lines: Vec<String> = (0..40).map(|i| format!("line {i}\n")).collect();
+    let base: String = lines.concat();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let reversed: String = lines.iter().rev().cloned().collect::<Vec<_>>().concat();
+    fs::write(repo.path().join("moved.txt"), reversed).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage reordered file");
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames array");
+    assert_eq!(renames.len(), 1, "{json}");
+    assert_eq!(renames[0]["exact"], false, "OIDs differ: {json}");
+    assert_eq!(
+        renames[0]["score"], 100,
+        "reordered lines score 100: {json}"
+    );
+}
+
+/// Partial similarity floors (Git floor semantics, §B.9 59999→99): an edited
+/// rename reports the floored percentage, never a rounded-up 100.
+#[test]
+fn json_inexact_spanhash_score_floor() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage edited file");
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames array");
+    assert_eq!(renames.len(), 1, "{json}");
+    assert_eq!(renames[0]["exact"], false, "{json}");
+    let score = renames[0]["score"].as_u64().expect("score");
+    assert!(
+        (50..100).contains(&score),
+        "one edited line floors below 100: {json}"
+    );
+}

@@ -189,8 +189,12 @@ combining it with `--long` or the cache modes fails closed. The embedding API's
 the CLI grammar is the complete surface).
 
 Renames are matched by the shared diffcore engine: exact matches are found by blob id, then a
-unique-basename pass, then a bounded inexact spanhash pass with a per-side rename limit (1000)
-and a similarity-comparison budget. Staged renames pair the HEAD tree with the index; unstaged
+unique-basename pass, then a bounded inexact spanhash pass with a per-side rename limit and a
+similarity-comparison budget. The limit comes from `status.renameLimit` (falling back to
+`diff.renameLimit`) through the strict local → global → system cascade: a non-negative integer,
+`0` disables the cap, default 1000 (Git parity); invalid values fail closed before any output,
+and exceeding the cap skips only the exhaustive stage with a structured
+`rename_limit_product_skipped` warning. Staged renames pair the HEAD tree with the index; unstaged
 renames pair the index with the worktree — but only when the `status.renameUntracked` config
 (a Libra extension, strict boolean, default `false`) is enabled, because every unstaged "new"
 path is an untracked file. With the default, a tracked→untracked move renders as `D` + `??`,

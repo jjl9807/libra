@@ -47,6 +47,8 @@ mod log_default_errors;
 mod log_defaults;
 #[path = "config_defaults_log_follow.rs"]
 mod log_follow_defaults;
+#[path = "config_defaults_status_renames.rs"]
+mod status_renames_defaults;
 
 const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 

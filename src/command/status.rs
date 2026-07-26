@@ -422,6 +422,9 @@ struct StatusConfigExtras {
     /// [`resolve_status_threshold`] (None = detection disabled). Cache modes
     /// force None at collection time regardless.
     rename_threshold: Option<u32>,
+    /// `status.renameLimit` falling back to `diff.renameLimit` (§B.5):
+    /// per-side inexact candidate cap, `0` = uncapped, default 1000.
+    rename_limit: usize,
 }
 
 /// Structured status degradation warning (§B.5; reused verbatim by the JSON
@@ -555,6 +558,27 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<Status
     // boolean; invalid values fail closed before any output.
     let rename_untracked = read_bool("status.renameUntracked").await?.unwrap_or(false);
 
+    // §B.5: `status.renameLimit` caps each inexact side, falling back to
+    // `diff.renameLimit`; non-negative Git integer, `0` disables the cap,
+    // default 1000 (Git/diff parity). Invalid values fail closed before any
+    // output.
+    async fn read_rename_limit(key: &str) -> CliResult<Option<usize>> {
+        match read_value(key).await? {
+            None => Ok(None),
+            Some(value) => {
+                crate::internal::config::parse_git_config_int(&value.to_ascii_lowercase())
+                    .filter(|number| *number >= 0)
+                    .and_then(|number| usize::try_from(number).ok())
+                    .map(Some)
+                    .ok_or_else(|| invalid(key, &value, "a non-negative integer"))
+            }
+        }
+    }
+    let rename_limit = match read_rename_limit("status.renameLimit").await? {
+        Some(value) => value,
+        None => read_rename_limit("diff.renameLimit").await?.unwrap_or(1000),
+    };
+
     if args.untracked_files.is_none() {
         args.untracked_files = untracked;
     }
@@ -582,6 +606,7 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<Status
     Ok(StatusConfigExtras {
         rename_untracked,
         rename_threshold,
+        rename_limit,
     })
 }
 
@@ -927,7 +952,7 @@ async fn collect_status_data(
         // Git 0..=60000 similarity scale (already engine-scale here).
         let config = rename_detect::RenameDetectConfig {
             threshold,
-            rename_limit: 1000,
+            rename_limit: extras.rename_limit,
             comparison_budget: Some(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS),
         };
         detect_renames_in_changes(
