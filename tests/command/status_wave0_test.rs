@@ -961,6 +961,17 @@ fn find_renames_raw_grammar_and_last_wins() {
         run(&["status", "--porcelain=v1", "--find-renames=0.505"]).contains(arrow),
         "decimal raw form works"
     );
+    // Git raw grammar reads a bare integer as `0.<digits>`: `=50000` is
+    // 0.50000 = 50%, so the ~70% rename still pairs; the exact-only `100%`
+    // literal splits it (card-designated raw forms).
+    assert!(
+        run(&["status", "--porcelain=v1", "--find-renames=50000"]).contains(arrow),
+        "=50000 parses as the 50% raw form"
+    );
+    assert!(
+        !run(&["status", "--porcelain=v1", "--find-renames=100%"]).contains("->"),
+        "=100% exact-only splits an inexact rename"
+    );
     // Three-way last-wins including --renames: strict 80% is overridden by a
     // later --renames (50% default) → pairs again.
     assert!(
@@ -1719,4 +1730,171 @@ fn human_rename_long_format() {
             .any(|l| l.trim_start().starts_with("renamed:") && l.contains("a.txt -> b.txt")),
         "long format uses the renamed: arrow form: {out}"
     );
+}
+
+// ── R0-4 residuals: cluster/value safety pins (§B.4.3) ───────────────────────
+
+/// A global short option's ATTACHED value must never leak letters into
+/// format detection, and a valued global before the subcommand must not
+/// shift the status slice (post-clap parsing is structurally immune; these
+/// pins keep it that way).
+#[test]
+fn global_short_value_contains_z_not_format() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\nsecond line\n");
+
+    // `-J=ndjson` carries 's'/'j'/'n' letters in its attached value: output
+    // must be one NDJSON envelope — no porcelain, no NUL, no short rows.
+    let out = status_stdout(repo.path(), &["-J=ndjson", "status"]);
+    let first = out.lines().next().expect("one ndjson line");
+    let doc: serde_json::Value = serde_json::from_str(first).expect("ndjson envelope");
+    assert_eq!(doc["command"], "status");
+    assert!(!out.contains('\0'), "no NUL records: {out:?}");
+
+    // Subcommand location is unaffected: the rename threshold still applies
+    // after a valued global option.
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let out = status_stdout(repo.path(), &["-J=ndjson", "st", "--find-renames=505"]);
+    let doc: serde_json::Value =
+        serde_json::from_str(out.lines().next().expect("line")).expect("json");
+    assert!(
+        doc["data"]["renames"]
+            .as_array()
+            .is_some_and(|r| r.len() == 1),
+        "threshold flag applies after a valued global: {out}"
+    );
+}
+
+/// A status-slice value option swallowing `s` must produce the option's own
+/// invalid-value error — never the short format.
+#[test]
+fn status_short_value_contains_s_not_short() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    let out = run_libra_command(&["status", "-bus"], repo.path());
+    assert!(!out.status.success(), "-bus must fail on the -u value");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid value 's'") && stderr.contains("untracked-files"),
+        "the 's' is -u's value, not the short flag: {stderr}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).is_empty(),
+        "fail-closed before any output"
+    );
+}
+
+/// A cluster stops at the first value-eating option: the remaining letters
+/// are its value (`-buno` = `-b -u no`), and a trailing `z` is a value too.
+#[test]
+fn cluster_stops_at_value_option() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    fs::write(repo.path().join("loose.txt"), "untracked\n").unwrap();
+
+    // `-buno`: branch + untracked-files=no — the untracked file disappears
+    // and the output stays the LONG format (no XY rows).
+    let out = status_stdout(repo.path(), &["status", "-buno"]);
+    assert!(
+        !out.contains("loose.txt") && !out.lines().any(|l| l.starts_with("??")),
+        "-buno hides untracked and stays long-format: {out}"
+    );
+
+    // `-buz`: the `z` is -u's (invalid) value, never the -z flag.
+    let out = run_libra_command(&["status", "-buz"], repo.path());
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid value 'z'"),
+        "the 'z' is -u's value, not -z: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The embedding API never mutates the process warning tracker: warnings
+/// ride the returned envelope only (§B.4.3 isolation contract; the internal
+/// design keeps the global tracker on the CLI delivery path exclusively).
+#[tokio::test]
+#[serial]
+async fn api_warning_no_global_exit_pollution() {
+    use libra::utils::test::ChangeDirGuard;
+
+    let repo = repo_with_two_exhaustive_candidates();
+    let cfg = run_libra_command(&["config", "status.renameLimit", "1"], repo.path());
+    assert_cli_success(&cfg, "set limit for warning");
+
+    let _guard = ChangeDirGuard::new(repo.path());
+    let before = libra::utils::output::warning_was_emitted();
+    let envelope = libra::command::status::collect_status_json_envelope_for_api(repo.path())
+        .await
+        .expect("api status");
+    assert!(
+        envelope["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| !w.is_empty()),
+        "the degradation warning rides the envelope: {envelope}"
+    );
+    assert_eq!(
+        libra::utils::output::warning_was_emitted(),
+        before,
+        "the API path must not touch the process warning tracker"
+    );
+}
+
+/// Two concurrent API invocations each carry their own warnings[] without
+/// cross-talk or global-tracker mutation. (The API is same-cwd by design —
+/// both calls target the same repository.)
+#[tokio::test]
+#[serial]
+async fn api_warning_concurrent_isolated() {
+    use libra::utils::test::ChangeDirGuard;
+
+    let repo = repo_with_two_exhaustive_candidates();
+    let cfg = run_libra_command(&["config", "status.renameLimit", "1"], repo.path());
+    assert_cli_success(&cfg, "set limit for warning");
+
+    let _guard = ChangeDirGuard::new(repo.path());
+    let before = libra::utils::output::warning_was_emitted();
+    let (a, b) = tokio::join!(
+        libra::command::status::collect_status_json_envelope_for_api(repo.path()),
+        libra::command::status::collect_status_json_envelope_for_api(repo.path()),
+    );
+    // The API entry serializes concurrent collections internally, so BOTH
+    // calls succeed with complete, consistent envelopes carrying their own
+    // warnings[], and the process tracker stays untouched.
+    for envelope in [a.expect("first api call"), b.expect("second api call")] {
+        assert!(
+            envelope["data"]["warnings"]
+                .as_array()
+                .is_some_and(|w| !w.is_empty()),
+            "each concurrent call carries its own warnings: {envelope}"
+        );
+    }
+    assert_eq!(libra::utils::output::warning_was_emitted(), before);
+}
+
+/// Warnings survive await points inside and between API calls (no
+/// thread_local storage that a task migration could drop).
+#[tokio::test]
+#[serial]
+async fn api_warning_survives_await() {
+    use libra::utils::test::ChangeDirGuard;
+
+    let repo = repo_with_two_exhaustive_candidates();
+    let cfg = run_libra_command(&["config", "status.renameLimit", "1"], repo.path());
+    assert_cli_success(&cfg, "set limit for warning");
+
+    let _guard = ChangeDirGuard::new(repo.path());
+    let first = libra::command::status::collect_status_json_envelope_for_api(repo.path())
+        .await
+        .expect("first api call");
+    tokio::task::yield_now().await;
+    let second = libra::command::status::collect_status_json_envelope_for_api(repo.path())
+        .await
+        .expect("second api call");
+    for envelope in [first, second] {
+        assert!(
+            envelope["data"]["warnings"]
+                .as_array()
+                .is_some_and(|w| !w.is_empty()),
+            "warnings persist across await points: {envelope}"
+        );
+    }
 }

@@ -8,13 +8,18 @@
 //! together — never edit only one side.
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
+    "api_warning_concurrent_isolated",
+    "api_warning_no_global_exit_pollution",
+    "api_warning_survives_await",
     "bare_null_emits_porcelain_v1",
     "bare_z_emits_porcelain_v1",
     "chain_rename_default_untracked_d_and_question",
     "chain_rename_two_records",
+    "cluster_stops_at_value_option",
     "core_quote_path_invalid_fail_closed",
     "find_renames_raw_grammar_and_last_wins",
     "generate_short_status_entries_api",
+    "global_short_value_contains_z_not_format",
     "human_rename_long_format",
     "json_inexact_reordered_score_100",
     "json_inexact_spanhash_score_floor",
@@ -52,6 +57,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "st_bare_z_emits_porcelain_v1",
     "staged_rename_then_delete_emits_rd",
     "staged_rename_then_modify_emits_rm",
+    "status_short_value_contains_s_not_short",
     "tracked_unreadable_path_fails_closed_not_deleted",
     "unmerged_stage_presence_to_xy_mapping",
 ];

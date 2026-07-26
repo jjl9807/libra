@@ -431,6 +431,10 @@ name = "compat_import_export_roundtrip"
 path = "tests/compat/import_export_roundtrip_test.rs"
 
 [[test]]
+name = "compat_status_args_parser_compile"
+path = "tests/compat/status_args_parser_compile.rs"
+
+[[test]]
 name = "compat_legacy_short_api_pre_r0_equivalence"
 path = "tests/compat/legacy_short_api_pre_r0_equivalence.rs"
 

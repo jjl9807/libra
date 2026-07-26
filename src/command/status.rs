@@ -309,7 +309,15 @@ pub(crate) fn normalize_status_argv(
                 break; // bare "-": positional
             }
             let mut consumed_value = false;
+            let mut attached_equals = false;
             for ch in cluster.chars() {
+                if ch == '=' {
+                    // `-J=value` (require_equals short form): the remainder
+                    // is an attached value — never option letters. clap
+                    // validates the value later; the locator must not bail.
+                    attached_equals = true;
+                    break;
+                }
                 match shorts.get(&ch) {
                     Some(true) => {
                         consumed_value = true;
@@ -319,7 +327,10 @@ pub(crate) fn normalize_status_argv(
                     None => return unchanged(raw_argv),
                 }
             }
-            if consumed_value && !cluster.ends_with(|c: char| shorts.get(&c) == Some(&true)) {
+            if attached_equals {
+                i += 1;
+            } else if consumed_value && !cluster.ends_with(|c: char| shorts.get(&c) == Some(&true))
+            {
                 // value attached inside the cluster
                 i += 1;
             } else if consumed_value {
@@ -1409,6 +1420,14 @@ pub async fn collect_status_json_envelope_for_api(
     working_dir: &std::path::Path,
 ) -> CliResult<serde_json::Value> {
     use std::path::PathBuf;
+
+    // Serialize concurrent API collections: interleaved collections against
+    // the shared repository connection have produced transient read errors
+    // and — worse — silently inconsistent snapshots (a staged-deletion side
+    // observed empty mid-interleave). The API serves one same-cwd repository,
+    // so a process-wide mutex is the correct, cheap consistency guarantee.
+    static API_STATUS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _serialized = API_STATUS_LOCK.lock().await;
 
     let mut args = StatusArgs::default();
     let canon_working =
