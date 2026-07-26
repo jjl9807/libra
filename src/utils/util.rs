@@ -1472,6 +1472,11 @@ fn peel_object_to_type_typed(
     let storage = objects_storage();
     let mut current = ensure_hash_kind(object_id, display_name, false)?;
     let mut seen = HashSet::new();
+    // Whether the peel walked through at least one annotated tag: a type
+    // mismatch is then the TAG's fault, and the error names it so users see
+    // which object to fix (e.g. `rev-list <tag>` where the tag targets a
+    // tree).
+    let mut peeled_through_tag = false;
 
     loop {
         if !seen.insert(current) {
@@ -1501,11 +1506,18 @@ fn peel_object_to_type_typed(
                 );
             }
             _ if current_type == ObjectType::Tag => {
+                peeled_through_tag = true;
                 current = peel_tag_target_typed(&storage, current, display_name)?;
             }
             Some(expected_type) => {
+                let tag_detail = if peeled_through_tag {
+                    format!(" (tag points to {current_type})")
+                } else {
+                    String::new()
+                };
                 return Err(CommitBaseError::InvalidReference(format!(
-                    "reference '{display_name}' cannot be peeled from {current_type} to {expected_type}"
+                    "reference '{display_name}' cannot be peeled from {current_type} to \
+                     {expected_type}{tag_detail}"
                 )));
             }
             None => return Ok(current),

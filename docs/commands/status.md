@@ -31,7 +31,9 @@ until the merge is continued or aborted.
 
 During merge, rebase, and cherry-pick conflicts, unmerged index entries are reported as conflicts
 instead of untracked files. Porcelain v1/short output uses Git-style XY codes such as `UU
-conflict.txt`; porcelain v2 emits `u <XY> ...` records with stage modes and object IDs.
+conflict.txt`; porcelain v2 emits `u <XY> ...` records with stage modes and object IDs. The
+default long format lists conflicts under an `Unmerged paths:` heading with human-readable
+labels (`both modified:`, `deleted by them:`, `both added:`, …) plus resolve/abort hints.
 
 Tracked symlinks participate in the same HEAD/index/worktree comparison as
 regular files. `status` treats the symlink itself as the worktree object,
@@ -263,7 +265,11 @@ cache and its JSON gains no keys. See [dirty.md](dirty.md).
 
 ### `--ignored`
 
-Include ignored files in the output.
+Include ignored files in the output. Ignored/untracked classification follows
+the shared ignore sources — `.gitignore`, `.git/info/exclude`,
+`core.excludesFile`, and `.libraignore` (nearest directory wins; a
+`.libraignore` beats a sibling `.gitignore`) — see
+[check-ignore.md](check-ignore.md) for the full precedence.
 
 ```bash
 libra status --ignored

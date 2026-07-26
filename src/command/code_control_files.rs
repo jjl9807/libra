@@ -20,7 +20,7 @@
 //!
 //! A version-2 [`ControlInfo`] carries the WRITER's scope — `repo_id`,
 //! `worktree_id`, and (when the writer holds a workspace lease) `workspace_id`
-//! + `lease_fence`. Every consumer that trusts, replaces, or removes an
+//! plus `lease_fence`. Every consumer that trusts, replaces, or removes an
 //! existing control file must first classify it against its OWN scope via
 //! [`classify_control_scope`]:
 //!
@@ -218,9 +218,10 @@ pub fn classify_control_scope(
             expected: expected.worktree_id.clone(),
         });
     }
-    if let (Some(found), Some(expected_ws)) =
-        (info.workspace_id.as_deref(), expected.workspace_id.as_deref())
-        && found != expected_ws
+    if let (Some(found), Some(expected_ws)) = (
+        info.workspace_id.as_deref(),
+        expected.workspace_id.as_deref(),
+    ) && found != expected_ws
     {
         return ControlScopeCheck::Foreign(ControlScopeMismatch::WorkspaceId {
             found: found.to_string(),
@@ -260,8 +261,8 @@ pub async fn resolve_control_scope(
     working_dir: &Path,
     workspace: Option<(String, i64)>,
 ) -> Result<ControlScope> {
-    let storage_path = util::try_get_storage_path(Some(working_dir.to_path_buf()))
-        .with_context(|| {
+    let storage_path =
+        util::try_get_storage_path(Some(working_dir.to_path_buf())).with_context(|| {
             format!(
                 "cannot resolve the repository storage root for '{}'",
                 working_dir.display()

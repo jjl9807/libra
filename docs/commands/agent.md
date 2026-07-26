@@ -69,7 +69,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies |
 | `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |
 | `rpc list` | List discovered `libra-agent-*` binaries on `PATH` (with trusted/quarantined state); requires the external-agents opt-in |
-| `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`) |
+| `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable, or when the binary is not under a trusted directory — `LBR-AGENT-005`). The provider-exporter slug `opencode` instead pins the provider's own CLI binary — resolved only from registered trusted directories, never `$PATH` — for the sandboxed export bridge; this form needs no external-agents opt-in |
 | `rpc trust --dir <path>` | Register a trusted directory (`agent.external_agents.trusted_dirs`, default `~/.libra/agents`): external binaries are only trustable when their canonical path lives under one. The path is canonicalized and must be an existing, non-world-writable directory |
 | `rpc untrust <slug>` | Revoke trust; the binary returns to quarantine (always available, even while external agents are disabled) |
 | `rpc invoke` | Invoke one JSON-RPC method on a trusted `libra-agent-*` binary |
@@ -133,6 +133,11 @@ the default version 1 payload remains shape-compatible and never gains those
 fields implicitly. OpenCode reports `transcript_discoverable` unsupported
 because batch discovery is unavailable; explicit-ID `importable` and
 `export_bridge` availability depend on its trusted offline exporter/sandbox.
+To enable the exporter, register the directory containing the verified
+`opencode` binary and then pin it: `libra agent rpc trust --dir <path>`
+followed by `libra agent rpc trust opencode`. Neither step opens the
+external-RPC surface (`agent.external_agents.enabled` stays untouched); the
+binary is resolved only from registered trusted directories, never `$PATH`.
 Claude/Codex discovery and import are reported unavailable when the platform
 cannot provide Libra's secure provider-root file-open primitive.
 Unsupported schema versions fail as a usage error (exit 129, category `cli`)
@@ -512,8 +517,11 @@ on them:
 
 - External `libra-agent-*` agents are **disabled by default**. Opt in with
   `libra config set agent.external_agents.enabled true` (repo-local); until
-  then `rpc list`/`rpc trust`/`rpc invoke` refuse with `LBR-AGENT-002`
-  (`rpc untrust` stays available — revoking trust only tightens security).
+  then `rpc list`/`libra-agent-*` `rpc trust`/`rpc invoke` refuse with
+  `LBR-AGENT-002` (`rpc untrust` stays available — revoking trust only
+  tightens security; `rpc trust --dir <path>` and provider-exporter trust,
+  e.g. `rpc trust opencode`, are preparation-only — they never scan `$PATH`
+  and arm nothing by themselves, so they work while gated).
   Discovered binaries stay quarantined until `rpc trust <slug>` records
   their provenance (trust is refused for a binary in a world-writable
   directory), every invoke revalidates it (drift revokes trust,

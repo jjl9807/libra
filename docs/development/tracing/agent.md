@@ -40,7 +40,7 @@ flowchart TD
     TE -->|"写 committed checkpoint"| CKPT
     SE -->|"写 committed checkpoint，state=stopped"| CKPT
     TU -.->|"规划：temporary checkpoint"| CKPT
-    SAE -.->|"规划：subagent checkpoint"| CKPT
+    SAE -->|"已实现：subagent checkpoint（A0-02 boundary；M5 content 走独立发现路径）"| CKPT
 
     SESS ==>|"1 : N 包含"| CKPT
     CKPT -->|"parent_checkpoint_id 自链"| CKPT
@@ -219,9 +219,9 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
    `disable/remove opencode` 只删除携带 Libra-managed 标记的 plugin 文件（两个目录都检查）；不删除用户自定义 OpenCode 配置，也不删除已捕获数据。OpenCode hook parser 只产 `LifecycleEvent`，不直接写 checkpoint；写入走统一 validation/redaction/owner filtering/checkpoint writer。
 
-5. **采集完成态（lifecycle-only，A6.5 实测固定）**
+5. **采集完成态（默认 lifecycle-only，A6.5 实测固定；DR-04b 后可升级为内容捕获）**
 
-   OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**——OpenCode 将会话存于全局 storage，插件事件不暴露 per-session transcript 文件。因此 hook 采集产生的 checkpoint 以**空 transcript 快照**为合法完成态：`extraction.present=false`、`extraction.partial=true`、warnings 含 `no raw transcript available`；A6.5 本地 smoke 对 opencode 的验收口径即此形态（`tests/harness/agent_local_capture.rs` 以本节为事实源）。这与 §1 的 `transcript_readable=true` 不冲突：该 flag 表达的是 native session export 格式可解析（AG-21 extract adapter，fixture `agent_transcripts/opencode.json`），不承诺 hook 采集路径能取得 transcript 内容。
+   OpenCode plugin envelope（§3 事件映射）**不携带 `transcript_path`**——OpenCode 将会话存于全局 storage，插件事件不暴露 per-session transcript 文件。未注册 exporter 信任时，hook 采集产生的 checkpoint 以**空 transcript 快照**为合法（降级）完成态：`extraction.present=false`、`extraction.partial=true`、warnings 含 `no raw transcript available`；A6.5 本地 smoke 对 opencode 的验收口径即此形态（`tests/harness/agent_local_capture.rs` 以本节为事实源，其环境不注册 exporter 信任）。**DR-04b 落地后**：当操作者已固定受信 `opencode` exporter（`libra agent rpc trust --dir <path>` + `libra agent rpc trust opencode`）且 Required sandbox 可用时，`session.idle` hook 路径经沙箱化 `opencode export <session>` bridge 取得授权 Bytes（seam → normalize → redact → claim），产生携带内容的 checkpoint；exporter 不可信/不可用时保持上述降级完成态并告警。这与 §1 的 `transcript_readable=true` 不冲突：该 flag 表达的是 native session export 格式可解析（AG-21 extract adapter，fixture `agent_transcripts/opencode.json`）。
 
 ### Codex 捕获目标契约（AG-19 已落地）
 
@@ -902,7 +902,7 @@ entire 当前是 1 stable（`claude-code`）+ 7 preview（`codex`、`copilot-cli
 
 | 语义键 | 真实编号（A3 已分配，2026-07-04） | 触发条件 | 主要 AG |
 |---|---|---|---|
-| `ERR_AGENT_EXTERNAL_AGENTS_DISABLED` | `LBR-AGENT-002` | external agents 未启用但请求 list/trust/invoke（`untrust` 不受门禁——撤销信任只会收紧安全面） | AG-18 |
+| `ERR_AGENT_EXTERNAL_AGENTS_DISABLED` | `LBR-AGENT-002` | external agents 未启用但请求 list/`libra-agent-*` trust/invoke（`untrust` 不受门禁——撤销信任只会收紧安全面；`trust --dir` 与 provider-exporter 信任（DR-04b，如 `trust opencode`）为纯准备动作，不扫 `$PATH`、本身不启用任何面，亦不受此门禁） | AG-18 |
 | `ERR_AGENT_PROTOCOL_VERSION_MISMATCH` | `LBR-AGENT-003` | protocol version mismatch | AG-18 |
 | `ERR_AGENT_CAPABILITY_UNDECLARED` | `LBR-AGENT-004` | undeclared capability / method | AG-18 |
 | `ERR_AGENT_PROVENANCE_REJECTED` | `LBR-AGENT-005` | provenance 拒绝或 hash 变化 | AG-18 |
@@ -1729,7 +1729,7 @@ Special cases：
 - 改 `hooks/runtime.rs:557`：删 `"claude"/"gemini"` provider_name→agent_kind 字符串桥，改用 `hooks_for(AgentKind)`；同步删 `providers/mod.rs::find_provider` 字符串注册表（或保留 thin shim 标 deprecated）。
 - 新增 Codex / OpenCode `HookProvider`（新 builtin adapter + `as_hooks()`）：Codex 和 OpenCode 的配置入口必须按真实上游 CLI 版本实测固定（Codex 需处理用户级 `[hooks.state]` trust/enabled 门控；OpenCode 预期为 plugin/config 入口），不得默认写未证实的 `.codex/hooks.json` / `.opencode/hooks.json` / `[features] hooks=true`。gemini `HookProvider` 不再列 supported/installable。
 - central validation + owner filtering（first-writer-wins，`SessionStart`/`TurnStart` 豁免）+ redaction-before-persist：所有写入只接受 `RedactedBytes`（接 `RedactedSink`，`redaction.rs:219`），provider parser 仍只产 `LifecycleEvent`、不直接写 checkpoint。
-- 测试：`agent_lifecycle_event_test::{invalid_hook_envelopes_are_rejected_before_checkpoint, owner_claim_prevents_duplicate_checkpoint, subagent_start_end_write_subagent_checkpoint, codex_trust_gap_banner_only_for_unapproved_hooks}`；`agent_checkpoint_redaction_test::raw_hook_input_is_redacted_before_persist`。
+- 测试：`agent_lifecycle_event_test::{invalid_hook_envelopes_are_rejected_before_checkpoint, owner_claim_prevents_duplicate_checkpoint, subagent_end_materializes_distinct_subagent_scope_checkpoint, codex_trust_gap_banner_only_for_unapproved_hooks}`；`agent_checkpoint_redaction_test::raw_hook_input_is_redacted_before_persist`。
 
 **AG-20 — checkpoint export / lazy IO（存储面，保持 bespoke）**
 - 改 `history.rs:880` `append_checkpoint_commit` / `command/agent/checkpoint.rs`：E4 root/session payload、`content_hash`（`sha256:` 前缀）、chunking/zstd（落地 `TranscriptChunker`，`adapter.rs:251` 现无 impl）、metadata-first list/show（`--limit 50`/cap 500/keyset cursor）。

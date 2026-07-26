@@ -1050,7 +1050,7 @@ flowchart TD
 
 - status/add/commit/diff 等热路径不因长期元数据默认退化为全历史扫描。
 - operation snapshots、hunk reconciliation、preflight、Forge sync、partial clone 和 capsule recall 均有容量上限和大仓库基准。
-- 大对象、transcript、findings、capsule artifact 和 VFS 数据采用 streaming/chunking 或内容引用，避免无界内存加载。
+- 大对象、transcript、findings、capsule artifact 和 VFS 数据采用 streaming/chunking 或内容引用，避免无界内存加载。承接 plan-20260713 DEFER-DR-02：live whole-transcript allowlist 的存储模型重构（当前每快照全量读导致累计 O(n²)）需专门 RFC、迁移与性能预算后再排期。
 
 ## 不进入本长期 Top 10 的兼容增强
 

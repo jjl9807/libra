@@ -1843,6 +1843,21 @@ async fn prepare_control_runtime(
     );
     let started_at = Utc::now();
 
+    // §C.8 W4: resolve this process's control scope once, up front, so both
+    // modes stamp `control.json` identically and the pre-write takeover gate
+    // has its inputs. `libra code` holds no workspace lease at startup, so
+    // the workspace association stays empty until a leased runtime threads
+    // one through.
+    let scope = resolve_control_scope(working_dir, None)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to resolve the control scope for '{}': {error:#}",
+                working_dir.display()
+            ))
+        })?;
+    let linked_evidence = repo_has_linked_evidence(&resolve_storage_root(working_dir));
+
     match args.control {
         ControlMode::Observe => Ok(ControlRuntimeConfig {
             mode: ControlMode::Observe,
@@ -1853,6 +1868,8 @@ async fn prepare_control_runtime(
             cleanup_token: false,
             info_written: AtomicBool::new(false),
             started_at,
+            scope,
+            linked_evidence,
         }),
         ControlMode::Write => {
             let lock_guard = acquire_control_lock(&paths.lock).map_err(|error| match error {
@@ -1881,6 +1898,8 @@ async fn prepare_control_runtime(
                 cleanup_token: true,
                 info_written: AtomicBool::new(false),
                 started_at,
+                scope,
+                linked_evidence,
             })
         }
     }

@@ -57,7 +57,7 @@ libra agent rpc <subcommand>
 | `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致 |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
-| `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`） |
+| `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable、或二进制不在受信目录下时拒绝——`LBR-AGENT-005`）。provider-exporter slug `opencode` 则改为固定 provider 自身的 CLI 二进制——只从已注册受信目录解析、绝不扫描 `$PATH`——供沙箱化 export bridge 使用；该形式无需 external-agents opt-in |
 | `rpc trust --dir <path>` | 注册一个受信目录（`agent.external_agents.trusted_dirs`，默认 `~/.libra/agents`）：外部二进制的 canonical path 必须位于其中之一才可被信任。路径会被 canonicalize，且必须是存在且非 world-writable 的目录 |
 | `rpc untrust <slug>` | 撤销信任；二进制回到隔离状态（始终可用，不受开关限制） |
 | `rpc invoke` | 在**已信任**的 `libra-agent-*` 二进制上调用一个 JSON-RPC 方法 |
@@ -76,6 +76,8 @@ libra agent rpc <subcommand>
 | `--limit <n>` | `session list`, `checkpoint list` | 每页最大行数（默认 50，硬上限 500——超过时钳制并在 stderr 提示；`0` 按 `1` 处理） |
 | `--cursor <cursor>` | `session list`, `checkpoint list` | 上一页 `next_cursor` 返回的不透明 keyset 游标；不要手工构造 |
 | `--extract-transcript <path>` | `session show` | 将会话元数据中的已捕获 transcript 路径复制到本地文件 |
+| `--allow-raw` / `--raw` | `checkpoint export` | 授权并请求 raw（未脱敏）导出；缺少 `--allow-raw` 时 `--raw` 请求会被拒绝（`LBR-AGENT-013`）并记入审计 |
+| `--justification <text>` / `-o <path>` | `checkpoint export` | raw 导出的审计理由与输出文件 |
 | `--all` | `clean` | 清理所有已停止会话的 checkpoint，而不只是最近一个 |
 | `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | 三窗口保留期 GC：(1) 删除已停止会话中早于 `agent.retention.transcript_days`（默认 90；用 `--retention-days` 覆盖）的 checkpoint；(2) 清理早于 `agent.retention.stderr_days`（默认 30）的**终态** run 的 reviewer stderr 诊断日志，保留聚合记录；(3) **A0-09** 删除早于 `agent.retention.findings_days`（默认 90）的**终态** review/investigate run 整个目录（`findings.md`/`manifest.json`/`state.json`/reviewer 日志）。对象化的 findings blob 是内容寻址对象，交由未来的仓库级 object GC 回收（per-run retention 绝不删除可能被共享的对象）。non-terminal/时间戳不可解析的 run 一律 fail-safe 跳过；永不触碰 `agent_audit_log`。`--dry-run` 仅预览各窗口及配套清理的 would-be 删除（包括 JSON `findings_runs_pruned`/`import_identities_pruned`），不实际删除 |
 | `--repair` | `doctor` | 修复检测到的 checkpoint 存储不一致（重建 catalog 行、补插 `object_index` 行、安全 drain 有效的过期普通 writer marker，并忽略普通 TTL 立即 drain `cleanup_pending` marker）；损坏 marker 保持 `manual_required`；省略时仅检测 |
@@ -103,7 +105,11 @@ libra --json agent rpc list
 支持及当前可用状态；默认版本 1 的 payload 保持原有字段集合，不会隐式
 增加扩展字段。OpenCode 的 `transcript_discoverable` 明确为 unsupported（不支持
 批量发现）；显式 ID 的 `importable`/`export_bridge` 可用性取决于受信任离线
-exporter 与 sandbox。不支持的 schema version 以 usage 错误（exit 129、category
+exporter 与 sandbox。启用该 exporter 的方式：先注册包含已核验 `opencode`
+二进制的目录，再固定它——`libra agent rpc trust --dir <path>`，然后
+`libra agent rpc trust opencode`。两步都不会打开 external-RPC 表面
+（`agent.external_agents.enabled` 保持不变）；二进制只从已注册受信目录解析，
+绝不扫描 `$PATH`。不支持的 schema version 以 usage 错误（exit 129、category
 `cli`）返回 `LBR-AGENT-017`。当平台无法提供 Libra 的 provider-root 安全打开
 原语时，Claude/Codex 的发现与导入会如实报告为 unavailable。
 
@@ -353,9 +359,19 @@ libra agent --json status
 
 `libra agent --help` 会渲染同一横幅，因此文档和 CLI 表面保持同步（跨命令 `--help` EXAMPLES 推出，见 `docs/development/commands/_general.md` 条目 B）。
 
+## 延后 parity（非目标）
+
+以下 external-agent parity 表面在本波次**有意不**公开。它们连同处理方式与重启条件一并记录在 Agent tracing 契约（[`../../development/tracing/agent.md`](../../development/tracing/agent.md) 的「还未实现的功能」表）中，在此点名以免脚本或用户产生依赖：
+
+- **`agent add`/`remove` 的 `--local-dev` / `--force` 标志**未发布——只使用规范的 `enable` / `disable`（及其 `add` / `remove` 别名）。若未来发布，会同时接到规范动词及其别名上。
+- **Provider 专属 transcript compaction / reassemble trait** 是未来 parity 项。writer 已把大 transcript 存为 manifest 相对 chunk，但尚无 provider 专属 compactor/reassembler。
+- **可选 capability trait**（`ProtectedFilesProvider`、`TranscriptCompactor`、`HookResponseWriter`、`RestoredSessionPathResolver` 等）在已落地的 `DeclaredAgentCaps` 矩阵之外尚无公开行为。
+- **v2 `info` / capability gate 之外的 external-RPC method family** 未实现；未声明某项 capability 的代理继续 fail-closed。
+- **非首批 roster 不受支持。** 仅 `claude-code`、`codex` 与 `opencode` 为 supported、hook-installable 且可用于 review/investigate 启动。`gemini`（仅 uninstall，见上文说明）、`cursor`、`copilot` 与 `factory-ai` 均为 `supported=false`，不出现在 `agent list`，`add`/`enable` 返回可操作的 unsupported 错误；它们不可启动。
+
 ## 说明
 
-- 外部 `libra-agent-*` 代理**默认禁用**。使用 `libra config set agent.external_agents.enabled true`（仓库级）显式开启；开启前 `rpc list`/`rpc trust`/`rpc invoke` 会以 `LBR-AGENT-002` 拒绝（`rpc untrust` 始终可用——撤销信任只会收紧安全面）。已发现的二进制在 `rpc trust <slug>` 记录来源前保持隔离（world-writable 目录中的二进制拒绝信任）；每次 invoke 都会复验来源（漂移即撤销信任，`LBR-AGENT-005`）；子进程环境被清空为白名单注入，stderr 被捕获/限长/脱敏——绝不继承。invoke 超时、broken pipe、malformed frame 映射 `LBR-AGENT-012`；IO 硬上限超限映射 `LBR-AGENT-007`。
+- 外部 `libra-agent-*` 代理**默认禁用**。使用 `libra config set agent.external_agents.enabled true`（仓库级）显式开启；开启前 `rpc list`/`libra-agent-*` 的 `rpc trust`/`rpc invoke` 会以 `LBR-AGENT-002` 拒绝（`rpc untrust` 始终可用——撤销信任只会收紧安全面；`rpc trust --dir <path>` 与 provider-exporter 信任如 `rpc trust opencode` 属纯准备动作——不扫描 `$PATH`、本身不启用任何东西，因此门控下亦可用）。已发现的二进制在 `rpc trust <slug>` 记录来源前保持隔离（world-writable 目录中的二进制拒绝信任）；每次 invoke 都会复验来源（漂移即撤销信任，`LBR-AGENT-005`）；子进程环境被清空为白名单注入，stderr 被捕获/限长/脱敏——绝不继承。invoke 超时、broken pipe、malformed frame 映射 `LBR-AGENT-012`；IO 硬上限超限映射 `LBR-AGENT-007`。
 
 - 顶层 `agent hooks` 入口是隐藏的，面向由 `libra agent enable` 安装的 hook 配置；用户通常不会直接调用它。若 hook envelope 未通过大小 / UTF-8 / JSON / schema / transcript 路径校验，会以 `LBR-AGENT-008`（退出码 128）fail-closed 拒绝——绝不回显 raw stdin。对不一致 store 执行 checkpoint 操作（如 `checkpoint rewind`）——catalog 行的 `parent_commit` 非法或指向缺失的 traces 对象——会以 `LBR-AGENT-009`（退出码 128）失败；运行 `libra agent doctor` 检查 store。
 - `checkpoint rewind --apply` 只恢复工作树文件；代理自身的 transcript 文件不会被重写。

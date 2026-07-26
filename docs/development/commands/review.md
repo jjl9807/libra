@@ -62,8 +62,12 @@ reviewer CLI（`claude-code`、`codex`、`opencode`），在隔离 workspace 中
   reviewers/<slug>.stderr.redacted.log
 ```
 
-`manual_attach` 是 E8 占位字段（恒为空）：AG-22 不提供 attach 命令面；要实现
-attach 入口必须先补 `agent.md` §5 规格。
+`manual_attach` 由 `libra review attach <run_id> <file>`（A0-06）填充：外部文件
+字节先经 `redact_untrusted` 脱敏，再内容寻址对象化（object_index `o_type =
+agent_findings`），manifest 追加 `{oid,name,provenance:"manual",size,attached_at}`
+条目（只存 basename，防路径泄露）。`findings_oid` 在 finalize 时由 findings.md
+内容寻址写入；`libra agent doctor` 覆盖 `missing_findings_object` /
+`missing_findings_object_index` 两类扫描与修复。
 
 ### Terminal states 与 cancel
 
@@ -142,7 +146,4 @@ stdout 为禁止字段。
 ## 还未实现的功能
 
 - `--fix`（内部 AgentRuntime fix bridge；Code 阶段 C7 源码锚点 + approval/
-  sandbox/tool gate 测试为前置）。
-- manual attach 命令面（E8 占位字段之外的入口需先补 `agent.md` §5 规格）。
-- findings 对象化（`findings_oid` 恒为 null；对象写入与 GC 由后续任务卡
-  承接）。
+  sandbox/tool gate 测试为前置；现由 plan-20260714 Part D PD-01 跟踪）。

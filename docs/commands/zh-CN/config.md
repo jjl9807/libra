@@ -37,7 +37,7 @@ libra config --rename-section <old-name> <new-name>
 1. **子命令风格**（推荐）：`libra config set key value`、`libra config get key`
 2. **Git 兼容标志风格**（隐藏）：`libra config --get key`、`libra config key value`
 
-使用 `get` 读取值时，Libra 会按优先级从 local 到 global 级联查找。第一个匹配项胜出。
+使用 `get` 读取值时，Libra 会按优先级 local → global → system 级联查找。第一个匹配项胜出；system 库不可读时会被跳过。
 
 ## 选项
 
@@ -76,7 +76,7 @@ libra config set vault.env.GEMINI_API_KEY
 
 #### `get <key>`
 
-获取配置值。从 local 到 global scope 级联，返回第一个匹配项。
+获取配置值。按 local → global → system scope 级联，返回第一个匹配项（system 库不可读时跳过）。
 
 | 标志 | 说明 |
 |------|------|
@@ -109,7 +109,7 @@ libra config get --regexp "user\\..*"
 | 标志 | 说明 |
 |------|------|
 | `--name-only` | 只显示 key 名，不显示值 |
-| `--show-origin` | 为每个条目加上 scope 前缀（`local` 或 `global`） |
+| `--show-origin` | 为每个条目加上 scope 前缀（`local`、`global` 或 `system`） |
 | `--vault` | 只显示 `vault.env.*` 条目 |
 | `--ssh-keys` | 显示 SSH key 条目 |
 | `--gpg-keys` | 显示 GPG key 条目 |

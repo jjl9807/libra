@@ -38,7 +38,7 @@ The command supports two invocation styles:
 1. **Subcommand style** (preferred): `libra config set key value`, `libra config get key`
 2. **Git-compatible flag style** (hidden): `libra config --get key`, `libra config key value`
 
-When reading a value with `get`, Libra cascades through scopes in precedence order: local, then global. The first match wins.
+When reading a value with `get`, Libra cascades through scopes in precedence order: local, then global, then system. The first match wins; an unreadable system database is skipped.
 
 ## Options
 
@@ -77,7 +77,7 @@ libra config set vault.env.GEMINI_API_KEY
 
 #### `get <key>`
 
-Retrieve a configuration value. Cascades from local to global scope, returning the first match.
+Retrieve a configuration value. Cascades local → global → system scope, returning the first match (an unreadable system database is skipped).
 
 | Flag | Description |
 |------|-------------|
@@ -110,7 +110,7 @@ List all configuration entries in the active scope.
 | Flag | Description |
 |------|-------------|
 | `--name-only` | Show only key names, not values |
-| `--show-origin` | Prefix each entry with its scope (`local` or `global`) |
+| `--show-origin` | Prefix each entry with its scope (`local`, `global`, or `system`) |
 | `--vault` | Show only `vault.env.*` entries |
 | `--ssh-keys` | Show SSH key entries |
 | `--gpg-keys` | Show GPG key entries |

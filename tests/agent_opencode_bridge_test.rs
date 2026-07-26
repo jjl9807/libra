@@ -63,12 +63,14 @@ impl BridgeRepo {
         };
         let out = this.run(&["init"], None);
         assert!(out.status.success(), "libra init: {}", describe(&out));
-        // Seed the export-bridge trust store directly (the RPC trust CLI is
-        // built for `libra-agent-*` binaries, not the real provider CLI —
-        // an operator registration path for the export binary is a
-        // documented DR-04b follow-up). This faithfully populates exactly
-        // what `read_trust`/`revalidate_trust` consume, via the lib's own
-        // provenance computation.
+        // Seed the export-bridge trust store directly for harness speed.
+        // The operator registration path is `libra agent rpc trust --dir
+        // <path>` followed by `libra agent rpc trust opencode` (DR-04b; its
+        // CLI contract is covered by tests/command/agent_rpc_trust_test.rs::
+        // provider_exporter_trust_is_ungated_and_trusted_dir_bound). This
+        // seed faithfully populates exactly what `read_trust`/
+        // `revalidate_trust` consume, via the lib's own provenance
+        // computation.
         this.seed_trust().await;
         Some(this)
     }

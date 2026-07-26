@@ -17,8 +17,11 @@ for actual deletion. Running `libra clean` without either flag is an
 error. This prevents accidental data loss by forcing the user to state
 intent explicitly.
 
-By default, only files are removed and Git/Libra ignore sources are honored
-(ignored files are skipped). The `-d` flag opts into removing untracked
+By default, only files are removed and the shared Git/Libra ignore sources
+are honored (ignored files are skipped): `.gitignore`, `.git/info/exclude`,
+`core.excludesFile`, and `.libraignore` — nearest directory wins, and a
+`.libraignore` beats a sibling `.gitignore`; see
+[check-ignore.md](check-ignore.md) for the full precedence. The `-d` flag opts into removing untracked
 directories as well; `-x` opts into removing files the ignore rules would
 otherwise protect; `-X` flips the rules so that *only* ignored files are
 removed. Every candidate path is canonicalized and verified to reside

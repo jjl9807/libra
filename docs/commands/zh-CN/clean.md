@@ -13,7 +13,7 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 
 `libra clean` 从工作树移除未跟踪文件。与 Git 不同，Libra 要求显式模式标志：`-n` 用于 dry-run 预览，`-f` 用于实际删除。不带任一标志运行 `libra clean` 是错误。这通过强制用户明确意图来防止意外数据丢失。
 
-默认情况下，只移除文件，并遵守 Git/Libra ignore 来源（忽略文件会被跳过）。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
+默认情况下，只移除文件，并遵守共享 Git/Libra ignore 来源（忽略文件会被跳过）：`.gitignore`、`.git/info/exclude`、`core.excludesFile` 与 `.libraignore`——就近目录优先，同目录 `.libraignore` 高于 `.gitignore`；完整优先级见 [check-ignore.md](check-ignore.md)。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
 
 可选 pathspec 会将 clean 候选限制为匹配的未跟踪文件或目录前缀。这是 `clean` 当前使用的字面前缀匹配器；`:(exclude)` / `:(glob)` 等共享 pathspec magic 尚未对删除路径启用。
 

@@ -430,6 +430,13 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
         working_dir: util::working_dir(),
         thread_id: None,
         started_at: chrono::Utc::now(),
+        // Repository-level sidecar: scope stamping (§C.8 W4) is a per-worktree
+        // `libra code` concern; `service.json` stays a legacy (version-1) file
+        // whose takeover is arbitrated by the advisory lock alone.
+        repo_id: None,
+        worktree_id: None,
+        workspace_id: None,
+        lease_fence: None,
     };
     write_control_info(&paths.info, &info).map_err(|e| {
         CliError::fatal(format!("failed to write service.json: {e}"))
