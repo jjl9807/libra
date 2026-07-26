@@ -1566,3 +1566,157 @@ fn json_inexact_spanhash_score_floor() {
         "one edited line floors below 100: {json}"
     );
 }
+
+// ── R0-6: quote_pathname / core.quotePath / public entries API ───────────────
+
+/// TAB (and every control character) is escaped REGARDLESS of
+/// `core.quotePath` (§B.6.6 always-escape class).
+#[test]
+fn quote_path_always_escapes_tab() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("tab\there.txt"), "tabbed\n").unwrap();
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        out.contains("?? \"tab\\there.txt\""),
+        "TAB must be escaped and the path quoted: {out:?}"
+    );
+
+    // Still escaped with core.quotePath=false.
+    let cfg = run_libra_command(&["config", "core.quotePath", "false"], repo.path());
+    assert_cli_success(&cfg, "set core.quotePath=false");
+    let out = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        out.contains("?? \"tab\\there.txt\""),
+        "control characters stay escaped under quotePath=false: {out:?}"
+    );
+}
+
+/// `core.quotePath=false` leaves non-ASCII UTF-8 unescaped in the short
+/// format (default `true` escapes it as octal).
+#[test]
+fn short_quote_path_core_false() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("café.txt"), "accented\n").unwrap();
+
+    let out = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(
+        out.contains("?? \"caf\\303\\251.txt\""),
+        "default quotePath=true escapes non-ASCII bytes: {out:?}"
+    );
+
+    let cfg = run_libra_command(&["config", "core.quotePath", "false"], repo.path());
+    assert_cli_success(&cfg, "set core.quotePath=false");
+    let out = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(
+        out.contains("?? café.txt") && !out.contains("\\303"),
+        "quotePath=false renders raw UTF-8 without quotes: {out:?}"
+    );
+}
+
+/// Porcelain v1/v2 quote non-ASCII paths under the default `core.quotePath`,
+/// while `-z` always emits raw unquoted bytes.
+#[test]
+fn porcelain_quote_path_utf8_non_ascii() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("café.txt"), "accented\n").unwrap();
+
+    let v1 = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(v1.contains("?? \"caf\\303\\251.txt\""), "v1 quotes: {v1:?}");
+    let v2 = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    assert!(v2.contains("? \"caf\\303\\251.txt\""), "v2 quotes: {v2:?}");
+    let z = status_stdout(repo.path(), &["status", "--porcelain", "-z"]);
+    assert!(
+        z.contains("?? café.txt\0") && !z.contains("\\303"),
+        "-z stays raw and unquoted: {z:?}"
+    );
+}
+
+/// `core.quotePath` is a strict Git boolean: invalid values fail closed
+/// before any output (§B.5).
+#[test]
+fn core_quote_path_invalid_fail_closed() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    let cfg = run_libra_command(&["config", "core.quotePath", "banana"], repo.path());
+    assert_cli_success(&cfg, "set invalid core.quotePath");
+    let out = run_libra_command(&["status"], repo.path());
+    assert!(!out.status.success(), "invalid quotePath must fail closed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("core.quotePath"),
+        "failure names the key: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The public `generate_short_status_entries` API keeps renames first-class
+/// (destination worktree state in the unstaged column) while the legacy
+/// tuple API decomposes them into pre-R0 D/A/?? endpoints.
+#[test]
+fn generate_short_status_entries_api() {
+    use std::path::PathBuf;
+
+    use libra::command::status::{
+        Changes, ShortStatusEntry, generate_short_format_status, generate_short_status_entries,
+    };
+
+    let staged = Changes {
+        renamed: vec![(PathBuf::from("a.txt"), PathBuf::from("b.txt"))],
+        ..Default::default()
+    };
+    let unstaged = Changes {
+        modified: vec![PathBuf::from("b.txt")],
+        new: vec![PathBuf::from("loose.txt")],
+        ..Default::default()
+    };
+
+    let entries = generate_short_status_entries(&staged, &unstaged);
+    assert_eq!(
+        entries,
+        vec![
+            ShortStatusEntry::Rename {
+                old: PathBuf::from("a.txt"),
+                new: PathBuf::from("b.txt"),
+                staged: 'R',
+                unstaged: 'M',
+            },
+            ShortStatusEntry::Path {
+                path: PathBuf::from("loose.txt"),
+                staged: '?',
+                unstaged: '?',
+            },
+        ],
+        "renames stay first-class with the destination's worktree state"
+    );
+
+    let legacy = generate_short_format_status(&staged, &unstaged);
+    assert_eq!(
+        legacy,
+        vec![
+            (PathBuf::from("a.txt"), 'D', ' '),
+            (PathBuf::from("b.txt"), 'A', 'M'),
+            (PathBuf::from("loose.txt"), '?', '?'),
+        ],
+        "the legacy tuple API decomposes renames into pre-R0 endpoints"
+    );
+}
+
+/// Human long format renders a rename as `renamed: <old> -> <new>` (§B.6.1).
+#[test]
+fn human_rename_long_format() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\nsecond line\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.lines()
+            .any(|l| l.trim_start().starts_with("renamed:") && l.contains("a.txt -> b.txt")),
+        "long format uses the renamed: arrow form: {out}"
+    );
+}

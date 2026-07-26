@@ -4,6 +4,24 @@
 
 ### Added
 
+- **`status` short/porcelain path quoting + public entry API
+  (plan-20260714 R0-6/R0-7)**: `core.quotePath` is honored through the
+  strict local→global→system cascade (strict Git boolean, default
+  `true`, invalid values fail closed) — human-short and non-`-z`
+  porcelain v1/v2 paths now C-style-escape control characters, `"` and
+  `\` unconditionally and non-ASCII bytes as `\ooo` octal under the
+  default; `-z` records keep raw unquoted bytes. New public API
+  `ShortStatusEntry` / `generate_short_status_entries` exposes the
+  rename-aware short entry list (renames first-class, destination
+  worktree state in the unstaged column) and now feeds both the short
+  and porcelain-v1 renderers. The legacy `generate_short_format_status`
+  tuple API is RESTORED to its pre-R0 shape: renames decompose into
+  endpoint states (staged old=`D `/new=`A `, unstaged old merges an
+  unstaged `D`, destination becomes `??`), guarded by the new
+  `compat_legacy_short_api_pre_r0_equivalence` target. `status` also
+  resolves `status.renameLimit` (falling back to `diff.renameLimit`)
+  through the same cascade.
+
 - **Task worktrees take a workspace lease (v0.19.62,
   plan-20260714 Part C §C.8, W4 slice 2)**: the scheduler's task
   worktrees are now first-class workspaces. Provisioning publishes an

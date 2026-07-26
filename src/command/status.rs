@@ -425,6 +425,8 @@ struct StatusConfigExtras {
     /// `status.renameLimit` falling back to `diff.renameLimit` (§B.5):
     /// per-side inexact candidate cap, `0` = uncapped, default 1000.
     rename_limit: usize,
+    /// `core.quotePath` (§B.6.6): default true (Git parity).
+    quote_path: bool,
 }
 
 /// Structured status degradation warning (§B.5; reused verbatim by the JSON
@@ -579,6 +581,11 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<Status
         None => read_rename_limit("diff.renameLimit").await?.unwrap_or(1000),
     };
 
+    // §B.6.6: `core.quotePath` — strict Git boolean, default true (escape
+    // non-ASCII bytes in human-short/non-`-z` porcelain paths). Invalid
+    // values fail closed before any output.
+    let quote_path = read_bool("core.quotePath").await?.unwrap_or(true);
+
     if args.untracked_files.is_none() {
         args.untracked_files = untracked;
     }
@@ -607,6 +614,7 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<Status
         rename_untracked,
         rename_threshold,
         rename_limit,
+        quote_path,
     })
 }
 
@@ -820,6 +828,9 @@ struct StatusData {
     /// (§B.5): rename-engine budget/limit downgrades. Rendered per the
     /// delivery matrix by the callers.
     warnings: Vec<StatusWarning>,
+    /// `core.quotePath` (§B.6.6): escape non-ASCII bytes in human-short and
+    /// non-`-z` porcelain paths (default true, Git parity).
+    quote_path: bool,
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
@@ -1045,6 +1056,7 @@ async fn collect_status_data(
         staged_rename_details,
         unstaged_rename_details,
         warnings,
+        quote_path: extras.quote_path,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
     Ok(data)
@@ -2068,6 +2080,7 @@ async fn run_status_cache_mode(
         staged_rename_details: RenameDetails::new(),
         unstaged_rename_details: RenameDetails::new(),
         warnings: Vec::new(),
+        quote_path: extras.quote_path,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
 
@@ -2177,6 +2190,7 @@ async fn render_status_to_writer(
                 &data.staged_rename_details,
                 &data.unstaged_rename_details,
                 args.null_terminated,
+                data.quote_path,
                 &mut buffer,
             )?;
             writer.write_all(&buffer).map_err(write_error)?;
@@ -2197,6 +2211,7 @@ async fn render_status_to_writer(
                 &data.unstaged,
                 &data.unmerged,
                 args.null_terminated,
+                data.quote_path,
                 &mut buffer,
             )?;
             if args.ignored && !data.ignored_files.is_empty() {
@@ -2245,6 +2260,7 @@ async fn render_status_to_writer(
             &data.unmerged,
             output,
             args.null_terminated,
+            data.quote_path,
             &mut buffer,
         )
         .await?;
@@ -2907,7 +2923,7 @@ pub fn output_porcelain(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    output_porcelain_with_unmerged(staged, unstaged, &[], null_terminated, writer)
+    output_porcelain_with_unmerged(staged, unstaged, &[], null_terminated, true, writer)
 }
 
 fn output_porcelain_with_unmerged(
@@ -2915,6 +2931,7 @@ fn output_porcelain_with_unmerged(
     unstaged: &Changes,
     unmerged: &[UnmergedEntry],
     null_terminated: bool,
+    quote_path: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let write_err =
@@ -2922,53 +2939,44 @@ fn output_porcelain_with_unmerged(
 
     // Renames render as a single `R  <old> -> <new>` record (Git porcelain v1
     // §B.6.3), never as two `R` endpoint rows. Under `-z` the record is
-    // `XY SP <new> NUL <old> NUL` (new before old, matching Git).
-    let mut endpoints: HashSet<PathBuf> = HashSet::new();
-    let mut rename_lines: Vec<(char, char, PathBuf, PathBuf)> = Vec::new();
-    for (old, new) in &staged.renamed {
-        endpoints.insert(old.clone());
-        endpoints.insert(new.clone());
-        // The Y column carries the worktree state of the rename's NEW path
-        // (Git: `RM`/`RD` when the destination is modified/deleted unstaged;
-        // the endpoint row is suppressed below so this is its only signal).
-        let y = if unstaged.modified.contains(new) {
-            'M'
-        } else if unstaged.deleted.contains(new) {
-            'D'
-        } else {
-            ' '
-        };
-        rename_lines.push(('R', y, old.clone(), new.clone()));
-    }
-    for (old, new) in &unstaged.renamed {
-        endpoints.insert(old.clone());
-        endpoints.insert(new.clone());
-        rename_lines.push((' ', 'R', old.clone(), new.clone()));
-    }
-
-    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
-    for (file, staged_status, unstaged_status) in status_list {
-        if endpoints.contains(&file) {
-            continue;
-        }
-        write!(
-            writer,
-            "{staged_status}{unstaged_status} {}",
-            file.display()
-        )
-        .map_err(write_err)?;
-        writer
-            .write_all(if null_terminated { b"\0" } else { b"\n" })
-            .map_err(write_err)?;
-    }
-    for (x, y, old, new) in rename_lines {
-        if null_terminated {
-            write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
-            writer.write_all(b"\0").map_err(write_err)?;
-            write!(writer, "{}", old.display()).map_err(write_err)?;
-            writer.write_all(b"\0").map_err(write_err)?;
-        } else {
-            writeln!(writer, "{x}{y} {} -> {}", old.display(), new.display()).map_err(write_err)?;
+    // `XY SP <new> NUL <old> NUL` (raw path bytes, new before old, matching
+    // Git); non-`-z` paths go through `quote_pathname` (§B.6.6).
+    for entry in generate_short_status_entries_with_unmerged(staged, unstaged, unmerged) {
+        match entry {
+            ShortStatusEntry::Path {
+                path,
+                staged: x,
+                unstaged: y,
+            } => {
+                if null_terminated {
+                    write!(writer, "{x}{y} {}", path.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                } else {
+                    writeln!(writer, "{x}{y} {}", quote_pathname(&path, quote_path))
+                        .map_err(write_err)?;
+                }
+            }
+            ShortStatusEntry::Rename {
+                old,
+                new,
+                staged: x,
+                unstaged: y,
+            } => {
+                if null_terminated {
+                    write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                    write!(writer, "{}", old.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                } else {
+                    writeln!(
+                        writer,
+                        "{x}{y} {} -> {}",
+                        quote_pathname(&old, quote_path),
+                        quote_pathname(&new, quote_path)
+                    )
+                    .map_err(write_err)?;
+                }
+            }
         }
     }
     Ok(())
@@ -3091,6 +3099,7 @@ fn write_rename_porcelain_v2(
     metadata: &PorcelainV2Data,
     zero_hash: &str,
     null_terminated: bool,
+    quote_path: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let write_err =
@@ -3155,7 +3164,13 @@ fn write_rename_porcelain_v2(
         write!(writer, "{}", old.display()).map_err(write_err)?;
         writer.write_all(b"\0").map_err(write_err)?;
     } else {
-        write!(writer, "{}\t{}", new.display(), old.display()).map_err(write_err)?;
+        write!(
+            writer,
+            "{}\t{}",
+            quote_pathname(new, quote_path),
+            quote_pathname(old, quote_path)
+        )
+        .map_err(write_err)?;
         writer.write_all(b"\n").map_err(write_err)?;
     }
     Ok(())
@@ -3172,6 +3187,7 @@ fn output_porcelain_v2(
     staged_rename_details: &RenameDetails,
     unstaged_rename_details: &RenameDetails,
     null_terminated: bool,
+    quote_path: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let metadata =
@@ -3212,6 +3228,7 @@ fn output_porcelain_v2(
             metadata,
             &zero_hash,
             null_terminated,
+            quote_path,
             writer,
         )?;
     }
@@ -3231,6 +3248,7 @@ fn output_porcelain_v2(
             metadata,
             &zero_hash,
             null_terminated,
+            quote_path,
             writer,
         )?;
     }
@@ -3241,7 +3259,11 @@ fn output_porcelain_v2(
             continue;
         }
         if staged_status == '?' && unstaged_status == '?' {
-            write!(writer, "? {}", file.display()).map_err(write_err)?;
+            if null_terminated {
+                write!(writer, "? {}", file.display()).map_err(write_err)?;
+            } else {
+                write!(writer, "? {}", quote_pathname(&file, quote_path)).map_err(write_err)?;
+            }
             if null_terminated {
                 writer.write_all(b"\0").map_err(write_err)?;
             } else {
@@ -3279,6 +3301,11 @@ fn output_porcelain_v2(
             "N...".to_string()
         };
 
+        let path_field = if null_terminated {
+            file.display().to_string()
+        } else {
+            quote_pathname(&file, quote_path)
+        };
         write!(
             writer,
             "1 {}{} {} {} {} {} {} {} {}",
@@ -3290,7 +3317,7 @@ fn output_porcelain_v2(
             format_mode(mode_worktree),
             hash_head,
             hash_index,
-            file.display()
+            path_field
         )
         .map_err(write_err)?;
         if null_terminated {
@@ -3301,7 +3328,11 @@ fn output_porcelain_v2(
     }
 
     for file in ignored {
-        write!(writer, "! {}", file.display()).map_err(write_err)?;
+        if null_terminated {
+            write!(writer, "! {}", file.display()).map_err(write_err)?;
+        } else {
+            write!(writer, "! {}", quote_pathname(file, quote_path)).map_err(write_err)?;
+        }
         if null_terminated {
             writer.write_all(b"\0").map_err(write_err)?;
         } else {
@@ -3373,12 +3404,67 @@ fn get_unmerged_worktree_mode(file_path: &std::path::Path) -> u32 {
 // Short format
 // ---------------------------------------------------------------------------
 
-/// Core logic for generating short format status without color (for testing)
+/// Core logic for generating short format status without color (for testing).
+///
+/// LEGACY tuple API (pre-R0 shape, §B.6.0.1): renames are DECOMPOSED into
+/// their endpoint states — a staged rename contributes `old = D ` / `new =
+/// A `, an unstaged rename contributes an unstaged `D` on its source (merged
+/// with any staged state via the ordinary rules) and `??` on its
+/// destination — so a chain `a→b` staged + `b→c` unstaged yields `a = D `,
+/// `b = AD`, `c = ??` with no duplicate rows. Rename-aware consumers use
+/// [`generate_short_status_entries`] instead.
 pub fn generate_short_format_status(
     staged: &Changes,
     unstaged: &Changes,
 ) -> Vec<(std::path::PathBuf, char, char)> {
     generate_short_format_status_with_unmerged(staged, unstaged, &[])
+}
+
+fn process_unstaged_changes(
+    files: &[PathBuf],
+    file_status: &mut HashMap<PathBuf, (char, char)>,
+    unstaged_char: char,
+) {
+    for file in files {
+        let staged_status = file_status.get(file).map(|(s, _)| *s);
+        if let Some(status) = staged_status {
+            file_status.insert(file.clone(), (status, unstaged_char));
+        } else {
+            file_status.insert(file.clone(), (' ', unstaged_char));
+        }
+    }
+}
+
+/// Shared base XY map: every non-rename change plus unmerged entries. Rename
+/// pairs are handled by the caller (decomposed by the legacy API, first-class
+/// in [`generate_short_status_entries`]).
+fn short_xy_base(
+    staged: &Changes,
+    unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
+) -> HashMap<PathBuf, (char, char)> {
+    let mut file_status: HashMap<PathBuf, (char, char)> = HashMap::new();
+
+    for file in &staged.new {
+        file_status.insert(file.clone(), ('A', ' '));
+    }
+    for file in &staged.modified {
+        file_status.insert(file.clone(), ('M', ' '));
+    }
+    for file in &staged.deleted {
+        file_status.insert(file.clone(), ('D', ' '));
+    }
+
+    process_unstaged_changes(&unstaged.modified, &mut file_status, 'M');
+    process_unstaged_changes(&unstaged.deleted, &mut file_status, 'D');
+
+    for file in &unstaged.new {
+        file_status.insert(file.clone(), ('?', '?'));
+    }
+    for entry in unmerged {
+        file_status.insert(entry.path.clone(), entry.xy());
+    }
+    file_status
 }
 
 pub(crate) fn generate_short_format_status_with_unmerged(
@@ -3397,35 +3483,27 @@ pub(crate) fn generate_short_format_status_with_unmerged(
     for file in &staged.deleted {
         file_status.insert(file.clone(), ('D', ' '));
     }
+    // Pre-R0 decomposition: a staged rename is a delete of the old path plus
+    // an add of the new path in this legacy tuple view.
     for (old, new) in &staged.renamed {
-        file_status.insert(old.clone(), ('R', ' '));
-        file_status.insert(new.clone(), ('R', ' '));
-    }
-
-    fn process_unstaged_changes(
-        files: &[PathBuf],
-        file_status: &mut HashMap<PathBuf, (char, char)>,
-        unstaged_char: char,
-    ) {
-        for file in files {
-            let staged_status = file_status.get(file).map(|(s, _)| *s);
-            if let Some(status) = staged_status {
-                file_status.insert(file.clone(), (status, unstaged_char));
-            } else {
-                file_status.insert(file.clone(), (' ', unstaged_char));
-            }
-        }
+        file_status.insert(old.clone(), ('D', ' '));
+        file_status.insert(new.clone(), ('A', ' '));
     }
 
     process_unstaged_changes(&unstaged.modified, &mut file_status, 'M');
     process_unstaged_changes(&unstaged.deleted, &mut file_status, 'D');
-    for (old, new) in &unstaged.renamed {
-        process_unstaged_changes(std::slice::from_ref(old), &mut file_status, 'R');
-        process_unstaged_changes(std::slice::from_ref(new), &mut file_status, 'R');
+    // Pre-R0 decomposition: an unstaged rename is an unstaged delete of its
+    // source (merged with any staged state) …
+    for (old, _new) in &unstaged.renamed {
+        process_unstaged_changes(std::slice::from_ref(old), &mut file_status, 'D');
     }
 
     for file in &unstaged.new {
         file_status.insert(file.clone(), ('?', '?'));
+    }
+    // … and an untracked destination.
+    for (_old, new) in &unstaged.renamed {
+        file_status.insert(new.clone(), ('?', '?'));
     }
     for entry in unmerged {
         file_status.insert(entry.path.clone(), entry.xy());
@@ -3442,6 +3520,101 @@ pub(crate) fn generate_short_format_status_with_unmerged(
         .collect()
 }
 
+/// One short-format / porcelain-v1 render entry (§B.6.1 public API): either a
+/// plain per-path change or a first-class rename pair (rendered with Git's
+/// `old -> new` arrow instead of two endpoint rows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShortStatusEntry {
+    Path {
+        path: PathBuf,
+        staged: char,
+        unstaged: char,
+    },
+    Rename {
+        old: PathBuf,
+        new: PathBuf,
+        staged: char,
+        unstaged: char,
+    },
+}
+
+impl ShortStatusEntry {
+    /// Sort key — Git orders renames by their destination path.
+    fn sort_key(&self) -> &Path {
+        match self {
+            ShortStatusEntry::Path { path, .. } => path,
+            ShortStatusEntry::Rename { new, .. } => new,
+        }
+    }
+}
+
+/// Build the shared short-format / porcelain-v1 entry list (§B.6.1): rename
+/// pairs stay first-class — the unstaged column of a staged rename carries
+/// the DESTINATION's worktree state (`RM`/`RD`) — and every non-endpoint
+/// path renders as an XY tuple. Entries sort by path, renames by their
+/// destination.
+pub fn generate_short_status_entries(
+    staged: &Changes,
+    unstaged: &Changes,
+) -> Vec<ShortStatusEntry> {
+    generate_short_status_entries_with_unmerged(staged, unstaged, &[])
+}
+
+pub(crate) fn generate_short_status_entries_with_unmerged(
+    staged: &Changes,
+    unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
+) -> Vec<ShortStatusEntry> {
+    let mut entries: Vec<ShortStatusEntry> = Vec::new();
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        // The endpoint rows are suppressed, so this column is the only
+        // signal for the destination's worktree state.
+        let unstaged_char = if unstaged.modified.contains(new) {
+            'M'
+        } else if unstaged.deleted.contains(new) {
+            'D'
+        } else {
+            ' '
+        };
+        entries.push(ShortStatusEntry::Rename {
+            old: old.clone(),
+            new: new.clone(),
+            staged: 'R',
+            unstaged: unstaged_char,
+        });
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        entries.push(ShortStatusEntry::Rename {
+            old: old.clone(),
+            new: new.clone(),
+            staged: ' ',
+            unstaged: 'R',
+        });
+    }
+
+    let mut base: Vec<_> = short_xy_base(staged, unstaged, unmerged)
+        .into_iter()
+        .collect();
+    base.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, (staged_char, unstaged_char)) in base {
+        if endpoints.contains(&path) {
+            continue;
+        }
+        entries.push(ShortStatusEntry::Path {
+            path,
+            staged: staged_char,
+            unstaged: unstaged_char,
+        });
+    }
+    entries.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
+    entries
+}
+
 /// Short format output — legacy public API used by tests.
 pub async fn output_short_format(
     staged: &Changes,
@@ -3454,122 +3627,110 @@ pub async fn output_short_format(
         &[],
         &OutputConfig::default(),
         false,
+        true,
         writer,
     )
     .await
 }
 
-/// A short-format render item: either a plain per-path change or a rename
-/// pair (rendered with Git's `old -> new` arrow instead of two `R` rows).
-enum ShortItem {
-    Path {
-        file: PathBuf,
-        x: char,
-        y: char,
-    },
-    Rename {
-        old: PathBuf,
-        new: PathBuf,
-        x: char,
-        y: char,
-    },
-}
-
-impl ShortItem {
-    /// Sort key — Git orders renames by their new (destination) path.
-    fn sort_key(&self) -> &Path {
-        match self {
-            ShortItem::Path { file, .. } => file,
-            ShortItem::Rename { new, .. } => new,
+/// C-style path quoting for human-short and non-`-z` porcelain output
+/// (§B.6.6). Control characters, `"` and `\` are ALWAYS escaped; bytes above
+/// 0x7F are additionally escaped as octal `\ooo` only under
+/// `core.quotePath=true` (the default, matching Git). A path needing any
+/// escape is wrapped in double quotes; `-z` output never calls this.
+pub(crate) fn quote_pathname(path: &Path, quote_path: bool) -> String {
+    let display = path.display().to_string();
+    let bytes = display.as_bytes();
+    let needs_escape =
+        |b: u8| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || (quote_path && b >= 0x80);
+    if !bytes.iter().copied().any(needs_escape) {
+        return display;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
+    out.push(b'"');
+    for &b in bytes {
+        match b {
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            _ if b < 0x20 || b == 0x7f || (quote_path && b >= 0x80) => {
+                out.extend_from_slice(format!("\\{b:03o}").as_bytes());
+            }
+            _ => out.push(b),
         }
     }
+    out.push(b'"');
+    // INVARIANT: escapes are pure ASCII and pass-through bytes come from a
+    // valid UTF-8 string, so the result is valid UTF-8; the lossy fallback
+    // only guards against future edits breaking that.
+    String::from_utf8(out)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 /// Short format output with color controlled by OutputConfig.
 ///
 /// Renames are rendered as a single `R  <old> -> <new>` line (Git's short
 /// rename form), not as two separate `R` rows (§B.6.1). Under `-z` the record
-/// is `XY SP <new> NUL <old> NUL` (new before old, matching Git).
+/// is `XY SP <new> NUL <old> NUL` (new before old, matching Git) with RAW
+/// unquoted paths; non-`-z` paths go through [`quote_pathname`] (§B.6.6).
 async fn output_short_format_with_config(
     staged: &Changes,
     unstaged: &Changes,
     unmerged: &[UnmergedEntry],
     output: &OutputConfig,
     null_terminated: bool,
+    quote_path: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let use_colors = should_use_colors(output).await;
     let write_err =
         |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
 
-    // Collect rename pairs and their endpoints so the flattened tuple list can
-    // exclude them (they render as arrow lines instead).
-    let mut items: Vec<ShortItem> = Vec::new();
-    let mut endpoints: HashSet<PathBuf> = HashSet::new();
-    for (old, new) in &staged.renamed {
-        endpoints.insert(old.clone());
-        endpoints.insert(new.clone());
-        // The Y column carries the worktree state of the NEW path (`RM`/`RD`)
-        // — the endpoint row is suppressed, so this is its only signal.
-        let y = if unstaged.modified.contains(new) {
-            'M'
-        } else if unstaged.deleted.contains(new) {
-            'D'
-        } else {
-            ' '
-        };
-        items.push(ShortItem::Rename {
-            old: old.clone(),
-            new: new.clone(),
-            x: 'R',
-            y,
-        });
-    }
-    for (old, new) in &unstaged.renamed {
-        endpoints.insert(old.clone());
-        endpoints.insert(new.clone());
-        items.push(ShortItem::Rename {
-            old: old.clone(),
-            new: new.clone(),
-            x: ' ',
-            y: 'R',
-        });
-    }
-
-    for (file, x, y) in generate_short_format_status_with_unmerged(staged, unstaged, unmerged) {
-        if endpoints.contains(&file) {
-            continue;
-        }
-        items.push(ShortItem::Path { file, x, y });
-    }
-    items.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
-
-    for item in items {
-        match item {
-            ShortItem::Path { file, x, y } => {
-                if use_colors {
-                    write!(writer, "{}", format_colored_status(x, y, &file)).map_err(write_err)?;
-                } else {
-                    write!(writer, "{x}{y} {}", file.display()).map_err(write_err)?;
-                }
-                writer
-                    .write_all(if null_terminated { b"\0" } else { b"\n" })
-                    .map_err(write_err)?;
-            }
-            ShortItem::Rename { old, new, x, y } => {
+    for entry in generate_short_status_entries_with_unmerged(staged, unstaged, unmerged) {
+        match entry {
+            ShortStatusEntry::Path {
+                path,
+                staged: x,
+                unstaged: y,
+            } => {
                 if null_terminated {
-                    // `XY SP <new> NUL <old> NUL` (§B.6.1).
+                    write!(writer, "{x}{y} {}", path.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                } else {
+                    let quoted = quote_pathname(&path, quote_path);
+                    if use_colors {
+                        write!(writer, "{}", format_colored_status(x, y, &quoted))
+                            .map_err(write_err)?;
+                    } else {
+                        write!(writer, "{x}{y} {quoted}").map_err(write_err)?;
+                    }
+                    writer.write_all(b"\n").map_err(write_err)?;
+                }
+            }
+            ShortStatusEntry::Rename {
+                old,
+                new,
+                staged: x,
+                unstaged: y,
+            } => {
+                if null_terminated {
+                    // `XY SP <new> NUL <old> NUL` (§B.6.1), raw path bytes.
                     write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                     write!(writer, "{}", old.display()).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
-                } else if use_colors {
-                    let head = format_colored_status(x, y, &old);
-                    // `format_colored_status` renders `XY <old>`; append the arrow.
-                    writeln!(writer, "{head} -> {}", new.display()).map_err(write_err)?;
                 } else {
-                    writeln!(writer, "{x}{y} {} -> {}", old.display(), new.display())
-                        .map_err(write_err)?;
+                    let q_old = quote_pathname(&old, quote_path);
+                    let q_new = quote_pathname(&new, quote_path);
+                    if use_colors {
+                        let head = format_colored_status(x, y, &q_old);
+                        // `format_colored_status` renders `XY <old>`; append the arrow.
+                        writeln!(writer, "{head} -> {q_new}").map_err(write_err)?;
+                    } else {
+                        writeln!(writer, "{x}{y} {q_old} -> {q_new}").map_err(write_err)?;
+                    }
                 }
             }
         }
@@ -3624,11 +3785,7 @@ async fn should_use_colors(output: &OutputConfig) -> bool {
     io::stdout().is_terminal()
 }
 
-fn format_colored_status(
-    staged_status: char,
-    unstaged_status: char,
-    file: &std::path::Path,
-) -> String {
+fn format_colored_status(staged_status: char, unstaged_status: char, file: &str) -> String {
     use colored::Colorize;
 
     let colored_staged = match staged_status {
@@ -3653,7 +3810,7 @@ fn format_colored_status(
         _ => unstaged_status.to_string().into(),
     };
 
-    format!("{}{} {}", colored_staged, colored_unstaged, file.display())
+    format!("{colored_staged}{colored_unstaged} {file}")
 }
 
 // ---------------------------------------------------------------------------

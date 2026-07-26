@@ -61,6 +61,11 @@ honored; an unreadable or unsupported system scope skipped):
 - `status.relativePaths=true|false` (config-only, like Git): `true` — the
   default — renders human long/short paths relative to the current directory;
   `false` keeps repository-root-relative paths.
+- `core.quotePath=true|false` (strict boolean, default `true`, matching Git):
+  human-short and non-`-z` porcelain v1/v2 paths always C-style-escape
+  control characters, `"` and `\` (wrapping the path in double quotes);
+  under the default, bytes above `0x7F` are additionally escaped as `\ooo`
+  octal. `-z` records always carry raw unquoted path bytes.
 
 All five keys are validated up front: an invalid value fails closed with
 `LBR-CLI-002` and an unreadable local/global scope with `LBR-IO-001`, before
