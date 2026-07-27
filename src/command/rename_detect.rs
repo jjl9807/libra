@@ -1612,5 +1612,29 @@ mod tests {
             tiny_total.read_worktree_blob(&big),
             ContentOutcome::Skipped(SkipReason::TooLarge)
         ));
+
+        // The POSITIVE half of independence, which zero-limit budgets cannot
+        // show. Everything above only proves that an ALREADY-EXHAUSTED
+        // budget refuses — true even if the two shared one pool.
+        //
+        // Object side: with the worktree budget fully spent, a fresh object
+        // budget with real limits must REACH the store. It cannot return
+        // `BudgetExceeded` (which is decided before any lookup); a
+        // storage-classified outcome proves the budget let it through.
+        let mut usable_objects = ObjectReadBudget::new(1024, 1024, 8, Duration::from_secs(30));
+        match usable_objects.read_blob(&oid_of(b"never stored")) {
+            ContentOutcome::Skipped(SkipReason::BudgetExceeded) => {
+                panic!("a fresh object budget must not inherit the worktree budget's exhaustion")
+            }
+            _ => { /* reached the store: missing/unavailable/content are all fine here */ }
+        }
+
+        // Worktree side: with object reads spent, a fresh worktree budget
+        // with real limits still returns CONTENT.
+        let mut usable_worktree = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_secs(30));
+        assert!(matches!(
+            usable_worktree.read_worktree_blob(&small),
+            ContentOutcome::Content(_)
+        ));
     }
 }

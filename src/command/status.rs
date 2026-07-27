@@ -4578,10 +4578,21 @@ fn output_porcelain_v2(
         } else {
             '.'
         };
+        // A missing score is NOT 100: `R100` is the documented spelling of an
+        // exact rename, so defaulting to it would publish an inexact pair as
+        // byte-identical. The mode and hash fields already fail closed on
+        // missing metadata; the score column gets the same treatment.
         let score = staged_rename_details
             .get(&(old.clone(), new.clone()))
             .map(|(pct, _)| *pct)
-            .unwrap_or(100);
+            .ok_or_else(|| {
+                CliError::fatal(format!(
+                    "cannot render the porcelain v2 rename record for '{}': score metadata is missing",
+                    quote_pathname(new, quote_path)
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("re-run 'libra status' after 'libra add'/'libra reset' settles the index")
+            })?;
         write_rename_porcelain_v2(
             old,
             new,
@@ -4601,7 +4612,14 @@ fn output_porcelain_v2(
         let score = unstaged_rename_details
             .get(&(old.clone(), new.clone()))
             .map(|(pct, _)| *pct)
-            .unwrap_or(100);
+            .ok_or_else(|| {
+                CliError::fatal(format!(
+                    "cannot render the porcelain v2 rename record for '{}': score metadata is missing",
+                    quote_pathname(new, quote_path)
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("re-run 'libra status' after 'libra add'/'libra reset' settles the index")
+            })?;
         // The SOURCE of an unstaged rename may also carry a staged change
         // (edit `a`, `add a`, then move it to `b`). Git reports that as
         // `MR`, keeping the real HEAD and index sides distinct. Hardcoding

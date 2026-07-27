@@ -4933,37 +4933,51 @@ fn porcelain_v2_staged_modify_then_worktree_rename_emits_mr() {
 #[test]
 fn ref_with_mismatched_hash_kind_fails_closed() {
     let repo = create_repo_with_committed_file("a.txt", "content\n");
-    // A syntactically valid SHA-256 id in a SHA-1 repository.
+    // A syntactically valid SHA-256 id in a SHA-1 repository. It parses
+    // cleanly — the length is valid for ITS kind — and used to reach object
+    // loading, where it panicked.
     let foreign = "f".repeat(64);
     let update = run_libra_command(&["update-ref", "refs/heads/broken", &foreign], repo.path());
-    if !update.status.success() {
-        // Refusing to WRITE it is an even stronger guarantee; either way the
-        // bad id never reaches object loading.
+
+    if update.status.success() {
+        // Written: reading it back MUST fail closed with an explained error.
+        let switch = run_libra_command(&["switch", "broken"], repo.path());
+        let out = run_libra_command(&["--json", "status"], repo.path());
+        let failed = !switch.status.success() || !out.status.success();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&switch.stderr),
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(
-            !String::from_utf8_lossy(&update.stderr).is_empty(),
-            "the refusal is explained"
+            failed,
+            "a foreign-algorithm ref must fail closed somewhere on the read path, \
+             not silently resolve: switch={:?} status={:?}",
+            switch.status.code(),
+            out.status.code()
+        );
+        assert!(
+            !combined.contains("panicked"),
+            "and the failure is an explained error, never a panic: {combined}"
+        );
+        assert!(
+            combined.contains("LBR-") || combined.to_lowercase().contains("fatal"),
+            "with an actionable message: {combined}"
         );
         return;
     }
-    let switch = run_libra_command(&["switch", "broken"], repo.path());
-    let out = run_libra_command(&["--json", "status"], repo.path());
-    // Whichever step rejects it, the failure must be an explained error and
-    // never a panic.
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&switch.stderr),
-        String::from_utf8_lossy(&out.stderr)
+
+    // Refused at WRITE — an even stronger guarantee, but it must still be an
+    // explained refusal rather than a crash.
+    let stderr = String::from_utf8_lossy(&update.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "the write refusal is an explained error, not a panic: {stderr}"
     );
     assert!(
-        !combined.contains("panicked"),
-        "a foreign-algorithm ref must fail closed, not panic: {combined}"
+        stderr.contains("LBR-") || stderr.to_lowercase().contains("fatal"),
+        "the write refusal is actionable: {stderr}"
     );
-    if !out.status.success() {
-        assert!(
-            combined.contains("LBR-") || combined.contains("fatal"),
-            "the failure carries an actionable message: {combined}"
-        );
-    }
 }
 
 /// §B.6.0.1 pathspec narrowing removes only the warnings DERIVED from
@@ -5742,6 +5756,13 @@ fn worktree_read_failure_degrades_with_warning_not_silence() {
             .as_array()
             .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
         "the base deletion survives: {doc}"
+    );
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "dest.txt" || p == "dest.txt/")),
+        "and so does the untracked DESTINATION — asserting only the deletion \
+         would pass even if a premature marker collapse dropped it: {doc}"
     );
     assert!(
         doc["data"]["warnings"].as_array().is_some_and(|w| w

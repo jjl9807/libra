@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review round 8)
+
+- **A porcelain v2 rename record with missing SCORE metadata fails closed**
+  instead of defaulting to `R100`. `R100` is the documented spelling of an
+  exact rename, so the default published inexact pairs as byte-identical —
+  the mode and hash columns already refused to guess.
+- **Every HEAD deserialization boundary validates the OID's hash algorithm**,
+  not just the main one: linked-worktree and remote detached HEADs went
+  through an unchecked parse. All three now share one
+  parse-plus-kind-validate helper, so a new boundary cannot silently skip it.
+- **`diff.renameComparisonBudget` bounds the unique-basename stage too.**
+  Enforcement began only in the exhaustive loop, so `=1` could still score
+  arbitrarily many basename pairs and, if they consumed every candidate,
+  report no degradation at all.
+
 ### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review rounds 5-7)
 
 - **An unstaged rename whose SOURCE also has a staged change renders `MR`,

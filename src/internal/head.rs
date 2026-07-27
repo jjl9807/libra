@@ -44,6 +44,32 @@ pub enum Head {
  * Incorrect Usage (in a transaction): `Head::update(...).await;` // DEADLOCK!
  */
 
+/// Parse a stored commit id AND verify it belongs to this repository's hash
+/// algorithm.
+///
+/// A well-formed id of the wrong algorithm parses cleanly — the length is
+/// valid for ITS kind — and only fails much later, as a panic inside object
+/// loading. Every ref-read boundary funnels through here so none can be
+/// updated without the check.
+fn parse_ref_commit(raw: &str, ref_name: &str) -> Result<ObjectHash, BranchStoreError> {
+    let commit = ObjectHash::from_str(raw).map_err(|error| BranchStoreError::Corrupt {
+        name: ref_name.to_string(),
+        detail: format!("invalid commit hash: {error}"),
+    })?;
+    let repo_kind = git_internal::hash::get_hash_kind();
+    if commit.kind() != repo_kind {
+        return Err(BranchStoreError::Corrupt {
+            name: ref_name.to_string(),
+            detail: format!(
+                "commit hash is {:?} but this repository uses {:?}",
+                commit.kind(),
+                repo_kind
+            ),
+        });
+    }
+    Ok(commit)
+}
+
 impl Head {
     const SQLITE_BUSY_MAX_RETRIES: usize = 15;
     const SQLITE_BUSY_RETRY_BASE_MS: u64 = 100;
@@ -168,27 +194,7 @@ impl Head {
                     name: "HEAD".to_string(),
                     detail: "detached HEAD is missing commit hash".to_string(),
                 })?;
-                let commit_hash = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
-                    BranchStoreError::Corrupt {
-                        name: "HEAD".to_string(),
-                        detail: format!("invalid detached HEAD commit hash: {error}"),
-                    }
-                })?;
-                // Length alone is not validation: a SHA-1 id in a SHA-256
-                // repository parses fine and then panics deep inside
-                // `Commit::load`. Refuse it here, where the ref is read, with
-                // a message that names the actual problem.
-                let repo_kind = git_internal::hash::get_hash_kind();
-                if commit_hash.kind() != repo_kind {
-                    return Err(BranchStoreError::Corrupt {
-                        name: "HEAD".to_string(),
-                        detail: format!(
-                            "detached HEAD commit hash is {:?} but this repository uses {:?}",
-                            commit_hash.kind(),
-                            repo_kind
-                        ),
-                    });
-                }
+                let commit_hash = parse_ref_commit(commit_hash.as_str(), "HEAD")?;
                 Ok(Head::Detached(commit_hash))
             }
         }
@@ -239,12 +245,7 @@ impl Head {
                     name: "HEAD".to_string(),
                     detail: "detached HEAD is missing commit hash".to_string(),
                 })?;
-                let commit = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
-                    BranchStoreError::Corrupt {
-                        name: "HEAD".to_string(),
-                        detail: format!("invalid detached HEAD commit hash: {error}"),
-                    }
-                })?;
+                let commit = parse_ref_commit(commit_hash.as_str(), "HEAD")?;
                 Ok(Some((Head::Detached(commit), Some(commit))))
             }
         }
@@ -280,12 +281,8 @@ impl Head {
                     name: format!("refs/remotes/{remote}/HEAD"),
                     detail: "detached remote HEAD is missing commit hash".to_string(),
                 })?;
-                let commit_hash = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
-                    BranchStoreError::Corrupt {
-                        name: format!("refs/remotes/{remote}/HEAD"),
-                        detail: format!("invalid detached remote HEAD commit hash: {error}"),
-                    }
-                })?;
+                let commit_hash =
+                    parse_ref_commit(commit_hash.as_str(), &format!("refs/remotes/{remote}/HEAD"))?;
                 Ok(Some(Head::Detached(commit_hash)))
             }
         }

@@ -3692,6 +3692,7 @@ fn apply_rename_detection(
     const MAX_SCORE: u32 = 60000;
 
     let mut basename_comparisons: u64 = 0;
+    let mut budget_discarded_in_basename = false;
     // §B.4.2.3 stage order: the unique-basename pass runs BEFORE (and
     // independently of) the bounded exhaustive stage, so a tripped
     // renameLimit or comparison budget still keeps the pairs a basename
@@ -3745,6 +3746,16 @@ fn apply_rename_detection(
             ) else {
                 continue;
             };
+            // The budget is TOTAL, so it gates this stage too — checking it
+            // only in the exhaustive loop let `renameComparisonBudget=1`
+            // score arbitrarily many basename pairs (and, if they consumed
+            // every candidate, emit no warning at all).
+            if let Some(budget) = comparison_budget
+                && basename_comparisons >= budget
+            {
+                budget_discarded_in_basename = true;
+                break;
+            }
             let score = similarity_score(&old_body, &new_body);
             basename_comparisons += 1;
             if score < threshold {
@@ -3787,7 +3798,7 @@ fn apply_rename_detection(
     // Git skips inexact detection entirely, so a 100%-similar but non-identical
     // pair (e.g. reordered lines) must NOT be folded.
     let basename = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
-    let mut budget_discarded = false;
+    let mut budget_discarded = budget_discarded_in_basename;
     // The unique-basename stage above SCORES its candidates, so those
     // comparisons are charged against the same budget the exhaustive stage
     // spends — matching the shared engine. Resetting the counter to zero
