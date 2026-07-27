@@ -1722,51 +1722,90 @@ fn build_rename_side(
     map
 }
 
-/// Call-level read-budget STATE, carried between detection sides.
+/// Call-level rename budget STATE, carried between detection sides.
 ///
-/// §B.3.4/§B.7 specify ONE 500k comparison cap and ONE 64 MiB read cap per
-/// `status` invocation. Constructing fresh budgets per side let a single
-/// call spend both twice, each side individually looking compliant. Only the
-/// remaining AMOUNTS travel — plain numbers — because the budget objects
-/// themselves hold `Rc` content caches and must not live across an `.await`.
-#[derive(Clone, Copy)]
+/// §B.3.4/§B.7 specify ONE 500k comparison cap, ONE 64 MiB read cap and ONE
+/// 5 s scoring deadline per `status` invocation. Rebuilding any of these per
+/// side let a single call spend them twice while each side individually
+/// looked compliant — so the remaining amounts, the ORIGINAL deadline, and
+/// the OID de-duplication cache all travel between the passes.
 struct RenameBudgets {
     objects_total: u64,
     objects_slots: u32,
     worktree_total: u64,
     worktree_tasks: u32,
+    /// Absolute batch deadline; a fresh one would hand the second side
+    /// another full 5 s.
+    deadline: std::time::Instant,
+    /// Shared so an object both sides need is read once, not twice.
+    object_cache: Vec<(ObjectHash, Result<Vec<u8>, rename_detect::SkipReason>)>,
+    /// Comparisons already spent; the next side's config is narrowed by it.
+    comparisons_spent: u64,
 }
 
 impl RenameBudgets {
     fn new() -> Self {
-        let objects = rename_detect::ObjectReadBudget::with_defaults().remaining();
-        let worktree = rename_detect::WorktreeReadBudget::with_defaults().remaining();
+        let objects = rename_detect::ObjectReadBudget::with_defaults();
+        let worktree = rename_detect::WorktreeReadBudget::with_defaults();
+        let (objects_total, objects_slots) = objects.remaining();
+        let (worktree_total, worktree_tasks) = worktree.remaining();
         Self {
-            objects_total: objects.0,
-            objects_slots: objects.1,
-            worktree_total: worktree.0,
-            worktree_tasks: worktree.1,
+            objects_total,
+            objects_slots,
+            worktree_total,
+            worktree_tasks,
+            deadline: objects.deadline(),
+            object_cache: Vec::new(),
+            comparisons_spent: 0,
         }
     }
 
-    fn take_objects(&self) -> rename_detect::ObjectReadBudget {
-        rename_detect::ObjectReadBudget::resumed(self.objects_total, self.objects_slots)
+    fn take_objects(&mut self) -> rename_detect::ObjectReadBudget {
+        rename_detect::ObjectReadBudget::resumed(
+            self.objects_total,
+            self.objects_slots,
+            self.deadline,
+            std::mem::take(&mut self.object_cache),
+        )
     }
 
     fn take_worktree(&self) -> rename_detect::WorktreeReadBudget {
-        rename_detect::WorktreeReadBudget::resumed(self.worktree_total, self.worktree_tasks)
+        rename_detect::WorktreeReadBudget::resumed(
+            self.worktree_total,
+            self.worktree_tasks,
+            self.deadline,
+        )
     }
 
-    fn restore_objects(&mut self, budget: &rename_detect::ObjectReadBudget) {
+    fn restore_objects(&mut self, budget: &mut rename_detect::ObjectReadBudget) {
         let (total, slots) = budget.remaining();
         self.objects_total = total;
         self.objects_slots = slots;
+        self.object_cache = budget.take_cache();
     }
 
     fn restore_worktree(&mut self, budget: &rename_detect::WorktreeReadBudget) {
         let (total, tasks) = budget.remaining();
         self.worktree_total = total;
         self.worktree_tasks = tasks;
+    }
+
+    /// The config for the NEXT side, with its comparison allowance reduced
+    /// by what earlier sides already spent.
+    fn narrowed(
+        &self,
+        config: &rename_detect::RenameDetectConfig,
+    ) -> rename_detect::RenameDetectConfig {
+        rename_detect::RenameDetectConfig {
+            comparison_budget: config
+                .comparison_budget
+                .map(|budget| budget.saturating_sub(self.comparisons_spent)),
+            ..config.clone()
+        }
+    }
+
+    fn record_comparisons(&mut self, spent: u64) {
+        self.comparisons_spent = self.comparisons_spent.saturating_add(spent);
     }
 }
 
@@ -1917,7 +1956,8 @@ fn detect_renames_with_destinations(
         objects: budgets.take_objects(),
         worktree: worktree_budget,
     };
-    let mut outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    let narrowed = budgets.narrowed(config);
+    let mut outcome = rename_detect::match_pairs(&snapshot, &narrowed, &mut source);
     // Snapshot-construction skips (optional worktree hash/stat failures)
     // join the engine's own content skips so ONE warning family covers
     // every candidate the run had to drop.
@@ -1993,11 +2033,13 @@ fn detect_renames_in_changes(
         objects: budgets.take_objects(),
         worktree: worktree_budget,
     };
-    let mut outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    let narrowed = budgets.narrowed(config);
+    let mut outcome = rename_detect::match_pairs(&snapshot, &narrowed, &mut source);
     // Hand the drawn-down budgets back so the OTHER side continues from
     // here rather than starting fresh.
-    budgets.restore_objects(&source.objects);
+    budgets.restore_objects(&mut source.objects);
     budgets.restore_worktree(&source.worktree);
+    budgets.record_comparisons(outcome.stats.comparisons);
     for (reason, count) in snapshot_skips {
         *outcome.stats.content_skips.entry(reason).or_default() += count;
     }
@@ -2992,8 +3034,15 @@ async fn run_status_cache_mode(
     // Assemble display data: cheap fresh pieces (head/upstream/merge state),
     // cache-derived changes (cwd-relative for display), NO rename detection
     // (would need object loads; documented) and no worktree walk.
-    let head = Head::current().await;
-    let head_oid_hash = Head::current_commit().await;
+    // Result-returning, like the full-scan path: a corrupt HEAD row (or an
+    // OID of the wrong hash algorithm) must surface as an actionable error,
+    // not as a process panic from the lossy `Head::current()` wrapper.
+    let head = Head::current_result()
+        .await
+        .map_err(|error| status_branch_store_error("resolve HEAD", error))?;
+    let head_oid_hash = Head::current_commit_result()
+        .await
+        .map_err(|error| status_branch_store_error("resolve HEAD commit", error))?;
     let staged = staged.to_relative();
     let mut unstaged = unstaged.to_relative();
     // Honor the resolved display defaults exactly like the full status

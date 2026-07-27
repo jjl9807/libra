@@ -690,12 +690,55 @@ impl ObjectReadBudget {
         (self.remaining_total, self.remaining_objects)
     }
 
-    /// A budget resumed from a previous side's remaining amounts.
-    pub fn resumed(remaining_total: u64, remaining_objects: u32) -> Self {
-        let mut budget = Self::with_defaults();
-        budget.remaining_total = remaining_total;
-        budget.remaining_objects = remaining_objects;
-        budget
+    /// A budget resumed from a previous side's remaining amounts, keeping
+    /// the ORIGINAL deadline and the OID cache. A fresh deadline would give
+    /// the second side another full 5 s (the cap is per scoring BATCH), and
+    /// a fresh cache would re-read objects both sides share.
+    pub fn resumed(
+        remaining_total: u64,
+        remaining_objects: u32,
+        deadline: Instant,
+        cache: Vec<(ObjectHash, Result<Vec<u8>, SkipReason>)>,
+    ) -> Self {
+        Self {
+            per_object_cap: OBJECT_READ_MAX_OBJECT_BYTES,
+            remaining_total,
+            remaining_objects,
+            deadline,
+            cache: cache
+                .into_iter()
+                .map(|(oid, slot)| {
+                    let slot = match slot {
+                        Ok(bytes) => ContentSlot::Content(Rc::new(bytes)),
+                        Err(reason) => ContentSlot::Skipped(reason),
+                    };
+                    (oid, slot)
+                })
+                .collect(),
+        }
+    }
+
+    /// The batch deadline, so a caller can carry it to the next side.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Take the OID cache in a form a caller can hold across an `.await`.
+    ///
+    /// The live cache stores `Rc<Vec<u8>>`, which is not `Send`; the carried
+    /// form owns its bytes so the de-duplication survives the trip between
+    /// detection sides without pinning the future to one thread.
+    pub fn take_cache(&mut self) -> Vec<(ObjectHash, Result<Vec<u8>, SkipReason>)> {
+        std::mem::take(&mut self.cache)
+            .into_iter()
+            .map(|(oid, slot)| match slot {
+                ContentSlot::Content(bytes) => (
+                    oid,
+                    Ok(Rc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone())),
+                ),
+                ContentSlot::Skipped(reason) => (oid, Err(reason)),
+            })
+            .collect()
     }
 
     pub fn with_defaults() -> Self {
@@ -796,12 +839,15 @@ impl WorktreeReadBudget {
         (self.remaining_total, self.remaining_tasks)
     }
 
-    /// A budget resumed from a previous side's remaining amounts.
-    pub fn resumed(remaining_total: u64, remaining_tasks: u32) -> Self {
-        let mut budget = Self::with_defaults();
-        budget.remaining_total = remaining_total;
-        budget.remaining_tasks = remaining_tasks;
-        budget
+    /// A budget resumed from a previous side's remaining amounts, keeping
+    /// the ORIGINAL batch deadline (see [`ObjectReadBudget::resumed`]).
+    pub fn resumed(remaining_total: u64, remaining_tasks: u32, deadline: Instant) -> Self {
+        Self {
+            per_file_cap: WORKTREE_READ_MAX_FILE_BYTES,
+            remaining_total,
+            remaining_tasks,
+            deadline,
+        }
     }
 
     pub fn with_defaults() -> Self {

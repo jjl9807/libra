@@ -3651,6 +3651,15 @@ fn apply_rename_detection(
                 .push_back(ai);
         }
     }
+    // Each bucket is sorted by NEW path bytes, matching the shared engine's
+    // tie-break. Leaving it in `files` order made the winner depend on the
+    // caller's enumeration, so a non-lexicographic input could pair
+    // differently in `diff` than in `status`.
+    for bucket in added_by_hash.values_mut() {
+        let mut sorted: Vec<usize> = bucket.iter().copied().collect();
+        sorted.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
+        *bucket = sorted.into();
+    }
     // Sources are consumed in path-byte order, and each picks a
     // SAME-BASENAME destination when the bucket offers one, else the
     // byte-order-smallest. This is `rename_detect::match_pairs`' exact-bucket

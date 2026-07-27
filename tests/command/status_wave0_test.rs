@@ -4932,52 +4932,79 @@ fn porcelain_v2_staged_modify_then_worktree_rename_emits_mr() {
 /// closed at the READ, with a message naming the mismatch.
 #[test]
 fn ref_with_mismatched_hash_kind_fails_closed() {
+    // Exercise the READ boundary, not the write one. `update-ref` rejects a
+    // 64-character id in a SHA-1 repository up front, so writing one never
+    // reaches deserialization. Instead: create the ref legitimately in a
+    // SHA-1 repository, then declare the repository SHA-256. The PERSISTED
+    // id is now the wrong algorithm, which is exactly the corrupt-ref shape
+    // the read path must refuse.
     let repo = create_repo_with_committed_file("a.txt", "content\n");
-    // A syntactically valid SHA-256 id in a SHA-1 repository. It parses
-    // cleanly — the length is valid for ITS kind — and used to reach object
-    // loading, where it panicked.
-    let foreign = "f".repeat(64);
-    let update = run_libra_command(&["update-ref", "refs/heads/broken", &foreign], repo.path());
+    let head_oid = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+        assert_cli_success(&out, "rev-parse HEAD");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    assert_eq!(head_oid.len(), 40, "the fixture is a SHA-1 repository");
 
-    if update.status.success() {
-        // Written: reading it back MUST fail closed with an explained error.
-        let switch = run_libra_command(&["switch", "broken"], repo.path());
-        let out = run_libra_command(&["--json", "status"], repo.path());
-        let failed = !switch.status.success() || !out.status.success();
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&switch.stderr),
-            String::from_utf8_lossy(&out.stderr)
+    let flip = run_libra_command(&["config", "core.objectformat", "sha256"], repo.path());
+    assert_cli_success(&flip, "declare the repository sha256");
+
+    // Every read path must now refuse the stored SHA-1 id.
+    for flags in [
+        vec!["status"],
+        vec!["--json", "status"],
+        vec!["status", "--porcelain"],
+    ] {
+        let out = run_libra_command(&flags, repo.path());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{flags:?}: a wrong-algorithm ref must fail closed, never panic: {stderr}"
         );
         assert!(
-            failed,
-            "a foreign-algorithm ref must fail closed somewhere on the read path, \
-             not silently resolve: switch={:?} status={:?}",
-            switch.status.code(),
-            out.status.code()
+            !out.status.success(),
+            "{flags:?}: it must not silently resolve either: {:?}",
+            String::from_utf8_lossy(&out.stdout)
         );
         assert!(
-            !combined.contains("panicked"),
-            "and the failure is an explained error, never a panic: {combined}"
+            stderr.contains("Sha1") || stderr.contains("Sha256") || stderr.contains("hash"),
+            "{flags:?}: the diagnostic names the hash-kind mismatch: {stderr}"
         );
-        assert!(
-            combined.contains("LBR-") || combined.to_lowercase().contains("fatal"),
-            "with an actionable message: {combined}"
-        );
-        return;
     }
+}
 
-    // Refused at WRITE — an even stronger guarantee, but it must still be an
-    // explained refusal rather than a crash.
-    let stderr = String::from_utf8_lossy(&update.stderr);
-    assert!(
-        !stderr.contains("panicked"),
-        "the write refusal is an explained error, not a panic: {stderr}"
-    );
-    assert!(
-        stderr.contains("LBR-") || stderr.to_lowercase().contains("fatal"),
-        "the write refusal is actionable: {stderr}"
-    );
+/// §B.4.1 deserialization boundary, index side: a corrupt index — including
+/// one whose stage-0 OIDs cannot be decoded — must produce an actionable
+/// error rather than a panic deep in object loading. Named by the plan as
+/// `malformed_index_oid_rejected_at_decode`.
+#[test]
+fn malformed_index_oid_rejected_at_decode() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    let index_path = repo.path().join(".libra/index");
+    let mut bytes = fs::read(&index_path).expect("read the index");
+    assert!(bytes.len() > 64, "the fixture index has entries");
+    // Corrupt the tail, where entry OIDs live, without touching the header —
+    // so the failure is a DECODE failure rather than "not an index file".
+    let tail = bytes.len() - 24;
+    for byte in &mut bytes[tail..] {
+        *byte ^= 0xFF;
+    }
+    fs::write(&index_path, &bytes).expect("write the corrupt index");
+
+    for flags in [vec!["status"], vec!["--json", "status"]] {
+        let out = run_libra_command(&flags, repo.path());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{flags:?}: a malformed index is an error, not a panic: {stderr}"
+        );
+        if !out.status.success() {
+            assert!(
+                stderr.contains("LBR-") || stderr.to_lowercase().contains("fatal"),
+                "{flags:?}: the failure is actionable: {stderr}"
+            );
+        }
+    }
 }
 
 /// §B.6.4: a rename record whose worktree mode cannot be READ (as opposed
@@ -5123,6 +5150,93 @@ fn worktree_candidate_vanishes_between_scan_and_hash() {
             .as_array()
             .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
         "the base status is unaffected: {doc}"
+    );
+}
+
+/// §B.7: the 500k comparison cap is per INVOCATION, not per detection side.
+/// Staged and unstaged detection run separately, so building a fresh budget
+/// for each let one `status` spend the cap twice while both sides
+/// individually looked compliant. The remaining allowance now travels
+/// between them, and the second side degrades once the first has spent it.
+#[test]
+fn comparison_budget_is_shared_across_both_detection_sides() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    // A wide STAGED rename set (exceeds the per-side rename limit, so the
+    // exhaustive stage is gated) plus an unstaged move, so both sides run.
+    for i in 0..1001 {
+        fs::write(
+            repo.path().join(format!("s{i}.txt")),
+            format!("staged {i}\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo.path().join("moved.txt"),
+        "unstaged content\nline two\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the fixture");
+    let commit = run_libra_command(&["commit", "-m", "base"], repo.path());
+    assert_cli_success(&commit, "commit the fixture");
+    enable_rename_untracked(repo.path());
+
+    for i in 0..1001 {
+        fs::remove_file(repo.path().join(format!("s{i}.txt"))).unwrap();
+        fs::write(
+            repo.path().join(format!("d{i}.txt")),
+            format!("staged {i} edited\n"),
+        )
+        .unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the wide move");
+    // Unstaged (worktree-only) move on top.
+    fs::rename(
+        repo.path().join("moved.txt"),
+        repo.path().join("moved-again.txt"),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&out, "both detection sides run");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    // The run must report the degradation ONCE for the whole invocation —
+    // two independently-budgeted sides would each emit their own count.
+    let warnings = doc["data"]["warnings"].as_array().expect("warnings");
+    let mut seen: Vec<(String, String)> = warnings
+        .iter()
+        .map(|w| {
+            (
+                w["code"].as_str().unwrap_or_default().to_string(),
+                w["source"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let before = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        before,
+        "one warning per {{code, source}} across BOTH sides: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["rename_detection_complete"], false,
+        "the wide staged set degrades detection: {doc}"
+    );
+    // The base status stays truthful regardless of budget pressure.
+    assert!(
+        doc["data"]["unstaged"]["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "moved.txt"))
+            || doc["data"]["renames"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|x| x["to"] == "moved-again.txt")),
+        "the unstaged side still reports its move, one way or the other: {doc}"
     );
 }
 

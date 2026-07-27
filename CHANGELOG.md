@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 / R0-2 review round 11)
+
+- **A corrupt HEAD no longer panics `status`.** The cache-mode path used the
+  lossy `Head::current()` wrapper, so a reference row that failed validation
+  — including one whose OID belongs to a different hash algorithm — aborted
+  the process instead of reporting an actionable error. `worktree list
+  --porcelain` likewise swallowed the error with `.ok().flatten()` and
+  printed a successful listing with the HEAD lines silently missing.
+- **The whole scoring batch shares one 5 s deadline and one OID cache.**
+  Resuming a budget rebuilt both, so the second detection side received a
+  fresh 5 s and re-read objects the first side had already fetched.
+- **`diff`'s exact buckets are ordered by new-path bytes**, so a
+  non-lexicographic input cannot pair differently in `diff` than in `status`.
+
 ### Fixed (plan-20260714 R0-5 review PASS)
 
 R0-5 (porcelain v2 rename records) passes Codex review. Everything the card

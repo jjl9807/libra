@@ -2292,7 +2292,9 @@ pub(crate) fn resolve_entry_worktree_id(path: &str, is_main: bool) -> Option<Str
 /// onto every entry. A worktree with no resolvable HEAD row (a legacy-symlink
 /// layout, or a missing/corrupt scope) emits neither line rather than
 /// mislabeling it with another worktree's commit.
-pub(crate) async fn format_worktree_porcelain(worktrees: &[WorktreeListEntry]) -> String {
+pub(crate) async fn format_worktree_porcelain(
+    worktrees: &[WorktreeListEntry],
+) -> Result<String, crate::internal::branch::BranchStoreError> {
     let mut out = String::new();
     for w in worktrees {
         out.push_str("worktree ");
@@ -2318,7 +2320,11 @@ pub(crate) async fn format_worktree_porcelain(worktrees: &[WorktreeListEntry]) -
             // No HEAD row for this scope (legacy layout / missing): omit HEAD
             // lines deterministically rather than stamping a wrong commit.
             Ok(None) => {}
-            Err(_) => {}
+            // A CORRUPT row (unparseable id, or one whose hash algorithm is
+            // not this repository's) is a different thing entirely: swallowing
+            // it printed a successful listing with the HEAD lines silently
+            // absent. Fail closed with the store's own message.
+            Err(error) => return Err(error),
         }
         if w.locked {
             match w.lock_reason.as_deref() {
@@ -2331,7 +2337,7 @@ pub(crate) async fn format_worktree_porcelain(worktrees: &[WorktreeListEntry]) -
         out.push_str(&format!("layout {}\n", w.layout));
         out.push('\n');
     }
-    out
+    Ok(out)
 }
 
 async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()> {
@@ -2343,7 +2349,14 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
         return Ok(());
     }
     if porcelain {
-        print!("{}", format_worktree_porcelain(&result.worktrees).await);
+        let porcelain = format_worktree_porcelain(&result.worktrees)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("cannot list worktrees: {error}"))
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .with_hint("a stored HEAD reference is corrupt; repair it and retry")
+            })?;
+        print!("{porcelain}");
         return Ok(());
     }
     for w in result.worktrees {
