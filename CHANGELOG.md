@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 / R0-2 review round 4)
+
+- **SHA-256 repositories detect unstaged exact renames again.** The worktree
+  OID is hashed on a pooled I/O worker, and the repository hash kind is
+  thread-local — a worker started at the SHA-1 default, so its id could never
+  equal the SHA-256 index entry. The pair silently degraded from exact to
+  inexact and read objects it did not need. The hash kind now crosses into
+  the worker with the job.
+- **`diff` applies the shared engine's inexact ELIGIBILITY and budget
+  accounting.** Symlinks no longer enter basename or exhaustive similarity
+  scoring (their "content" is a target string, which `status` never scores),
+  and unique-basename comparisons are charged against the same
+  `diff.renameComparisonBudget` the exhaustive stage spends instead of
+  restarting the count at zero.
+
 ### Fixed (plan-20260714 R0-1 shared-scorer parity)
 
 - **`diff` and `status` now report the SAME rename pairings.** Both apply the

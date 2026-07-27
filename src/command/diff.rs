@@ -3591,6 +3591,15 @@ fn apply_rename_detection(
     ignore_blank: bool,
     diff_algorithm: &DiffAlgorithm,
 ) -> RenameDetectionSkips {
+    // The shared engine only lets non-empty REGULAR files into inexact
+    // scoring (§B.4.2): a symlink's "content" is its target string, which is
+    // not comparable by content similarity, so pairing symlinks inexactly
+    // would report a rename `status` never would.
+    let is_regular = |path: &str, modes: &HashMap<PathBuf, u32>| {
+        modes
+            .get(&PathBuf::from(path))
+            .is_none_or(|mode| mode & 0o170000 == 0o100000)
+    };
     let same_file_type = |old_path: &str, new_path: &str| {
         let old_type = first_modes
             .get(&PathBuf::from(old_path))
@@ -3681,6 +3690,7 @@ fn apply_rename_detection(
 
     const MAX_SCORE: u32 = 60000;
 
+    let mut basename_comparisons: u64 = 0;
     // §B.4.2.3 stage order: the unique-basename pass runs BEFORE (and
     // independently of) the bounded exhaustive stage, so a tripped
     // renameLimit or comparison budget still keeps the pairs a basename
@@ -3720,6 +3730,11 @@ fn apply_rename_detection(
             if used_del[di] || used_add[ai] {
                 continue;
             }
+            if !is_regular(&files[di].path, first_modes)
+                || !is_regular(&files[ai].path, second_modes)
+            {
+                continue;
+            }
             // Like the shared engine's stage 3, a basename pair is still
             // SCORED — a same-named delete+add whose contents are
             // unrelated must not be reported as a rename.
@@ -3730,6 +3745,7 @@ fn apply_rename_detection(
                 continue;
             };
             let score = similarity_score(&old_body, &new_body);
+            basename_comparisons += 1;
             if score < threshold {
                 continue;
             }
@@ -3771,13 +3787,17 @@ fn apply_rename_detection(
     // pair (e.g. reordered lines) must NOT be folded.
     let basename = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
     let mut budget_discarded = false;
+    // The unique-basename stage above SCORES its candidates, so those
+    // comparisons are charged against the same budget the exhaustive stage
+    // spends — matching the shared engine. Resetting the counter to zero
+    // here let `diff` run a larger total than `status` for one config.
+    let mut comparisons: u64 = basename_comparisons;
     if threshold < MAX_SCORE && !inexact_skipped {
         // Per-destination top-K bounded edge set (K=4, plan-20260714 §B.4.2.5)
         // keeps memory at O(K × destinations) even for `-l0`-style uncapped
         // candidate sets. Edge order: score desc, same-basename first, then
         // (deleted, added) index ascending — diff's historical tie-break.
         const PER_DEST_TOP_K: usize = 4;
-        let mut comparisons: u64 = 0;
         // per added-index: (score, same_basename, di, ai) best-first
         let mut per_dest: HashMap<usize, Vec<(u32, bool, usize, usize)>> = HashMap::new();
         'outer: for &ai in &added {
@@ -3792,6 +3812,13 @@ fn apply_rename_detection(
                     continue;
                 }
                 if !same_file_type(&files[di].path, &files[ai].path) {
+                    continue;
+                }
+                // Same eligibility as the shared engine: inexact scoring is
+                // for regular-file content only.
+                if !is_regular(&files[di].path, first_modes)
+                    || !is_regular(&files[ai].path, second_modes)
+                {
                     continue;
                 }
                 let Some(old) = old_contents.get(&di) else {

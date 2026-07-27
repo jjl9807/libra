@@ -122,6 +122,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "rename_no_renames_flag_splits_add_delete",
     "rename_porcelain_v2_emits_rename_record",
     "rename_sha256_repo_detected",
+    "rename_sha256_worktree_exact_pairing",
     "rename_short_format_uses_arrow",
     "rename_untracked_config_cascade",
     "rename_untracked_true_uno_no_question_mark",

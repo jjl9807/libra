@@ -4697,6 +4697,44 @@ fn diff_and_status_agree_on_duplicate_content_pairings() {
     );
 }
 
+/// §B.4.1 in a SHA-256 repository, unstaged arm: the worktree OID is hashed
+/// on a pooled I/O worker, and the repository hash kind is thread-local. A
+/// worker that started at the SHA-1 default would produce an id that could
+/// never equal the SHA-256 index entry, silently degrading an exact pair to
+/// an inexact one (and reading objects it did not need).
+#[test]
+fn rename_sha256_worktree_exact_pairing() {
+    let repo = tempdir().expect("temp repo");
+    let init = run_libra_command(&["init", "--object-format", "sha256"], repo.path());
+    if !init.status.success() {
+        eprintln!("skipped (sha256 repositories unavailable)");
+        return;
+    }
+    configure_identity_via_cli(repo.path());
+    let body = "sha256 worktree exact\nline two\nline three\n";
+    fs::write(repo.path().join("src.txt"), body).unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the fixture");
+    let commit = run_libra_command(&["commit", "-m", "base"], repo.path());
+    assert_cli_success(&commit, "commit the fixture");
+    enable_rename_untracked(repo.path());
+
+    // Pure worktree move, byte-identical content.
+    fs::rename(repo.path().join("src.txt"), repo.path().join("dst.txt")).unwrap();
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames");
+    assert_eq!(renames.len(), 1, "the move pairs: {json}");
+    assert_eq!(renames[0]["from"], "src.txt", "{json}");
+    assert_eq!(renames[0]["to"], "dst.txt", "{json}");
+    assert_eq!(
+        renames[0]["exact"], true,
+        "the worktree OID must be hashed with the REPOSITORY's hash kind: {json}"
+    );
+    assert_eq!(renames[0]["score"], 100, "{json}");
+}
+
 /// §B.6.0.1 pathspec narrowing removes only the warnings DERIVED from
 /// filtered-out `io_blocked[]` entries. The worktree family also carries
 /// aggregate rename-scoring warnings that name no path; dropping those by

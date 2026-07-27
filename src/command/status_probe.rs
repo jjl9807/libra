@@ -180,7 +180,14 @@ where
     }
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    // The repository hash kind is THREAD-LOCAL and set on the main thread by
+    // the CLI preflight. A pooled worker starts at the SHA-1 default, so a
+    // worktree OID hashed there would never equal the SHA-256 index entry it
+    // is supposed to match — the exact stage would silently degrade to
+    // inexact and read objects it did not need. Carry it across.
+    let hash_kind = git_internal::hash::get_hash_kind();
     let job: IoJob = Box::new(move || {
+        git_internal::hash::set_hash_kind(hash_kind);
         // A closed receiver (timed-out caller) is expected; drop the value,
         // then release the slot so the pool accounting stays accurate.
         let _ = tx.send(op());
@@ -294,7 +301,9 @@ where
             return Err(());
         }
     }
+    let hash_kind = git_internal::hash::get_hash_kind();
     let job: IoJob = Box::new(move || {
+        git_internal::hash::set_hash_kind(hash_kind);
         op();
         IO_BUSY.fetch_sub(1, Ordering::SeqCst);
     });
