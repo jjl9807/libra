@@ -25,6 +25,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "cluster_stops_at_value_option",
     "config_copy_fail_closed",
     "core_quote_path_invalid_fail_closed",
+    "diff_and_status_agree_on_duplicate_content_pairings",
     "exit_code_ioblocked_is_one",
     "exit_warning_over_dirty_cache_fallback",
     "exit_warning_over_dirty_ioblocked_json",

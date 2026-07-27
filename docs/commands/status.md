@@ -222,7 +222,9 @@ from a subdirectory.
 
 Renames render as Git-compatible records in every format: `renamed: <old> -> <new>` in the
 human long format, `R  <old> -> <new>` in `--short` (`XY SP <new> NUL <old> NUL` under `-z`),
-a single `2 R<score> … <new>\t<old>` record with real HEAD/index/worktree modes and hashes in
+a single `2 XY <sub> <mH> <mI> <mW> <hH> <hI> R<score> <new>\t<old>` record — `XY` is the second
+field (`R.` staged-only, `.R` unstaged-only) and `R<score>` the ninth, a separate column — with
+real HEAD/index/worktree modes and hashes in
 `--porcelain=v2`, and a top-level `renames[]` array (`{from, to, score, exact, staged,
 unstaged}`) in `--json` — never as two separate `R`/`1 R` rows for the endpoints. When the
 rename's destination is then modified or deleted in the worktree, that state rides in the

@@ -3642,25 +3642,41 @@ fn apply_rename_detection(
                 .push_back(ai);
         }
     }
-    for &di in &deleted {
+    // Sources are consumed in path-byte order, and each picks a
+    // SAME-BASENAME destination when the bucket offers one, else the
+    // byte-order-smallest. This is `rename_detect::match_pairs`' exact-bucket
+    // rule verbatim (§B.4.2.2): taking whichever candidate happened to be
+    // enumerated first made `diff` and `status` disagree on which pair they
+    // reported for duplicate-content renames.
+    let mut deleted_ordered: Vec<usize> = deleted.clone();
+    deleted_ordered.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
+    for &di in &deleted_ordered {
         let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
             continue;
         };
         let Some(candidates) = added_by_hash.get_mut(&dh.to_string()) else {
             continue;
         };
-        let Some(position) = candidates
+        let mut allowed: Vec<usize> = candidates
             .iter()
-            .position(|&ai| same_file_type(&files[di].path, &files[ai].path))
-        else {
+            .copied()
+            .filter(|&ai| same_file_type(&files[di].path, &files[ai].path))
+            .collect();
+        if allowed.is_empty() {
             continue;
-        };
-        let Some(ai) = candidates.remove(position) else {
-            continue;
-        };
-        pairs.push((di, ai, 60000));
+        }
+        allowed.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
+        let base_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let old_base = base_of(&files[di].path);
+        let picked = allowed
+            .iter()
+            .copied()
+            .find(|&ai| base_of(&files[ai].path) == old_base)
+            .unwrap_or(allowed[0]);
+        candidates.retain(|&ai| ai != picked);
+        pairs.push((di, picked, 60000));
         used_del[di] = true;
-        used_add[ai] = true;
+        used_add[picked] = true;
     }
 
     const MAX_SCORE: u32 = 60000;
@@ -3795,11 +3811,15 @@ fn apply_rename_detection(
                     let same_base = basename(&files[di].path) == basename(&files[ai].path);
                     let edges = per_dest.entry(ai).or_default();
                     edges.push((score, same_base, di, ai));
+                    // Ties break on PATH BYTES, matching the shared engine's
+                    // `EdgeKey`. Sorting by vector index made the winner
+                    // depend on enumeration order, so the same repository
+                    // could pair differently in `diff` than in `status`.
                     edges.sort_by(|a, b| {
                         b.0.cmp(&a.0)
                             .then(b.1.cmp(&a.1))
-                            .then(a.2.cmp(&b.2))
-                            .then(a.3.cmp(&b.3))
+                            .then(files[a.2].path.cmp(&files[b.2].path))
+                            .then(files[a.3].path.cmp(&files[b.3].path))
                     });
                     if edges.len() > PER_DEST_TOP_K {
                         edges.truncate(PER_DEST_TOP_K);
@@ -3812,8 +3832,8 @@ fn apply_rename_detection(
         candidates.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then(b.1.cmp(&a.1))
-                .then(a.2.cmp(&b.2))
-                .then(a.3.cmp(&b.3))
+                .then(files[a.2].path.cmp(&files[b.2].path))
+                .then(files[a.3].path.cmp(&files[b.3].path))
         });
         for (score, _, di, ai) in candidates {
             if !used_del[di] && !used_add[ai] {

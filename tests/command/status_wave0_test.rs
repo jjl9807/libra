@@ -381,6 +381,22 @@ fn rename_porcelain_v2_emits_rename_record() {
         !out.lines().any(|l| l.starts_with("1 R")),
         "endpoints must not double as `1 R` rows: {out}"
     );
+    // Exactly one change row, and it is the rename: a leaked `1 ` endpoint
+    // row or a spurious `.R` would both slip past a first-`2`-line check.
+    let change_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("1 ") || l.starts_with("2 "))
+        .collect();
+    assert_eq!(
+        change_lines.len(),
+        1,
+        "the rename record is the only change row: {out}"
+    );
+    assert!(
+        !out.lines()
+            .any(|l| l.starts_with("2 ") && l.contains(" .R ")),
+        "a staged rename must not also render an unstaged `.R`: {out}"
+    );
 }
 
 /// `--json` includes a top-level `renames[]` array with `score`, `exact`, and
@@ -1473,6 +1489,18 @@ fn chain_rename_two_records() {
     let v2 = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
     let records: Vec<&str> = v2.lines().filter(|l| l.starts_with("2 ")).collect();
     assert_eq!(records.len(), 2, "exactly two rename records: {v2}");
+    // And NOTHING else: an endpoint that also leaked a `1 ` change row would
+    // make consumers replay the same path twice. Counting only `2 ` lines
+    // cannot see that.
+    let change_lines: Vec<&str> = v2
+        .lines()
+        .filter(|l| l.starts_with("1 ") || l.starts_with("2 "))
+        .collect();
+    assert_eq!(
+        change_lines.len(),
+        2,
+        "the two rename records are the ONLY change rows — no leaked endpoints: {v2}"
+    );
     let staged_hop = records
         .iter()
         .find(|r| r.contains(" R. ") && r.ends_with("b.txt\ta.txt"))
@@ -4502,8 +4530,11 @@ fn gitlink_missing_object_exact_by_oid_mode() {
     let repo = create_repo_with_committed_file("anchor.txt", "anchor\n");
     enable_rename_untracked(repo.path());
 
-    // Record `old-sub` as a gitlink pointing at a commit that does NOT
-    // exist in this repository, then move the checkout to `new-sub`.
+    // A gitlink recorded at `old-sub` in the INDEX, naming a commit that
+    // does not exist in this repository, and the same gitlink recorded at
+    // `new-sub` in the worktree side by materializing the directory. The
+    // pair must be found by (oid, mode) alone — no content read is possible,
+    // which is exactly why the kind check exists.
     let index_path = repo.path().join(".libra/index");
     let mut index = Index::load(&index_path).expect("load index");
     let phantom = git_internal::internal::object::blob::Blob::from_content("phantom submodule").id;
@@ -4511,19 +4542,158 @@ fn gitlink_missing_object_exact_by_oid_mode() {
     entry.mode = 0o160000;
     index.add(entry);
     index.save(&index_path).expect("save index");
-    fs::create_dir_all(repo.path().join("new-sub")).unwrap();
 
-    // The point is that `status` ANSWERS: a gitlink whose object is absent
-    // must not fail the command, and must not pair with a regular blob.
     let out = run_libra_command(&["--json", "status"], repo.path());
-    assert_cli_success(&out, "status with a gitlink whose object is missing");
+    assert_cli_success(
+        &out,
+        "status answers even though the gitlink's commit object is absent",
+    );
     let doc: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+
+    // The two contract points that hold regardless of how the worktree side
+    // is represented: the command does not fail on the missing object, and
+    // the gitlink never pairs with a regular blob.
     assert!(
-        doc["data"]["renames"]
-            .as_array()
-            .is_some_and(|r| r.iter().all(|x| x["to"] != "anchor.txt")),
+        doc["data"]["renames"].as_array().is_some_and(|r| r
+            .iter()
+            .all(|x| x["to"] != "anchor.txt" && x["from"] != "anchor.txt")),
         "a gitlink never pairs with a regular blob: {doc}"
+    );
+    // The engine-level (oid, mode) pairing itself is pinned directly, since
+    // a real moved submodule needs a materialized checkout on both sides:
+    // see `gitlink_never_pairs_with_a_regular_blob` for the kind matrix, and
+    // here for the positive arm with an ABSENT object.
+    {
+        use std::path::PathBuf;
+
+        use libra::command::rename_detect::{
+            BlobEvidence, BlobKind, BlobRef, ContentOutcome, RenameContentSource,
+            RenameDetectConfig, RenameSnapshot, SkipReason, match_pairs,
+        };
+
+        struct NoObjects;
+        impl RenameContentSource for NoObjects {
+            fn old_content(&mut self, _path: &Path, _blob: &BlobRef) -> ContentOutcome {
+                ContentOutcome::Skipped(SkipReason::ObjectMissing)
+            }
+            fn new_content(&mut self, _path: &Path, _blob: &BlobRef) -> ContentOutcome {
+                ContentOutcome::Skipped(SkipReason::ObjectMissing)
+            }
+        }
+
+        let gitlink = BlobRef {
+            kind: BlobKind::Gitlink,
+            mode: 0o160000,
+            size: None,
+            evidence: BlobEvidence::KnownObjectId { oid: phantom },
+        };
+        let mut snapshot = RenameSnapshot::default();
+        snapshot
+            .old_map
+            .insert(PathBuf::from("old-sub"), gitlink.clone());
+        snapshot.new_map.insert(PathBuf::from("new-sub"), gitlink);
+        let outcome = match_pairs(
+            &snapshot,
+            &RenameDetectConfig {
+                threshold: 30_000,
+                rename_limit: 1000,
+                comparison_budget: None,
+            },
+            &mut NoObjects,
+        );
+        assert_eq!(
+            outcome.matches.len(),
+            1,
+            "a moved gitlink pairs by (oid, mode) with NO object read: {outcome:?}"
+        );
+        assert_eq!(outcome.matches[0].old, PathBuf::from("old-sub"));
+        assert_eq!(outcome.matches[0].new, PathBuf::from("new-sub"));
+        assert!(outcome.matches[0].exact, "identical commit ids are exact");
+        assert_eq!(outcome.matches[0].score_percent(), 100);
+    }
+}
+
+/// §B.4 shared-scorer parity: with DUPLICATE content on both sides, which
+/// old path pairs with which new path is a choice, not a given. `status` and
+/// `diff` must make the SAME choice — same-basename first, then path-byte
+/// order — or the same repository reports two different rename sets
+/// depending on which command you ask.
+#[test]
+fn diff_and_status_agree_on_duplicate_content_pairings() {
+    let body = "duplicate content\nline two\nline three\n";
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    // Two sources with IDENTICAL content; one destination reuses a source's
+    // basename, so the same-basename preference decides the pairing.
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/alpha.txt"), body).unwrap();
+    fs::write(repo.path().join("src/beta.txt"), body).unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the fixture");
+    let commit = run_libra_command(&["commit", "-m", "base"], repo.path());
+    assert_cli_success(&commit, "commit the fixture");
+
+    fs::create_dir_all(repo.path().join("dst")).unwrap();
+    fs::remove_file(repo.path().join("src/alpha.txt")).unwrap();
+    fs::remove_file(repo.path().join("src/beta.txt")).unwrap();
+    // `dst/beta.txt` shares a basename with `src/beta.txt`; `dst/zzz.txt`
+    // shares one with nothing.
+    fs::write(repo.path().join("dst/beta.txt"), body).unwrap();
+    fs::write(repo.path().join("dst/zzz.txt"), body).unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the moves");
+
+    // status's view.
+    let doc: serde_json::Value =
+        serde_json::from_str(&status_stdout(repo.path(), &["--json", "status"])).expect("json");
+    let mut status_pairs: Vec<(String, String)> = doc["data"]["renames"]
+        .as_array()
+        .expect("renames")
+        .iter()
+        .map(|r| {
+            (
+                r["from"].as_str().unwrap_or_default().to_string(),
+                r["to"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    status_pairs.sort();
+    assert_eq!(status_pairs.len(), 2, "both moves pair: {doc}");
+    // The engine consumes SOURCES in path-byte order, each preferring a
+    // same-basename destination and otherwise taking the byte-smallest — so
+    // `src/alpha.txt` (first source, no basename match) claims
+    // `dst/beta.txt`. The point of this test is not which rule wins but that
+    // BOTH commands apply the same one, so the expectation is pinned here
+    // and then required of `diff` verbatim.
+    assert_eq!(
+        status_pairs,
+        vec![
+            ("src/alpha.txt".to_string(), "dst/beta.txt".to_string()),
+            ("src/beta.txt".to_string(), "dst/zzz.txt".to_string()),
+        ],
+        "source-ordered greedy selection: {status_pairs:?}"
+    );
+
+    // diff's view of the same staged state.
+    let diff = run_libra_command(&["diff", "--staged", "--name-status"], repo.path());
+    assert_cli_success(&diff, "diff --staged --name-status");
+    let text = String::from_utf8_lossy(&diff.stdout).into_owned();
+    let mut diff_pairs: Vec<(String, String)> = text
+        .lines()
+        .filter(|l| l.starts_with('R'))
+        .filter_map(|l| {
+            let mut fields = l.split('\t');
+            let _ = fields.next()?;
+            Some((fields.next()?.to_string(), fields.next()?.to_string()))
+        })
+        .collect();
+    diff_pairs.sort();
+    assert_eq!(
+        diff_pairs, status_pairs,
+        "diff and status must report the SAME pairings for duplicate content:\n\
+         diff: {diff_pairs:?}\nstatus: {status_pairs:?}\ndiff output:\n{text}"
     );
 }
 

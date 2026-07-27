@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 shared-scorer parity)
+
+- **`diff` and `status` now report the SAME rename pairings.** Both apply the
+  shared engine's exact-bucket rule — sources consumed in path-byte order,
+  each preferring a same-basename destination and otherwise the byte-smallest
+  candidate — and both break exhaustive-stage ties on path bytes rather than
+  on transient vector indexes. Previously `diff` took whichever destination
+  happened to be enumerated first, so a repository with duplicate content
+  could report one set of renames from `status` and a different set from
+  `diff`.
+- **Porcelain v2's rename record syntax is documented correctly** in the EN
+  and zh status docs and the CHANGELOG: `2 <XY> <sub> <mH> <mI> <mW> <hH>
+  <hI> R<score> <new>\t<old>`. The old text wrote `2 R<score> …`, conflating
+  the second field (`R.` staged-only, `.R` unstaged-only) with the ninth.
+
 ### Fixed (plan-20260714 R0-2 / R0-5 / R0-6 review closeout)
 
 - **`status --porcelain=v2` rename records from a SUBDIRECTORY report real
@@ -1097,8 +1112,8 @@
 
 - **`status` porcelain v2 and JSON emit proper rename records (v0.19.6,
   plan-20260714 Part B R0-5 + R0-7 JSON)**: `--porcelain=v2` now renders a
-  detected rename as Git's single `2 R<score> N... <mH> <mI> <mW> <hH> <hI>
-  R<pct> <new>\t<old>` record — with the real HEAD tree modes/hashes, index
+  detected rename as Git's single `2 <XY> N... <mH> <mI> <mW> <hH> <hI>
+  R<score> <new>\t<old>` record — with the real HEAD tree modes/hashes, index
   modes/hashes, and worktree mode (`<new> NUL <old> NUL` path field under
   `-z`) — instead of two `1 R` change rows for the endpoints. `--json` gains
   a top-level `data.renames[]` array of `{from, to, score, exact, staged,
