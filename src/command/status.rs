@@ -1056,6 +1056,7 @@ async fn collect_status_data(
     // warning per {code, source} for the whole run, so the per-side stats
     // are folded together and rendered once (see `merge_rename_stats`).
     let mut rename_stats = rename_detect::RenameDetectStats::default();
+    let mut rename_budgets = RenameBudgets::new();
     let mut maybe_index = Some(worktree.index);
 
     // Resolve rename detection (§B.5). Precedence: CLI flags always win —
@@ -1100,6 +1101,7 @@ async fn collect_status_data(
             RenameBlobSide::Known(&index_blobs),
             &mut staged_rename_details,
             &mut rename_stats,
+            &mut rename_budgets,
         );
         // §B.3.1 Git default: unstaged "new" entries are untracked paths,
         // which may only be consumed as rename destinations under the
@@ -1187,6 +1189,7 @@ async fn collect_status_data(
                 &destinations_display,
                 &mut unstaged_rename_details,
                 &mut rename_stats,
+                &mut rename_budgets,
             );
             let complete_roots: Vec<PathBuf> = outcome
                 .complete_roots
@@ -1644,6 +1647,16 @@ fn build_rename_side(
                     stat_target.symlink_metadata()
                 })
                 .unwrap_or_else(|()| Err(io::Error::new(io::ErrorKind::TimedOut, "reclaimed")));
+                // Debug-only seam for the stat→hash race, which is far too
+                // narrow to hit reliably from a test: the named path is
+                // treated as having changed TYPE between the two reads.
+                #[cfg(debug_assertions)]
+                let forced_type_race = std::env::var("LIBRA_TEST_TYPE_RACE_PATH")
+                    .ok()
+                    .filter(|target| !target.is_empty())
+                    .is_some_and(|target| repo_key == std::path::Path::new(&target));
+                #[cfg(not(debug_assertions))]
+                let forced_type_race = false;
                 let stat_kind = stat.as_ref().err().map(|error| error.kind());
                 let (kind, mode) = match stat {
                     Ok(meta) if meta.file_type().is_symlink() => (BlobKind::Symlink, 0o120000),
@@ -1690,7 +1703,7 @@ fn build_rename_side(
                 // something the recorded kind does not — a symlink target
                 // labelled `Regular` could then clear the exact gate against
                 // a blob. Drop the candidate and report the race.
-                if observed_kind != kind {
+                if observed_kind != kind || forced_type_race {
                     *snapshot_skips
                         .entry(rename_detect::SkipReason::IoFailed)
                         .or_default() += 1;
@@ -1707,6 +1720,54 @@ fn build_rename_side(
         map.insert(repo_key, blob);
     }
     map
+}
+
+/// Call-level read-budget STATE, carried between detection sides.
+///
+/// §B.3.4/§B.7 specify ONE 500k comparison cap and ONE 64 MiB read cap per
+/// `status` invocation. Constructing fresh budgets per side let a single
+/// call spend both twice, each side individually looking compliant. Only the
+/// remaining AMOUNTS travel — plain numbers — because the budget objects
+/// themselves hold `Rc` content caches and must not live across an `.await`.
+#[derive(Clone, Copy)]
+struct RenameBudgets {
+    objects_total: u64,
+    objects_slots: u32,
+    worktree_total: u64,
+    worktree_tasks: u32,
+}
+
+impl RenameBudgets {
+    fn new() -> Self {
+        let objects = rename_detect::ObjectReadBudget::with_defaults().remaining();
+        let worktree = rename_detect::WorktreeReadBudget::with_defaults().remaining();
+        Self {
+            objects_total: objects.0,
+            objects_slots: objects.1,
+            worktree_total: worktree.0,
+            worktree_tasks: worktree.1,
+        }
+    }
+
+    fn take_objects(&self) -> rename_detect::ObjectReadBudget {
+        rename_detect::ObjectReadBudget::resumed(self.objects_total, self.objects_slots)
+    }
+
+    fn take_worktree(&self) -> rename_detect::WorktreeReadBudget {
+        rename_detect::WorktreeReadBudget::resumed(self.worktree_total, self.worktree_tasks)
+    }
+
+    fn restore_objects(&mut self, budget: &rename_detect::ObjectReadBudget) {
+        let (total, slots) = budget.remaining();
+        self.objects_total = total;
+        self.objects_slots = slots;
+    }
+
+    fn restore_worktree(&mut self, budget: &rename_detect::WorktreeReadBudget) {
+        let (total, tasks) = budget.remaining();
+        self.worktree_total = total;
+        self.worktree_tasks = tasks;
+    }
 }
 
 /// Per-pair rename detail: percentage score and exactness (§B.6.4/§B.6.5),
@@ -1828,12 +1889,13 @@ fn detect_renames_with_destinations(
     destinations_display: &[PathBuf],
     details: &mut RenameDetails,
     stats_acc: &mut rename_detect::RenameDetectStats,
+    budgets: &mut RenameBudgets,
 ) -> HashSet<PathBuf> {
     let mut consumed_new: HashSet<PathBuf> = HashSet::new();
     if changes.deleted.is_empty() || destinations_display.is_empty() {
         return consumed_new;
     }
-    let mut worktree_budget = rename_detect::WorktreeReadBudget::with_defaults();
+    let mut worktree_budget = budgets.take_worktree();
     let mut snapshot_skips: HashMap<rename_detect::SkipReason, u64> = HashMap::new();
     let snapshot = rename_detect::RenameSnapshot {
         old_map: build_rename_side(
@@ -1852,7 +1914,7 @@ fn detect_renames_with_destinations(
     let mut source = StatusContentSource {
         old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
         new_is_worktree: true,
-        objects: rename_detect::ObjectReadBudget::with_defaults(),
+        objects: budgets.take_objects(),
         worktree: worktree_budget,
     };
     let mut outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
@@ -1900,14 +1962,16 @@ fn detect_renames_in_changes(
     new_side: RenameBlobSide<'_>,
     details: &mut RenameDetails,
     stats_acc: &mut rename_detect::RenameDetectStats,
+    budgets: &mut RenameBudgets,
 ) {
     if changes.deleted.is_empty() || changes.new.is_empty() {
         return;
     }
-    // One worktree read budget covers the WHOLE batch: exact-stage OID
-    // streaming during snapshot building and the inexact content reads below
-    // draw from the same caps (§B.3.4).
-    let mut worktree_budget = rename_detect::WorktreeReadBudget::with_defaults();
+    // Budgets are CALL-level, not per-side: the staged and unstaged passes
+    // draw from the same caps. Constructing them here let one `status` spend
+    // 2 × 500k comparisons and 2 × 64 MiB of reads while both sides
+    // individually looked compliant.
+    let mut worktree_budget = budgets.take_worktree();
     let mut snapshot_skips: HashMap<rename_detect::SkipReason, u64> = HashMap::new();
     let snapshot = rename_detect::RenameSnapshot {
         old_map: build_rename_side(
@@ -1926,10 +1990,14 @@ fn detect_renames_in_changes(
     let mut source = StatusContentSource {
         old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
         new_is_worktree: matches!(new_side, RenameBlobSide::Worktree),
-        objects: rename_detect::ObjectReadBudget::with_defaults(),
+        objects: budgets.take_objects(),
         worktree: worktree_budget,
     };
     let mut outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    // Hand the drawn-down budgets back so the OTHER side continues from
+    // here rather than starting fresh.
+    budgets.restore_objects(&source.objects);
+    budgets.restore_worktree(&source.worktree);
     for (reason, count) in snapshot_skips {
         *outcome.stats.content_skips.entry(reason).or_default() += count;
     }
@@ -4289,6 +4357,16 @@ enum WorktreeMode {
 /// payload is projected to repo-root paths before rendering, so it must NOT
 /// go through `current_to_workdir` a second time.
 fn get_worktree_mode_result_for_workdir(workdir_path: &std::path::Path) -> WorktreeMode {
+    // Debug-only seam: the RENDER-time unreadable branch is otherwise only
+    // reachable by winning a race between collection and rendering, so tests
+    // name the path that must report as unreadable.
+    #[cfg(debug_assertions)]
+    if let Ok(target) = std::env::var("LIBRA_TEST_UNREADABLE_MODE_PATH")
+        && !target.is_empty()
+        && workdir_path == std::path::Path::new(&target)
+    {
+        return WorktreeMode::Unreadable;
+    }
     let abs_path = util::workdir_to_absolute(workdir_path);
     match std::fs::symlink_metadata(&abs_path) {
         Ok(metadata) => {

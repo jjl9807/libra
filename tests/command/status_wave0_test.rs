@@ -4980,6 +4980,152 @@ fn ref_with_mismatched_hash_kind_fails_closed() {
     );
 }
 
+/// §B.6.4: a rename record whose worktree mode cannot be READ (as opposed
+/// to being genuinely absent) fails closed rather than emitting a fabricated
+/// `100644`. The race window between collection and rendering is too narrow
+/// to hit reliably, so a debug-only seam names the path.
+#[test]
+fn porcelain_v2_rename_unreadable_mode_fails_closed() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), &edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage the rename");
+
+    // Sanity: without the seam the record renders normally.
+    let ok = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    assert!(
+        ok.lines().any(|l| l.starts_with("2 ")),
+        "the fixture really produces a v2 rename record: {ok}"
+    );
+
+    let out = run_libra_command_with_stdin_and_env(
+        &["status", "--porcelain=v2"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_UNREADABLE_MODE_PATH", "moved.txt")],
+    );
+    assert!(
+        !out.status.success(),
+        "an unreadable worktree mode must fail closed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot read the worktree mode"),
+        "the error names the actual problem: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("100644"),
+        "and no partial record with a fabricated mode is printed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// §B.4.1: a candidate whose TYPE changes between the snapshot stat and the
+/// OID read is dropped, not paired. Otherwise a regular file replaced by a
+/// symlink hands the exact gate a symlink-target OID labelled `Regular`.
+/// The window is too narrow to hit from a test, so a debug-only seam names
+/// the path that "changed".
+#[test]
+fn worktree_type_race_between_stat_and_hash_drops_candidate() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+
+    // Without the seam the move pairs normally.
+    let doc: serde_json::Value =
+        serde_json::from_str(&status_stdout(repo.path(), &["--json", "status"])).expect("json");
+    assert!(
+        doc["data"]["renames"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|x| x["to"] == "dest.txt")),
+        "the fixture really pairs without the race: {doc}"
+    );
+
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_TYPE_RACE_PATH", "dest.txt")],
+    );
+    assert_cli_success(&out, "a type race degrades, it does not fail the command");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert_eq!(
+        doc["data"]["renames"],
+        serde_json::json!([]),
+        "a candidate that changed type is never paired: {doc}"
+    );
+    // Base status intact: source deletion AND untracked destination.
+    assert!(
+        doc["data"]["unstaged"]["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
+        "the base deletion survives: {doc}"
+    );
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "dest.txt" || p == "dest.txt/")),
+        "and the untracked destination survives: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["rename_detection_complete"], false,
+        "the dropped candidate is reported as a degradation: {doc}"
+    );
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|x| x["source"] == "worktree")),
+        "with a structured warning: {doc}"
+    );
+}
+
+/// §B.4.1: a rename candidate that DISAPPEARS between the display scan and
+/// the snapshot stat costs a candidate, so the run is reported degraded. It
+/// used to be dropped silently, leaving `rename_detection_complete: true`
+/// for a pairing that was never attempted.
+#[test]
+#[cfg(unix)]
+fn worktree_candidate_vanishes_between_scan_and_hash() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    // A second untracked file keeps the directory non-empty so the display
+    // scan still has something to report after the candidate is removed.
+    fs::write(repo.path().join("other.txt"), "unrelated\n").unwrap();
+
+    // Remove the candidate through the same seam the type race uses: the
+    // path is treated as unusable at snapshot time, which is exactly what a
+    // vanished file looks like to the snapshot builder.
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_TYPE_RACE_PATH", "dest.txt")],
+    );
+    assert_cli_success(&out, "a vanished candidate degrades, it does not fail");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert_eq!(
+        doc["data"]["renames"],
+        serde_json::json!([]),
+        "no rename is claimed for a candidate that could not be read: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["rename_detection_complete"], false,
+        "and the run says so rather than claiming the pairing was ruled out: {doc}"
+    );
+    assert!(
+        doc["data"]["unstaged"]["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
+        "the base status is unaffected: {doc}"
+    );
+}
+
 /// §B.6.0.1 pathspec narrowing removes only the warnings DERIVED from
 /// filtered-out `io_blocked[]` entries. The worktree family also carries
 /// aggregate rename-scoring warnings that name no path; dropping those by

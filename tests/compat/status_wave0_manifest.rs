@@ -71,6 +71,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "porcelain_v1_rename_output_stays_add_delete",
     "porcelain_v1_uses_rename_arrow_when_detected",
     "porcelain_v2_rename_from_subdirectory_keeps_real_metadata",
+    "porcelain_v2_rename_unreadable_mode_fails_closed",
     "porcelain_v2_staged_modify_then_worktree_rename_emits_mr",
     "porcelain_v2_staged_rename_mode_hash_fields",
     "porcelain_v2_unmerged_u_line",
@@ -147,6 +148,8 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "tracked_scan_io_timeout_is_reported_not_hung",
     "tracked_unreadable_path_fails_closed_not_deleted",
     "unmerged_stage_presence_to_xy_mapping",
+    "worktree_candidate_vanishes_between_scan_and_hash",
     "worktree_exact_matches_known_index_oid",
     "worktree_read_failure_degrades_with_warning_not_silence",
+    "worktree_type_race_between_stat_and_hash_drops_candidate",
 ];

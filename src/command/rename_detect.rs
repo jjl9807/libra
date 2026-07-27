@@ -683,6 +683,21 @@ enum ContentSlot {
 }
 
 impl ObjectReadBudget {
+    /// Remaining (total bytes, object slots) — the state a caller carries
+    /// between detection sides. Plain numbers, so the caller never has to
+    /// hold the budget itself (its cache is `Rc`-based and not `Send`).
+    pub fn remaining(&self) -> (u64, u32) {
+        (self.remaining_total, self.remaining_objects)
+    }
+
+    /// A budget resumed from a previous side's remaining amounts.
+    pub fn resumed(remaining_total: u64, remaining_objects: u32) -> Self {
+        let mut budget = Self::with_defaults();
+        budget.remaining_total = remaining_total;
+        budget.remaining_objects = remaining_objects;
+        budget
+    }
+
     pub fn with_defaults() -> Self {
         Self::new(
             OBJECT_READ_MAX_OBJECT_BYTES,
@@ -776,6 +791,19 @@ pub(crate) struct WorktreeReadBudget {
 }
 
 impl WorktreeReadBudget {
+    /// Remaining (total bytes, task slots); see [`ObjectReadBudget::remaining`].
+    pub fn remaining(&self) -> (u64, u32) {
+        (self.remaining_total, self.remaining_tasks)
+    }
+
+    /// A budget resumed from a previous side's remaining amounts.
+    pub fn resumed(remaining_total: u64, remaining_tasks: u32) -> Self {
+        let mut budget = Self::with_defaults();
+        budget.remaining_total = remaining_total;
+        budget.remaining_tasks = remaining_tasks;
+        budget
+    }
+
     pub fn with_defaults() -> Self {
         Self::new(
             WORKTREE_READ_MAX_FILE_BYTES,

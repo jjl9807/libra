@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review round 9)
+
+- **A single `status` no longer spends its read budgets twice.** The staged
+  and unstaged passes each built fresh `ObjectReadBudget`/`WorktreeReadBudget`
+  instances, so one invocation could use 2 × 500k comparisons and 2 × 64 MiB
+  of reads while each side individually looked compliant. The remaining
+  amounts now travel between the two passes.
+- `Cargo.lock` is kept in step with the version bump, so the release
+  workflow's `cargo build --locked` cannot fail on a stale lockfile.
+
 ### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review round 8)
 
 - **A porcelain v2 rename record with missing SCORE metadata fails closed**
