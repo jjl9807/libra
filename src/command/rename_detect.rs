@@ -51,14 +51,14 @@ pub(crate) const WORKTREE_READ_DEADLINE: Duration = Duration::from_secs(5);
 /// pairs `Regular` with `Regular`; exact pairing additionally requires the
 /// kinds to be equal (and for gitlinks, the modes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum BlobKind {
+pub enum BlobKind {
     Regular,
     Symlink,
     Gitlink,
 }
 
 impl BlobKind {
-    pub(crate) fn from_mode(mode: u32) -> Self {
+    pub fn from_mode(mode: u32) -> Self {
         match mode & 0o170000 {
             0o160000 => BlobKind::Gitlink,
             0o120000 => BlobKind::Symlink,
@@ -71,7 +71,7 @@ impl BlobKind {
 /// `ComputedWorktreeThisCall` may participate in exact pairing; `Unknown`
 /// blobs join inexact scoring only after their content is successfully read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BlobEvidence {
+pub enum BlobEvidence {
     /// OID recorded by HEAD tree / index stage-0 (content-addressed fact).
     KnownObjectId { oid: ObjectHash },
     /// OID streamed from the worktree during this status/diff call.
@@ -92,67 +92,89 @@ impl BlobEvidence {
             BlobEvidence::Unknown => None,
         }
     }
+
+    /// True only for a content-addressed fact recorded by HEAD/index.
+    fn is_known(&self) -> bool {
+        matches!(self, BlobEvidence::KnownObjectId { .. })
+    }
+
+    /// §B.4.1 exact allow-list: a pair may skip content scoring only when
+    /// AT LEAST ONE side's OID is a recorded fact (K/K, K/C, C/K).
+    /// `ComputedWorktreeThisCall ↔ ComputedWorktreeThisCall` is refused —
+    /// two same-call worktree hashes prove the bytes match right now but
+    /// neither side is anchored in the object store, so the pair must go
+    /// through the ordinary inexact path instead of being asserted exact
+    /// (fail closed). `Unknown` never pairs exactly at all.
+    fn exact_pair_allowed(old: &Self, new: &Self) -> bool {
+        match (old, new) {
+            (BlobEvidence::Unknown, _) | (_, BlobEvidence::Unknown) => false,
+            (old, new) => old.is_known() || new.is_known(),
+        }
+    }
 }
 
 /// One side of a rename candidate (§B.4.1 唯一定义).
 #[derive(Debug, Clone)]
-pub(crate) struct BlobRef {
-    pub(crate) kind: BlobKind,
-    pub(crate) mode: u32,
-    pub(crate) size: Option<u64>,
-    pub(crate) evidence: BlobEvidence,
+pub struct BlobRef {
+    pub kind: BlobKind,
+    pub mode: u32,
+    pub size: Option<u64>,
+    pub evidence: BlobEvidence,
 }
 
 /// Snapshot of both sides of a rename-detection run. For the staged side
 /// `old = HEAD` / `new = index stage-0`; for the unstaged side `old = index
 /// stage-0` / `new = worktree` (§B.4.1). Keys are repo-relative paths.
 #[derive(Debug, Default)]
-pub(crate) struct RenameSnapshot {
-    pub(crate) old_map: HashMap<PathBuf, BlobRef>,
-    pub(crate) new_map: HashMap<PathBuf, BlobRef>,
+pub struct RenameSnapshot {
+    pub old_map: HashMap<PathBuf, BlobRef>,
+    pub new_map: HashMap<PathBuf, BlobRef>,
 }
 
 /// Engine knobs. `threshold` uses Git's 0..=60000 scale; `rename_limit == 0`
 /// means "no per-side cap"; `comparison_budget == None` means unlimited
 /// (diff's default per §B.7).
 #[derive(Debug, Clone)]
-pub(crate) struct RenameDetectConfig {
-    pub(crate) threshold: u32,
-    pub(crate) rename_limit: usize,
-    pub(crate) comparison_budget: Option<u64>,
+pub struct RenameDetectConfig {
+    pub threshold: u32,
+    pub rename_limit: usize,
+    pub comparison_budget: Option<u64>,
 }
 
 /// A matched rename pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RenameMatch {
-    pub(crate) old: PathBuf,
-    pub(crate) new: PathBuf,
-    pub(crate) exact: bool,
+pub struct RenameMatch {
+    pub old: PathBuf,
+    pub new: PathBuf,
+    pub exact: bool,
     /// Git-scale similarity (0..=60000). Exact pairs always carry 60000.
-    pub(crate) internal_score: u32,
+    pub internal_score: u32,
 }
 
 impl RenameMatch {
     /// Percentage (0..=100) as rendered by porcelain v2 / JSON. Git floors,
     /// except a non-exact 60000 caps at 100 anyway.
-    pub(crate) fn score_percent(&self) -> u32 {
+    pub fn score_percent(&self) -> u32 {
         (self.internal_score / 600).min(100)
     }
 }
 
 /// Why a candidate's content could not be scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum SkipReason {
+pub enum SkipReason {
     ObjectMissing,
     ObjectCorrupt,
     ObjectUnavailable,
     TooLarge,
     BudgetExceeded,
     IoFailed,
+    /// The read exceeded the per-operation I/O deadline and the run was
+    /// reclaimed (§B.3.3) rather than hanging.
+    IoTimeout,
 }
 
 /// Outcome of a content read for inexact scoring.
-pub(crate) enum ContentOutcome {
+pub enum ContentOutcome {
     Content(Rc<Vec<u8>>),
     Skipped(SkipReason),
 }
@@ -160,32 +182,32 @@ pub(crate) enum ContentOutcome {
 /// Caller-supplied content provider. Implementations own read budgets and
 /// OID de-duplication; the engine caches spanhash entries per path, so each
 /// path is requested at most once per run.
-pub(crate) trait RenameContentSource {
+pub trait RenameContentSource {
     fn old_content(&mut self, path: &Path, blob: &BlobRef) -> ContentOutcome;
     fn new_content(&mut self, path: &Path, blob: &BlobRef) -> ContentOutcome;
 }
 
 /// Run statistics for warnings and tests (§B.4.2.6).
 #[derive(Debug, Default, Clone)]
-pub(crate) struct RenameDetectStats {
-    pub(crate) comparisons: u64,
+pub struct RenameDetectStats {
+    pub comparisons: u64,
     /// Exhaustive stage skipped because a side exceeded `rename_limit`.
-    pub(crate) skipped_by_limit: bool,
+    pub skipped_by_limit: bool,
     /// Comparison budget hit: every exhaustive edge was discarded and only
     /// exact + basename pairs survive (§B.4.2.5 触顶规则).
-    pub(crate) exhaustive_discarded: bool,
+    pub exhaustive_discarded: bool,
     /// Peak number of retained inexact edges (`≤ PER_DEST_TOP_K × dests`).
-    pub(crate) peak_edges: usize,
+    pub peak_edges: usize,
     /// Per-reason counts of candidates dropped by content-read failures.
-    pub(crate) content_skips: HashMap<SkipReason, u64>,
+    pub content_skips: HashMap<SkipReason, u64>,
 }
 
 /// Engine output.
 #[derive(Debug, Default)]
-pub(crate) struct RenameDetectOutcome {
+pub struct RenameDetectOutcome {
     /// Matched pairs, sorted by (old, new) path bytes.
-    pub(crate) matches: Vec<RenameMatch>,
-    pub(crate) stats: RenameDetectStats,
+    pub matches: Vec<RenameMatch>,
+    pub stats: RenameDetectStats,
 }
 
 /// Per-path spanhash cache entry: `None` when content was skipped.
@@ -199,7 +221,7 @@ pub(crate) struct SpanhashEntry {
 }
 
 /// Match renames between the two snapshot sides (§B.4.2 stage order).
-pub(crate) fn match_pairs(
+pub fn match_pairs(
     snapshot: &RenameSnapshot,
     config: &RenameDetectConfig,
     source: &mut dyn RenameContentSource,
@@ -239,11 +261,25 @@ pub(crate) fn match_pairs(
         }
         // Prefer a same-basename destination; fall back to the first (path
         // byte order) candidate — deterministic one-to-one consumption.
-        let same_basename = candidates
+        // Only destinations whose evidence pairing is allowed (§B.4.1)
+        // may be consumed here; a C/C pair falls through to inexact.
+        let allowed: Vec<&PathBuf> = candidates
+            .iter()
+            .copied()
+            .filter(|path| {
+                remaining_new.get(path).is_some_and(|new_blob| {
+                    BlobEvidence::exact_pair_allowed(&old_blob.evidence, &new_blob.evidence)
+                })
+            })
+            .collect();
+        if allowed.is_empty() {
+            continue;
+        }
+        let same_basename = allowed
             .iter()
             .find(|p| p.file_name() == old_path.file_name())
             .copied();
-        let picked: &PathBuf = match same_basename.or_else(|| candidates.first().copied()) {
+        let picked: &PathBuf = match same_basename.or_else(|| allowed.first().copied()) {
             Some(picked) => picked,
             None => continue,
         };
@@ -598,7 +634,7 @@ enum ContentSlot {
 }
 
 impl ObjectReadBudget {
-    pub(crate) fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self {
         Self::new(
             OBJECT_READ_MAX_OBJECT_BYTES,
             OBJECT_READ_MAX_TOTAL_BYTES,
@@ -607,7 +643,7 @@ impl ObjectReadBudget {
         )
     }
 
-    pub(crate) fn new(
+    pub fn new(
         per_object_cap: u64,
         max_total_bytes: u64,
         max_objects: u32,
@@ -625,7 +661,7 @@ impl ObjectReadBudget {
     /// Read a blob's content under budget, de-duplicating by OID: repeated
     /// requests for the same object return the cached outcome without
     /// consuming budget again.
-    pub(crate) fn read_blob(&mut self, oid: &ObjectHash) -> ContentOutcome {
+    pub fn read_blob(&mut self, oid: &ObjectHash) -> ContentOutcome {
         if let Some(slot) = self.cache.get(oid) {
             return match slot {
                 ContentSlot::Content(bytes) => ContentOutcome::Content(bytes.clone()),
@@ -691,7 +727,7 @@ pub(crate) struct WorktreeReadBudget {
 }
 
 impl WorktreeReadBudget {
-    pub(crate) fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self {
         Self::new(
             WORKTREE_READ_MAX_FILE_BYTES,
             WORKTREE_READ_MAX_TOTAL_BYTES,
@@ -700,7 +736,7 @@ impl WorktreeReadBudget {
         )
     }
 
-    pub(crate) fn new(
+    pub fn new(
         per_file_cap: u64,
         max_total_bytes: u64,
         max_tasks: u32,
@@ -724,7 +760,7 @@ impl WorktreeReadBudget {
 
     /// Read the blob bytes Git would store for a worktree path (regular file
     /// content, LFS pointer, or symlink target bytes) under budget.
-    pub(crate) fn read_worktree_blob(&mut self, abs_path: &Path) -> ContentOutcome {
+    pub fn read_worktree_blob(&mut self, abs_path: &Path) -> ContentOutcome {
         if !self.take_task() {
             return ContentOutcome::Skipped(SkipReason::BudgetExceeded);
         }
@@ -744,20 +780,48 @@ impl WorktreeReadBudget {
             if metadata.len() > self.per_file_cap.min(self.remaining_total) {
                 return ContentOutcome::Skipped(SkipReason::TooLarge);
             }
-            return match crate::utils::lfs::generate_pointer_file_result(abs_path) {
-                Ok((pointer, _)) => {
+            // Bounded AND deadline-guarded: the pointer is tiny, but
+            // producing it hashes the whole file, so the cap is re-applied
+            // inside the read (the stat above can be defeated by a file that
+            // grows) and the run is reclaimable on a hung mount.
+            let cap = self.per_file_cap.min(self.remaining_total);
+            let lfs_path = abs_path.to_path_buf();
+            return match crate::command::status_probe::with_io_deadline(move || {
+                crate::utils::lfs::generate_pointer_file_bounded(&lfs_path, cap)
+            }) {
+                Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
+                Ok(Ok(Some((pointer, _)))) => {
                     self.remaining_total = self.remaining_total.saturating_sub(metadata.len());
                     ContentOutcome::Content(Rc::new(pointer.into_bytes()))
                 }
-                Err(_) => ContentOutcome::Skipped(SkipReason::IoFailed),
+                Ok(Ok(None)) => ContentOutcome::Skipped(SkipReason::TooLarge),
+                Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
             };
         }
-        if metadata.len() > self.per_file_cap.min(self.remaining_total) {
+        let cap = self.per_file_cap.min(self.remaining_total);
+        if metadata.len() > cap {
             return ContentOutcome::Skipped(SkipReason::TooLarge);
         }
-        match std::fs::read(abs_path) {
-            Ok(bytes) => self.account(bytes),
-            Err(_) => ContentOutcome::Skipped(SkipReason::IoFailed),
+        // §B.3.4 bounded read: `read` the file through a `take(cap + 1)`
+        // limiter so a file that GREW between the metadata check and the
+        // read (or a growing FIFO/FUSE path) can never allocate past the
+        // budget, and run it under the shared I/O deadline so a hung mount
+        // reclaims the run instead of blocking `status` forever.
+        let path = abs_path.to_path_buf();
+        let outcome = crate::command::status_probe::with_io_deadline(move || {
+            use std::io::Read as _;
+
+            let mut file = std::fs::File::open(&path)?;
+            let mut bytes = Vec::new();
+            file.by_ref()
+                .take(cap.saturating_add(1))
+                .read_to_end(&mut bytes)?;
+            Ok::<Vec<u8>, std::io::Error>(bytes)
+        });
+        match outcome {
+            Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
+            Ok(Ok(bytes)) => self.account(bytes),
+            Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
         }
     }
 
@@ -773,7 +837,7 @@ impl WorktreeReadBudget {
     /// Stream a worktree path's Git blob OID and byte size under budget
     /// (§B.4.1 `worktree_blob_oid_and_size`). Costs one task; the streamed
     /// bytes are charged against the total budget but never buffered.
-    pub(crate) fn worktree_blob_oid_and_size(
+    pub fn worktree_blob_oid_and_size(
         &mut self,
         abs_path: &Path,
     ) -> Result<(ObjectHash, u64), SkipReason> {
@@ -792,18 +856,45 @@ impl WorktreeReadBudget {
             let oid = git_internal::internal::object::blob::Blob::from_content_bytes(bytes).id;
             return Ok((oid, len));
         }
-        if metadata.len() > self.per_file_cap.min(self.remaining_total) {
+        let cap = self.per_file_cap.min(self.remaining_total);
+        if metadata.len() > cap {
             return Err(SkipReason::TooLarge);
         }
         if crate::utils::lfs::is_lfs_tracked(abs_path) {
-            let (pointer, _) = crate::utils::lfs::generate_pointer_file_result(abs_path)
-                .map_err(|_| SkipReason::IoFailed)?;
+            // The POINTER is tiny, but producing it requires a full-file
+            // SHA-256, so this read needs the same deadline as any other:
+            // the size cap above already rejected anything over the
+            // per-file budget, and the deadline covers a hung mount.
+            let pointer_path = abs_path.to_path_buf();
+            let (pointer, _) = match crate::command::status_probe::with_io_deadline(move || {
+                crate::utils::lfs::generate_pointer_file_bounded(&pointer_path, cap)
+            }) {
+                Err(()) => return Err(SkipReason::IoTimeout),
+                Ok(Ok(Some(result))) => result,
+                // Over the cap, or the file changed size mid-read.
+                Ok(Ok(None)) => return Err(SkipReason::TooLarge),
+                Ok(Err(_)) => return Err(SkipReason::IoFailed),
+            };
             self.remaining_total = self.remaining_total.saturating_sub(metadata.len());
             let len = pointer.len() as u64;
             let oid = git_internal::internal::object::blob::Blob::from_content(&pointer).id;
             return Ok((oid, len));
         }
-        let oid = super::stream_file_blob_hash(abs_path).map_err(|_| SkipReason::IoFailed)?;
+        // The cap is re-applied INSIDE the read: the stat above can be
+        // defeated by a file that grows before the bytes are consumed, and
+        // an unbounded hash of a now-huge file would blow the read budget
+        // it was supposed to respect.
+        let hash_path = abs_path.to_path_buf();
+        let oid = match crate::command::status_probe::with_io_deadline(move || {
+            super::stream_file_blob_hash_bounded(&hash_path, cap)
+        }) {
+            Err(()) => return Err(SkipReason::IoTimeout),
+            Ok(Ok(Some(oid))) => oid,
+            // Over the cap, or the file changed size mid-read: skip the
+            // candidate rather than trust a hash of a moving target.
+            Ok(Ok(None)) => return Err(SkipReason::TooLarge),
+            Ok(Err(_)) => return Err(SkipReason::IoFailed),
+        };
         self.remaining_total = self.remaining_total.saturating_sub(metadata.len());
         Ok((oid, metadata.len()))
     }

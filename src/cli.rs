@@ -1946,6 +1946,21 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         command::diff::record_algorithm_selector_events(diff_args, &argv);
     }
     apply_global_runtime_flags(&args)?;
+    // Declare the output mode BEFORE anything that can raise a warning. The
+    // repository preflight below runs ahead of `OutputConfig::resolve`, so
+    // setting the flag there would let a preflight warning reach stderr
+    // milliseconds before the JSON envelope that is supposed to carry it —
+    // the stderr-only channel §B.5 forbids.
+    utils::output::set_structured_output(args.json.is_some() || args.machine);
+    // Debug-only seam: the delivery matrix for PREFLIGHT warnings (raised
+    // before any command runs) is otherwise only reachable by corrupting a
+    // repository, so tests inject one here instead.
+    #[cfg(debug_assertions)]
+    if let Ok(message) = std::env::var("LIBRA_TEST_PREFLIGHT_WARNING")
+        && !message.is_empty()
+    {
+        utils::error::emit_warning(message);
+    }
     // Auto-upgrade transaction recovery gate (§A.7/§A.10): a crashed install
     // must be resolved before any repo preflight or user command runs. Inert
     // (no I/O) until release keys are provisioned; a fatal, unrecoverable
@@ -2008,6 +2023,10 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         &args.progress,
     );
     output.apply_color_override();
+    // Warnings raised from here on (including repository preflight, which
+    // runs before the command itself) are delivered through the structured
+    // envelope when one is being rendered, instead of onto stderr.
+    utils::output::set_structured_output(output.is_json());
 
     // Most object-writing commands enqueue recoverable cloud-index work and
     // report terminal failures as a durable-pending warning. Import has its own

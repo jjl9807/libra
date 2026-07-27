@@ -2380,13 +2380,13 @@ async fn run_diff(
         );
         if rename_skips.inexact_skipped_by_limit {
             crate::utils::error::emit_legacy_stderr(format!(
-                "warning: skipped inexact rename detection because more than {} sources or destinations changed (diff.renameLimit); exact renames were still detected",
+                "warning: skipped inexact rename detection because more than {} sources or destinations changed (diff.renameLimit); exact and unique-basename renames were still detected",
                 config.rename_limit,
             ));
         }
         if rename_skips.inexact_discarded_by_budget {
             crate::utils::error::emit_legacy_stderr(
-                "warning: inexact rename detection exceeded diff.renameComparisonBudget; scored candidates were discarded and only exact renames were detected",
+                "warning: inexact rename detection exceeded diff.renameComparisonBudget; the exhaustive pass was discarded and only exact and unique-basename renames were detected",
             );
         }
     }
@@ -3663,9 +3663,68 @@ fn apply_rename_detection(
         used_add[ai] = true;
     }
 
+    const MAX_SCORE: u32 = 60000;
+
+    // §B.4.2.3 stage order: the unique-basename pass runs BEFORE (and
+    // independently of) the bounded exhaustive stage, so a tripped
+    // renameLimit or comparison budget still keeps the pairs a basename
+    // proves — degradation must never demote a stable rename to D+A
+    // (this is the same staged order `status` gets from `match_pairs`).
+    if threshold < MAX_SCORE {
+        let basename_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+        let mut old_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for &di in &deleted {
+            if !used_del[di] {
+                old_by_name
+                    .entry(basename_of(&files[di].path))
+                    .or_default()
+                    .push(di);
+            }
+        }
+        let mut new_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for &ai in &added {
+            if !used_add[ai] {
+                new_by_name
+                    .entry(basename_of(&files[ai].path))
+                    .or_default()
+                    .push(ai);
+            }
+        }
+        let mut names: Vec<&String> = old_by_name.keys().collect();
+        names.sort();
+        let unique_pairs: Vec<(usize, usize)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let olds = old_by_name.get(name)?;
+                let news = new_by_name.get(name)?;
+                (olds.len() == 1 && news.len() == 1).then(|| (olds[0], news[0]))
+            })
+            .collect();
+        for (di, ai) in unique_pairs {
+            if used_del[di] || used_add[ai] {
+                continue;
+            }
+            // Like the shared engine's stage 3, a basename pair is still
+            // SCORED — a same-named delete+add whose contents are
+            // unrelated must not be reported as a rename.
+            let (Some(old_body), Some(new_body)) = (
+                load(&files[di].path, first_map),
+                load(&files[ai].path, second_map),
+            ) else {
+                continue;
+            };
+            let score = similarity_score(&old_body, &new_body);
+            if score < threshold {
+                continue;
+            }
+            used_del[di] = true;
+            used_add[ai] = true;
+            pairs.push((di, ai, score));
+        }
+    }
+
     let remaining_deleted = deleted.iter().filter(|&&di| !used_del[di]).count();
     let remaining_added = added.iter().filter(|&&ai| !used_add[ai]).count();
-    const MAX_SCORE: u32 = 60000;
     let inexact_skipped = threshold < MAX_SCORE
         && inexact_rename_detection_exceeds_limit(remaining_deleted, remaining_added, rename_limit);
 

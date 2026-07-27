@@ -94,7 +94,10 @@ pub mod rebase;
 pub mod reflog;
 pub mod remote;
 pub mod remove;
-pub(crate) mod rename_detect;
+// The shared diffcore rename engine (§B.4). Public so the wave-0
+// integration suite can pin engine-level contracts (evidence allow-list,
+// budget independence) that no CLI path can construct today.
+pub mod rename_detect;
 pub mod repack;
 pub mod replace;
 pub mod rerere;
@@ -316,6 +319,55 @@ pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
 #[cfg(not(unix))]
 pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
     target.to_string_lossy().as_bytes().to_vec()
+}
+
+/// Hash a worktree file as a Git blob under a hard byte cap.
+///
+/// Returns `Ok(None)` when the file exceeds `cap`, or when its size changes
+/// under the read. The second case matters for correctness as much as for
+/// budget: the blob header commits to a length before the body is read, so
+/// a file that grows or shrinks mid-read would otherwise yield a WRONG
+/// object id that silently claims to be the file's content. Callers that
+/// enforce a read budget must use this instead of [`stream_file_blob_hash`],
+/// whose size check can be defeated by a file that grows after the stat.
+pub(crate) fn stream_file_blob_hash_bounded(
+    path: impl AsRef<Path>,
+    cap: u64,
+) -> io::Result<Option<ObjectHash>> {
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > cap {
+        return Ok(None);
+    }
+    // Read one byte past the committed length so growth is detectable
+    // rather than silently truncated into a plausible-looking hash.
+    let mut reader = io::BufReader::new(file).take(len.saturating_add(1));
+    let mut hasher = HashAlgorithm::new();
+
+    hasher.update(b"blob ");
+    hasher.update(len.to_string().as_bytes());
+    hasher.update(b"\0");
+
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > len {
+            return Ok(None); // grew under the read
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if total != len {
+        return Ok(None); // shrank under the read
+    }
+    ObjectHash::from_bytes(&hasher.finalize())
+        .map(Some)
+        .map_err(io::Error::other)
 }
 
 fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {

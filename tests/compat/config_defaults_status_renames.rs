@@ -84,6 +84,73 @@ fn status_renames_falls_back_to_diff_renames() {
     );
 }
 
+/// The FALLBACK key has its own three-scope cascade: with `status.renames`
+/// unset everywhere, `diff.renames` resolves local → global → system just
+/// like the primary key, and an unsupported/invalid value at the winning
+/// scope fails closed. Testing only a local `diff.renames` would miss a
+/// fallback that consults the wrong scope.
+#[test]
+fn diff_renames_fallback_cascades_across_all_three_scopes() {
+    let fixture = Fixture::new();
+
+    // System scope alone drives the fallback.
+    fixture.success(
+        Path::new("/"),
+        &["config", "--system", "diff.renames", "false"],
+    );
+    let repo = staged_inexact_rename_repo(&fixture, "diff-renames-cascade");
+    assert!(
+        !status_reports_rename(&fixture, &repo),
+        "system-scope diff.renames=false is inherited by status"
+    );
+
+    // Global beats system.
+    fixture.success(
+        Path::new("/"),
+        &["config", "--global", "diff.renames", "true"],
+    );
+    assert!(
+        status_reports_rename(&fixture, &repo),
+        "global diff.renames=true beats system false"
+    );
+
+    // Local beats global.
+    fixture.success(&repo, &["config", "diff.renames", "false"]);
+    assert!(
+        !status_reports_rename(&fixture, &repo),
+        "local diff.renames=false beats global true"
+    );
+
+    // A `status.renames` at ANY scope outranks every `diff.renames` scope.
+    fixture.success(
+        Path::new("/"),
+        &["config", "--global", "status.renames", "true"],
+    );
+    assert!(
+        status_reports_rename(&fixture, &repo),
+        "global status.renames beats local diff.renames"
+    );
+    fixture.success(
+        Path::new("/"),
+        &["config", "--global", "--unset", "status.renames"],
+    );
+
+    // Unsupported/invalid values fail closed through the fallback too, at
+    // whichever scope currently wins.
+    for value in ["copy", "sideways"] {
+        fixture.success(&repo, &["config", "diff.renames", value]);
+        let out = fixture.run(&repo, &["status"]);
+        assert!(
+            !out.status.success(),
+            "diff.renames={value} must fail closed through the fallback"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("diff.renames"),
+            "the failure names the fallback key, not the primary one"
+        );
+    }
+}
+
 /// `copy`/`copies` values fail closed (R0 has no copy detection) and invalid
 /// booleans fail closed too — never a silent downgrade.
 #[test]
@@ -106,6 +173,158 @@ fn status_renames_copy_and_invalid_fail_closed() {
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("status.renames"),
         "failure names the key"
+    );
+}
+
+/// `status.renameUntracked` and `core.quotePath` are documented as strict
+/// local → global → system cascades, but the wave-0 regressions only reach
+/// global and local (they have no isolated system store). This pins the
+/// SYSTEM scope for both: a system-only value takes effect, a nearer scope
+/// overrides it, and an invalid value at the winning scope fails closed
+/// before any output — an empty stdout, not a partial status.
+#[test]
+fn rename_untracked_and_quote_path_honor_the_system_scope() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("system-scope-keys");
+    fixture.init_repo(&repo);
+    let body = "system scope content\nsecond line\n";
+    fixture.commit_file(&repo, "a.txt", body, "base");
+    fs::rename(repo.join("a.txt"), repo.join("moved.txt")).expect("worktree move");
+
+    let porcelain = |fixture: &Fixture| -> String {
+        String::from_utf8_lossy(&fixture.success(&repo, &["status", "--porcelain"]).stdout)
+            .into_owned()
+    };
+
+    // Default (unset everywhere): a tracked→untracked move stays D + ??.
+    assert!(
+        porcelain(&fixture).lines().any(|l| l == "?? moved.txt"),
+        "the extension is off by default"
+    );
+
+    // System scope alone turns it on.
+    fixture.success(
+        Path::new("/"),
+        &["config", "--system", "status.renameUntracked", "true"],
+    );
+    assert!(
+        porcelain(&fixture)
+            .lines()
+            .any(|l| l == " R a.txt -> moved.txt"),
+        "a system-scope value takes effect"
+    );
+
+    // A nearer scope overrides it.
+    fixture.success(&repo, &["config", "status.renameUntracked", "false"]);
+    assert!(
+        porcelain(&fixture).lines().any(|l| l == "?? moved.txt"),
+        "local false beats system true"
+    );
+    fixture.success(&repo, &["config", "--unset", "status.renameUntracked"]);
+
+    // Invalid at the winning (system) scope fails closed with NO output.
+    fixture.success(
+        Path::new("/"),
+        &["config", "--system", "status.renameUntracked", "sideways"],
+    );
+    let out = fixture.run(&repo, &["status", "--porcelain"]);
+    assert!(
+        !out.status.success(),
+        "an invalid system value fails closed"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "fail-closed means no partial status was printed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    fixture.success(
+        Path::new("/"),
+        &["config", "--system", "--unset", "status.renameUntracked"],
+    );
+
+    // Same three checks for core.quotePath, whose effect is visible in the
+    // escaping of a non-ASCII path.
+    fs::write(repo.join("née.txt"), "accented\n").expect("write non-ascii path");
+    fixture.success(
+        Path::new("/"),
+        &["config", "--system", "core.quotePath", "false"],
+    );
+    assert!(
+        porcelain(&fixture).contains("née.txt"),
+        "system-scope quotePath=false leaves non-ASCII unescaped"
+    );
+    fixture.success(&repo, &["config", "core.quotePath", "true"]);
+    assert!(
+        porcelain(&fixture).contains("\\303"),
+        "local true beats system false and octal-escapes the name"
+    );
+    fixture.success(&repo, &["config", "--unset", "core.quotePath"]);
+
+    fixture.success(
+        Path::new("/"),
+        &["config", "--system", "core.quotePath", "sideways"],
+    );
+    let out = fixture.run(&repo, &["status", "--porcelain"]);
+    assert!(
+        !out.status.success(),
+        "an invalid system core.quotePath fails closed"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "fail-closed means no partial status was printed: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// Precedence applies to the VALUE, not to validation. A CLI rename flag
+/// beats a *valid* config value, but it does not suppress the fail-closed
+/// parse of an unsupported/invalid one — same as Git, which parses the
+/// config before applying the command line. Documented in
+/// `docs/commands/status.md`; this pins it so the two cannot drift.
+#[test]
+fn status_renames_cli_flag_does_not_mask_an_invalid_config() {
+    let fixture = Fixture::new();
+    let repo = staged_inexact_rename_repo(&fixture, "renames-cli-vs-invalid");
+
+    // Valid value + CLI flag: the flag wins, both directions.
+    fixture.success(&repo, &["config", "status.renames", "false"]);
+    assert!(
+        String::from_utf8_lossy(&fixture.success(&repo, &["status", "--renames"]).stdout)
+            .contains("renamed:"),
+        "--renames overrides a valid status.renames=false"
+    );
+    fixture.success(&repo, &["config", "status.renames", "true"]);
+    assert!(
+        !String::from_utf8_lossy(&fixture.success(&repo, &["status", "--no-renames"]).stdout)
+            .contains("renamed:"),
+        "--no-renames overrides a valid status.renames=true"
+    );
+
+    // Unsupported/invalid values still fail closed under every rename
+    // spelling — the flag never makes a broken config invisible.
+    for value in ["copy", "sideways"] {
+        fixture.success(&repo, &["config", "status.renames", value]);
+        for flag in ["--no-renames", "--renames", "--find-renames=80"] {
+            let out = fixture.run(&repo, &["status", flag]);
+            assert!(
+                !out.status.success(),
+                "status.renames={value} with {flag} must still fail closed"
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("status.renames"),
+                "status.renames={value} with {flag} must name the key: {stderr}"
+            );
+        }
+    }
+
+    // The same holds for the diff.renames fallback.
+    fixture.success(&repo, &["config", "--unset", "status.renames"]);
+    fixture.success(&repo, &["config", "diff.renames", "copy"]);
+    let out = fixture.run(&repo, &["status", "--no-renames"]);
+    assert!(
+        !out.status.success(),
+        "an invalid diff.renames fallback fails closed under --no-renames too"
     );
 }
 

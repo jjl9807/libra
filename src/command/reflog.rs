@@ -669,17 +669,27 @@ async fn handle_expire(options: ExpireCliOptions, output: &OutputConfig) -> CliR
     // trims reflog entries and is unaffected.
     if options.updateref && !options.dry_run {
         for ref_name in &refs {
-            if let Some(branch) = ref_name.strip_prefix("refs/heads/")
-                && let Some(other) =
-                    crate::internal::head::Head::branch_checked_out_elsewhere(branch).await
-            {
-                return Err(CliError::fatal(format!(
-                    "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
-                ))
-                .with_stable_code(StableErrorCode::Unsupported)
-                .with_hint(
-                    "switch that worktree to another branch first, or run the command there",
-                ));
+            if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                let checked_out_elsewhere =
+                    crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
+                        .await
+                        .map_err(|error| {
+                            CliError::fatal(format!(
+                                "cannot verify whether '{branch}' is checked out in another \
+                                 worktree: {error}"
+                            ))
+                            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                            .with_hint("repair the repository database, then retry")
+                        })?;
+                if let Some(other) = checked_out_elsewhere {
+                    return Err(CliError::fatal(format!(
+                        "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
+                    ))
+                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                    .with_hint(
+                        "switch that worktree to another branch first, or run the command there",
+                    ));
+                }
             }
         }
     }

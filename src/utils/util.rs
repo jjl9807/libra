@@ -1865,6 +1865,27 @@ fn path_has_git_dir_component(work_dir: &Path, target_file: &Path) -> bool {
 /// parsing.
 ///
 /// Assume `target_file` is in `work_dir`.
+/// [`check_gitignore`] under the status I/O deadline.
+///
+/// Ignore resolution reads `.gitignore` / `.libraignore` files, so on a hung
+/// mount it can block like any other filesystem read. `None` means the
+/// lookup was reclaimed: callers treat that as "cannot decide" and report
+/// the path blocked rather than silently choosing an answer.
+pub fn check_gitignore_bounded(workdir: &Path, path: &Path) -> Option<bool> {
+    let workdir_owned = workdir.to_path_buf();
+    let path_owned = path.to_path_buf();
+    let answer = crate::command::status_probe::with_io_deadline(move || {
+        check_gitignore(&workdir_owned, &path_owned)
+    })
+    .ok()?;
+    // An unreadable ignore file yields an EMPTY matcher, so `false` here
+    // would mean "not ignored" when the truth is "unknown".
+    if ignore_read_failed() {
+        return None;
+    }
+    Some(answer)
+}
+
 pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
     assert!(target_file.starts_with(work_dir));
 
@@ -2143,6 +2164,17 @@ pub fn exclude_matcher_verdict(
     }
 }
 
+/// Set when an ignore file existed but could not be read during this
+/// invocation. `check_gitignore_bounded` turns it into an undecidable
+/// answer, which callers report as `io_blocked` rather than guessing.
+static IGNORE_READ_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any ignore file failed to read since the last reset.
+pub fn ignore_read_failed() -> bool {
+    IGNORE_READ_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
     let mut builder = GitignoreBuilder::new(base);
     match fs::read_to_string(ignore_path) {
@@ -2156,11 +2188,18 @@ fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
                 }
             }
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            eprintln!(
-                "warning: failed to read ignore file {}: {error}",
+            // An ignore file we cannot READ leaves an empty matcher, which
+            // silently reclassifies everything under it as NOT ignored. Mark
+            // the invocation so callers that must fail closed (the status
+            // probe and worktree scan) can refuse to answer instead of
+            // inventing a classification.
+            IGNORE_READ_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::utils::error::emit_warning(format!(
+                "failed to read ignore file {}: {error}",
                 ignore_path.display()
-            );
+            ));
         }
     }
     match builder.build() {

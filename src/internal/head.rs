@@ -450,6 +450,20 @@ impl Head {
     }
 
     pub async fn branch_checked_out_elsewhere(branch: &str) -> Option<String> {
+        // Legacy convenience wrapper. Destructive writers MUST use
+        // [`Self::branch_checked_out_elsewhere_result`]: swallowing a
+        // database error here would fail OPEN and let a cross-worktree
+        // branch move through (§C.4.4).
+        Self::branch_checked_out_elsewhere_result(branch)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Fail-CLOSED cross-worktree checkout probe: a query failure is an
+    /// error the caller must surface, never "nobody has it checked out".
+    pub async fn branch_checked_out_elsewhere_result(
+        branch: &str,
+    ) -> Result<Option<String>, sea_orm::DbErr> {
         let db = get_db_conn_instance().await;
         let current = crate::utils::util::current_worktree_id();
         let rows = reference::Entity::find()
@@ -457,11 +471,11 @@ impl Head {
             .filter(reference::Column::Remote.is_null())
             .filter(reference::Column::Name.eq(branch))
             .all(&db)
-            .await
-            .unwrap_or_default();
-        rows.into_iter()
+            .await?;
+        Ok(rows
+            .into_iter()
             .find(|row| row.worktree_id != current)
-            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string()))
+            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
     }
 
     pub async fn update_with_conn<C>(db: &C, new_head: Self, remote: Option<&str>)

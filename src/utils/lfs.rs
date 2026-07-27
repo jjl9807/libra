@@ -79,6 +79,33 @@ pub fn generate_pointer_file_result(path: impl AsRef<Path>) -> io::Result<(Strin
     Ok((pointer, oid))
 }
 
+/// [`generate_pointer_file_result`] under a hard byte cap.
+///
+/// Returns `Ok(None)` when the file exceeds `cap`, or when its size changes
+/// under the read. Best-effort readers (rename detection) must use this:
+/// the plain helper hashes to EOF, so a file that grows after its size was
+/// checked would blow the read budget it was supposed to respect, and a
+/// pointer built from a moving target names content that never existed.
+pub fn generate_pointer_file_bounded(
+    path: impl AsRef<Path>,
+    cap: u64,
+) -> io::Result<Option<(String, String)>> {
+    let path = path.as_ref();
+    let size = path.metadata()?.len();
+    if size > cap {
+        return Ok(None);
+    }
+    let Some(oid) = calc_lfs_file_hash_bounded(path, cap)? else {
+        return Ok(None);
+    };
+    // Re-check: a file that changed size under the read would otherwise get
+    // a pointer whose `size` field disagrees with the bytes hashed.
+    if path.metadata()?.len() != size {
+        return Ok(None);
+    }
+    Ok(Some((format_pointer_string(&oid, size), oid)))
+}
+
 pub fn format_pointer_string(oid: &str, size: u64) -> String {
     format!("version {LFS_VERSION}\noid {LFS_HASH_ALGO}:{oid}\nsize {size}\n")
 }
@@ -239,6 +266,34 @@ where
 
 /// SHA256 without type
 // `ring` crate is much faster than `sha2` crate ( > 10 times)
+/// [`calc_lfs_file_hash`] that refuses to read past `cap` bytes, returning
+/// `Ok(None)` instead of hashing an unbounded amount.
+pub fn calc_lfs_file_hash_bounded<P>(path: P, cap: u64) -> io::Result<Option<String>>
+where
+    P: AsRef<Path>,
+{
+    let path = path.as_ref();
+    let mut hash = Context::new(&SHA256);
+    let file = File::open(path)?;
+    // One byte past the cap so an overrun is detectable rather than silently
+    // truncated into a plausible-looking digest.
+    let mut reader = BufReader::new(file).take(cap.saturating_add(1));
+    let mut buffer = [0; 65536];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        total = total.saturating_add(n as u64);
+        if total > cap {
+            return Ok(None);
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(Some(hex::encode(hash.finish().as_ref())))
+}
+
 pub fn calc_lfs_file_hash<P>(path: P) -> io::Result<String>
 where
     P: AsRef<Path>,

@@ -68,7 +68,7 @@ EXAMPLES:
 // at the bottom of `libra status --help`. The meta-commentary that used to
 // live here as a `///` line leaked into clap's `--help` body (see
 // `tests/command/status_test.rs::test_status_help_does_not_leak_impl_meta`).
-#[derive(Parser, Debug, Default)]
+#[derive(Parser, Debug, Default, Clone)]
 #[command(after_help = STATUS_EXAMPLES)]
 pub struct StatusArgs {
     /// Output in a machine-readable format (default v1). Use v2 for extended format.
@@ -452,7 +452,7 @@ pub struct StatusWarning {
 
 /// Stable warning codes (§B.5). Serialization names are pinned by
 /// `json_warnings_schema_snapshot`.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StatusWarningCode {
@@ -480,13 +480,79 @@ pub enum StatusWarningCode {
     DirtyCacheLockStolen,
     DirtyCacheStaleFallback,
     DirtyCacheConcurrentInvalidate,
+    /// A path could not be encoded for the dirty cache (a non-UTF-8 name),
+    /// so its row was omitted from the snapshot. The base status is
+    /// unaffected; `--cached` simply will not list that path.
+    DirtyCachePathUnencodable,
+    /// A repository-level PREFLIGHT advisory raised before the command ran
+    /// (e.g. a pending durable object-index repair). Carried in
+    /// `warnings[]` so `--exit-code-on-warning` can never return 9 with an
+    /// empty structured list — §B.5 forbids a stderr-only channel.
+    RepositoryPreflight,
+}
+
+impl StatusWarningCode {
+    /// The complete frozen code set, in the order the user-facing warning
+    /// table lists it. `compat_r0_9_doc_closeout` walks this to assert the
+    /// docs stay in sync, so a code added here without a doc row fails the
+    /// build rather than shipping undocumented.
+    pub const ALL: &'static [StatusWarningCode] = &[
+        StatusWarningCode::RenameLimitProductSkipped,
+        StatusWarningCode::SimilarityBudgetExceeded,
+        StatusWarningCode::ProbeTruncated,
+        StatusWarningCode::RenamePathEncodingUnsupported,
+        StatusWarningCode::MetadataUnavailable,
+        StatusWarningCode::MetadataBudgetExceeded,
+        StatusWarningCode::WorktreeReadFailed,
+        StatusWarningCode::WorktreePermissionDenied,
+        StatusWarningCode::WorktreeIoTimeout,
+        StatusWarningCode::DirtyCacheLockStolen,
+        StatusWarningCode::DirtyCacheStaleFallback,
+        StatusWarningCode::DirtyCacheConcurrentInvalidate,
+        StatusWarningCode::DirtyCachePathUnencodable,
+        StatusWarningCode::RepositoryPreflight,
+    ];
+
+    /// The subsystem a code is ALWAYS emitted under (§B.5 table). Every
+    /// emit site derives its `source` from here instead of repeating the
+    /// pairing, so the code→source mapping has exactly one definition and
+    /// the published table can be checked against it.
+    pub fn source(self) -> StatusWarningSource {
+        match self {
+            StatusWarningCode::ProbeTruncated => StatusWarningSource::Probe,
+            StatusWarningCode::SimilarityBudgetExceeded
+            | StatusWarningCode::RenameLimitProductSkipped
+            | StatusWarningCode::RenamePathEncodingUnsupported => StatusWarningSource::RenameDetect,
+            StatusWarningCode::MetadataUnavailable | StatusWarningCode::MetadataBudgetExceeded => {
+                StatusWarningSource::Metadata
+            }
+            StatusWarningCode::WorktreeReadFailed
+            | StatusWarningCode::WorktreePermissionDenied
+            | StatusWarningCode::WorktreeIoTimeout => StatusWarningSource::Worktree,
+            StatusWarningCode::DirtyCacheLockStolen
+            | StatusWarningCode::DirtyCacheStaleFallback
+            | StatusWarningCode::DirtyCacheConcurrentInvalidate
+            | StatusWarningCode::DirtyCachePathUnencodable => StatusWarningSource::Cache,
+            StatusWarningCode::RepositoryPreflight => StatusWarningSource::Config,
+        }
+    }
 }
 
 /// Which subsystem produced a warning (§B.5).
-#[derive(Clone, Copy, Debug, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum StatusWarningSource {
+    /// Repository-level advisories not tied to a scan — currently
+    /// `repository_preflight`. Config RESOLUTION itself never warns: an
+    /// invalid value fails closed instead of degrading.
+    Config,
+    /// The bounded rename-destination worktree probe (§B.3.2). Distinct
+    /// from `RenameDetect` on purpose: a truncated probe means "we may not
+    /// have SEEN every candidate", while a `RenameDetect` warning means
+    /// "we saw them but could not score them". Consumers act differently
+    /// on the two (re-run narrower vs. accept the pairing).
+    Probe,
     RenameDetect,
     Cache,
     /// Repository-object reads (§B.3.4 metadata side).
@@ -870,6 +936,11 @@ struct StatusData {
     /// closed on any entry; JSON reports the partial result plus
     /// `data.io_blocked[]` with `is_clean = false`.
     io_blocked: Vec<crate::command::status_probe::IoBlockedEvent>,
+    /// Whether the RENAME side (probe or candidate reads) was blocked, as
+    /// opposed to the base scan. `rename_detection_complete` keys off this
+    /// so a base-scan-only block does not also claim the rename pairing
+    /// degraded.
+    rename_scan_blocked: bool,
     /// Whether the BASE scan (tracked dirty + untracked enumeration) hit an
     /// I/O block — `data.base_scan_complete` is its negation; probe blocks
     /// only affect `rename_detection_complete`.
@@ -976,6 +1047,15 @@ async fn collect_status_data(
         .collect();
     let mut io_blocked = worktree.io_blocked;
     let base_scan_blocked = !io_blocked.is_empty();
+    // Tracked separately from `base_scan_blocked`: a block during the
+    // BASE scan does not mean rename detection degraded, and reporting
+    // both flags false for one base-scan EACCES tells consumers the
+    // rename pairing is unreliable when it was never attempted.
+    let mut rename_scan_blocked = false;
+    // One accumulator for BOTH detection sides: §B.5 requires exactly one
+    // warning per {code, source} for the whole run, so the per-side stats
+    // are folded together and rendered once (see `merge_rename_stats`).
+    let mut rename_stats = rename_detect::RenameDetectStats::default();
     let mut maybe_index = Some(worktree.index);
 
     // Resolve rename detection (§B.5). Precedence: CLI flags always win —
@@ -1019,7 +1099,7 @@ async fn collect_status_data(
             RenameBlobSide::Known(&head_blobs),
             RenameBlobSide::Known(&index_blobs),
             &mut staged_rename_details,
-            &mut warnings,
+            &mut rename_stats,
         );
         // §B.3.1 Git default: unstaged "new" entries are untracked paths,
         // which may only be consumed as rename destinations under the
@@ -1064,7 +1144,7 @@ async fn collect_status_data(
             // §B.3.2 merge rules (R0-8): blocked probe paths accumulate into
             // `data.io_blocked` — text formats fail closed at render time,
             // JSON keeps pairing and reports the partial contract.
-            let probe_blocked = !outcome.io_blocked.is_empty();
+            rename_scan_blocked |= !outcome.io_blocked.is_empty();
             io_blocked.extend(outcome.io_blocked.iter().cloned());
             if let Some(kind) = outcome.truncated {
                 warnings.push(StatusWarning {
@@ -1076,7 +1156,7 @@ async fn collect_status_data(
                             crate::command::status_probe::ProbeBudgetKind::Destination => "destination",
                         }
                     ),
-                    source: StatusWarningSource::RenameDetect,
+                    source: StatusWarningCode::ProbeTruncated.source(),
                 });
             }
             if outcome.encoding_skipped > 0 {
@@ -1089,7 +1169,7 @@ async fn collect_status_data(
                         "rename detection skipped {} candidate(s) with non-UTF-8 names; their untracked/base status is unaffected",
                         outcome.encoding_skipped
                     ),
-                    source: StatusWarningSource::RenameDetect,
+                    source: StatusWarningCode::RenamePathEncodingUnsupported.source(),
                 });
             }
             // Detection runs on the probe's destination set (display base);
@@ -1106,13 +1186,26 @@ async fn collect_status_data(
                 RenameBlobSide::Known(&index_blobs),
                 &destinations_display,
                 &mut unstaged_rename_details,
-                &mut warnings,
+                &mut rename_stats,
             );
+            let complete_roots: Vec<PathBuf> = outcome
+                .complete_roots
+                .iter()
+                .map(|root| {
+                    if root.as_os_str().is_empty() {
+                        // "" = the whole worktree; keep it empty so the
+                        // collapse treats every marker as governed.
+                        PathBuf::new()
+                    } else {
+                        util::workdir_to_current(root)
+                    }
+                })
+                .collect();
             crate::command::status_probe::collapse_untracked_markers(
                 &mut unstaged.new,
                 &destinations_display,
                 &consumed,
-                outcome.truncated.is_none() && !probe_blocked,
+                &complete_roots,
             );
         }
     }
@@ -1162,6 +1255,27 @@ async fn collect_status_data(
         None
     };
 
+    // The engine's own warnings are the rename-side degradation signal. The
+    // worktree/metadata CODES are shared with the io_blocked mapping (a
+    // base-scan EACCES emits `worktree_permission_denied` too), so the flag
+    // is captured HERE — before the io_blocked-derived warnings are
+    // synthesized into the same list — rather than inferred from codes.
+    warnings_from_rename_stats(&rename_stats, &mut warnings);
+    // Preflight advisories join the structured list before anything reads
+    // it, so exit arbitration and the JSON payload see the same set.
+    for message in crate::utils::output::pending_warning_messages() {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::RepositoryPreflight,
+            message,
+            source: StatusWarningCode::RepositoryPreflight.source(),
+        });
+    }
+    rename_scan_blocked |= warnings.iter().any(|warning| {
+        matches!(
+            warning.source,
+            StatusWarningSource::Worktree | StatusWarningSource::Metadata
+        )
+    });
     let mut data = StatusData {
         head,
         head_oid,
@@ -1182,18 +1296,113 @@ async fn collect_status_data(
         porcelain_v2,
         staged_rename_details,
         unstaged_rename_details,
-        warnings,
+        warnings: {
+            // §B.5/§B.6.0.1: every blocked path contributes its
+            // worktree-family warning HERE (not at JSON-render time), so
+            // exit arbitration (`--exit-code-on-warning` → 9) and the
+            // stderr delivery of text formats see exactly the same set.
+            // The list is then deduplicated on the FULL {code, source,
+            // message} triple, not just {code, source}: two detection passes
+            // (staged + unstaged) must not double-report the same
+            // degradation, but two different blocked paths carry different
+            // messages and must each keep their own warning — the JSON
+            // contract is one warning per `io_blocked[]` entry.
+            let mut warnings = warnings;
+            let mut blocked_sorted = io_blocked.clone();
+            blocked_sorted.sort_by_key(|event| raw_path_sort_key(&event.path));
+            blocked_sorted.dedup_by(|a, b| a.path == b.path);
+            for event in &blocked_sorted {
+                let (reason, code) = io_blocked_reason_and_code(event.reason);
+                warnings.push(StatusWarning {
+                    code,
+                    message: format!(
+                        "cannot inspect '{}': {reason}",
+                        quote_pathname(&event.path, extras.quote_path)
+                    ),
+                    source: code.source(),
+                });
+            }
+            let mut seen: HashSet<(StatusWarningCode, StatusWarningSource, String)> =
+                HashSet::new();
+            warnings.retain(|warning| {
+                seen.insert((warning.code, warning.source, warning.message.clone()))
+            });
+            warnings
+        },
         quote_path: extras.quote_path,
         io_blocked: {
             let mut events = io_blocked;
-            events.sort_by(|a, b| a.path.cmp(&b.path));
+            events.sort_by_key(|event| raw_path_sort_key(&event.path));
             events.dedup_by(|a, b| a.path == b.path);
             events
         },
         base_scan_blocked,
+        rename_scan_blocked,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
     Ok(data)
+}
+
+impl StatusData {
+    /// A copy whose change lists use repository-root-relative paths (the
+    /// machine-format base, §B.6.4). Cheap enough for one render and
+    /// keeps the human path base untouched.
+    fn to_repo_relative(&self) -> StatusData {
+        /// Collapsed untracked/ignored directories carry a deliberate
+        /// trailing `/` marker; `current_to_workdir` normalizes through
+        /// path components and would eat it, making `?? dir/` render as
+        /// `?? dir` — indistinguishable from an untracked FILE named `dir`.
+        fn current_to_workdir_keeping_marker(path: &Path) -> PathBuf {
+            let rooted = current_to_workdir(path);
+            if path.to_string_lossy().ends_with('/') {
+                PathBuf::from(format!("{}/", rooted.display()))
+            } else {
+                rooted
+            }
+        }
+        fn project(paths: &[PathBuf]) -> Vec<PathBuf> {
+            paths
+                .iter()
+                .map(|path| current_to_workdir_keeping_marker(path))
+                .collect()
+        }
+        fn project_changes(changes: &Changes) -> Changes {
+            Changes {
+                new: project(&changes.new),
+                modified: project(&changes.modified),
+                deleted: project(&changes.deleted),
+                renamed: changes
+                    .renamed
+                    .iter()
+                    .map(|(old, new)| {
+                        (
+                            current_to_workdir_keeping_marker(old),
+                            current_to_workdir_keeping_marker(new),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+        fn project_details(details: &RenameDetails) -> RenameDetails {
+            details
+                .iter()
+                .map(|((old, new), value)| {
+                    ((current_to_workdir(old), current_to_workdir(new)), *value)
+                })
+                .collect()
+        }
+
+        let mut projected = self.clone();
+        projected.staged = project_changes(&self.staged);
+        projected.unstaged = project_changes(&self.unstaged);
+        projected.ignored_files = project(&self.ignored_files);
+        projected.staged_rename_details = project_details(&self.staged_rename_details);
+        projected.unstaged_rename_details = project_details(&self.unstaged_rename_details);
+        for entry in &mut projected.unmerged {
+            entry.path = current_to_workdir(&entry.path);
+        }
+        projected
+    }
 }
 
 fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> CliResult<()> {
@@ -1206,6 +1415,68 @@ fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> C
 
     filter_changes_by_pathspec(&mut data.staged, &pathspecs);
     filter_changes_by_pathspec(&mut data.unstaged, &pathspecs);
+    // §B.3.2: a blocked path OUTSIDE the requested pathspec is not this
+    // run's problem — it must neither fail a narrowed status closed nor
+    // leak through `io_blocked[]`. The base-scan walk is pathspec-blind,
+    // so the narrowing happens here, and the derived warnings follow.
+    let blocked_before = data.io_blocked.len();
+    // Keep an event when the path matches the spec OR could CONTAIN a match:
+    // `:(glob)wanted/*.txt` never matches the directory `wanted`, yet a block
+    // on that directory is exactly what hides the files the caller asked
+    // for. The probe roots are already derived from the spec set, so a path
+    // at, under, or above a root is in scope.
+    let roots = crate::command::status_probe::pathspec_probe_roots(Some(&pathspecs));
+    data.io_blocked.retain(|event| {
+        if pathspecs.matches_path(&event.path) {
+            return true;
+        }
+        let path = current_to_workdir(&event.path);
+        roots.iter().any(|root| {
+            root.as_os_str().is_empty() || path.starts_with(root) || root.starts_with(&path)
+        })
+    });
+    if data.io_blocked.len() != blocked_before {
+        // Only the warnings DERIVED from `io_blocked[]` are rebuilt. The
+        // worktree family also carries aggregate rename-scoring warnings
+        // (`worktree_read_failed` / `worktree_io_timeout` from
+        // `warnings_from_rename_stats`) that name no path and are not tied
+        // to any event — dropping those by source would hide a real
+        // degradation, flip `rename_detection_complete` back to true, and
+        // silently downgrade `--exit-code-on-warning` from 9.
+        data.warnings
+            .retain(|warning| !warning.message.starts_with("cannot inspect '"));
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for event in &data.io_blocked {
+            if !seen.insert(event.path.clone()) {
+                continue;
+            }
+            let (reason, code) = io_blocked_reason_and_code(event.reason);
+            data.warnings.push(StatusWarning {
+                code,
+                message: format!(
+                    "cannot inspect '{}': {reason}",
+                    quote_pathname(&event.path, data.quote_path)
+                ),
+                source: code.source(),
+            });
+        }
+        if data.io_blocked.is_empty() {
+            data.base_scan_blocked = false;
+            // The rename-side flag survives unless BOTH sources of it are
+            // gone: the blocked events (now empty) and the engine's own
+            // aggregate warnings, which name no path and therefore are not
+            // rebuilt above. Clearing it on event count alone would report
+            // `rename_detection_complete = true` while an
+            // "N candidate(s): worktree reads failed" warning is still in
+            // the payload.
+            data.rename_scan_blocked = data.warnings.iter().any(|warning| {
+                matches!(
+                    warning.source,
+                    StatusWarningSource::Worktree | StatusWarningSource::Metadata
+                ) && !warning.message.starts_with("cannot inspect '")
+            });
+        }
+    }
     data.unmerged
         .retain(|entry| current_relative_matches(&entry.path, &pathspecs));
     data.ignored_files
@@ -1339,6 +1610,7 @@ fn build_rename_side(
     paths: &[PathBuf],
     side: &RenameBlobSide<'_>,
     worktree_budget: &mut rename_detect::WorktreeReadBudget,
+    snapshot_skips: &mut HashMap<rename_detect::SkipReason, u64>,
 ) -> HashMap<PathBuf, rename_detect::BlobRef> {
     use rename_detect::{BlobEvidence, BlobKind, BlobRef};
     // §B.4.1: the empty blob is recognizable by OID alone, so HEAD/index
@@ -1367,15 +1639,37 @@ fn build_rename_side(
                 let (kind, mode) = match std::fs::symlink_metadata(&abs) {
                     Ok(meta) if meta.file_type().is_symlink() => (BlobKind::Symlink, 0o120000),
                     Ok(_) => (BlobKind::Regular, 0o100644),
-                    Err(_) => continue,
+                    Err(error) => {
+                        // §B.3.4: a candidate we cannot even stat is a
+                        // DEGRADATION, not a silent non-candidate — a
+                        // post-scan race or permission problem must still
+                        // surface a warning while the base status stays
+                        // truthful. NotFound is the ordinary "deleted
+                        // between scan and detection" TOCTOU and needs no
+                        // warning.
+                        if error.kind() != io::ErrorKind::NotFound {
+                            *snapshot_skips
+                                .entry(rename_detect::SkipReason::IoFailed)
+                                .or_default() += 1;
+                        }
+                        continue;
+                    }
                 };
                 // §B.3.4: worktree OID computation streams through the SAME
                 // read budget that later feeds inexact content reads, so a
                 // pathological candidate set cannot bypass the caps via the
                 // exact stage (LFS paths hash the pointer blob, matching
                 // what the index records).
-                let Ok((oid, size)) = worktree_budget.worktree_blob_oid_and_size(&abs) else {
-                    continue;
+                let (oid, size) = match worktree_budget.worktree_blob_oid_and_size(&abs) {
+                    Ok(pair) => pair,
+                    Err(reason) => {
+                        // Budget/size/I-O failures during the OPTIONAL
+                        // worktree hash drop the candidate; record the
+                        // reason so the same deduplicated warning family
+                        // fires as for inexact content reads.
+                        *snapshot_skips.entry(reason).or_default() += 1;
+                        continue;
+                    }
                 };
                 BlobRef {
                     kind,
@@ -1402,6 +1696,20 @@ type RenameDetails = HashMap<(PathBuf, PathBuf), (u32, bool)>;
 /// base for display; detection runs on repo-relative keys.
 /// Map rename-engine degradation stats onto structured warnings (§B.5).
 /// Split out so the seam is unit-testable independent of read budgets.
+/// Fold one detection side's stats into the run-wide accumulator.
+fn merge_rename_stats(
+    acc: &mut rename_detect::RenameDetectStats,
+    side: &rename_detect::RenameDetectStats,
+) {
+    acc.comparisons += side.comparisons;
+    acc.skipped_by_limit |= side.skipped_by_limit;
+    acc.exhaustive_discarded |= side.exhaustive_discarded;
+    acc.peak_edges = acc.peak_edges.max(side.peak_edges);
+    for (reason, count) in &side.content_skips {
+        *acc.content_skips.entry(*reason).or_default() += count;
+    }
+}
+
 fn warnings_from_rename_stats(
     stats: &rename_detect::RenameDetectStats,
     warnings: &mut Vec<StatusWarning>,
@@ -1410,7 +1718,7 @@ fn warnings_from_rename_stats(
         warnings.push(StatusWarning {
             code: StatusWarningCode::RenameLimitProductSkipped,
             message: "rename detection skipped inexact matching: too many candidates on one side (renameLimit)".to_string(),
-            source: StatusWarningSource::RenameDetect,
+            source: StatusWarningCode::RenameLimitProductSkipped.source(),
         });
     }
     if stats.exhaustive_discarded {
@@ -1419,7 +1727,7 @@ fn warnings_from_rename_stats(
             message:
                 "rename detection discarded the inexact pass: similarity comparison budget exceeded"
                     .to_string(),
-            source: StatusWarningSource::RenameDetect,
+            source: StatusWarningCode::SimilarityBudgetExceeded.source(),
         });
     }
     // §B.3.4: content-read skips surface as deduplicated warnings — object
@@ -1444,7 +1752,7 @@ fn warnings_from_rename_stats(
             message: format!(
                 "rename detection skipped {unavailable} candidate(s): repository objects missing, corrupt, or unavailable"
             ),
-            source: StatusWarningSource::Metadata,
+            source: StatusWarningCode::MetadataUnavailable.source(),
         });
     }
     let budget = count(&[SkipReason::TooLarge, SkipReason::BudgetExceeded]);
@@ -1454,7 +1762,22 @@ fn warnings_from_rename_stats(
             message: format!(
                 "rename detection skipped {budget} candidate(s): content-read budget or size cap reached"
             ),
-            source: StatusWarningSource::Metadata,
+            source: StatusWarningCode::MetadataBudgetExceeded.source(),
+        });
+    }
+    let io_timeout = count(&[SkipReason::IoTimeout]);
+    // NOTE: the worktree-family codes below are also emitted by the
+    // io_blocked mapping for BASE-scan blocks, so `rename_detection_complete`
+    // cannot key off the code alone — see `rename_scan_blocked`, which the
+    // caller sets from these same counts.
+
+    if io_timeout > 0 {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::WorktreeIoTimeout,
+            message: format!(
+                "rename detection reclaimed {io_timeout} candidate read(s) that exceeded the I/O deadline"
+            ),
+            source: StatusWarningCode::WorktreeIoTimeout.source(),
         });
     }
     let io_failed = count(&[SkipReason::IoFailed]);
@@ -1464,7 +1787,7 @@ fn warnings_from_rename_stats(
             message: format!(
                 "rename detection skipped {io_failed} candidate(s): worktree reads failed"
             ),
-            source: StatusWarningSource::Worktree,
+            source: StatusWarningCode::WorktreeReadFailed.source(),
         });
     }
 }
@@ -1479,19 +1802,26 @@ fn detect_renames_with_destinations(
     old_side: RenameBlobSide<'_>,
     destinations_display: &[PathBuf],
     details: &mut RenameDetails,
-    warnings: &mut Vec<StatusWarning>,
+    stats_acc: &mut rename_detect::RenameDetectStats,
 ) -> HashSet<PathBuf> {
     let mut consumed_new: HashSet<PathBuf> = HashSet::new();
     if changes.deleted.is_empty() || destinations_display.is_empty() {
         return consumed_new;
     }
     let mut worktree_budget = rename_detect::WorktreeReadBudget::with_defaults();
+    let mut snapshot_skips: HashMap<rename_detect::SkipReason, u64> = HashMap::new();
     let snapshot = rename_detect::RenameSnapshot {
-        old_map: build_rename_side(&changes.deleted, &old_side, &mut worktree_budget),
+        old_map: build_rename_side(
+            &changes.deleted,
+            &old_side,
+            &mut worktree_budget,
+            &mut snapshot_skips,
+        ),
         new_map: build_rename_side(
             destinations_display,
             &RenameBlobSide::Worktree,
             &mut worktree_budget,
+            &mut snapshot_skips,
         ),
     };
     let mut source = StatusContentSource {
@@ -1500,8 +1830,18 @@ fn detect_renames_with_destinations(
         objects: rename_detect::ObjectReadBudget::with_defaults(),
         worktree: worktree_budget,
     };
-    let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
-    warnings_from_rename_stats(&outcome.stats, warnings);
+    let mut outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    // Snapshot-construction skips (optional worktree hash/stat failures)
+    // join the engine's own content skips so ONE warning family covers
+    // every candidate the run had to drop.
+    for (reason, count) in snapshot_skips {
+        *outcome.stats.content_skips.entry(reason).or_default() += count;
+    }
+    // The stats are ACCUMULATED, not turned into warnings here: staged and
+    // unstaged detection run separately, and emitting per side would produce
+    // two warnings with the same {code, source} and different counts —
+    // §B.5 requires exactly one per code/source for the whole run.
+    merge_rename_stats(stats_acc, &outcome.stats);
     if outcome.matches.is_empty() {
         return consumed_new;
     }
@@ -1534,7 +1874,7 @@ fn detect_renames_in_changes(
     old_side: RenameBlobSide<'_>,
     new_side: RenameBlobSide<'_>,
     details: &mut RenameDetails,
-    warnings: &mut Vec<StatusWarning>,
+    stats_acc: &mut rename_detect::RenameDetectStats,
 ) {
     if changes.deleted.is_empty() || changes.new.is_empty() {
         return;
@@ -1543,9 +1883,20 @@ fn detect_renames_in_changes(
     // streaming during snapshot building and the inexact content reads below
     // draw from the same caps (§B.3.4).
     let mut worktree_budget = rename_detect::WorktreeReadBudget::with_defaults();
+    let mut snapshot_skips: HashMap<rename_detect::SkipReason, u64> = HashMap::new();
     let snapshot = rename_detect::RenameSnapshot {
-        old_map: build_rename_side(&changes.deleted, &old_side, &mut worktree_budget),
-        new_map: build_rename_side(&changes.new, &new_side, &mut worktree_budget),
+        old_map: build_rename_side(
+            &changes.deleted,
+            &old_side,
+            &mut worktree_budget,
+            &mut snapshot_skips,
+        ),
+        new_map: build_rename_side(
+            &changes.new,
+            &new_side,
+            &mut worktree_budget,
+            &mut snapshot_skips,
+        ),
     };
     let mut source = StatusContentSource {
         old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
@@ -1553,8 +1904,15 @@ fn detect_renames_in_changes(
         objects: rename_detect::ObjectReadBudget::with_defaults(),
         worktree: worktree_budget,
     };
-    let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
-    warnings_from_rename_stats(&outcome.stats, warnings);
+    let mut outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    for (reason, count) in snapshot_skips {
+        *outcome.stats.content_skips.entry(reason).or_default() += count;
+    }
+    // The stats are ACCUMULATED, not turned into warnings here: staged and
+    // unstaged detection run separately, and emitting per side would produce
+    // two warnings with the same {code, source} and different counts —
+    // §B.5 requires exactly one per code/source for the whole run.
+    merge_rename_stats(stats_acc, &outcome.stats);
     if outcome.matches.is_empty() {
         return;
     }
@@ -1735,11 +2093,22 @@ pub(crate) async fn execute_safe_with_resolution(
 
     if output.is_json() {
         let json_data = build_status_json(&data, &args);
-        emit_json_data("status", &json_data, output)?;
+        // A non-EPIPE stdout failure must not swallow the collected
+        // warnings: JSON is their only channel, so they fall back to stderr
+        // rather than vanishing with the envelope.
+        if let Err(error) = emit_json_data("status", &json_data, output) {
+            if !error.is_silent() {
+                deliver_warnings_stderr(&data.warnings);
+            }
+            return Err(error);
+        }
     } else {
         // §B.5 delivery matrix: stderr warnings even under `--quiet`
         // (quiet suppresses the body, never diagnostics).
         deliver_warnings_stderr(&data.warnings);
+        // Fail closed BEFORE the quiet check: suppressing the body must not
+        // suppress the "could not inspect" verdict.
+        fail_closed_on_io_blocked(&data, output)?;
         if !output.quiet {
             let mut stdout = std::io::stdout();
             render_status_to_writer(&data, &args, output, &mut stdout).await?;
@@ -1749,30 +2118,12 @@ pub(crate) async fn execute_safe_with_resolution(
     // §B.5 exit arbitration: warnings + --exit-code-on-warning (9) beats
     // the --exit-code dirty exit (1); JSON gets the same silent 9 without a
     // second stderr envelope.
-    if let Some(exit) = warning_exit(output, &data.warnings) {
-        return Err(exit);
-    }
-    // --exit-code: dirty → exit 1 (silent; do not emit an error line)
-    if args.exit_code && data.is_dirty() {
-        return Err(CliError::silent_exit(1));
-    }
+    StatusOutcome::new(&data, &args).resolve(output)?;
 
     Ok(())
 }
 
 // ─── Dirty-set cache modes (lore.md §1.1) ───────────────────────────────────
-
-/// The raw (repo-relative) staged + unstaged sets for dirty-cache snapshots.
-/// This remains a full reconcile so `status --scan` can discover every dirty
-/// path before replacing the cache.
-async fn compute_raw_sets() -> CliResult<(Changes, Changes)> {
-    let staged = changes_to_be_committed_safe()
-        .await
-        .map_err(CliError::from)?;
-    let ignore_case = effective_ignore_case_for_status().await?;
-    let unstaged = changes_to_be_staged_with_ignore_case(ignore_case).map_err(CliError::from)?;
-    Ok((staged, unstaged))
-}
 
 async fn effective_ignore_case_for_status() -> CliResult<bool> {
     crate::utils::path_case::effective_ignore_case()
@@ -1788,30 +2139,37 @@ fn dirty_cache_error(action: &str, error: anyhow::Error) -> CliError {
 }
 
 /// Snapshot rows from the raw sets ('/'-normalized repo-relative paths).
-fn snapshot_rows(
-    staged: &Changes,
-    unstaged: &Changes,
-) -> Result<Vec<(String, &'static str)>, CliError> {
+/// Cache rows for a snapshot, plus the count of paths that could not be
+/// represented in the cache at all.
+struct SnapshotRows {
+    rows: Vec<(String, &'static str)>,
+    unencodable: u64,
+}
+
+fn snapshot_rows(staged: &Changes, unstaged: &Changes) -> SnapshotRows {
     use crate::internal::dirty;
     let mut rows: Vec<(String, &'static str)> = Vec::new();
-    let mut push = |paths: &[PathBuf], kind: &'static str| -> Result<(), CliError> {
+    let mut unencodable = 0u64;
+    let mut push = |paths: &[PathBuf], kind: &'static str| {
         for path in paths {
-            // Strict: the reconcile already refuses undecodable paths, so this
-            // only fires defensively — the scan aborts rather than caching a
-            // lossy-mangled path that would later verify as a different file.
-            let stored = dirty::native_path_to_stored(path)
-                .map_err(|e| dirty_cache_error("encode a path for", e))?;
-            rows.push((stored, kind));
+            // A non-UTF-8 name cannot be stored, but §B.6.1 forbids failing
+            // status over one: the row is DROPPED (never lossy-mangled into
+            // a different file's key) and the omission is reported, so
+            // `--cached` under-reporting that path is visible rather than
+            // silent.
+            match dirty::native_path_to_stored(path) {
+                Ok(stored) => rows.push((stored, kind)),
+                Err(_) => unencodable += 1,
+            }
         }
-        Ok(())
     };
-    push(&unstaged.new, dirty::KIND_NEW)?;
-    push(&unstaged.modified, dirty::KIND_MODIFIED)?;
-    push(&unstaged.deleted, dirty::KIND_DELETED)?;
-    push(&staged.new, dirty::KIND_STAGED_NEW)?;
-    push(&staged.modified, dirty::KIND_STAGED_MODIFIED)?;
-    push(&staged.deleted, dirty::KIND_STAGED_DELETED)?;
-    Ok(rows)
+    push(&unstaged.new, dirty::KIND_NEW);
+    push(&unstaged.modified, dirty::KIND_MODIFIED);
+    push(&unstaged.deleted, dirty::KIND_DELETED);
+    push(&staged.new, dirty::KIND_STAGED_NEW);
+    push(&staged.modified, dirty::KIND_STAGED_MODIFIED);
+    push(&staged.deleted, dirty::KIND_STAGED_DELETED);
+    SnapshotRows { rows, unencodable }
 }
 
 /// `status --scan`: run the full safe reconcile and atomically replace the
@@ -1915,8 +2273,9 @@ async fn run_status_scan_locked_inner(
     let head_before = Head::current_commit().await.map(|oid| oid.to_string());
     let scan_started_at = crate::internal::dirty::now_timestamp();
 
-    // The same full safe reconcile as the default status, raw + display.
-    let (staged_raw, unstaged_raw) = compute_raw_sets().await?;
+    // The io_blocked-aware collection runs FIRST: the legacy raw walker
+    // below fails fast on an unreadable directory, which would bypass the
+    // partial contract (JSON) and the cache guard (both formats).
     let mut data = collect_status_data(args, extras).await?;
     // Fold the collected (rename) warnings into the canonical pending vec so
     // ANY later failure — recheck, txn, JSON emit, render, summary — reaches
@@ -1934,22 +2293,103 @@ async fn run_status_scan_locked_inner(
         .with_hint("re-run 'libra status --scan' once the concurrent operation finishes"));
     }
 
+    // The CACHE is a whole-repository snapshot, so it is collected WITHOUT
+    // the pathspec — still through the bounded, io_blocked-aware
+    // accumulator, never a legacy fail-fast walk. It runs BEFORE the guard
+    // below so a block discovered only by this pass takes the same shared
+    // route: JSON reports the partial result, text fails closed. Returning
+    // fatal from inside the collection would bypass `data.io_blocked[]`,
+    // the warnings and the completeness flags in JSON mode.
+    let snapshot_data = {
+        let mut unfiltered = args.clone();
+        unfiltered.pathspec.clear();
+        // The cache records individual PATHS, so the snapshot walk must not
+        // collapse untracked directories into a `dir/` marker the way the
+        // display default does — `--cached docs` has to be able to answer
+        // with `docs/readme.md`.
+        unfiltered.untracked_files = Some(UntrackedFiles::All);
+        // Rename detection is DISABLED for the snapshot. Pairing removes the
+        // endpoints from `deleted`/`new` and records them under `renamed`,
+        // which the cache has no row kind for — so a scan of a renamed file
+        // would persist an empty snapshot and a later `--cached --exit-code`
+        // would call the repository clean.
+        let mut snapshot_extras = extras;
+        snapshot_extras.rename_threshold = None;
+        collect_status_data(&unfiltered, snapshot_extras).await?
+    };
+    for event in &snapshot_data.io_blocked {
+        if !data
+            .io_blocked
+            .iter()
+            .any(|existing| existing.path == event.path)
+        {
+            data.io_blocked.push(event.clone());
+            data.base_scan_blocked = true;
+            let (reason, code) = io_blocked_reason_and_code(event.reason);
+            cache_warnings.push(StatusWarning {
+                code,
+                message: format!(
+                    "cannot inspect '{}': {reason}",
+                    quote_pathname(&event.path, data.quote_path)
+                ),
+                source: code.source(),
+            });
+        }
+    }
+    data.io_blocked
+        .sort_by_key(|event| raw_path_sort_key(&event.path));
+
     // §B.3.3 dirty-cache guard: an I/O-blocked scan must not write ANY
     // cache content — an unreadable path is "cannot tell", and caching the
     // partial snapshot would prune NEW rows or confirm DELETED ones that
     // were merely unreadable. Text formats fail closed below anyway; JSON
     // reports the partial result while the previous snapshot stays intact.
     if !data.io_blocked.is_empty() {
+        if output.is_json() {
+            // JSON keeps the partial contract: report the blocked paths and
+            // the untouched cache instead of failing, then let the shared
+            // arbitration decide the exit code (warning 9 ≻ dirty 1).
+            data.warnings = cache_warnings.clone();
+            let mut json_data = build_status_json(&data, args);
+            json_data["mode"] = serde_json::json!("scan");
+            json_data["cache_written"] = serde_json::json!(false);
+            // A non-EPIPE stdout failure must not swallow the collected
+            // warnings: JSON is their only channel, so they fall back to stderr
+            // rather than vanishing with the envelope.
+            if let Err(error) = emit_json_data("status", &json_data, output) {
+                if !error.is_silent() {
+                    deliver_warnings_stderr(&data.warnings);
+                }
+                return Err(error);
+            }
+            StatusOutcome::new(&data, args).resolve(output)?;
+            return Ok(());
+        }
         return Err(CliError::fatal(format!(
             "cannot rebuild the dirty cache: {} path(s) could not be inspected (first: '{}')",
             data.io_blocked.len(),
-            data.io_blocked[0].path.display()
+            quote_pathname(&data.io_blocked[0].path, data.quote_path)
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
         .with_hint("fix the unreadable path permissions and re-run 'libra status --scan'")
-        .with_hint("the previous dirty-cache snapshot was left untouched"));
+        .with_hint(
+            "the previous dirty-cache snapshot was left untouched; use --json to inspect \
+             the partial result with data.io_blocked[]",
+        ));
     }
-    let rows = snapshot_rows(&staged_raw, &unstaged_raw)?;
+    // Fully inspectable: the cache rows come from the accumulator walk above.
+    let rooted = snapshot_data.to_repo_relative();
+    let (staged_raw, unstaged_raw) = (rooted.staged.clone(), rooted.unstaged.clone());
+    let SnapshotRows { rows, unencodable } = snapshot_rows(&staged_raw, &unstaged_raw);
+    if unencodable > 0 {
+        cache_warnings.push(cache_warning(
+            StatusWarningCode::DirtyCachePathUnencodable,
+            format!(
+                "{unencodable} path(s) with non-UTF-8 names were omitted from the dirty cache; \
+                 the full status still reports them"
+            ),
+        ));
+    }
     let row_count = rows.len();
     let db = get_db_conn_instance().await;
     let txn = db
@@ -1979,7 +2419,15 @@ async fn run_status_scan_locked_inner(
         let mut json_data = build_status_json(&data, args);
         json_data["mode"] = serde_json::json!("scan");
         json_data["cached_paths"] = serde_json::json!(row_count);
-        emit_json_data("status", &json_data, output)?;
+        // A non-EPIPE stdout failure must not swallow the collected
+        // warnings: JSON is their only channel, so they fall back to stderr
+        // rather than vanishing with the envelope.
+        if let Err(error) = emit_json_data("status", &json_data, output) {
+            if !error.is_silent() {
+                deliver_warnings_stderr(&data.warnings);
+            }
+            return Err(error);
+        }
     } else {
         // Deliver AFTER the body renders: a render failure then reaches the
         // wrapper's snapshot fallback instead of double-printing (warnings
@@ -1996,12 +2444,7 @@ async fn run_status_scan_locked_inner(
         }
         deliver_warnings_stderr(&data.warnings);
     }
-    if let Some(exit) = warning_exit(output, &data.warnings) {
-        return Err(exit);
-    }
-    if args.exit_code && data.is_dirty() {
-        return Err(CliError::silent_exit(1));
-    }
+    StatusOutcome::new(&data, args).resolve(output)?;
     Ok(())
 }
 
@@ -2011,44 +2454,107 @@ async fn run_status_scan_locked_inner(
 /// §B.3.3 revalidation tri-state: `NotFound` is the only proof of absence —
 /// any other metadata error means "cannot tell" and must neither prune a
 /// cached NEW row nor confirm a cached DELETED row.
+#[derive(Clone, Copy)]
 enum CachedPathState {
     Exists,
     Gone,
-    Blocked,
+    /// Carries the §B.6.0.1 reason so a blocked re-verification can be
+    /// reported through `data.io_blocked[]` with the same taxonomy the
+    /// worktree walk uses, instead of a generic "something failed".
+    Blocked(crate::command::status_probe::IoBlockedReason),
 }
 
-fn cached_path_state(abs: &Path) -> CachedPathState {
-    match abs.symlink_metadata() {
-        Ok(_) => CachedPathState::Exists,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => CachedPathState::Gone,
-        Err(_) => CachedPathState::Blocked,
+/// Classify a revalidation I/O error into the §B.6.0.1 reason taxonomy.
+/// `TimedOut` is its OWN reason: the docs promise consumers can tell a hung
+/// mount from an ordinary read failure, and collapsing it into `io_error`
+/// silently breaks that distinction on the cache path.
+fn blocked_reason(error: &io::Error) -> crate::command::status_probe::IoBlockedReason {
+    use crate::command::status_probe::IoBlockedReason;
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => IoBlockedReason::PermissionDenied,
+        io::ErrorKind::TimedOut => IoBlockedReason::IoTimeout,
+        _ => IoBlockedReason::IoError,
     }
 }
 
-fn classify_manual_mark(
-    index: &Index,
-    workdir: &std::path::Path,
-    stored: &str,
-) -> Option<&'static str> {
+/// Hash a worktree file for cache revalidation under the §B.3.3 deadline.
+/// A reclaimed read surfaces as `TimedOut` so callers classify it as blocked
+/// rather than as a content change.
+fn hash_under_deadline(abs: &Path) -> io::Result<git_internal::hash::ObjectHash> {
+    let target = abs.to_path_buf();
+    match crate::command::status_probe::with_io_deadline(move || calc_file_blob_hash(&target)) {
+        Ok(result) => result,
+        Err(()) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "content read exceeded the status I/O deadline",
+        )),
+    }
+}
+
+fn cached_path_state(abs: &Path) -> CachedPathState {
+    use crate::command::status_probe::IoBlockedReason;
+    // §B.3.3: revalidation stats run under the same deadline as the full
+    // scan. A cached path that became a FIFO or moved onto a hung mount must
+    // reclaim the caller and keep its cache row, not block `--check-dirty`
+    // forever.
+    let target = abs.to_path_buf();
+    let stat =
+        match crate::command::status_probe::with_io_deadline(move || target.symlink_metadata()) {
+            Ok(result) => result,
+            Err(()) => return CachedPathState::Blocked(IoBlockedReason::IoTimeout),
+        };
+    match stat {
+        Ok(_) => CachedPathState::Exists,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => CachedPathState::Gone,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            CachedPathState::Blocked(IoBlockedReason::PermissionDenied)
+        }
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            CachedPathState::Blocked(IoBlockedReason::IoTimeout)
+        }
+        Err(_) => CachedPathState::Blocked(IoBlockedReason::IoError),
+    }
+}
+
+/// Outcome of re-classifying a manual `libra dirty` mark (stored as
+/// `unknown`). The `Blocked` arm exists because "cannot inspect" is neither
+/// dirty nor clean: collapsing it into either one lets `--check-dirty`
+/// delete a still-valid row or render a present file as deleted.
+enum ManualMarkClass {
+    Dirty(&'static str),
+    Clean,
+    Blocked(crate::command::status_probe::IoBlockedReason),
+}
+
+fn classify_manual_mark(index: &Index, workdir: &std::path::Path, stored: &str) -> ManualMarkClass {
     use crate::internal::dirty;
     let native = dirty::stored_path_to_native(stored);
     let Some(path_str) = native.to_str() else {
-        return Some(dirty::KIND_NEW); // undecodable: over-report
+        return ManualMarkClass::Dirty(dirty::KIND_NEW); // undecodable: over-report
     };
     let tracked = index.tracked(path_str, 0);
     let abs = workdir.join(&native);
-    let exists = abs.symlink_metadata().is_ok();
+    // Tri-state stat (§B.6.0.1): EACCES must not masquerade as absence, or a
+    // tracked-but-unreadable path is reported deleted and a manual mark on
+    // an unreadable untracked path is pruned from the cache.
+    let exists = match cached_path_state(&abs) {
+        CachedPathState::Exists => true,
+        CachedPathState::Gone => false,
+        CachedPathState::Blocked(reason) => return ManualMarkClass::Blocked(reason),
+    };
     match (tracked, exists) {
-        (false, true) => Some(dirty::KIND_NEW),
-        (false, false) => None, // neither tracked nor present: not dirty
-        (true, false) => Some(dirty::KIND_DELETED),
+        (false, true) => ManualMarkClass::Dirty(dirty::KIND_NEW),
+        (false, false) => ManualMarkClass::Clean, // neither tracked nor present: not dirty
+        (true, false) => ManualMarkClass::Dirty(dirty::KIND_DELETED),
         (true, true) => {
             // Content confirm (no stat shortcut: manual marks are few, and a
             // wrong stat shortcut here would silently drop a real edit).
-            match calc_file_blob_hash(&abs) {
-                Ok(hash) if index.verify_hash(path_str, 0, &hash) => None,
-                Ok(_) => Some(dirty::KIND_MODIFIED),
-                Err(_) => Some(dirty::KIND_MODIFIED), // unreadable: over-report
+            match hash_under_deadline(&abs) {
+                Ok(hash) if index.verify_hash(path_str, 0, &hash) => ManualMarkClass::Clean,
+                Ok(_) => ManualMarkClass::Dirty(dirty::KIND_MODIFIED),
+                // Readable metadata but an unreadable body: still "cannot
+                // inspect", so never let it confirm or prune a cache row.
+                Err(error) => ManualMarkClass::Blocked(blocked_reason(&error)),
             }
         }
     }
@@ -2103,6 +2609,16 @@ async fn run_status_cache_mode(
                 return Err(error);
             }
         } else {
+            // Fail closed on any blocked path BEFORE rendering — and before
+            // the quiet check. The fallback runs a full scan, so it can
+            // discover blocked paths exactly like the normal path; skipping
+            // the guard here would let `--cached` print a partial body (or
+            // exit 0 under `--quiet`) on a repository it could not inspect.
+            fail_closed_on_io_blocked(&data, output).inspect_err(|error| {
+                if !error.is_silent() {
+                    deliver_warnings_stderr(&data.warnings);
+                }
+            })?;
             // Deliver AFTER the body: EPIPE mid-render stays fully silent
             // (P0-06), while a real render failure still surfaces the
             // warning before propagating.
@@ -2118,12 +2634,7 @@ async fn run_status_cache_mode(
             }
             deliver_warnings_stderr(&data.warnings);
         }
-        if let Some(exit) = warning_exit(output, &data.warnings) {
-            return Err(exit);
-        }
-        if args.exit_code && data.is_dirty() {
-            return Err(CliError::silent_exit(1));
-        }
+        StatusOutcome::new(&data, args).resolve(output)?;
         return Ok(());
     }
 
@@ -2140,6 +2651,12 @@ async fn run_status_cache_mode(
     let mut unstaged = Changes::default();
     let mut pruned: Vec<(String, String)> = Vec::new();
     let mut confirmed: Vec<(String, String)> = Vec::new();
+    // Rows whose re-verification could not run (§B.6.0.1). These are neither
+    // confirmed nor pruned, and their presence suppresses the cache write
+    // entirely — a partial re-verification must never be persisted as if it
+    // had inspected everything.
+    let mut blocked_paths: Vec<(PathBuf, crate::command::status_probe::IoBlockedReason)> =
+        Vec::new();
     for row in &rows {
         let native = dirty::stored_path_to_native(&row.path);
         let verify = args.check_dirty;
@@ -2154,19 +2671,28 @@ async fn run_status_cache_mode(
                     unstaged.new.push(native);
                     continue;
                 };
-                if verify
-                    && matches!(
-                        cached_path_state(&workdir.join(&native)),
-                        CachedPathState::Blocked
-                    )
-                {
-                    // Unreadable: keep the cached fact, write nothing.
+                let abs = workdir.join(&native);
+                // ONE tri-state stat, reused for both the guard and the
+                // decision. Calling it twice reintroduces the race it exists
+                // to close: a permission change between the two calls makes
+                // the second read "gone" while `blocked_paths` stays empty,
+                // and the row is pruned from a cache it was never verified
+                // against.
+                let state = if verify {
+                    cached_path_state(&abs)
+                } else {
+                    CachedPathState::Exists
+                };
+                if let (true, CachedPathState::Blocked(reason)) = (verify, state) {
+                    // Unreadable is NOT proof the path went away (§B.6.0.1):
+                    // keep the cached fact, write nothing — pruning here
+                    // would silently forget a real untracked file.
+                    blocked_paths.push((native.clone(), reason));
                     unstaged.new.push(native);
                     continue;
                 }
                 let still = !verify
-                    || (workdir.join(&native).symlink_metadata().is_ok()
-                        && !index.tracked(path_str, 0));
+                    || (matches!(state, CachedPathState::Exists) && !index.tracked(path_str, 0));
                 if still {
                     unstaged.new.push(native);
                     if verify {
@@ -2182,19 +2708,36 @@ async fn run_status_cache_mode(
                     continue;
                 };
                 let abs = workdir.join(&native);
-                if verify && matches!(cached_path_state(&abs), CachedPathState::Blocked) {
+                // Single tri-state stat, reused below (see the NEW branch).
+                let state = if verify {
+                    cached_path_state(&abs)
+                } else {
+                    CachedPathState::Exists
+                };
+                if let (true, CachedPathState::Blocked(reason)) = (verify, state) {
                     // Unreadable: keep the cached fact, write nothing.
+                    blocked_paths.push((native.clone(), reason));
                     unstaged.modified.push(native);
                     continue;
                 }
-                let still = !verify || {
-                    index.tracked(path_str, 0)
-                        && abs.symlink_metadata().is_ok()
-                        && match calc_file_blob_hash(&abs) {
+                // The stat can succeed while the CONTENT read fails (a
+                // chmod-000 file still stats fine), so the hash failure is
+                // its own blocked case: keep the row, report it, write
+                // nothing. Treating it as "still modified" without an event
+                // would leave `io_blocked[]` and `warnings[]` empty on a run
+                // that demonstrably could not inspect the file.
+                let mut still = !verify;
+                if verify {
+                    still = index.tracked(path_str, 0)
+                        && matches!(state, CachedPathState::Exists)
+                        && match hash_under_deadline(&abs) {
                             Ok(hash) => !index.verify_hash(path_str, 0, &hash),
-                            Err(_) => true, // unreadable: keep (over-report)
-                        }
-                };
+                            Err(error) => {
+                                blocked_paths.push((native.clone(), blocked_reason(&error)));
+                                true // unreadable: keep (over-report)
+                            }
+                        };
+                }
                 if still {
                     unstaged.modified.push(native);
                     if verify {
@@ -2209,10 +2752,19 @@ async fn run_status_cache_mode(
                     unstaged.deleted.push(native);
                     continue;
                 };
-                let state = cached_path_state(&workdir.join(&native));
-                if verify && matches!(state, CachedPathState::Blocked) {
+                // `--cached` promises NO worktree walk: only `--check-dirty`
+                // re-verifies, so the stat is skipped entirely rather than
+                // performed and discarded (which would still take an I/O
+                // worker slot and could wait out a deadline on a hung mount).
+                let state = if verify {
+                    cached_path_state(&workdir.join(&native))
+                } else {
+                    CachedPathState::Exists
+                };
+                if let (true, CachedPathState::Blocked(reason)) = (verify, state) {
                     // Unreadable is NOT proof of deletion (§B.6.0.1): keep
                     // the cached fact, write nothing — never confirm.
+                    blocked_paths.push((native.clone(), reason));
                     unstaged.deleted.push(native);
                     continue;
                 }
@@ -2230,11 +2782,27 @@ async fn run_status_cache_mode(
             _ => {
                 // Manual 'unknown' marks: classified in memory, always content
                 // confirmed (both modes — cheap, marks are few).
+                if !verify {
+                    // `--cached` consumes the snapshot only (documented "no
+                    // worktree walk"). A manual mark has no recorded kind, so
+                    // the conservative reading is "still dirty" — never a
+                    // stat/hash that could block on the worktree.
+                    unstaged.modified.push(native);
+                    continue;
+                }
                 match classify_manual_mark(&index, &workdir, &row.path) {
-                    Some(dirty::KIND_NEW) => unstaged.new.push(native),
-                    Some(dirty::KIND_DELETED) => unstaged.deleted.push(native),
-                    Some(_) => unstaged.modified.push(native),
-                    None => {
+                    ManualMarkClass::Dirty(dirty::KIND_NEW) => unstaged.new.push(native),
+                    ManualMarkClass::Dirty(dirty::KIND_DELETED) => unstaged.deleted.push(native),
+                    ManualMarkClass::Dirty(_) => unstaged.modified.push(native),
+                    ManualMarkClass::Blocked(reason) => {
+                        // Cannot inspect: keep the mark and surface it as a
+                        // blocked path, never prune and never invent a
+                        // deletion. Text formats fail closed downstream;
+                        // `--json` reports it in `data.io_blocked[]`.
+                        blocked_paths.push((native.clone(), reason));
+                        unstaged.modified.push(native);
+                    }
+                    ManualMarkClass::Clean => {
                         if verify {
                             pruned.push((row.path.clone(), row.kind.clone()));
                         }
@@ -2281,6 +2849,15 @@ async fn run_status_cache_mode(
                 return Err(error);
             }
         } else {
+            // Same fail-closed guard as every other text path (§B.6.0.1):
+            // the concurrent-invalidate fallback also runs a full scan, so
+            // it can discover blocked paths and must not print a partial
+            // body or exit 0 under `--quiet`.
+            fail_closed_on_io_blocked(&data, output).inspect_err(|error| {
+                if !error.is_silent() {
+                    deliver_warnings_stderr(&data.warnings);
+                }
+            })?;
             // Deliver AFTER the body: EPIPE mid-render stays fully silent
             // (P0-06), while a real render failure still surfaces the
             // warning before propagating.
@@ -2296,13 +2873,15 @@ async fn run_status_cache_mode(
             }
             deliver_warnings_stderr(&data.warnings);
         }
-        if let Some(exit) = warning_exit(output, &data.warnings) {
-            return Err(exit);
-        }
-        if args.exit_code && data.is_dirty() {
-            return Err(CliError::silent_exit(1));
-        }
+        StatusOutcome::new(&data, args).resolve(output)?;
         return Ok(());
+    }
+    // §B.6.0.1: a re-verification that could not inspect every row must not
+    // persist its partial view — pruning on an incomplete pass is how a
+    // still-dirty path silently disappears from the cache.
+    if args.check_dirty && !blocked_paths.is_empty() {
+        pruned.clear();
+        confirmed.clear();
     }
     if args.check_dirty && (!pruned.is_empty() || !confirmed.is_empty()) {
         let txn = db
@@ -2378,10 +2957,63 @@ async fn run_status_cache_mode(
         porcelain_v2: None,
         staged_rename_details: RenameDetails::new(),
         unstaged_rename_details: RenameDetails::new(),
-        warnings: Vec::new(),
+        // One `worktree_*` warning per blocked row, exactly like the full
+        // scan: `io_blocked[]` and `warnings[]` are a documented 1:1 pairing,
+        // and `--exit-code-on-warning` reads the warning list, so an empty
+        // one here would silently downgrade exit 9 to exit 1.
+        warnings: {
+            let mut preflight: Vec<StatusWarning> =
+                crate::utils::output::pending_warning_messages()
+                    .into_iter()
+                    .map(|message| StatusWarning {
+                        code: StatusWarningCode::RepositoryPreflight,
+                        message,
+                        source: StatusWarningCode::RepositoryPreflight.source(),
+                    })
+                    .collect();
+            let mut seen: HashSet<PathBuf> = HashSet::new();
+            let mut sorted = blocked_paths.clone();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            sorted
+                .into_iter()
+                .filter(|(path, _)| seen.insert(path.clone()))
+                .map(|(path, reason)| {
+                    let (text, code) = io_blocked_reason_and_code(reason);
+                    StatusWarning {
+                        code,
+                        message: format!(
+                            "cannot inspect '{}': {text}",
+                            quote_pathname(&path, extras.quote_path)
+                        ),
+                        source: code.source(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .chain(preflight.drain(..))
+                .collect()
+        },
         quote_path: extras.quote_path,
-        io_blocked: Vec::new(),
-        base_scan_blocked: false,
+        io_blocked: {
+            let mut events: Vec<_> = blocked_paths
+                .iter()
+                .map(
+                    |(path, reason)| crate::command::status_probe::IoBlockedEvent {
+                        path: path.clone(),
+                        reason: *reason,
+                    },
+                )
+                .collect();
+            events.sort_by_key(|event| raw_path_sort_key(&event.path));
+            events.dedup_by(|a, b| a.path == b.path);
+            events
+        },
+        // A re-verification that could not inspect every row is NOT a
+        // complete scan: reporting `base_scan_complete: true` alongside a
+        // non-empty `io_blocked[]` tells automation the cached answer is
+        // authoritative when it demonstrably is not.
+        base_scan_blocked: !blocked_paths.is_empty(),
+        rename_scan_blocked: false,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
 
@@ -2400,29 +3032,47 @@ async fn run_status_cache_mode(
                     .collect::<Vec<_>>()
             );
         }
-        emit_json_data("status", &json_data, output)?;
-    } else if !output.quiet {
+        // A non-EPIPE stdout failure must not swallow the collected
+        // warnings: JSON is their only channel, so they fall back to stderr
+        // rather than vanishing with the envelope.
+        if let Err(error) = emit_json_data("status", &json_data, output) {
+            if !error.is_silent() {
+                deliver_warnings_stderr(&data.warnings);
+            }
+            return Err(error);
+        }
+    } else {
+        deliver_warnings_stderr(&data.warnings);
+        fail_closed_on_io_blocked(&data, output)?;
+        if !output.quiet {
+            render_cached_status_body(&data, args, output, checked, pruned.len()).await?;
+        }
+    }
+    StatusOutcome::new(&data, args).resolve(output)?;
+    Ok(())
+}
+
+async fn render_cached_status_body(
+    data: &StatusData,
+    args: &StatusArgs,
+    output: &OutputConfig,
+    checked: usize,
+    pruned: usize,
+) -> CliResult<()> {
+    {
         use std::io::Write;
         let mut stdout = std::io::stdout();
-        render_status_to_writer(&data, args, output, &mut stdout).await?;
+        render_status_to_writer(data, args, output, &mut stdout).await?;
         if args.check_dirty {
             // Fallible write: a bare println! would panic on stdout EPIPE.
             writeln!(
                 stdout,
-                "dirty cache re-verified ({} checked, {} pruned)",
-                checked,
-                pruned.len()
+                "dirty cache re-verified ({checked} checked, {pruned} pruned)"
             )
             .map_err(|error| {
                 crate::utils::output::stdout_write_error("write the check-dirty summary", error)
             })?;
         }
-    }
-    if let Some(exit) = warning_exit(output, &data.warnings) {
-        return Err(exit);
-    }
-    if args.exit_code && data.is_dirty() {
-        return Err(CliError::silent_exit(1));
     }
     Ok(())
 }
@@ -2449,9 +3099,29 @@ pub(crate) async fn execute_to_resolved(
     // by `resolve_config_defaults` across the side-effect boundary, so no
     // second (potentially inconsistent) read ever happens here.
     let ResolvedStatusArgs { args, extras } = resolved;
+    // This writer entry renders a plain full status. It does NOT implement
+    // the dirty-cache modes or the exit arbitration (it returns `()`, not an
+    // exit code), so silently ignoring those options would hand an embedder
+    // an ordinary status while it believed it had asked for a cache read or
+    // a dirty exit code. Refuse instead — a caller that needs them must go
+    // through `execute_safe_with_resolution`.
+    let unsupported: &[(&str, bool)] = &[
+        ("--scan", args.scan),
+        ("--cached", args.cached),
+        ("--check-dirty", args.check_dirty),
+        ("--exit-code", args.exit_code),
+    ];
+    if let Some((flag, _)) = unsupported.iter().find(|(_, set)| *set) {
+        return Err(CliError::command_usage(format!(
+            "'{flag}' is not supported by the status writer entry point"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("run the status command itself; this entry renders a plain full status"));
+    }
     let data = collect_status_data(&args, extras).await?;
     deliver_warnings_stderr(&data.warnings);
     let output = OutputConfig::default();
+    fail_closed_on_io_blocked(&data, &output)?;
     render_status_to_writer(&data, &args, &output, writer).await
 }
 
@@ -2459,29 +3129,51 @@ pub(crate) async fn execute_to_resolved(
 // Rendering dispatcher
 // ---------------------------------------------------------------------------
 
+/// §B.3.3/§B.6.0.1 delivery matrix: human/short/porcelain fail CLOSED on any
+/// I/O-blocked path — no partial dirty/porcelain body is ever printed. Only
+/// JSON/API may report the partial result (`io_blocked[]`).
+///
+/// This lives OUTSIDE the renderer because `--quiet` skips rendering: routing
+/// the guard through the writer would let `libra --quiet status` exit 0 on a
+/// repository it could not fully inspect, which is precisely the silent
+/// "looks clean" answer the contract exists to prevent.
+fn fail_closed_on_io_blocked(data: &StatusData, output: &OutputConfig) -> CliResult<()> {
+    if data.io_blocked.is_empty() || output.is_json() {
+        return Ok(());
+    }
+    let first = &data.io_blocked[0];
+    Err(CliError::fatal(format!(
+        "cannot inspect '{}' ({} path(s) blocked); status output would be incomplete",
+        quote_pathname(&first.path, data.quote_path),
+        data.io_blocked.len()
+    ))
+    .with_stable_code(StableErrorCode::IoReadFailed)
+    .with_hint("fix the unreadable path permissions and retry")
+    .with_hint("use --json to inspect the partial result with data.io_blocked[]"))
+}
+
 async fn render_status_to_writer(
     data: &StatusData,
     args: &StatusArgs,
     output: &OutputConfig,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    // §B.3.3/§B.6.0.1 delivery matrix: human/short/porcelain fail CLOSED on
-    // any I/O-blocked path — no partial dirty/porcelain body is ever
-    // printed. Only JSON/API may report the partial result (io_blocked[]).
-    if !data.io_blocked.is_empty() && !output.is_json() {
-        let first = &data.io_blocked[0];
-        return Err(CliError::fatal(format!(
-            "cannot inspect '{}' ({} path(s) blocked); status output would be incomplete",
-            first.path.display(),
-            data.io_blocked.len()
-        ))
-        .with_stable_code(StableErrorCode::IoReadFailed)
-        .with_hint("fix the unreadable path permissions and retry")
-        .with_hint("use --json to inspect the partial result with data.io_blocked[]"));
-    }
+    fail_closed_on_io_blocked(data, output)?;
     let write_error =
         |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     let mut buffer = Vec::new();
+
+    // §B.6.4 machine-format path base: porcelain v1/v2 ALWAYS emit
+    // repository-root-relative paths (Git parity), while the human
+    // formats honor `status.relativePaths`. The collected data carries
+    // the display base, so project it back for the porcelain renderers.
+    let porcelain_data;
+    let data = if args.porcelain.is_some() {
+        porcelain_data = data.to_repo_relative();
+        &porcelain_data
+    } else {
+        data
+    };
 
     // Porcelain modes
     match args.porcelain {
@@ -2536,7 +3228,8 @@ async fn render_status_to_writer(
                         write_raw_path(&mut buffer, file).map_err(write_error)?;
                         buffer.push(b'\0');
                     } else {
-                        writeln!(&mut buffer, "!! {}", file.display()).map_err(write_error)?;
+                        writeln!(&mut buffer, "!! {}", quote_pathname(file, data.quote_path))
+                            .map_err(write_error)?;
                     }
                 }
             }
@@ -2587,7 +3280,8 @@ async fn render_status_to_writer(
                     write_raw_path(&mut buffer, file).map_err(write_error)?;
                     buffer.push(b'\0');
                 } else {
-                    writeln!(&mut buffer, "!! {}", file.display()).map_err(write_error)?;
+                    writeln!(&mut buffer, "!! {}", quote_pathname(file, data.quote_path))
+                        .map_err(write_error)?;
                 }
             }
         }
@@ -3102,7 +3796,39 @@ fn cache_warning(code: StatusWarningCode, message: impl Into<String>) -> StatusW
     StatusWarning {
         code,
         message: message.into(),
-        source: StatusWarningSource::Cache,
+        source: code.source(),
+    }
+}
+
+/// The single §B.5 exit arbitration point.
+///
+/// Every status path — full scan, `--scan`, both cache modes, and both
+/// fallbacks — resolves its exit code here instead of repeating the
+/// comparison. That matters because the ordering is subtle and one branch
+/// getting it wrong is invisible in review: an early `silent_exit(1)` for a
+/// dirty tree would preempt the warning exit 9 that is supposed to outrank
+/// it. Priority: **fatal ≻ 9 (`--exit-code-on-warning`) ≻ 1 (dirty,
+/// including a non-empty `io_blocked`) ≻ 0**. Fatal is raised earlier by
+/// `fail_closed_on_io_blocked`, so this resolver covers 9 ≻ 1 ≻ 0.
+struct StatusOutcome<'a> {
+    data: &'a StatusData,
+    args: &'a StatusArgs,
+}
+
+impl<'a> StatusOutcome<'a> {
+    fn new(data: &'a StatusData, args: &'a StatusArgs) -> Self {
+        Self { data, args }
+    }
+
+    fn resolve(&self, output: &OutputConfig) -> CliResult<()> {
+        if let Some(exit) = warning_exit(output, &self.data.warnings) {
+            return Err(exit);
+        }
+        // `--exit-code`: dirty → exit 1, silently (no error line).
+        if self.args.exit_code && self.data.is_dirty() {
+            return Err(CliError::silent_exit(1));
+        }
+        Ok(())
     }
 }
 
@@ -3111,11 +3837,94 @@ fn cache_warning(code: StatusWarningCode, message: impl Into<String>) -> StatusW
 /// because an early `silent_exit(1)` would otherwise preempt the top-level
 /// exit-9 pass in `cli.rs` (and JSON never records globally).
 fn warning_exit(output: &OutputConfig, warnings: &[StatusWarning]) -> Option<CliError> {
-    // Any non-status-owned warning (e.g. future callers) may still mark the
-    // global tracker — honor it too, so no warning can be preempted by the
-    // dirty exit 1.
-    let any = !warnings.is_empty() || crate::utils::output::warning_was_emitted();
-    (output.exit_code_on_warning && any).then(|| CliError::silent_exit(9))
+    // Decided from THIS invocation's structured list only. Consulting the
+    // process-global tracker would let a warning emitted by an earlier
+    // embedded call flip a later, clean one to exit 9 with an empty
+    // `warnings[]` — and the reverse leak, where a status call marks the
+    // tracker for whoever runs next. Preflight advisories are folded into
+    // the list at collection time, so nothing is lost by dropping the
+    // global read.
+    (output.exit_code_on_warning && !warnings.is_empty()).then(|| CliError::silent_exit(9))
+}
+
+/// Sort key for `io_blocked[]`: the RAW path encoding, matching what
+/// `raw_base64` serializes. `PathBuf`'s own ordering compares WTF-8 bytes on
+/// Windows, which disagrees with UTF-16 code-unit order once supplementary
+/// characters are involved — so a machine consumer relying on the documented
+/// "sorted by raw path bytes" would see a different order than it computed.
+pub(crate) fn raw_path_sort_key(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        // BIG-endian in the SORT KEY only. The documented order is by UTF-16
+        // code unit, and a bytewise comparison reproduces that only when the
+        // high byte comes first: little-endian would put U+0101 (`01 01`)
+        // after U+0200 (`00 02`), inverting the required order. The
+        // published `raw_base64` stays little-endian — the key exists to be
+        // compared, not to be transmitted.
+        let mut bytes = Vec::new();
+        for unit in path.as_os_str().encode_wide() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        bytes
+    }
+    #[cfg(not(any(unix, windows)))]
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+/// Reversible encoding of a path whose name is not valid UTF-8, for the
+/// `io_blocked[].path.raw_base64` contract (§B.6.0.1). Returns `None` for a
+/// valid-UTF-8 name, whose `display` form is already lossless.
+///
+/// Unix encodes the raw `OsStr` bytes. Windows encodes the UTF-16 code units
+/// LITTLE-ENDIAN, because an unpaired surrogate has no UTF-8 form at all —
+/// returning `None` there would break reversibility for exactly the names
+/// that need it.
+pub fn raw_path_base64(path: &Path) -> Option<String> {
+    use base64::Engine as _;
+
+    if path.to_str().is_some() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(base64::engine::general_purpose::STANDARD.encode(path.as_os_str().as_bytes()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut bytes = Vec::new();
+        for unit in path.as_os_str().encode_wide() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+    #[cfg(not(any(unix, windows)))]
+    None
+}
+
+/// A path as a JSON string, using the same escaping the docs promise for
+/// display forms. Undecodable bytes become `\ooo` octal escapes rather than
+/// `U+FFFD`, so distinct filenames stay distinct in the payload. The quoting
+/// wrapper is stripped: JSON supplies its own quoting.
+fn json_path_string(path: &Path, quote_path: bool) -> String {
+    match path.to_str() {
+        Some(text) => text.to_string(),
+        None => {
+            let quoted = quote_pathname(path, quote_path);
+            quoted
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map(str::to_string)
+                .unwrap_or(quoted)
+        }
+    }
 }
 
 fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value {
@@ -3125,20 +3934,25 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
     // the JSON payload converts here — identity when cwd is the repo root.
     let rooted = data_with_repo_root_paths(data);
     let data = &rooted;
-    let paths_to_json = |paths: &[PathBuf]| -> Vec<serde_json::Value> {
+    // Paths render through the SAME escaping the docs promise for display
+    // forms. `Path::display()` replaces undecodable bytes with U+FFFD, so
+    // two different real filenames could collapse to one JSON string —
+    // silently merging distinct entries for every consumer.
+    let quote = data.quote_path;
+    let paths_to_json = move |paths: &[PathBuf]| -> Vec<serde_json::Value> {
         paths
             .iter()
-            .map(|p| serde_json::Value::String(p.display().to_string()))
+            .map(|p| serde_json::Value::String(json_path_string(p, quote)))
             .collect()
     };
 
-    let renamed_to_json = |renamed: &[(PathBuf, PathBuf)]| -> Vec<serde_json::Value> {
+    let renamed_to_json = move |renamed: &[(PathBuf, PathBuf)]| -> Vec<serde_json::Value> {
         renamed
             .iter()
             .map(|(old, new)| {
                 serde_json::json!({
-                    "from": old.display().to_string(),
-                    "to": new.display().to_string(),
+                    "from": json_path_string(old, quote),
+                    "to": json_path_string(new, quote),
                 })
             })
             .collect()
@@ -3154,8 +3968,8 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
                 .copied()
                 .unwrap_or((100, true));
             renames.push(serde_json::json!({
-                "from": old.display().to_string(),
-                "to": new.display().to_string(),
+                "from": json_path_string(old, quote),
+                "to": json_path_string(new, quote),
                 "score": score,
                 "exact": exact,
                 "staged": staged,
@@ -3172,41 +3986,37 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
     // non-UTF-8 paths, the KNOWN staged component only, the reason
     // taxonomy, and the staged rename pair when one is known. Sorted by raw
     // path, deduplicated. Every entry also emits a worktree-family warning.
-    let mut warnings_json = data.warnings.clone();
+    // Warnings already carry the worktree family from collection time
+    // (§B.5 single arbitration source); JSON only serializes them.
+    let warnings_json = data.warnings.clone();
     let mut io_blocked_json: Vec<serde_json::Value> = Vec::new();
     for event in &data.io_blocked {
         let display = quote_pathname(&event.path, data.quote_path);
-        let raw_base64: serde_json::Value = match event.path.to_str() {
-            Some(_) => serde_json::Value::Null,
-            None => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::ffi::OsStrExt;
-
-                    use base64::Engine as _;
-                    serde_json::Value::String(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(event.path.as_os_str().as_bytes()),
-                    )
-                }
-                #[cfg(not(unix))]
-                {
-                    serde_json::Value::Null
-                }
-            }
+        let raw_base64: serde_json::Value = match raw_path_base64(&event.path) {
+            Some(encoded) => serde_json::Value::String(encoded),
+            None => serde_json::Value::Null,
         };
-        let event_display_path = util::workdir_to_current(&event.path);
-        let staged_component = if data.staged.modified.contains(&event_display_path) {
+        // Compare on REPO-RELATIVE keys: `event.path` is repo-relative
+        // while the change lists carry the display base, so from a
+        // subdirectory a display-base conversion of the event would never
+        // match (the historical `staged`/`rename` = null bug).
+        // The change lists may carry repo-relative OR display-base paths
+        // depending on the caller; accept either spelling of the same file
+        // so the schema fields stay correct from a subdirectory.
+        let matches_event = |candidate: &PathBuf| -> bool {
+            candidate == &event.path || current_to_workdir(candidate) == event.path
+        };
+        let staged_component = if data.staged.modified.iter().any(matches_event) {
             serde_json::json!("M")
-        } else if data.staged.new.contains(&event_display_path) {
+        } else if data.staged.new.iter().any(matches_event) {
             serde_json::json!("A")
-        } else if data.staged.deleted.contains(&event_display_path) {
+        } else if data.staged.deleted.iter().any(matches_event) {
             serde_json::json!("D")
         } else if data
             .staged
             .renamed
             .iter()
-            .any(|(_, new)| new == &event_display_path)
+            .any(|(_, new)| matches_event(new))
         {
             serde_json::json!("R")
         } else {
@@ -3216,7 +4026,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
             .staged
             .renamed
             .iter()
-            .find(|(_, new)| new == &event_display_path)
+            .find(|(_, new)| matches_event(new))
             .map(|pair| {
                 let score = data
                     .staged_rename_details
@@ -3230,20 +4040,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
                 })
             })
             .unwrap_or(serde_json::Value::Null);
-        let (reason, warning_code) = match event.reason {
-            crate::command::status_probe::IoBlockedReason::PermissionDenied => (
-                "permission_denied",
-                StatusWarningCode::WorktreePermissionDenied,
-            ),
-            crate::command::status_probe::IoBlockedReason::IoError => {
-                ("io_error", StatusWarningCode::WorktreeReadFailed)
-            }
-        };
-        warnings_json.push(StatusWarning {
-            code: warning_code,
-            message: format!("cannot inspect '{display}': {reason}"),
-            source: StatusWarningSource::Worktree,
-        });
+        let (reason, _warning_code) = io_blocked_reason_and_code(event.reason);
         io_blocked_json.push(serde_json::json!({
             "path": { "display": display, "raw_base64": raw_base64 },
             "staged": staged_component,
@@ -3253,7 +4050,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
     }
     // §B.6.0.1: rename detection is complete only when nothing degraded it —
     // no probe truncation/blocks and no engine skip/limit/budget warnings.
-    let rename_detection_complete = data.io_blocked.is_empty()
+    let rename_detection_complete = !data.rename_scan_blocked
         && !data.warnings.iter().any(|w| {
             matches!(
                 w.code,
@@ -3262,7 +4059,6 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
                     | StatusWarningCode::SimilarityBudgetExceeded
                     | StatusWarningCode::MetadataUnavailable
                     | StatusWarningCode::MetadataBudgetExceeded
-                    | StatusWarningCode::WorktreeReadFailed
                     | StatusWarningCode::RenamePathEncodingUnsupported
             )
         });
@@ -3456,21 +4252,48 @@ fn current_to_workdir(path: &std::path::Path) -> PathBuf {
     util::to_workdir_path(&abs_path)
 }
 
+/// Tri-state worktree mode. "Gone" and "unreadable" are different answers:
+/// the first is representable (`000000`), the second must never be guessed.
+enum WorktreeMode {
+    Mode(u32),
+    Gone,
+    Unreadable,
+}
+
 #[cfg(unix)]
-fn get_worktree_mode(file_path: &std::path::Path) -> u32 {
+fn get_worktree_mode_result(file_path: &std::path::Path) -> WorktreeMode {
     use std::os::unix::fs::PermissionsExt;
     let workdir_path = current_to_workdir(file_path);
     let abs_path = util::workdir_to_absolute(&workdir_path);
-    if let Ok(metadata) = std::fs::symlink_metadata(&abs_path) {
-        if metadata.file_type().is_symlink() {
+    match std::fs::symlink_metadata(&abs_path) {
+        Ok(metadata) => WorktreeMode::Mode(if metadata.file_type().is_symlink() {
             0o120000
         } else if metadata.permissions().mode() & 0o111 != 0 {
             0o100755
         } else {
             0o100644
-        }
-    } else {
-        0o100644
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorktreeMode::Gone,
+        Err(_) => WorktreeMode::Unreadable,
+    }
+}
+
+#[cfg(unix)]
+fn get_worktree_mode(file_path: &std::path::Path) -> u32 {
+    match get_worktree_mode_result(file_path) {
+        WorktreeMode::Mode(mode) => mode,
+        _ => 0o100644,
+    }
+}
+
+#[cfg(not(unix))]
+fn get_worktree_mode_result(file_path: &std::path::Path) -> WorktreeMode {
+    let workdir_path = current_to_workdir(file_path);
+    let abs_path = util::workdir_to_absolute(&workdir_path);
+    match std::fs::symlink_metadata(&abs_path) {
+        Ok(_) => WorktreeMode::Mode(get_worktree_mode(file_path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorktreeMode::Gone,
+        Err(_) => WorktreeMode::Unreadable,
     }
 }
 
@@ -3538,12 +4361,24 @@ fn write_rename_porcelain_v2(
     // Unstaged-only rename (`.R`): there is no staged component, so Git copies
     // the index fields into the HEAD fields.
     let staged_rename = x == 'R';
+    // §B.6.4 forbids fabricated all-zero hashes / default modes in a
+    // rename record: a script that trusts `2 R…` must be able to trust
+    // its mode+hash columns. Missing metadata is an internal
+    // inconsistency, so fail closed with the offending path instead.
+    let missing = |field: &str, path: &Path| -> CliError {
+        CliError::fatal(format!(
+            "cannot render the porcelain v2 rename record for '{}': {field} metadata is missing",
+            path.display()
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint("re-run 'libra status' after 'libra add'/'libra reset' settles the index")
+    };
     let (mode_head, hash_head) = if staged_rename {
         metadata
             .head_tree_items
             .get(&old_workdir)
             .map(|info| (info.mode, info.hash.clone()))
-            .unwrap_or((0, zero_hash.to_string()))
+            .ok_or_else(|| missing("HEAD tree", &old_workdir))?
     } else {
         // `.R`: filled from the index below (fixup).
         (0, zero_hash.to_string())
@@ -3553,12 +4388,14 @@ fn write_rename_porcelain_v2(
     } else {
         &old_workdir
     };
-    let index_str = index_key.to_str().unwrap_or_default();
+    let index_str = index_key
+        .to_str()
+        .ok_or_else(|| missing("index (non-UTF-8 path)", index_key))?;
     let (mode_index, hash_index) = metadata
         .index
         .get(index_str, 0)
         .map(|entry| (entry.mode, entry.hash.to_string()))
-        .unwrap_or((0o100644, zero_hash.to_string()));
+        .ok_or_else(|| missing("index", index_key))?;
     let (mode_head, hash_head) = if staged_rename {
         (mode_head, hash_head)
     } else {
@@ -3566,7 +4403,31 @@ fn write_rename_porcelain_v2(
     };
     // A worktree-deleted destination (`RD`) has no worktree entry: mW must
     // be 000000 like an ordinary v2 deleted row, not a fabricated 100644.
-    let mode_worktree = if y == 'D' { 0 } else { get_worktree_mode(new) };
+    let mode_worktree = if y == 'D' {
+        0
+    } else {
+        // A mode read that FAILS is not `100644`. Between the scan and this
+        // render the destination can be deleted or made unreadable; emitting
+        // a fabricated regular-file mode would hand a script a value the
+        // filesystem never reported. Fail closed instead — the same rule the
+        // hash fields already follow.
+        match get_worktree_mode_result(new) {
+            WorktreeMode::Mode(mode) => mode,
+            // Genuinely absent (a chained rename already moved it on):
+            // `000000`, the v2 spelling for "no worktree entry".
+            WorktreeMode::Gone => 0,
+            // Present but UNREADABLE: a fabricated `100644` would hand a
+            // script a mode the filesystem never reported.
+            WorktreeMode::Unreadable => {
+                return Err(CliError::fatal(format!(
+                    "cannot read the worktree mode of '{}' while rendering its rename record",
+                    quote_pathname(new, true)
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("re-run 'libra status' once the path is readable again"));
+            }
+        }
+    };
     let sub = if is_submodule_mode(mode_index) || is_submodule_mode(mode_head) {
         get_submodule_status(new)
     } else {
@@ -3624,7 +4485,7 @@ fn output_porcelain_v2(
         |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
 
     for entry in unmerged {
-        write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, writer)?;
+        write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, quote_path, writer)?;
     }
 
     // Rename records (`2 …`) render separately from the flattened `1 …` list;
@@ -3777,6 +4638,7 @@ fn write_unmerged_porcelain_v2(
     entry: &UnmergedEntry,
     zero_hash: &str,
     null_terminated: bool,
+    quote_path: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
     let write_err =
@@ -3796,7 +4658,7 @@ fn write_unmerged_porcelain_v2(
     };
     write!(
         writer,
-        "u {}{} N... {} {} {} {} {} {} {} {}",
+        "u {}{} N... {} {} {} {} {} {} {} ",
         staged_status,
         unstaged_status,
         mode(1),
@@ -3805,13 +4667,18 @@ fn write_unmerged_porcelain_v2(
         format_mode(get_unmerged_worktree_mode(&entry.path)),
         hash(1),
         hash(2),
-        hash(3),
-        entry.path.display()
+        hash(3)
     )
     .map_err(write_err)?;
+    // §B.6.6: `-z` carries RAW path bytes (a non-UTF-8 name must survive
+    // byte-for-byte), every other mode carries the C-style-escaped form.
+    // `display()` did neither — it lossily replaced undecodable bytes and
+    // left control characters unescaped, which can break the line format.
     if null_terminated {
+        write_raw_path(writer, &entry.path).map_err(write_err)?;
         writer.write_all(b"\0").map_err(write_err)?;
     } else {
+        write!(writer, "{}", quote_pathname(&entry.path, quote_path)).map_err(write_err)?;
         writer.write_all(b"\n").map_err(write_err)?;
     }
     Ok(())
@@ -4065,6 +4932,22 @@ pub async fn output_short_format(
 /// 0x7F are additionally escaped as octal `\ooo` only under
 /// `core.quotePath=true` (the default, matching Git). A path needing any
 /// escape is wrapped in double quotes; `-z` output never calls this.
+/// §B.6.0.1 reason taxonomy → JSON reason string + warning code.
+pub(crate) fn io_blocked_reason_and_code(
+    reason: crate::command::status_probe::IoBlockedReason,
+) -> (&'static str, StatusWarningCode) {
+    use crate::command::status_probe::IoBlockedReason;
+
+    match reason {
+        IoBlockedReason::PermissionDenied => (
+            "permission_denied",
+            StatusWarningCode::WorktreePermissionDenied,
+        ),
+        IoBlockedReason::IoError => ("io_error", StatusWarningCode::WorktreeReadFailed),
+        IoBlockedReason::IoTimeout => ("io_timeout", StatusWarningCode::WorktreeIoTimeout),
+    }
+}
+
 /// Write a path under `-z` as RAW OS bytes (Git parity: `-z` never quotes,
 /// and on Unix a non-UTF-8 name keeps its exact bytes on the wire). Non-Unix
 /// platforms fall back to the platform's stable `display()` encoding.
@@ -4080,7 +4963,9 @@ fn write_raw_path(writer: &mut impl Write, path: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn quote_pathname(path: &Path, quote_path: bool) -> String {
+/// Public so the wave-0 suite can pin the §B.6.6 escape matrix on paths
+/// (LF/CR) that cannot be created as files on every filesystem.
+pub fn quote_pathname(path: &Path, quote_path: bool) -> String {
     // Escape the RAW OS path bytes (Unix), not a lossy `display()` copy, so
     // a non-UTF-8 name renders its true bytes (`\377`) instead of U+FFFD
     // replacement bytes. On non-Unix `display()` is the platform's stable
@@ -4675,11 +5560,11 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
     let tree_files = tree.get_plain_items_with_mode();
 
     for (item_path, item_hash, item_mode) in tree_files.iter() {
-        let item_str = item_path
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding {
-                path: item_path.clone(),
-            })?;
+        // §B.6.1: a tree path that is not valid UTF-8 cannot match an index
+        // key, so it is skipped rather than made fatal.
+        let Some(item_str) = item_path.to_str() else {
+            continue;
+        };
         if index.tracked(item_str, 0) {
             // A staged change is either a content change (blob hash differs) OR a
             // mode change (e.g. `add --chmod=+x`): the index records 100755 while
@@ -4716,12 +5601,6 @@ pub fn changes_to_be_staged_with_policy(policy: IgnorePolicy) -> Result<Changes,
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
     changes_to_be_staged_with_policy_and_ignore_case(policy, ignore_case)
-}
-
-pub(crate) fn changes_to_be_staged_with_ignore_case(
-    ignore_case: bool,
-) -> Result<Changes, StatusError> {
-    changes_to_be_staged_with_policy_and_ignore_case(IgnorePolicy::Respect, ignore_case)
 }
 
 fn changes_to_be_staged_with_policy_and_ignore_case(
@@ -4798,9 +5677,11 @@ fn changes_to_be_staged_split_force_with_index(
     let tracked_files = index.tracked_files();
     let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     for file in tracked_files.iter() {
-        let file_str = file
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
+        // §B.6.1: skip the keyed comparisons for an undecodable name rather
+        // than failing the whole status (see `collect_tracked_worktree_changes`).
+        let Some(file_str) = file.to_str() else {
+            continue;
+        };
         let file_abs = workdir.join(file);
         if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
@@ -4821,21 +5702,26 @@ fn changes_to_be_staged_split_force_with_index(
             source,
         }
     })?;
+    // A non-UTF-8 name is NOT a status failure (§B.6.1): the base `??` row
+    // survives everywhere else, and failing the whole command here would
+    // make `--scan` the one mode a repository containing such a file could
+    // never run. It cannot be a tracked-lookup key, so it is simply treated
+    // as untracked — which is what it is.
     for file in files {
-        let file_str = file
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
-        {
+        let untracked = match file.to_str() {
+            Some(file_str) => !index.tracked(file_str, 0),
+            None => true,
+        };
+        if untracked && !is_same_file_tracked_alias(workdir, &file, &tracked_fold) {
             visible.new.push(file);
         }
     }
     for file in ignored_files {
-        let file_str = file
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
-        {
+        let untracked = match file.to_str() {
+            Some(file_str) => !index.tracked(file_str, 0),
+            None => true,
+        };
+        if untracked && !is_same_file_tracked_alias(workdir, &file, &tracked_fold) {
             ignored.new.push(file);
         }
     }
@@ -4852,9 +5738,11 @@ fn changes_to_be_staged_split_with_index(
     let tracked_files = index.tracked_files();
     let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     for file in tracked_files.iter() {
-        let file_str = file
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
+        // §B.6.1: skip the keyed comparisons for an undecodable name rather
+        // than failing the whole status (see `collect_tracked_worktree_changes`).
+        let Some(file_str) = file.to_str() else {
+            continue;
+        };
         let file_abs = workdir.join(file);
         if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
@@ -4874,21 +5762,17 @@ fn changes_to_be_staged_split_with_index(
             path: workdir.clone(),
             source,
         })?;
+    // §B.6.1: an undecodable name is untracked, not a fatal error — it can
+    // never be an index key, so the lookup is simply skipped.
     for file in files {
-        let file_str = file
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
-        {
+        let untracked = file.to_str().is_none_or(|name| !index.tracked(name, 0));
+        if untracked && !is_same_file_tracked_alias(workdir, &file, &tracked_fold) {
             visible.new.push(file);
         }
     }
     for file in ignored_files {
-        let file_str = file
-            .to_str()
-            .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
-        {
+        let untracked = file.to_str().is_none_or(|name| !index.tracked(name, 0));
+        if untracked && !is_same_file_tracked_alias(workdir, &file, &tracked_fold) {
             ignored.new.push(file);
         }
     }

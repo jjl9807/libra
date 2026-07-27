@@ -1300,8 +1300,18 @@ macro_rules! cli_error {
 /// global warning tracker is updated and the `--exit-code-on-warning` flag
 /// works correctly.
 pub fn emit_warning(message: impl std::fmt::Display) {
-    record_warning();
-    eprintln!("warning: {message}");
+    let message = message.to_string();
+    // Buffered as well as printed: a command rendering a structured
+    // envelope picks these up so `--json` never exits 9 with an empty
+    // `warnings[]` (§B.5 "no stderr-only bypass").
+    crate::utils::output::record_warning_message(message.clone());
+    // Under a structured envelope the message is delivered through
+    // `data.warnings[]`; printing it here too would reintroduce the
+    // stderr-only channel the contract forbids (and dirty the stream that
+    // JSON consumers are told stays clean on success).
+    if !crate::utils::output::structured_output_active() {
+        eprintln!("warning: {message}");
+    }
 }
 
 /// Emit an advisory warning to stderr WITHOUT tripping the

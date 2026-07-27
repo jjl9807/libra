@@ -248,3 +248,53 @@ fn clone_no_shared_overrides_shared() {
         String::from_utf8_lossy(&alts.stdout)
     );
 }
+
+/// plan-20260714 W0 deletion hard gate: EVERY deletion entry point must
+/// refuse while a live borrower exists. `repack -d` drops loose objects,
+/// so it is one of them (the base's reachability does not include the
+/// borrower's refs).
+#[test]
+fn repack_delete_refuses_while_a_borrower_exists() {
+    let (base, oid) = committed_repo("repack-base");
+    let borrower = tempfile::tempdir().expect("borrower");
+    let bp = borrower.path();
+    assert_cli_success(&run_libra_command(&["init"], bp), "init borrower");
+    assert_cli_success(
+        &run_libra_command(&["alternates", "add", &objects_dir(base.path())], bp),
+        "add alternate",
+    );
+
+    // With the borrower registered, `repack -d` must refuse in the BASE.
+    let refused = run_libra_command(&["repack", "-a", "-d"], base.path());
+    assert!(
+        !refused.status.success(),
+        "repack -d must refuse while borrowed: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("borrow"),
+        "the refusal names the borrower relationship: {stderr}"
+    );
+    let loose = base
+        .path()
+        .join(".libra/objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    assert!(
+        loose.exists(),
+        "no loose object was deleted before refusing"
+    );
+
+    // After the borrower detaches, the same command is allowed again.
+    assert_cli_success(
+        &run_libra_command(&["alternates", "remove", &objects_dir(base.path())], bp),
+        "remove alternate",
+    );
+    let allowed = run_libra_command(&["repack", "-a", "-d"], base.path());
+    assert!(
+        allowed.status.success(),
+        "repack -d proceeds once nothing borrows: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+}

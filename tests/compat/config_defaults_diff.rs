@@ -375,3 +375,86 @@ fn diff_no_comparison_budget_regression() {
         "no budget warning without configuration: {stderr}"
     );
 }
+
+/// plan-20260714 R0-1 §B.4.2.3: a tripped `diff.renameLimit` skips ONLY
+/// the exhaustive inexact stage — exact pairs AND unique-basename pairs
+/// still report as renames instead of degrading to delete + add.
+#[test]
+fn rename_limit_degradation_keeps_unique_basename_pairs() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("diff-rename-limit-basename");
+    fixture.init_repo(&repo);
+    // `src/keep.txt` → `dst/keep.txt` shares a BASENAME but its content
+    // changed enough that only the basename pass can pair it; the noise
+    // files push both sides past renameLimit=1 so the exhaustive stage
+    // is skipped.
+    fs::create_dir_all(repo.join("src")).expect("create src");
+    fixture.commit_file(
+        &repo,
+        "src/keep.txt",
+        "alpha\nbravo\ncharlie\ndelta\n",
+        "base keep",
+    );
+    for index in 0..3 {
+        fixture.commit_file(
+            &repo,
+            &format!("src/noise{index}.txt"),
+            &format!("noise {index}\nmore {index}\n"),
+            &format!("base noise{index}"),
+        );
+    }
+    fs::remove_file(repo.join("src/keep.txt")).expect("remove keep");
+    fs::create_dir_all(repo.join("dst")).expect("create dst");
+    fs::write(repo.join("dst/keep.txt"), "alpha\nbravo\ncharlie\nomega\n")
+        .expect("write keep dest");
+    for index in 0..3 {
+        fs::remove_file(repo.join(format!("src/noise{index}.txt"))).expect("remove noise");
+        fs::write(
+            repo.join(format!("dst/other{index}.txt")),
+            format!("entirely unrelated payload {index}\n"),
+        )
+        .expect("write noise dest");
+    }
+    fixture.success(&repo, &["add", "-A"]);
+
+    fixture.success(&repo, &["config", "diff.renameLimit", "1"]);
+    let out = fixture.success(&repo, &["diff", "--staged", "-M40%"]);
+    let text = stdout_trim(&out);
+    assert!(
+        text.contains("rename from src/keep.txt") && text.contains("rename to dst/keep.txt"),
+        "the basename-proven rename survives a tripped renameLimit: {text}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("diff.renameLimit"),
+        "the degradation still warns: {stderr}"
+    );
+    // The warning must describe what ACTUALLY survived. Saying "exact
+    // renames were still detected" while a unique-basename pair is sitting
+    // in the output above sends readers hunting for a bug that is not
+    // there — and contradicts the docs, COMPATIBILITY and the CHANGELOG.
+    assert!(
+        stderr.contains("unique-basename"),
+        "the warning must name unique-basename pairs as surviving, since one \
+         is present in this very diff: {stderr}"
+    );
+    fixture.success(&repo, &["config", "--unset", "diff.renameLimit"]);
+
+    // Same claim for the OTHER degradation: the comparison budget discards
+    // the exhaustive pass, and the basename pair survives that too.
+    fixture.success(&repo, &["config", "diff.renameComparisonBudget", "1"]);
+    let out = fixture.success(&repo, &["diff", "--staged", "-M40%"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("diff.renameComparisonBudget") {
+        assert!(
+            stderr.contains("unique-basename"),
+            "the budget warning must name unique-basename pairs as surviving: {stderr}"
+        );
+        assert!(
+            stdout_trim(&out).contains("rename to dst/keep.txt"),
+            "and the pair really is still reported: {}",
+            stdout_trim(&out)
+        );
+    }
+    fixture.success(&repo, &["config", "--unset", "diff.renameComparisonBudget"]);
+}

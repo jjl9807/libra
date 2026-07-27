@@ -67,7 +67,7 @@ honored; an unreadable or unsupported system scope skipped):
   under the default, bytes above `0x7F` are additionally escaped as `\ooo`
   octal. `-z` records always carry raw unquoted path bytes.
 
-All five keys are validated up front: an invalid value fails closed with
+All six keys are validated up front: an invalid value fails closed with
 `LBR-CLI-002` and an unreadable local/global scope with `LBR-IO-001`, before
 any status output is produced. Exception: a global config store whose schema
 is newer than this Libra binary is skipped with a one-time deduplicated
@@ -237,25 +237,42 @@ libra status --find-renames=75
 ### Warnings and exit arbitration
 
 Every structured warning is a `{code, message, source}` triple drawn from one frozen
-schema — there is no bypass stderr-only channel:
+schema — there is no bypass stderr-only channel; repository-level preflight advisories from
+other subsystems are folded into the same list (see below):
 
 | Code | Source | Meaning |
 |------|--------|---------|
 | `rename_limit_product_skipped` | `rename_detect` | One side exceeded the per-side rename limit; the exhaustive inexact stage was skipped |
 | `similarity_budget_exceeded` | `rename_detect` | The similarity-comparison budget was exhausted; the inexact pass was discarded |
-| `probe_truncated` | `rename_detect` | The rename-destination probe tripped its enumeration/destination budget; pairing is partial |
+| `probe_truncated` | `probe` | The rename-destination probe tripped its enumeration/destination budget; pairing is partial |
 | `rename_path_encoding_unsupported` | `rename_detect` | Candidates with non-UTF-8 names sat out rename scoring (base `??`/`D` rows unaffected) |
 | `metadata_unavailable` | `metadata` | Repository objects missing, corrupt, or unavailable; the dependent inexact candidates were skipped |
 | `metadata_budget_exceeded` | `metadata` | Content-read budget or per-object size cap reached; remaining candidates skipped |
 | `worktree_read_failed` | `worktree` | A worktree read failed (I/O error); the affected path is in `data.io_blocked[]` or its rename candidate was skipped |
 | `worktree_permission_denied` | `worktree` | A path could not be inspected (EACCES); the path is in `data.io_blocked[]` |
 | `worktree_io_timeout` | `worktree` | A worktree read exceeded its deadline |
-| `dirty_cache_lock_stolen` | `cache` | Another scan stole the dirty-cache lock; results were not persisted |
+| `dirty_cache_lock_stolen` | `cache` | A previous scanner's stale lock was stolen — that scanner may not have finished persisting; THIS scan rebuilds the cache and its result is persisted |
 | `dirty_cache_stale_fallback` | `cache` | The dirty cache was missing/stale; degraded to a full status |
 | `dirty_cache_concurrent_invalidate` | `cache` | A concurrent writer invalidated the cache mid-read |
+| `dirty_cache_path_unencodable` | `cache` | A non-UTF-8 path could not be stored in the dirty cache; its row was omitted (the full status still reports it) |
+| `repository_preflight` | `config` | A repository-level advisory raised before the command ran (e.g. a pending durable object-index repair) |
 
-Human/short/porcelain modes print them as `warning: …` on stderr (even under `--quiet`);
-`--json` carries them in `data.warnings[]` and keeps stderr
+The `source` column is a frozen enum: `config`, `probe`, `rename_detect`, `worktree`,
+`metadata`, `cache`. `probe` and `rename_detect` are deliberately distinct — a `probe`
+warning means candidates may never have been *seen*, while `rename_detect` means they were
+seen but could not be scored. `config` covers repository-level advisories that are not tied to a scan — currently the
+`repository_preflight` row above. Config *resolution* itself never warns: an invalid value
+fails closed instead of degrading.
+
+Repository-level preflight advisories from other subsystems (for example a pending durable
+object-index repair, emitted before any command runs) follow the SAME delivery matrix as status
+warnings: printed on stderr in text modes, and carried in `data.warnings[]` as
+`repository_preflight` / `config` under `--json` — where stderr stays clean. That keeps the rule
+exact: exit 9 always corresponds to at least one entry in the structured list, so a `--json`
+consumer never has to read stderr to learn why its exit code changed.
+
+Human/short/porcelain modes print status warnings as `warning: …` on stderr (even under
+`--quiet`); `--json` carries them in `data.warnings[]` and keeps stderr
 clean on every successful run; the single exception is a non-EPIPE stdout failure while
 emitting the JSON envelope itself, where the pending warnings are flushed to stderr rather
 than silently lost. With the global `--exit-code-on-warning`, a warning exits 9 and takes precedence
@@ -274,9 +291,12 @@ a fake deletion, a dirty check reporting clean). Instead:
 - **`--json`** succeeds and reports the partial result: every blocked path appears in
   `data.io_blocked[]` as `{path: {display, raw_base64}, staged, reason, rename}` —
   `display` is the escaped repo-relative form (same quoting as non-`-z` porcelain),
-  `raw_base64` carries the exact OS bytes when the name is not valid UTF-8 (else `null`),
+  `raw_base64` carries the exact OS bytes when the name is not valid UTF-8 (else `null`) — on Unix
+  the raw `OsStr` bytes, on Windows the UTF-16 code units serialized little-endian, so an
+  unpaired surrogate round-trips too —
   `staged` is the known staged component (`"M"`/`"A"`/`"D"`/`"R"` or `null`), `reason` is
-  `"permission_denied"` or `"io_error"`, and `rename` is the affected staged rename pair
+  `"permission_denied"`, `"io_error"`, or `"io_timeout"` (a single filesystem operation
+  exceeded the probe deadline), and `rename` is the affected staged rename pair
   (`{from, to, score}`) when one is known. Entries are sorted by raw path bytes and
   deduplicated; each also emits a `worktree_*` warning.
 - `data.base_scan_complete` is `false` when the base scan itself was blocked;
@@ -297,8 +317,13 @@ disables). Config applies only when none is given. The `status.renames` config (
 `diff.renames`) sets the default through the strict local → global → system cascade: `false`
 disables detection, a truthy value or an unset key enables it at 50%. `copy`/`copies` are
 rejected (copy detection is not yet supported) rather than degrading to plain renames. Invalid
-values fail closed with `LBR-CLI-002` before any output. The Libra dirty-cache extensions
-(`--cached`/`--check-dirty`) run without rename detection.
+values fail closed with `LBR-CLI-002` before any output. Precedence applies to the *value*, not
+to validation: like Git, the config is parsed before the flags are applied, so
+`status.renames=copy` (or any non-boolean) still fails closed even when `--no-renames` would
+have made the value irrelevant — fix the config rather than masking it with a flag. The Libra
+dirty-cache extensions (`--cached`/`--check-dirty`) do not run rename detection at all, and
+combining them with any rename flag is a usage error (`LBR-CLI-002`) rather than a silent
+disable — the cache stores no rename information, so a request for it cannot be honored.
 
 ```bash
 libra status --renames
@@ -441,7 +466,8 @@ silent dirty check (exit 1 if dirty, exit 0 if clean).
 
 - `--json` writes one success envelope to `stdout`
 - `--machine` writes the same schema as compact single-line JSON
-- `stderr` stays clean on success
+- `stderr` stays clean on success: every warning, including a repository-level preflight
+  advisory from another subsystem, is delivered through `data.warnings[]`
 
 Example:
 
@@ -539,9 +565,10 @@ Detached HEAD:
   lists are empty, no global merge state is active, **and** `io_blocked` is
   empty ("cannot inspect" is never clean)
 - `has_commits` is `false` in a freshly initialized repository with no commits
-- `staged.renamed` / `unstaged.renamed` list rename pairs as `"old -> new"`
-  strings, and the top-level `renames[]` array carries the structured records
-  (`{from, to, score, exact, staged, unstaged}`), sorted by destination
+- `staged.renamed` / `unstaged.renamed` list rename pairs as `{from, to}`
+  objects (path strings, repo-root-relative), and the top-level `renames[]`
+  array carries the structured records (`{from, to, score, exact, staged,
+  unstaged}`), sorted by destination
 - `warnings[]` carries the structured `{code, message, source}` warnings (see
   *Warnings and exit arbitration*)
 - `io_blocked[]` lists paths the scan could not inspect (see *The io_blocked
@@ -566,6 +593,23 @@ extended v2 line layout — for each tracked file:
 1 XY <sub> <mode_HEAD> <mode_index> <mode_worktree> <hash_HEAD> <hash_index> <path>
 ```
 
+A detected rename is ONE `2` record instead of two `1` rows:
+
+```text
+2 XY <sub> <mode_HEAD> <mode_index> <mode_worktree> <hash_HEAD> <hash_index> R<score> <new>\t<old>
+```
+
+`R<score>` is the similarity percentage (`R100` for an exact pair). The
+`mode_HEAD`/`hash_HEAD` columns describe the rename's ORIGIN (the old
+path's HEAD entry), while `mode_index`/`hash_index` describe the new
+path's staged entry — an unstaged rename (`.R`) therefore copies the
+index entry into both the HEAD and index columns, because HEAD does not
+know the destination. A destination modified or deleted in the worktree
+rides in the second XY column (`RM`/`RD`); a deleted destination reports
+`mode_worktree` as `000000`. Under `-z` the record's trailing field pair
+is `…R<score> <new> NUL <old> NUL` — NEW first, then OLD, with raw
+unquoted path bytes and no tab separator.
+
 Untracked entries collapse to `? <path>` and ignored entries to `! <path>`,
 matching Git's own v2 encoding. The implementation lives in
 `src/command/status.rs::output_porcelain_v2` and is fed by
@@ -589,7 +633,7 @@ Git's `git status` always exits 0 regardless of repository state, and checking f
 requires `git diff --exit-code` or parsing `git status --porcelain` output. Libra adds an
 explicit `--exit-code` flag that returns exit 1 when the working tree is dirty. This is
 intentionally opt-in (rather than default) to avoid breaking scripts that check `$?` after
-`libra status`. Combined with `--quiet`, it provides a zero-output, exit-code-only dirty check
+`libra status`. Combined with `--quiet`, it provides a stdout-free, exit-code-driven dirty check
 that is cleaner than parsing text output.
 
 ### `--show-stash` in standard mode only
@@ -639,7 +683,10 @@ a branch needs to be pushed or pulled, without having to run separate `libra log
 | `--exit-code` | exit 0 | exit 1 |
 
 `--exit-code` enables a silent dirty check useful for scripting. When combined with
-`--quiet`, no output is produced -- only the exit code signals the repository state.
+`--quiet`, no `stdout` is produced -- the exit code signals the repository state. Diagnostics
+are NOT suppressed: warnings still reach `stderr` (that is what makes `--quiet
+--exit-code-on-warning` actionable), and a blocked path still fails closed with its
+`LBR-IO-001` message.
 
 A non-empty `io_blocked` set counts as dirty for `--exit-code`. With the global
 `--exit-code-on-warning`, any structured warning exits 9 instead; the full arbitration

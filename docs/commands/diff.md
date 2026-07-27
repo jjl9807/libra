@@ -255,8 +255,11 @@ irrelevant prefix defaults are not read. `-R` swaps the resulting pair.
 ### Rename detection budgets
 
 `diff.renameLimit` (like Git) bounds the quadratic inexact-rename pass: when the
-number of rename sources *or* destinations exceeds the limit, exact renames are
-still reported but the inexact pass is skipped and a warning is emitted. The
+number of rename sources *or* destinations exceeds the limit, the exhaustive
+inexact pass is skipped and a warning is emitted, but the cheap stages that run
+before the gate still report — exact (blob-id) renames **and** scored
+unique-basename pairs (a lone `foo.rs` on each side, pairing only when its
+similarity still meets the threshold). The
 value is a non-negative integer through the strict local → global → system
 cascade; `0` means "no per-side limit"; the default is 1000. `diff.renameComparisonBudget`
 caps the total number of similarity comparisons in the inexact pass: a

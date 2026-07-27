@@ -2,6 +2,42 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-3 / R0-7 / R0-8 / R0-9 review closeout)
+
+- **`status` never reports a repository it could not fully inspect as
+  clean.** The fail-closed guard moved out of the renderer, so `--quiet`
+  (which skips rendering) and both dirty-cache fallback paths now refuse
+  with `LBR-IO-001` instead of exiting 0. `--check-dirty` re-verification
+  runs one tri-state stat per row — a permission change mid-run can no
+  longer be read as "the file is gone" and prune a still-valid cache row —
+  and a blocked re-verification writes nothing at all.
+- **`status --scan` no longer walks the worktree twice.** The cache
+  snapshot is built from the same bounded, `io_blocked`-aware scan that
+  produced the status, with rename detection disabled for the snapshot
+  (the cache stores paths by kind and has no rename row: pairing them
+  would have persisted an empty snapshot for a renamed file, and the next
+  `--cached --exit-code` would have called the repository clean).
+- **Every blocking worktree read is now time-bounded** — tracked stat and
+  content hash, untracked enumeration, ignore lookups, and the probe's
+  directory listing and per-entry metadata — by a pool of 8 REUSED worker
+  threads. The deadline measures lack of progress, so a large directory
+  that keeps yielding entries is never mistaken for a hung mount.
+- **`io_blocked[]` and `warnings[]` are one-to-one**, including on the
+  cache paths; repository-level preflight advisories are folded into the
+  same list as `repository_preflight` / `config`, so `--json
+  --exit-code-on-warning` can never exit 9 with an empty `warnings[]`,
+  and `--json` keeps stderr clean. `base_scan_complete` and
+  `rename_detection_complete` now report their own subsystems
+  independently.
+- **Non-UTF-8 names never fail `status`** in any mode, including `--scan`
+  and the cache modes, and JSON paths render through the documented
+  escaping instead of `Path::display()` — two different filenames can no
+  longer collapse onto one JSON string.
+- **The probe excludes repository metadata, gitlinks and nested
+  repositories unconditionally**, including when a pathspec names one
+  directly, and reports a resolved-outside-the-worktree path as blocked
+  rather than skipping it silently.
+
 ### Added (Part C W4)
 
 - **`libra agent workspace list|show` (plan-20260714 Part C W4 machine
@@ -12,6 +48,21 @@
   owner, lease fence/expiry, canonical path, task/session
   associations). Lease mutation stays internal to the agent runtime
   services.
+
+### Changed
+
+- **Rename-degradation semantics are now spelled out (plan-20260714
+  R0-9)**: when `diff.renameLimit` / `status.renameLimit` is exceeded on
+  either side, exact renames AND unique-basename renames are still
+  reported — only the exhaustive inexact stage is skipped, with a
+  `rename_limit_product_skipped` warning. When
+  `diff.renameComparisonBudget` (or status's similarity budget) is
+  exhausted, the exhaustive pass's results are discarded wholesale (a
+  partial exhaustive result would be order-dependent) while exact and
+  unique-basename pairs survive, with a `similarity_budget_exceeded`
+  warning. `diff` now runs the same staged order as `status`
+  (exact → unique-basename → bounded exhaustive), so a degraded run can
+  no longer demote a basename-proven rename to a delete + add pair.
 
 ### Fixed
 
@@ -154,13 +205,22 @@
   and reports the partial result through `data.io_blocked[]`
   (`{path:{display,raw_base64},staged,reason,rename}`, raw-byte-sorted
   and deduplicated) plus `base_scan_complete` /
-  `rename_detection_complete` / `complete`; `is_clean` is `false` and
+  `rename_detection_complete` / `complete`. The unstaged rename-destination
+  probe is bounded by two call-global budgets — 50,000 enumerated entries
+  and 10,000 qualified destinations, aggregated across probe roots — and
+  tripping either keeps the pairs found so far while emitting a
+  `probe_truncated` warning (`source: probe`) that names which budget
+  ran out. The budgets apply ONLY to the probe: the display scan still
+  reports every untracked path; `is_clean` is `false` and
   `--exit-code` reports dirty while anything is blocked, a blocked
   `--scan` refuses to replace the dirty cache, and `--check-dirty`
   keeps rows it cannot re-verify. Structured warnings now use one
   frozen `{code, message, source}` schema (sources
-  `rename_detect`/`metadata`/`worktree`/`cache`, codes documented in
-  `docs/commands/status.md`), object-read faults during rename scoring
+  `config`/`probe`/`rename_detect`/`worktree`/`metadata`/`cache`, codes
+  documented in `docs/commands/status.md`; `probe` is distinct from
+  `rename_detect` so consumers can tell "candidates may never have been
+  seen" from "seen but unscorable"), one warning per `io_blocked[]`
+  entry, object-read faults during rename scoring
   (missing/corrupt/unavailable objects, budget caps) skip only the
   dependent inexact candidates with deduplicated
   `metadata_unavailable`/`metadata_budget_exceeded` warnings, and exit
