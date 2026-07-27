@@ -1639,19 +1639,19 @@ fn build_rename_side(
                 let (kind, mode) = match std::fs::symlink_metadata(&abs) {
                     Ok(meta) if meta.file_type().is_symlink() => (BlobKind::Symlink, 0o120000),
                     Ok(_) => (BlobKind::Regular, 0o100644),
-                    Err(error) => {
-                        // §B.3.4: a candidate we cannot even stat is a
-                        // DEGRADATION, not a silent non-candidate — a
-                        // post-scan race or permission problem must still
-                        // surface a warning while the base status stays
-                        // truthful. NotFound is the ordinary "deleted
-                        // between scan and detection" TOCTOU and needs no
-                        // warning.
-                        if error.kind() != io::ErrorKind::NotFound {
-                            *snapshot_skips
-                                .entry(rename_detect::SkipReason::IoFailed)
-                                .or_default() += 1;
-                        }
+                    Err(_) => {
+                        // §B.3.4/§B.4.1: a candidate we cannot even stat is
+                        // a DEGRADATION, not a silent non-candidate — the
+                        // base status stays truthful, but the run must say
+                        // rename detection was incomplete. That includes
+                        // `NotFound`: the path DID exist when the scan
+                        // enumerated it, so its disappearance is a race that
+                        // cost a rename candidate, and reporting the run as
+                        // complete would claim a pairing was ruled out when
+                        // it was never attempted.
+                        *snapshot_skips
+                            .entry(rename_detect::SkipReason::IoFailed)
+                            .or_default() += 1;
                         continue;
                     }
                 };
@@ -4260,6 +4260,35 @@ enum WorktreeMode {
     Unreadable,
 }
 
+/// Mode of an already repository-root-relative path. The porcelain v2
+/// payload is projected to repo-root paths before rendering, so it must NOT
+/// go through `current_to_workdir` a second time.
+fn get_worktree_mode_result_for_workdir(workdir_path: &std::path::Path) -> WorktreeMode {
+    let abs_path = util::workdir_to_absolute(workdir_path);
+    match std::fs::symlink_metadata(&abs_path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                WorktreeMode::Mode(if metadata.file_type().is_symlink() {
+                    0o120000
+                } else if metadata.permissions().mode() & 0o111 != 0 {
+                    0o100755
+                } else {
+                    0o100644
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = metadata;
+                WorktreeMode::Mode(0o100644)
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorktreeMode::Gone,
+        Err(_) => WorktreeMode::Unreadable,
+    }
+}
+
 #[cfg(unix)]
 fn get_worktree_mode_result(file_path: &std::path::Path) -> WorktreeMode {
     use std::os::unix::fs::PermissionsExt;
@@ -4354,8 +4383,13 @@ fn write_rename_porcelain_v2(
 ) -> CliResult<()> {
     let write_err =
         |e: io::Error| crate::utils::output::stdout_write_error("write status output", e);
-    let old_workdir = current_to_workdir(old);
-    let new_workdir = current_to_workdir(new);
+    // The porcelain payload was ALREADY projected to repository-root paths
+    // (`to_repo_relative`), so these keys are used as-is. Converting again
+    // would double the prefix when `status` runs from a subdirectory —
+    // `sub/a.txt` became `sub/sub/a.txt`, the HEAD/index lookups missed, and
+    // the record fail-closed instead of reporting its real mode and hash.
+    let old_workdir = old.to_path_buf();
+    let new_workdir = new.to_path_buf();
 
     // Staged rename: HEAD side is the OLD path, index side is the NEW path.
     // Unstaged-only rename (`.R`): there is no staged component, so Git copies
@@ -4411,7 +4445,7 @@ fn write_rename_porcelain_v2(
         // a fabricated regular-file mode would hand a script a value the
         // filesystem never reported. Fail closed instead — the same rule the
         // hash fields already follow.
-        match get_worktree_mode_result(new) {
+        match get_worktree_mode_result_for_workdir(&new_workdir) {
             WorktreeMode::Mode(mode) => mode,
             // Genuinely absent (a chained rename already moved it on):
             // `000000`, the v2 spelling for "no worktree entry".

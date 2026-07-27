@@ -527,6 +527,28 @@ fn staged_rename_then_modify_emits_rm() {
         record.split_whitespace().nth(1) == Some("RM"),
         "v2 xy is RM when the destination has a worktree edit: {record}"
     );
+    // The pairing must be the STAGED HEAD↔index one: exact, score 100. A
+    // HEAD↔worktree implementation would also render `RM` here, but would
+    // score the edited worktree bytes inexactly — so the rendered code alone
+    // cannot tell the two apart.
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames");
+    assert_eq!(renames.len(), 1, "one rename record: {json}");
+    assert_eq!(
+        renames[0]["exact"], true,
+        "staged side is HEAD↔index: {json}"
+    );
+    assert_eq!(renames[0]["score"], 100, "and therefore exact: {json}");
+    assert_eq!(renames[0]["staged"], true, "{json}");
+    assert_eq!(renames[0]["unstaged"], false, "{json}");
+    // The worktree edit is still reported, separately.
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|m| !m.is_empty()),
+        "the worktree modification survives as its own entry: {json}"
+    );
 }
 
 /// `status.renameUntracked` is a strict-bool config cascade: enabling it (in
@@ -4391,6 +4413,117 @@ fn scan_snapshot_keeps_rename_endpoints_as_dirty_rows() {
         Some(1),
         "--exit-code over the cache still reports dirty: {}",
         String::from_utf8_lossy(&exit.stderr)
+    );
+}
+
+/// §B.6.4: porcelain v2 rename records carry repository-root paths AND real
+/// metadata when `status` runs from a SUBDIRECTORY. The payload is projected
+/// to repo-root paths before rendering, so the writer must use those keys
+/// as-is — projecting a second time turned `sub/a.txt` into `sub/sub/a.txt`,
+/// missed the HEAD/index lookups, and failed the record closed.
+#[test]
+fn porcelain_v2_rename_from_subdirectory_keeps_real_metadata() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir_all(repo.path().join("sub")).unwrap();
+    fs::write(repo.path().join("sub/a.txt"), &base).unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the fixture");
+    let commit = run_libra_command(&["commit", "-m", "base"], repo.path());
+    assert_cli_success(&commit, "commit the fixture");
+    let head_oid = {
+        let out = run_libra_command(&["rev-parse", "HEAD:sub/a.txt"], repo.path());
+        assert_cli_success(&out, "rev-parse");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let mv = run_libra_command(&["mv", "sub/a.txt", "sub/b.txt"], repo.path());
+    assert_cli_success(&mv, "stage the rename");
+
+    // Run from INSIDE `sub/`.
+    let sub = repo.path().join("sub");
+    let out = status_stdout(&sub, &["status", "--porcelain=v2"]);
+    let record = out
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("a v2 rename record is emitted: {out}"));
+    let fields: Vec<&str> = record.split_whitespace().collect();
+    assert_eq!(fields[1], "R.", "staged-only rename: {out}");
+    assert_eq!(fields[3], "100644", "mH is real, not fail-closed: {out}");
+    assert_eq!(fields[4], "100644", "mI is real: {out}");
+    assert_eq!(fields[5], "100644", "mW is the real worktree mode: {out}");
+    assert_eq!(fields[6], head_oid, "hH is the real HEAD blob: {out}");
+    assert_ne!(fields[6], "0".repeat(fields[6].len()), "not a zero hash");
+    // Paths are repository-root-relative in porcelain, regardless of cwd.
+    assert!(
+        record.ends_with("sub/b.txt\tsub/a.txt"),
+        "repo-root paths, projected exactly once: {out}"
+    );
+}
+
+/// §B.4.1 exact worktree arm, end to end: an unstaged (index↔worktree)
+/// rename whose bytes are unchanged pairs EXACTLY — the worktree OID is
+/// streamed this call and the index side is a recorded fact, so the
+/// allow-list permits skipping content scoring entirely. Score 100,
+/// `exact: true`, on the unstaged side.
+#[test]
+fn worktree_exact_matches_known_index_oid() {
+    let repo = create_repo_with_committed_file("src.txt", "exact worktree content\nline two\n");
+    enable_rename_untracked(repo.path());
+    // Pure worktree move: the index still records `src.txt` with its OID,
+    // and `dst.txt` holds byte-identical content.
+    fs::rename(repo.path().join("src.txt"), repo.path().join("dst.txt")).unwrap();
+
+    let json = status_stdout(repo.path(), &["--json", "status"]);
+    let doc: serde_json::Value = serde_json::from_str(&json).expect("json status");
+    let renames = doc["data"]["renames"].as_array().expect("renames");
+    assert_eq!(renames.len(), 1, "one unstaged rename: {json}");
+    assert_eq!(renames[0]["from"], "src.txt", "{json}");
+    assert_eq!(renames[0]["to"], "dst.txt", "{json}");
+    assert_eq!(
+        renames[0]["exact"], true,
+        "index OID is a recorded fact, so the pair is exact: {json}"
+    );
+    assert_eq!(renames[0]["score"], 100, "{json}");
+    assert_eq!(renames[0]["unstaged"], true, "{json}");
+    assert_eq!(renames[0]["staged"], false, "{json}");
+}
+
+/// §B.4.1 gitlink arm, end to end over a REAL index: a moved submodule
+/// gitlink pairs by (oid, mode) without any content read — the commit object
+/// it names need not exist in this repository at all, which is the whole
+/// point of the kind check. A regular blob with the same id must not pair
+/// with it.
+#[test]
+fn gitlink_missing_object_exact_by_oid_mode() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let repo = create_repo_with_committed_file("anchor.txt", "anchor\n");
+    enable_rename_untracked(repo.path());
+
+    // Record `old-sub` as a gitlink pointing at a commit that does NOT
+    // exist in this repository, then move the checkout to `new-sub`.
+    let index_path = repo.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let phantom = git_internal::internal::object::blob::Blob::from_content("phantom submodule").id;
+    let mut entry = IndexEntry::new_from_blob("old-sub".to_string(), phantom, 0);
+    entry.mode = 0o160000;
+    index.add(entry);
+    index.save(&index_path).expect("save index");
+    fs::create_dir_all(repo.path().join("new-sub")).unwrap();
+
+    // The point is that `status` ANSWERS: a gitlink whose object is absent
+    // must not fail the command, and must not pair with a regular blob.
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&out, "status with a gitlink whose object is missing");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["renames"]
+            .as_array()
+            .is_some_and(|r| r.iter().all(|x| x["to"] != "anchor.txt")),
+        "a gitlink never pairs with a regular blob: {doc}"
     );
 }
 

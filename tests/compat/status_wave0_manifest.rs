@@ -30,6 +30,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "exit_warning_over_dirty_ioblocked_json",
     "find_renames_raw_grammar_and_last_wins",
     "generate_short_status_entries_api",
+    "gitlink_missing_object_exact_by_oid_mode",
     "gitlink_never_pairs_with_a_regular_blob",
     "global_short_value_contains_z_not_format",
     "human_rename_long_format",
@@ -67,6 +68,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "porcelain_untracked_directory_marker_survives_projection",
     "porcelain_v1_rename_output_stays_add_delete",
     "porcelain_v1_uses_rename_arrow_when_detected",
+    "porcelain_v2_rename_from_subdirectory_keeps_real_metadata",
     "porcelain_v2_staged_rename_mode_hash_fields",
     "porcelain_v2_unmerged_u_line",
     "porcelain_v2_unstaged_dot_r_hash_fixup",
@@ -140,5 +142,6 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "tracked_scan_io_timeout_is_reported_not_hung",
     "tracked_unreadable_path_fails_closed_not_deleted",
     "unmerged_stage_presence_to_xy_mapping",
+    "worktree_exact_matches_known_index_oid",
     "worktree_read_failure_degrades_with_warning_not_silence",
 ];

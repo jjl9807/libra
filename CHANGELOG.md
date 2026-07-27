@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-2 / R0-5 / R0-6 review closeout)
+
+- **`status --porcelain=v2` rename records from a SUBDIRECTORY report real
+  metadata again.** The payload is projected to repository-root paths before
+  rendering; the v2 writer projected them a second time, so `sub/a.txt`
+  became `sub/sub/a.txt`, the HEAD/index lookups missed, and the record
+  failed closed instead of carrying its mode and hash.
+- **A rename record fails closed on an UNREADABLE worktree mode** instead of
+  fabricating `100644`. A genuinely absent destination (a chained rename
+  already moved it) still renders `000000` — "gone" and "cannot read" are
+  different answers.
+- **`--porcelain --ignored` / `--short --ignored` honor `core.quotePath`**,
+  and porcelain v2 `u` records carry raw path bytes under `-z` and the
+  escaped form otherwise; both previously used `Path::display()`, which
+  neither escaped control characters nor preserved non-UTF-8 bytes.
+- **A rename candidate that disappears between the scan and the hash is
+  reported as a degradation.** It used to be dropped silently, leaving
+  `rename_detection_complete: true` for a pairing that was never attempted.
+- **LFS worktree reads are byte-capped and size-stable**, so a file that
+  grows after its size check can no longer blow the read budget or produce a
+  pointer describing content that never existed.
+
 ### Fixed (plan-20260714 R0-3 / R0-7 / R0-8 / R0-9 review closeout)
 
 - **`status` never reports a repository it could not fully inspect as
