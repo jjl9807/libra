@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-5 review PASS)
+
+R0-5 (porcelain v2 rename records) passes Codex review. Everything the card
+claims is now pinned by a regression: staged `R.` with a real mode flip,
+unstaged `.R` with real `100755` columns from an executable fixture, chained
+renames asserted by TOTAL change-row count in both configurations (so a
+leaked endpoint row or spurious `.R` cannot hide behind a correct `2 ` count),
+`-z` raw bytes, records from a subdirectory carrying real metadata, `MR` when
+the rename source also has a staged change, and fail-closed handling of an
+unreadable — as opposed to absent — worktree mode.
+
 ### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review round 9)
 
 - **A single `status` no longer spends its read budgets twice.** The staged
