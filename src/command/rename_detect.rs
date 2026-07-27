@@ -246,52 +246,92 @@ pub fn match_pairs(
         }
     }
 
-    let old_paths: Vec<&PathBuf> = remaining_old.keys().copied().collect();
-    for old_path in old_paths {
-        let old_blob = remaining_old[&old_path];
-        let Some(oid) = old_blob.evidence.oid() else {
-            continue;
-        };
-        let mode_key = (old_blob.kind == BlobKind::Gitlink).then_some(old_blob.mode);
-        let Some(candidates) = buckets.get_mut(&(*oid, old_blob.kind, mode_key)) else {
-            continue;
-        };
-        if candidates.is_empty() {
-            continue;
+    // §B.4.2.2 exact selection is GLOBAL, not per-source-in-order. Every
+    // allowed (old, new) candidate edge is enumerated first and sorted
+    // `same_basename DESC, old ASC, new ASC`, then consumed greedily. Walking
+    // sources in path order and letting each take its best remaining
+    // destination gets this wrong: with `src/alpha.txt` and `src/beta.txt`
+    // both matching `dst/beta.txt` and `dst/zzz.txt`, `alpha` (first source,
+    // no basename match) would claim `dst/beta.txt` and strand the pair that
+    // actually shares a name. Git's diffcore runs the same-basename pass
+    // first for exactly this reason.
+    // Two passes over the SOURCES, never over the old × new product: a
+    // repository with thousands of identically-named duplicate blobs must
+    // not materialize a cartesian edge set here (that is quadratic in both
+    // time and memory, before `rename_limit` has had any say).
+    //
+    // Pass A gives every source its same-basename destination if the bucket
+    // holds one; pass B assigns what remains in path order. The result is
+    // the same global "same_basename DESC, old ASC, new ASC" ranking a
+    // sorted edge list would produce, because a same-basename edge exists
+    // for at most one destination per source.
+    let mut consumed_old: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut consumed_new: BTreeSet<PathBuf> = BTreeSet::new();
+    let allowed_dest = |old_blob: &BlobRef, new_path: &PathBuf| -> bool {
+        remaining_new.get(new_path).is_some_and(|new_blob| {
+            BlobEvidence::exact_pair_allowed(&old_blob.evidence, &new_blob.evidence)
+        })
+    };
+    // `remaining_old` is a BTreeMap, so both passes walk sources in path
+    // byte order without an extra sort.
+    // Sources are visited in path order (BTreeMap), and each consumed
+    // destination is REMOVED from its bucket immediately. Without that
+    // removal, N delete/add pairs sharing one blob id make every source
+    // rescan the whole bucket — O(N²) work before `rename_limit` has had any
+    // say. With it, each destination is examined a bounded number of times.
+    let old_keys: Vec<PathBuf> = remaining_old.keys().map(|p| (*p).clone()).collect();
+    for same_basename_pass in [true, false] {
+        for old_path in &old_keys {
+            if consumed_old.contains(old_path) {
+                continue;
+            }
+            let Some(old_blob) = remaining_old.get(old_path) else {
+                continue;
+            };
+            let Some(oid) = old_blob.evidence.oid() else {
+                continue;
+            };
+            let mode_key = (old_blob.kind == BlobKind::Gitlink).then_some(old_blob.mode);
+            let bucket_key = (*oid, old_blob.kind, mode_key);
+            let Some(candidates) = buckets.get(&bucket_key) else {
+                continue;
+            };
+            let picked = if same_basename_pass {
+                // At most ONE candidate can share the basename, so this is a
+                // lookup, not a scan of the bucket.
+                candidates
+                    .iter()
+                    .find(|new_path| {
+                        new_path.file_name() == old_path.file_name()
+                            && allowed_dest(old_blob, new_path)
+                    })
+                    .cloned()
+            } else {
+                candidates
+                    .iter()
+                    .find(|new_path| allowed_dest(old_blob, new_path))
+                    .cloned()
+            };
+            if let Some(new_path) = picked {
+                if let Some(bucket) = buckets.get_mut(&bucket_key) {
+                    bucket.remove(new_path);
+                }
+                consumed_old.insert(old_path.clone());
+                consumed_new.insert(new_path.clone());
+                matches.push(RenameMatch {
+                    old: old_path.clone(),
+                    new: new_path.clone(),
+                    exact: true,
+                    internal_score: EXACT_SCORE,
+                });
+            }
         }
-        // Prefer a same-basename destination; fall back to the first (path
-        // byte order) candidate — deterministic one-to-one consumption.
-        // Only destinations whose evidence pairing is allowed (§B.4.1)
-        // may be consumed here; a C/C pair falls through to inexact.
-        let allowed: Vec<&PathBuf> = candidates
-            .iter()
-            .copied()
-            .filter(|path| {
-                remaining_new.get(path).is_some_and(|new_blob| {
-                    BlobEvidence::exact_pair_allowed(&old_blob.evidence, &new_blob.evidence)
-                })
-            })
-            .collect();
-        if allowed.is_empty() {
-            continue;
-        }
-        let same_basename = allowed
-            .iter()
-            .find(|p| p.file_name() == old_path.file_name())
-            .copied();
-        let picked: &PathBuf = match same_basename.or_else(|| allowed.first().copied()) {
-            Some(picked) => picked,
-            None => continue,
-        };
-        candidates.remove(picked);
-        remaining_new.remove(picked);
-        remaining_old.remove(old_path);
-        matches.push(RenameMatch {
-            old: old_path.clone(),
-            new: picked.clone(),
-            exact: true,
-            internal_score: EXACT_SCORE,
-        });
+    }
+    for path in &consumed_old {
+        remaining_old.remove(path);
+    }
+    for path in &consumed_new {
+        remaining_new.remove(path);
     }
 
     // ---- Stage 2: `-M100%` stops after exact ------------------------------
@@ -342,9 +382,18 @@ pub fn match_pairs(
         if !inexact_eligible(old_blob) || !inexact_eligible(new_blob) {
             continue;
         }
-        // The basename stage always runs (§B.4.2.3): its comparisons count
-        // toward the budget diagnostics but are never gated by it — only the
-        // exhaustive stage is discarded on exhaustion (§B.4.2.5 触顶规则).
+        // The basename stage always RUNS before the gate (§B.4.2.3), but the
+        // comparison budget is a real bound on the whole detection pass: a
+        // tree with 500_001 unique-basename pairs would otherwise score
+        // every one of them and report no degradation at all. Once the
+        // budget is spent the stage STOPS (keeping what it already paired)
+        // and the run is marked degraded.
+        if let Some(budget) = config.comparison_budget
+            && stats.comparisons >= budget
+        {
+            stats.exhaustive_discarded = true;
+            break;
+        }
         stats.comparisons += 1;
         let Some(old_entry) = spanhash_for(
             &mut old_hashes,
@@ -764,14 +813,24 @@ impl WorktreeReadBudget {
         if !self.take_task() {
             return ContentOutcome::Skipped(SkipReason::BudgetExceeded);
         }
-        let metadata = match std::fs::symlink_metadata(abs_path) {
-            Ok(metadata) => metadata,
-            Err(_) => return ContentOutcome::Skipped(SkipReason::IoFailed),
+        // Deadline-guarded: an optional content read must never wedge the
+        // command on a hung mount.
+        let stat_target = abs_path.to_path_buf();
+        let metadata = match crate::command::status_probe::with_io_deadline(move || {
+            stat_target.symlink_metadata()
+        }) {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::IoFailed),
+            Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
         };
         if metadata.file_type().is_symlink() {
-            return match super::read_symlink_blob_bytes(abs_path) {
-                Ok(bytes) => self.account(bytes),
-                Err(_) => ContentOutcome::Skipped(SkipReason::IoFailed),
+            let link_target = abs_path.to_path_buf();
+            return match crate::command::status_probe::with_io_deadline(move || {
+                super::read_symlink_blob_bytes(&link_target)
+            }) {
+                Ok(Ok(bytes)) => self.account(bytes),
+                Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
+                Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
             };
         }
         if crate::utils::lfs::is_lfs_tracked(abs_path) {
@@ -794,7 +853,10 @@ impl WorktreeReadBudget {
                     self.remaining_total = self.remaining_total.saturating_sub(metadata.len());
                     ContentOutcome::Content(Rc::new(pointer.into_bytes()))
                 }
-                Ok(Ok(None)) => ContentOutcome::Skipped(SkipReason::TooLarge),
+                Ok(Ok(None)) => {
+                    self.remaining_total = self.remaining_total.saturating_sub(cap);
+                    ContentOutcome::Skipped(SkipReason::TooLarge)
+                }
                 Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
             };
         }
@@ -827,34 +889,58 @@ impl WorktreeReadBudget {
 
     fn account(&mut self, bytes: Vec<u8>) -> ContentOutcome {
         let len = bytes.len() as u64;
-        if len > self.per_file_cap.min(self.remaining_total) {
+        // The bytes were READ, so they are charged whether or not the result
+        // is usable. Refusing without charging let a file that grew after
+        // its size check consume real I/O for free: 4096 tasks could each
+        // read ~2 MiB while the 64 MiB total budget stayed untouched.
+        let over = len > self.per_file_cap.min(self.remaining_total);
+        self.remaining_total = self.remaining_total.saturating_sub(len);
+        if over {
             return ContentOutcome::Skipped(SkipReason::TooLarge);
         }
-        self.remaining_total = self.remaining_total.saturating_sub(len);
         ContentOutcome::Content(Rc::new(bytes))
     }
 
     /// Stream a worktree path's Git blob OID and byte size under budget
     /// (§B.4.1 `worktree_blob_oid_and_size`). Costs one task; the streamed
     /// bytes are charged against the total budget but never buffered.
+    /// Streams the OID and returns the kind OBSERVED during that read, so a
+    /// caller that stat'ed the path earlier can detect a type change in
+    /// between (a regular file replaced by a symlink would otherwise hand
+    /// the exact gate a symlink-target OID labelled `Regular`).
     pub fn worktree_blob_oid_and_size(
         &mut self,
         abs_path: &Path,
-    ) -> Result<(ObjectHash, u64), SkipReason> {
+    ) -> Result<(ObjectHash, u64, BlobKind), SkipReason> {
         if !self.take_task() {
             return Err(SkipReason::BudgetExceeded);
         }
-        let metadata = std::fs::symlink_metadata(abs_path).map_err(|_| SkipReason::IoFailed)?;
+        // Deadline-guarded like every other worktree read: a stat that hangs
+        // must reclaim the caller and skip the candidate.
+        let stat_target = abs_path.to_path_buf();
+        let metadata = match crate::command::status_probe::with_io_deadline(move || {
+            stat_target.symlink_metadata()
+        }) {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(_)) => return Err(SkipReason::IoFailed),
+            Err(()) => return Err(SkipReason::IoTimeout),
+        };
         if metadata.file_type().is_symlink() {
-            let bytes =
-                super::read_symlink_blob_bytes(abs_path).map_err(|_| SkipReason::IoFailed)?;
+            let link_target = abs_path.to_path_buf();
+            let bytes = match crate::command::status_probe::with_io_deadline(move || {
+                super::read_symlink_blob_bytes(&link_target)
+            }) {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) => return Err(SkipReason::IoFailed),
+                Err(()) => return Err(SkipReason::IoTimeout),
+            };
             let len = bytes.len() as u64;
             if len > self.per_file_cap.min(self.remaining_total) {
                 return Err(SkipReason::TooLarge);
             }
             self.remaining_total = self.remaining_total.saturating_sub(len);
             let oid = git_internal::internal::object::blob::Blob::from_content_bytes(bytes).id;
-            return Ok((oid, len));
+            return Ok((oid, len, BlobKind::Symlink));
         }
         let cap = self.per_file_cap.min(self.remaining_total);
         if metadata.len() > cap {
@@ -878,7 +964,7 @@ impl WorktreeReadBudget {
             self.remaining_total = self.remaining_total.saturating_sub(metadata.len());
             let len = pointer.len() as u64;
             let oid = git_internal::internal::object::blob::Blob::from_content(&pointer).id;
-            return Ok((oid, len));
+            return Ok((oid, len, BlobKind::Regular));
         }
         // The cap is re-applied INSIDE the read: the stat above can be
         // defeated by a file that grows before the bytes are consumed, and
@@ -891,12 +977,17 @@ impl WorktreeReadBudget {
             Err(()) => return Err(SkipReason::IoTimeout),
             Ok(Ok(Some(oid))) => oid,
             // Over the cap, or the file changed size mid-read: skip the
-            // candidate rather than trust a hash of a moving target.
-            Ok(Ok(None)) => return Err(SkipReason::TooLarge),
+            // candidate rather than trust a hash of a moving target — but
+            // still charge the bytes the attempt cost, or a growth race
+            // would give an attacker unlimited free reads.
+            Ok(Ok(None)) => {
+                self.remaining_total = self.remaining_total.saturating_sub(cap);
+                return Err(SkipReason::TooLarge);
+            }
             Ok(Err(_)) => return Err(SkipReason::IoFailed),
         };
         self.remaining_total = self.remaining_total.saturating_sub(metadata.len());
-        Ok((oid, metadata.len()))
+        Ok((oid, metadata.len(), BlobKind::Regular))
     }
 }
 

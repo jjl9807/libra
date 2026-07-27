@@ -1636,7 +1636,16 @@ fn build_rename_side(
             }
             RenameBlobSide::Worktree => {
                 let abs = util::workdir_to_absolute(&repo_key);
-                let (kind, mode) = match std::fs::symlink_metadata(&abs) {
+                // §B.3.3: this OPTIONAL stat runs under the deadline like
+                // every other worktree read — a hung mount must cost the
+                // rename candidate and a warning, not the whole command.
+                let stat_target = abs.clone();
+                let stat = crate::command::status_probe::with_io_deadline(move || {
+                    stat_target.symlink_metadata()
+                })
+                .unwrap_or_else(|()| Err(io::Error::new(io::ErrorKind::TimedOut, "reclaimed")));
+                let stat_kind = stat.as_ref().err().map(|error| error.kind());
+                let (kind, mode) = match stat {
                     Ok(meta) if meta.file_type().is_symlink() => (BlobKind::Symlink, 0o120000),
                     Ok(_) => (BlobKind::Regular, 0o100644),
                     Err(_) => {
@@ -1650,7 +1659,11 @@ fn build_rename_side(
                         // complete would claim a pairing was ruled out when
                         // it was never attempted.
                         *snapshot_skips
-                            .entry(rename_detect::SkipReason::IoFailed)
+                            .entry(if matches!(stat_kind, Some(io::ErrorKind::TimedOut)) {
+                                rename_detect::SkipReason::IoTimeout
+                            } else {
+                                rename_detect::SkipReason::IoFailed
+                            })
                             .or_default() += 1;
                         continue;
                     }
@@ -1660,17 +1673,29 @@ fn build_rename_side(
                 // pathological candidate set cannot bypass the caps via the
                 // exact stage (LFS paths hash the pointer blob, matching
                 // what the index records).
-                let (oid, size) = match worktree_budget.worktree_blob_oid_and_size(&abs) {
-                    Ok(pair) => pair,
-                    Err(reason) => {
-                        // Budget/size/I-O failures during the OPTIONAL
-                        // worktree hash drop the candidate; record the
-                        // reason so the same deduplicated warning family
-                        // fires as for inexact content reads.
-                        *snapshot_skips.entry(reason).or_default() += 1;
-                        continue;
-                    }
-                };
+                let (oid, size, observed_kind) =
+                    match worktree_budget.worktree_blob_oid_and_size(&abs) {
+                        Ok(triple) => triple,
+                        Err(reason) => {
+                            // Budget/size/I-O failures during the OPTIONAL
+                            // worktree hash drop the candidate; record the
+                            // reason so the same deduplicated warning family
+                            // fires as for inexact content reads.
+                            *snapshot_skips.entry(reason).or_default() += 1;
+                            continue;
+                        }
+                    };
+                // The kind was stat'ed above and the OID streamed just now.
+                // If the path changed type in between, the OID describes
+                // something the recorded kind does not — a symlink target
+                // labelled `Regular` could then clear the exact gate against
+                // a blob. Drop the candidate and report the race.
+                if observed_kind != kind {
+                    *snapshot_skips
+                        .entry(rename_detect::SkipReason::IoFailed)
+                        .or_default() += 1;
+                    continue;
+                }
                 BlobRef {
                     kind,
                     mode,
@@ -4407,12 +4432,28 @@ fn write_rename_porcelain_v2(
         .with_stable_code(StableErrorCode::RepoStateInvalid)
         .with_hint("re-run 'libra status' after 'libra add'/'libra reset' settles the index")
     };
+    // The HEAD side comes from the HEAD TREE whenever the record has a real
+    // staged component — `R.` (staged rename) and `MR`/`AR` (an unstaged
+    // rename whose SOURCE also changed in the index) alike. Only a pure
+    // `.R`, where HEAD and index agree by construction, copies the index
+    // fields; doing that for `MR` would claim HEAD matches an index the user
+    // just changed.
+    let head_from_tree = staged_rename || x != '.';
     let (mode_head, hash_head) = if staged_rename {
         metadata
             .head_tree_items
             .get(&old_workdir)
             .map(|info| (info.mode, info.hash.clone()))
             .ok_or_else(|| missing("HEAD tree", &old_workdir))?
+    } else if head_from_tree {
+        // `MR`/`AR`: the source is the HEAD path. An `A` source has no HEAD
+        // entry at all, which is exactly what `A` means, so the zero hash is
+        // the honest answer there rather than a fabrication.
+        match metadata.head_tree_items.get(&old_workdir) {
+            Some(info) => (info.mode, info.hash.clone()),
+            None if x == 'A' => (0, zero_hash.to_string()),
+            None => return Err(missing("HEAD tree", &old_workdir)),
+        }
     } else {
         // `.R`: filled from the index below (fixup).
         (0, zero_hash.to_string())
@@ -4430,7 +4471,7 @@ fn write_rename_porcelain_v2(
         .get(index_str, 0)
         .map(|entry| (entry.mode, entry.hash.to_string()))
         .ok_or_else(|| missing("index", index_key))?;
-    let (mode_head, hash_head) = if staged_rename {
+    let (mode_head, hash_head) = if staged_rename || head_from_tree {
         (mode_head, hash_head)
     } else {
         (mode_index, hash_index.clone())
@@ -4561,10 +4602,24 @@ fn output_porcelain_v2(
             .get(&(old.clone(), new.clone()))
             .map(|(pct, _)| *pct)
             .unwrap_or(100);
+        // The SOURCE of an unstaged rename may also carry a staged change
+        // (edit `a`, `add a`, then move it to `b`). Git reports that as
+        // `MR`, keeping the real HEAD and index sides distinct. Hardcoding
+        // `.R` both lost the staged component — the endpoint row is
+        // suppressed, so it vanished entirely — and made the record copy the
+        // index hash into `hH`, claiming HEAD and index agree when they do
+        // not.
+        let staged_char = if staged.modified.contains(old) {
+            'M'
+        } else if staged.new.contains(old) {
+            'A'
+        } else {
+            '.'
+        };
         write_rename_porcelain_v2(
             old,
             new,
-            '.',
+            staged_char,
             'R',
             score,
             metadata,

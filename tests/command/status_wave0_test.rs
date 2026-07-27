@@ -499,6 +499,31 @@ fn chain_rename_default_untracked_d_and_question() {
         fields[5], "000000",
         "mW is zero for a deleted destination: {record}"
     );
+    // Completeness of the DEFAULT v2 view, not just its first record: with
+    // `status.renameUntracked` off, the chain collapses to exactly one `2 RD`
+    // record — the second hop is untracked, so it must appear as `? c.txt`
+    // and never as a `.R`. Reading only the first `2 ` line cannot see a
+    // leaked endpoint row or an extra rename record.
+    let v2_records: Vec<&str> = v2.lines().filter(|l| l.starts_with("2 ")).collect();
+    assert_eq!(v2_records.len(), 1, "exactly one v2 rename record: {v2}");
+    let v2_changes: Vec<&str> = v2
+        .lines()
+        .filter(|l| l.starts_with("1 ") || l.starts_with("2 "))
+        .collect();
+    assert_eq!(
+        v2_changes.len(),
+        1,
+        "and it is the only change row — no leaked endpoints: {v2}"
+    );
+    assert!(
+        !v2.lines()
+            .any(|l| l.starts_with("2 ") && l.contains(" .R ")),
+        "the extension is off, so no unstaged rename record: {v2}"
+    );
+    assert!(
+        v2.lines().any(|l| l.trim() == "? c.txt"),
+        "the chain's second hop stays untracked in v2: {v2}"
+    );
 
     // `-z` v1: `RD SP <new> NUL <old> NUL` record shape.
     let z = run_libra_command(&["status", "--porcelain", "-z"], repo.path());
@@ -1417,7 +1442,27 @@ fn porcelain_v2_staged_rename_mode_hash_fields() {
 /// mH == mI == the real mode; the all-zero fallback must fail this test.
 #[test]
 fn porcelain_v2_unstaged_dot_r_hash_fixup() {
-    let repo = create_repo_with_committed_file("a.txt", "hash fixup content\nsecond line\n");
+    // Executable from the START: chmod-then-re-add does not change the
+    // recorded mode, because the content is unchanged and `add` sees a clean
+    // entry. Committing it executable gives the mode columns a value that
+    // differs from the 100644 default a hardcoding bug would emit.
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::write(
+        repo.path().join("a.txt"),
+        "hash fixup content\nsecond line\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(repo.path().join("a.txt"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let add = run_libra_command(&["add", "a.txt"], repo.path());
+    assert_cli_success(&add, "stage the executable fixture");
+    let commit = run_libra_command(&["commit", "-m", "base"], repo.path());
+    assert_cli_success(&commit, "commit the fixture");
     let cfg = run_libra_command(&["config", "status.renameUntracked", "true"], repo.path());
     assert_cli_success(&cfg, "enable renameUntracked");
     let index_oid = {
@@ -1428,12 +1473,32 @@ fn porcelain_v2_unstaged_dot_r_hash_fixup() {
     // Pure worktree move: index keeps a.txt, disk has b.txt.
     fs::rename(repo.path().join("a.txt"), repo.path().join("b.txt")).unwrap();
 
+    // Read the REAL index mode instead of assuming the 100644 default: with
+    // an executable fixture, a `.R` branch that hardcoded `100644` would
+    // pass a test that compares two constants to each other.
+    let index_mode = {
+        let out = run_libra_command(&["ls-files", "--stage"], repo.path());
+        assert_cli_success(&out, "ls-files --stage");
+        let stage = String::from_utf8(out.stdout).unwrap();
+        stage
+            .lines()
+            .find(|l| l.ends_with("a.txt"))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_else(|| panic!("staged entry for a.txt: {stage}"))
+            .to_string()
+    };
+    #[cfg(unix)]
+    assert_eq!(
+        index_mode, "100755",
+        "the fixture really is executable, so the mode columns are testable"
+    );
+
     let out = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
     let fields = first_v2_record(&out);
     assert_eq!(fields[1], ".R", "unstaged-only rename xy: {out}");
-    assert_eq!(fields[3], "100644", "mH copies the index mode: {out}");
-    assert_eq!(fields[4], "100644", "mI is the index mode: {out}");
-    assert_eq!(fields[5], "100644", "mW is the real worktree mode: {out}");
+    assert_eq!(fields[3], index_mode, "mH copies the index mode: {out}");
+    assert_eq!(fields[4], index_mode, "mI is the index mode: {out}");
+    assert_eq!(fields[5], index_mode, "mW is the real worktree mode: {out}");
     assert_eq!(fields[6], index_oid, "hH copies the index OID: {out}");
     assert_eq!(fields[7], index_oid, "hI is the index OID: {out}");
     assert_eq!(fields[8], "R100", "pure move is exact: {out}");
@@ -2165,6 +2230,13 @@ fn probe_skipped_when_untracked_disabled() {
             .as_array()
             .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
         "the base deletion survives: {doc}"
+    );
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "dest.txt" || p == "dest.txt/")),
+        "and so does the untracked destination — an early marker collapse \
+         would silently lose it: {doc}"
     );
 }
 
@@ -4527,21 +4599,41 @@ fn worktree_exact_matches_known_index_oid() {
 fn gitlink_missing_object_exact_by_oid_mode() {
     use git_internal::internal::index::{Index, IndexEntry};
 
+    // A REAL staged gitlink move: HEAD records `old-sub` as a gitlink, the
+    // index records `new-sub` with the same commit id, and that commit
+    // object does not exist in this repository. The pair must be found by
+    // (oid, mode) alone — no content read is possible, which is exactly why
+    // the kind check exists.
     let repo = create_repo_with_committed_file("anchor.txt", "anchor\n");
-    enable_rename_untracked(repo.path());
-
-    // A gitlink recorded at `old-sub` in the INDEX, naming a commit that
-    // does not exist in this repository, and the same gitlink recorded at
-    // `new-sub` in the worktree side by materializing the directory. The
-    // pair must be found by (oid, mode) alone — no content read is possible,
-    // which is exactly why the kind check exists.
-    let index_path = repo.path().join(".libra/index");
-    let mut index = Index::load(&index_path).expect("load index");
     let phantom = git_internal::internal::object::blob::Blob::from_content("phantom submodule").id;
-    let mut entry = IndexEntry::new_from_blob("old-sub".to_string(), phantom, 0);
-    entry.mode = 0o160000;
-    index.add(entry);
-    index.save(&index_path).expect("save index");
+    let index_path = repo.path().join(".libra/index");
+
+    // Commit `old-sub` as a gitlink so it lands in the HEAD tree.
+    {
+        let mut index = Index::load(&index_path).expect("load index");
+        let mut entry = IndexEntry::new_from_blob("old-sub".to_string(), phantom, 0);
+        entry.mode = 0o160000;
+        index.add(entry);
+        index.save(&index_path).expect("save index");
+    }
+    // §B.4.1 makes this scenario a hard requirement, so it is asserted, not
+    // skipped: a build that cannot commit a gitlink whose object is absent
+    // cannot satisfy the card at all.
+    let commit = run_libra_command(&["commit", "-m", "add submodule"], repo.path());
+    assert_cli_success(
+        &commit,
+        "committing a gitlink whose commit object is absent is required by B.4.1",
+    );
+
+    // Move it in the INDEX: drop `old-sub`, add `new-sub` with the same id.
+    {
+        let mut index = Index::load(&index_path).expect("reload index");
+        index.remove("old-sub", 0);
+        let mut entry = IndexEntry::new_from_blob("new-sub".to_string(), phantom, 0);
+        entry.mode = 0o160000;
+        index.add(entry);
+        index.save(&index_path).expect("save index");
+    }
 
     let out = run_libra_command(&["--json", "status"], repo.path());
     assert_cli_success(
@@ -4550,68 +4642,27 @@ fn gitlink_missing_object_exact_by_oid_mode() {
     );
     let doc: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
-
-    // The two contract points that hold regardless of how the worktree side
-    // is represented: the command does not fail on the missing object, and
-    // the gitlink never pairs with a regular blob.
-    assert!(
-        doc["data"]["renames"].as_array().is_some_and(|r| r
-            .iter()
-            .all(|x| x["to"] != "anchor.txt" && x["from"] != "anchor.txt")),
-        "a gitlink never pairs with a regular blob: {doc}"
+    let renames = doc["data"]["renames"].as_array().expect("renames");
+    assert_eq!(
+        renames.len(),
+        1,
+        "the moved gitlink is the only rename: {doc}"
     );
-    // The engine-level (oid, mode) pairing itself is pinned directly, since
-    // a real moved submodule needs a materialized checkout on both sides:
-    // see `gitlink_never_pairs_with_a_regular_blob` for the kind matrix, and
-    // here for the positive arm with an ABSENT object.
-    {
-        use std::path::PathBuf;
-
-        use libra::command::rename_detect::{
-            BlobEvidence, BlobKind, BlobRef, ContentOutcome, RenameContentSource,
-            RenameDetectConfig, RenameSnapshot, SkipReason, match_pairs,
-        };
-
-        struct NoObjects;
-        impl RenameContentSource for NoObjects {
-            fn old_content(&mut self, _path: &Path, _blob: &BlobRef) -> ContentOutcome {
-                ContentOutcome::Skipped(SkipReason::ObjectMissing)
-            }
-            fn new_content(&mut self, _path: &Path, _blob: &BlobRef) -> ContentOutcome {
-                ContentOutcome::Skipped(SkipReason::ObjectMissing)
-            }
-        }
-
-        let gitlink = BlobRef {
-            kind: BlobKind::Gitlink,
-            mode: 0o160000,
-            size: None,
-            evidence: BlobEvidence::KnownObjectId { oid: phantom },
-        };
-        let mut snapshot = RenameSnapshot::default();
-        snapshot
-            .old_map
-            .insert(PathBuf::from("old-sub"), gitlink.clone());
-        snapshot.new_map.insert(PathBuf::from("new-sub"), gitlink);
-        let outcome = match_pairs(
-            &snapshot,
-            &RenameDetectConfig {
-                threshold: 30_000,
-                rename_limit: 1000,
-                comparison_budget: None,
-            },
-            &mut NoObjects,
-        );
-        assert_eq!(
-            outcome.matches.len(),
-            1,
-            "a moved gitlink pairs by (oid, mode) with NO object read: {outcome:?}"
-        );
-        assert_eq!(outcome.matches[0].old, PathBuf::from("old-sub"));
-        assert_eq!(outcome.matches[0].new, PathBuf::from("new-sub"));
-        assert!(outcome.matches[0].exact, "identical commit ids are exact");
-        assert_eq!(outcome.matches[0].score_percent(), 100);
-    }
+    assert_eq!(renames[0]["from"], "old-sub", "{doc}");
+    assert_eq!(renames[0]["to"], "new-sub", "{doc}");
+    assert_eq!(
+        renames[0]["exact"], true,
+        "paired by (oid, mode) with NO object read: {doc}"
+    );
+    assert_eq!(renames[0]["score"], 100, "{doc}");
+    // And the absent object never surfaced as a metadata degradation,
+    // because it was never requested.
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().all(|x| x["source"] != "metadata")),
+        "an exact gitlink pair reads no objects: {doc}"
+    );
 }
 
 /// §B.4 shared-scorer parity: with DUPLICATE content on both sides, which
@@ -4661,19 +4712,18 @@ fn diff_and_status_agree_on_duplicate_content_pairings() {
         .collect();
     status_pairs.sort();
     assert_eq!(status_pairs.len(), 2, "both moves pair: {doc}");
-    // The engine consumes SOURCES in path-byte order, each preferring a
-    // same-basename destination and otherwise taking the byte-smallest — so
-    // `src/alpha.txt` (first source, no basename match) claims
-    // `dst/beta.txt`. The point of this test is not which rule wins but that
-    // BOTH commands apply the same one, so the expectation is pinned here
-    // and then required of `diff` verbatim.
+    // Selection is GLOBAL, not per-source-in-order: every allowed edge is
+    // ranked `same_basename DESC, old ASC, new ASC` and consumed greedily.
+    // So `src/beta.txt` claims `dst/beta.txt` (the only same-name edge) and
+    // `src/alpha.txt` takes what is left — a per-source walk would have let
+    // `alpha` grab `dst/beta.txt` first and strand the name match.
     assert_eq!(
         status_pairs,
         vec![
-            ("src/alpha.txt".to_string(), "dst/beta.txt".to_string()),
-            ("src/beta.txt".to_string(), "dst/zzz.txt".to_string()),
+            ("src/alpha.txt".to_string(), "dst/zzz.txt".to_string()),
+            ("src/beta.txt".to_string(), "dst/beta.txt".to_string()),
         ],
-        "source-ordered greedy selection: {status_pairs:?}"
+        "same-basename edges win globally: {status_pairs:?}"
     );
 
     // diff's view of the same staged state.
@@ -4705,11 +4755,11 @@ fn diff_and_status_agree_on_duplicate_content_pairings() {
 #[test]
 fn rename_sha256_worktree_exact_pairing() {
     let repo = tempdir().expect("temp repo");
+    // Asserted, not skipped: SHA-256 support is a hard requirement of the
+    // card, so a build that cannot create such a repository fails here
+    // rather than reporting a green skip.
     let init = run_libra_command(&["init", "--object-format", "sha256"], repo.path());
-    if !init.status.success() {
-        eprintln!("skipped (sha256 repositories unavailable)");
-        return;
-    }
+    assert_cli_success(&init, "sha256 repositories are required by R0-2");
     configure_identity_via_cli(repo.path());
     let body = "sha256 worktree exact\nline two\nline three\n";
     fs::write(repo.path().join("src.txt"), body).unwrap();
@@ -4733,6 +4783,187 @@ fn rename_sha256_worktree_exact_pairing() {
         "the worktree OID must be hashed with the REPOSITORY's hash kind: {json}"
     );
     assert_eq!(renames[0]["score"], 100, "{json}");
+}
+
+/// §B.4 shared-scorer parity beyond the exact stage. The duplicate-content
+/// test above is consumed entirely by exact OID buckets, so it cannot see a
+/// divergence in the stages that actually differ between implementations:
+/// unique-basename scoring, inexact eligibility, and budget accounting.
+#[test]
+#[cfg(unix)]
+fn diff_and_status_agree_on_inexact_stages() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    // (a) A unique-basename pair whose content CHANGED — only the basename
+    // stage can pair it, and only if the score still clears the threshold.
+    fs::write(repo.path().join("src/keep.txt"), &base).unwrap();
+    // (b) A symlink pair with "similar" targets: neither command may score
+    // symlinks inexactly, so these must NOT be reported as a rename.
+    std::os::unix::fs::symlink("target/aaaa", repo.path().join("src/link-a")).unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the fixture");
+    let commit = run_libra_command(&["commit", "-m", "base"], repo.path());
+    assert_cli_success(&commit, "commit the fixture");
+
+    fs::create_dir_all(repo.path().join("dst")).unwrap();
+    fs::remove_file(repo.path().join("src/keep.txt")).unwrap();
+    fs::write(
+        repo.path().join("dst/keep.txt"),
+        base.replace("line 7\n", "line seven edited\n"),
+    )
+    .unwrap();
+    fs::remove_file(repo.path().join("src/link-a")).unwrap();
+    std::os::unix::fs::symlink("target/aaab", repo.path().join("dst/link-b")).unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage the moves");
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&status_stdout(repo.path(), &["--json", "status"])).expect("json");
+    let mut status_pairs: Vec<(String, String)> = doc["data"]["renames"]
+        .as_array()
+        .expect("renames")
+        .iter()
+        .map(|r| {
+            (
+                r["from"].as_str().unwrap_or_default().to_string(),
+                r["to"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    status_pairs.sort();
+
+    let diff = run_libra_command(&["diff", "--staged", "--name-status", "-M40%"], repo.path());
+    assert_cli_success(&diff, "diff --staged --name-status -M40%");
+    let text = String::from_utf8_lossy(&diff.stdout).into_owned();
+    let mut diff_pairs: Vec<(String, String)> = text
+        .lines()
+        .filter(|l| l.starts_with('R'))
+        .filter_map(|l| {
+            let mut fields = l.split('\t');
+            let _ = fields.next()?;
+            Some((fields.next()?.to_string(), fields.next()?.to_string()))
+        })
+        .collect();
+    diff_pairs.sort();
+
+    assert_eq!(
+        diff_pairs, status_pairs,
+        "diff and status must agree across the basename/inexact stages too:\n\
+         diff: {diff_pairs:?}\nstatus: {status_pairs:?}\ndiff output:\n{text}"
+    );
+    // The basename pair IS found (it is the point of stage 3)…
+    assert!(
+        status_pairs.contains(&("src/keep.txt".into(), "dst/keep.txt".into())),
+        "the scored unique-basename pair is reported: {status_pairs:?}"
+    );
+    // …and the symlinks are NOT paired by content similarity.
+    assert!(
+        status_pairs
+            .iter()
+            .all(|(from, to)| !from.contains("link-") && !to.contains("link-")),
+        "symlinks never enter inexact scoring: {status_pairs:?}"
+    );
+}
+
+/// §B.6.4: an unstaged rename whose SOURCE also carries a staged change
+/// renders `MR`, not `.R`. Edit `a`, `add a`, then move it to `b` with
+/// `status.renameUntracked` on. Reporting `.R` loses the staged
+/// modification entirely (the endpoint row is suppressed) and copies the
+/// index hash into `hH`, claiming HEAD and index agree when the user just
+/// changed the index.
+#[test]
+fn porcelain_v2_staged_modify_then_worktree_rename_emits_mr() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("a.txt", &base);
+    enable_rename_untracked(repo.path());
+    let head_oid = {
+        let out = run_libra_command(&["rev-parse", "HEAD:a.txt"], repo.path());
+        assert_cli_success(&out, "rev-parse HEAD:a.txt");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+
+    // Staged modification of `a.txt` …
+    fs::write(
+        repo.path().join("a.txt"),
+        base.replace("line 3\n", "line three edited\n"),
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "a.txt"], repo.path());
+    assert_cli_success(&add, "stage the edit");
+    let index_oid = {
+        let out = run_libra_command(&["ls-files", "--stage"], repo.path());
+        assert_cli_success(&out, "ls-files --stage");
+        let stage = String::from_utf8(out.stdout).unwrap();
+        stage
+            .lines()
+            .find(|l| l.ends_with("a.txt"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .unwrap_or_else(|| panic!("staged entry for a.txt: {stage}"))
+            .to_string()
+    };
+    assert_ne!(head_oid, index_oid, "the staged edit really changed the id");
+    // … then a worktree-only move.
+    fs::rename(repo.path().join("a.txt"), repo.path().join("b.txt")).unwrap();
+
+    let out = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    let record = out
+        .lines()
+        .find(|l| l.starts_with("2 "))
+        .unwrap_or_else(|| panic!("a v2 rename record is emitted: {out}"));
+    let fields: Vec<&str> = record.split_whitespace().collect();
+    assert_eq!(
+        fields[1], "MR",
+        "the staged modification rides in the X column: {out}"
+    );
+    assert_eq!(
+        fields[6], head_oid,
+        "hH is the real HEAD blob, not a copy of the index: {out}"
+    );
+    assert_eq!(fields[7], index_oid, "hI is the staged blob: {out}");
+    assert_ne!(fields[6], fields[7], "HEAD and index differ: {out}");
+}
+
+/// §B.4.1 deserialization boundary: an OID of the WRONG hash algorithm
+/// parses cleanly (the length is valid for its own kind) and used to reach
+/// object loading, where it panicked. A ref carrying such an id must fail
+/// closed at the READ, with a message naming the mismatch.
+#[test]
+fn ref_with_mismatched_hash_kind_fails_closed() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    // A syntactically valid SHA-256 id in a SHA-1 repository.
+    let foreign = "f".repeat(64);
+    let update = run_libra_command(&["update-ref", "refs/heads/broken", &foreign], repo.path());
+    if !update.status.success() {
+        // Refusing to WRITE it is an even stronger guarantee; either way the
+        // bad id never reaches object loading.
+        assert!(
+            !String::from_utf8_lossy(&update.stderr).is_empty(),
+            "the refusal is explained"
+        );
+        return;
+    }
+    let switch = run_libra_command(&["switch", "broken"], repo.path());
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    // Whichever step rejects it, the failure must be an explained error and
+    // never a panic.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&switch.stderr),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("panicked"),
+        "a foreign-algorithm ref must fail closed, not panic: {combined}"
+    );
+    if !out.status.success() {
+        assert!(
+            combined.contains("LBR-") || combined.contains("fatal"),
+            "the failure carries an actionable message: {combined}"
+        );
+    }
 }
 
 /// §B.6.0.1 pathspec narrowing removes only the warnings DERIVED from

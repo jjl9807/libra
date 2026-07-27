@@ -174,6 +174,21 @@ impl Head {
                         detail: format!("invalid detached HEAD commit hash: {error}"),
                     }
                 })?;
+                // Length alone is not validation: a SHA-1 id in a SHA-256
+                // repository parses fine and then panics deep inside
+                // `Commit::load`. Refuse it here, where the ref is read, with
+                // a message that names the actual problem.
+                let repo_kind = git_internal::hash::get_hash_kind();
+                if commit_hash.kind() != repo_kind {
+                    return Err(BranchStoreError::Corrupt {
+                        name: "HEAD".to_string(),
+                        detail: format!(
+                            "detached HEAD commit hash is {:?} but this repository uses {:?}",
+                            commit_hash.kind(),
+                            repo_kind
+                        ),
+                    });
+                }
                 Ok(Head::Detached(commit_hash))
             }
         }

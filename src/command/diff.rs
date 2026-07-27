@@ -3657,35 +3657,36 @@ fn apply_rename_detection(
     // rule verbatim (§B.4.2.2): taking whichever candidate happened to be
     // enumerated first made `diff` and `status` disagree on which pair they
     // reported for duplicate-content renames.
+    let base_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+    // Same GLOBAL ranking as the shared engine (§B.4.2.2) — same-basename
+    // edges win over path order — implemented as TWO passes over the
+    // sources rather than a materialized `old × new` edge list, which would
+    // be quadratic in time and memory for a tree full of duplicate blobs.
     let mut deleted_ordered: Vec<usize> = deleted.clone();
     deleted_ordered.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
-    for &di in &deleted_ordered {
-        let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
-            continue;
-        };
-        let Some(candidates) = added_by_hash.get_mut(&dh.to_string()) else {
-            continue;
-        };
-        let mut allowed: Vec<usize> = candidates
-            .iter()
-            .copied()
-            .filter(|&ai| same_file_type(&files[di].path, &files[ai].path))
-            .collect();
-        if allowed.is_empty() {
-            continue;
+    for same_basename_pass in [true, false] {
+        for &di in &deleted_ordered {
+            if used_del[di] {
+                continue;
+            }
+            let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
+                continue;
+            };
+            let Some(candidates) = added_by_hash.get(&dh.to_string()) else {
+                continue;
+            };
+            let old_base = base_of(&files[di].path);
+            let picked = candidates.iter().copied().find(|&ai| {
+                !used_add[ai]
+                    && same_file_type(&files[di].path, &files[ai].path)
+                    && (!same_basename_pass || base_of(&files[ai].path) == old_base)
+            });
+            if let Some(ai) = picked {
+                pairs.push((di, ai, 60000));
+                used_del[di] = true;
+                used_add[ai] = true;
+            }
         }
-        allowed.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
-        let base_of = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
-        let old_base = base_of(&files[di].path);
-        let picked = allowed
-            .iter()
-            .copied()
-            .find(|&ai| base_of(&files[ai].path) == old_base)
-            .unwrap_or(allowed[0]);
-        candidates.retain(|&ai| ai != picked);
-        pairs.push((di, picked, 60000));
-        used_del[di] = true;
-        used_add[picked] = true;
     }
 
     const MAX_SCORE: u32 = 60000;

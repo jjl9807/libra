@@ -150,6 +150,20 @@ fn branch_from_model(model: reference::Model) -> Result<Option<Branch>, BranchSt
         name: name.clone(),
         detail: e.to_string(),
     })?;
+    // A well-formed id of the WRONG algorithm parses cleanly and only fails
+    // much later, inside object loading, as a panic. Fail closed at the read
+    // boundary instead.
+    let repo_kind = git_internal::hash::get_hash_kind();
+    if commit.kind() != repo_kind {
+        return Err(BranchStoreError::Corrupt {
+            name: name.clone(),
+            detail: format!(
+                "commit hash is {:?} but this repository uses {:?}",
+                commit.kind(),
+                repo_kind
+            ),
+        });
+    }
     Ok(Some(Branch {
         name,
         commit,

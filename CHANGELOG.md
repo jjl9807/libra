@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review rounds 5-7)
+
+- **An unstaged rename whose SOURCE also has a staged change renders `MR`,
+  not `.R`.** Edit `a`, `add a`, then move it to `b`: the record used to
+  claim `.R` — losing the staged modification entirely (the endpoint row is
+  suppressed) and copying the index hash into `hH`, asserting HEAD and index
+  agree when the user had just changed the index.
+- **Rename pairing is decided GLOBALLY, same-basename first**, in both
+  `status` and `diff`. Walking sources in path order let a source with no
+  name match claim the destination another source shared a name with.
+  Implemented as two linear passes with consumed destinations removed from
+  their bucket, so a tree full of duplicate blobs is not quadratic.
+- **The worktree read budget cannot be bypassed by a growth race.** Bytes
+  that were read are charged even when the result is refused as over-cap;
+  previously 4096 candidates could each read ~2 MiB while the 64 MiB total
+  budget stayed untouched. The `status` comparison budget now also bounds the
+  unique-basename stage rather than only the exhaustive one.
+- **A ref carrying an OID of the wrong hash algorithm fails closed at the
+  read.** A well-formed SHA-256 id in a SHA-1 repository parsed cleanly and
+  only failed much later, as a panic inside object loading.
+- **A type change between the snapshot stat and the OID read is detected.**
+  A regular file replaced by a symlink would otherwise hand the exact gate a
+  symlink-target OID labelled `Regular`.
+- Optional worktree stats and symlink reads now run under the same I/O
+  deadline as every other worktree read.
+
 ### Fixed (plan-20260714 R0-1 / R0-2 review round 4)
 
 - **SHA-256 repositories detect unstaged exact renames again.** The worktree
