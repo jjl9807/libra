@@ -43,14 +43,19 @@ fn package_json_version(relative: &str) -> String {
     panic!("{relative} has no version field");
 }
 
-fn install_default_version() -> String {
+/// The RAW `DEFAULT_VERSION` value, exactly as `install.sh` will use it.
+///
+/// Deliberately not normalized: the shell substitutes this string verbatim
+/// into the download URL, so `vv0.19.76` is a broken tag, not a spelling
+/// variant. An earlier `trim_start_matches('v')` here stripped ANY number of
+/// leading `v`s, which let exactly that typo satisfy the guard.
+fn install_default_version_raw() -> String {
     let text = read("install.sh");
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("DEFAULT_VERSION=\"")
             && let Some(value) = rest.strip_suffix('"')
         {
-            // The shell fallback carries the `v` release-tag prefix.
-            return value.trim_start_matches('v').to_string();
+            return value.to_string();
         }
     }
     panic!("install.sh has no DEFAULT_VERSION assignment");
@@ -61,7 +66,7 @@ fn all_four_release_version_surfaces_agree() {
     let cargo = cargo_version();
     let web = package_json_version("web/package.json");
     let worker = package_json_version("worker/package.json");
-    let install = install_default_version();
+    let install = install_default_version_raw();
 
     assert_eq!(
         web, cargo,
@@ -71,10 +76,16 @@ fn all_four_release_version_surfaces_agree() {
         worker, cargo,
         "worker/package.json version must match Cargo.toml ({cargo})"
     );
+    // Exact equality against the ONE canonical spelling, `v<cargo>`. The
+    // value is used verbatim by the shell, so anything else — a stale
+    // version, a missing prefix, or a doubled one — is a broken download.
     assert_eq!(
-        install, cargo,
-        "install.sh DEFAULT_VERSION must match Cargo.toml ({cargo}) — a stale \
-         fallback installs an old binary when the release API is unreachable"
+        install,
+        format!("v{cargo}"),
+        "install.sh DEFAULT_VERSION must be exactly \"v{cargo}\" — it is \
+         substituted verbatim into the release URL, so a stale value installs \
+         an old binary when the release API is unreachable and a malformed \
+         one installs nothing at all"
     );
 }
 
@@ -85,8 +96,19 @@ fn install_default_version_carries_the_release_tag_prefix() {
         .lines()
         .find(|line| line.starts_with("DEFAULT_VERSION="))
         .expect("install.sh DEFAULT_VERSION");
+    let value = install_default_version_raw();
+    let semver = value.strip_prefix('v').unwrap_or_else(|| {
+        panic!("DEFAULT_VERSION keeps the `v<semver>` release-tag spelling: {line}")
+    });
     assert!(
-        line.contains("=\"v"),
-        "DEFAULT_VERSION keeps the `v<semver>` release-tag spelling: {line}"
+        !semver.starts_with('v'),
+        "exactly ONE `v` — `{value}` would be substituted into the release URL as written: {line}"
+    );
+    assert!(
+        semver.split('.').count() == 3
+            && semver
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())),
+        "DEFAULT_VERSION is `v<major>.<minor>.<patch>`, not `{value}`: {line}"
     );
 }
