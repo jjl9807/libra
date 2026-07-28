@@ -5013,6 +5013,67 @@ async fn restore_agent_capture_from_rows_with_subagents(
         .map_err(|error| CloudError::Generic(format!("create fenced traces ref: {error}")))?;
     }
 
+    // PD-03 tombstone-first, LOCAL side. The remote catalog is filtered by
+    // the tombstones the mirror knows about, but a session erased here and
+    // not yet propagated is invisible to that filter — restoring from a
+    // stale mirror would otherwise bring it back. The schema triggers would
+    // abort such a write, which is the right outcome but the wrong
+    // experience: the whole restore fails on an opaque RAISE(ABORT) instead
+    // of quietly declining the rows the user already erased. Read the local
+    // tombstones inside the SAME transaction and skip them.
+    let mut locally_erased_sessions: HashSet<(String, String)> = HashSet::new();
+    let mut locally_erased_session_ids: HashSet<String> = HashSet::new();
+    for row in txn
+        .query_all(Statement::from_string(
+            backend,
+            "SELECT agent_kind, provider_session_id, erased_session_id \
+             FROM agent_import_tombstone",
+        ))
+        .await
+        .map_err(|error| CloudError::Generic(format!("read local erasure tombstones: {error}")))?
+    {
+        let agent_kind: String = row
+            .try_get_by("agent_kind")
+            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        let provider_session_id: String = row
+            .try_get_by("provider_session_id")
+            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        let erased_session_id: String = row
+            .try_get_by("erased_session_id")
+            .map_err(|error| CloudError::Generic(format!("decode local tombstone: {error}")))?;
+        locally_erased_sessions.insert((agent_kind, provider_session_id));
+        locally_erased_session_ids.insert(erased_session_id);
+    }
+    // Collect the dropped sessions' REMOTE ids before filtering: a
+    // checkpoint references its session by id, and the mirror's id for an
+    // erased session need not match the local `erased_session_id`.
+    let dropped_session_ids: HashSet<String> = session_rows
+        .iter()
+        .filter(|row| {
+            locally_erased_sessions
+                .contains(&(row.agent_kind.clone(), row.provider_session_id.clone()))
+        })
+        .map(|row| row.session_id.clone())
+        .collect();
+    let session_rows: Vec<_> = session_rows
+        .iter()
+        .filter(|row| {
+            !locally_erased_sessions
+                .contains(&(row.agent_kind.clone(), row.provider_session_id.clone()))
+        })
+        .cloned()
+        .collect();
+    let session_rows = &session_rows[..];
+    let checkpoint_rows: Vec<_> = checkpoint_rows
+        .iter()
+        .filter(|row| {
+            !locally_erased_session_ids.contains(&row.session_id)
+                && !dropped_session_ids.contains(&row.session_id)
+        })
+        .cloned()
+        .collect();
+    let checkpoint_rows = &checkpoint_rows[..];
+
     // Validate every immutable/mutable companion conflict before applying any
     // row. The surrounding transaction guarantees a later SQL/FK failure also
     // rolls back sessions, checkpoints, skeleton claims, revisions, and links.
@@ -6893,6 +6954,114 @@ mod tests {
         assert!(validate_agent_capture_traces_shape(&[checkpoint], None, "remote").is_err());
         validate_agent_capture_traces_shape(&[], None, "remote")
             .expect("an empty capture has no traces head");
+    }
+
+    /// PD-03: a session erased HERE must not come back from a mirror that
+    /// has not yet seen the erasure.
+    ///
+    /// `restore` filtered only the tombstones the remote catalog carried,
+    /// so the window between a local `agent erase` and the next `cloud
+    /// sync` was a resurrection hole: restoring from the stale mirror
+    /// re-UPSERTed the session. The schema triggers would have aborted the
+    /// write — correct, but it takes the whole restore down with an opaque
+    /// `RAISE(ABORT)` instead of quietly declining rows the user already
+    /// erased. Both the session and its checkpoints must be dropped, and
+    /// everything else must still restore.
+    #[test]
+    #[serial]
+    fn restore_skips_locally_tombstoned_sessions_and_their_checkpoints() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
+        rt.block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
+        rt.block_on(async {
+            let db_conn = db::get_db_conn_instance().await;
+            let erased = fixture_session_row("sess-ERASED", "prov-ERASED");
+            let kept = fixture_session_row("sess-KEPT", "prov-KEPT");
+
+            // The local tombstone `agent erase` leaves behind. Note the
+            // mirror's session id need NOT equal `erased_session_id`, which
+            // is why checkpoints are dropped by the id the ROWS carry.
+            db_conn
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    db_conn.get_database_backend(),
+                    "INSERT INTO agent_import_tombstone
+                       (agent_kind, provider_session_id, erased_session_id, erased_at)
+                     VALUES (?, ?, ?, ?)",
+                    [
+                        erased.agent_kind.clone().into(),
+                        erased.provider_session_id.clone().into(),
+                        "sess-LOCAL-ID".into(),
+                        1_i64.into(),
+                    ],
+                ))
+                .await
+                .expect("write the local erasure tombstone");
+
+            let sessions = vec![erased.clone(), kept.clone()];
+            let checkpoints = vec![
+                fixture_checkpoint_row("ckpt-ERASED", "sess-ERASED", Some("gone")),
+                fixture_checkpoint_row("ckpt-KEPT", "sess-KEPT", Some("stays")),
+            ];
+
+            restore_agent_capture_from_rows_with_subagents(
+                &db_conn,
+                AgentCaptureRestoreRows {
+                    sessions: &sessions,
+                    checkpoints: &checkpoints,
+                    claims: &[],
+                    revisions: &[],
+                    links: &[],
+                    traces_head: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                    remote_is_known_ancestor: true,
+                },
+                true,
+            )
+            .await
+            .expect("restore must SUCCEED, declining the erased rows rather than aborting");
+
+            let restored_session = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'sess-ERASED'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored_session, 0,
+                "an erased session must not be resurrected by a stale mirror"
+            );
+            let restored_checkpoint = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-ERASED'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restored_checkpoint, 0,
+                "nor may its checkpoints come back without it"
+            );
+
+            // Everything unrelated still restores: the filter is targeted,
+            // not a blanket refusal.
+            let kept_session = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'sess-KEPT'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(kept_session, 1, "an untombstoned session still restores");
+            let kept_checkpoint = scalar_count(
+                &db_conn,
+                "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'ckpt-KEPT'",
+            )
+            .await
+            .unwrap();
+            assert_eq!(kept_checkpoint, 1, "and so do its checkpoints");
+        });
     }
 
     /// Codex Q5 fixture: a fresh restore inserts both sessions and

@@ -106,6 +106,20 @@ pub async fn execute_safe(args: RepackArgs, output: &OutputConfig) -> CliResult<
     // is ever deleted.
     let mut loose_removed = 0usize;
     if args.delete {
+        // lore.md 2.3 / plan-20260714 W0 deletion hard gate: `-d` is a
+        // DELETION entry point, so it must refuse while another repository
+        // borrows from this object store — this store's reachability does
+        // not include the borrower's refs, so a loose object it still needs
+        // could be dropped. The borrower must `alternates remove` (or
+        // dissociate) first.
+        if crate::internal::alternates::has_live_borrowers(&crate::utils::path::objects()) {
+            return Err(CliError::fatal(
+                "refusing to delete loose objects: another repository borrows from this                  object store via alternates",
+            )
+            .with_stable_code(crate::utils::error::StableErrorCode::ConflictOperationBlocked)
+            .with_hint("run 'libra alternates remove' in the borrowing repository first")
+            .with_hint("or re-run 'libra repack' without -d to keep the loose objects"));
+        }
         let packed: HashSet<ObjectHash> = to_pack.iter().copied().collect();
         for (hash_str, obj_path) in &loose {
             if let Some(hash) = parse_object_hash(hash_str)

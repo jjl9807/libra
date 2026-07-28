@@ -341,11 +341,18 @@ checkpoint-history rebuild/prune rewinds the current claim to an older
 surviving revision, stale challenger evidence is deleted and the claim returns
 to its non-conflicted committed state.
 
-The tombstone is local only. Agent capture rows already mirrored to D1/R2 are
-not deleted and the tombstone is not propagated; `libra cloud restore` or a
-cross-machine re-sync can therefore resurrect locally erased capture until
-cloud delete/tombstone propagation is implemented. Do not use this local
-control as the sole cross-device erasure mechanism.
+The tombstone is propagated. `libra cloud sync` publishes it to D1 under the
+generation fence and removes the erased session's mirrored catalog rows, and
+`libra cloud restore` is tombstone-first in BOTH directions: it filters rows
+carrying a remote tombstone AND rows matching this repository's own
+`agent_import_tombstone`, inside the restore transaction. Erasing locally and
+then restoring from a mirror that has not yet seen the tombstone therefore
+does not bring the session back.
+
+What is still deferred is R2 physical payload deletion: the erased content's
+objects remain in R2, so another machine that has never seen the tombstone can
+still fetch them. Treat `agent erase` as irreversible for THIS repository, not
+as a cross-machine guarantee that every copy is gone.
 
 `agent session list --json` and `agent checkpoint list --json` return one
 page per call: `data` carries a `schema_version`, the rows under `sessions`

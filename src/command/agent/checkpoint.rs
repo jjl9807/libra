@@ -1341,6 +1341,19 @@ pub(super) async fn resolve_checkpoint_input_spec(
                 let child = read_tree_object(&storage, &item.id.to_string()).map_err(scoped)?;
                 pending.push((rel_path, child));
             } else {
+                // A gitlink has no content to materialize; a checkpoint
+                // tree carrying one is malformed, not a submodule.
+                if item.mode == TreeItemMode::Commit {
+                    return Err(scoped(format!(
+                        "entry {rel_path} is a gitlink, which has no content to materialize"
+                    )));
+                }
+                // Re-validate the path HERE, not only in the materializer:
+                // the acceptance criterion is that a malformed checkpoint
+                // fails before any run exists, and a path the materializer
+                // would refuse must not first cost the caller an error run.
+                crate::internal::ai::checkpoint_input::sanitize_rel_path(&rel_path)
+                    .map_err(scoped)?;
                 let oid = item.id.to_string();
                 let object_path = storage.join("objects").join(&oid[..2]).join(&oid[2..]);
                 if !object_path.exists() {
@@ -1354,6 +1367,42 @@ pub(super) async fn resolve_checkpoint_input_spec(
     }
     if files.is_empty() {
         return Err(scoped("the checkpoint tree carries no files".to_string()));
+    }
+    // Presence is not readability. Decode every blob under the SAME caps
+    // the materializer enforces, so a corrupt, wrong-typed, or oversized
+    // checkpoint is refused here — before a run row exists — instead of
+    // failing halfway through materialization and leaving an error run
+    // behind for the user to clean up.
+    let mut total: u64 = 0;
+    for file in &files {
+        let oid = ObjectHash::from_str(&file.oid)
+            .map_err(|e| scoped(format!("invalid blob oid '{}': {e}", file.oid)))?;
+        let (bytes, truncated) = read_git_object_bounded(
+            &storage,
+            &oid,
+            crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES,
+        )
+        .map_err(|e| {
+            scoped(format!(
+                "blob {} ({}) is not readable from the local object store: {e}",
+                file.oid, file.rel_path
+            ))
+        })?;
+        if truncated {
+            return Err(scoped(format!(
+                "blob {} ({}) exceeds the {}-byte per-file cap",
+                file.oid,
+                file.rel_path,
+                crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_FILE_BYTES
+            )));
+        }
+        total = total.saturating_add(bytes.len() as u64);
+        if total > crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_TOTAL_BYTES {
+            return Err(scoped(format!(
+                "the checkpoint's files exceed the {}-byte total cap",
+                crate::internal::ai::checkpoint_input::CHECKPOINT_INPUT_MAX_TOTAL_BYTES
+            )));
+        }
     }
     files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(CheckpointInputSpec {

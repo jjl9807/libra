@@ -123,13 +123,26 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     // ANOTHER worktree — its HEAD would be left dangling or its working tree
     // would silently diverge. `branch_checked_out_elsewhere` excludes the
     // current worktree, so updating this worktree's own branch is still allowed.
-    if let Some(other) = crate::internal::head::Head::branch_checked_out_elsewhere(branch).await {
+    // Fail CLOSED: a probe failure must refuse, never silently allow the
+    // cross-worktree move (§C.4.4).
+    let checked_out_elsewhere =
+        crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "cannot verify whether '{branch}' is checked out in another worktree: {error}"
+                ))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("repair the repository database, then retry")
+            })?;
+    if let Some(other) = checked_out_elsewhere {
         return Err(CliError::fatal(format!(
             "cannot update '{}': branch '{branch}' is checked out at worktree '{other}'",
             args.ref_name
         ))
         .with_exit_code(128)
-        .with_stable_code(StableErrorCode::Unsupported)
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
         .with_hint("switch that worktree to another branch first, or run the command there"));
     }
 

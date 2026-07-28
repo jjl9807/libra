@@ -2,6 +2,182 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260714 R0-1: `diff` now uses the shared rename engine)
+
+- **`diff` delegates rename pairing to `rename_detect::match_pairs`.** It had
+  carried its own exact / unique-basename / renameLimit / top-K / greedy
+  implementation, which meant two sets of tie-breaks, two budget accountings
+  and two eligibility rules — and they had drifted, so the same repository
+  could report different renames depending on which command you asked. The
+  remaining diff-side code builds a `RenameSnapshot`, supplies a
+  `RenameContentSource` over its existing loaders, and translates the result
+  back into diff entries. Behavior is unchanged for every case the suites
+  cover; what goes away is the second implementation that could drift again.
+
+### Fixed (plan-20260714 R0-1 / R0-2 review round 11)
+
+- **A corrupt HEAD no longer panics `status`.** The cache-mode path used the
+  lossy `Head::current()` wrapper, so a reference row that failed validation
+  — including one whose OID belongs to a different hash algorithm — aborted
+  the process instead of reporting an actionable error. `worktree list
+  --porcelain` likewise swallowed the error with `.ok().flatten()` and
+  printed a successful listing with the HEAD lines silently missing.
+- **The whole scoring batch shares one 5 s deadline and one OID cache.**
+  Resuming a budget rebuilt both, so the second detection side received a
+  fresh 5 s and re-read objects the first side had already fetched.
+- **`diff`'s exact buckets are ordered by new-path bytes**, so a
+  non-lexicographic input cannot pair differently in `diff` than in `status`.
+
+### Fixed (plan-20260714 R0-5 review PASS)
+
+R0-5 (porcelain v2 rename records) passes Codex review. Everything the card
+claims is now pinned by a regression: staged `R.` with a real mode flip,
+unstaged `.R` with real `100755` columns from an executable fixture, chained
+renames asserted by TOTAL change-row count in both configurations (so a
+leaked endpoint row or spurious `.R` cannot hide behind a correct `2 ` count),
+`-z` raw bytes, records from a subdirectory carrying real metadata, `MR` when
+the rename source also has a staged change, and fail-closed handling of an
+unreadable — as opposed to absent — worktree mode.
+
+### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review round 9)
+
+- **A single `status` no longer spends its read budgets twice.** The staged
+  and unstaged passes each built fresh `ObjectReadBudget`/`WorktreeReadBudget`
+  instances, so one invocation could use 2 × 500k comparisons and 2 × 64 MiB
+  of reads while each side individually looked compliant. The remaining
+  amounts now travel between the two passes.
+- `Cargo.lock` is kept in step with the version bump, so the release
+  workflow's `cargo build --locked` cannot fail on a stale lockfile.
+
+### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review round 8)
+
+- **A porcelain v2 rename record with missing SCORE metadata fails closed**
+  instead of defaulting to `R100`. `R100` is the documented spelling of an
+  exact rename, so the default published inexact pairs as byte-identical —
+  the mode and hash columns already refused to guess.
+- **Every HEAD deserialization boundary validates the OID's hash algorithm**,
+  not just the main one: linked-worktree and remote detached HEADs went
+  through an unchecked parse. All three now share one
+  parse-plus-kind-validate helper, so a new boundary cannot silently skip it.
+- **`diff.renameComparisonBudget` bounds the unique-basename stage too.**
+  Enforcement began only in the exhaustive loop, so `=1` could still score
+  arbitrarily many basename pairs and, if they consumed every candidate,
+  report no degradation at all.
+
+### Fixed (plan-20260714 R0-1 / R0-2 / R0-5 review rounds 5-7)
+
+- **An unstaged rename whose SOURCE also has a staged change renders `MR`,
+  not `.R`.** Edit `a`, `add a`, then move it to `b`: the record used to
+  claim `.R` — losing the staged modification entirely (the endpoint row is
+  suppressed) and copying the index hash into `hH`, asserting HEAD and index
+  agree when the user had just changed the index.
+- **Rename pairing is decided GLOBALLY, same-basename first**, in both
+  `status` and `diff`. Walking sources in path order let a source with no
+  name match claim the destination another source shared a name with.
+  Implemented as two linear passes with consumed destinations removed from
+  their bucket, so a tree full of duplicate blobs is not quadratic.
+- **The worktree read budget cannot be bypassed by a growth race.** Bytes
+  that were read are charged even when the result is refused as over-cap;
+  previously 4096 candidates could each read ~2 MiB while the 64 MiB total
+  budget stayed untouched. The `status` comparison budget now also bounds the
+  unique-basename stage rather than only the exhaustive one.
+- **A ref carrying an OID of the wrong hash algorithm fails closed at the
+  read.** A well-formed SHA-256 id in a SHA-1 repository parsed cleanly and
+  only failed much later, as a panic inside object loading.
+- **A type change between the snapshot stat and the OID read is detected.**
+  A regular file replaced by a symlink would otherwise hand the exact gate a
+  symlink-target OID labelled `Regular`.
+- Optional worktree stats and symlink reads now run under the same I/O
+  deadline as every other worktree read.
+
+### Fixed (plan-20260714 R0-1 / R0-2 review round 4)
+
+- **SHA-256 repositories detect unstaged exact renames again.** The worktree
+  OID is hashed on a pooled I/O worker, and the repository hash kind is
+  thread-local — a worker started at the SHA-1 default, so its id could never
+  equal the SHA-256 index entry. The pair silently degraded from exact to
+  inexact and read objects it did not need. The hash kind now crosses into
+  the worker with the job.
+- **`diff` applies the shared engine's inexact ELIGIBILITY and budget
+  accounting.** Symlinks no longer enter basename or exhaustive similarity
+  scoring (their "content" is a target string, which `status` never scores),
+  and unique-basename comparisons are charged against the same
+  `diff.renameComparisonBudget` the exhaustive stage spends instead of
+  restarting the count at zero.
+
+### Fixed (plan-20260714 R0-1 shared-scorer parity)
+
+- **`diff` and `status` now report the SAME rename pairings.** Both apply the
+  shared engine's exact-bucket rule — sources consumed in path-byte order,
+  each preferring a same-basename destination and otherwise the byte-smallest
+  candidate — and both break exhaustive-stage ties on path bytes rather than
+  on transient vector indexes. Previously `diff` took whichever destination
+  happened to be enumerated first, so a repository with duplicate content
+  could report one set of renames from `status` and a different set from
+  `diff`.
+- **Porcelain v2's rename record syntax is documented correctly** in the EN
+  and zh status docs and the CHANGELOG: `2 <XY> <sub> <mH> <mI> <mW> <hH>
+  <hI> R<score> <new>\t<old>`. The old text wrote `2 R<score> …`, conflating
+  the second field (`R.` staged-only, `.R` unstaged-only) with the ninth.
+
+### Fixed (plan-20260714 R0-2 / R0-5 / R0-6 review closeout)
+
+- **`status --porcelain=v2` rename records from a SUBDIRECTORY report real
+  metadata again.** The payload is projected to repository-root paths before
+  rendering; the v2 writer projected them a second time, so `sub/a.txt`
+  became `sub/sub/a.txt`, the HEAD/index lookups missed, and the record
+  failed closed instead of carrying its mode and hash.
+- **A rename record fails closed on an UNREADABLE worktree mode** instead of
+  fabricating `100644`. A genuinely absent destination (a chained rename
+  already moved it) still renders `000000` — "gone" and "cannot read" are
+  different answers.
+- **`--porcelain --ignored` / `--short --ignored` honor `core.quotePath`**,
+  and porcelain v2 `u` records carry raw path bytes under `-z` and the
+  escaped form otherwise; both previously used `Path::display()`, which
+  neither escaped control characters nor preserved non-UTF-8 bytes.
+- **A rename candidate that disappears between the scan and the hash is
+  reported as a degradation.** It used to be dropped silently, leaving
+  `rename_detection_complete: true` for a pairing that was never attempted.
+- **LFS worktree reads are byte-capped and size-stable**, so a file that
+  grows after its size check can no longer blow the read budget or produce a
+  pointer describing content that never existed.
+
+### Fixed (plan-20260714 R0-3 / R0-7 / R0-8 / R0-9 review closeout)
+
+- **`status` never reports a repository it could not fully inspect as
+  clean.** The fail-closed guard moved out of the renderer, so `--quiet`
+  (which skips rendering) and both dirty-cache fallback paths now refuse
+  with `LBR-IO-001` instead of exiting 0. `--check-dirty` re-verification
+  runs one tri-state stat per row — a permission change mid-run can no
+  longer be read as "the file is gone" and prune a still-valid cache row —
+  and a blocked re-verification writes nothing at all.
+- **`status --scan` no longer walks the worktree twice.** The cache
+  snapshot is built from the same bounded, `io_blocked`-aware scan that
+  produced the status, with rename detection disabled for the snapshot
+  (the cache stores paths by kind and has no rename row: pairing them
+  would have persisted an empty snapshot for a renamed file, and the next
+  `--cached --exit-code` would have called the repository clean).
+- **Every blocking worktree read is now time-bounded** — tracked stat and
+  content hash, untracked enumeration, ignore lookups, and the probe's
+  directory listing and per-entry metadata — by a pool of 8 REUSED worker
+  threads. The deadline measures lack of progress, so a large directory
+  that keeps yielding entries is never mistaken for a hung mount.
+- **`io_blocked[]` and `warnings[]` are one-to-one**, including on the
+  cache paths; repository-level preflight advisories are folded into the
+  same list as `repository_preflight` / `config`, so `--json
+  --exit-code-on-warning` can never exit 9 with an empty `warnings[]`,
+  and `--json` keeps stderr clean. `base_scan_complete` and
+  `rename_detection_complete` now report their own subsystems
+  independently.
+- **Non-UTF-8 names never fail `status`** in any mode, including `--scan`
+  and the cache modes, and JSON paths render through the documented
+  escaping instead of `Path::display()` — two different filenames can no
+  longer collapse onto one JSON string.
+- **The probe excludes repository metadata, gitlinks and nested
+  repositories unconditionally**, including when a pathspec names one
+  directly, and reports a resolved-outside-the-worktree path as blocked
+  rather than skipping it silently.
+
 ### Added (Part C W4)
 
 - **`libra agent workspace list|show` (plan-20260714 Part C W4 machine
@@ -12,6 +188,21 @@
   owner, lease fence/expiry, canonical path, task/session
   associations). Lease mutation stays internal to the agent runtime
   services.
+
+### Changed
+
+- **Rename-degradation semantics are now spelled out (plan-20260714
+  R0-9)**: when `diff.renameLimit` / `status.renameLimit` is exceeded on
+  either side, exact renames AND unique-basename renames are still
+  reported — only the exhaustive inexact stage is skipped, with a
+  `rename_limit_product_skipped` warning. When
+  `diff.renameComparisonBudget` (or status's similarity budget) is
+  exhausted, the exhaustive pass's results are discarded wholesale (a
+  partial exhaustive result would be order-dependent) while exact and
+  unique-basename pairs survive, with a `similarity_budget_exceeded`
+  warning. `diff` now runs the same staged order as `status`
+  (exact → unique-basename → bounded exhaustive), so a degraded run can
+  no longer demote a basename-proven rename to a delete + add pair.
 
 ### Fixed
 
@@ -154,13 +345,22 @@
   and reports the partial result through `data.io_blocked[]`
   (`{path:{display,raw_base64},staged,reason,rename}`, raw-byte-sorted
   and deduplicated) plus `base_scan_complete` /
-  `rename_detection_complete` / `complete`; `is_clean` is `false` and
+  `rename_detection_complete` / `complete`. The unstaged rename-destination
+  probe is bounded by two call-global budgets — 50,000 enumerated entries
+  and 10,000 qualified destinations, aggregated across probe roots — and
+  tripping either keeps the pairs found so far while emitting a
+  `probe_truncated` warning (`source: probe`) that names which budget
+  ran out. The budgets apply ONLY to the probe: the display scan still
+  reports every untracked path; `is_clean` is `false` and
   `--exit-code` reports dirty while anything is blocked, a blocked
   `--scan` refuses to replace the dirty cache, and `--check-dirty`
   keeps rows it cannot re-verify. Structured warnings now use one
   frozen `{code, message, source}` schema (sources
-  `rename_detect`/`metadata`/`worktree`/`cache`, codes documented in
-  `docs/commands/status.md`), object-read faults during rename scoring
+  `config`/`probe`/`rename_detect`/`worktree`/`metadata`/`cache`, codes
+  documented in `docs/commands/status.md`; `probe` is distinct from
+  `rename_detect` so consumers can tell "candidates may never have been
+  seen" from "seen but unscorable"), one warning per `io_blocked[]`
+  entry, object-read faults during rename scoring
   (missing/corrupt/unavailable objects, budget caps) skip only the
   dependent inexact candidates with deduplicated
   `metadata_unavailable`/`metadata_budget_exceeded` warnings, and exit
@@ -1015,8 +1215,8 @@
 
 - **`status` porcelain v2 and JSON emit proper rename records (v0.19.6,
   plan-20260714 Part B R0-5 + R0-7 JSON)**: `--porcelain=v2` now renders a
-  detected rename as Git's single `2 R<score> N... <mH> <mI> <mW> <hH> <hI>
-  R<pct> <new>\t<old>` record — with the real HEAD tree modes/hashes, index
+  detected rename as Git's single `2 <XY> N... <mH> <mI> <mW> <hH> <hI>
+  R<score> <new>\t<old>` record — with the real HEAD tree modes/hashes, index
   modes/hashes, and worktree mode (`<new> NUL <old> NUL` path field under
   `-z`) — instead of two `1 R` change rows for the endpoints. `--json` gains
   a top-level `data.renames[]` array of `{from, to, score, exact, staged,

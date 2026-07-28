@@ -1642,8 +1642,10 @@ fn investigate_artifacts_objectized() {
 
 /// A real finalized investigate run's manifest carries the retention fields;
 /// once backdated past the `agent.retention.findings_days` window,
-/// `libra agent clean --gc` removes the run dir (the objectized blob is
-/// content-addressed and kept for a future repo-wide object GC).
+/// `libra agent clean --gc` removes the run dir and, since PD-04, reclaims
+/// the objectized findings blob with it — unless a surviving run still names
+/// that oid or a ref reaches it (content addressing lets a findings blob
+/// collide with one history needs).
 #[test]
 fn findings_retention_manifest() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1699,11 +1701,13 @@ fn findings_retention_manifest() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!run_dir.exists(), "the expired terminal run dir is GC'd");
-    // The objectized blob is content-addressed and left for a future repo-wide
-    // object GC — per-run retention never deletes it.
+    // PD-04: the findings blob is reclaimed with the run. Nothing else names
+    // this oid and no ref reaches it, so it is genuinely garbage — the two
+    // conservative exceptions (a surviving run's oid, a ref-reachable oid)
+    // are covered by the unit test in `command::agent::clean`.
     assert!(
-        blob.exists(),
-        "the objectized findings blob is not deleted here"
+        !blob.exists(),
+        "the expired run's findings blob is reclaimed with it, not leaked"
     );
 }
 

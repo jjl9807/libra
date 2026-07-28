@@ -44,6 +44,37 @@ pub enum Head {
  * Incorrect Usage (in a transaction): `Head::update(...).await;` // DEADLOCK!
  */
 
+/// Parse a stored commit id AND verify it belongs to this repository's hash
+/// algorithm.
+///
+/// A well-formed id of the wrong algorithm parses cleanly — the length is
+/// valid for ITS kind — and only fails much later, as a panic inside object
+/// loading. Every ref-read boundary funnels through here so none can be
+/// updated without the check.
+/// Parse a stored ref commit and validate it against the repository's hash
+/// algorithm. `what` names the hash for the user — "detached HEAD commit
+/// hash", not just "commit hash" — because the same helper serves the
+/// local, linked-worktree, and remote HEAD boundaries and the message is
+/// the only thing that tells them apart.
+fn parse_ref_commit(raw: &str, ref_name: &str, what: &str) -> Result<ObjectHash, BranchStoreError> {
+    let commit = ObjectHash::from_str(raw).map_err(|error| BranchStoreError::Corrupt {
+        name: ref_name.to_string(),
+        detail: format!("invalid {what}: {error}"),
+    })?;
+    let repo_kind = git_internal::hash::get_hash_kind();
+    if commit.kind() != repo_kind {
+        return Err(BranchStoreError::Corrupt {
+            name: ref_name.to_string(),
+            detail: format!(
+                "{what} is {:?} but this repository uses {:?}",
+                commit.kind(),
+                repo_kind
+            ),
+        });
+    }
+    Ok(commit)
+}
+
 impl Head {
     const SQLITE_BUSY_MAX_RETRIES: usize = 15;
     const SQLITE_BUSY_RETRY_BASE_MS: u64 = 100;
@@ -168,12 +199,8 @@ impl Head {
                     name: "HEAD".to_string(),
                     detail: "detached HEAD is missing commit hash".to_string(),
                 })?;
-                let commit_hash = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
-                    BranchStoreError::Corrupt {
-                        name: "HEAD".to_string(),
-                        detail: format!("invalid detached HEAD commit hash: {error}"),
-                    }
-                })?;
+                let commit_hash =
+                    parse_ref_commit(commit_hash.as_str(), "HEAD", "detached HEAD commit hash")?;
                 Ok(Head::Detached(commit_hash))
             }
         }
@@ -224,12 +251,8 @@ impl Head {
                     name: "HEAD".to_string(),
                     detail: "detached HEAD is missing commit hash".to_string(),
                 })?;
-                let commit = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
-                    BranchStoreError::Corrupt {
-                        name: "HEAD".to_string(),
-                        detail: format!("invalid detached HEAD commit hash: {error}"),
-                    }
-                })?;
+                let commit =
+                    parse_ref_commit(commit_hash.as_str(), "HEAD", "detached HEAD commit hash")?;
                 Ok(Some((Head::Detached(commit), Some(commit))))
             }
         }
@@ -265,12 +288,11 @@ impl Head {
                     name: format!("refs/remotes/{remote}/HEAD"),
                     detail: "detached remote HEAD is missing commit hash".to_string(),
                 })?;
-                let commit_hash = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
-                    BranchStoreError::Corrupt {
-                        name: format!("refs/remotes/{remote}/HEAD"),
-                        detail: format!("invalid detached remote HEAD commit hash: {error}"),
-                    }
-                })?;
+                let commit_hash = parse_ref_commit(
+                    commit_hash.as_str(),
+                    &format!("refs/remotes/{remote}/HEAD"),
+                    "detached remote HEAD commit hash",
+                )?;
                 Ok(Some(Head::Detached(commit_hash)))
             }
         }
@@ -450,6 +472,20 @@ impl Head {
     }
 
     pub async fn branch_checked_out_elsewhere(branch: &str) -> Option<String> {
+        // Legacy convenience wrapper. Destructive writers MUST use
+        // [`Self::branch_checked_out_elsewhere_result`]: swallowing a
+        // database error here would fail OPEN and let a cross-worktree
+        // branch move through (§C.4.4).
+        Self::branch_checked_out_elsewhere_result(branch)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Fail-CLOSED cross-worktree checkout probe: a query failure is an
+    /// error the caller must surface, never "nobody has it checked out".
+    pub async fn branch_checked_out_elsewhere_result(
+        branch: &str,
+    ) -> Result<Option<String>, sea_orm::DbErr> {
         let db = get_db_conn_instance().await;
         let current = crate::utils::util::current_worktree_id();
         let rows = reference::Entity::find()
@@ -457,11 +493,11 @@ impl Head {
             .filter(reference::Column::Remote.is_null())
             .filter(reference::Column::Name.eq(branch))
             .all(&db)
-            .await
-            .unwrap_or_default();
-        rows.into_iter()
+            .await?;
+        Ok(rows
+            .into_iter()
             .find(|row| row.worktree_id != current)
-            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string()))
+            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
     }
 
     pub async fn update_with_conn<C>(db: &C, new_head: Self, remote: Option<&str>)

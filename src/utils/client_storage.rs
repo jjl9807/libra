@@ -1586,6 +1586,14 @@ impl ClientStorage {
                     ObjectReadFailure::Corrupt
                 }
             }
+            // A filesystem/transport failure reading the object STORE is an
+            // availability fault, not an unknown one: the object may well
+            // exist and be intact, we just cannot read it right now
+            // (EACCES on a loose file, a dropped tier connection). Routing
+            // it through `Other` would report an object-store problem under
+            // the worktree warning family and send readers to inspect the
+            // wrong subsystem.
+            GitError::IOError(_) | GitError::NetworkError(_) => ObjectReadFailure::Unavailable,
             _ => ObjectReadFailure::Other,
         }
     }

@@ -723,7 +723,14 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 layout: "task-fuse",
             });
         }
-        print!("{}", legacy::format_worktree_porcelain(&all).await);
+        let porcelain = legacy::format_worktree_porcelain(&all)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("cannot list worktrees: {error}"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
+                    .with_hint("a stored HEAD reference is corrupt; repair it and retry")
+            })?;
+        print!("{porcelain}");
         return Ok(());
     }
 
