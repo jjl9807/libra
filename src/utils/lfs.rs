@@ -86,24 +86,30 @@ pub fn generate_pointer_file_result(path: impl AsRef<Path>) -> io::Result<(Strin
 /// the plain helper hashes to EOF, so a file that grows after its size was
 /// checked would blow the read budget it was supposed to respect, and a
 /// pointer built from a moving target names content that never existed.
+/// Returns `(pointer, bytes_read)`. `bytes_read` is what the hash actually
+/// consumed — NOT the pre-read `stat` length — and is reported even when the
+/// pointer is refused, so a caller enforcing a read budget charges what the
+/// attempt really cost. A file that grows between the stat and the read
+/// otherwise buys unmetered I/O.
 pub fn generate_pointer_file_bounded(
     path: impl AsRef<Path>,
     cap: u64,
-) -> io::Result<Option<(String, String)>> {
+) -> io::Result<(Option<(String, String)>, u64)> {
     let path = path.as_ref();
     let size = path.metadata()?.len();
     if size > cap {
-        return Ok(None);
+        return Ok((None, 0));
     }
-    let Some(oid) = calc_lfs_file_hash_bounded(path, cap)? else {
-        return Ok(None);
+    let (oid, bytes_read) = calc_lfs_file_hash_bounded(path, cap)?;
+    let Some(oid) = oid else {
+        return Ok((None, bytes_read));
     };
     // Re-check: a file that changed size under the read would otherwise get
     // a pointer whose `size` field disagrees with the bytes hashed.
-    if path.metadata()?.len() != size {
-        return Ok(None);
+    if path.metadata()?.len() != size || bytes_read != size {
+        return Ok((None, bytes_read));
     }
-    Ok(Some((format_pointer_string(&oid, size), oid)))
+    Ok((Some((format_pointer_string(&oid, size), oid)), bytes_read))
 }
 
 pub fn format_pointer_string(oid: &str, size: u64) -> String {
@@ -268,7 +274,10 @@ where
 // `ring` crate is much faster than `sha2` crate ( > 10 times)
 /// [`calc_lfs_file_hash`] that refuses to read past `cap` bytes, returning
 /// `Ok(None)` instead of hashing an unbounded amount.
-pub fn calc_lfs_file_hash_bounded<P>(path: P, cap: u64) -> io::Result<Option<String>>
+/// Returns `(oid, bytes_read)`. `bytes_read` counts every byte pulled off the
+/// file, including the overrun byte that proves the cap was exceeded, so a
+/// caller can charge a refused read as well as a successful one.
+pub fn calc_lfs_file_hash_bounded<P>(path: P, cap: u64) -> io::Result<(Option<String>, u64)>
 where
     P: AsRef<Path>,
 {
@@ -287,11 +296,11 @@ where
         }
         total = total.saturating_add(n as u64);
         if total > cap {
-            return Ok(None);
+            return Ok((None, total));
         }
         hash.update(&buffer[..n]);
     }
-    Ok(Some(hex::encode(hash.finish().as_ref())))
+    Ok((Some(hex::encode(hash.finish().as_ref())), total))
 }
 
 pub fn calc_lfs_file_hash<P>(path: P) -> io::Result<String>
@@ -401,6 +410,41 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    /// §B.3.4: the bounded LFS readers report the bytes they actually
+    /// consumed, on the refusal paths as well as the success path. A caller
+    /// enforcing a read budget settles on that number; billing the pre-read
+    /// `stat` instead lets a file that grows in between pull the larger read
+    /// through for the smaller stale price.
+    #[test]
+    fn bounded_lfs_readers_report_bytes_actually_read() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, vec![b'x'; 5000]).unwrap();
+
+        // Success: the count is the real content length.
+        let (oid, read) = calc_lfs_file_hash_bounded(&path, 1 << 20).unwrap();
+        assert!(oid.is_some());
+        assert_eq!(read, 5000);
+        let (pointer, read) = generate_pointer_file_bounded(&path, 1 << 20).unwrap();
+        assert!(pointer.is_some());
+        assert_eq!(read, 5000);
+
+        // Refused for exceeding the cap: still charged for what it cost. The
+        // reader stops one byte past the cap, which is what it consumed.
+        let (oid, read) = calc_lfs_file_hash_bounded(&path, 100).unwrap();
+        assert!(oid.is_none(), "over the cap");
+        assert_eq!(read, 101, "the overrun byte proves the cap was passed");
+
+        // A pointer whose hash consumed a different number of bytes than the
+        // pre-read stat is refused rather than published with a size field
+        // that disagrees with the bytes hashed.
+        let (pointer, read) = generate_pointer_file_bounded(&path, 100).unwrap();
+        assert!(pointer.is_none(), "over the cap");
+        assert_eq!(read, 0, "the stat-level rejection never opened the file");
+    }
 
     #[tokio::test]
     #[serial]

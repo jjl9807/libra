@@ -330,15 +330,20 @@ pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
 /// object id that silently claims to be the file's content. Callers that
 /// enforce a read budget must use this instead of [`stream_file_blob_hash`],
 /// whose size check can be defeated by a file that grows after the stat.
+/// Returns `(oid, bytes_read)`. `bytes_read` is what was actually pulled off
+/// the file, NOT the caller's pre-read `stat` length, and is reported on the
+/// refusal paths too: a file that grows between the caller's stat and this
+/// read must be charged for the bytes it really cost, or a growth race buys
+/// unmetered I/O against the budget this function exists to enforce.
 pub(crate) fn stream_file_blob_hash_bounded(
     path: impl AsRef<Path>,
     cap: u64,
-) -> io::Result<Option<ObjectHash>> {
+) -> io::Result<(Option<ObjectHash>, u64)> {
     let path = path.as_ref();
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     if len > cap {
-        return Ok(None);
+        return Ok((None, 0));
     }
     // Read one byte past the committed length so growth is detectable
     // rather than silently truncated into a plausible-looking hash.
@@ -358,15 +363,15 @@ pub(crate) fn stream_file_blob_hash_bounded(
         }
         total = total.saturating_add(read as u64);
         if total > len {
-            return Ok(None); // grew under the read
+            return Ok((None, total)); // grew under the read
         }
         hasher.update(&buffer[..read]);
     }
     if total != len {
-        return Ok(None); // shrank under the read
+        return Ok((None, total)); // shrank under the read
     }
     ObjectHash::from_bytes(&hasher.finalize())
-        .map(Some)
+        .map(|oid| (Some(oid), total))
         .map_err(io::Error::other)
 }
 

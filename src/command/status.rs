@@ -832,6 +832,8 @@ pub enum StatusError {
     Workdir { source: io::Error },
     #[error("{source}")]
     ConfigRead { source: anyhow::Error },
+    #[error("cannot read the HEAD {what} '{oid}': the object is missing or corrupt")]
+    HeadObjectUnreadable { what: &'static str, oid: String },
 }
 
 impl From<StatusError> for CliError {
@@ -862,6 +864,9 @@ impl From<StatusError> for CliError {
             StatusError::ConfigRead { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            StatusError::HeadObjectUnreadable { .. } => CliError::fatal(msg)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("run 'libra fsck' or restore the object, then retry"),
         }
     }
 }
@@ -1083,6 +1088,7 @@ async fn collect_status_data(
         let head_blobs = head_oid
             .as_ref()
             .map(load_head_tree_blobs)
+            .transpose()?
             .unwrap_or_default();
         let index_blobs = maybe_index
             .as_ref()
@@ -1092,7 +1098,7 @@ async fn collect_status_data(
         let config = rename_detect::RenameDetectConfig {
             threshold,
             rename_limit: extras.rename_limit,
-            comparison_budget: Some(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS),
+            comparison_budget: Some(status_comparison_budget()),
         };
         detect_renames_in_changes(
             &mut staged,
@@ -1253,7 +1259,7 @@ async fn collect_status_data(
         Some(std::sync::Arc::new(build_porcelain_v2_data(
             index,
             head_oid.as_ref(),
-        )))
+        )?))
     } else {
         None
     };
@@ -1722,6 +1728,20 @@ fn build_rename_side(
     map
 }
 
+/// The §B.7 comparison cap for `status`. Debug builds honor
+/// `LIBRA_TEST_STATUS_COMPARISON_BUDGET` so a test can observe the shared
+/// allowance without generating 500k real comparisons.
+fn status_comparison_budget() -> u64 {
+    #[cfg(debug_assertions)]
+    if let Ok(value) = std::env::var("LIBRA_TEST_STATUS_COMPARISON_BUDGET")
+        && let Ok(parsed) = value.parse::<u64>()
+        && parsed > 0
+    {
+        return parsed;
+    }
+    rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS
+}
+
 /// Call-level rename budget STATE, carried between detection sides.
 ///
 /// §B.3.4/§B.7 specify ONE 500k comparison cap, ONE 64 MiB read cap and ONE
@@ -2088,15 +2108,37 @@ fn tree_item_mode_to_unix(mode: TreeItemMode) -> u32 {
     }
 }
 
+/// The error for a HEAD object that passes ref validation but is not in the
+/// object store. `Commit::load` / `Tree::load` PANIC in that case, so every
+/// status path that expands HEAD goes through the `try_load` pair below: a
+/// pruned or corrupt object is a repository problem the user can act on, not
+/// a reason to take the process down.
+pub(crate) fn head_object_unreadable(what: &str, oid: &ObjectHash) -> CliError {
+    CliError::fatal(format!(
+        "cannot read the HEAD {what} '{oid}': the object is missing or corrupt"
+    ))
+    .with_stable_code(StableErrorCode::RepoStateInvalid)
+    .with_hint("run 'libra fsck' or restore the object, then retry")
+}
+
+/// Load the HEAD commit and its tree, failing closed when either is absent.
+pub(crate) fn load_head_commit_tree(head_oid: &ObjectHash) -> CliResult<(Commit, Tree)> {
+    let commit =
+        Commit::try_load(head_oid).ok_or_else(|| head_object_unreadable("commit", head_oid))?;
+    let tree = Tree::try_load(&commit.tree_id)
+        .ok_or_else(|| head_object_unreadable("tree", &commit.tree_id))?;
+    Ok((commit, tree))
+}
+
 /// HEAD tree blobs keyed by repo-relative path → (oid, mode) (§B.4.1 old side
 /// of the staged snapshot).
-fn load_head_tree_blobs(head_oid: &ObjectHash) -> HashMap<PathBuf, (ObjectHash, u32)> {
-    let commit = Commit::load(head_oid);
-    let tree = Tree::load(&commit.tree_id);
-    tree.get_plain_items_with_mode()
+fn load_head_tree_blobs(head_oid: &ObjectHash) -> CliResult<HashMap<PathBuf, (ObjectHash, u32)>> {
+    let (_, tree) = load_head_commit_tree(head_oid)?;
+    Ok(tree
+        .get_plain_items_with_mode()
         .into_iter()
         .map(|(path, hash, mode)| (path, (hash, tree_item_mode_to_unix(mode))))
-        .collect()
+        .collect())
 }
 
 /// Index stage-0 blobs keyed by repo-relative path → (oid, mode) (index side
@@ -4491,10 +4533,12 @@ fn get_submodule_status(_file_path: &std::path::Path) -> String {
     "S...".to_string()
 }
 
-fn build_porcelain_v2_data(index: Index, head_oid: Option<&ObjectHash>) -> PorcelainV2Data {
+fn build_porcelain_v2_data(
+    index: Index,
+    head_oid: Option<&ObjectHash>,
+) -> CliResult<PorcelainV2Data> {
     let head_tree_items = if let Some(commit_hash) = head_oid {
-        let commit = Commit::load(commit_hash);
-        let tree = Tree::load(&commit.tree_id);
+        let (_, tree) = load_head_commit_tree(commit_hash)?;
         tree.get_plain_items_with_mode()
             .into_iter()
             .map(|(path, hash, mode)| {
@@ -4511,10 +4555,10 @@ fn build_porcelain_v2_data(index: Index, head_oid: Option<&ObjectHash>) -> Porce
         HashMap::new()
     };
 
-    PorcelainV2Data {
+    Ok(PorcelainV2Data {
         index,
         head_tree_items,
-    }
+    })
 }
 
 /// Emit a porcelain v2 `2 <xy> …` rename record (§B.6.4):
@@ -5789,8 +5833,16 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
         Some(head_commit) => head_commit,
         None => return Ok(changes),
     };
-    let commit = Commit::load(&head_commit);
-    let tree = Tree::load(&commit.tree_id);
+    let commit =
+        Commit::try_load(&head_commit).ok_or_else(|| StatusError::HeadObjectUnreadable {
+            what: "commit",
+            oid: head_commit.to_string(),
+        })?;
+    let tree =
+        Tree::try_load(&commit.tree_id).ok_or_else(|| StatusError::HeadObjectUnreadable {
+            what: "tree",
+            oid: commit.tree_id.to_string(),
+        })?;
     let tree_files = tree.get_plain_items_with_mode();
 
     for (item_path, item_hash, item_mode) in tree_files.iter() {
