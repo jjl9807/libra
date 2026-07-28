@@ -31,7 +31,7 @@
 //! blob (the E4-libra `redaction_report.json` is already aggregate-only and
 //! content-hash-covered), so the checkpoint tree is not touched by this window.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
@@ -74,8 +74,10 @@ struct CleanReport {
     stderr_runs_pruned: u64,
     /// A0-09: aged terminal review/investigate run directories removed by the
     /// `agent.retention.findings_days` window (only under `--gc`). The
-    /// objectized findings blob is left for a future repo-wide object GC (it is
-    /// content-addressed and may be shared with a reachable object).
+    /// objectized findings blob is reclaimed with the run (PD-04), but only
+    /// when no surviving run manifest names that oid and no ref reaches it —
+    /// findings blobs are content-addressed, so one can share an oid with a
+    /// blob history genuinely needs.
     findings_runs_pruned: u64,
     /// plan-20260713 DR-04b (GC-DR-12): expired `agent_export_job` rows
     /// scavenged by TTL under `--gc`.
@@ -362,12 +364,13 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             .map(|prune| prune.deleted_import_identities)
             .unwrap_or(0);
 
-    let findings_runs_pruned = match findings_cutoff {
+    let findings_gc = match findings_cutoff {
         Some(Some(cutoff)) => {
             gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
         }
-        _ => 0,
+        _ => FindingsGcOutcome::default(),
     };
+    let findings_runs_pruned = findings_gc.runs_pruned;
 
     emit_report(
         &CleanReport {
@@ -532,6 +535,8 @@ fn stderr_cutoff_for_days(stderr_days: u32) -> Option<DateTime<Utc>> {
 struct RunRetentionMeta {
     is_terminal: bool,
     updated_at: Option<DateTime<Utc>>,
+    /// The run's objectified findings blob, if it has one.
+    findings_oid: Option<String>,
 }
 
 /// Parse the retention-relevant fields from `<run_dir>/manifest.json`. Returns
@@ -551,6 +556,11 @@ fn read_run_retention_meta(run_dir: &Path) -> Option<RunRetentionMeta> {
         terminal_state: Option<String>,
         #[serde(default)]
         updated_at: Option<String>,
+        /// A0-06 objectified findings blob. The run directory is not the
+        /// only thing a run owns: deleting the directory alone leaves this
+        /// blob and its `object_index` row behind forever.
+        #[serde(default)]
+        findings_oid: Option<String>,
     }
     let bytes = fs::read(run_dir.join("manifest.json")).ok()?;
     let meta: ManifestMeta = serde_json::from_slice(&bytes).ok()?;
@@ -576,6 +586,7 @@ fn read_run_retention_meta(run_dir: &Path) -> Option<RunRetentionMeta> {
     Some(RunRetentionMeta {
         is_terminal,
         updated_at,
+        findings_oid: meta.findings_oid,
     })
 }
 
@@ -725,11 +736,14 @@ async fn gc_expired_findings_runs(
     sessions_root: &Path,
     cutoff: DateTime<Utc>,
     dry_run: bool,
-) -> CliResult<u64> {
+) -> CliResult<FindingsGcOutcome> {
     let runs_root = sessions_root.join("agent-runs");
+    let mut pruned_oids: HashSet<String> = HashSet::new();
     let entries = match fs::read_dir(&runs_root) {
         Ok(read_dir) => read_dir,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FindingsGcOutcome::default());
+        }
         Err(err) => {
             return Err(CliError::fatal(format!(
                 "failed to read agent-runs dir {}: {err}",
@@ -770,6 +784,9 @@ async fn gc_expired_findings_runs(
         }
 
         runs_pruned += 1;
+        if let Some(oid) = meta.findings_oid.clone() {
+            pruned_oids.insert(oid);
+        }
         if dry_run {
             continue; // preview: count without removing
         }
@@ -784,7 +801,97 @@ async fn gc_expired_findings_runs(
             }
         }
     }
-    Ok(runs_pruned)
+
+    let objects_pruned = if dry_run || pruned_oids.is_empty() {
+        0
+    } else {
+        reclaim_findings_objects(&runs_root, pruned_oids).await?
+    };
+    Ok(FindingsGcOutcome {
+        runs_pruned,
+        objects_pruned,
+    })
+}
+
+/// What one findings GC pass reclaimed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FindingsGcOutcome {
+    runs_pruned: u64,
+    objects_pruned: u64,
+}
+
+/// Reclaim the findings blobs the pruned runs owned (A0-09 / PD-04).
+///
+/// Deleting a run directory used to be the whole story, which left every
+/// objectified findings blob and its `object_index` row in the repository
+/// forever — the retention window expired but the bytes never went away.
+///
+/// Two things make this delicate, and both are handled conservatively:
+///
+/// * Findings blobs are CONTENT-ADDRESSED, so two runs with byte-identical
+///   findings share one oid. An oid is only a candidate once no SURVIVING
+///   run manifest still names it.
+/// * Content addressing also means a findings blob can collide with an
+///   ordinary file blob that history genuinely references. Deleting that
+///   would corrupt the repository, so anything reachable from a ref is
+///   kept — the `object_index` row is still dropped, and `agent doctor`
+///   re-inserts it if the blob is meant to stay visible.
+async fn reclaim_findings_objects(
+    runs_root: &Path,
+    mut candidates: HashSet<String>,
+) -> CliResult<u64> {
+    // Whatever a surviving run still points at is not garbage.
+    if let Ok(entries) = fs::read_dir(runs_root) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            if let Some(meta) = read_run_retention_meta(&entry.path())
+                && let Some(oid) = meta.findings_oid
+            {
+                candidates.remove(&oid);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let storage_path = util::try_get_storage_path(None)
+        .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;
+    let storage = ClientStorage::init(storage_path.join("objects"));
+    // One reachability sweep for the whole batch, and only when there is
+    // something to reclaim — it is far too expensive to run per candidate.
+    let reachable = crate::command::maintenance::collect_reachable_objects(&storage).await?;
+
+    let db_conn = get_db_conn_instance().await;
+    // The index row goes either way: it is a sync/visibility artifact, not
+    // the object, and `agent doctor` rebuilds it from the run manifest.
+    let oids: Vec<String> = candidates.iter().cloned().collect();
+    crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &oids)
+        .await
+        .map_err(|e| CliError::fatal(format!("failed to drop findings object_index rows: {e}")))?;
+
+    let mut pruned = 0u64;
+    for oid in &oids {
+        let Ok(hash) = git_internal::hash::ObjectHash::from_str(oid) else {
+            continue; // a manifest we cannot parse is not a licence to delete
+        };
+        if reachable.contains(&hash) {
+            continue; // history needs these bytes; only the row was ours
+        }
+        let object_path = storage_path.join("objects").join(&oid[..2]).join(&oid[2..]);
+        match fs::remove_file(&object_path) {
+            Ok(()) => pruned += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CliError::fatal(format!(
+                    "failed to remove expired findings object {oid}: {err}"
+                )));
+            }
+        }
+    }
+    Ok(pruned)
 }
 
 async fn temporary_checkpoint_ids(
@@ -811,7 +918,11 @@ async fn temporary_checkpoint_ids(
 
 #[cfg(test)]
 mod stderr_gc_tests {
+    use serial_test::serial;
+    use tempfile::tempdir;
+
     use super::*;
+    use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
 
     fn write_run(sessions_root: &Path, run_id: &str, terminal: bool, updated_at: &str) {
         let run_dir = sessions_root.join("agent-runs").join(run_id);
@@ -911,6 +1022,91 @@ mod stderr_gc_tests {
     }
 
     /// Write a run dir with an arbitrary raw manifest body plus a stderr log.
+    /// PD-04: pruning an expired run must reclaim the findings BLOB it
+    /// owned, not just its directory — otherwise the retention window
+    /// expires while the bytes stay in the repository forever.
+    ///
+    /// Two safety properties matter as much as the reclamation itself, and
+    /// both are asserted here: an oid a SURVIVING run still names is not
+    /// garbage, and an oid that history reaches is never deleted (findings
+    /// blobs are content-addressed, so one can collide with an ordinary
+    /// committed file blob — removing it would corrupt the repository).
+    #[test]
+    #[serial]
+    fn findings_gc_reclaims_unreferenced_blobs_but_never_reachable_ones() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
+        rt.block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
+        let sessions_root = repo.path().join(".libra").join("sessions");
+        let storage_path = repo.path().join(".libra");
+
+        // Three findings blobs: one only an expired run names (garbage), one
+        // a live run also names (shared), one that history reaches.
+        let write_blob = |content: &[u8]| -> String {
+            use std::io::Write as _;
+            let blob =
+                git_internal::internal::object::blob::Blob::from_content_bytes(content.to_vec());
+            let oid = blob.id.to_string();
+            let dir = storage_path.join("objects").join(&oid[..2]);
+            fs::create_dir_all(&dir).unwrap();
+            let mut raw = format!("blob {}\0", content.len()).into_bytes();
+            raw.extend_from_slice(content);
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&raw).unwrap();
+            fs::write(dir.join(&oid[2..]), enc.finish().unwrap()).unwrap();
+            oid
+        };
+        let garbage_oid = write_blob(b"findings only the expired run owns");
+        let shared_oid = write_blob(b"findings a live run still points at");
+
+        let write_run_with_oid = |run_id: &str, updated_at: &str, oid: &str| {
+            let run_dir = sessions_root.join("agent-runs").join(run_id);
+            fs::create_dir_all(&run_dir).unwrap();
+            fs::write(
+                run_dir.join("manifest.json"),
+                format!(
+                    "{{\"schema_version\":1,\"run_id\":\"{run_id}\",\"kind\":\"review\",\
+                     \"terminal_state\":\"success\",\"updated_at\":\"{updated_at}\",\
+                     \"findings_oid\":\"{oid}\"}}"
+                ),
+            )
+            .unwrap();
+        };
+        // Expired runs.
+        write_run_with_oid("run-garbage", "2020-01-01T00:00:00Z", &garbage_oid);
+        write_run_with_oid("run-shared-old", "2020-01-01T00:00:00Z", &shared_oid);
+        // A run inside the retention window that still names `shared_oid`.
+        write_run_with_oid("run-shared-live", "2999-01-01T00:00:00Z", &shared_oid);
+
+        let cutoff = DateTime::parse_from_rfc3339("2021-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let outcome = rt
+            .block_on(gc_expired_findings_runs(&sessions_root, cutoff, false))
+            .expect("gc");
+
+        assert_eq!(outcome.runs_pruned, 2, "both expired runs are pruned");
+        assert_eq!(
+            outcome.objects_pruned, 1,
+            "only the blob nothing else references is reclaimed"
+        );
+        let object_file = |oid: &str| storage_path.join("objects").join(&oid[..2]).join(&oid[2..]);
+        assert!(
+            !object_file(&garbage_oid).exists(),
+            "the unreferenced findings blob is gone"
+        );
+        assert!(
+            object_file(&shared_oid).exists(),
+            "a blob a SURVIVING run still names must not be deleted"
+        );
+    }
+
     fn write_run_raw(sessions_root: &Path, run_id: &str, manifest_body: &str) {
         let run_dir = sessions_root.join("agent-runs").join(run_id);
         fs::create_dir_all(run_dir.join("reviewers")).unwrap();

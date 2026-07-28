@@ -1441,13 +1441,15 @@ async fn agent_clean_findings_retention_gc() {
     );
     assert_eq!(json["data"]["dry_run"], false);
 
-    // Aged terminal run DIR: gone. The objectized blob is deliberately KEPT
-    // (content-addressed; reclaimed by a future repo-wide object GC, never by
-    // per-run retention, so a shared/reachable object can't be corrupted).
+    // Aged terminal run DIR: gone — and since PD-04 so is the findings blob
+    // it owned. Leaving it meant the retention window expired while the
+    // bytes stayed in the repository forever. Reclamation is still
+    // conservative: an oid a surviving run names, or one history reaches,
+    // is never deleted (see the unit test in `agent::clean`).
     assert!(!runs_root.join("aged-run").exists(), "aged run dir removed");
     assert!(
-        loose(&aged_oid).exists(),
-        "the objectized blob is left for a repo-wide GC, not deleted here"
+        !loose(&aged_oid).exists(),
+        "the aged run's findings blob is reclaimed with it, not leaked"
     );
     // Recent terminal + aged in-flight runs: KEPT.
     assert!(runs_root.join("recent-run").exists(), "recent run kept");
