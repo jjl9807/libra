@@ -51,17 +51,22 @@ pub enum Head {
 /// valid for ITS kind — and only fails much later, as a panic inside object
 /// loading. Every ref-read boundary funnels through here so none can be
 /// updated without the check.
-fn parse_ref_commit(raw: &str, ref_name: &str) -> Result<ObjectHash, BranchStoreError> {
+/// Parse a stored ref commit and validate it against the repository's hash
+/// algorithm. `what` names the hash for the user — "detached HEAD commit
+/// hash", not just "commit hash" — because the same helper serves the
+/// local, linked-worktree, and remote HEAD boundaries and the message is
+/// the only thing that tells them apart.
+fn parse_ref_commit(raw: &str, ref_name: &str, what: &str) -> Result<ObjectHash, BranchStoreError> {
     let commit = ObjectHash::from_str(raw).map_err(|error| BranchStoreError::Corrupt {
         name: ref_name.to_string(),
-        detail: format!("invalid commit hash: {error}"),
+        detail: format!("invalid {what}: {error}"),
     })?;
     let repo_kind = git_internal::hash::get_hash_kind();
     if commit.kind() != repo_kind {
         return Err(BranchStoreError::Corrupt {
             name: ref_name.to_string(),
             detail: format!(
-                "commit hash is {:?} but this repository uses {:?}",
+                "{what} is {:?} but this repository uses {:?}",
                 commit.kind(),
                 repo_kind
             ),
@@ -194,7 +199,8 @@ impl Head {
                     name: "HEAD".to_string(),
                     detail: "detached HEAD is missing commit hash".to_string(),
                 })?;
-                let commit_hash = parse_ref_commit(commit_hash.as_str(), "HEAD")?;
+                let commit_hash =
+                    parse_ref_commit(commit_hash.as_str(), "HEAD", "detached HEAD commit hash")?;
                 Ok(Head::Detached(commit_hash))
             }
         }
@@ -245,7 +251,8 @@ impl Head {
                     name: "HEAD".to_string(),
                     detail: "detached HEAD is missing commit hash".to_string(),
                 })?;
-                let commit = parse_ref_commit(commit_hash.as_str(), "HEAD")?;
+                let commit =
+                    parse_ref_commit(commit_hash.as_str(), "HEAD", "detached HEAD commit hash")?;
                 Ok(Some((Head::Detached(commit), Some(commit))))
             }
         }
@@ -281,8 +288,11 @@ impl Head {
                     name: format!("refs/remotes/{remote}/HEAD"),
                     detail: "detached remote HEAD is missing commit hash".to_string(),
                 })?;
-                let commit_hash =
-                    parse_ref_commit(commit_hash.as_str(), &format!("refs/remotes/{remote}/HEAD"))?;
+                let commit_hash = parse_ref_commit(
+                    commit_hash.as_str(),
+                    &format!("refs/remotes/{remote}/HEAD"),
+                    "detached remote HEAD commit hash",
+                )?;
                 Ok(Some(Head::Detached(commit_hash)))
             }
         }

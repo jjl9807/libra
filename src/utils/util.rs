@@ -1872,6 +1872,7 @@ fn path_has_git_dir_component(work_dir: &Path, target_file: &Path) -> bool {
 /// lookup was reclaimed: callers treat that as "cannot decide" and report
 /// the path blocked rather than silently choosing an answer.
 pub fn check_gitignore_bounded(workdir: &Path, path: &Path) -> Option<bool> {
+    prewarm_ignore_config(workdir);
     let workdir_owned = workdir.to_path_buf();
     let path_owned = path.to_path_buf();
     let answer = crate::command::status_probe::with_io_deadline(move || {
@@ -1884,6 +1885,20 @@ pub fn check_gitignore_bounded(workdir: &Path, path: &Path) -> Option<bool> {
         return None;
     }
     Some(answer)
+}
+
+/// Resolve the DATABASE-backed part of the ignore configuration on the
+/// CALLING thread.
+///
+/// `check_gitignore` consults `core.excludesFile`, which is a SQLite read of
+/// the repository config — not a filesystem operation. Running it on a
+/// pooled I/O worker means contention on the repository database is charged
+/// against the worktree I/O deadline and surfaces as a bogus `io_timeout`
+/// for a path that was perfectly readable. Callers that are about to hand
+/// `check_gitignore` to `with_io_deadline` warm the process-wide config
+/// cache here first, so the worker only ever touches the filesystem.
+pub fn prewarm_ignore_config(workdir: &Path) {
+    let _ = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, workdir);
 }
 
 pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {

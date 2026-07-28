@@ -345,9 +345,11 @@ pub(crate) fn stream_file_blob_hash_bounded(
     if len > cap {
         return Ok((None, 0));
     }
-    // Read one byte past the committed length so growth is detectable
-    // rather than silently truncated into a plausible-looking hash.
-    let mut reader = io::BufReader::new(file).take(len.saturating_add(1));
+    // Read AT MOST `len` (<= cap) bytes: the cap is a hard ceiling, so growth
+    // is detected by re-stating AFTER the read rather than by reading one
+    // byte past it. Reading cap+1 would overrun the very bound this function
+    // exists to enforce, exactly when the caller is at its limit.
+    let mut reader = io::BufReader::new(file).take(len);
     let mut hasher = HashAlgorithm::new();
 
     hasher.update(b"blob ");
@@ -362,13 +364,15 @@ pub(crate) fn stream_file_blob_hash_bounded(
             break;
         }
         total = total.saturating_add(read as u64);
-        if total > len {
-            return Ok((None, total)); // grew under the read
-        }
         hasher.update(&buffer[..read]);
     }
     if total != len {
         return Ok((None, total)); // shrank under the read
+    }
+    // Post-read length check: a file that grew would otherwise hash a prefix
+    // and pass it off as the whole file.
+    if reader.into_inner().into_inner().metadata()?.len() != len {
+        return Ok((None, total)); // grew under the read
     }
     ObjectHash::from_bytes(&hasher.finalize())
         .map(|oid| (Some(oid), total))
@@ -409,6 +413,32 @@ pub async fn get_target_commit(
 
 #[cfg(test)]
 mod tests {
+    use super::stream_file_blob_hash_bounded;
+
+    /// §B.3.4: `cap` is a HARD ceiling. The bounded hasher used to read
+    /// `cap + 1` bytes to detect a growing file, which meant a caller sitting
+    /// exactly at its 2 MiB / 64 MiB limit could still be made to read one
+    /// byte past it. Growth is now caught by re-stating AFTER the read, so
+    /// nothing beyond the cap is ever consumed.
+    #[test]
+    fn bounded_hash_never_reads_past_the_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("exactly-at-cap.bin");
+        let cap = 4096_u64;
+        std::fs::write(&path, vec![b'z'; cap as usize]).expect("write");
+
+        // Exactly at the cap: accepted, and charged exactly the cap.
+        let (oid, read) = stream_file_blob_hash_bounded(&path, cap).expect("read at the cap");
+        assert!(oid.is_some(), "a file exactly at the cap is readable");
+        assert_eq!(read, cap, "and costs exactly the cap, never cap + 1");
+
+        // One byte over: refused before anything is read.
+        std::fs::write(&path, vec![b'z'; cap as usize + 1]).expect("grow past the cap");
+        let (oid, read) = stream_file_blob_hash_bounded(&path, cap).expect("read past the cap");
+        assert!(oid.is_none(), "a file over the cap is refused");
+        assert_eq!(read, 0, "and no byte past the cap is consumed to find out");
+    }
+
     use git_internal::internal::object::commit::Commit;
     use serial_test::serial;
     use tempfile::tempdir;

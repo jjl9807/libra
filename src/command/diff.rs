@@ -3630,6 +3630,13 @@ fn apply_rename_detection(
         .map(|&i| (PathBuf::from(&files[i].path), i))
         .collect();
 
+    // The engine's inexact stage is restricted to NON-EMPTY regular files
+    // (`size != Some(0)`). Leaving every size `None` would let empty blobs
+    // reach content scoring here but not in `status`, so a small
+    // `diff.renameComparisonBudget` could be spent on them and a real
+    // rename discarded — the same input producing two different answers.
+    // Recorded ids are enough to recognise emptiness without a read.
+    let empty_oid = git_internal::internal::object::blob::Blob::from_content_bytes(Vec::new()).id;
     let blob_for = |path: &str,
                     map: &HashMap<PathBuf, ObjectHash>,
                     modes: &HashMap<PathBuf, u32>|
@@ -3640,7 +3647,7 @@ fn apply_rename_detection(
         Some(rename_detect::BlobRef {
             kind: rename_detect::BlobKind::from_mode(mode),
             mode,
-            size: None,
+            size: (oid == empty_oid).then_some(0),
             // Both sides are recorded tree/index/worktree ids, so exact
             // pairing is permitted (§B.4.1 allow-list).
             evidence: rename_detect::BlobEvidence::KnownObjectId { oid },

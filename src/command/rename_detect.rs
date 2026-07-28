@@ -163,15 +163,36 @@ impl RenameMatch {
 
 /// Why a candidate's content could not be scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The size/budget/IO reasons are SIDE-QUALIFIED. Both the object store and
+/// the working tree can hit a size cap, exhaust a budget, or fail to read,
+/// but the `source` field of the resulting status warning is a frozen enum
+/// where `metadata` means the object store and `worktree` means the working
+/// tree. A shared reason would erase that distinction on the way out, so the
+/// origin is carried in the reason itself and the compiler enforces it at
+/// every emit site.
 pub enum SkipReason {
     ObjectMissing,
     ObjectCorrupt,
     ObjectUnavailable,
-    TooLarge,
-    BudgetExceeded,
-    IoFailed,
+    /// Object side: the blob exceeded the per-object size cap.
+    ObjectTooLarge,
+    /// Object side: the object-read budget (bytes, slots, or deadline) was
+    /// exhausted.
+    ObjectBudgetExceeded,
+    /// Object side: a read failed for a reason that is not missing, corrupt,
+    /// or unavailable.
+    ObjectIoFailed,
+    /// Worktree side: the file exceeded the per-file size cap.
+    WorktreeTooLarge,
+    /// Worktree side: the worktree-read budget (bytes or tasks) was
+    /// exhausted.
+    WorktreeBudgetExceeded,
+    /// Worktree side: a worktree read failed (I/O error).
+    WorktreeIoFailed,
     /// The read exceeded the per-operation I/O deadline and the run was
-    /// reclaimed (§B.3.3) rather than hanging.
+    /// reclaimed (§B.3.3) rather than hanging. Worktree-side only: object
+    /// reads bound themselves with `ObjectBudgetExceeded` instead.
     IoTimeout,
 }
 
@@ -800,7 +821,7 @@ impl ObjectReadBudget {
             || self.remaining_objects == 0
             || self.remaining_total == 0
         {
-            return ContentOutcome::Skipped(SkipReason::BudgetExceeded);
+            return ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded);
         }
 
         // Reserve the object slot up front: failed lookups (missing, corrupt,
@@ -838,8 +859,8 @@ fn classify_object_error(err: &GitError) -> SkipReason {
         ObjectReadFailure::Missing => SkipReason::ObjectMissing,
         ObjectReadFailure::Corrupt => SkipReason::ObjectCorrupt,
         ObjectReadFailure::Unavailable => SkipReason::ObjectUnavailable,
-        ObjectReadFailure::TooLarge => SkipReason::TooLarge,
-        ObjectReadFailure::Other => SkipReason::IoFailed,
+        ObjectReadFailure::TooLarge => SkipReason::ObjectTooLarge,
+        ObjectReadFailure::Other => SkipReason::ObjectIoFailed,
     }
 }
 
@@ -931,7 +952,7 @@ impl WorktreeReadBudget {
     /// content, LFS pointer, or symlink target bytes) under budget.
     pub fn read_worktree_blob(&mut self, abs_path: &Path) -> ContentOutcome {
         if !self.take_task() {
-            return ContentOutcome::Skipped(SkipReason::BudgetExceeded);
+            return ContentOutcome::Skipped(SkipReason::WorktreeBudgetExceeded);
         }
         // Deadline-guarded: an optional content read must never wedge the
         // command on a hung mount.
@@ -940,7 +961,7 @@ impl WorktreeReadBudget {
             stat_target.symlink_metadata()
         }) {
             Ok(Ok(metadata)) => metadata,
-            Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::IoFailed),
+            Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
             Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
         };
         if metadata.file_type().is_symlink() {
@@ -949,7 +970,7 @@ impl WorktreeReadBudget {
                 super::read_symlink_blob_bytes(&link_target)
             }) {
                 Ok(Ok(bytes)) => self.account(bytes),
-                Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
+                Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
                 Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
             };
         }
@@ -957,7 +978,7 @@ impl WorktreeReadBudget {
             // The budget covers hydrated bytes, not pointer length (§B.9
             // lfs_budget_counts_hydrated_bytes): charge the on-disk size.
             if metadata.len() > self.per_file_cap.min(self.remaining_total) {
-                return ContentOutcome::Skipped(SkipReason::TooLarge);
+                return ContentOutcome::Skipped(SkipReason::WorktreeTooLarge);
             }
             // Bounded AND deadline-guarded: the pointer is tiny, but
             // producing it hashes the whole file, so the cap is re-applied
@@ -978,14 +999,14 @@ impl WorktreeReadBudget {
                 }
                 Ok(Ok((None, read))) => {
                     self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                    ContentOutcome::Skipped(SkipReason::TooLarge)
+                    ContentOutcome::Skipped(SkipReason::WorktreeTooLarge)
                 }
-                Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
+                Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
             };
         }
         let cap = self.per_file_cap.min(self.remaining_total);
         if metadata.len() > cap {
-            return ContentOutcome::Skipped(SkipReason::TooLarge);
+            return ContentOutcome::Skipped(SkipReason::WorktreeTooLarge);
         }
         grow_under_read_for_test(abs_path);
         // §B.3.4 bounded read: `read` the file through a `take(cap + 1)`
@@ -1007,7 +1028,7 @@ impl WorktreeReadBudget {
         match outcome {
             Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
             Ok(Ok(bytes)) => self.account(bytes),
-            Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::IoFailed),
+            Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
         }
     }
 
@@ -1020,7 +1041,7 @@ impl WorktreeReadBudget {
         let over = len > self.per_file_cap.min(self.remaining_total);
         self.remaining_total = self.remaining_total.saturating_sub(len);
         if over {
-            return ContentOutcome::Skipped(SkipReason::TooLarge);
+            return ContentOutcome::Skipped(SkipReason::WorktreeTooLarge);
         }
         ContentOutcome::Content(Rc::new(bytes))
     }
@@ -1037,7 +1058,7 @@ impl WorktreeReadBudget {
         abs_path: &Path,
     ) -> Result<(ObjectHash, u64, BlobKind), SkipReason> {
         if !self.take_task() {
-            return Err(SkipReason::BudgetExceeded);
+            return Err(SkipReason::WorktreeBudgetExceeded);
         }
         // Deadline-guarded like every other worktree read: a stat that hangs
         // must reclaim the caller and skip the candidate.
@@ -1046,7 +1067,7 @@ impl WorktreeReadBudget {
             stat_target.symlink_metadata()
         }) {
             Ok(Ok(metadata)) => metadata,
-            Ok(Err(_)) => return Err(SkipReason::IoFailed),
+            Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
             Err(()) => return Err(SkipReason::IoTimeout),
         };
         if metadata.file_type().is_symlink() {
@@ -1055,12 +1076,12 @@ impl WorktreeReadBudget {
                 super::read_symlink_blob_bytes(&link_target)
             }) {
                 Ok(Ok(bytes)) => bytes,
-                Ok(Err(_)) => return Err(SkipReason::IoFailed),
+                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
                 Err(()) => return Err(SkipReason::IoTimeout),
             };
             let len = bytes.len() as u64;
             if len > self.per_file_cap.min(self.remaining_total) {
-                return Err(SkipReason::TooLarge);
+                return Err(SkipReason::WorktreeTooLarge);
             }
             self.remaining_total = self.remaining_total.saturating_sub(len);
             let oid = git_internal::internal::object::blob::Blob::from_content_bytes(bytes).id;
@@ -1068,7 +1089,7 @@ impl WorktreeReadBudget {
         }
         let cap = self.per_file_cap.min(self.remaining_total);
         if metadata.len() > cap {
-            return Err(SkipReason::TooLarge);
+            return Err(SkipReason::WorktreeTooLarge);
         }
         grow_under_read_for_test(abs_path);
         if crate::utils::lfs::is_lfs_tracked(abs_path) {
@@ -1086,9 +1107,9 @@ impl WorktreeReadBudget {
                 // attempt anyway — see the note on the success path below.
                 Ok(Ok((None, read))) => {
                     self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                    return Err(SkipReason::TooLarge);
+                    return Err(SkipReason::WorktreeTooLarge);
                 }
-                Ok(Err(_)) => return Err(SkipReason::IoFailed),
+                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
             };
             // `read` is the hash's real consumption; `metadata.len()` is a
             // pre-read stat a growing file can make stale.
@@ -1113,9 +1134,9 @@ impl WorktreeReadBudget {
             // would give an attacker unlimited free reads.
             Ok(Ok((None, read))) => {
                 self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                return Err(SkipReason::TooLarge);
+                return Err(SkipReason::WorktreeTooLarge);
             }
-            Ok(Err(_)) => return Err(SkipReason::IoFailed),
+            Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
         };
         // Charge and report what the read ACTUALLY consumed. `metadata.len()`
         // is a pre-read stat, and a file that grew in between would otherwise
@@ -1752,7 +1773,7 @@ mod tests {
         let mut objects = ObjectReadBudget::new(1024, 1024, 0, Duration::from_secs(30));
         assert!(matches!(
             objects.read_blob(&oid_of(b"whatever")),
-            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+            ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded)
         ));
 
         // ...while a worktree budget still reads through its own counters.
@@ -1761,15 +1782,16 @@ mod tests {
             worktree.read_worktree_blob(&small),
             ContentOutcome::Content(_)
         ));
-        // Worktree per-file cap trips as TooLarge (not BudgetExceeded)...
+        // Worktree per-file cap trips as WorktreeTooLarge (not a budget
+        // exhaustion, and never an OBJECT-side reason)...
         assert!(matches!(
             worktree.read_worktree_blob(&big),
-            ContentOutcome::Skipped(SkipReason::TooLarge)
+            ContentOutcome::Skipped(SkipReason::WorktreeTooLarge)
         ));
-        // ...and the task cap trips as BudgetExceeded on the third task.
+        // ...and the task cap trips as WorktreeBudgetExceeded on the third.
         assert!(matches!(
             worktree.read_worktree_blob(&small),
-            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+            ContentOutcome::Skipped(SkipReason::WorktreeBudgetExceeded)
         ));
 
         // The exhausted worktree budget leaves a fresh object budget's
@@ -1778,20 +1800,21 @@ mod tests {
         let mut fresh_zero_total = ObjectReadBudget::new(1024, 0, 8, Duration::from_secs(30));
         assert!(matches!(
             fresh_zero_total.read_blob(&oid_of(b"whatever")),
-            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+            ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded)
         ));
         let mut fresh_expired = ObjectReadBudget::new(1024, 1024, 8, Duration::ZERO);
         assert!(matches!(
             fresh_expired.read_blob(&oid_of(b"whatever")),
-            ContentOutcome::Skipped(SkipReason::BudgetExceeded)
+            ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded)
         ));
 
         // Worktree total-byte cap is likewise its own counter: a fresh
-        // budget with a tiny total refuses the big symlink as TooLarge.
+        // budget with a tiny total refuses the big symlink, and does so with
+        // the WORKTREE-side reason.
         let mut tiny_total = WorktreeReadBudget::new(1024, 4, 8, Duration::from_secs(30));
         assert!(matches!(
             tiny_total.read_worktree_blob(&big),
-            ContentOutcome::Skipped(SkipReason::TooLarge)
+            ContentOutcome::Skipped(SkipReason::WorktreeTooLarge)
         ));
 
         // The POSITIVE half of independence, which zero-limit budgets cannot

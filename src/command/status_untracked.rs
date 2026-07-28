@@ -39,6 +39,7 @@ fn io_timeout_event(path: &Path) -> crate::command::status_probe::IoBlockedEvent
     crate::command::status_probe::IoBlockedEvent {
         path: path.to_path_buf(),
         reason: crate::command::status_probe::IoBlockedReason::IoTimeout,
+        absorbed: false,
     }
 }
 
@@ -58,6 +59,7 @@ fn io_blocked_event(
             io::ErrorKind::TimedOut => IoBlockedReason::IoTimeout,
             _ => IoBlockedReason::IoError,
         },
+        absorbed: false,
     }
 }
 
@@ -391,6 +393,10 @@ fn scan_workdir(
                 // under the deadline. A reclaimed lookup is treated as
                 // "ignored" (conservative: it never invents an untracked
                 // entry) and the directory is reported blocked.
+                // Resolve the DB-backed `core.excludesFile` here, not on the
+                // worker: a database read charged against the worktree I/O
+                // deadline reads back as an `io_timeout` on a fine path.
+                util::prewarm_ignore_config(workdir);
                 let ignore_target = (workdir.to_path_buf(), path.clone());
                 let ignored = match crate::command::status_probe::with_io_deadline(move || {
                     let (workdir, path) = ignore_target;
@@ -433,8 +439,17 @@ fn scan_workdir(
                             // matching git) AND record the block so the
                             // base scan is not claimed complete and the
                             // dirty cache is not rewritten from a guess.
+                            //
+                            // The block is ABSORBED: the marker is in the
+                            // output, so nothing the user would see is
+                            // missing and the command must not fail closed.
+                            // At worst we list a directory a readable scan
+                            // would have hidden — over-reporting, which is
+                            // the safe direction.
                             scan.untracked.push(directory_marker(&relative));
-                            scan.io_blocked.push(io_blocked_event(&relative, &error));
+                            let mut event = io_blocked_event(&relative, &error);
+                            event.absorbed = true;
+                            scan.io_blocked.push(event);
                         }
                     }
                     continue;

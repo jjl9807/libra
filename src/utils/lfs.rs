@@ -284,9 +284,14 @@ where
     let path = path.as_ref();
     let mut hash = Context::new(&SHA256);
     let file = File::open(path)?;
-    // One byte past the cap so an overrun is detectable rather than silently
-    // truncated into a plausible-looking digest.
-    let mut reader = BufReader::new(file).take(cap.saturating_add(1));
+    let len = file.metadata()?.len();
+    if len > cap {
+        return Ok((None, 0));
+    }
+    // Read AT MOST `len` (<= cap) bytes. The cap is a hard ceiling, so a file
+    // that grows is caught by re-stating AFTER the read; reading cap+1 to
+    // detect it would overrun the bound itself.
+    let mut reader = BufReader::new(file).take(len);
     let mut buffer = [0; 65536];
     let mut total: u64 = 0;
     loop {
@@ -295,10 +300,12 @@ where
             break;
         }
         total = total.saturating_add(n as u64);
-        if total > cap {
-            return Ok((None, total));
-        }
         hash.update(&buffer[..n]);
+    }
+    if total != len || reader.into_inner().into_inner().metadata()?.len() != len {
+        // Changed size under the read: the digest describes a prefix, or a
+        // file that no longer exists in that form.
+        return Ok((None, total));
     }
     Ok((Some(hex::encode(hash.finish().as_ref())), total))
 }
@@ -432,11 +439,12 @@ mod tests {
         assert!(pointer.is_some());
         assert_eq!(read, 5000);
 
-        // Refused for exceeding the cap: still charged for what it cost. The
-        // reader stops one byte past the cap, which is what it consumed.
+        // Refused for exceeding the cap, and the cap is a HARD ceiling: the
+        // stat rejects before a single byte is read, so nothing is consumed
+        // and nothing is charged.
         let (oid, read) = calc_lfs_file_hash_bounded(&path, 100).unwrap();
         assert!(oid.is_none(), "over the cap");
-        assert_eq!(read, 101, "the overrun byte proves the cap was passed");
+        assert_eq!(read, 0, "a refused read consumes nothing past the cap");
 
         // A pointer whose hash consumed a different number of bytes than the
         // pre-read stat is refused rather than published with a size field

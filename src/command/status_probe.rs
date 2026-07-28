@@ -339,6 +339,25 @@ fn run_io_worker(pool: &IoWorkerPool) {
     }
 }
 
+#[cfg(test)]
+mod pool_smoke_tests {
+    #[test]
+    fn io_deadline_pool_runs_a_trivial_job() {
+        let got = super::with_io_deadline(|| 42_u32);
+        assert_eq!(got, Ok(42), "the pooled worker never ran the job");
+    }
+
+    #[tokio::test]
+    async fn io_deadline_pool_runs_a_trivial_job_inside_tokio() {
+        let got = super::with_io_deadline(|| 7_u32);
+        assert_eq!(
+            got,
+            Ok(7),
+            "the pooled worker never ran the job under tokio"
+        );
+    }
+}
+
 /// One blocked path (workdir-relative) with its reason.
 #[derive(Debug, Clone)]
 pub(crate) struct IoBlockedEvent {
@@ -346,6 +365,17 @@ pub(crate) struct IoBlockedEvent {
     /// Reason taxonomy (§B.6.0.1), consumed by the io_blocked[] JSON
     /// contract (R0-8) and its worktree-family warning mapping.
     pub(crate) reason: IoBlockedReason,
+    /// The scan ABSORBED this block by over-reporting conservatively, so the
+    /// rendered output is still complete and must not fail closed.
+    ///
+    /// The only case today is an unreadable top-level untracked directory:
+    /// we cannot prove it holds a visible file, so we emit its `?? dir/`
+    /// marker anyway. Nothing is missing from what the user sees — at worst
+    /// a directory is listed that a readable scan would have hidden — so
+    /// refusing the whole command would be disproportionate. The event is
+    /// still recorded, so `--json` lists it and `base_scan_complete` stays
+    /// false, and the dirty cache is not rewritten from a guess.
+    pub(crate) absorbed: bool,
 }
 
 /// Which budget tripped first when `truncated` is set (JSON warning must
@@ -628,6 +658,7 @@ pub(crate) fn probe_rename_destinations(
             outcome.io_blocked.push(IoBlockedEvent {
                 path: root.clone(),
                 reason: IoBlockedReason::IoError,
+                absorbed: false,
             });
             continue;
         }
@@ -638,6 +669,7 @@ pub(crate) fn probe_rename_destinations(
                 outcome.io_blocked.push(IoBlockedEvent {
                     path: root.clone(),
                     reason: IoBlockedReason::IoTimeout,
+                    absorbed: false,
                 });
                 continue;
             }
@@ -648,6 +680,7 @@ pub(crate) fn probe_rename_destinations(
                 outcome.io_blocked.push(IoBlockedEvent {
                     path: root.clone(),
                     reason: IoBlockedReason::from_error(&error),
+                    absorbed: false,
                 });
                 continue;
             }
@@ -682,6 +715,7 @@ pub(crate) fn probe_rename_destinations(
                     outcome.io_blocked.push(IoBlockedEvent {
                         path: root.clone(),
                         reason,
+                        absorbed: false,
                     });
                     continue;
                 }
@@ -703,6 +737,7 @@ pub(crate) fn probe_rename_destinations(
                     outcome.io_blocked.push(IoBlockedEvent {
                         path: dir.clone(),
                         reason: IoBlockedReason::IoTimeout,
+                        absorbed: false,
                     });
                     continue;
                 }
@@ -716,6 +751,7 @@ pub(crate) fn probe_rename_destinations(
                     outcome.io_blocked.push(IoBlockedEvent {
                         path: dir.clone(),
                         reason: IoBlockedReason::from_error(&error),
+                        absorbed: false,
                     });
                     continue;
                 }
@@ -736,6 +772,7 @@ pub(crate) fn probe_rename_destinations(
                 outcome.io_blocked.push(IoBlockedEvent {
                     path: dir.clone(),
                     reason: IoBlockedReason::IoError,
+                    absorbed: false,
                 });
                 continue;
             }
@@ -794,6 +831,7 @@ pub(crate) fn probe_rename_destinations(
                         outcome.io_blocked.push(IoBlockedEvent {
                             path: dir.clone(),
                             reason: IoBlockedReason::IoTimeout,
+                            absorbed: false,
                         });
                     }
                     continue;
@@ -805,6 +843,7 @@ pub(crate) fn probe_rename_destinations(
                         outcome.io_blocked.push(IoBlockedEvent {
                             path: dir.clone(),
                             reason: IoBlockedReason::from_error(&error),
+                            absorbed: false,
                         });
                     }
                     continue;
@@ -815,6 +854,7 @@ pub(crate) fn probe_rename_destinations(
                 outcome.io_blocked.push(IoBlockedEvent {
                     path: dir.clone(),
                     reason: IoBlockedReason::from_error(error),
+                    absorbed: false,
                 });
             }
             if listing.hit_cap {
@@ -846,6 +886,7 @@ pub(crate) fn probe_rename_destinations(
                             outcome.io_blocked.push(IoBlockedEvent {
                                 path: relative.clone(),
                                 reason: IoBlockedReason::IoTimeout,
+                                absorbed: false,
                             });
                         }
                         continue;
@@ -864,6 +905,7 @@ pub(crate) fn probe_rename_destinations(
                             outcome.io_blocked.push(IoBlockedEvent {
                                 path: relative.clone(),
                                 reason: IoBlockedReason::from_error(&error),
+                                absorbed: false,
                             });
                         }
                         continue;
@@ -885,6 +927,10 @@ pub(crate) fn probe_rename_destinations(
                     // every other traversal read. A reclaimed probe is
                     // treated as "do not descend": conservative, and it
                     // cannot wedge the walk.
+                    // `core.excludesFile` is a DB read, not a filesystem
+                    // one; resolving it here keeps database contention off
+                    // the worktree I/O deadline.
+                    util::prewarm_ignore_config(workdir);
                     let ignore_target = (workdir.to_path_buf(), absolute.clone());
                     let ignored = match with_io_deadline(move || {
                         let (workdir, absolute) = ignore_target;
@@ -900,6 +946,7 @@ pub(crate) fn probe_rename_destinations(
                                 outcome.io_blocked.push(IoBlockedEvent {
                                     path: relative.clone(),
                                     reason: IoBlockedReason::IoTimeout,
+                                    absorbed: false,
                                 });
                             }
                             true
@@ -912,6 +959,7 @@ pub(crate) fn probe_rename_destinations(
                         outcome.io_blocked.push(IoBlockedEvent {
                             path: relative.clone(),
                             reason,
+                            absorbed: false,
                         });
                     }
                     if ignored

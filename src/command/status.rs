@@ -464,9 +464,16 @@ pub enum StatusWarningCode {
     /// §B.3.4: repository-object reads for inexact scoring were skipped
     /// (missing/corrupt/unavailable objects); affected candidates dropped.
     MetadataUnavailable,
-    /// §B.3.4: an object/worktree read budget (size or count) was hit;
-    /// affected candidates dropped, detection may be incomplete.
+    /// §B.3.4: an OBJECT read budget (per-object size cap, byte total, slot
+    /// count, or deadline) was hit; affected candidates dropped, detection
+    /// may be incomplete. The worktree-side equivalent is
+    /// [`StatusWarningCode::WorktreeBudgetExceeded`] — the two are separate
+    /// because `source` distinguishes `metadata` from `worktree`.
     MetadataBudgetExceeded,
+    /// §B.3.4: a WORKTREE read budget (per-file size cap, byte total, or
+    /// task count) was hit during optional rename content reads; affected
+    /// candidates dropped, detection may be incomplete.
+    WorktreeBudgetExceeded,
     /// §B.3.3: a worktree read failed (I/O) during optional rename content
     /// reads; the affected candidate was dropped.
     WorktreeReadFailed,
@@ -503,6 +510,7 @@ impl StatusWarningCode {
         StatusWarningCode::RenamePathEncodingUnsupported,
         StatusWarningCode::MetadataUnavailable,
         StatusWarningCode::MetadataBudgetExceeded,
+        StatusWarningCode::WorktreeBudgetExceeded,
         StatusWarningCode::WorktreeReadFailed,
         StatusWarningCode::WorktreePermissionDenied,
         StatusWarningCode::WorktreeIoTimeout,
@@ -526,7 +534,8 @@ impl StatusWarningCode {
             StatusWarningCode::MetadataUnavailable | StatusWarningCode::MetadataBudgetExceeded => {
                 StatusWarningSource::Metadata
             }
-            StatusWarningCode::WorktreeReadFailed
+            StatusWarningCode::WorktreeBudgetExceeded
+            | StatusWarningCode::WorktreeReadFailed
             | StatusWarningCode::WorktreePermissionDenied
             | StatusWarningCode::WorktreeIoTimeout => StatusWarningSource::Worktree,
             StatusWarningCode::DirtyCacheLockStolen
@@ -1342,7 +1351,7 @@ async fn collect_status_data(
         io_blocked: {
             let mut events = io_blocked;
             events.sort_by_key(|event| raw_path_sort_key(&event.path));
-            events.dedup_by(|a, b| a.path == b.path);
+            collapse_io_blocked_by_path(&mut events);
             events
         },
         base_scan_blocked,
@@ -1648,6 +1657,18 @@ fn build_rename_side(
                 // §B.3.3: this OPTIONAL stat runs under the deadline like
                 // every other worktree read — a hung mount must cost the
                 // rename candidate and a warning, not the whole command.
+                // Debug-only seam for the scan→stat disappearance race. It
+                // REMOVES the named path so the stat below returns a genuine
+                // `NotFound` from the OS — synthesizing the error instead
+                // would leave the real branch untested.
+                #[cfg(debug_assertions)]
+                if std::env::var("LIBRA_TEST_VANISH_PATH")
+                    .ok()
+                    .filter(|target| !target.is_empty())
+                    .is_some_and(|target| repo_key == std::path::Path::new(&target))
+                {
+                    let _ = std::fs::remove_file(&abs);
+                }
                 let stat_target = abs.clone();
                 let stat = crate::command::status_probe::with_io_deadline(move || {
                     stat_target.symlink_metadata()
@@ -1681,7 +1702,7 @@ fn build_rename_side(
                             .entry(if matches!(stat_kind, Some(io::ErrorKind::TimedOut)) {
                                 rename_detect::SkipReason::IoTimeout
                             } else {
-                                rename_detect::SkipReason::IoFailed
+                                rename_detect::SkipReason::WorktreeIoFailed
                             })
                             .or_default() += 1;
                         continue;
@@ -1711,7 +1732,7 @@ fn build_rename_side(
                 // a blob. Drop the candidate and report the race.
                 if observed_kind != kind || forced_type_race {
                     *snapshot_skips
-                        .entry(rename_detect::SkipReason::IoFailed)
+                        .entry(rename_detect::SkipReason::WorktreeIoFailed)
                         .or_default() += 1;
                     continue;
                 }
@@ -1886,28 +1907,46 @@ fn warnings_from_rename_stats(
             .filter_map(|r| stats.content_skips.get(r))
             .sum()
     };
+    // The reasons are side-qualified, so each family lands under the source
+    // its published `source` claims: object-store problems under `metadata`,
+    // working-tree problems under `worktree`. Folding them together would
+    // report a worktree budget as a repository-object budget.
     let unavailable = count(&[
         SkipReason::ObjectMissing,
         SkipReason::ObjectCorrupt,
         SkipReason::ObjectUnavailable,
+        SkipReason::ObjectIoFailed,
     ]);
     if unavailable > 0 {
         warnings.push(StatusWarning {
             code: StatusWarningCode::MetadataUnavailable,
             message: format!(
-                "rename detection skipped {unavailable} candidate(s): repository objects missing, corrupt, or unavailable"
+                "rename detection skipped {unavailable} candidate(s): repository objects missing, corrupt, or unreadable"
             ),
             source: StatusWarningCode::MetadataUnavailable.source(),
         });
     }
-    let budget = count(&[SkipReason::TooLarge, SkipReason::BudgetExceeded]);
+    let budget = count(&[SkipReason::ObjectTooLarge, SkipReason::ObjectBudgetExceeded]);
     if budget > 0 {
         warnings.push(StatusWarning {
             code: StatusWarningCode::MetadataBudgetExceeded,
             message: format!(
-                "rename detection skipped {budget} candidate(s): content-read budget or size cap reached"
+                "rename detection skipped {budget} candidate(s): object-read budget or per-object size cap reached"
             ),
             source: StatusWarningCode::MetadataBudgetExceeded.source(),
+        });
+    }
+    let worktree_budget = count(&[
+        SkipReason::WorktreeTooLarge,
+        SkipReason::WorktreeBudgetExceeded,
+    ]);
+    if worktree_budget > 0 {
+        warnings.push(StatusWarning {
+            code: StatusWarningCode::WorktreeBudgetExceeded,
+            message: format!(
+                "rename detection skipped {worktree_budget} candidate(s): worktree-read budget or per-file size cap reached"
+            ),
+            source: StatusWarningCode::WorktreeBudgetExceeded.source(),
         });
     }
     let io_timeout = count(&[SkipReason::IoTimeout]);
@@ -1925,7 +1964,7 @@ fn warnings_from_rename_stats(
             source: StatusWarningCode::WorktreeIoTimeout.source(),
         });
     }
-    let io_failed = count(&[SkipReason::IoFailed]);
+    let io_failed = count(&[SkipReason::WorktreeIoFailed]);
     if io_failed > 0 {
         warnings.push(StatusWarning {
             code: StatusWarningCode::WorktreeReadFailed,
@@ -3185,6 +3224,7 @@ async fn run_status_cache_mode(
                     |(path, reason)| crate::command::status_probe::IoBlockedEvent {
                         path: path.clone(),
                         reason: *reason,
+                        absorbed: false,
                     },
                 )
                 .collect();
@@ -3321,15 +3361,45 @@ pub(crate) async fn execute_to_resolved(
 /// the guard through the writer would let `libra --quiet status` exit 0 on a
 /// repository it could not fully inspect, which is precisely the silent
 /// "looks clean" answer the contract exists to prevent.
+/// Collapse a SORTED `io_blocked[]` to one entry per path.
+///
+/// A path survives as `absorbed` only if EVERY report of it was absorbed.
+/// The same unreadable directory can be compensated for by one consumer and
+/// not another — an untracked scan emits its `?? dir/` marker regardless,
+/// while rename detection genuinely could not see what was inside it. A
+/// plain dedup keeps whichever event happened to be recorded first, so an
+/// absorbed report could silently downgrade a real omission and stop the
+/// command failing closed.
+fn collapse_io_blocked_by_path(events: &mut Vec<crate::command::status_probe::IoBlockedEvent>) {
+    let mut collapsed: Vec<crate::command::status_probe::IoBlockedEvent> =
+        Vec::with_capacity(events.len());
+    for event in events.drain(..) {
+        match collapsed.last_mut() {
+            Some(last) if last.path == event.path => last.absorbed &= event.absorbed,
+            _ => collapsed.push(event),
+        }
+    }
+    *events = collapsed;
+}
+
 fn fail_closed_on_io_blocked(data: &StatusData, output: &OutputConfig) -> CliResult<()> {
-    if data.io_blocked.is_empty() || output.is_json() {
+    if output.is_json() {
         return Ok(());
     }
-    let first = &data.io_blocked[0];
+    // An ABSORBED block was compensated for in the rendered output (today:
+    // an unreadable untracked directory whose `?? dir/` marker we emitted
+    // anyway). The message below claims the output "would be incomplete",
+    // and for those it simply is not — refusing the command over a path the
+    // user can already see would be wrong. They stay in `io_blocked[]` for
+    // `--json` and still keep `base_scan_complete` false.
+    let mut omitted = data.io_blocked.iter().filter(|event| !event.absorbed);
+    let Some(first) = omitted.next() else {
+        return Ok(());
+    };
+    let count = 1 + omitted.count();
     Err(CliError::fatal(format!(
-        "cannot inspect '{}' ({} path(s) blocked); status output would be incomplete",
+        "cannot inspect '{}' ({count} path(s) blocked); status output would be incomplete",
         quote_pathname(&first.path, data.quote_path),
-        data.io_blocked.len()
     ))
     .with_stable_code(StableErrorCode::IoReadFailed)
     .with_hint("fix the unreadable path permissions and retry")
@@ -4243,6 +4313,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
                     | StatusWarningCode::SimilarityBudgetExceeded
                     | StatusWarningCode::MetadataUnavailable
                     | StatusWarningCode::MetadataBudgetExceeded
+                    | StatusWarningCode::WorktreeBudgetExceeded
                     | StatusWarningCode::RenamePathEncodingUnsupported
             )
         });
@@ -6365,38 +6436,68 @@ mod test {
         );
     }
 
+    /// §B.5: the frozen `source` enum means `metadata` for the object store
+    /// and `worktree` for the working tree. Both sides can hit a size cap,
+    /// exhaust a budget, and fail to read, so this asserts BOTH directions:
+    /// no worktree problem is published as `metadata`, and no object problem
+    /// is published as `worktree`.
     #[test]
     fn content_skips_map_to_metadata_and_worktree_warnings() {
         use rename_detect::SkipReason;
         let mut stats = rename_detect::RenameDetectStats::default();
         stats.content_skips.insert(SkipReason::ObjectMissing, 2);
         stats.content_skips.insert(SkipReason::ObjectCorrupt, 1);
-        stats.content_skips.insert(SkipReason::TooLarge, 3);
-        stats.content_skips.insert(SkipReason::BudgetExceeded, 4);
-        stats.content_skips.insert(SkipReason::IoFailed, 5);
+        stats.content_skips.insert(SkipReason::ObjectIoFailed, 6);
+        stats.content_skips.insert(SkipReason::ObjectTooLarge, 3);
+        stats
+            .content_skips
+            .insert(SkipReason::ObjectBudgetExceeded, 4);
+        stats.content_skips.insert(SkipReason::WorktreeTooLarge, 8);
+        stats
+            .content_skips
+            .insert(SkipReason::WorktreeBudgetExceeded, 9);
+        stats.content_skips.insert(SkipReason::WorktreeIoFailed, 5);
         let mut warnings = Vec::new();
         warnings_from_rename_stats(&stats, &mut warnings);
-        assert_eq!(warnings.len(), 3);
-        assert!(warnings.iter().any(|w| matches!(
-            (&w.code, &w.source),
-            (
-                StatusWarningCode::MetadataUnavailable,
-                StatusWarningSource::Metadata
-            )
-        ) && w.message.contains("3 candidate(s)")));
-        assert!(warnings.iter().any(|w| matches!(
-            (&w.code, &w.source),
-            (
-                StatusWarningCode::MetadataBudgetExceeded,
-                StatusWarningSource::Metadata
-            )
-        ) && w.message.contains("7 candidate(s)")));
-        assert!(warnings.iter().any(|w| matches!(
-            (&w.code, &w.source),
-            (
-                StatusWarningCode::WorktreeReadFailed,
-                StatusWarningSource::Worktree
-            )
-        ) && w.message.contains("5 candidate(s)")));
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+
+        let find = |code: StatusWarningCode| {
+            warnings
+                .iter()
+                .find(|w| w.code == code)
+                .unwrap_or_else(|| panic!("{code:?} missing from {warnings:?}"))
+        };
+
+        // Object side: missing + corrupt + object I/O failure, all `metadata`.
+        let unavailable = find(StatusWarningCode::MetadataUnavailable);
+        assert_eq!(unavailable.source, StatusWarningSource::Metadata);
+        assert!(
+            unavailable.message.contains("9 candidate(s)"),
+            "{unavailable:?}"
+        );
+        // Object side caps, still `metadata` — and NOT inflated by the
+        // worktree caps below.
+        let object_budget = find(StatusWarningCode::MetadataBudgetExceeded);
+        assert_eq!(object_budget.source, StatusWarningSource::Metadata);
+        assert!(
+            object_budget.message.contains("7 candidate(s)"),
+            "{object_budget:?}"
+        );
+        // Worktree caps get their OWN code under `worktree`; before the
+        // split these were reported as a repository-object budget.
+        let worktree_budget = find(StatusWarningCode::WorktreeBudgetExceeded);
+        assert_eq!(worktree_budget.source, StatusWarningSource::Worktree);
+        assert!(
+            worktree_budget.message.contains("17 candidate(s)"),
+            "{worktree_budget:?}"
+        );
+        // And a worktree read failure stays `worktree` — the object-side
+        // I/O failure above must not have leaked into this count.
+        let worktree_failed = find(StatusWarningCode::WorktreeReadFailed);
+        assert_eq!(worktree_failed.source, StatusWarningSource::Worktree);
+        assert!(
+            worktree_failed.message.contains("5 candidate(s)"),
+            "{worktree_failed:?}"
+        );
     }
 }

@@ -152,6 +152,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "tracked_scan_io_timeout_is_reported_not_hung",
     "tracked_unreadable_path_fails_closed_not_deleted",
     "unmerged_stage_presence_to_xy_mapping",
+    "worktree_candidate_not_found_between_scan_and_hash",
     "worktree_candidate_vanishes_between_scan_and_hash",
     "worktree_exact_matches_known_index_oid",
     "worktree_read_failure_degrades_with_warning_not_silence",

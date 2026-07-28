@@ -239,6 +239,60 @@ fn diff_rename_limit_config() {
     fixture.success(&repo, &["config", "--unset", "diff.renameLimit"]);
 }
 
+/// plan-20260714 R0-1: `diff` and `status` must apply the SAME inexact
+/// eligibility rule — non-empty regular files only. `diff` built every
+/// `BlobRef` with `size: None`, so the shared engine's empty-file gate
+/// (`size != Some(0)`) never fired on this side: an empty blob reached
+/// content scoring, spent a comparison, and under a small
+/// `diff.renameComparisonBudget` could exhaust it before a real inexact
+/// rename was ever scored. Same repository, two different answers.
+#[test]
+fn diff_empty_blob_does_not_consume_the_comparison_budget() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("diff-empty-blob-budget");
+    fixture.init_repo(&repo);
+    // `init` leaves `.libraignore` untracked; commit it so the candidate set
+    // below is exactly what this test builds and the comparison count is
+    // deterministic.
+    fixture.success(&repo, &["add", ".libraignore"]);
+    fixture.success(&repo, &["commit", "-m", "track the ignore file"]);
+    // One empty file and one genuine inexact candidate.
+    fixture.commit_file(&repo, "empty.txt", "", "empty base");
+    fixture.commit_file(
+        &repo,
+        "near.txt",
+        "alpha1\nalpha2\nalpha3\nalpha4\nalpha5\n",
+        "near base",
+    );
+    // The empty file is REPLACED by non-empty content at a new path, so it
+    // can only ever pair inexactly — an exact OID match is impossible.
+    fs::remove_file(repo.join("empty.txt")).expect("rm empty");
+    fs::write(repo.join("was-empty.log"), "something entirely new\n").expect("write dest");
+    fs::remove_file(repo.join("near.txt")).expect("rm near");
+    fs::write(
+        repo.join("moved-near.log"),
+        "alpha1\nalpha2\nalpha3\nalpha4\nCHANGED\n",
+    )
+    .expect("write near dest");
+    fixture.success(&repo, &["add", "-A"]);
+
+    // Two deleted (empty.txt, near.txt) and two added (was-empty.log,
+    // moved-near.log). With the empty source correctly ineligible that is
+    // 1 x 2 = 2 comparisons; with it eligible it is 2 x 2 = 4. A budget of 2
+    // is therefore exactly enough for the correct behaviour and one short of
+    // the broken one, which discards every scored inexact edge.
+    fixture.success(&repo, &["config", "diff.renameComparisonBudget", "2"]);
+    let out = stdout_trim(&fixture.success(&repo, &["diff", "--staged", "-M40%"]));
+    assert!(
+        out.contains("rename from near.txt"),
+        "the real inexact rename keeps the budget it deserves: {out}"
+    );
+    assert!(
+        !out.contains("rename from empty.txt"),
+        "and an empty source never pairs inexactly, matching status: {out}"
+    );
+}
+
 /// plan-20260714 R0-1: `diff.renameComparisonBudget` parses (0 → unlimited,
 /// invalid fail-closed) and exhaustion discards inexact candidates with a
 /// warning while exact renames survive.

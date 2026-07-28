@@ -136,6 +136,7 @@ libra status --find-renames=75
 | `rename_path_encoding_unsupported` | `rename_detect` | 非 UTF-8 名字的候选不参与 rename 评分（基础 `??`/`D` 行不受影响） |
 | `metadata_unavailable` | `metadata` | 仓库对象缺失、损坏或不可用；依赖它的 inexact 候选被跳过 |
 | `metadata_budget_exceeded` | `metadata` | 内容读取预算或单对象大小上限触顶；剩余候选被跳过 |
+| `worktree_budget_exceeded` | `worktree` | 工作树读取预算或单文件大小上限已达；其余候选被跳过 |
 | `worktree_read_failed` | `worktree` | 工作树读取失败（I/O 错误）；受影响路径在 `data.io_blocked[]` 中或其 rename 候选被跳过 |
 | `worktree_permission_denied` | `worktree` | 路径无法检查（EACCES）；该路径在 `data.io_blocked[]` 中 |
 | `worktree_io_timeout` | `worktree` | 工作树读取超时 |

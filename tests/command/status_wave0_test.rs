@@ -774,6 +774,10 @@ fn json_warnings_schema_snapshot() {
             "metadata_budget_exceeded",
         ),
         (
+            libra::command::status::StatusWarningCode::WorktreeBudgetExceeded,
+            "worktree_budget_exceeded",
+        ),
+        (
             libra::command::status::StatusWarningCode::WorktreeReadFailed,
             "worktree_read_failed",
         ),
@@ -816,7 +820,7 @@ fn json_warnings_schema_snapshot() {
     // without a pinned wire name here would be free to change spelling.
     assert_eq!(
         libra::command::status::StatusWarningCode::ALL.len(),
-        14,
+        15,
         "a warning code was added or removed; pin its wire name in this snapshot"
     );
 
@@ -5128,10 +5132,13 @@ fn worktree_type_race_between_stat_and_hash_drops_candidate() {
     );
 }
 
-/// §B.4.1: a rename candidate that DISAPPEARS between the display scan and
-/// the snapshot stat costs a candidate, so the run is reported degraded. It
-/// used to be dropped silently, leaving `rename_detection_complete: true`
-/// for a pairing that was never attempted.
+/// §B.4.1: a rename candidate that becomes UNUSABLE between the display scan
+/// and the snapshot stat costs a candidate, so the run is reported degraded.
+/// It used to be dropped silently, leaving `rename_detection_complete: true`
+/// for a pairing that was never attempted. This drives the type-race arm;
+/// the genuine-`NotFound` arm is
+/// `worktree_candidate_not_found_between_scan_and_hash` below — they reach
+/// the degradation through different branches, so both are pinned.
 #[test]
 #[cfg(unix)]
 fn worktree_candidate_vanishes_between_scan_and_hash() {
@@ -5141,9 +5148,9 @@ fn worktree_candidate_vanishes_between_scan_and_hash() {
     // scan still has something to report after the candidate is removed.
     fs::write(repo.path().join("other.txt"), "unrelated\n").unwrap();
 
-    // Remove the candidate through the same seam the type race uses: the
-    // path is treated as unusable at snapshot time, which is exactly what a
-    // vanished file looks like to the snapshot builder.
+    // Force the type-race branch: the path is treated as having changed type
+    // between the stat and the hash, so its OID describes something the
+    // recorded kind does not.
     let out = run_libra_command_with_stdin_and_env(
         &["--json", "status"],
         repo.path(),
@@ -5167,6 +5174,60 @@ fn worktree_candidate_vanishes_between_scan_and_hash() {
             .as_array()
             .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
         "the base status is unaffected: {doc}"
+    );
+}
+
+/// §B.4.1 companion to the type-race case above, driving the OTHER branch:
+/// the candidate is genuinely GONE by the time the snapshot stats it, so
+/// `symlink_metadata()` returns a real `NotFound` from the OS. The type-race
+/// seam never reaches this arm — it takes the `observed_kind != kind` exit
+/// further down — so without this test `NotFound` could be special-cased
+/// into a silent skip and nothing would notice. A path that existed when the
+/// scan enumerated it and is missing a moment later cost a rename candidate;
+/// reporting the run as complete would claim a pairing was ruled out when it
+/// was never attempted.
+#[test]
+#[cfg(unix)]
+fn worktree_candidate_not_found_between_scan_and_hash() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    fs::write(repo.path().join("other.txt"), "unrelated\n").unwrap();
+
+    // The seam DELETES the file just before the stat, so the error is the
+    // filesystem's own `NotFound` rather than a synthesized one.
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_VANISH_PATH", "dest.txt")],
+    );
+    assert_cli_success(&out, "a missing candidate degrades, it does not fail");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        !repo.path().join("dest.txt").exists(),
+        "the seam really removed the candidate"
+    );
+    assert_eq!(
+        doc["data"]["renames"],
+        serde_json::json!([]),
+        "no rename is claimed for a candidate that no longer exists: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["rename_detection_complete"], false,
+        "and the run says the pairing was never attempted: {doc}"
+    );
+    assert!(
+        doc["data"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|entry| entry["source"] == "worktree")),
+        "a worktree-family warning fires instead of silence: {doc}"
+    );
+    assert!(
+        doc["data"]["unstaged"]["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),
+        "the base status stays truthful: the source is still reported deleted: {doc}"
     );
 }
 
