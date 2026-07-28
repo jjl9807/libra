@@ -72,9 +72,19 @@ pub fn materialize_checkpoint_input(
     run_dir: &Path,
 ) -> Result<PathBuf, String> {
     let root = run_dir.join(CHECKPOINT_INPUT_DIR);
+    // Start from nothing. A paused investigate re-materializes into the
+    // SAME run directory, so anything the previous turn's agent left here
+    // — most importantly a symlink standing in for a file we are about to
+    // write — must not survive into this one.
+    match std::fs::remove_dir_all(&root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("failed to clear stale checkpoint input dir: {e}")),
+    }
     std::fs::create_dir_all(&root)
         .map_err(|e| format!("failed to create checkpoint input dir: {e}"))?;
     let mut total: u64 = 0;
+    let mut dirs: Vec<PathBuf> = Vec::new();
     for file in &spec.files {
         let rel = sanitize_rel_path(&file.rel_path)?;
         let oid = ObjectHash::from_str(&file.oid).map_err(|e| {
@@ -111,17 +121,58 @@ pub fn materialize_checkpoint_input(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("failed to create checkpoint input subdir: {e}"))?;
+            if parent != root {
+                dirs.push(parent.to_path_buf());
+            }
         }
-        std::fs::write(&dest, &bytes).map_err(|e| {
+        // `create_new` is the no-follow write: it fails if ANYTHING already
+        // occupies the path, so a planted symlink is refused instead of
+        // followed. Plain `fs::write` would open the link's target and
+        // write through it, outside this directory.
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+            .map_err(|e| {
+                format!(
+                    "failed to create checkpoint input file {} (a path that already exists here \
+                     is refused, never followed): {e}",
+                    file.rel_path
+                )
+            })?;
+        use std::io::Write as _;
+        handle.write_all(&bytes).map_err(|e| {
             format!(
                 "failed to write checkpoint input file {}: {e}",
                 file.rel_path
             )
         })?;
+        drop(handle);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o444));
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o444)).map_err(
+                |e| {
+                    format!(
+                        "failed to make checkpoint input file {} read-only: {e}",
+                        file.rel_path
+                    )
+                },
+            )?;
+        }
+    }
+    // Read-only FILES in a writable DIRECTORY are not read-only input: the
+    // agent could still unlink one and put a symlink in its place. Lock the
+    // directories too, deepest first so a parent is never sealed before its
+    // children are written.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        dirs.sort();
+        dirs.dedup();
+        for dir in dirs.iter().rev().chain(std::iter::once(&root)) {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+                .map_err(|e| format!("failed to make checkpoint input dir read-only: {e}"))?;
         }
     }
     Ok(root)
@@ -130,18 +181,51 @@ pub fn materialize_checkpoint_input(
 /// Reject absolute/parent-escaping components: the spec's rel paths come
 /// from a checkpoint tree, but the materializer re-validates so a corrupt
 /// tree can never write outside the input dir.
-fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
+///
+/// Checkpoint tree paths use `/`, but validating only `/` is not enough:
+/// on Windows `\\` is ALSO a separator, so a single `..\evil` component
+/// would survive a `/`-only split and then escape when pushed onto a
+/// `PathBuf`. Every platform separator is rejected here, on every
+/// platform, so a hostile tree cannot become a traversal on the one OS
+/// the check was not written for. The result is re-verified through
+/// `Path::components()`, which is the authority on what the OS will
+/// actually do with the string.
+pub(crate) fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
+    let unsafe_component = |rel: &str| {
+        Err(format!(
+            "checkpoint input path '{rel}' contains an unsafe component; refusing"
+        ))
+    };
+    if rel.is_empty() {
+        return Err("checkpoint input path is empty; refusing".to_string());
+    }
+    // A drive-relative or UNC prefix (`C:x`, `\\?\…`) is absolute on
+    // Windows and merely odd elsewhere; refuse it everywhere.
+    if rel.contains(':') {
+        return unsafe_component(rel);
+    }
     let mut out = PathBuf::new();
     for component in rel.split('/') {
-        if component.is_empty() || component == "." || component == ".." {
-            return Err(format!(
-                "checkpoint input path '{rel}' contains an unsafe component; refusing"
-            ));
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains('\\')
+            || component.contains('/')
+        {
+            return unsafe_component(rel);
         }
         out.push(component);
     }
     if out.as_os_str().is_empty() {
         return Err("checkpoint input path is empty; refusing".to_string());
+    }
+    // Belt and braces: whatever the string looked like, the OS must see a
+    // pure sequence of normal components.
+    if !out
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return unsafe_component(rel);
     }
     Ok(out)
 }
@@ -150,9 +234,139 @@ fn sanitize_rel_path(rel: &str) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    /// Write a loose blob into `storage` and return its spec entry.
+    fn write_blob(storage: &Path, rel_path: &str, content: &[u8]) -> CheckpointInputFile {
+        use std::io::Write as _;
+
+        let blob = git_internal::internal::object::blob::Blob::from_content_bytes(content.to_vec());
+        let oid = blob.id.to_string();
+        let dir = storage.join("objects").join(&oid[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut raw = format!("blob {}\0", content.len()).into_bytes();
+        raw.extend_from_slice(content);
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        std::fs::write(dir.join(&oid[2..]), encoder.finish().unwrap()).unwrap();
+        CheckpointInputFile {
+            rel_path: rel_path.to_string(),
+            oid,
+        }
+    }
+
+    /// PD-02: the materialized input must be READ-ONLY in the sense that
+    /// matters — an agent must not be able to replace a file. Read-only
+    /// files inside a writable directory are not that: the file can be
+    /// unlinked and a symlink put in its place.
+    #[cfg(unix)]
+    #[test]
+    fn materialized_input_locks_files_and_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "abcd".to_string(),
+            files: vec![
+                write_blob(&storage, "metadata.json", b"{}"),
+                write_blob(&storage, "transcript/claude_code", b"hello"),
+            ],
+        };
+
+        let root = materialize_checkpoint_input(&storage, &spec, &run_dir).expect("materialize");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&root.join("metadata.json")),
+            0o444,
+            "files are read-only"
+        );
+        assert_eq!(
+            mode(&root.join("transcript/claude_code")),
+            0o444,
+            "including nested ones"
+        );
+        assert_eq!(mode(&root), 0o555, "and the root directory is not writable");
+        assert_eq!(
+            mode(&root.join("transcript")),
+            0o555,
+            "nor is a subdirectory — otherwise a file could be swapped for a symlink"
+        );
+
+        // Restore write permission so the tempdir can be cleaned up.
+        for p in [root.join("transcript"), root.clone()] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// PD-02: a paused investigate re-materializes into the SAME run
+    /// directory. Anything the previous turn's agent left behind — above
+    /// all a symlink standing in for a file we are about to write — must
+    /// not be written through.
+    #[cfg(unix)]
+    #[test]
+    fn rematerialization_does_not_write_through_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let spec = CheckpointInputSpec {
+            checkpoint_id: "abcd".to_string(),
+            files: vec![write_blob(&storage, "metadata.json", b"REAL")],
+        };
+
+        // First materialization, then simulate a hostile agent swapping the
+        // file for a link that points outside the run directory.
+        let root = materialize_checkpoint_input(&storage, &spec, &run_dir).expect("first");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"UNTOUCHED").unwrap();
+        std::fs::remove_file(root.join("metadata.json")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("metadata.json")).unwrap();
+
+        // Re-materialize, as a resumed run does.
+        let root = materialize_checkpoint_input(&storage, &spec, &run_dir).expect("second");
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"UNTOUCHED",
+            "the write must NOT have followed the planted link out of the run directory"
+        );
+        assert_eq!(
+            std::fs::read(root.join("metadata.json")).unwrap(),
+            b"REAL",
+            "and the real content is materialized in its place"
+        );
+        assert!(
+            !std::fs::symlink_metadata(root.join("metadata.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is gone, not reused"
+        );
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[test]
     fn sanitize_rejects_escapes() {
-        for bad in ["../x", "a/../b", "/abs", "a//b", "", "."] {
+        for bad in [
+            "../x",
+            "a/../b",
+            "/abs",
+            "a//b",
+            "",
+            ".",
+            // Windows separators and prefixes: rejected on EVERY platform,
+            // so a hostile checkpoint cannot become a traversal on the one
+            // OS the check was not written for.
+            "..\\evil",
+            "a\\..\\b",
+            "\\\\server\\share",
+            "C:/abs",
+            "C:evil",
+        ] {
             assert!(sanitize_rel_path(bad).is_err(), "{bad} must be rejected");
         }
         assert_eq!(
