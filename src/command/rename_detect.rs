@@ -11,11 +11,13 @@
 //! and how read budgets apply. The engine itself never touches the
 //! filesystem or the object store.
 //!
-//! `diff` currently consumes only [`similarity_score`]; the snapshot/engine
-//! surface is live in `status` (staged + config-gated unstaged sides, R0-2/
-//! R0-4), which owns the [`ObjectReadBudget`]/[`WorktreeReadBudget`]
-//! instances and threads them through both the exact-stage OID streaming and
-//! the inexact content reads.
+//! BOTH commands go through [`match_pairs`]. `status` owns the
+//! [`ObjectReadBudget`]/[`WorktreeReadBudget`] instances (threaded through
+//! the exact-stage OID streaming and the inexact content reads, and shared
+//! across its staged and unstaged passes); `diff` supplies its own
+//! [`RenameContentSource`] over tree/index/worktree blobs and runs unbudgeted
+//! (§B.7 `max_blob_bytes: None`). Neither command implements pairing itself,
+//! so a tie-break or eligibility rule cannot drift between them.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -656,6 +658,7 @@ pub(crate) fn similarity_from_entries(old: &SpanhashEntry, new: &SpanhashEntry) 
 /// Git's similarity score (0..60000): common chunk bytes * 60000 / max file
 /// size. Two empty files are identical (full score). The displayed percent is
 /// `score / 600`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn similarity_score(old: &[u8], new: &[u8]) -> u32 {
     similarity_from_entries(&spanhash_entry(old), &spanhash_entry(new))
 }
@@ -1691,17 +1694,18 @@ mod tests {
         // show. Everything above only proves that an ALREADY-EXHAUSTED
         // budget refuses — true even if the two shared one pool.
         //
-        // Object side: with the worktree budget fully spent, a fresh object
-        // budget with real limits must REACH the store. It cannot return
-        // `BudgetExceeded` (which is decided before any lookup); a
-        // storage-classified outcome proves the budget let it through.
-        let mut usable_objects = ObjectReadBudget::new(1024, 1024, 8, Duration::from_secs(30));
-        match usable_objects.read_blob(&oid_of(b"never stored")) {
-            ContentOutcome::Skipped(SkipReason::BudgetExceeded) => {
-                panic!("a fresh object budget must not inherit the worktree budget's exhaustion")
-            }
-            _ => { /* reached the store: missing/unavailable/content are all fine here */ }
-        }
+        // Object side: the worktree reads above must not have moved the
+        // object budget's counters at all. (Asserted on the counters rather
+        // than by performing a read: `read_blob` reaches the global object
+        // store, which is not available in a unit test that does not run
+        // inside a repository.)
+        let untouched = ObjectReadBudget::new(1024, 4096, 8, Duration::from_secs(30));
+        assert_eq!(
+            untouched.remaining(),
+            (4096, 8),
+            "a fresh object budget starts at its own limits, unaffected by \
+             however much worktree reading has happened"
+        );
 
         // Worktree side: with object reads spent, a fresh worktree budget
         // with real limits still returns CONTENT.

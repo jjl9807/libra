@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260714 R0-1: `diff` now uses the shared rename engine)
+
+- **`diff` delegates rename pairing to `rename_detect::match_pairs`.** It had
+  carried its own exact / unique-basename / renameLimit / top-K / greedy
+  implementation, which meant two sets of tie-breaks, two budget accountings
+  and two eligibility rules — and they had drifted, so the same repository
+  could report different renames depending on which command you asked. The
+  remaining diff-side code builds a `RenameSnapshot`, supplies a
+  `RenameContentSource` over its existing loaders, and translates the result
+  back into diff entries. Behavior is unchanged for every case the suites
+  cover; what goes away is the second implementation that could drift again.
+
 ### Fixed (plan-20260714 R0-1 / R0-2 review round 11)
 
 - **A corrupt HEAD no longer panics `status`.** The cache-mode path used the
