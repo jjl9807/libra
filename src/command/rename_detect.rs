@@ -948,25 +948,43 @@ impl WorktreeReadBudget {
         true
     }
 
+    /// How long a single read may block WITHOUT overshooting the batch
+    /// budget.
+    ///
+    /// Checking the batch deadline only before starting a read leaves the
+    /// read itself unbounded by it: one begun a moment before the batch
+    /// expires still gets the full per-operation window, so a 5s batch could
+    /// run to 15s while every individual read looked compliant. The tighter
+    /// of the two bounds wins, and a batch with nothing left yields zero —
+    /// which the I/O helper refuses outright.
+    fn read_window(&self) -> Duration {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        remaining.min(crate::command::status_probe::io_op_timeout())
+    }
+
     /// Read the blob bytes Git would store for a worktree path (regular file
     /// content, LFS pointer, or symlink target bytes) under budget.
     pub fn read_worktree_blob(&mut self, abs_path: &Path) -> ContentOutcome {
         if !self.take_task() {
             return ContentOutcome::Skipped(SkipReason::WorktreeBudgetExceeded);
         }
+        // Bound EVERY read below by what is left of the batch, not just the
+        // per-operation default — see `read_window`.
+        let window = self.read_window();
         // Deadline-guarded: an optional content read must never wedge the
         // command on a hung mount.
         let stat_target = abs_path.to_path_buf();
-        let metadata = match crate::command::status_probe::with_io_deadline(move || {
-            stat_target.symlink_metadata()
-        }) {
-            Ok(Ok(metadata)) => metadata,
-            Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
-            Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
-        };
+        let metadata =
+            match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                stat_target.symlink_metadata()
+            }) {
+                Ok(Ok(metadata)) => metadata,
+                Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
+                Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
+            };
         if metadata.file_type().is_symlink() {
             let link_target = abs_path.to_path_buf();
-            return match crate::command::status_probe::with_io_deadline(move || {
+            return match crate::command::status_probe::with_io_deadline_bounded(window, move || {
                 super::read_symlink_blob_bytes(&link_target)
             }) {
                 Ok(Ok(bytes)) => self.account(bytes),
@@ -986,7 +1004,7 @@ impl WorktreeReadBudget {
             // grows) and the run is reclaimable on a hung mount.
             let cap = self.per_file_cap.min(self.remaining_total);
             let lfs_path = abs_path.to_path_buf();
-            return match crate::command::status_probe::with_io_deadline(move || {
+            return match crate::command::status_probe::with_io_deadline_bounded(window, move || {
                 crate::utils::lfs::generate_pointer_file_bounded(&lfs_path, cap)
             }) {
                 Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
@@ -1015,7 +1033,7 @@ impl WorktreeReadBudget {
         // budget, and run it under the shared I/O deadline so a hung mount
         // reclaims the run instead of blocking `status` forever.
         let path = abs_path.to_path_buf();
-        let outcome = crate::command::status_probe::with_io_deadline(move || {
+        let outcome = crate::command::status_probe::with_io_deadline_bounded(window, move || {
             use std::io::Read as _;
 
             let mut file = std::fs::File::open(&path)?;
@@ -1060,25 +1078,28 @@ impl WorktreeReadBudget {
         if !self.take_task() {
             return Err(SkipReason::WorktreeBudgetExceeded);
         }
+        let window = self.read_window();
         // Deadline-guarded like every other worktree read: a stat that hangs
         // must reclaim the caller and skip the candidate.
         let stat_target = abs_path.to_path_buf();
-        let metadata = match crate::command::status_probe::with_io_deadline(move || {
-            stat_target.symlink_metadata()
-        }) {
-            Ok(Ok(metadata)) => metadata,
-            Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-            Err(()) => return Err(SkipReason::IoTimeout),
-        };
-        if metadata.file_type().is_symlink() {
-            let link_target = abs_path.to_path_buf();
-            let bytes = match crate::command::status_probe::with_io_deadline(move || {
-                super::read_symlink_blob_bytes(&link_target)
+        let metadata =
+            match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                stat_target.symlink_metadata()
             }) {
-                Ok(Ok(bytes)) => bytes,
+                Ok(Ok(metadata)) => metadata,
                 Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
                 Err(()) => return Err(SkipReason::IoTimeout),
             };
+        if metadata.file_type().is_symlink() {
+            let link_target = abs_path.to_path_buf();
+            let bytes =
+                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                    super::read_symlink_blob_bytes(&link_target)
+                }) {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+                    Err(()) => return Err(SkipReason::IoTimeout),
+                };
             let len = bytes.len() as u64;
             if len > self.per_file_cap.min(self.remaining_total) {
                 return Err(SkipReason::WorktreeTooLarge);
@@ -1098,19 +1119,20 @@ impl WorktreeReadBudget {
             // the size cap above already rejected anything over the
             // per-file budget, and the deadline covers a hung mount.
             let pointer_path = abs_path.to_path_buf();
-            let (pointer, read) = match crate::command::status_probe::with_io_deadline(move || {
-                crate::utils::lfs::generate_pointer_file_bounded(&pointer_path, cap)
-            }) {
-                Err(()) => return Err(SkipReason::IoTimeout),
-                Ok(Ok((Some((pointer, _)), read))) => (pointer, read),
-                // Over the cap, or the file changed size mid-read. Charge the
-                // attempt anyway — see the note on the success path below.
-                Ok(Ok((None, read))) => {
-                    self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                    return Err(SkipReason::WorktreeTooLarge);
-                }
-                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-            };
+            let (pointer, read) =
+                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                    crate::utils::lfs::generate_pointer_file_bounded(&pointer_path, cap)
+                }) {
+                    Err(()) => return Err(SkipReason::IoTimeout),
+                    Ok(Ok((Some((pointer, _)), read))) => (pointer, read),
+                    // Over the cap, or the file changed size mid-read. Charge the
+                    // attempt anyway — see the note on the success path below.
+                    Ok(Ok((None, read))) => {
+                        self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
+                        return Err(SkipReason::WorktreeTooLarge);
+                    }
+                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+                };
             // `read` is the hash's real consumption; `metadata.len()` is a
             // pre-read stat a growing file can make stale.
             self.remaining_total = self.remaining_total.saturating_sub(read);
@@ -1123,21 +1145,22 @@ impl WorktreeReadBudget {
         // an unbounded hash of a now-huge file would blow the read budget
         // it was supposed to respect.
         let hash_path = abs_path.to_path_buf();
-        let (oid, read) = match crate::command::status_probe::with_io_deadline(move || {
-            super::stream_file_blob_hash_bounded(&hash_path, cap)
-        }) {
-            Err(()) => return Err(SkipReason::IoTimeout),
-            Ok(Ok((Some(oid), read))) => (oid, read),
-            // Over the cap, or the file changed size mid-read: skip the
-            // candidate rather than trust a hash of a moving target — but
-            // still charge the bytes the attempt cost, or a growth race
-            // would give an attacker unlimited free reads.
-            Ok(Ok((None, read))) => {
-                self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                return Err(SkipReason::WorktreeTooLarge);
-            }
-            Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-        };
+        let (oid, read) =
+            match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                super::stream_file_blob_hash_bounded(&hash_path, cap)
+            }) {
+                Err(()) => return Err(SkipReason::IoTimeout),
+                Ok(Ok((Some(oid), read))) => (oid, read),
+                // Over the cap, or the file changed size mid-read: skip the
+                // candidate rather than trust a hash of a moving target — but
+                // still charge the bytes the attempt cost, or a growth race
+                // would give an attacker unlimited free reads.
+                Ok(Ok((None, read))) => {
+                    self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
+                    return Err(SkipReason::WorktreeTooLarge);
+                }
+                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+            };
         // Charge and report what the read ACTUALLY consumed. `metadata.len()`
         // is a pre-read stat, and a file that grew in between would otherwise
         // have the larger read billed at the smaller stale price.
@@ -1425,6 +1448,132 @@ mod tests {
         assert_eq!(by_old[&PathBuf::from("old2")], PathBuf::from("new2"));
     }
 
+    /// §B.4.2 stage-5 ordering is `EdgeKey(score DESC, same_basename DESC,
+    /// old ASC, new ASC)`. The existing basename tests only exercise the
+    /// EXACT bucket, and the path-tie test gives its old and new entries
+    /// different basenames — so nothing pinned the `same_basename` component
+    /// of the INEXACT ranking.
+    ///
+    /// This constructs a genuine tie: two destinations with byte-identical
+    /// content, so their similarity scores are equal and only the tie-break
+    /// can decide. The same-basename candidate sorts LATER by path, so if
+    /// the basename term were dropped the other one would win.
+    #[test]
+    fn exhaustive_tie_break_prefers_the_same_basename() {
+        let old_bytes = b"alpha\nbeta\ngamma\ndelta\n".to_vec();
+        // Same content on both destinations => identical scores.
+        let new_bytes = b"alpha\nbeta\ngamma\nCHANGED\n".to_vec();
+
+        let mut source = MapSource::new();
+        source
+            .old
+            .insert(PathBuf::from("src/name.rs"), old_bytes.clone());
+        source
+            .new
+            .insert(PathBuf::from("dst/aaa-different.rs"), new_bytes.clone());
+        source
+            .new
+            .insert(PathBuf::from("dst/name.rs"), new_bytes.clone());
+
+        let snap = RenameSnapshot {
+            old_map: [(
+                PathBuf::from("src/name.rs"),
+                regular(BlobEvidence::Unknown, old_bytes.len() as u64),
+            )]
+            .into(),
+            new_map: [
+                (
+                    PathBuf::from("dst/aaa-different.rs"),
+                    regular(BlobEvidence::Unknown, new_bytes.len() as u64),
+                ),
+                (
+                    PathBuf::from("dst/name.rs"),
+                    regular(BlobEvidence::Unknown, new_bytes.len() as u64),
+                ),
+            ]
+            .into(),
+        };
+
+        let cfg = RenameDetectConfig {
+            threshold: 3000,
+            rename_limit: 0,
+            comparison_budget: None,
+        };
+        let outcome = match_pairs(&snap, &cfg, &mut source);
+        assert_eq!(outcome.matches.len(), 1, "{outcome:?}");
+        assert!(!outcome.matches[0].exact, "this is an INEXACT pairing");
+        assert_eq!(
+            outcome.matches[0].new,
+            PathBuf::from("dst/name.rs"),
+            "equal scores must break toward the shared basename, even though \
+             the other candidate sorts first by path: {outcome:?}"
+        );
+    }
+
+    /// §B.7 `rename_limit` is `sources > limit || destinations > limit` —
+    /// per side, an OR. The companion test above trips only the SOURCE side
+    /// (3 old / 1 new), and neither `status` (2x2) nor `diff` (3x3) can
+    /// isolate the destination branch either. A regression that dropped the
+    /// `|| destinations > limit` half would leave all of them green, so the
+    /// mirror case is pinned here explicitly.
+    #[test]
+    fn rename_limit_gates_on_the_destination_side_alone() {
+        let content = |i: usize| format!("unique line {i}\nshared shared shared\n").into_bytes();
+        let mut source = MapSource::new();
+
+        // ONE source, THREE destinations: only the destination side is over
+        // a limit of 2.
+        let old_bytes = content(0);
+        source.old.insert(PathBuf::from("old0"), old_bytes.clone());
+        let mut new_map = std::collections::HashMap::new();
+        for i in 0..3 {
+            let path = format!("new{i}");
+            let bytes = content(i);
+            source.new.insert(PathBuf::from(&path), bytes.clone());
+            new_map.insert(
+                PathBuf::from(&path),
+                regular(BlobEvidence::Unknown, bytes.len() as u64),
+            );
+        }
+        let snap = RenameSnapshot {
+            old_map: [(
+                PathBuf::from("old0"),
+                regular(BlobEvidence::Unknown, old_bytes.len() as u64),
+            )]
+            .into(),
+            new_map,
+        };
+
+        let cfg = RenameDetectConfig {
+            threshold: 30000,
+            rename_limit: 2,
+            comparison_budget: None,
+        };
+        let outcome = match_pairs(&snap, &cfg, &mut source);
+        assert!(
+            outcome.stats.skipped_by_limit,
+            "1 source but 3 destinations still trips the per-side limit"
+        );
+        assert!(
+            outcome.matches.is_empty(),
+            "and the exhaustive stage is skipped: {outcome:?}"
+        );
+
+        // Uncapped, the same input pairs old0 to its moved copy.
+        let cfg = RenameDetectConfig {
+            threshold: 30000,
+            rename_limit: 0,
+            comparison_budget: None,
+        };
+        let mut again = MapSource::new();
+        again.old = source.old.clone();
+        again.new = source.new.clone();
+        let outcome = match_pairs(&snap, &cfg, &mut again);
+        assert!(!outcome.stats.skipped_by_limit);
+        assert_eq!(outcome.matches.len(), 1, "{outcome:?}");
+        assert_eq!(outcome.matches[0].new, PathBuf::from("new0"));
+    }
+
     #[test]
     fn rename_limit_per_side_gates_exhaustive_only() {
         let content = |i: usize| format!("unique line {i}\nshared shared shared\n").into_bytes();
@@ -1704,6 +1853,131 @@ mod tests {
         assert_eq!(m(EXACT_SCORE).score_percent(), 100);
         assert_eq!(m(59999).score_percent(), 99, "§B.9: 59999→99 floor");
         assert_eq!(m(30000).score_percent(), 50);
+    }
+
+    /// §B.7: the worktree batch deadline must bound the READS, not merely
+    /// gate their start.
+    ///
+    /// `take_task` refused a read that BEGAN after the batch expired, but a
+    /// read starting a moment before it got the full per-operation window —
+    /// so a 5s batch could run to 15s while every individual read looked
+    /// compliant, and nothing degraded or warned. `read_window` now hands
+    /// each read the tighter of (batch remaining, per-operation default).
+    #[cfg(unix)]
+    #[test]
+    fn worktree_batch_deadline_bounds_each_read_not_just_its_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("a.link");
+        std::os::unix::fs::symlink("target", &link).expect("symlink");
+
+        // A batch with time left reads normally.
+        let mut fresh = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_secs(30));
+        assert!(
+            fresh.read_window() <= crate::command::status_probe::io_op_timeout(),
+            "a read never gets more than the per-operation default"
+        );
+        assert!(matches!(
+            fresh.read_worktree_blob(&link),
+            ContentOutcome::Content(_)
+        ));
+
+        // A batch whose remaining time is SHORTER than the per-operation
+        // default hands the read that shorter window — this is the whole
+        // point: the batch cap, not the per-read cap, is what binds.
+        let brief = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(50));
+        assert!(
+            brief.read_window() < crate::command::status_probe::io_op_timeout(),
+            "the batch remainder wins when it is tighter: {:?}",
+            brief.read_window()
+        );
+
+        // An EXPIRED batch yields a zero window, and a zero window is
+        // refused outright rather than silently promoted to the default.
+        let expired = WorktreeReadBudget::new(1024, 1024, 8, Duration::ZERO);
+        assert_eq!(
+            expired.read_window(),
+            Duration::ZERO,
+            "an expired batch buys no read time at all"
+        );
+        assert_eq!(
+            crate::command::status_probe::with_io_deadline_bounded(Duration::ZERO, || 1_u8),
+            Err(()),
+            "and the I/O helper refuses a zero budget instead of running the job"
+        );
+    }
+
+    /// §B.4.1: the POSITIVE half of budget independence, with a real object
+    /// store behind it.
+    ///
+    /// `object_budget_independent_of_worktree_budget` proves the negative
+    /// direction — an exhausted budget refuses — but it runs without a
+    /// repository, so its "object side still works" half could only inspect
+    /// counters, never perform a read. That cannot distinguish "the object
+    /// budget is independent" from "the object budget is broken in the same
+    /// way". Here a real repository exists, the WORKTREE budget is spent to
+    /// nothing, and an object read is then required to succeed on content it
+    /// actually returns.
+    #[test]
+    #[serial_test::serial]
+    fn object_read_still_succeeds_after_the_worktree_budget_is_spent() {
+        use std::time::Duration;
+
+        use crate::utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _test_home = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
+        rt.block_on(setup_with_new_libra_in(repo.path()));
+        let _cwd = ChangeDirGuard::new(repo.path());
+
+        // A real blob in the real object store.
+        let payload = b"content the object budget must still be able to read\n";
+        let blob = git_internal::internal::object::blob::Blob::from_content_bytes(payload.to_vec());
+        let oid = blob.id;
+        {
+            use std::io::Write as _;
+            let hex = oid.to_string();
+            let dir = repo.path().join(".libra/objects").join(&hex[..2]);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut raw = format!("blob {}\0", payload.len()).into_bytes();
+            raw.extend_from_slice(payload);
+            let mut enc =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(&raw).unwrap();
+            std::fs::write(dir.join(&hex[2..]), enc.finish().unwrap()).unwrap();
+        }
+
+        // Spend the WORKTREE budget down to nothing on a real read.
+        let link = repo.path().join("spent.link");
+        std::os::unix::fs::symlink("t", &link).unwrap();
+        let mut worktree = WorktreeReadBudget::new(1024, 1024, 1, Duration::from_secs(30));
+        assert!(matches!(
+            worktree.read_worktree_blob(&link),
+            ContentOutcome::Content(_)
+        ));
+        assert!(
+            matches!(
+                worktree.read_worktree_blob(&link),
+                ContentOutcome::Skipped(SkipReason::WorktreeBudgetExceeded)
+            ),
+            "the worktree budget is now genuinely exhausted"
+        );
+
+        // The OBJECT budget must still perform a real read and hand back the
+        // real bytes — this is what a counter check cannot show.
+        let mut objects = ObjectReadBudget::new(1 << 20, 1 << 20, 8, Duration::from_secs(30));
+        match objects.read_blob(&oid) {
+            ContentOutcome::Content(bytes) => assert_eq!(
+                bytes.as_slice(),
+                payload,
+                "the object read returns the stored content"
+            ),
+            ContentOutcome::Skipped(reason) => {
+                panic!("object read must succeed after worktree exhaustion, got {reason:?}")
+            }
+        }
     }
 
     /// §B.3.4: the worktree total is settled by the bytes the read ACTUALLY

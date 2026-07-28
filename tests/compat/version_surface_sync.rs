@@ -43,6 +43,29 @@ fn package_json_version(relative: &str) -> String {
     panic!("{relative} has no version field");
 }
 
+/// The RAW `$DefaultVersion` value from the Windows installer, exactly as
+/// `install.ps1` will use it.
+///
+/// This surface was invisible to the guard until PD-10 and had drifted 66
+/// patch releases behind (`v0.18.15` against a 0.19.81 manifest). Like the
+/// POSIX one, the value is substituted verbatim into the download URL, so a
+/// stale value silently installs an old binary whenever `-Version` is not
+/// passed.
+fn install_ps1_default_version_raw() -> String {
+    let text = read("install.ps1");
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("$DefaultVersion")
+            && let Some(rest) = rest.trim_start().strip_prefix('=')
+            && let Some(value) = rest.trim().strip_prefix('"')
+            && let Some(value) = value.strip_suffix('"')
+        {
+            return value.to_string();
+        }
+    }
+    panic!("install.ps1 has no $DefaultVersion assignment");
+}
+
 /// The RAW `DEFAULT_VERSION` value, exactly as `install.sh` will use it.
 ///
 /// Deliberately not normalized: the shell substitutes this string verbatim
@@ -62,11 +85,12 @@ fn install_default_version_raw() -> String {
 }
 
 #[test]
-fn all_four_release_version_surfaces_agree() {
+fn all_release_version_surfaces_agree() {
     let cargo = cargo_version();
     let web = package_json_version("web/package.json");
     let worker = package_json_version("worker/package.json");
     let install = install_default_version_raw();
+    let install_ps1 = install_ps1_default_version_raw();
 
     assert_eq!(
         web, cargo,
@@ -79,6 +103,13 @@ fn all_four_release_version_surfaces_agree() {
     // Exact equality against the ONE canonical spelling, `v<cargo>`. The
     // value is used verbatim by the shell, so anything else — a stale
     // version, a missing prefix, or a doubled one — is a broken download.
+    assert_eq!(
+        install_ps1,
+        format!("v{cargo}"),
+        "install.ps1 $DefaultVersion must be exactly \"v{cargo}\" — the Windows \
+         installer substitutes it verbatim into the release URL just like the \
+         POSIX one, and it is not covered by any other guard"
+    );
     assert_eq!(
         install,
         format!("v{cargo}"),
