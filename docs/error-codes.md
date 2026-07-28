@@ -132,7 +132,7 @@ structured report is always present.
 | `128` | `LBR-AGENT-020` | `internal` | Transcript source lacks a valid provider-root or trusted-export authorization proof | attempting to import through a symlink or an untrusted exporter |
 | `128` | `LBR-AGENT-021` | `internal` | Requested captured-agent session is absent from both the session catalog and local erasure tombstones | `libra agent graph unknown-session` |
 | `128` | `LBR-AGENT-022` | `internal` | Agent workspace lease refused: another live workspace record already claims the linked worktree identity or the canonical directory | two agents requesting a writable lease on the same linked worktree, or on an alias of an already-leased path |
-| `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after `libra worktree doctor` reclaimed the expired lease |
+| `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after the expired lease was reclaimed with a higher fence by its workspace owner |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 ## Stable Codes By Category
