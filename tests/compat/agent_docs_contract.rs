@@ -6,6 +6,12 @@
 //! them.
 
 const AGENT_DOC: &str = include_str!("../../docs/development/tracing/agent.md");
+/// The USER-facing pages. The tracing doc is not the only place the
+/// tombstone story is told, and a guard that reads one file cannot stop the
+/// other two from contradicting it — which is exactly how they came to say
+/// `restore` still resurrects erased sessions after it no longer did.
+const AGENT_CMD_DOC_EN: &str = include_str!("../../docs/commands/agent.md");
+const AGENT_CMD_DOC_ZH: &str = include_str!("../../docs/commands/zh-CN/agent.md");
 const CODE_COMMAND: &str = include_str!("../../src/command/code.rs");
 
 #[test]
@@ -98,6 +104,53 @@ fn agent_doc_declares_cloud_tombstone_deferred() {
         );
     }
 
+    // Every page that describes erasure must agree, and must agree on the
+    // ONE remaining deferral.
+    for (label, doc) in [
+        ("docs/commands/agent.md", AGENT_CMD_DOC_EN),
+        ("docs/commands/zh-CN/agent.md", AGENT_CMD_DOC_ZH),
+    ] {
+        assert!(
+            doc.contains("R2"),
+            "{label} must still name R2 physical deletion as the remaining deferral",
+        );
+        // Scoped to the claim that actually went stale: RESTORE (or a
+        // cross-machine re-sync) bringing an erased session back. Matching
+        // "resurrect" alone catches unrelated prose — the `--restore-erased`
+        // flag description, a note about queue updates reviving a row — so
+        // a line only counts when it ties the two ideas together. The old
+        // guard pinned the exact string `复活已本地擦除` while the doc said
+        // `复活已擦除`, which is how the contradiction survived.
+        for line in doc.lines() {
+            let claims_revival = ["复活", "resurrect", "revive"]
+                .iter()
+                .any(|claim| line.contains(claim));
+            let about_restore = ["restore", "re-sync", "resync", "重新同步", "跨机"]
+                .iter()
+                .any(|word| line.contains(word));
+            if !(claims_revival && about_restore) {
+                continue;
+            }
+            let negated = [
+                "不",
+                "does not",
+                "not bring",
+                "no longer",
+                // Naming the MECHANISM that prevents revival is the opposite
+                // of claiming revival happens.
+                "anti-resurrection",
+                "防复活",
+                "反复活",
+            ]
+            .iter()
+            .any(|word| line.contains(word));
+            assert!(
+                negated,
+                "{label} says restore can bring erased capture back, which PD-03 fixed: {line}",
+            );
+        }
+    }
+
     for forbidden in [
         // The old, factually wrong claims that the mirror does not exist.
         "当前未启用 D1/R2 agent capture mirror",
@@ -112,6 +165,11 @@ fn agent_doc_declares_cloud_tombstone_deferred() {
         // the old warning wording must not survive anywhere.
         "复活已本地擦除",
         "会复活已擦除",
+        // The phrasing the old list missed. `restore` is tombstone-first on
+        // both sides now, so no page may say otherwise in ANY spelling.
+        "复活已擦除",
+        "仍可复活",
+        "会复活 session",
         "不传播 tombstone",
         "tombstone 也不上传",
     ] {

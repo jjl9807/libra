@@ -258,10 +258,15 @@ GC 运行一致，同时不修改 catalog。
 history rebuild/prune 将 current claim 回退到更早的存活 revision 时，会删除已经
 失效的 challenger 证据，并把 claim 恢复为非冲突的 committed 状态。
 
-tombstone 目前仅在本地生效。已镜像到 D1/R2 的 capture 行不会被删除，
-tombstone 也不会传播；在 cloud delete/tombstone propagation 落地前，
-`libra cloud restore` 或跨机 re-sync 仍可能复活本地已擦除 capture。因此不能把
-此本地控制当作唯一的跨设备擦除机制。
+tombstone 会传播。`libra cloud sync` 在 generation fence 下把它发布到 D1，
+并删除该 session 在远端 catalog 的镜像行；`libra cloud restore` 则是**双向
+tombstone 优先**——在 restore 事务内同时过滤带远端 tombstone 的行与匹配本仓库
+`agent_import_tombstone` 的行。因此本机 erase 之后、再从尚未见过该 tombstone
+的镜像 restore，也不会把 session 复活。
+
+**仍 deferred 的只有 R2 物理删除**：已擦除内容的 payload 仍留在 R2，未见过该
+tombstone 的另一台机器仍可取回。所以 `agent erase` 应视为对**本仓库**不可逆，
+而不是「所有副本都已消失」的跨机保证。
 
 `agent session list --json` 与 `agent checkpoint list --json` 每次返回一页：`data` 携带 `schema_version`、位于 `sessions` / `checkpoints` 下的行（单行结构不变），以及 `next_cursor`——传回 `--cursor` 的不透明游标，列表耗尽时为 `null`。页序为最新在前（`started_at` / `created_at` 降序，行 id 作为并列时的次序键）。
 
