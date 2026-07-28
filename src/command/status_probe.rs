@@ -138,7 +138,27 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    with_io_deadline_bounded(io_op_timeout(), op)
+}
+
+/// [`with_io_deadline`] with an EXPLICIT budget instead of the per-operation
+/// default.
+///
+/// A caller with a batch budget cannot express it through the default: the
+/// per-operation deadline gates how long ONE read may take, so a batch with
+/// 0.1s left still hands the worker a full 10s window and overshoots its own
+/// cap without any degradation signal. Passing the remaining batch time makes
+/// the tighter of the two bounds win.
+pub(crate) fn with_io_deadline_bounded<T, F>(budget: std::time::Duration, op: F) -> Result<T, ()>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     use std::sync::atomic::Ordering;
+
+    if budget.is_zero() {
+        return Err(());
+    }
 
     let pool = IO_POOL.get_or_init(|| {
         std::sync::Arc::new(IoWorkerPool {
@@ -202,7 +222,7 @@ where
     }
     pool.ready.notify_one();
 
-    rx.recv_timeout(io_op_timeout()).map_err(|_| ())
+    rx.recv_timeout(budget).map_err(|_| ())
 }
 
 /// Like [`with_io_deadline`], but the deadline measures LACK OF PROGRESS
