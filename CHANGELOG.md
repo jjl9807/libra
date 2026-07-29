@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-4 review: argv is `OsString`, warnings are per-invocation)
+
+- **A non-UTF-8 argument killed the process.** `env::args()` panics on
+  anything that is not valid UTF-8, so an ordinary pathspec naming a
+  non-UTF-8 file aborted `libra status` with a Rust panic before clap ever
+  saw it — and the error path in `main` had the same read, so it could panic
+  while trying to report an error. The argv pipeline now carries `OsString`
+  end to end (§B.4.3), and only the places that must interpret a value as
+  text ask for UTF-8, failing there with a usage error about that one
+  argument. `--find-renames=<non-UTF-8>` that a later occurrence overrides is
+  therefore never interpreted at all; the same value as the winner is
+  `LBR-CLI-002`; and a non-UTF-8 pathspec is refused by the parser with that
+  code rather than panicking (`StatusArgs.pathspec` stays `String` for source
+  compatibility — a documented narrowing).
+- **Status warnings came from a process-wide buffer.** A long-running `libra
+  code` server accumulates preflight advisories for its lifetime, so an API
+  status collection reported warnings that had nothing to do with the
+  request, and kept reporting them. The invocation's warning context is now
+  passed explicitly: the CLI adopts the process buffer, the API starts empty.
+- **A cache-mode status could still resolve a rename threshold.** clap
+  refuses the flag combination, but `StatusArgs` is public: a struct-literal
+  caller with `cached: true` and a threshold got a live threshold, and rename
+  detection ran against a cache that cannot support it. Cache modes force it
+  to `None` before anything else is considered.
+- The argv scan records which format flags it SAW, interpreting short
+  clusters through a merged root-plus-subcommand arity table, and refuses to
+  run if it and the parser ever disagree — so a cluster-scan bug surfaces as
+  a refusal instead of NUL separators nobody asked for.
+
 ### Fixed (plan-20260714 W0 review: deletion safety, scope guards, GC boundaries)
 
 - **`libra file obliterate --recover` deleted object payloads without ever

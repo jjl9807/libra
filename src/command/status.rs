@@ -231,11 +231,54 @@ impl StatusArgs {
     }
 }
 
+/// The warnings that belong to ONE invocation (§B.4.3, R0-4).
+///
+/// Preflight advisories are buffered process-wide, which is right for a CLI
+/// process that runs exactly one command — and wrong for anything else. In a
+/// long-running `libra code` server the buffer accumulates whatever the
+/// process has emitted since it started, so an API status collection would
+/// report warnings that have nothing to do with the request, and would keep
+/// reporting them.
+///
+/// The context is therefore passed EXPLICITLY (never read from a global or a
+/// thread-local at the point of use): the CLI adopts the process buffer, the
+/// API starts empty.
+#[derive(Clone, Debug, Default)]
+pub struct InvocationWarningCtx {
+    preflight: Vec<String>,
+}
+
+impl InvocationWarningCtx {
+    /// The CLI invocation: adopt what this process's preflight buffered.
+    /// `reset_warning_tracker` clears it at the start of each invocation, so
+    /// the buffer belongs to this command.
+    pub fn from_process_preflight() -> Self {
+        Self {
+            preflight: crate::utils::output::pending_warning_messages(),
+        }
+    }
+
+    /// An embedded/API invocation: no inherited warnings, and nothing this
+    /// collection does may leak into the process-wide exit tracker.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    fn preflight_messages(&self) -> &[String] {
+        &self.preflight
+    }
+}
+
 /// One rename-threshold-affecting occurrence in argv order (§B.4.3, R0-4).
 #[derive(Clone, Debug)]
 pub(crate) enum RenameThresholdOccurrence {
-    /// `--find-renames[=RAW]`; empty string = bare.
-    FindRaw(String),
+    /// `--find-renames[=RAW]`; empty = bare.
+    ///
+    /// `OsString`, not `String` (§B.4.3): argv is not guaranteed to be UTF-8,
+    /// and an occurrence that is NOT the last one is never interpreted — so a
+    /// non-UTF-8 value that a later flag overrides must not fail, and must
+    /// certainly not abort the process on the way in.
+    FindRaw(std::ffi::OsString),
     /// `--renames`.
     EnableDefault,
     /// `--no-renames`.
@@ -248,8 +291,60 @@ pub(crate) enum RenameThresholdOccurrence {
 /// across all three spellings — clap's pairwise `overrides_with` cannot
 /// express that.
 pub(crate) struct StatusArgvResolution {
-    pub(crate) argv: Vec<String>,
+    pub(crate) argv: Vec<std::ffi::OsString>,
     rename_occurrences: Vec<RenameThresholdOccurrence>,
+    /// Which format-selecting flags the argv scan SAW (§B.4.3). Recorded by
+    /// the same arity-driven pass that finds the rename occurrences, so a
+    /// letter inside a short option's VALUE can never be mistaken for a flag.
+    pub(crate) format: StatusFormatFlags,
+}
+
+/// Format flags as they appear in argv, independent of clap's parse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StatusFormatFlags {
+    /// `-z` / `--null` appeared (including inside a short cluster).
+    pub(crate) z_explicit: bool,
+    /// `-s` / `--short` appeared.
+    pub(crate) short_explicit: bool,
+    /// `--long` appeared.
+    pub(crate) long_explicit: bool,
+    /// `--porcelain[=N]` appeared, with its version when given.
+    pub(crate) porcelain_explicit: Option<u8>,
+    /// `--cached` / `--check-dirty` appeared.
+    pub(crate) cached_mode: bool,
+}
+
+impl StatusFormatFlags {
+    /// Every flag the argv scan SAW must be a flag clap also parsed.
+    ///
+    /// One-directional: config may set `short`/`porcelain` with nothing in
+    /// argv. The other direction is the interesting one — it catches a
+    /// cluster-scan bug (a letter inside a value read as a flag, or a flag
+    /// missed inside a cluster) at the point where it would otherwise become
+    /// output the user did not ask for.
+    fn ensure_agrees_with(&self, args: &StatusArgs) -> CliResult<()> {
+        let disagreement = if self.z_explicit && !args.null_terminated {
+            Some("-z/--null")
+        } else if self.short_explicit && !args.short {
+            Some("-s/--short")
+        } else if self.long_explicit && !args.long_format {
+            Some("--long")
+        } else if self.porcelain_explicit.is_some() && args.porcelain.is_none() {
+            Some("--porcelain")
+        } else if self.cached_mode && !(args.cached || args.check_dirty) {
+            Some("--cached/--check-dirty")
+        } else {
+            None
+        };
+        match disagreement {
+            None => Ok(()),
+            Some(flag) => Err(CliError::fatal(format!(
+                "internal: the argument scan saw `{flag}` but the parser did not"
+            ))
+            .with_stable_code(StableErrorCode::InternalInvariant)
+            .with_hint("re-run without short-option clusters, and report this")),
+        }
+    }
 }
 
 /// Locate the `status`/`st` subcommand using the ROOT command's global-arg
@@ -257,12 +352,13 @@ pub(crate) struct StatusArgvResolution {
 /// slice. Any other subcommand — including `status` appearing as a pathspec
 /// of another command — returns argv unchanged.
 pub(crate) fn normalize_status_argv(
-    raw_argv: Vec<String>,
+    raw_argv: Vec<std::ffi::OsString>,
     root: &clap::Command,
 ) -> StatusArgvResolution {
-    let unchanged = |argv: Vec<String>| StatusArgvResolution {
+    let unchanged = |argv: Vec<std::ffi::OsString>| StatusArgvResolution {
         argv,
         rename_occurrences: Vec::new(),
+        format: StatusFormatFlags::default(),
     };
     // Global long/short tables: name → takes-a-separate-value.
     let mut longs: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
@@ -287,10 +383,37 @@ pub(crate) fn normalize_status_argv(
             shorts.insert(short, takes_value);
         }
     }
+    // The short arity table for scanning clusters INSIDE the status slice:
+    // the subcommand's own options PLUS the root globals, because clap
+    // accepts a global after the subcommand too (`libra status -J=ndjson`).
+    // Leaving the globals out made `ndjson` scan as a cluster, and its `s`
+    // read as `--short`.
+    //
+    // `-u` takes an optional value, so `-buno` is `-b` plus `-u=no`, and the
+    // letters of that value are never flags.
+    let mut status_shorts: std::collections::HashMap<char, bool> = shorts.clone();
+    if let Some(status) = root
+        .get_subcommands()
+        .find(|candidate| candidate.get_name() == "status")
+    {
+        for arg in status.get_arguments() {
+            if let Some(short) = arg.get_short() {
+                let takes_value = arg
+                    .get_num_args()
+                    .map(|range| range.max_values() >= 1)
+                    .unwrap_or(false);
+                status_shorts.insert(short, takes_value);
+            }
+        }
+    }
 
     let mut i = 1usize; // skip argv[0]
     while i < raw_argv.len() {
-        let token = &raw_argv[i];
+        // A token that is not valid UTF-8 cannot be an ASCII option, so it is
+        // a positional — which, before the subcommand, means "not status".
+        let Some(token) = raw_argv[i].to_str() else {
+            return unchanged(raw_argv);
+        };
         if token == "--" {
             return unchanged(raw_argv); // root-level `--`: no subcommand area
         }
@@ -347,35 +470,134 @@ pub(crate) fn normalize_status_argv(
         // Rewrite the slice after the subcommand up to `--`.
         let mut argv = raw_argv.clone();
         let mut occurrences = Vec::new();
+        let mut format = StatusFormatFlags::default();
         let mut j = i + 1;
         while j < argv.len() {
-            let tok = argv[j].clone();
+            // A non-UTF-8 token is a pathspec — EXCEPT for the one option
+            // whose VALUE is allowed to be arbitrary bytes. Matching the
+            // prefix on the platform representation is what lets
+            // `--find-renames=<invalid utf-8>` be recognised, recorded, and
+            // replaced by the placeholder; skipping it would leave the raw
+            // bytes for clap, which rejects the whole command line.
+            let Some(tok) = argv[j].to_str().map(str::to_string) else {
+                if os_starts_with(&argv[j], "--find-renames=") {
+                    occurrences.push(RenameThresholdOccurrence::FindRaw(raw_find_renames_value(
+                        &argv[j],
+                    )));
+                    argv[j] = std::ffi::OsString::from("--find-renames=50");
+                }
+                j += 1;
+                continue;
+            };
             if tok == "--" {
                 break;
             }
             if tok == "--find-renames" {
-                occurrences.push(RenameThresholdOccurrence::FindRaw(String::new()));
+                occurrences.push(RenameThresholdOccurrence::FindRaw(std::ffi::OsString::new()));
                 // Placeholder stops clap's num_args=0..=1 from eating the
                 // next pathspec token.
-                argv[j] = "--find-renames=50".to_string();
-            } else if let Some(raw) = tok.strip_prefix("--find-renames=") {
-                occurrences.push(RenameThresholdOccurrence::FindRaw(raw.to_string()));
+                argv[j] = std::ffi::OsString::from("--find-renames=50");
+            } else if tok.starts_with("--find-renames=") {
+                // The RAW value is taken from the ORIGINAL `OsStr`, not from
+                // the UTF-8 copy: `--find-renames=<invalid utf-8>` must reach
+                // the resolver intact, and only fail if it is the occurrence
+                // that wins.
+                occurrences.push(RenameThresholdOccurrence::FindRaw(raw_find_renames_value(
+                    &argv[j],
+                )));
                 // Placeholder keeps clap from rejecting Git raw syntax the
                 // resolver validates later.
-                argv[j] = "--find-renames=50".to_string();
+                argv[j] = std::ffi::OsString::from("--find-renames=50");
             } else if tok == "--renames" {
                 occurrences.push(RenameThresholdOccurrence::EnableDefault);
             } else if tok == "--no-renames" {
                 occurrences.push(RenameThresholdOccurrence::Disable);
+            } else if tok == "--null" {
+                format.z_explicit = true;
+            } else if tok == "--short" {
+                format.short_explicit = true;
+            } else if tok == "--long" {
+                format.long_explicit = true;
+            } else if tok == "--porcelain" {
+                format.porcelain_explicit = Some(1);
+            } else if let Some(version) = tok.strip_prefix("--porcelain=") {
+                format.porcelain_explicit = Some(version.parse().unwrap_or(1));
+            } else if tok == "--cached" || tok == "--check-dirty" {
+                format.cached_mode = true;
+            } else if let Some(cluster) = tok
+                .strip_prefix('-')
+                .filter(|rest| !rest.is_empty() && !rest.starts_with('-'))
+            {
+                // Short cluster: interpreted through the merged arity table,
+                // stopping at the first value-taking option OR at an `=` —
+                // every character after that is a VALUE, not a flag. `-uno`
+                // is `-u=no` and `-J=ndjson` is a global with an attached
+                // value; neither contributes flags.
+                for ch in cluster.chars() {
+                    if ch == '=' {
+                        break;
+                    }
+                    match status_shorts.get(&ch) {
+                        Some(true) => break,
+                        // An unknown letter means this is not a cluster we
+                        // understand; clap will report it. Recording flags
+                        // from the rest would be guessing.
+                        None => break,
+                        Some(false) => match ch {
+                            'z' => format.z_explicit = true,
+                            's' => format.short_explicit = true,
+                            _ => {}
+                        },
+                    }
+                }
             }
             j += 1;
         }
         return StatusArgvResolution {
             argv,
             rename_occurrences: occurrences,
+            format,
         };
     }
     unchanged(raw_argv)
+}
+
+/// Does this argument begin with `prefix`, comparing the PLATFORM
+/// representation rather than a UTF-8 rendering it may not have?
+fn os_starts_with(token: &std::ffi::OsStr, prefix: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        token.as_bytes().starts_with(prefix.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        token.to_string_lossy().starts_with(prefix)
+    }
+}
+
+/// The RAW bytes after `--find-renames=`, preserved as an `OsString`.
+///
+/// Splitting on the UTF-8 rendering would lose exactly the values this exists
+/// to carry, so the split happens on the platform representation.
+fn raw_find_renames_value(token: &std::ffi::OsStr) -> std::ffi::OsString {
+    const PREFIX_LEN: usize = "--find-renames=".len();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let bytes = token.as_bytes();
+        std::ffi::OsString::from_vec(bytes[PREFIX_LEN.min(bytes.len())..].to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        // On platforms without a byte view, a non-UTF-8 value cannot be split
+        // losslessly; such a token is not valid UTF-8 as a whole, and the
+        // resolver rejects it if it wins.
+        match token.to_str() {
+            Some(text) => std::ffi::OsString::from(&text[PREFIX_LEN.min(text.len())..]),
+            None => std::ffi::OsString::from(token),
+        }
+    }
 }
 
 /// Resolve the engine-scale rename threshold (§B.4.3): with a CLI resolution
@@ -387,6 +609,15 @@ pub(crate) fn resolve_status_threshold(
     args: &StatusArgs,
     resolution: Option<&StatusArgvResolution>,
 ) -> CliResult<Option<u32>> {
+    // §B.4.3: a cache mode forces detection OFF, and it does so FIRST —
+    // before any occurrence or config value is considered. clap refuses the
+    // flag combination on the command line, but `StatusArgs` is public: a
+    // struct-literal caller can set `cached: true` with a threshold, and
+    // resolving that to a live threshold would run rename detection against
+    // a cache that cannot support it.
+    if args.cached || args.check_dirty {
+        return Ok(None);
+    }
     if let Some(resolution) = resolution
         && let Some(last) = resolution.rename_occurrences.last()
     {
@@ -395,6 +626,18 @@ pub(crate) fn resolve_status_threshold(
             RenameThresholdOccurrence::EnableDefault => Some(30000),
             RenameThresholdOccurrence::FindRaw(raw) if raw.is_empty() => Some(30000),
             RenameThresholdOccurrence::FindRaw(raw) => {
+                // UTF-8 is required only HERE, of the occurrence that WON. An
+                // earlier `--find-renames=<invalid utf-8>` that a later flag
+                // overrides is never interpreted, and never fails (§B.4.3) —
+                // which is also why it had to survive as an `OsString`.
+                let raw = raw.to_str().ok_or_else(|| {
+                    CliError::command_usage(format!(
+                        "invalid --find-renames value {}: not valid UTF-8",
+                        raw.to_string_lossy()
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("use Git score syntax: N (0.N), N%, or a decimal")
+                })?;
                 let score =
                     crate::command::diff::options::parse_rename_score(raw).map_err(|_| {
                         CliError::command_usage(format!("invalid --find-renames value '{raw}'"))
@@ -1008,6 +1251,7 @@ impl StatusData {
 async fn collect_status_data(
     args: &StatusArgs,
     extras: StatusConfigExtras,
+    warning_ctx: &InvocationWarningCtx,
 ) -> CliResult<StatusData> {
     // lore.md 2.4: layer-overlay paths are excluded from status like ignored
     // files (a no-op with no layers). W1 §C.4.1.1: refreshed with this
@@ -1281,10 +1525,10 @@ async fn collect_status_data(
     warnings_from_rename_stats(&rename_stats, &mut warnings);
     // Preflight advisories join the structured list before anything reads
     // it, so exit arbitration and the JSON payload see the same set.
-    for message in crate::utils::output::pending_warning_messages() {
+    for message in warning_ctx.preflight_messages() {
         warnings.push(StatusWarning {
             code: StatusWarningCode::RepositoryPreflight,
-            message,
+            message: message.clone(),
             source: StatusWarningCode::RepositoryPreflight.source(),
         });
     }
@@ -2252,7 +2496,9 @@ pub async fn collect_status_json_envelope_for_api(
     // the CLI entry points.
     let extras = apply_status_config_defaults(&mut args).await?;
     let args = args;
-    let data = collect_status_data(&args, extras).await?;
+    // An API request inherits NOTHING from the process: a long-running
+    // server's preflight buffer is not this request's warning list.
+    let data = collect_status_data(&args, extras, &InvocationWarningCtx::empty()).await?;
     let inner = build_status_json(&data, &args);
     Ok(serde_json::json!({
         "ok": true,
@@ -2287,8 +2533,18 @@ pub(crate) async fn execute_safe_with_resolution(
     // Fail closed on invalid `status.*` config before any mode runs or any
     // output is produced; CLI flags keep precedence inside the resolver.
     let mut extras = apply_status_config_defaults(&mut args).await?;
-    if resolution.is_some() {
-        extras.rename_threshold = resolve_status_threshold(&args, resolution)?;
+    if let Some(resolution) = resolution {
+        extras.rename_threshold = resolve_status_threshold(&args, Some(resolution))?;
+        // The argv scan and clap must agree about which format flags were
+        // GIVEN. The scan interprets short clusters from the subcommand's own
+        // arity table (so `-uno` is `-u=no`, and its letters are not flags);
+        // if it ever disagreed with clap, the disagreement would show up as
+        // silently wrong output — NUL separators that were never asked for,
+        // or a porcelain format the user did not select. It fails closed
+        // instead. The implication is one-directional on purpose: config can
+        // set `short` with nothing in argv, but argv can never set something
+        // clap did not see.
+        resolution.format.ensure_agrees_with(&args)?;
     }
     let args = args;
 
@@ -2305,7 +2561,12 @@ pub(crate) async fn execute_safe_with_resolution(
         return run_status_cache_mode(&args, extras, output).await;
     }
 
-    let data = collect_status_data(&args, extras).await?;
+    let data = collect_status_data(
+        &args,
+        extras,
+        &InvocationWarningCtx::from_process_preflight(),
+    )
+    .await?;
 
     if output.is_json() {
         let json_data = build_status_json(&data, &args);
@@ -2492,7 +2753,12 @@ async fn run_status_scan_locked_inner(
     // The io_blocked-aware collection runs FIRST: the legacy raw walker
     // below fails fast on an unreadable directory, which would bypass the
     // partial contract (JSON) and the cache guard (both formats).
-    let mut data = collect_status_data(args, extras).await?;
+    let mut data = collect_status_data(
+        args,
+        extras,
+        &InvocationWarningCtx::from_process_preflight(),
+    )
+    .await?;
     // Fold the collected (rename) warnings into the canonical pending vec so
     // ANY later failure — recheck, txn, JSON emit, render, summary — reaches
     // the wrapper fallback with the complete set.
@@ -2531,7 +2797,12 @@ async fn run_status_scan_locked_inner(
         // would call the repository clean.
         let mut snapshot_extras = extras;
         snapshot_extras.rename_threshold = None;
-        collect_status_data(&unfiltered, snapshot_extras).await?
+        collect_status_data(
+            &unfiltered,
+            snapshot_extras,
+            &InvocationWarningCtx::from_process_preflight(),
+        )
+        .await?
     };
     for event in &snapshot_data.io_blocked {
         if !data
@@ -2804,7 +3075,12 @@ async fn run_status_cache_mode(
 
     if state != CacheState::Fresh {
         // Degrade to the full reconcile — never trust a doubtful cache.
-        let mut data = collect_status_data(args, extras).await?;
+        let mut data = collect_status_data(
+            args,
+            extras,
+            &InvocationWarningCtx::from_process_preflight(),
+        )
+        .await?;
         data.warnings.push(cache_warning(
             StatusWarningCode::DirtyCacheStaleFallback,
             format!(
@@ -3047,7 +3323,12 @@ async fn run_status_cache_mode(
         current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
     let head_now = Head::current_commit().await.map(|oid| oid.to_string());
     if fingerprint_now != fingerprint || head_now != head_oid {
-        let mut data = collect_status_data(args, extras).await?;
+        let mut data = collect_status_data(
+            args,
+            extras,
+            &InvocationWarningCtx::from_process_preflight(),
+        )
+        .await?;
         data.warnings.push(cache_warning(
             StatusWarningCode::DirtyCacheConcurrentInvalidate,
             "the index or HEAD changed while reading the dirty cache; falling back to the full status",
@@ -3185,15 +3466,19 @@ async fn run_status_cache_mode(
         // and `--exit-code-on-warning` reads the warning list, so an empty
         // one here would silently downgrade exit 9 to exit 1.
         warnings: {
-            let mut preflight: Vec<StatusWarning> =
-                crate::utils::output::pending_warning_messages()
-                    .into_iter()
-                    .map(|message| StatusWarning {
-                        code: StatusWarningCode::RepositoryPreflight,
-                        message,
-                        source: StatusWarningCode::RepositoryPreflight.source(),
-                    })
-                    .collect();
+            // Cache mode is a CLI-only path, so its invocation context is
+            // the process preflight buffer — bound once here rather than read
+            // at each use.
+            let cache_warning_ctx = InvocationWarningCtx::from_process_preflight();
+            let mut preflight: Vec<StatusWarning> = cache_warning_ctx
+                .preflight_messages()
+                .iter()
+                .map(|message| StatusWarning {
+                    code: StatusWarningCode::RepositoryPreflight,
+                    message: message.clone(),
+                    source: StatusWarningCode::RepositoryPreflight.source(),
+                })
+                .collect();
             let mut seen: HashSet<PathBuf> = HashSet::new();
             let mut sorted = blocked_paths.clone();
             sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -3342,7 +3627,12 @@ pub(crate) async fn execute_to_resolved(
         .with_stable_code(StableErrorCode::CliInvalidArguments)
         .with_hint("run the status command itself; this entry renders a plain full status"));
     }
-    let data = collect_status_data(&args, extras).await?;
+    let data = collect_status_data(
+        &args,
+        extras,
+        &InvocationWarningCtx::from_process_preflight(),
+    )
+    .await?;
     deliver_warnings_stderr(&data.warnings);
     let output = OutputConfig::default();
     fail_closed_on_io_blocked(&data, &output)?;
@@ -6249,6 +6539,156 @@ fn list_workdir_files_split_force(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>
 /// List ignored files (not tracked by index, but ignored by configured rules) under workdir
 pub fn list_ignored_files() -> Result<Changes, StatusError> {
     changes_to_be_staged_with_policy(IgnorePolicy::OnlyIgnored)
+}
+
+#[cfg(test)]
+mod argv_normalization_test {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<std::ffi::OsString> {
+        parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    fn normalize(parts: &[&str]) -> StatusArgvResolution {
+        normalize_status_argv(
+            argv(parts),
+            &<crate::cli::Cli as clap::CommandFactory>::command(),
+        )
+    }
+
+    /// §B.4.3: the argv scan itself records the format flags, from the
+    /// SUBCOMMAND's arity table.
+    ///
+    /// This is the level the cluster logic has to be tested at. An
+    /// end-to-end assertion about `-bz` output cannot fail if the scan is
+    /// deleted, because clap parses the cluster too — so it proves clap
+    /// works, not that the scan does.
+    #[test]
+    fn clusters_are_scanned_from_the_subcommand_arity_table() {
+        for cluster in ["-bz", "-zb"] {
+            let resolution = normalize(&["libra", "status", cluster]);
+            assert!(
+                resolution.format.z_explicit,
+                "`{cluster}` contains -z: {:?}",
+                resolution.format
+            );
+            assert!(
+                !resolution.format.short_explicit,
+                "`{cluster}` contains no -s: {:?}",
+                resolution.format
+            );
+        }
+        for cluster in ["-sz", "-zs"] {
+            let resolution = normalize(&["libra", "status", cluster]);
+            assert!(
+                resolution.format.z_explicit && resolution.format.short_explicit,
+                "`{cluster}` contains both -s and -z: {:?}",
+                resolution.format
+            );
+        }
+    }
+
+    /// A cluster STOPS at the first value-taking option: everything after it
+    /// is that option's value, and its letters are not flags. `-uzs` is
+    /// `-u=zs`, so neither `z` nor `s` may be recorded.
+    #[test]
+    fn a_cluster_value_is_never_read_as_flags() {
+        let resolution = normalize(&["libra", "status", "-uzs"]);
+        assert_eq!(
+            resolution.format,
+            StatusFormatFlags::default(),
+            "`zs` is -u's VALUE, not two flags: {:?}",
+            resolution.format
+        );
+        // And the same letters BEFORE the value option are flags.
+        let resolution = normalize(&["libra", "status", "-zuno"]);
+        assert!(
+            resolution.format.z_explicit,
+            "the -z before -u is a flag: {:?}",
+            resolution.format
+        );
+        assert!(
+            !resolution.format.short_explicit,
+            "`no` is -u's value: {:?}",
+            resolution.format
+        );
+    }
+
+    /// A global AFTER the subcommand is a global, not a cluster.
+    ///
+    /// clap accepts `libra status -J=ndjson`, and the scan has to as well:
+    /// reading `ndjson` as a cluster made its `s` look like `--short`, and
+    /// the agreement check then refused a perfectly ordinary command line.
+    #[test]
+    fn a_global_after_the_subcommand_is_not_a_cluster() {
+        let resolution = normalize(&["libra", "status", "-J=ndjson"]);
+        assert_eq!(
+            resolution.format,
+            StatusFormatFlags::default(),
+            "`ndjson` is -J's value: {:?}",
+            resolution.format
+        );
+        // The same for a global taking a SEPARATE value.
+        let resolution = normalize(&["libra", "status", "--color", "never"]);
+        assert_eq!(resolution.format, StatusFormatFlags::default());
+    }
+
+    /// A valued GLOBAL with an attached value does not shift subcommand
+    /// location, and the value's letters are not flags.
+    #[test]
+    fn a_global_attached_value_does_not_shift_the_subcommand() {
+        let resolution = normalize(&["libra", "-J=ndjson", "status", "--find-renames=505"]);
+        assert_eq!(
+            resolution.rename_occurrences.len(),
+            1,
+            "the status slice was found after a valued global"
+        );
+        assert_eq!(
+            resolution.format,
+            StatusFormatFlags::default(),
+            "`ndjson` is a value, not flags: {:?}",
+            resolution.format
+        );
+        // The raw value survives for the resolver; argv carries a placeholder.
+        assert_eq!(
+            resolution.argv[3],
+            std::ffi::OsString::from("--find-renames=50")
+        );
+    }
+
+    /// Everything after `--` is copied verbatim: not scanned for flags, not
+    /// collected as an occurrence, not rewritten.
+    #[test]
+    fn tokens_after_the_separator_are_untouched() {
+        let resolution = normalize(&["libra", "status", "--", "--find-renames=505", "-z"]);
+        assert!(
+            resolution.rename_occurrences.is_empty(),
+            "a pathspec is not an occurrence"
+        );
+        assert_eq!(
+            resolution.format,
+            StatusFormatFlags::default(),
+            "a pathspec is not a flag: {:?}",
+            resolution.format
+        );
+        assert_eq!(
+            resolution.argv[3],
+            std::ffi::OsString::from("--find-renames=505"),
+            "and it is not rewritten"
+        );
+    }
+
+    /// A non-status subcommand is never rewritten, even when its own
+    /// arguments spell `status`.
+    #[test]
+    fn a_non_status_subcommand_is_left_alone() {
+        let resolution = normalize(&["libra", "diff", "status", "--find-renames=505"]);
+        assert!(resolution.rename_occurrences.is_empty());
+        assert_eq!(
+            resolution.argv[3],
+            std::ffi::OsString::from("--find-renames=505")
+        );
+    }
 }
 
 #[cfg(test)]

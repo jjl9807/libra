@@ -1579,7 +1579,11 @@ fn strip_relative_prefix_in_line(line: &str, strip: &str, full: &str, stripped: 
 /// deterministic (same pattern as rev-parse). Caveat inherited from rev-parse:
 /// an earlier argv token literally equal to `diff` could confuse the scan.
 fn bare_dashdash_in_diff_argv() -> bool {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: see `notes` — `env::args()` panics on a non-UTF-8
+    // argument, and only ASCII flags are matched here.
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
     match argv.iter().position(|a| a == "diff") {
         Some(idx) => argv[idx + 1..].iter().any(|a| a == "--"),
         None => false,

@@ -237,7 +237,7 @@ fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
     after_help = ROOT_AFTER_HELP,
     arg_required_else_help = true,
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Emit machine-readable JSON to stdout.
     /// Use `--json` alone for pretty output, or `--json=compact` / `--json=ndjson`
     /// to select an alternative layout.  The `=` is required when specifying a format
@@ -926,19 +926,16 @@ pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
 /// through clap's own metadata (aliases like `br` canonicalize to `branch`).
 /// Never derived from user argv content beyond the subcommand token itself.
 fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
-    let argv: Vec<String> = match args {
-        Some(args) => args.iter().map(|s| s.to_string()).collect(),
-        None => env::args().collect(),
+    let argv: Vec<std::ffi::OsString> = match args {
+        Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
+        None => env::args_os().collect(),
     };
     let (index, _) = find_subcommand_index(&argv)?;
-    let token = argv.get(index)?;
+    let token = argv.get(index)?.to_str()?;
     let cli = <Cli as clap::CommandFactory>::command();
     cli.get_subcommands()
         .find(|candidate| {
-            candidate.get_name() == token.as_str()
-                || candidate
-                    .get_all_aliases()
-                    .any(|alias| alias == token.as_str())
+            candidate.get_name() == token || candidate.get_all_aliases().any(|alias| alias == token)
         })
         .map(|candidate| candidate.get_name().to_string())
 }
@@ -960,7 +957,7 @@ fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
 /// See: [`tests::clap_alias_br_resolves_to_branch`] and friends for related parser
 /// behaviour. The exact rewrite is exercised end-to-end by the integration tests in
 /// `tests/command/log_test.rs`.
-fn rewrite_log_short_number_args(args: Vec<String>) -> Vec<String> {
+fn rewrite_log_short_number_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     // Detect the real subcommand position to avoid rewriting positional args for other commands.
     let subcommand = find_subcommand_index(&args);
     let Some((log_index, from_double_dash)) = subcommand else {
@@ -970,7 +967,7 @@ fn rewrite_log_short_number_args(args: Vec<String>) -> Vec<String> {
         return args;
     }
 
-    let mut out: Vec<String> = Vec::with_capacity(args.len() + 2);
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 2);
     if from_double_dash {
         // Drop the `--` that was used to separate global args from the subcommand.
         for (idx, arg) in args.iter().enumerate().take(log_index + 1) {
@@ -997,18 +994,21 @@ fn rewrite_log_short_number_args(args: Vec<String>) -> Vec<String> {
             continue;
         }
 
-        if is_short_number_flag(&arg) {
-            out.push("-n".to_string());
-            out.push(arg[1..].to_string());
-        } else {
-            out.push(arg);
+        // A non-UTF-8 argument is never one of these ASCII shortcuts, so it
+        // passes through untouched rather than being lossily inspected.
+        match arg.to_str() {
+            Some(text) if is_short_number_flag(text) => {
+                out.push(std::ffi::OsString::from("-n"));
+                out.push(std::ffi::OsString::from(&text[1..]));
+            }
+            _ => out.push(arg),
         }
     }
 
     out
 }
 
-fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
+fn rewrite_index_pack_progress_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let subcommand = find_subcommand_index(&args);
     let Some((index_pack_index, from_double_dash)) = subcommand else {
         return args;
@@ -1017,7 +1017,7 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
         return args;
     }
 
-    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
     if from_double_dash {
         for (idx, arg) in args.iter().enumerate().take(index_pack_index + 1) {
             if idx + 1 == index_pack_index && arg == "--" {
@@ -1040,9 +1040,9 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
             out.push(arg);
             continue;
         }
-        match arg.as_str() {
-            "--progress" => out.push("--progress=text".to_string()),
-            "--no-progress" => out.push("--progress=none".to_string()),
+        match arg.to_str() {
+            Some("--progress") => out.push(std::ffi::OsString::from("--progress=text")),
+            Some("--no-progress") => out.push(std::ffi::OsString::from("--progress=none")),
             _ => out.push(arg),
         }
     }
@@ -1050,7 +1050,7 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
     out
 }
 
-fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
+fn rewrite_reset_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let subcommand = find_subcommand_index(&args);
     let Some((reset_index, from_double_dash)) = subcommand else {
         return args;
@@ -1085,26 +1085,32 @@ fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
     for arg in args.iter().take(separator_index).skip(reset_index + 1) {
         out.push(arg.clone());
     }
-    out.push(format!(
+    out.push(std::ffi::OsString::from(format!(
         "--{}",
         command::reset::RESET_PATHSPEC_SEPARATOR_FLAG
-    ));
+    )));
     if !has_target_before_separator && args.get(separator_index + 1).is_some() {
-        out.push(command::reset::DEFAULT_RESET_TARGET.to_string());
+        out.push(std::ffi::OsString::from(
+            command::reset::DEFAULT_RESET_TARGET,
+        ));
     }
-    out.push("--".to_string());
+    out.push(std::ffi::OsString::from("--"));
     out.extend(args.iter().skip(separator_index + 1).cloned());
     out
 }
 
 fn reset_has_positional_target_before_separator(
-    args: &[String],
+    args: &[std::ffi::OsString],
     start: usize,
     separator_index: usize,
 ) -> bool {
     let mut index = start;
     while index < separator_index {
-        let arg = &args[index];
+        // A non-UTF-8 token is never one of these ASCII flags, so it is the
+        // positional target this is looking for.
+        let Some(arg) = args[index].to_str() else {
+            return true;
+        };
         if reset_flag_takes_separate_value(arg) {
             index += 2;
             continue;
@@ -1136,10 +1142,14 @@ fn reset_flag_takes_separate_value(arg: &str) -> bool {
 ///   `None` if `--` is the last token.
 /// - Returns `None` when no non-flag token exists (e.g. argv is `["libra"]` or
 ///   `["libra", "--help"]`).
-fn find_subcommand_index(args: &[String]) -> Option<(usize, bool)> {
+fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
     let mut i = 1;
     while i < args.len() {
-        let arg = &args[i];
+        // A token that is not valid UTF-8 cannot be an ASCII flag, so it is
+        // the first non-flag token — the subcommand position.
+        let Some(arg) = args[i].to_str() else {
+            return Some((i, false));
+        };
         if arg == "--" {
             return if i + 1 < args.len() {
                 Some((i + 1, true))
@@ -1147,7 +1157,7 @@ fn find_subcommand_index(args: &[String]) -> Option<(usize, bool)> {
                 None
             };
         }
-        if matches!(arg.as_str(), "--color" | "--progress") {
+        if matches!(arg, "--color" | "--progress") {
             i = (i + 2).min(args.len());
             continue;
         }
@@ -1252,11 +1262,14 @@ const REMOVED_CODE_CLAUDECODE_FLAGS: &[&str] = &[
     "--permission-mode",
 ];
 
-fn removed_code_claudecode_hints(argv: &[String]) -> Vec<String> {
+fn removed_code_claudecode_hints(argv: &[std::ffi::OsString]) -> Vec<String> {
     let Some((subcommand_index, _)) = find_subcommand_index(argv) else {
         return Vec::new();
     };
-    if !matches!(argv.get(subcommand_index).map(String::as_str), Some("code")) {
+    if !matches!(
+        argv.get(subcommand_index).and_then(|arg| arg.to_str()),
+        Some("code")
+    ) {
         return Vec::new();
     }
 
@@ -1272,9 +1285,10 @@ fn removed_code_claudecode_hints(argv: &[String]) -> Vec<String> {
     }
 
     let has_removed_flag = argv.iter().any(|arg| {
-        REMOVED_CODE_CLAUDECODE_FLAGS
-            .iter()
-            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+        REMOVED_CODE_CLAUDECODE_FLAGS.iter().any(|flag| {
+            arg.to_str()
+                .is_some_and(|text| text == *flag || text.starts_with(&format!("{flag}=")))
+        })
     });
     if has_removed_flag {
         hints.push(
@@ -1859,15 +1873,15 @@ async fn repair_pending_object_index_updates_before_command(
     }
 }
 
-fn is_error_codes_help_topic(argv: &[String]) -> bool {
+fn is_error_codes_help_topic(argv: &[std::ffi::OsString]) -> bool {
     let Some((index, _)) = find_subcommand_index(argv) else {
         return false;
     };
-    if !matches!(argv.get(index).map(String::as_str), Some("help")) {
+    if !matches!(argv.get(index).and_then(|arg| arg.to_str()), Some("help")) {
         return false;
     }
     if !matches!(
-        argv.get(index + 1).map(String::as_str),
+        argv.get(index + 1).and_then(|arg| arg.to_str()),
         Some("error-codes" | "errors")
     ) {
         return false;
@@ -2033,21 +2047,24 @@ fn prepare_cli_invocation_state() {
     utils::atomic_write::init_sync_data_from_env();
 }
 
-fn is_top_level_unknown_command(argv: &[String], err: &clap::Error) -> Option<String> {
+fn is_top_level_unknown_command(argv: &[std::ffi::OsString], err: &clap::Error) -> Option<String> {
     let invalid = match err.get(ContextKind::InvalidSubcommand) {
         Some(ContextValue::String(cmd)) => cmd,
         _ => return None,
     };
 
     let (index, _) = find_subcommand_index(argv)?;
-    if argv.get(index).is_some_and(|arg| arg == invalid) {
+    if argv
+        .get(index)
+        .is_some_and(|arg| arg.to_str() == Some(invalid.as_str()))
+    {
         return Some(invalid.to_string());
     }
 
     None
 }
 
-fn classify_parse_error(argv: &[String], err: &clap::Error) -> CliError {
+fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliError {
     if let Some(cmd) = is_top_level_unknown_command(argv, err) {
         let hints = top_level_unknown_command_hints(err);
         let mut cli_error = CliError::unknown_command(format!(
@@ -2143,15 +2160,23 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
 ///   function returns a `CliError::failure` with stable code `WarningEmitted` even
 ///   though the underlying command succeeded.
 pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
-    let argv = match args {
-        Some(args) => args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-        None => env::args().collect::<Vec<_>>(),
+    // `args_os`, not `args`: `env::args()` PANICS on an argument that is not
+    // valid UTF-8, and a pathspec naming a file whose name is not UTF-8 is an
+    // ordinary thing to type on Unix. The argv pipeline therefore carries
+    // `OsString` all the way to clap (§B.4.3), and only the places that must
+    // interpret a value as text ask for UTF-8 — failing with a usage error
+    // there, on that one argument, instead of aborting the process.
+    let argv: Vec<std::ffi::OsString> = match args {
+        Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
+        None => env::args_os().collect(),
     };
     // Auto-upgrade candidate self-check (§A.7): recognized at the very front,
     // before any argv rewrite, warning-tracker/env side effect, clap parse,
     // repo preflight, schema migration or background task. It runs ONLY a
     // side-effect-free identity self-check and exits; it never forwards to a
     // real user command.
+    // The RAW argv, not a filtered view: the probe is recognised by POSITION
+    // (argv[1]), and dropping a token before it would shift that position.
     if let Some(probe) = command::upgrade::parse_probe_argv(&argv) {
         return command::upgrade::run_probe(probe);
     }
@@ -2162,7 +2187,18 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     .await
 }
 
-async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
+/// A UTF-8 view of argv for consumers that only match ASCII flags.
+///
+/// Tokens that are not valid UTF-8 are dropped rather than transcoded: they
+/// are pathspecs as far as these consumers are concerned, and a lossy `?`
+/// substitution would make one look like a different path.
+fn utf8_argv_view(argv: &[std::ffi::OsString]) -> Vec<String> {
+    argv.iter()
+        .filter_map(|arg| arg.to_str().map(str::to_string))
+        .collect()
+}
+
+async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
@@ -2174,6 +2210,8 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         &<Cli as clap::CommandFactory>::command(),
     );
     let argv = status_resolution.argv.clone();
+    // Same reasoning as above, for the consumers below that inspect argv.
+    let utf8_argv = utf8_argv_view(&argv);
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
@@ -2193,7 +2231,7 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
         },
     };
     if let Commands::Diff(diff_args) = &mut args.command {
-        command::diff::record_algorithm_selector_events(diff_args, &argv);
+        command::diff::record_algorithm_selector_events(diff_args, &utf8_argv);
     }
     apply_global_runtime_flags(&args)?;
     // Declare the output mode BEFORE anything that can raise a warning. The
@@ -2513,7 +2551,7 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
                 command::describe::execute_safe(cmd_args, &output).await?
             }
             Commands::Notes(cmd_args) => {
-                command::notes::execute_safe(cmd_args, &output, &argv).await?
+                command::notes::execute_safe(cmd_args, &output, &utf8_argv).await?
             }
             Commands::CherryPick(cmd_args) => {
                 command::cherry_pick::execute_safe(cmd_args, &output).await?
@@ -2766,7 +2804,7 @@ mod tests {
     /// natural-but-wrong word are pointed at the real flag.
     #[tokio::test]
     async fn parse_error_shows_import_hint() {
-        let argv = vec!["libra".to_string(), "import".to_string()];
+        let argv: Vec<std::ffi::OsString> = vec!["libra".into(), "import".into()];
         let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
         let err = classify_parse_error(&argv, &clap_err);
         let msg = err.render();
@@ -2803,10 +2841,10 @@ mod tests {
     #[test]
     fn index_pack_progress_rewrite_keeps_pack_positional() {
         let rewritten = rewrite_index_pack_progress_args(vec![
-            "libra".to_string(),
-            "index-pack".to_string(),
-            "--progress".to_string(),
-            "fixture.pack".to_string(),
+            "libra".into(),
+            "index-pack".into(),
+            "--progress".into(),
+            "fixture.pack".into(),
         ]);
 
         assert_eq!(
@@ -2818,12 +2856,12 @@ mod tests {
     #[test]
     fn index_pack_no_progress_rewrite_uses_global_none_mode() {
         let rewritten = rewrite_index_pack_progress_args(vec![
-            "libra".to_string(),
-            "--progress".to_string(),
-            "none".to_string(),
-            "index-pack".to_string(),
-            "--no-progress".to_string(),
-            "fixture.pack".to_string(),
+            "libra".into(),
+            "--progress".into(),
+            "none".into(),
+            "index-pack".into(),
+            "--no-progress".into(),
+            "fixture.pack".into(),
         ]);
 
         assert_eq!(
@@ -2906,7 +2944,7 @@ mod tests {
     #[tokio::test]
     async fn clap_fuzzy_suggests_similar_command() {
         // "initt" is close enough to "init" for clap's built-in fuzzy match.
-        let argv = vec!["libra".to_string(), "initt".to_string()];
+        let argv: Vec<std::ffi::OsString> = vec!["libra".into(), "initt".into()];
         let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
         let err = classify_parse_error(&argv, &clap_err);
         let msg = err.render();
@@ -3128,23 +3166,23 @@ mod tests {
     #[test]
     fn detects_help_error_codes_topic() {
         assert!(is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "help".to_string(),
-            "error-codes".to_string(),
+            "libra".into(),
+            "help".into(),
+            "error-codes".into(),
         ]));
         assert!(is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "help".to_string(),
-            "errors".to_string(),
+            "libra".into(),
+            "help".into(),
+            "errors".into(),
         ]));
         assert!(!is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "help".to_string(),
-            "status".to_string(),
+            "libra".into(),
+            "help".into(),
+            "status".into(),
         ]));
         assert!(!is_error_codes_help_topic(&[
-            "libra".to_string(),
-            "--help".to_string(),
+            "libra".into(),
+            "--help".into(),
         ]));
     }
 

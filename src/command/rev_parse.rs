@@ -194,7 +194,11 @@ pub async fn execute(args: RevParseArgs) -> Result<(), String> {
 /// never contains that token) can never spuriously report a separator — this is
 /// only consulted when `spec` is empty and `after_dashdash` is empty.
 fn leading_bare_dashdash_in_argv() -> bool {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: see `notes` — `env::args()` panics on a non-UTF-8
+    // argument, and only ASCII flags are matched here.
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
     match argv.iter().position(|a| a == "rev-parse") {
         Some(idx) => argv[idx + 1..].iter().any(|a| a == "--"),
         None => false,
