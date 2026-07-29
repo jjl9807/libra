@@ -2686,7 +2686,12 @@ fn shallow_file_path() -> Result<PathBuf, FetchError> {
         })
 }
 
-fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
+/// The repository's shallow boundary commits, or an empty set when the clone
+/// is complete. `pub(crate)` because GC must treat the same OIDs as traversal
+/// boundaries (§C.4.3 `Boundary`) — a second parser would be free to disagree
+/// with this one about what counts as a boundary, which is precisely the
+/// disagreement that turns a shallow clone's GC into a corruption report.
+pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
     let path = shallow_file_path()?;
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,

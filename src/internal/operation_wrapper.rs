@@ -498,6 +498,9 @@ where
         end_ts: Some(end_ts),
         status: OperationStatus::Succeeded,
         worktree_id: scope_key.clone(),
+        // W0 §C.11: this process resolved its own scope, so the value is
+        // DECLARED. Only migration 2026072902 ever writes `unknown`.
+        scope_provenance: "declared".to_string(),
     };
     let parents = selected_parents
         .into_iter()
@@ -823,6 +826,7 @@ mod tests {
             end_ts: Some(end_ts),
             status,
             worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
         }
     }
 
@@ -841,7 +845,8 @@ mod tests {
                 start_ts INTEGER NOT NULL,
                 end_ts INTEGER,
                 status TEXT NOT NULL,
-                worktree_id TEXT NOT NULL DEFAULT ''
+                worktree_id TEXT NOT NULL DEFAULT '',
+                scope_provenance TEXT NOT NULL DEFAULT 'declared'
             )
             "#
             .to_string(),

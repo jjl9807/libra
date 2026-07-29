@@ -1071,29 +1071,33 @@ async fn attach(args: ReviewAttachArgs, output: &OutputConfig) -> CliResult<()> 
         .map_err(|e| CliError::fatal(format!("failed to read attach file '{name}': {e}")))?;
     // provenance=manual, untrusted external content → redact before persist.
     let (redacted, _report) = crate::internal::ai::review::redact_untrusted(&raw);
-    let oid = store
-        .objectize_bytes(redacted.as_bytes())
-        .map_err(|e| map_store_error("failed to objectize the attachment", e))?;
-
     let attached_at = crate::internal::ai::review::store::utc_timestamp();
-    let entry = serde_json::json!({
-        "oid": oid,
-        "name": name,
-        "provenance": "manual",
-        "size": redacted.len(),
-        "attached_at": attached_at,
-    });
-
     let mut manifest = store
         .load_manifest(&args.run_id)
         .map_err(|e| map_store_error("failed to read review run manifest", e))?
         .ok_or_else(|| run_not_found(&args.run_id))?;
-    manifest.manual_attach.push(entry);
-    manifest.updated_at = attached_at;
-    let attachments = manifest.manual_attach.len();
-    store
-        .write_manifest(&manifest)
-        .map_err(|e| map_store_error("failed to record the attachment in the manifest", e))?;
+
+    // §C.4.3: the objectized blob is rootless until the manifest naming it is
+    // written, and an attachment is content-addressed — its oid may be one a
+    // `gc` has already quarantined. `objectize_and_publish` is the only route
+    // to the object writer, and it holds the repository maintenance lock
+    // across both steps, so the pair cannot be split here.
+    let mut attachments = 0usize;
+    let redacted_len = redacted.len();
+    let oid = store
+        .objectize_and_publish(redacted.as_bytes(), |oid| {
+            manifest.manual_attach.push(serde_json::json!({
+                "oid": oid,
+                "name": name,
+                "provenance": "manual",
+                "size": redacted_len,
+                "attached_at": attached_at,
+            }));
+            manifest.updated_at = attached_at.clone();
+            attachments = manifest.manual_attach.len();
+            store.write_manifest(&manifest)
+        })
+        .map_err(|e| map_store_error("failed to attach the file", e))?;
 
     if output.is_json() {
         let payload = serde_json::json!({

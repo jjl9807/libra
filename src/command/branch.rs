@@ -455,7 +455,7 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     // Part C W0 (§C.11): refuse to reset a branch checked out in ANOTHER
     // worktree — moving its tip would silently diverge that worktree's working
     // tree from its branch. The current worktree's branch is caught above.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch).await {
+    if let Some(other) = checked_out_elsewhere_or_refuse(&branch).await? {
         return Err(CliError::from(BranchError::CheckedOutElsewhere(
             "reset", branch, other,
         )));
@@ -928,10 +928,14 @@ impl From<BranchError> for CliError {
             ))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("switch to another branch first."),
+            // §C.13: "branch checked out in another worktree" is a
+            // CONFLICT, carrying the occupying worktree's id — not a
+            // generic "unsupported", which tells the user nothing about
+            // what to do next.
             BranchError::CheckedOutElsewhere(verb, name, other) => CliError::fatal(format!(
                 "Cannot {verb} branch '{name}': it is checked out at worktree '{other}'"
             ))
-            .with_stable_code(StableErrorCode::Unsupported)
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint(
                 "switch that worktree to another branch first, or run the command there",
             ),
@@ -1041,6 +1045,25 @@ fn detached_head_branch_error() -> BranchError {
     BranchError::DetachedHead
 }
 
+/// plan-20260714 §C.4.4: the ONE cross-worktree checkout probe every branch
+/// writer in this module uses.
+///
+/// The infallible `Head::branch_checked_out_elsewhere` folded a database error
+/// into `None` — indistinguishable from "no other worktree has it". Every
+/// destructive caller then read a transient query failure as permission to
+/// move or delete a branch another worktree was sitting on. This variant makes
+/// the failure a refusal.
+async fn checked_out_elsewhere_or_refuse(branch: &str) -> Result<Option<String>, BranchError> {
+    Head::branch_checked_out_elsewhere_result(branch)
+        .await
+        .map_err(|error| {
+            BranchError::StorageQueryFailed(format!(
+                "cannot determine whether branch '{branch}' is checked out in another worktree: \
+                 {error}"
+            ))
+        })
+}
+
 /// Translate an internal storage error into the user-facing [`BranchError`].
 ///
 /// Boundary conditions:
@@ -1060,6 +1083,14 @@ fn map_branch_store_error(error: branch::BranchStoreError) -> BranchError {
             branch: name,
             detail,
         },
+        // §C.13 LBR-CONFLICT-002 — the SAME variant the preflight raises, so
+        // a collision detected at the storage seam (after the preflight, in
+        // the window this card closed) is reported identically to one caught
+        // before it. Routing it through `DeleteFailed` instead would report a
+        // storage failure for a branch that is perfectly healthy and in use.
+        branch::BranchStoreError::CheckedOutElsewhere { name, worktree } => {
+            BranchError::CheckedOutElsewhere("modify", name, worktree)
+        }
     }
 }
 
@@ -1532,7 +1563,7 @@ async fn delete_branch_impl(branch_name: String, force: bool) -> Result<BranchOu
     // Part C W0 (§C.11): refuse to delete a branch checked out in ANOTHER
     // worktree — that worktree's HEAD would be left dangling (Git parity). The
     // current worktree's own branch is caught by DeleteCurrent above.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+    if let Some(other) = checked_out_elsewhere_or_refuse(&branch_name).await? {
         return Err(BranchError::CheckedOutElsewhere(
             "delete",
             branch_name,
@@ -1611,7 +1642,7 @@ async fn rename_branch_impl(args: &[String]) -> Result<BranchOutput, BranchError
     // Part C W0 (§C.11): refuse to rename a branch checked out in ANOTHER
     // worktree — that worktree's HEAD would be left pointing at the deleted old
     // name. The current worktree's own HEAD is re-pointed to the new name below.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&old_name).await {
+    if let Some(other) = checked_out_elsewhere_or_refuse(&old_name).await? {
         return Err(BranchError::CheckedOutElsewhere("rename", old_name, other));
     }
     if Branch::find_branch_result(&new_name, None)

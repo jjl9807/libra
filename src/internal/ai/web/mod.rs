@@ -348,9 +348,11 @@ async fn repo_info_handler(
             .unwrap_or_default(),
     };
 
-    let storage_root = resolve_storage_root(&state.working_dir);
-    let desc_path = storage_root.join("description");
-    let description = std::fs::read_to_string(&desc_path).unwrap_or_default();
+    // §C.4.1: no storage root → no description, rather than reading one out
+    // of a directory this process would have had to invent.
+    let description = resolve_storage_root(&state.working_dir)
+        .map(|root| std::fs::read_to_string(root.join("description")).unwrap_or_default())
+        .unwrap_or_default();
 
     Ok(Json(json!({
         "id": id,
@@ -494,7 +496,14 @@ async fn code_threads_handler(
         .clamp(1, MAX_THREAD_LIST_LIMIT);
     let offset = parse_optional_u64("offset", raw_query.offset.as_deref())?.unwrap_or(0);
 
-    let storage_root = resolve_storage_root(state.working_dir.as_path());
+    let storage_root =
+        resolve_storage_root(state.working_dir.as_path()).ok_or_else(|| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "STORAGE_ROOT_UNRESOLVED".to_string(),
+            message: "cannot resolve the repository storage root; if this is a linked worktree, \
+                      run `libra worktree repair <worktree-path>`"
+                .to_string(),
+        })?;
     let db_path = storage_root.join("libra.db");
     let db_path_str = db_path.to_str().ok_or_else(|| WebApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,

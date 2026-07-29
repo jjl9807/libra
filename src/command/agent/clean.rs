@@ -191,6 +191,37 @@ async fn preview_import_identity_prune_count(
 }
 
 pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<()> {
+    // §C.4.3 writer-vs-deleter: `agent clean` is a DELETER — it prunes
+    // checkpoint objects and reclaims findings blobs — so it takes the
+    // repository maintenance lock EXCLUSIVELY rather than the shared hold
+    // every publishing command takes (`cli::command_holds_shared_maintenance_lock`
+    // carves it out for exactly this reason). Held for the whole command, so
+    // its ref rewrite and its unlinks are one uninterruptible sequence.
+    // A preview deletes nothing and takes nothing.
+    let _deletion_lock = if args.dry_run {
+        None
+    } else {
+        Some(
+            crate::internal::maintenance_lock::MaintenanceLock::exclusive_or_refuse(
+                &util::storage_path(),
+                "clean agent runs and checkpoints",
+            )?,
+        )
+    };
+    // lore.md 2.3 / W0 deletion hard gate: `agent clean` unlinks object
+    // payloads (checkpoint prune, findings-blob reclamation), so it is a
+    // DELETION entry point and passes the same borrower gate as `gc`. A
+    // borrowing repository resolves objects through the alternates path, and
+    // its reachability is not part of this store's walk — a blob that is
+    // unreachable here may be exactly what it is reading. Evaluated UNDER the
+    // exclusive hold, so a borrower cannot register between the check and the
+    // unlinks (§C.4.3).
+    if _deletion_lock.is_some() {
+        crate::internal::alternates::ensure_no_live_borrowers(
+            "clean agent runs and checkpoints",
+            crate::utils::error::StableErrorCode::ConflictOperationBlocked,
+        )?;
+    }
     let conn = get_db_conn_instance().await;
     let backend = conn.get_database_backend();
 
@@ -771,7 +802,62 @@ async fn gc_expired_findings_runs(
         }
         let run_dir = entry.path();
         let Some(meta) = read_run_retention_meta(&run_dir) else {
-            continue; // missing/corrupt manifest → skip fail-safe (dir kept)
+            // NO manifest at all: an interrupted run. The maintenance root
+            // walk now fails CLOSED on these rather than pruning objects the
+            // run may still own (plan-20260714 §C.4.3 — a mandatory root that
+            // cannot be enumerated is never "no roots"), so SOMETHING has to
+            // be able to retire them; otherwise one crashed run makes the
+            // repository permanently unprunable.
+            //
+            // This is that route, and it is explicit rather than automatic:
+            // only under the user's `agent clean`, and only for directories
+            // untouched since the same retention cutoff, so a run that is
+            // merely mid-write is never taken. The objects such a directory
+            // owned become unreachable and then face the ordinary two-scan
+            // quarantine; nothing is deleted here but the directory.
+            //
+            // A manifest that IS a JSON object but that this GC declines to
+            // act on (a foreign `kind`, a non-terminal state) is a different
+            // case and is left alone, as before: the run is out of scope for
+            // this GC, not abandoned — and the root walk can read it, so it
+            // wedges nothing.
+            let manifest_path = run_dir.join("manifest.json");
+            let unenumerable = match fs::read(&manifest_path) {
+                // No manifest at all.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                // Unreadable: the walk cannot enumerate it either.
+                Err(_) => true,
+                // Present but not a JSON OBJECT — `[]`, `null`, a bare
+                // string, or corrupt bytes. The GC root walk refuses these
+                // outright (a field lookup on them returns nothing, which
+                // would read as "this run declares no roots"), so they need
+                // the same retirement route or they wedge pruning forever.
+                Ok(bytes) => !serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .is_ok_and(|value| value.is_object()),
+            };
+            let abandoned = unenumerable
+                && fs::metadata(&run_dir)
+                    .and_then(|meta| meta.modified())
+                    .map(DateTime::<Utc>::from)
+                    .is_ok_and(|touched| touched < cutoff);
+            if !abandoned {
+                continue;
+            }
+            runs_pruned += 1;
+            if dry_run {
+                continue;
+            }
+            match fs::remove_dir_all(&run_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(CliError::fatal(format!(
+                        "failed to remove abandoned run dir {}: {err}",
+                        run_dir.display()
+                    )));
+                }
+            }
+            continue;
         };
         if !meta.is_terminal {
             continue; // never delete an in-flight / paused run
@@ -1152,6 +1238,106 @@ mod stderr_gc_tests {
         assert!(stderr_exists(&sessions, "foreign-kind"));
         assert!(stderr_exists(&sessions, "corrupt-terminal"));
         assert!(stderr_exists(&sessions, "garbage-terminal"));
+    }
+
+    /// The escape hatch the maintenance walk's new fail-closed posture
+    /// requires: a run directory with NO manifest is abandoned, and
+    /// `agent clean` retires it once it is past the retention cutoff.
+    ///
+    /// Without this, one crashed run makes the repository permanently
+    /// unprunable — the walk refuses to guess at its roots, and nothing can
+    /// remove it. With it, the removal is explicit (only under the user's
+    /// `agent clean`) and bounded (only past the cutoff), which is what the
+    /// two halves below pin: the SAME directory survives a cutoff it is
+    /// newer than and is retired by one it is older than.
+    #[test]
+    fn a_manifestless_run_is_retired_only_when_past_the_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let runs_root = sessions.join("agent-runs");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // No manifest: an interrupted run.
+        let abandoned = runs_root.join("run-abandoned");
+        fs::create_dir_all(&abandoned).unwrap();
+        fs::write(abandoned.join("findings.md"), "orphaned findings").unwrap();
+
+        // A manifest EXISTS but names a foreign kind: out of scope for this
+        // GC, NOT abandoned — it must survive both cutoffs.
+        write_run_raw(
+            &sessions,
+            "run-foreign",
+            "{\"kind\":\"other\",\"terminal_state\":\"success\",\"updated_at\":\"2000-01-01T00:00:00Z\"}",
+        );
+        let foreign = runs_root.join("run-foreign");
+
+        // A manifest that is valid JSON but NOT an object. The root walk
+        // refuses these, so without a retirement route they would wedge
+        // pruning forever — they are retired on the same terms as a missing
+        // manifest.
+        write_run_raw(&sessions, "run-nonobject", "[]");
+        let nonobject = runs_root.join("run-nonobject");
+
+        // Cutoff in the past: the directory is NEWER than it — still in
+        // flight as far as retention is concerned, so nothing is taken.
+        let past_cutoff = Utc::now() - chrono::Duration::days(30);
+        let outcome = rt
+            .block_on(gc_expired_findings_runs(&sessions, past_cutoff, false))
+            .expect("gc");
+        assert_eq!(
+            outcome.runs_pruned, 0,
+            "a manifest-less run newer than the cutoff must be left alone"
+        );
+        assert!(abandoned.exists(), "still within the retention window");
+        assert!(nonobject.exists(), "and so is an unreadable one");
+
+        // Cutoff ahead of now: the same directory is past it and is retired.
+        let future_cutoff = Utc::now() + chrono::Duration::days(1);
+        let outcome = rt
+            .block_on(gc_expired_findings_runs(&sessions, future_cutoff, false))
+            .expect("gc");
+        assert_eq!(
+            outcome.runs_pruned, 2,
+            "both unenumerable runs are retired: no manifest, and a non-object one"
+        );
+        assert!(
+            !abandoned.exists(),
+            "the abandoned run directory is removed"
+        );
+        assert!(
+            !nonobject.exists(),
+            "and so is the one whose manifest the root walk refuses to read"
+        );
+        assert!(
+            foreign.exists(),
+            "a run with a readable manifest this GC does not own is not 'abandoned'"
+        );
+    }
+
+    /// `--dry-run` counts the abandoned run without removing it.
+    #[test]
+    fn a_manifestless_run_is_only_counted_under_dry_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let abandoned = sessions.join("agent-runs").join("run-abandoned");
+        fs::create_dir_all(&abandoned).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt
+            .block_on(gc_expired_findings_runs(
+                &sessions,
+                Utc::now() + chrono::Duration::days(1),
+                true,
+            ))
+            .expect("gc");
+        assert_eq!(outcome.runs_pruned, 1);
+        assert!(abandoned.exists(), "a preview must not delete anything");
     }
 
     #[test]

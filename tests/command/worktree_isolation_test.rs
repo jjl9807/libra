@@ -2356,6 +2356,101 @@ fn registry_v1_file_upgrades_to_v2_with_backfilled_ids() {
     );
 }
 
+/// W0 §C.4.1: a linked worktree whose identity is corrupt must REFUSE
+/// mutations, not proceed under a synthesized one.
+///
+/// `current_worktree_id` synthesizes an id from the canonical path when the
+/// `worktree_id` file is unusable — deliberately, because returning `None`
+/// would alias the worktree to main and graft main's HEAD. But a synthesized
+/// id is a guess: mutating under it writes HEAD/index/sequencer rows keyed to
+/// an identity nothing else associates with this worktree, and it fails
+/// silently.
+///
+/// An unknown identity has no HEAD row of its own, so commands that resolve
+/// HEAD cannot succeed — the point is that they say SO, naming the repair
+/// route, instead of reporting "HEAD reference is missing from storage",
+/// which describes a corrupt repository this user does not have. Identity-
+/// independent reads and the repair route itself must keep working.
+#[test]
+fn corrupt_linked_identity_refuses_mutations_and_points_at_repair() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-corrupt-id");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Replace the identity with one the registry has never seen.
+    let id_file = wt.join(".libra").join("worktree_id");
+    assert!(id_file.exists(), "the linked worktree has an identity file");
+    std::fs::write(&id_file, "deadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
+
+    // A MUTATION is refused, with the repair route named.
+    std::fs::write(wt.join("new.txt"), "content\n").unwrap();
+    let mutate = run_libra_command(&["add", "new.txt"], &wt);
+    assert!(
+        !mutate.status.success(),
+        "mutating under an unknown identity must fail closed: {}",
+        String::from_utf8_lossy(&mutate.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&mutate.stderr);
+    assert!(
+        stderr.contains("worktree repair"),
+        "and must name the repair route: {stderr}"
+    );
+
+    // §C.13 pins the code for a corrupt/missing linked identity.
+    let json = run_libra_command(&["--json", "add", "new.txt"], &wt);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&json.stdout),
+        String::from_utf8_lossy(&json.stderr)
+    );
+    assert!(
+        combined.contains("LBR-REPO-002"),
+        "corrupt identity is LBR-REPO-002, not a generic state error: {combined}"
+    );
+
+    // A read that does not need this worktree's HEAD still works, so the
+    // damage stays diagnosable.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "list"], &wt),
+        "worktree list stays readable",
+    );
+
+    // A read that DOES need HEAD cannot succeed — there is no HEAD row for an
+    // identity nothing registered. It must still explain itself: the raw
+    // "HEAD reference is missing from storage" reads as repository
+    // corruption, which would send the user looking for the wrong problem.
+    let read = run_libra_command(&["status"], &wt);
+    let read_err = String::from_utf8_lossy(&read.stderr);
+    assert!(
+        !read.status.success() && read_err.contains("worktree repair"),
+        "a HEAD-dependent read must name the identity fault and its repair: {read_err}"
+    );
+    assert!(
+        !read_err.contains("HEAD reference is missing from storage"),
+        "and must not describe this as a corrupt repository: {read_err}"
+    );
+
+    // The REPAIR ROUTE the error names must run. A guard that blocks its
+    // own remedy leaves the worktree permanently stuck, so `worktree` stays
+    // classified as repository scope (it manages the registry, not this
+    // worktree's HEAD/index).
+    let repair = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    assert!(
+        repair.status.success(),
+        "the repair route named in the error must run: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    // After repair the mutation is accepted again.
+    assert_cli_success(
+        &run_libra_command(&["add", "new.txt"], &wt),
+        "add after repair",
+    );
+}
+
 /// `worktree repair <path>` (§C.7): restores a linked worktree's deleted
 /// `.libra/worktree_id` and `commondir` from the registry's PERSISTED id, so
 /// the worktree maps back to ITS OWN scoped rows (never a fresh synthesized
@@ -2537,7 +2632,12 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         // cleanly here because a fresh repository holds no workspace lease —
         // its own down guard refuses once one exists, which is also what keeps
         // a live lease from being rolled through the deeper guards.
-        assert_eq!(rolled, vec![2026072501, 2026072403, 2026072402, 2026072401]);
+        assert_eq!(
+            rolled,
+            vec![
+                2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401
+            ]
+        );
         conn.close().await.expect("close");
     }
 
@@ -4114,6 +4214,20 @@ fn legacy_symlink_mutation_fails_closed() {
         vec!["sparse-view", "set", "src/**"],
         vec!["layer", "add", "ov", "--source", "/tmp/ov"],
         vec!["symbolic-ref", "HEAD", "refs/heads/feature"],
+        // W0 §C.11 declares these mutators too. They were missing from the
+        // hand-maintained list the guard used to consult, so each one wrote
+        // through the shared symlink into MAIN's gitdir: `apply` patched
+        // main's working tree, `fetch` wrote main's FETCH_HEAD, `rerere`
+        // main's MERGE_RR. The inventory is now an exhaustive `match`, so
+        // omission is a compile error rather than a silent hole.
+        vec!["apply", "/dev/null"],
+        vec!["fetch", "origin"],
+        vec!["rerere", "clear"],
+        vec!["mv", "x.txt", "y.txt"],
+        vec!["clean", "-f"],
+        vec!["restore", "x.txt"],
+        vec!["reset", "--hard"],
+        vec!["rm", "--cached", "x.txt"],
     ] {
         let out = run_libra_command(&argv, &wt);
         assert!(
@@ -4662,4 +4776,346 @@ async fn layout_migration_crash_matrix() {
         String::from_utf8_lossy(&blocked.stderr).contains("unfinished layout migration"),
         "refusal names the pending migration"
     );
+}
+
+/// plan-20260714 W0 (§C.11, Codex R16/R17): `worktree doctor` is STRICTLY
+/// read-only.
+///
+/// The whole point of a diagnostic is that it is safe to run on a repository
+/// you do not yet understand. A doctor that adopts, reclaims or repairs by
+/// default would make its own output unreproducible and could resolve an
+/// ambiguity the operator had not yet seen. Repair actions arrive as explicit
+/// subcommands in later waves; until then the invariant is: nothing changes.
+#[test]
+fn worktree_doctor_default_invocation_is_readonly() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-doctor");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Fingerprint everything doctor could plausibly touch.
+    let registry = main.join(".libra").join("worktrees.json");
+    let db = main.join(".libra").join("libra.db");
+    let snapshot = |path: &std::path::Path| -> Option<Vec<u8>> { std::fs::read(path).ok() };
+    let registry_before = snapshot(&registry);
+    let db_before = snapshot(&db);
+    let wt_id_before = snapshot(&wt.join(".libra").join("worktree_id"));
+    // "Strictly read-only" includes CREATING nothing. Snapshotting only the
+    // files that already exist cannot catch a command that adds one, and the
+    // `worktree add` above has already created several — so the whole `.libra`
+    // tree is listed, and the maintenance lock (which the generic
+    // publisher hold would create) is removed first so its absence is
+    // meaningful.
+    let lock = main.join(".libra").join("maintenance.lock");
+    let _ = std::fs::remove_file(&lock);
+    let tree = |root: &std::path::Path| -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path.clone());
+                }
+                found.push(path.to_string_lossy().into_owned());
+            }
+        }
+        found.sort();
+        found
+    };
+    let tree_before = tree(&main.join(".libra"));
+
+    let out = run_libra_command(&["worktree", "doctor"], main);
+    assert_cli_success(&out, "worktree doctor");
+
+    assert!(
+        !lock.exists(),
+        "doctor must not create the maintenance lock: it is strictly read-only"
+    );
+    assert_eq!(
+        tree_before,
+        tree(&main.join(".libra")),
+        "doctor must not add or remove any file under .libra"
+    );
+
+    assert_eq!(
+        registry_before,
+        snapshot(&registry),
+        "doctor must not rewrite the registry"
+    );
+    assert_eq!(db_before, snapshot(&db), "doctor must not write to the DB");
+    assert_eq!(
+        wt_id_before,
+        snapshot(&wt.join(".libra").join("worktree_id")),
+        "doctor must not touch a worktree's identity"
+    );
+
+    // A healthy repository reports so rather than inventing findings.
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no problems detected"),
+        "healthy repo: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// The read-only doctor REPORTS a damaged identity — and still changes
+/// nothing, including the damaged worktree it is reporting on.
+#[test]
+fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-doctor-damaged");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let id_file = wt.join(".libra").join("worktree_id");
+    std::fs::write(&id_file, "deadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
+    let damaged_before = std::fs::read(&id_file).unwrap();
+
+    let out = run_libra_command(&["--json", "worktree", "doctor"], main);
+    assert_cli_success(&out, "worktree doctor --json");
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor emits one JSON envelope");
+    assert_eq!(json["command"], "worktree.doctor");
+    let data = &json["data"];
+    assert_eq!(data["schema_version"], 1);
+    assert!(data["next_cursor"].is_null(), "W0 emits a single page");
+    let diagnostics = data["diagnostics"]
+        .as_array()
+        .expect("diagnostics is an array");
+    assert_eq!(diagnostics.len(), 2, "main + the linked worktree");
+
+    let damaged = diagnostics
+        .iter()
+        .find(|d| d["is_main"] == false)
+        .expect("the linked worktree is reported");
+    assert_eq!(
+        damaged["identity_registered"], false,
+        "the unknown identity is reported: {damaged}"
+    );
+    assert!(
+        damaged["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|f| f.as_str().is_some_and(|s| s.contains("worktree repair"))),
+        "and the report names the repair route: {damaged}"
+    );
+
+    // Reporting is not repairing.
+    assert_eq!(
+        damaged_before,
+        std::fs::read(&id_file).unwrap(),
+        "doctor reported the damage without fixing it"
+    );
+}
+
+/// W0 §C.11: `worktree doctor` does not upgrade the schema of the repository
+/// it is diagnosing.
+///
+/// Applying a pending migration IS a write. A diagnostic that silently
+/// performs one changes the thing you were trying to observe — and a
+/// repository behind schema is precisely the case where you want to look
+/// before committing to an upgrade. The already-current-schema test cannot
+/// catch this, because there is no migration to apply.
+///
+/// The repository is put behind schema by removing the LAST applied version
+/// from the ledger AND undoing what it created, so re-applying is a real
+/// forward step rather than a non-idempotent replay.
+#[test]
+fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let db = main.join(".libra").join("libra.db");
+
+    assert!(
+        sqlite_exec(
+            &db,
+            &[
+                "DROP TRIGGER IF EXISTS operation_scope_provenance_domain_insert",
+                "DROP TRIGGER IF EXISTS operation_scope_provenance_domain_update",
+                "ALTER TABLE operation DROP COLUMN scope_provenance",
+                "DELETE FROM schema_versions WHERE version = 2026072902",
+            ],
+        ),
+        "put the repository one migration behind"
+    );
+    let before = std::fs::read(&db).expect("db before");
+
+    let out = run_libra_command(&["worktree", "doctor"], main);
+    assert_cli_success(&out, "doctor on a behind-schema repository");
+    assert_eq!(
+        before,
+        std::fs::read(&db).expect("db after"),
+        "doctor must not apply the pending migration"
+    );
+
+    // An ordinary command still upgrades, so the exclusion is scoped to
+    // doctor rather than disabling migrations outright.
+    assert_cli_success(&run_libra_command(&["status"], main), "status upgrades");
+    assert_ne!(
+        before,
+        std::fs::read(&db).expect("db after status"),
+        "the pending migration was still pending, and status applied it"
+    );
+}
+
+/// Run statements against a repository database without pulling an async
+/// runtime into a synchronous test.
+fn sqlite_exec(db: &std::path::Path, statements: &[&str]) -> bool {
+    let script = statements
+        .iter()
+        .map(|sql| format!("c.execute({sql:?})"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sqlite3\nc=sqlite3.connect({db:?})\n{script}\nc.commit()\n"
+        ))
+        .output();
+    matches!(out, Ok(o) if o.status.success())
+}
+
+/// §C.13: a checkout collision raised at the STORAGE SEAM carries
+/// `LBR-CONFLICT-002`, exactly like one caught by a command's preflight.
+///
+/// The seam guard was added so the check and the write could not be split by
+/// a concurrent attach, but it reported the collision through
+/// `BranchStoreError::Corrupt`, which `symbolic-ref` maps to `LBR-REPO-002`.
+/// A user racing two worktrees was told their repository was corrupt for what
+/// is an ordinary, recoverable conflict — and any tooling keyed on the code
+/// would have escalated it as damage.
+#[test]
+fn seam_checkout_collision_reports_a_conflict_not_corruption() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-collide");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap(), "feature"], main),
+        "worktree add on 'feature'",
+    );
+
+    // `symbolic-ref HEAD` goes through the POOLED attach entry point — the
+    // one the seam guard now covers transactionally.
+    let attach = run_libra_command(
+        &["--json", "symbolic-ref", "HEAD", "refs/heads/feature"],
+        main,
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&attach.stdout),
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    assert!(
+        !attach.status.success(),
+        "attaching a second HEAD to a checked-out branch must be refused: {combined}"
+    );
+    assert!(
+        combined.contains("LBR-CONFLICT-002"),
+        "a checkout collision is a conflict, not repository corruption: {combined}"
+    );
+    assert!(
+        !combined.contains("LBR-REPO-002"),
+        "and must not be reported as corruption: {combined}"
+    );
+
+    // The same is true of the DELETE seam: `branch -d` of a branch another
+    // worktree holds is a conflict, not a storage failure.
+    let delete = run_libra_command(&["--json", "branch", "-D", "feature"], main);
+    let delete_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&delete.stdout),
+        String::from_utf8_lossy(&delete.stderr)
+    );
+    assert!(
+        !delete.status.success(),
+        "deleting a branch checked out elsewhere must be refused: {delete_out}"
+    );
+    assert!(
+        delete_out.contains("LBR-CONFLICT-002"),
+        "branch deletion collision is LBR-CONFLICT-002: {delete_out}"
+    );
+
+    // And the branch is still there and still usable in the other worktree.
+    assert_cli_success(
+        &run_libra_command(&["status"], &wt),
+        "the other worktree keeps its branch",
+    );
+}
+
+/// §C.13, the writer seam this time: a branch TIP write refused because
+/// another worktree holds the branch is `LBR-CONFLICT-002`, not a write fault.
+///
+/// The refusal is raised inside `Branch`'s storage seam and then travels
+/// through sea_orm's `DbErr` (the reflog closure's error type is fixed, so a
+/// typed enum cannot pass) and one or two more wrapping layers before a
+/// command sees it. Every boundary that classified by hand lost it on the
+/// way: `switch -C`, which deletes and recreates, reported `LBR-IO-002` —
+/// "failed to delete" — for a branch that was simply in use somewhere else,
+/// and any tooling keyed on the code would have escalated it as damage.
+#[test]
+fn seam_branch_tip_collision_reports_a_conflict_not_a_write_fault() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-tip");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap(), "feature"], main),
+        "worktree add on 'feature'",
+    );
+    fs::write(main.join("b.txt"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], main),
+        "commit",
+    );
+    let tip = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // Force-create over a branch the other worktree has checked out: the
+    // delete half of `-C` is refused at the seam.
+    let force_create = run_libra_command(&["--json", "switch", "-C", "feature"], main);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&force_create.stdout),
+        String::from_utf8_lossy(&force_create.stderr)
+    );
+    assert!(
+        !force_create.status.success(),
+        "recreating a branch another worktree holds must be refused: {combined}"
+    );
+    assert!(
+        combined.contains("LBR-CONFLICT-002"),
+        "and reported as a conflict, not a write fault: {combined}"
+    );
+    assert!(
+        !combined.contains("LBR-IO-002"),
+        "the generic write-failure code must not survive the wrapping: {combined}"
+    );
+
+    // Moving the tip directly is refused with the same code.
+    let update_ref = run_libra_command(
+        &["--json", "update-ref", "refs/heads/feature", tip.as_str()],
+        main,
+    );
+    let update_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&update_ref.stdout),
+        String::from_utf8_lossy(&update_ref.stderr)
+    );
+    assert!(
+        !update_ref.status.success() && update_out.contains("LBR-CONFLICT-002"),
+        "moving a tip another worktree holds is the same conflict: {update_out}"
+    );
+
+    // The other worktree is untouched by either refusal.
+    assert_eq!(abbrev_head(&wt), "feature");
 }

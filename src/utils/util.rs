@@ -1133,6 +1133,15 @@ impl CommitBaseError {
             }
             BranchStoreError::Corrupt { .. } => Self::CorruptReference(message),
             BranchStoreError::NotFound(_) => Self::InvalidReference(message),
+            // §C.4.4's checkout-collision refusal is raised only by the WRITE
+            // seams (`Head::update_result_with_conn`,
+            // `Branch::delete_branch_result_with_conn`); the read functions
+            // this classifier wraps cannot produce it. Classified as an
+            // unusable reference rather than corruption so that if a future
+            // refactor ever routes a write error through here, the user is
+            // told the ref cannot be used — not that their repository is
+            // damaged.
+            BranchStoreError::CheckedOutElsewhere { .. } => Self::InvalidReference(message),
         }
     }
 

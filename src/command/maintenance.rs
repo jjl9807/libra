@@ -237,6 +237,36 @@ async fn run_tasks(
         if !quiet {
             info_println(output, &format!("Running maintenance task: {task}"));
         }
+        // §C.4.3 writer-vs-deleter: the tasks that PUBLISH object references
+        // hold the maintenance lock shared for their duration, exactly like
+        // any other publishing command. `maintenance` itself is carved out of
+        // the command-level shared hold (`cli::command_holds_shared_maintenance_lock`)
+        // precisely so that this can be decided per task: the deleting tasks
+        // take the lock EXCLUSIVELY inside themselves, and a shared hold
+        // cannot be upgraded. The two sets are disjoint by construction, and
+        // this match is exhaustive so a new task must classify itself.
+        let publish_lock = match task {
+            // `prefetch` runs the ordinary fetch writer in-process: it writes
+            // objects AND publishes remote-tracking refs.
+            MaintenanceTask::Prefetch
+            // `pack-refs` rewrites the ref store. It deletes loose REF
+            // files, never object payloads, so a shared hold is the right
+            // mode for it.
+            | MaintenanceTask::PackRefs => {
+                Some(crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?)
+            }
+            // These take the lock themselves, in the mode each PHASE needs.
+            // `loose-objects` and `incremental-repack` both publish a pack
+            // and then UNLINK — shared for the write, exclusive for the
+            // deletion; `gc` and `cache-evict` are deletion phases outright.
+            // `commit-graph` derives a file from objects it neither
+            // publishes nor deletes.
+            MaintenanceTask::LooseObjects
+            | MaintenanceTask::IncrementalRepack
+            | MaintenanceTask::Gc
+            | MaintenanceTask::CacheEvict
+            | MaintenanceTask::CommitGraph => None,
+        };
         let result = match task {
             MaintenanceTask::Gc => run_gc(&repo_path, dry_run, quiet, output).await,
             MaintenanceTask::LooseObjects => {
@@ -252,6 +282,7 @@ async fn run_tasks(
             MaintenanceTask::Prefetch => run_prefetch(&repo_path, dry_run, quiet, output).await,
             MaintenanceTask::CacheEvict => run_cache_evict(dry_run).await,
         };
+        drop(publish_lock);
         match result {
             Ok(r) => {
                 if !r.success {
@@ -323,6 +354,12 @@ async fn run_tasks(
 /// `libra cache evict`, with the resolved budget and the default age floor.
 async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
     use crate::utils::storage::EvictRequest;
+    // The SAME preflight `libra cache evict` runs. Reaching the engine
+    // directly from here used to bypass the alternates-borrower gate and the
+    // offline read-policy gate outright — scheduled maintenance could delete
+    // objects a borrowing repository still needed.
+    // Held for the whole eviction: the guard IS the exclusion.
+    let _deletion_lock = crate::command::cache::evict_preflight(dry_run)?;
     let budget = crate::utils::client_storage::resolve_cache_config()
         .map_err(|error| CliError::fatal(format!("cannot resolve the cache budget: {error}")))?
         .cache_size_bytes as u64;
@@ -364,6 +401,138 @@ async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
     })
 }
 
+/// The GC prune-candidate ledger: `oid -> unix seconds when it was FIRST
+/// observed unreachable`.
+///
+/// Derivable state (§C.4.3 `IndexOnly`-adjacent): an unreadable or corrupt
+/// ledger is treated as empty, which costs one delayed prune cycle and can
+/// never cost an object. It is deliberately NOT in SQLite — it must survive
+/// being lost, and it holds no authority over what exists.
+fn read_prune_candidate_ledger(
+    path: &std::path::Path,
+) -> CliResult<std::collections::HashMap<String, u64>> {
+    // Bounded: an unbounded read of a file that grows with the repository's
+    // dead objects is a memory hazard on exactly the repositories that need
+    // pruning most. Over the cap is a hard refusal rather than a silent
+    // reset, because "start over" would restart the two-scan clock and could
+    // delay pruning forever.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_PRUNE_LEDGER_BYTES => {
+            return Err(CliError::fatal(format!(
+                "the GC prune-candidate ledger '{}' is {} bytes, past the \
+                 {MAX_PRUNE_LEDGER_BYTES}-byte cap",
+                path.display(),
+                meta.len()
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(
+                "delete it to restart the quarantine clock (this delays pruning by one grace \
+                 window; it never deletes an object)",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashMap::new());
+        }
+        Err(error) => {
+            return Err(CliError::fatal(format!(
+                "failed to stat the GC prune-candidate ledger '{}': {error}",
+                path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed));
+        }
+    }
+    match std::fs::read_to_string(path) {
+        // A corrupt ledger is treated as empty: it holds no authority over
+        // what exists, so the worst case is one delayed prune cycle.
+        Ok(text) => Ok(serde_json::from_str(&text).unwrap_or_default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::collections::HashMap::new())
+        }
+        Err(error) => Err(CliError::fatal(format!(
+            "failed to read the GC prune-candidate ledger '{}': {error}",
+            path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)),
+    }
+}
+
+/// 4 MiB holds ~90k entries — far past any healthy repository, and small
+/// enough that reading it can never be the thing that fails a prune.
+const MAX_PRUNE_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Serializes the ledger's read-modify-write against a concurrent GC.
+///
+/// Two overlapping runs would otherwise last-writer-win, and the loser's
+/// `first_seen` timestamps would be replaced by the winner's fresher ones —
+/// restarting the two-scan clock on every overlap, so a busy repository
+/// could never finish a quarantine cycle. The lock is taken BEFORE any
+/// SQLite work in `run_gc`, so it can never be waited on by a process
+/// holding a database transaction.
+fn acquire_prune_ledger_lock(path: &std::path::Path) -> CliResult<std::fs::File> {
+    use std::fs::File;
+    let lock_path = path.with_extension("lock");
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to open the GC prune-candidate ledger lock '{}': {error}",
+                lock_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
+    file.lock().map_err(|error| {
+        CliError::fatal(format!(
+            "failed to lock the GC prune-candidate ledger '{}': {error}",
+            lock_path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+    Ok(file)
+}
+
+fn write_prune_candidate_ledger(
+    path: &std::path::Path,
+    ledger: &std::collections::HashMap<String, u64>,
+) -> CliResult<()> {
+    let text = serde_json::to_string(ledger).map_err(|error| {
+        CliError::fatal(format!(
+            "failed to serialize the GC prune-candidate ledger: {error}"
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+    // The cap is enforced on the way OUT as well as the way in. Checking it
+    // only on read lets a ledger that was legal when loaded grow past the cap
+    // in THIS run and be written anyway — after which every later run refuses
+    // to read it, and the quarantine clock stops for a file this code
+    // created. Refusing here leaves the previous, still-readable ledger in
+    // place (one delayed prune cycle, never an object).
+    if text.len() as u64 > MAX_PRUNE_LEDGER_BYTES {
+        return Err(CliError::fatal(format!(
+            "the GC prune-candidate ledger would grow to {} bytes, past the \
+             {MAX_PRUNE_LEDGER_BYTES}-byte cap; '{}' was left unchanged",
+            text.len(),
+            path.display()
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid)
+        .with_hint(
+            "this repository has more quarantined objects than the ledger can track: run \
+             `libra gc` again after the current grace window expires so the backlog drains, \
+             or delete the ledger to restart the quarantine clock",
+        ));
+    }
+    crate::utils::atomic_write::write_atomic(path, text.as_bytes(), false).map_err(|error| {
+        CliError::fatal(format!(
+            "failed to write the GC prune-candidate ledger '{}': {error}",
+            path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+    })
+}
+
 /// plan-20260714 Part C W0 (§C.11 release gate): does this repository have any
 /// LINKED worktree besides the main one?
 ///
@@ -394,7 +563,23 @@ async fn run_gc(
     // while any live borrower exists — the borrower must `alternates remove`
     // (or dissociate) first. This makes the base's gc "never delete a
     // borrowed object" AIRTIGHT.
-    if !dry_run && crate::internal::alternates::has_live_borrowers(&path::objects()) {
+    // The predicate comes from the ONE deletion gate (§C.11); scheduled
+    // maintenance reports it as a skipped task instead of failing the whole
+    // run, but it can never disagree with the interactive commands about
+    // WHEN deletion is unsafe.
+    if !dry_run
+        && let Err(refusal) = crate::internal::alternates::ensure_no_live_borrowers(
+            "prune loose objects",
+            StableErrorCode::ConflictOperationBlocked,
+        )
+    {
+        // A live borrower is a known state this task may report as skipped.
+        // An UNREADABLE registration is a fault, and folding it into a
+        // successful run would hide the one condition that makes deletion
+        // unsafe for reasons nobody can see.
+        if refusal.stable_code() != StableErrorCode::ConflictOperationBlocked {
+            return Err(refusal);
+        }
         return Ok(TaskResult {
             task: "gc".to_string(),
             success: true,
@@ -403,14 +588,13 @@ async fn run_gc(
             refs_packed: 0,
             packs_repacked: 0,
             object_index_rows_removed: 0,
-            message: "skipped loose-object prune: this store is shared (other repos borrow from                       it via alternates); have borrowers run 'libra alternates remove' first"
-                .to_string(),
+            message: format!("skipped loose-object prune: {refusal}"),
         });
     }
     // W2 §C.4.3: the typed `GcObjectSource` inventory is complete — the
     // reachability walk enumerates EVERY worktree's private index (all
     // stages), every scope's sequencer/rebase/bisect rows, every gitdir's
-    // held-autostash + merge/revert/rebase-aux sidecars and FETCH_HEAD, the
+    // held-autostash + merge/revert/rebase-aux sidecars, the
     // shared refs/reflogs/stash reflog, note blobs, undo view snapshots, and
     // AI capture checkpoints. The former W0 multi-worktree prune skip is
     // therefore LIFTED; any unreadable root still fails the walk closed.
@@ -476,50 +660,118 @@ async fn run_gc(
     const PRUNE_GRACE_SECS: u64 = 3600;
     let now = std::time::SystemTime::now();
 
-    let mut removed = 0;
-    let mut pruned_oids: Vec<String> = Vec::new();
+    // Select the candidates FIRST, then invalidate the catalogue, then
+    // unlink (§C.4.3 item 12). The order matters: `object_index` is what
+    // cloud sync and repair consult to decide an object is available here.
+    //
+    // Unlinking first — as this did — means a SQLite failure or lock in
+    // between leaves rows advertising bytes that no longer exist, and
+    // nothing later reconciles that: a peer asks for the object and gets a
+    // hard miss. Dropping the rows first can only leave the opposite
+    // asymmetry, an object present but uncatalogued, which under-advertises
+    // (never a broken promise) and which `agent doctor` rebuilds from the
+    // manifests.
+    // Candidates for THIS pass: unreachable now, and old enough that they
+    // cannot be an object written moments ago whose ref record has not landed
+    // yet. A stat error keeps the object — never delete what cannot be aged.
+    let mut unreachable_now: Vec<(&String, &std::path::PathBuf)> = Vec::new();
     for (hash_str, obj_path) in &all_loose {
         if let Some(hash) = parse_object_hash(hash_str)
             && !reachable.contains(&hash)
         {
-            // Grace window: keep fresh objects (and keep on ANY stat error —
-            // never delete what cannot be aged; fail closed).
             let age_ok = std::fs::metadata(obj_path)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|mtime| now.duration_since(mtime).ok())
                 .is_some_and(|age| age.as_secs() >= PRUNE_GRACE_SECS);
-            if !age_ok {
-                continue;
+            if age_ok {
+                unreachable_now.push((hash_str, obj_path));
             }
-            if dry_run {
-                if !quiet {
+        }
+    }
+
+    // §C.4.3 writer-vs-deleter defence — the QUARANTINE half.
+    //
+    // An mtime grace alone does not protect an OLD orphan that becomes
+    // reachable while this run is between its root scan and its unlink: a
+    // concurrent `update-ref`, `reset`, `stash apply` or `op restore` can
+    // republish a long-dead object, and the scan that decided it was
+    // unreachable already happened.
+    //
+    // So nothing is deleted the first time it is seen unreachable. A
+    // candidate is recorded, and only deleted by a LATER run that still finds
+    // it unreachable after the grace window has passed — meaning it survived
+    // two independent root scans, separated in time, with no reference
+    // appearing in between. Anything that became reachable is dropped from
+    // the ledger and never deleted.
+    //
+    // The ledger is derivable state: losing it costs one delayed prune cycle,
+    // never an object.
+    let ledger_path = crate::utils::util::storage_path().join("gc-prune-candidates.json");
+    // Held across the read-modify-write below so two concurrent GCs cannot
+    // last-writer-win and reset each other's quarantine clock. A dry run
+    // only reads, so it takes no lock.
+    let _ledger_lock = if dry_run {
+        None
+    } else {
+        Some(acquire_prune_ledger_lock(&ledger_path)?)
+    };
+    let mut ledger = read_prune_candidate_ledger(&ledger_path)?;
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let unreachable_keys: std::collections::HashSet<&str> = unreachable_now
+        .iter()
+        .map(|(hash_str, _)| hash_str.as_str())
+        .collect();
+    // Anything no longer unreachable (or no longer present) leaves the ledger.
+    ledger.retain(|oid, _| unreachable_keys.contains(oid.as_str()));
+
+    #[allow(unused_assignments)]
+    let mut pruned_oids: Vec<String> = Vec::new();
+    let mut prune_targets: Vec<(&String, &std::path::PathBuf)> = Vec::new();
+    let mut newly_quarantined = 0usize;
+    for (hash_str, obj_path) in unreachable_now {
+        match ledger.get(hash_str.as_str()) {
+            Some(first_seen) if now_secs.saturating_sub(*first_seen) >= PRUNE_GRACE_SECS => {
+                if dry_run && !quiet {
                     info_println(
                         output,
                         &format!("  would remove unreachable object {hash_str}"),
                     );
                 }
                 pruned_oids.push(hash_str.clone());
-            } else {
-                if let Err(e) = fs::remove_file(obj_path) {
-                    // A concurrent cache eviction may have removed it first —
-                    // the goal state (file gone) is reached either way.
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Err(CliError::fatal(format!(
-                            "failed to remove unreachable object {}: {e}",
-                            hash_str
-                        )));
-                    }
+                prune_targets.push((hash_str, obj_path));
+            }
+            Some(_) => {}
+            None => {
+                if !dry_run {
+                    ledger.insert(hash_str.clone(), now_secs);
                 }
-                removed += 1;
-                pruned_oids.push(hash_str.clone());
+                newly_quarantined += 1;
             }
         }
     }
-
-    // Clean up empty object directories
     if !dry_run {
-        let _ = cleanup_empty_dirs(&path::objects());
+        // The candidates about to be deleted STAY in the ledger until they
+        // actually are. Dropping them here was safe only while deletion
+        // always followed; now that the deletion phase can be deferred (a
+        // publisher holds the maintenance lock) or refuse individual
+        // candidates, dropping them first would reset each deferred
+        // candidate's `first_seen` to the next run's clock — and a
+        // repository with a long-running session would restart its quarantine
+        // on every attempt and never prune anything.
+        write_prune_candidate_ledger(&ledger_path, &ledger)?;
+    }
+    if newly_quarantined > 0 && !quiet {
+        info_println(
+            output,
+            &format!(
+                "  {newly_quarantined} newly unreachable object(s) recorded; a later run \
+                 deletes them if they are still unreachable"
+            ),
+        );
     }
 
     // PD-04: reclaim the `object_index` catalogue rows of the pruned blobs
@@ -529,27 +781,177 @@ async fn run_gc(
     // blobs reach this point exclusively through the reachability walk: a
     // blob anchored by any ref, index, sidecar, or live agent-run manifest
     // never becomes a prune candidate, so shared bytes stay alive.
+    let mut removed = 0;
     let object_index_rows_removed = if pruned_oids.is_empty() {
         0
-    } else {
+    } else if dry_run {
         let db_conn = db::get_db_conn_instance().await;
-        if dry_run {
-            crate::utils::client_storage::count_object_index_rows_with_conn(&db_conn, &pruned_oids)
-                .await
-                .map_err(|e| {
-                    CliError::fatal(format!(
-                        "failed to count object_index rows for pruned objects: {e}"
+        crate::utils::client_storage::count_object_index_rows_with_conn(&db_conn, &pruned_oids)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!(
+                    "failed to count object_index rows for pruned objects: {e}"
+                ))
+            })?
+    } else {
+        // §C.4.3 writer-vs-deleter: the deletion phase runs under the
+        // repository maintenance lock, held EXCLUSIVELY.
+        //
+        // Two historical scans prove an object was unreachable twice; they do
+        // not prove nothing referenced it in between — and a database
+        // transaction cannot prove it either, because the publications that
+        // matter most here are FILES: a worktree's private index, a merge or
+        // rebase sidecar, an agent-run manifest. Staging content that happens
+        // to hash to a quarantined object commits without touching SQLite at
+        // all, so a transaction's SHARED read lock excludes exactly the
+        // writers that were never the problem.
+        //
+        // Every publisher instead holds this lock shared for its whole run
+        // (`cli::command_holds_shared_maintenance_lock`). Holding it
+        // exclusively across "final scan → catalogue invalidation → unlink"
+        // is therefore the interval-emptiness proof the ledger cannot give,
+        // and it covers filesystem and database publishers alike.
+        let Some(_deletion_lock) =
+            crate::internal::maintenance_lock::MaintenanceLock::try_exclusive(
+                &crate::utils::util::storage_path(),
+                crate::internal::maintenance_lock::DELETION_LOCK_WAIT,
+            )?
+        else {
+            // Deferral, not failure: the objects stay, and the next run takes
+            // them. Deleting them without the exclusion is the one option
+            // that could cost data.
+            return Ok(TaskResult {
+                task: "gc".to_string(),
+                success: true,
+                objects_removed: 0,
+                objects_packed: 0,
+                refs_packed: 0,
+                packs_repacked: 0,
+                object_index_rows_removed: 0,
+                message: format!(
+                    "deferred the deletion of {} unreachable loose object(s): another command \
+                     is still publishing objects in this repository (a long-running `libra \
+                     code` session counts). Re-run when it finishes.",
+                    prune_targets.len()
+                ),
+            });
+        };
+
+        if let Err(refusal) = crate::internal::alternates::ensure_no_live_borrowers(
+            "prune loose objects",
+            StableErrorCode::ConflictOperationBlocked,
+        ) {
+            // A live borrower is a known state this task may report as
+            // skipped. An UNREADABLE registration is a fault, and folding
+            // it into a successful run would hide the one condition that
+            // makes deletion unsafe for reasons nobody can see.
+            if refusal.stable_code() != StableErrorCode::ConflictOperationBlocked {
+                return Err(refusal);
+            }
+            // Re-checked UNDER the exclusive hold: the gate at the top of
+            // this function ran before the lock existed, and registering a
+            // borrower is itself a publication (it takes the base's shared
+            // hold now), so one that appeared in between is caught here
+            // rather than losing objects it already depends on (§C.4.3).
+            return Ok(TaskResult {
+                task: "gc".to_string(),
+                success: true,
+                objects_removed: 0,
+                objects_packed: 0,
+                refs_packed: 0,
+                packs_repacked: 0,
+                object_index_rows_removed: 0,
+                message: format!("skipped loose-object prune: {refusal}"),
+            });
+        }
+
+        let db_conn = db::get_db_conn_instance().await;
+        // The last word on reachability. No publisher can be running, so this
+        // needs no transaction of its own — and must not have one: the walk
+        // loads every commit and tree in the repository, and holding a
+        // database read lock across it would block ref writers for the whole
+        // traversal (§C.10 keeps database transactions short).
+        let still_reachable = collect_reachable_objects_with_conn(&storage, &db_conn).await?;
+        let mut final_targets: Vec<(&String, &std::path::PathBuf)> = Vec::new();
+        let mut final_oids: Vec<String> = Vec::new();
+        let mut resurrected_oids: Vec<String> = Vec::new();
+        for (hash_str, obj_path) in &prune_targets {
+            match parse_object_hash(hash_str) {
+                Some(hash) if !still_reachable.contains(&hash) => {
+                    final_targets.push((hash_str, obj_path));
+                    final_oids.push((*hash_str).clone());
+                }
+                // Referenced since the earlier scan: drop it from this run,
+                // and from the LEDGER — keeping its old `first_seen` would
+                // mean that if the new reference goes away again, the very
+                // next run deletes it on the strength of a quarantine
+                // interval that a reference appeared inside. The window has
+                // to be continuous to prove anything, so it starts over.
+                Some(_) => resurrected_oids.push((*hash_str).clone()),
+                None => {
+                    return Err(CliError::fatal(format!(
+                        "prune candidate '{hash_str}' is not a valid object id"
                     ))
-                })?
+                    .with_stable_code(StableErrorCode::RepoCorrupt));
+                }
+            }
+        }
+        if !resurrected_oids.is_empty() && !quiet {
+            info_println(
+                output,
+                &format!(
+                    "  {} candidate(s) became reachable since the earlier scan and were kept",
+                    resurrected_oids.len()
+                ),
+            );
+        }
+        for oid in &resurrected_oids {
+            ledger.remove(oid.as_str());
+        }
+
+        // Catalogue FIRST, and committed before the first unlink — the two
+        // steps are ordered, not wrapped. A catalogue that has already
+        // dropped rows for objects still on disk merely UNDER-advertises,
+        // which `agent doctor` rebuilds; the inverse — unlinking inside a
+        // transaction that then rolls back — would restore rows advertising
+        // bytes that are gone, and nothing repairs that from the inside.
+        let rows = if final_oids.is_empty() {
+            0
         } else {
-            crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &pruned_oids)
+            crate::utils::client_storage::remove_object_index_rows_with_conn(&db_conn, &final_oids)
                 .await
                 .map_err(|e| {
                     CliError::fatal(format!(
                         "failed to remove object_index rows for pruned objects: {e}"
                     ))
                 })?
+        };
+
+        // The catalogue no longer claims these objects, so unlinking them can
+        // only make the store MORE honest, never less.
+        for (hash_str, obj_path) in &final_targets {
+            if let Err(e) = fs::remove_file(obj_path) {
+                // A concurrent cache eviction may have removed it first —
+                // the goal state (file gone) is reached either way.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(CliError::fatal(format!(
+                        "failed to remove unreachable object {hash_str}: {e}"
+                    )));
+                }
+            }
+            removed += 1;
         }
+        let _ = cleanup_empty_dirs(&path::objects());
+        // Now — and only now — the deleted candidates leave the ledger. The
+        // ones this run kept (resurrected, or deferred by an earlier return)
+        // keep their original `first_seen`, so the quarantine clock they
+        // already served is not thrown away.
+        for oid in &final_oids {
+            ledger.remove(oid.as_str());
+        }
+        write_prune_candidate_ledger(&ledger_path, &ledger)?;
+        pruned_oids = final_oids;
+        rows
     };
 
     let message = if dry_run {
@@ -586,6 +988,13 @@ async fn run_loose_objects(
     quiet: bool,
     output: &OutputConfig,
 ) -> CliResult<TaskResult> {
+    // §C.4.3: this task PUBLISHES (a pack that becomes the objects' home)
+    // and then DELETES (the loose copies), so it holds the shared lock for
+    // the first half and swaps to the exclusive one for the second — the
+    // same shape as `repack -d`.
+    let publish_lock = crate::internal::maintenance_lock::MaintenanceLock::shared(
+        &crate::utils::util::storage_path(),
+    )?;
     let loose = list_loose_objects(repo_path)
         .map_err(|e| CliError::fatal(format!("failed to list loose objects: {e}")))?;
 
@@ -674,11 +1083,11 @@ async fn run_loose_objects(
         .filter_map(|(hash_str, _)| parse_object_hash(hash_str))
         .collect();
 
-    let pack_path =
+    let publication =
         match pack_writer::write_pack_with_index(&storage, &hashes, &pack_dir, get_hash_kind())
             .await
         {
-            Ok(Some(path)) => path,
+            Ok(Some(publication)) => publication,
             Ok(None) => {
                 return Ok(TaskResult {
                     task: "loose-objects".to_string(),
@@ -696,6 +1105,87 @@ async fn run_loose_objects(
             }
         };
 
+    // §C.4.3 writer-vs-deleter: the pack is published, so the shared hold
+    // ends and the UNLINKS take the exclusive one. A shared hold cannot be
+    // upgraded in place (another process may hold it too), so this is a
+    // release-then-acquire; the objects being removed live in the pack this
+    // function just wrote, so nothing is lost if the deletion is deferred.
+    // The pack is about to become these objects' only home, so its NAME must
+    // be durable, not just its bytes: a crash that loses the directory entry
+    // after the loose copies are gone loses the objects. The pack itself is
+    // kept — it is valid, and the next run will delete the loose copies once
+    // durability can be proven.
+    if !publication.durable {
+        return Ok(TaskResult {
+            task: "loose-objects".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: old_loose.len(),
+            refs_packed: 0,
+            packs_repacked: 0,
+            object_index_rows_removed: 0,
+            message: format!(
+                "packed {} loose object(s); kept the loose copies because the new pack's \
+                 directory entry could not be made durable",
+                old_loose.len()
+            ),
+        });
+    }
+    drop(publish_lock);
+    let Some(_deletion_lock) = crate::internal::maintenance_lock::MaintenanceLock::try_exclusive(
+        &crate::utils::util::storage_path(),
+        crate::internal::maintenance_lock::DELETION_LOCK_WAIT,
+    )?
+    else {
+        return Ok(TaskResult {
+            task: "loose-objects".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: old_loose.len(),
+            refs_packed: 0,
+            packs_repacked: 0,
+            object_index_rows_removed: 0,
+            message: format!(
+                "packed {} loose object(s), then deferred removing the loose copies: another \
+                 command is still publishing objects in this repository. The objects are safe \
+                 in the new pack — re-run when it finishes.",
+                old_loose.len()
+            ),
+        });
+    };
+
+    // lore.md 2.3 / W0 deletion hard gate, evaluated UNDER the exclusive
+    // hold: this is a DELETION entry point, so it passes the same borrower
+    // gate as `gc` and `repack -d`. Packing the objects first does not make
+    // the unlink safe for a BORROWER — a borrowing repository resolves loose
+    // objects through the alternates path, and its reachability is not part
+    // of this store's walk.
+    if let Err(refusal) = crate::internal::alternates::ensure_no_live_borrowers(
+        "remove loose objects after packing them",
+        StableErrorCode::ConflictOperationBlocked,
+    ) {
+        // A live borrower is a known state this task may report as
+        // skipped. An UNREADABLE registration is a fault, and folding
+        // it into a successful run would hide the one condition that
+        // makes deletion unsafe for reasons nobody can see.
+        if refusal.stable_code() != StableErrorCode::ConflictOperationBlocked {
+            return Err(refusal);
+        }
+        return Ok(TaskResult {
+            task: "loose-objects".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: old_loose.len(),
+            refs_packed: 0,
+            packs_repacked: 0,
+            object_index_rows_removed: 0,
+            message: format!(
+                "packed {} loose object(s); skipped removing the loose copies: {refusal}",
+                old_loose.len()
+            ),
+        });
+    }
+
     // Remove the loose objects now that they live in the pack.
     for (hash_str, obj_path) in &old_loose {
         if let Err(e) = fs::remove_file(obj_path) {
@@ -710,7 +1200,8 @@ async fn run_loose_objects(
     }
     let _ = cleanup_empty_dirs(&path::objects());
     let packed = hashes.len();
-    let pack_name = pack_path
+    let pack_name = publication
+        .path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "the new pack".to_string());
@@ -854,7 +1345,19 @@ async fn run_incremental_repack(
     // on objects that live only in this store's OLD packs yet are not in
     // THIS repository's root set — consolidating and deleting those packs
     // would corrupt the borrower. Refuse while live borrowers exist.
-    if !dry_run && crate::internal::alternates::has_live_borrowers(&path::objects()) {
+    if !dry_run
+        && let Err(refusal) = crate::internal::alternates::ensure_no_live_borrowers(
+            "consolidate and delete old packs",
+            StableErrorCode::ConflictOperationBlocked,
+        )
+    {
+        // A live borrower is a known state this task may report as skipped.
+        // An UNREADABLE registration is a fault, and folding it into a
+        // successful run would hide the one condition that makes deletion
+        // unsafe for reasons nobody can see.
+        if refusal.stable_code() != StableErrorCode::ConflictOperationBlocked {
+            return Err(refusal);
+        }
         return Ok(TaskResult {
             task: "incremental-repack".to_string(),
             success: true,
@@ -863,9 +1366,7 @@ async fn run_incremental_repack(
             refs_packed: 0,
             packs_repacked: 0,
             object_index_rows_removed: 0,
-            message: "skipped repack: this store is shared (other repos borrow from it via \
-                      alternates); have borrowers run 'libra alternates remove' first"
-                .to_string(),
+            message: format!("skipped repack: {refusal}"),
         });
     }
     let pack_dir = repo_path.join("objects").join("pack");
@@ -934,17 +1435,24 @@ async fn run_incremental_repack(
     // packs would drop every packed-only object. `collect_reachable_objects`
     // walks refs/reflogs/index through storage (which reads the packs too), so
     // the new pack contains all reachable objects before the old packs go.
+    // §C.4.3: writing the consolidated pack PUBLISHES — the pack becomes the
+    // only home of objects it holds — so this half runs under the shared
+    // hold, like any other publisher. It is released before the deletion
+    // phase takes the exclusive one (a shared hold cannot be upgraded).
+    let publish_lock = crate::internal::maintenance_lock::MaintenanceLock::shared(
+        &crate::utils::util::storage_path(),
+    )?;
     let storage = ClientStorage::init(path::objects());
     let all_hashes: Vec<ObjectHash> = collect_reachable_objects(&storage)
         .await?
         .into_iter()
         .collect();
 
-    let new_pack_path =
+    let new_publication =
         match pack_writer::write_pack_with_index(&storage, &all_hashes, &pack_dir, get_hash_kind())
             .await
         {
-            Ok(Some(path)) => path,
+            Ok(Some(publication)) => publication,
             Ok(None) => {
                 return Ok(TaskResult {
                     task: "incremental-repack".to_string(),
@@ -971,21 +1479,113 @@ async fn run_incremental_repack(
     // second-pass root must already be inside the consolidated set, else a
     // concurrent writer moved underneath us and deletion aborts (the new
     // pack is redundant-but-harmless; re-run when quiescent).
-    let first_pass: HashSet<ObjectHash> = all_hashes.iter().copied().collect();
-    let second_pass = collect_reachable_objects(&storage).await?;
-    if !second_pass.is_subset(&first_pass) {
+    //
+    // §C.4.3 writer-vs-deleter: this second pass and the pack deletion below
+    // run under the repository maintenance lock, held EXCLUSIVELY. Verifying
+    // and then deleting without it leaves a window in which a writer can
+    // repoint a ref — or stage an index entry, which never reaches SQLite at
+    // all — at an object that lives only in an aged old pack: absent from
+    // the consolidated pack, and gone once that pack is unlinked. Every
+    // publisher holds the same lock shared for its whole run, so within this
+    // section no publication can be in flight.
+    // The consolidated pack is about to become the only home of everything
+    // the old packs held, so its NAME must be durable before they are
+    // unlinked. Keeping them costs disk, not data.
+    if !new_publication.durable {
         return Ok(TaskResult {
             task: "incremental-repack".to_string(),
             success: true,
             objects_removed: 0,
-            objects_packed: 0,
+            objects_packed: all_hashes.len(),
             refs_packed: 0,
             packs_repacked: 0,
             object_index_rows_removed: 0,
-            message: "aborted old-pack deletion: concurrent repository activity created new \
-                      reachability roots during the repack; the consolidated pack was kept \
-                      (harmless duplicate data) — re-run when the repository is quiescent"
-                .to_string(),
+            message: format!(
+                "consolidated {} object(s) into a new pack, then kept the {} old pack(s): the \
+                 new pack's directory entry could not be made durable",
+                all_hashes.len(),
+                packs.len()
+            ),
+        });
+    }
+    drop(publish_lock);
+    let Some(_repack_deletion_lock) =
+        crate::internal::maintenance_lock::MaintenanceLock::try_exclusive(
+            &crate::utils::util::storage_path(),
+            crate::internal::maintenance_lock::DELETION_LOCK_WAIT,
+        )?
+    else {
+        // The pack WAS written, so the counts must say so: reporting
+        // `objects_packed: 0` here would make the structured output false
+        // about disk state. Only the old-pack deletion is deferred.
+        return Ok(TaskResult {
+            task: "incremental-repack".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: all_hashes.len(),
+            refs_packed: 0,
+            packs_repacked: 0,
+            object_index_rows_removed: 0,
+            message: format!(
+                "consolidated {} object(s) into a new pack, then deferred deleting the {} old \
+                 pack(s): another command is still publishing objects in this repository. The \
+                 consolidated pack was kept (harmless duplicate data) — re-run when it \
+                 finishes.",
+                all_hashes.len(),
+                packs.len()
+            ),
+        });
+    };
+    if let Err(refusal) = crate::internal::alternates::ensure_no_live_borrowers(
+        "delete old pack files",
+        StableErrorCode::ConflictOperationBlocked,
+    ) {
+        // A live borrower is a known state this task may report as
+        // skipped. An UNREADABLE registration is a fault, and folding
+        // it into a successful run would hide the one condition that
+        // makes deletion unsafe for reasons nobody can see.
+        if refusal.stable_code() != StableErrorCode::ConflictOperationBlocked {
+            return Err(refusal);
+        }
+        // Re-checked under the exclusive hold, for the same reason `gc` does.
+        return Ok(TaskResult {
+            task: "incremental-repack".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: all_hashes.len(),
+            refs_packed: 0,
+            packs_repacked: 0,
+            object_index_rows_removed: 0,
+            message: format!(
+                "consolidated {} object(s) into a new pack; skipped deleting the old packs: \
+                 {refusal}",
+                all_hashes.len()
+            ),
+        });
+    }
+    let repack_db = db::get_db_conn_instance().await;
+    let first_pass: HashSet<ObjectHash> = all_hashes.iter().copied().collect();
+    let second_pass = collect_reachable_objects_with_conn(&storage, &repack_db).await?;
+    if !second_pass.is_subset(&first_pass) {
+        // Same honesty rule as the contention path above: the consolidated
+        // pack exists on disk, so the counts must say so. Only the old-pack
+        // deletion was abandoned.
+        return Ok(TaskResult {
+            task: "incremental-repack".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: all_hashes.len(),
+            refs_packed: 0,
+            packs_repacked: 0,
+            object_index_rows_removed: 0,
+            message: format!(
+                "consolidated {} object(s) into a new pack, then aborted deleting the {} old \
+                 pack(s): concurrent repository activity created new reachability roots during \
+                 the repack. The consolidated pack was kept (harmless duplicate data) — re-run \
+                 when the repository is quiescent.",
+                all_hashes.len(),
+                packs.len()
+            ),
         });
     }
 
@@ -1021,8 +1621,12 @@ async fn run_incremental_repack(
         let idx_path = old_pack.with_extension("idx");
         let _ = fs::remove_file(idx_path);
     }
+    // `_repack_deletion_lock` closes the exclusion window when this function
+    // returns — after the last unlink above, and on the early-return and
+    // unwind paths too.
     let repacked = all_hashes.len();
-    let new_pack_name = new_pack_path
+    let new_pack_name = new_publication
+        .path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "the consolidated pack".to_string());
@@ -1647,12 +2251,35 @@ async fn stop(output: &OutputConfig) -> CliResult<()> {
 pub(crate) async fn collect_reachable_objects(
     storage: &ClientStorage,
 ) -> CliResult<HashSet<ObjectHash>> {
-    let mut reachable: HashSet<ObjectHash> = HashSet::new();
     let db_conn = db::get_db_conn_instance().await;
+    collect_reachable_objects_with_conn(storage, &db_conn).await
+}
+
+/// [`collect_reachable_objects`] on a caller-supplied connection.
+///
+/// §C.4.3 writer-vs-deleter: the deletion phase runs this INSIDE its own
+/// transaction. Because the repository database uses SQLite's rollback
+/// journal, an open read transaction holds a SHARED lock, and a concurrent
+/// ref publication cannot commit until it is released — so no reference can
+/// appear between this revalidation and the unlink that follows it. Two
+/// historical scans narrow the window; only this closes it.
+pub(crate) async fn collect_reachable_objects_with_conn<C>(
+    storage: &ClientStorage,
+    db_conn: &C,
+) -> CliResult<HashSet<ObjectHash>>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let mut reachable: HashSet<ObjectHash> = HashSet::new();
+    // §C.4.3 Boundary: loaded ONCE for the whole walk. A shallow clone's
+    // grafts stop parent traversal instead of demanding parents it was never
+    // given; malformed metadata fails closed before anything is pruned.
+    let boundaries = shallow_boundaries()?;
+    let boundaries = &boundaries;
 
     // Collect from refs
     let refs = reference::Entity::find()
-        .all(&db_conn)
+        .all(db_conn)
         .await
         .map_err(|e| CliError::fatal(format!("failed to load refs: {e}")))?;
 
@@ -1670,13 +2297,13 @@ pub(crate) async fn collect_reachable_objects(
             // hash is already in the set, so pre-inserting would stop it from
             // descending into the commit's tree — leaving reachable trees/blobs
             // looking unreachable (gc could then prune live objects).
-            walk_reachable(&hash, storage, &mut reachable)?;
+            walk_reachable(&hash, storage, boundaries, &mut reachable)?;
         }
     }
 
     // Collect from reflogs
     let reflogs = reflog::Entity::find()
-        .all(&db_conn)
+        .all(db_conn)
         .await
         .map_err(|e| CliError::fatal(format!("failed to load reflogs: {e}")))?;
 
@@ -1697,7 +2324,7 @@ pub(crate) async fn collect_reachable_objects(
             // into the commit's tree instead of returning early. Both sides of
             // every reflog entry are roots: the oldest retained `old_oid` need
             // not occur as another row's `new_oid`.
-            walk_reachable(&hash, storage, &mut reachable)?;
+            walk_reachable(&hash, storage, boundaries, &mut reachable)?;
         }
     }
 
@@ -1726,7 +2353,7 @@ pub(crate) async fn collect_reachable_objects(
                 .transpose()?;
         let rebase_autostash = crate::command::rebase::held_autostash_oid_in_gitdir(&gitdir)?;
         for held in [merge_autostash, rebase_autostash].into_iter().flatten() {
-            walk_reachable(&held, storage, &mut reachable)?;
+            walk_reachable(&held, storage, boundaries, &mut reachable)?;
         }
     }
 
@@ -1736,13 +2363,14 @@ pub(crate) async fn collect_reachable_objects(
     // needs. Every row of every worktree scope is a root; a row that cannot
     // be read or carries an invalid OID fails closed (callers never prune
     // against a partial root set).
-    collect_sequencer_state_roots(&db_conn, storage, &mut reachable).await?;
+    collect_sequencer_state_roots(db_conn, storage, boundaries, &mut reachable).await?;
 
     // W2 §C.4.3 typed inventory: note blobs, undo view snapshots, and AI
     // capture checkpoints anchor object-store OIDs nowhere else — plus the
-    // worktree-local merge/revert/rebase-aux sidecars and FETCH_HEAD tips.
-    collect_registered_store_roots(&db_conn, storage, &mut reachable).await?;
-    collect_worktree_sidecar_roots(storage, &mut reachable)?;
+    // worktree-local merge/revert/rebase-aux sidecars (NOT FETCH_HEAD —
+    // §C.4.3 item 13 classifies it as a non-root).
+    collect_registered_store_roots(db_conn, storage, boundaries, &mut reachable).await?;
+    collect_worktree_sidecar_roots(storage, boundaries, &mut reachable)?;
 
     // Ordinary stashes are file-backed rather than SQLite reference rows, and
     // older entries live only in logs/refs/stash. Trace the full reflog, not
@@ -1752,7 +2380,7 @@ pub(crate) async fn collect_reachable_objects(
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
     for oid in stash_roots {
-        walk_reachable(&oid, storage, &mut reachable)?;
+        walk_reachable(&oid, storage, boundaries, &mut reachable)?;
     }
 
     // Collect from EVERY worktree's index — every stage, not just stage 0, so a
@@ -1879,10 +2507,102 @@ fn worktree_gitdir_roots() -> CliResult<Vec<std::path::PathBuf>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcSourceStatus {
     /// Contributes reachability roots in `collect_reachable_objects`.
+    /// Objects reachable from here are KEPT.
+    ///
+    /// (`TracedRoot` is the historical spelling of §C.4.3's
+    /// `ReachabilityRoot`; kept as the variant name so the DB inventory rows
+    /// below and their guard test do not all churn.)
     TracedRoot,
+    /// §C.4.3 `AntiRoot`: objects listed here are DELIBERATELY absent, and
+    /// must never be resurrected by heal, hydrate, or an alternate. Missing
+    /// payload is the expected state, not corruption.
+    AntiRoot,
+    /// §C.4.3 `Boundary`: a stop-list for the traversal. The boundary object
+    /// itself is kept; the graph beyond it does not exist in this clone and
+    /// must not be demanded.
+    Boundary,
+    /// §C.4.3 `IndexOnly`: a catalogue/visibility artifact, not the object.
+    /// It keeps nothing alive, and it must be invalidated in step with the
+    /// deletion it describes.
+    IndexOnly,
     /// Deliberately NOT a root, with the reason documented alongside.
     NonRoot,
 }
+
+/// §C.4.3: where a source lives. File-backed sources are inventoried
+/// alongside the DB columns because the four semantic kinds cut across both
+/// — a shallow `Boundary` and an obliteration `AntiRoot` are files, and a
+/// classification model that only knows about SQLite columns cannot express
+/// either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcSourceOrigin {
+    /// A SQLite column: `(table, column)`.
+    Column,
+    /// A file or directory under the repository storage.
+    File,
+}
+
+/// One inventoried source: what it is, where it lives, how GC treats it.
+#[derive(Debug, Clone, Copy)]
+pub struct GcObjectSource {
+    pub origin: GcSourceOrigin,
+    /// Table name for `Column` origins; a path pattern for `File` origins.
+    pub location: &'static str,
+    /// Column name for `Column` origins; `""` for files.
+    pub column: &'static str,
+    pub status: GcSourceStatus,
+    pub note: &'static str,
+}
+
+/// §C.4.3: the FILE-backed half of the inventory. Each entry names the
+/// collector or gate that implements its classification, so a reader can
+/// check the claim rather than trust it.
+pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/merge-autostash.json, merge-state.json, revert-state.json,                    rebase-aux.json",
+        column: "",
+        status: GcSourceStatus::TracedRoot,
+        note: "collect_worktree_sidecar_roots — held autostash and in-progress operation state, across every worktree scope; corrupt JSON fails closed",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: ".libra/sessions/agent-runs/<id>/manifest.json",
+        column: "",
+        status: GcSourceStatus::TracedRoot,
+        note: "collect_agent_run_manifest_roots — findings_oid and manual_attach[].oid parsed structurally and bounded; a missing manifest on a young run DEFERS the prune, an absent object fails closed",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: ".libra/shallow",
+        column: "",
+        status: GcSourceStatus::Boundary,
+        note: "shallow_boundaries — parent traversal STOPS at these commits; the commits themselves are kept and their absent parents are never demanded. Unparseable metadata fails closed",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/FETCH_HEAD",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        note: "§C.4.3 item 13: explicitly NOT a root. fetch records advertised tips that are already up to date and have no local destination, so rooting them would pin objects nothing references. Safety comes from the writer-vs-deleter grace window (PRUNE_GRACE_SECS), not from root registration",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: ".libra/gc-prune-candidates.json",
+        column: "",
+        status: GcSourceStatus::IndexOnly,
+        note: "read_prune_candidate_ledger — the writer-vs-deleter quarantine ledger: OIDs seen \
+               unreachable, with when. Keeps nothing alive and confers no authority; losing it \
+               costs one delayed prune cycle, never an object",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<objects>/info/alternates, <objects>/info/borrowers",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        note: "alternates::ensure_no_live_borrowers — a live borrower blocks every deletion entry point outright, rather than contributing roots this store cannot see",
+    },
+];
 
 /// `(table, column, status, note)` — inventory version 1 (W2 §C.4.3).
 pub const GC_OBJECT_SOURCE_INVENTORY: &[(&str, &str, GcSourceStatus, &str)] = &[
@@ -2070,31 +2790,31 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[(&str, &str, GcSourceStatus, &str)] = &[
     (
         "object_index",
         "o_id",
-        GcSourceStatus::NonRoot,
+        GcSourceStatus::IndexOnly,
         "catalog of what the store holds; derivable, never an anchor",
     ),
     (
         "working_dirty",
         "head_oid",
-        GcSourceStatus::NonRoot,
+        GcSourceStatus::IndexOnly,
         "advisory freshness key; the commit is ref/reflog-anchored",
     ),
     (
         "working_dirty_meta",
         "head_oid",
-        GcSourceStatus::NonRoot,
+        GcSourceStatus::IndexOnly,
         "advisory freshness key; the commit is ref/reflog-anchored",
     ),
     (
         "revision_ordinal",
         "oid",
-        GcSourceStatus::NonRoot,
+        GcSourceStatus::IndexOnly,
         "derivable ordinal cache over ref history; rebuilt on demand",
     ),
     (
         "revision_ordinal_meta",
         "tip_oid",
-        GcSourceStatus::NonRoot,
+        GcSourceStatus::IndexOnly,
         "cache validity key (the tip is ref-anchored); rebuilt on demand",
     ),
     (
@@ -2106,7 +2826,7 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[(&str, &str, GcSourceStatus, &str)] = &[
     (
         "object_obliteration",
         "oid",
-        GcSourceStatus::NonRoot,
+        GcSourceStatus::AntiRoot,
         "intentional-absence tombstone — the opposite of a root",
     ),
     (
@@ -2122,12 +2842,13 @@ pub const GC_OBJECT_SOURCE_INVENTORY: &[(&str, &str, GcSourceStatus, &str)] = &[
 /// and AI capture checkpoints. Missing tables (pre-migration DBs) are
 /// tolerated; unreadable rows or invalid OIDs fail CLOSED (callers must
 /// never prune against a partial root set).
-async fn collect_registered_store_roots(
-    db: &sea_orm::DatabaseConnection,
+async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
+    db: &C,
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    use sea_orm::{DbBackend, Statement};
     let stmt_of = |sql: &'static str| Statement::from_string(DbBackend::Sqlite, sql.to_string());
     let missing_table = |err: &sea_orm::DbErr| err.to_string().contains("no such table");
     let is_null_oid = |oid: &str| !oid.is_empty() && oid.chars().all(|c| c == '0');
@@ -2229,11 +2950,11 @@ async fn collect_registered_store_roots(
                                     ))
                                     .with_stable_code(StableErrorCode::RepoCorrupt)
                                 })?;
-                                walk_reachable(&hash, storage, reachable)?;
+                                walk_reachable(&hash, storage, boundaries, reachable)?;
                             }
                             CellMode::OidIfParses => {
                                 if let Some(hash) = parse_object_hash(trimmed) {
-                                    walk_reachable(&hash, storage, reachable)?;
+                                    walk_reachable(&hash, storage, boundaries, reachable)?;
                                 }
                             }
                         }
@@ -2276,7 +2997,7 @@ async fn collect_registered_store_roots(
             ))
             .with_stable_code(StableErrorCode::InternalInvariant)
         })?;
-        walk_json_value_oids(value, storage, reachable)?;
+        walk_json_value_oids(value, storage, boundaries, reachable)?;
     }
     match db
         .query_all(stmt_of(
@@ -2292,7 +3013,7 @@ async fn collect_registered_store_roots(
                     ))
                     .with_stable_code(StableErrorCode::RepoCorrupt)
                 })?;
-                walk_payload_oids(&value, storage, reachable)?;
+                walk_payload_oids(&value, storage, boundaries, reachable)?;
             }
         }
         Err(err) if missing_table(&err) => {}
@@ -2309,11 +3030,12 @@ async fn collect_registered_store_roots(
 /// W2 §C.4.3: roots from WORKTREE-LOCAL sidecars beyond the held autostash —
 /// an in-progress merge/revert (`merge-state.json` / `revert-state.json`,
 /// scanned leniently for OID-shaped strings like the sequencer payloads) and
-/// `FETCH_HEAD` (whose fetched tips may not be anchored by any ref yet).
+/// `FETCH_HEAD` is deliberately EXCLUDED (§C.4.3 item 13).
 /// Every registered worktree's gitdir is enumerated; unreadable sidecars
 /// fail CLOSED.
 fn collect_worktree_sidecar_roots(
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
     for gitdir in worktree_gitdir_roots()? {
@@ -2326,6 +3048,7 @@ fn collect_worktree_sidecar_roots(
                         &format!("sidecar '{}'", path.display()),
                         &text,
                         storage,
+                        boundaries,
                         reachable,
                     )?
                 }
@@ -2339,62 +3062,15 @@ fn collect_worktree_sidecar_roots(
                 }
             }
         }
-        let fetch_head = gitdir.join("FETCH_HEAD");
-        match std::fs::read_to_string(&fetch_head) {
-            Ok(text) => {
-                for line in text.lines() {
-                    let Some(first) = line.split_whitespace().next() else {
-                        continue;
-                    };
-                    let hash = parse_object_hash(first).ok_or_else(|| {
-                        CliError::fatal(format!(
-                            "FETCH_HEAD '{}' contains invalid object id '{first}' while \
-                             computing GC roots",
-                            fetch_head.display()
-                        ))
-                        .with_stable_code(StableErrorCode::RepoCorrupt)
-                    })?;
-                    // A stale FETCH_HEAD may name a tip this store never
-                    // kept — genuinely-absent is skippable, but a PROBE
-                    // failure must fail closed (`exist()` folds read errors
-                    // into `false`, which would silently drop a live root).
-                    match storage.get_object_type(&hash) {
-                        Ok(_) => walk_reachable(&hash, storage, reachable)?,
-                        Err(git_internal::errors::GitError::ObjectNotFound(_))
-                            if crate::utils::read_policy::read_policy()
-                                != crate::utils::read_policy::ReadPolicy::LocalOnly =>
-                        {
-                            // A genuinely-stale tip is skippable — but only
-                            // when the read policy could actually SEE every
-                            // tier (LocalOnly encodes "remote read forbidden"
-                            // as NotFound, which must not pass as absence).
-                        }
-                        Err(git_internal::errors::GitError::ObjectNotFound(_)) => {
-                            return Err(CliError::fatal(format!(
-                                "cannot verify FETCH_HEAD GC root {hash} under the local-only \
-                                 read policy (a remote-tier object reports NotFound here)"
-                            ))
-                            .with_stable_code(StableErrorCode::IoReadFailed)
-                            .with_hint("re-run without --offline / LIBRA_READ_POLICY=local"));
-                        }
-                        Err(error) => {
-                            return Err(CliError::fatal(format!(
-                                "failed to probe FETCH_HEAD GC root {hash}: {error}"
-                            ))
-                            .with_stable_code(StableErrorCode::IoReadFailed));
-                        }
-                    }
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CliError::fatal(format!(
-                    "failed to read FETCH_HEAD GC root '{}': {error}",
-                    fetch_head.display()
-                ))
-                .with_stable_code(StableErrorCode::IoReadFailed));
-            }
-        }
+        // §C.4.3 item 13: `FETCH_HEAD` is explicitly NOT a reachability
+        // root. `fetch` records the advertised tip of every ref it
+        // negotiated — INCLUDING refs that were already up to date and have
+        // no local destination — so rooting it pins objects that nothing in
+        // this repository references, indefinitely, on every fetch. Git does
+        // not root it either. What keeps a just-fetched object alive between
+        // its write and the ref update is the writer-vs-deleter grace window
+        // (PRUNE_GRACE_SECS), not root registration; see the NonRoot entry
+        // for it in GC_OBJECT_FILE_SOURCE_INVENTORY.
     }
     // `refs/replace/<original-oid>` files (repository-shared): the CONTENT
     // names the replacement object — anchored nowhere else. Both sides are
@@ -2435,8 +3111,8 @@ fn collect_worktree_sidecar_roots(
                     ))
                     .with_stable_code(StableErrorCode::RepoCorrupt)
                 })?;
-                walk_reachable(&original, storage, reachable)?;
-                walk_reachable(&replacement, storage, reachable)?;
+                walk_reachable(&original, storage, boundaries, reachable)?;
+                walk_reachable(&replacement, storage, boundaries, reachable)?;
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2450,41 +3126,42 @@ fn collect_worktree_sidecar_roots(
     }
 
     // Review/investigate run manifests (`.libra/sessions/agent-runs/<id>/
-    // manifest.json`) persist findings/attachment blob OIDs anchored nowhere
-    // else — lenient JSON scan keeps them alive. (The full findings
-    // reachability contract is PD-04; this keep-alive floor ships with the
-    // prune-skip lift so nothing regresses meanwhile.)
+    // manifest.json`) hold findings/attachment blob OIDs anchored nowhere
+    // else, so they are MANDATORY reachability roots (§C.4.3): a manifest
+    // this walk cannot read completely means roots it cannot enumerate, and
+    // pruning past that deletes a run's findings.
+    collect_agent_run_manifest_roots(storage, boundaries, reachable)?;
+
+    Ok(())
+}
+
+/// Mandatory `ReachabilityRoot` source: review/investigate run manifests.
+///
+/// Everything here is fail-CLOSED and bounded, because the previous lenient
+/// scan had three ways to lose a run's only roots silently: a missing
+/// `manifest.json` (which is exactly what an interrupted run leaves behind)
+/// was skipped; the generic JSON walker skipped any OID whose object it could
+/// not find; and both the directory enumeration and the JSON walk were
+/// unbounded, so a large or adversarial tree could stall the prune with no
+/// deadline.
+fn collect_agent_run_manifest_roots(
+    storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
+    reachable: &mut HashSet<ObjectHash>,
+) -> CliResult<()> {
+    /// Enough for any real installation; past this the scan is not bounded
+    /// and prune must not proceed on a partial root set.
+    const MAX_RUN_DIRS: usize = 50_000;
+    /// A manifest is a small JSON document. A larger one is either corrupt
+    /// or not ours.
+    const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+    /// Attachment lists are human-scale.
+    const MAX_ATTACHMENTS: usize = 10_000;
+
     let runs_dir = crate::utils::util::storage_path().join("sessions/agent-runs");
-    match std::fs::read_dir(&runs_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry.map_err(|error| {
-                    CliError::fatal(format!(
-                        "failed to enumerate agent-run GC roots in '{}': {error}",
-                        runs_dir.display()
-                    ))
-                    .with_stable_code(StableErrorCode::IoReadFailed)
-                })?;
-                let manifest = entry.path().join("manifest.json");
-                match std::fs::read_to_string(&manifest) {
-                    Ok(text) => walk_strict_json_oids(
-                        &format!("agent-run manifest '{}'", manifest.display()),
-                        &text,
-                        storage,
-                        reachable,
-                    )?,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(CliError::fatal(format!(
-                            "failed to read agent-run manifest GC root '{}': {error}",
-                            manifest.display()
-                        ))
-                        .with_stable_code(StableErrorCode::IoReadFailed));
-                    }
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(CliError::fatal(format!(
                 "failed to enumerate agent-run GC roots in '{}': {error}",
@@ -2492,17 +3169,207 @@ fn collect_worktree_sidecar_roots(
             ))
             .with_stable_code(StableErrorCode::IoReadFailed));
         }
+    };
+
+    let mut scanned = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CliError::fatal(format!(
+                "failed to enumerate agent-run GC roots in '{}': {error}",
+                runs_dir.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        scanned += 1;
+        if scanned > MAX_RUN_DIRS {
+            return Err(CliError::fatal(format!(
+                "more than {MAX_RUN_DIRS} agent-run directories in '{}'; the mandatory root                  scan is no longer bounded, so pruning would proceed on a partial root set",
+                runs_dir.display()
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("run `libra agent clean` to retire completed runs, then retry"));
+        }
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let manifest = dir.join("manifest.json");
+        let text = match std::fs::metadata(&manifest) {
+            Ok(meta) => {
+                if meta.len() > MAX_MANIFEST_BYTES {
+                    return Err(CliError::fatal(format!(
+                        "agent-run manifest '{}' is {} bytes, past the {MAX_MANIFEST_BYTES}-byte                          cap; its roots cannot be enumerated safely",
+                        manifest.display(),
+                        meta.len()
+                    ))
+                    .with_stable_code(StableErrorCode::RepoCorrupt));
+                }
+                std::fs::read_to_string(&manifest).map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to read agent-run manifest GC root '{}': {error}",
+                        manifest.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // An interrupted run leaves its directory without a manifest
+                // while its blobs already exist. Treating that as "no roots"
+                // is what deletes them — and AGE does not make it safe: an
+                // abandoned run's blobs are exactly as unlisted after a day
+                // as after a minute, so the old grace-bounded `continue`
+                // turned "I cannot enumerate this run's roots" into "this run
+                // has none" for every directory older than the window.
+                //
+                // A mandatory root that cannot be read fails the walk closed.
+                // Retiring the directory is an explicit user action
+                // (`libra agent clean`, which takes manifest-less runs past
+                // the retention cutoff), so this can never wedge pruning
+                // forever — it just refuses to guess.
+                return Err(CliError::fatal(format!(
+                    "agent-run directory '{}' has no manifest, so the objects it may still own \
+                     cannot be enumerated; pruning would proceed on a partial root set",
+                    dir.display()
+                ))
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint(
+                    "re-run once the agent run completes; if the run was interrupted and will \
+                     not resume, retire it with `libra agent clean` and try again",
+                ));
+            }
+            Err(error) => {
+                return Err(CliError::fatal(format!(
+                    "failed to stat agent-run manifest GC root '{}': {error}",
+                    manifest.display()
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed));
+            }
+        };
+
+        let document: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+            CliError::fatal(format!(
+                "agent-run manifest '{}' holds corrupt JSON while computing GC roots: {error}",
+                manifest.display()
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+        // Well-formed JSON is not a well-formed manifest. `[]`, `null` and
+        // `"…"` all parse, and every `document.get(...)` below then returns
+        // `None` — which reads as "this run declares no roots" and prunes the
+        // blob it owned. The shape is part of the contract.
+        if !document.is_object() {
+            return Err(CliError::fatal(format!(
+                "agent-run manifest '{}' is not a JSON object, so its roots cannot be read",
+                manifest.display()
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(
+                "restore or delete the manifest (`libra agent doctor` reports what a run \
+                 should contain), then re-run",
+            ));
+        }
+
+        // Structural, not a generic scan: these two fields ARE the contract.
+        let mut oids: Vec<String> = Vec::new();
+        // A FINALIZED run always writes the key, even when there were no
+        // findings (then it is null). A finished manifest missing the key
+        // entirely has lost a root, not declined to have one — and the blob
+        // it pointed at is exactly what a prune would take next.
+        let finalized = document
+            .get("terminal_state")
+            .is_some_and(|state| !state.is_null());
+        match document.get("findings_oid") {
+            Some(value) if value.is_null() => {}
+            Some(value) => {
+                let oid = value.as_str().ok_or_else(|| {
+                    CliError::fatal(format!(
+                        "agent-run manifest '{}' has a non-string findings_oid",
+                        manifest.display()
+                    ))
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                oids.push(oid.to_string());
+            }
+            None if finalized => {
+                return Err(CliError::fatal(format!(
+                    "agent-run manifest '{}' is finalized but has no findings_oid field; its                      evidence blob has no root and pruning would take it",
+                    manifest.display()
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run `libra agent doctor` to reconcile the run manifests"));
+            }
+            None => {}
+        }
+        if let Some(value) = document.get("manual_attach")
+            && !value.is_null()
+        {
+            let list = value.as_array().ok_or_else(|| {
+                CliError::fatal(format!(
+                    "agent-run manifest '{}' has a non-array manual_attach",
+                    manifest.display()
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            if list.len() > MAX_ATTACHMENTS {
+                return Err(CliError::fatal(format!(
+                    "agent-run manifest '{}' lists {} attachments, past the                      {MAX_ATTACHMENTS} cap",
+                    manifest.display(),
+                    list.len()
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt));
+            }
+            for item in list {
+                // An attachment entry exists BECAUSE something was attached.
+                // Missing, null or non-string here is corruption — skipping
+                // it would quietly surrender that attachment's only root.
+                let oid = item
+                    .get("oid")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "agent-run manifest '{}' has a manual_attach entry without a usable                              oid; its attachment has no root and pruning would take it",
+                            manifest.display()
+                        ))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                        .with_hint("run `libra agent doctor` to reconcile the run manifests")
+                    })?;
+                oids.push(oid.to_string());
+            }
+        }
+
+        for oid in oids {
+            let hash = parse_object_hash(&oid).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "agent-run manifest '{}' names '{oid}', which is not a valid object id",
+                    manifest.display()
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            // A mandatory root whose object is ABSENT is not "nothing to
+            // keep alive" — it means the run's evidence is already gone, and
+            // continuing to prune would compound the damage.
+            if !storage.exist(&hash) {
+                return Err(CliError::fatal(format!(
+                    "agent-run manifest '{}' names object {hash}, which is not in the store",
+                    manifest.display()
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+                .with_hint("run `libra agent doctor` to reconcile the run manifests"));
+            }
+            walk_reachable(&hash, storage, boundaries, reachable)?;
+        }
     }
 
     Ok(())
 }
 
-async fn collect_sequencer_state_roots(
-    db: &sea_orm::DatabaseConnection,
+async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
+    db: &C,
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
-    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    use sea_orm::{DbBackend, Statement};
 
     let is_null_oid = |oid: &str| !oid.is_empty() && oid.chars().all(|c| c == '0');
     let stmt_of = |sql: &'static str| Statement::from_string(DbBackend::Sqlite, sql.to_string());
@@ -2514,6 +3381,7 @@ async fn collect_sequencer_state_roots(
         column: &str,
         raw: &str,
         storage: &ClientStorage,
+        boundaries: &HashSet<ObjectHash>,
         reachable: &mut HashSet<ObjectHash>,
     ) -> CliResult<()> {
         let trimmed = raw.trim();
@@ -2527,7 +3395,7 @@ async fn collect_sequencer_state_roots(
             ))
             .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
-        walk_reachable(&hash, storage, reachable)
+        walk_reachable(&hash, storage, boundaries, reachable)
     }
 
     // ── sequence_state: head_orig / current_oid / todo (newline list) /
@@ -2546,13 +3414,27 @@ async fn collect_sequencer_state_roots(
                 let payload: String = row.try_get_by_index(4).map_err(state_row_error)?;
                 for cell in [&head_orig, &current_oid] {
                     if !is_null_oid(cell) {
-                        walk_cell("sequence_state", "oid", cell, storage, reachable)?;
+                        walk_cell(
+                            "sequence_state",
+                            "oid",
+                            cell,
+                            storage,
+                            boundaries,
+                            reachable,
+                        )?;
                     }
                 }
                 for line in todo.lines() {
-                    walk_cell("sequence_state", "todo", line, storage, reachable)?;
+                    walk_cell(
+                        "sequence_state",
+                        "todo",
+                        line,
+                        storage,
+                        boundaries,
+                        reachable,
+                    )?;
                 }
-                walk_payload_oids(&payload, storage, reachable)?;
+                walk_payload_oids(&payload, storage, boundaries, reachable)?;
             }
         }
         Err(err) if missing_table(&err) => {}
@@ -2577,17 +3459,31 @@ async fn collect_sequencer_state_roots(
             for row in rows {
                 for (idx, column) in [(1, "onto"), (2, "orig_head"), (3, "current_head")] {
                     let cell: String = row.try_get_by_index(idx).map_err(state_row_error)?;
-                    walk_cell("rebase_state", column, &cell, storage, reachable)?;
+                    walk_cell(
+                        "rebase_state",
+                        column,
+                        &cell,
+                        storage,
+                        boundaries,
+                        reachable,
+                    )?;
                 }
                 for (idx, column) in [(4, "todo"), (5, "done")] {
                     let list: String = row.try_get_by_index(idx).map_err(state_row_error)?;
                     for line in list.lines() {
-                        walk_cell("rebase_state", column, line, storage, reachable)?;
+                        walk_cell("rebase_state", column, line, storage, boundaries, reachable)?;
                     }
                 }
                 let stopped: Option<String> = row.try_get_by_index(6).map_err(state_row_error)?;
                 if let Some(stopped) = stopped {
-                    walk_cell("rebase_state", "stopped_sha", &stopped, storage, reachable)?;
+                    walk_cell(
+                        "rebase_state",
+                        "stopped_sha",
+                        &stopped,
+                        storage,
+                        boundaries,
+                        reachable,
+                    )?;
                 }
             }
         }
@@ -2610,12 +3506,26 @@ async fn collect_sequencer_state_roots(
         Ok(rows) => {
             for row in rows {
                 let orig_head: String = row.try_get_by_index(0).map_err(state_row_error)?;
-                walk_cell("bisect_state", "orig_head", &orig_head, storage, reachable)?;
+                walk_cell(
+                    "bisect_state",
+                    "orig_head",
+                    &orig_head,
+                    storage,
+                    boundaries,
+                    reachable,
+                )?;
                 for (idx, column) in [(1, "bad"), (3, "current")] {
                     let cell: Option<String> =
                         row.try_get_by_index(idx).map_err(state_row_error)?;
                     if let Some(cell) = cell {
-                        walk_cell("bisect_state", column, &cell, storage, reachable)?;
+                        walk_cell(
+                            "bisect_state",
+                            column,
+                            &cell,
+                            storage,
+                            boundaries,
+                            reachable,
+                        )?;
                     }
                 }
                 for (idx, column) in [(2, "good"), (4, "skipped")] {
@@ -2628,7 +3538,7 @@ async fn collect_sequencer_state_roots(
                         .with_stable_code(StableErrorCode::RepoCorrupt)
                     })?;
                     for oid in oids {
-                        walk_cell("bisect_state", column, &oid, storage, reachable)?;
+                        walk_cell("bisect_state", column, &oid, storage, boundaries, reachable)?;
                     }
                 }
             }
@@ -2659,6 +3569,7 @@ fn state_row_error(err: sea_orm::DbErr) -> CliError {
 fn walk_payload_oids(
     payload: &str,
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
     if payload.trim().is_empty() {
@@ -2669,7 +3580,7 @@ fn walk_payload_oids(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
         return Ok(());
     };
-    walk_json_value_oids(value, storage, reachable)
+    walk_json_value_oids(value, storage, boundaries, reachable)
 }
 
 /// STRICT variant for Libra-owned JSON documents (in-progress sidecars,
@@ -2680,6 +3591,7 @@ fn walk_strict_json_oids(
     context: &str,
     payload: &str,
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
     // An EMPTY owned document is corruption too (a truncated manifest or
@@ -2690,12 +3602,13 @@ fn walk_strict_json_oids(
         ))
         .with_stable_code(StableErrorCode::RepoCorrupt)
     })?;
-    walk_json_value_oids(value, storage, reachable)
+    walk_json_value_oids(value, storage, boundaries, reachable)
 }
 
 fn walk_json_value_oids(
     value: serde_json::Value,
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
     let mut stack = vec![value];
@@ -2707,7 +3620,7 @@ fn walk_json_value_oids(
                     // object is normal for a scan, but a PROBE failure must
                     // fail closed rather than pass as absence.
                     match storage.get_object_type(&hash) {
-                        Ok(_) => walk_reachable(&hash, storage, reachable)?,
+                        Ok(_) => walk_reachable(&hash, storage, boundaries, reachable)?,
                         Err(git_internal::errors::GitError::ObjectNotFound(_)) => {}
                         Err(error) => {
                             return Err(CliError::fatal(format!(
@@ -2726,10 +3639,42 @@ fn walk_json_value_oids(
     Ok(())
 }
 
+/// plan-20260714 §C.4.3 `Boundary`: the shallow stop-list for the roots walk.
+///
+/// A shallow clone deliberately lacks its boundary commits' parents. Without
+/// this the walk follows `parent_commit_ids` off the end of the graft and
+/// reports the absent parent as repository corruption — so `gc`, `repack`
+/// and `prune` all failed outright on every shallow clone. Malformed shallow
+/// metadata fails closed rather than silently degrading to "no boundaries",
+/// because that reading would resume the corruption report.
+fn shallow_boundaries() -> CliResult<HashSet<ObjectHash>> {
+    let raw = crate::command::fetch::read_shallow_boundaries().map_err(|error| {
+        CliError::fatal(format!(
+            "shallow metadata cannot be trusted before pruning: {error}"
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
+    raw.iter()
+        .map(|oid| {
+            parse_object_hash(oid).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "shallow metadata lists '{oid}', which is not a valid object id"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })
+        })
+        .collect()
+}
+
 /// Walk object references recursively, adding all transitive dependencies.
+///
+/// `boundaries` is the shallow stop-list (see [`shallow_boundaries`]): a
+/// commit listed there is itself preserved, but the walk does not descend
+/// into its parents, which this clone does not have.
 fn walk_reachable(
     hash: &ObjectHash,
     storage: &ClientStorage,
+    boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
     if !reachable.insert(*hash) {
@@ -2751,9 +3696,14 @@ fn walk_reachable(
                 ))
                 .with_stable_code(StableErrorCode::RepoCorrupt)
             })?;
-            walk_reachable(&commit.tree_id, storage, reachable)?;
-            for parent in &commit.parent_commit_ids {
-                walk_reachable(parent, storage, reachable)?;
+            walk_reachable(&commit.tree_id, storage, boundaries, reachable)?;
+            // §C.4.3 Boundary: STOP here on a shallow graft. The commit
+            // itself stays reachable (it is in `reachable` already); its
+            // parents are not in this clone and must not be demanded.
+            if !boundaries.contains(hash) {
+                for parent in &commit.parent_commit_ids {
+                    walk_reachable(parent, storage, boundaries, reachable)?;
+                }
             }
         }
         ObjectType::Tree => {
@@ -2764,7 +3714,7 @@ fn walk_reachable(
                 .with_stable_code(StableErrorCode::RepoCorrupt)
             })?;
             for item in &tree.tree_items {
-                walk_reachable(&item.id, storage, reachable)?;
+                walk_reachable(&item.id, storage, boundaries, reachable)?;
             }
         }
         ObjectType::Tag => {
@@ -2774,7 +3724,7 @@ fn walk_reachable(
                 ))
                 .with_stable_code(StableErrorCode::RepoCorrupt)
             })?;
-            walk_reachable(&tag.object_hash, storage, reachable)?;
+            walk_reachable(&tag.object_hash, storage, boundaries, reachable)?;
         }
         ObjectType::Blob => {}
         other => {
@@ -2909,6 +3859,50 @@ fn info_println(output: &OutputConfig, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 4 MiB ledger cap is enforced on the way OUT, not only on the way
+    /// in. Checking it only on read lets THIS run write a ledger every later
+    /// run then refuses to read — the quarantine clock stops for a file this
+    /// code created, and nothing outside the repository caused it.
+    #[test]
+    fn an_oversized_ledger_is_refused_without_replacing_the_readable_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gc-prune-candidates.json");
+        std::fs::write(&path, "{}").expect("seed a readable ledger");
+
+        // ~90k entries is past the cap by construction: each entry is a
+        // 40-hex key plus a timestamp, so 200k entries cannot fit in 4 MiB.
+        let mut ledger = std::collections::HashMap::new();
+        for i in 0..200_000u64 {
+            ledger.insert(format!("{i:040x}"), i);
+        }
+        let error = write_prune_candidate_ledger(&path, &ledger)
+            .expect_err("a ledger past the cap must be refused");
+        assert_eq!(error.stable_code(), StableErrorCode::RepoStateInvalid);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("ledger still readable"),
+            "{}",
+            "the previous, readable ledger must be left in place"
+        );
+        // And what was left behind is still loadable, so the next run works.
+        assert!(
+            read_prune_candidate_ledger(&path).is_ok(),
+            "refusing to write must not leave an unreadable ledger"
+        );
+    }
+
+    /// A ledger that fits is written normally — the cap must not be a
+    /// blanket refusal.
+    #[test]
+    fn a_ledger_within_the_cap_is_written() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gc-prune-candidates.json");
+        let mut ledger = std::collections::HashMap::new();
+        ledger.insert("a".repeat(40), 42u64);
+        write_prune_candidate_ledger(&path, &ledger).expect("a small ledger is written");
+        let loaded = read_prune_candidate_ledger(&path).expect("read back");
+        assert_eq!(loaded.get(&"a".repeat(40)).copied(), Some(42));
+    }
 
     #[test]
     fn test_parse_object_hash_valid() {

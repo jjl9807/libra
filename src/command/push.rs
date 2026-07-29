@@ -2581,6 +2581,13 @@ fn map_update_remote_tracking_branch_error(
             "failed to inspect remote tracking branch '{name}': {detail}"
         ))
         .with_stable_code(StableErrorCode::IoWriteFailed),
+        // §C.13 LBR-CONFLICT-002. Remote-tracking refs are never checked
+        // out, so this is unreachable here — it is mapped anyway rather than
+        // wildcarded, so a future caller cannot inherit a wrong code.
+        BranchStoreError::CheckedOutElsewhere { .. } => CliError::fatal(format!(
+            "failed to inspect remote tracking branch '{remote_tracking_branch}': {error}"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked),
     }
 }
 

@@ -969,6 +969,13 @@ fn map_symbolic_ref_resolution_error(spec: &str, error: BranchStoreError) -> Cli
             CliError::fatal(format!("failed to resolve symbolic ref '{spec}': {detail}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
         }
+        // §C.13 LBR-CONFLICT-002: `rev-parse` resolves rather than writes, so
+        // this arm is defensive — but a resolution that DID collide must not
+        // be reported as an I/O failure.
+        error @ BranchStoreError::CheckedOutElsewhere { .. } => {
+            CliError::fatal(format!("failed to resolve symbolic ref '{spec}': {error}"))
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        }
     }
 }
 

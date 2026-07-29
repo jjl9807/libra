@@ -84,9 +84,65 @@ impl Head {
         message.contains("database is locked") || message.contains("database schema is locked")
     }
 
+    /// This scope's HEAD row, or `Ok(None)` when it genuinely has none yet.
+    ///
+    /// The distinction matters at the WRITE seam: an absent row means
+    /// "insert", while a corrupt or AMBIGUOUS one (two rows for one scope)
+    /// must abort. Collapsing them — as `Err(Corrupt) => None` did — turned
+    /// an ambiguous scope into a third row.
+    async fn query_local_head_optional_with_conn<C>(
+        db: &C,
+    ) -> Result<Option<reference::Model>, BranchStoreError>
+    where
+        C: ConnectionTrait,
+    {
+        Self::query_local_head_rows_with_conn(db).await
+    }
+
+    /// This scope's HEAD row, or an actionable error when it has none.
+    ///
+    /// W0 §C.4.1/C.13: for a linked worktree whose identity the registry does
+    /// not know, "HEAD reference is missing from storage" describes a corrupt
+    /// repository — which this is not. Name the actual fault and the repair
+    /// route, so the first thing the user sees after a damaged `worktree_id`
+    /// is not an error implying their objects are gone.
     async fn query_local_head_result_with_conn<C>(
         db: &C,
     ) -> Result<reference::Model, BranchStoreError>
+    where
+        C: ConnectionTrait,
+    {
+        if let Some(model) = Self::query_local_head_rows_with_conn(db).await? {
+            return Ok(model);
+        }
+        let scope = crate::internal::worktree_scope::WorktreeScope::current();
+        let detail = match scope.worktree_id() {
+            Some(id)
+                if crate::command::worktree::registry_knows_linked_worktree(id) == Some(false) =>
+            {
+                format!(
+                    "this linked worktree's identity '{id}' is not in the worktree registry, so \
+                     it has no HEAD of its own — run `libra worktree repair` from the main \
+                     worktree to restore it"
+                )
+            }
+            _ => "HEAD reference is missing from storage".to_string(),
+        };
+        Err(BranchStoreError::Corrupt {
+            name: "HEAD".to_string(),
+            detail,
+        })
+    }
+
+    /// This scope's HEAD row, or `Ok(None)` when it genuinely has none.
+    ///
+    /// An ABSENT row and an AMBIGUOUS one are different answers: the write
+    /// seam inserts for the first and must abort on the second. They used to
+    /// share `Err(Corrupt)`, which is how "two HEAD rows for this scope"
+    /// became "you have none" and then a third row.
+    async fn query_local_head_rows_with_conn<C>(
+        db: &C,
+    ) -> Result<Option<reference::Model>, BranchStoreError>
     where
         C: ConnectionTrait,
     {
@@ -109,14 +165,31 @@ impl Head {
                 Some(id) => query.filter(reference::Column::WorktreeId.eq(id.clone())),
                 None => query.filter(reference::Column::WorktreeId.is_null()),
             };
-            match query.one(db).await {
-                Ok(Some(model)) => return Ok(model),
-                Ok(None) => {
+            // ADR-0714-08: read up to TWO rows, not one. `.one()` resolves a
+            // duplicate scope by returning whichever row SQLite hands back
+            // first, so a repository that predates migration 2026072901's
+            // unique index would silently operate on an arbitrary HEAD — and
+            // the next ref write would move that one. An ambiguous scope is
+            // never resolved by guessing.
+            match query.all(db).await {
+                Ok(rows) if rows.len() > 1 => {
                     return Err(BranchStoreError::Corrupt {
                         name: "HEAD".to_string(),
-                        detail: "HEAD reference is missing from storage".to_string(),
+                        detail: match &worktree_id {
+                            Some(id) => format!(
+                                "more than one HEAD row exists for worktree '{id}', so which \
+                                 one this worktree is on cannot be determined; inspect the \
+                                 duplicates and remove the row that does not belong to it"
+                            ),
+                            None => "more than one HEAD row exists for the main worktree, so \
+                                     which one it is on cannot be determined; inspect the \
+                                     duplicates and remove the row that does not belong to it"
+                                .to_string(),
+                        },
                     });
                 }
+                Ok(mut rows) if !rows.is_empty() => return Ok(Some(rows.remove(0))),
+                Ok(_) => return Ok(None),
                 Err(err)
                     if Self::is_sqlite_busy(&err) && attempt < Self::SQLITE_BUSY_MAX_RETRIES =>
                 {
@@ -363,6 +436,25 @@ impl Head {
     where
         C: ConnectionTrait,
     {
+        // §C.4.4: attaching THIS worktree's HEAD to a branch another worktree
+        // already has checked out creates the duplicate checkout Libra
+        // categorically refuses. The check lives at the seam, on the caller's
+        // connection, because the call sites that pre-flighted it — `switch`,
+        // `checkout`, `symbolic-ref`, `stash branch`, `worktree add` — each
+        // did so in a SEPARATE transaction from the write, leaving a window
+        // for the other worktree to attach in between.
+        if remote.is_none()
+            && let Head::Branch(branch_name) = &new_head
+            && let Some(other) =
+                Self::branch_checked_out_elsewhere_result_with_conn(db, branch_name)
+                    .await
+                    .map_err(|error| BranchStoreError::Query(error.to_string()))?
+        {
+            return Err(BranchStoreError::CheckedOutElsewhere {
+                name: branch_name.clone(),
+                worktree: other,
+            });
+        }
         for attempt in 0..=Self::SQLITE_BUSY_MAX_RETRIES {
             let head = match remote {
                 Some(remote) => Self::query_remote_head_with_conn(db, remote).await,
@@ -370,9 +462,13 @@ impl Head {
                 // seeded — a missing per-worktree HEAD falls to the INSERT
                 // branch (which tags the row with the current worktree id)
                 // rather than erroring.
-                None => match Self::query_local_head_result_with_conn(db).await {
-                    Ok(model) => Some(model),
-                    Err(BranchStoreError::Corrupt { .. }) => None,
+                // A genuinely ABSENT row falls to the INSERT branch. A
+                // CORRUPT or AMBIGUOUS one must not: swallowing
+                // `Corrupt` here turned "this scope has two HEAD rows and I
+                // cannot tell which is yours" into "you have none", and
+                // inserted a third.
+                None => match Self::query_local_head_optional_with_conn(db).await {
+                    Ok(model) => model,
                     Err(e) => return Err(e),
                 },
             };
@@ -471,15 +567,11 @@ impl Head {
             .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
     }
 
-    pub async fn branch_checked_out_elsewhere(branch: &str) -> Option<String> {
-        // Legacy convenience wrapper. Destructive writers MUST use
-        // [`Self::branch_checked_out_elsewhere_result`]: swallowing a
-        // database error here would fail OPEN and let a cross-worktree
-        // branch move through (§C.4.4).
-        Self::branch_checked_out_elsewhere_result(branch)
-            .await
-            .unwrap_or_default()
-    }
+    // §C.4.4: the fail-OPEN convenience wrapper that used to live here is
+    // GONE. Documenting that destructive writers "MUST" use the fallible
+    // variant did not stop nine of them from using this one, because the
+    // infallible signature is the more convenient of the two at every call
+    // site. Deleting it makes the safe choice the only choice.
 
     /// Fail-CLOSED cross-worktree checkout probe: a query failure is an
     /// error the caller must surface, never "nobody has it checked out".
@@ -487,12 +579,30 @@ impl Head {
         branch: &str,
     ) -> Result<Option<String>, sea_orm::DbErr> {
         let db = get_db_conn_instance().await;
+        Self::branch_checked_out_elsewhere_result_with_conn(&db, branch).await
+    }
+
+    /// Transaction-safe form of [`Self::branch_checked_out_elsewhere_result`].
+    ///
+    /// A ref writer that already holds a write transaction MUST use this. The
+    /// public form opens the pooled connection, which on SQLite blocks behind
+    /// the caller's own open write — the probe and the write deadlock each
+    /// other. Running on the caller's connection also makes the check and the
+    /// ref update atomic, which is the point: a probe committed separately
+    /// could be stale by the time the write lands.
+    pub async fn branch_checked_out_elsewhere_result_with_conn<C>(
+        db: &C,
+        branch: &str,
+    ) -> Result<Option<String>, sea_orm::DbErr>
+    where
+        C: ConnectionTrait,
+    {
         let current = crate::utils::util::current_worktree_id();
         let rows = reference::Entity::find()
             .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
             .filter(reference::Column::Remote.is_null())
             .filter(reference::Column::Name.eq(branch))
-            .all(&db)
+            .all(db)
             .await?;
         Ok(rows
             .into_iter()
@@ -500,6 +610,15 @@ impl Head {
             .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string())))
     }
 
+    /// Deprecated shim retained ONLY for call sites that have already
+    /// decided a HEAD write failure is not their problem.
+    ///
+    /// There are none left in production code, and there should not be: this
+    /// swallowed the error, so a command whose HEAD update failed still
+    /// committed the work around it and reported success — a repository left
+    /// pointing at the wrong commit, silently. Use
+    /// [`Head::update_result_with_conn`].
+    #[cfg(test)]
     pub async fn update_with_conn<C>(db: &C, new_head: Self, remote: Option<&str>)
     where
         C: ConnectionTrait,
@@ -513,18 +632,43 @@ impl Head {
         }
     }
 
+    /// Must NOT be called from within an active transaction (it acquires its
+    /// own pooled connection — see the `_with_conn` contract in `branch.rs`).
     pub async fn update_result(
         new_head: Self,
         remote: Option<&str>,
     ) -> Result<(), BranchStoreError> {
         let db_conn = get_db_conn_instance().await;
-        Self::update_result_with_conn(&db_conn, new_head, remote).await
+        // §C.4.4: the checked-out-elsewhere probe inside
+        // `update_result_with_conn` and the HEAD write must be ONE
+        // transaction. On a pool connection they are two implicit ones, so
+        // two worktrees attaching to the same branch can both pass the probe
+        // and both write — the exact duplicate checkout the guard exists to
+        // prevent. Callers that already hold a transaction (`switch`,
+        // `checkout`, `worktree add`) were always atomic; this closes the
+        // pooled entry point that `symbolic-ref` and `stash branch` use.
+        use sea_orm::TransactionTrait;
+        let txn = db_conn
+            .begin()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        Self::update_result_with_conn(&txn, new_head, remote).await?;
+        txn.commit()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))
     }
 
     // HEAD is unique, update if exists, insert if not
     pub async fn update(new_head: Self, remote: Option<&str>) {
-        let db_conn = get_db_conn_instance().await;
-        Self::update_with_conn(&db_conn, new_head, remote).await;
+        // Routed through the transactional form so the infallible entry point
+        // is not the one that skips the §C.4.4 atomicity the fallible one has.
+        if let Err(error) = Self::update_result(new_head, remote).await {
+            tracing::error!(
+                remote = ?remote,
+                error = %error,
+                "Failed to update HEAD reference"
+            );
+        }
     }
 }
 

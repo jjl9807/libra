@@ -2,6 +2,258 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W0 review: deletion safety, scope guards, GC boundaries)
+
+- **`libra file obliterate --recover` deleted object payloads without ever
+  asking whether another repository was borrowing them**, and plain
+  `obliterate` ran that same recovery pass *before* its own borrower check —
+  so an interrupted obliteration was completed, objects unlinked, before
+  anyone asked. The alternates-borrower gate is now one function called from
+  the payload unlink itself, so no entry point can route around it, and every
+  deletion surface (gc, repack `-d`, `cache evict` direct and scheduled,
+  obliterate, obliterate recovery) goes through it.
+- **`gc`, `repack` and `prune` failed on every shallow clone.** The
+  reachability walk followed `parent_commit_ids` unconditionally, so the first
+  absent parent past a `.libra/shallow` graft was reported as repository
+  corruption. Shallow entries are now traversal boundaries: the boundary
+  commit is kept, its absent parents are not demanded, and unparseable shallow
+  metadata fails closed rather than silently resuming the old behaviour.
+- **A pruned object's `object_index` row could outlive the object.** Loose
+  files were unlinked first and the catalogue rows dropped afterwards, so a
+  SQLite failure in between left rows advertising bytes that were gone. The
+  order is inverted: the catalogue can now only under-advertise, which `agent
+  doctor` rebuilds.
+- **Nine ref writers consulted a fail-OPEN cross-worktree checkout probe** that
+  folded a database error into "no other worktree has it", turning a transient
+  query failure into permission to move or delete a branch another worktree was
+  sitting on. That wrapper is deleted, so the fallible form is the only one
+  available. `commit`/`amend` gained the guard they never had at all, running
+  on the caller's own connection so the check and the ref write are atomic.
+- **Nothing enforced one HEAD row per worktree scope.** Two concurrent
+  detached-HEAD updates in one scope could both insert, after which the reader
+  resolved the duplicate by returning an arbitrary row. Migration
+  `2026072901` adds partial unique indexes and fails closed on pre-existing
+  duplicates; the scoped read now reports the ambiguity instead of guessing.
+- **`op restore` accepted an operation that ran in a different worktree**, and
+  operations predating the scope column all claimed main scope. Migration
+  `2026072902` records scope provenance and marks the genuinely
+  unattributable rows `unknown`; restore refuses those and any cross-scope
+  target before the dry-run report.
+- **Three code paths minted a phantom `<working_dir>/.libra`** when storage
+  resolution failed — creating a second repository, with its own `libra.db`
+  and `objects/`, beside the real one. They now degrade to the read-only
+  session they already fall back to, or fail closed with the repair route.
+- **`hydrate` could resurrect an obliterated object**, because its fetch
+  resolves through alternates and the durable tier, which may still hold bytes
+  this repository erased. It now consults the tombstone snapshot first, and an
+  unreadable tombstone table refuses the command instead of defaulting to
+  "nothing was obliterated".
+- A linked worktree whose identity the registry does not know now reports that
+  fault and names `libra worktree repair`, instead of "HEAD reference is
+  missing from storage" — which describes a corrupt repository the user does
+  not have.
+- Hints in `src/internal/workspace.rs` no longer direct users at
+  `libra worktree doctor` *mutations* (`reclaim` / `adopt` / `release`) that do
+  not exist until W4.
+- **GC could delete an object that became reachable mid-run.** The one-hour
+  mtime grace protects an object written moments ago, but not an OLD orphan
+  that a concurrent `update-ref`, `reset`, `stash apply` or `op restore`
+  republishes after the root scan has already decided it is unreachable.
+  Nothing is deleted the first time it is seen unreachable now: a candidate is
+  recorded, and only a later run that still finds it unreachable after the
+  grace window deletes it — so it must survive two independent root scans,
+  separated in time, with no reference appearing in between.
+- **`FETCH_HEAD` was treated as a reachability root**, contrary to §C.4.3
+  item 13 and to Git. `fetch` records the advertised tip of every ref it
+  negotiated, including refs already up to date with no local destination, so
+  rooting it pinned objects nothing in the repository referenced — permanently,
+  and a little more on every fetch.
+- **Agent-run findings manifests could be skipped silently.** A run
+  interrupted before writing `manifest.json` — the exact state that leaves
+  blobs with no other anchor — was read as "no roots", and the generic JSON
+  walker skipped any OID whose object it could not find. The manifest is now
+  parsed structurally (`findings_oid`, `manual_attach[].oid`), an absent
+  object fails the run closed, a run directory with no manifest fails the
+  walk closed at any age, and the directory scan, manifest size and
+  attachment count are all bounded.
+- **An invalid `scope_provenance` value failed open**, because `op restore`
+  tested for the literal `"unknown"`. It now accepts only `"declared"`, and
+  the database enforces the domain with triggers.
+- Six user-facing error messages contained runs of fourteen spaces from
+  collapsed line continuations.
+- **Nothing stopped a worktree from publishing a reference to an object a
+  concurrent deletion phase was about to unlink.** The two-scan quarantine
+  proves an object was unreachable at two separated moments; it cannot prove
+  nothing referenced it in between, and neither can a database transaction —
+  the publications that matter here are FILES (a worktree's private index, a
+  merge or rebase sidecar, an agent-run manifest), so staging content that
+  happens to hash to a quarantined object commits without touching SQLite at
+  all. A repository maintenance lock now supplies that exclusion: every
+  command that can publish an object reference holds it shared for its whole
+  run (derived from the scope inventory, so a new command cannot forget), and
+  `gc`, `repack -d`, `cache evict`, `agent clean` and `file obliterate` hold
+  it exclusively across "decide what is unreachable → invalidate the
+  catalogue → unlink". Publishers never block each other; a deletion phase
+  that cannot get exclusive access **defers** (the objects stay, the next run
+  takes them) rather than deleting without the exclusion — except
+  obliteration, which refuses outright, because reporting an erasure as done
+  without performing it is worse than failing. A deferral leaves the
+  quarantine clock untouched, so it never restarts the two-scan window.
+- **The GC deletion phase held a SQLite read transaction across the whole
+  reachability walk** — every commit and tree in the repository — blocking ref
+  writers for the duration, and it unlinked files *inside* that transaction,
+  so a failure part-way through rolled the catalogue back to advertise bytes
+  that were already gone. The walk now runs under the maintenance lock with
+  no transaction, and the catalogue invalidation is committed *before* the
+  first unlink, in that order rather than wrapped around it.
+- **The 4 MiB prune-ledger cap was checked only on read.** A ledger that was
+  legal when loaded could grow past the cap during the run and be written
+  anyway, after which every later run refused to read it — the quarantine
+  clock stopped for a file this code had created. The size is now checked
+  before the atomic replacement, and refusing leaves the previous, readable
+  ledger in place.
+- **A manifest that was valid JSON but not a JSON *object* was read as "this
+  run declares no roots".** `[]`, `null` and a bare string all parse, every
+  field lookup then returns nothing, and the findings blob the run owned
+  became a prune candidate. The shape is now part of the contract.
+- **A checkout collision detected at the storage seam was reported as
+  repository corruption.** The seam guard added in this card raised
+  `BranchStoreError::Corrupt`, which `symbolic-ref` maps to `LBR-REPO-002` —
+  so a user racing two worktrees was told their repository was damaged, and
+  any tooling keyed on the code would have escalated it. There is now a typed
+  `CheckedOutElsewhere` variant carrying the occupying worktree, mapped to
+  `LBR-CONFLICT-002` at every writer boundary, identical to the code the
+  command preflights already returned.
+- **The pooled HEAD-attach and branch-delete entry points ran their guard and
+  their write as two separate implicit transactions**, so two worktrees could
+  both pass the probe and both write. Both now open one transaction, matching
+  `update_branch` — which also makes the branch-metadata cascade atomic with
+  the ref delete instead of documenting the gap.
+- **`Head::update_with_conn` logged HEAD-write failures and returned
+  nothing.** `commit`, `reset`, `merge`, `rebase` and `bisect` all called it,
+  so a failed HEAD update let the surrounding work commit and the command
+  report success with HEAD pointing at the wrong commit — silently, and with
+  the only evidence in a log nobody reads. The production form now returns
+  `Result` and every caller propagates it; the swallowing variant survives
+  only under `#[cfg(test)]`.
+- **A checkout collision lost its classification on the way out of the
+  storage layer.** `Branch::update_branch_with_conn` is called from inside
+  reflog closures whose error type sea_orm fixes at `DbErr`, so the typed
+  refusal cannot pass; by the time a command saw it, it had been wrapped
+  twice more and each boundary re-classified it by hand. `switch -C` on a
+  branch another worktree held reported `LBR-IO-002` — "failed to delete" —
+  for a branch that was merely in use. The wording is now produced by one
+  constructor and recognised by one predicate, both in `internal::branch`, and
+  the boundaries ask that predicate instead of guessing.
+- **Long-running sessions no longer hold the maintenance lock.** `libra code`,
+  `automation`, `sandbox`, `service` and the agent surface are excluded: a
+  session that runs for hours would starve every deletion phase, and a shell
+  command the user approves *inside* that session could never satisfy "wait
+  for the other command to finish" — the other command is its own parent.
+  Excluding them opens no hole: an agent's VCS mutations go through
+  `run_libra_vcs`, which spawns `libra` as a subprocess, and their in-process
+  publications are already covered by the agent-run manifest fail-closed rule
+  and the traces-inflight marker.
+- **`maintenance` takes the lock per task, not per command.** `prefetch` runs
+  the ordinary fetch writer in-process and publishes remote-tracking refs;
+  `pack-refs` and `loose-objects` publish too. Carving out the whole command
+  left them unprotected while a concurrent `repack` deleted an old pack.
+  `repack` itself now publishes its consolidated pack under the shared hold
+  and takes the exclusive one only for the deletion — so an obliteration can
+  no longer classify an object as loose-only and then find it re-published
+  inside a pack it never inspected.
+- **`file obliterate` wrote its tombstone and audit record before taking the
+  lock.** A contended lock was therefore discovered only after durable state
+  existed, and the next unrelated obliteration would run recovery and complete
+  an erasure this invocation had reported as refused. The lock is taken first,
+  and it is re-entrant within a process so the re-check at the unlink sees the
+  same hold.
+- **A candidate that became reachable again kept its old quarantine
+  timestamp.** If the new reference later went away, the very next `gc`
+  deleted it on the strength of a window a reference had appeared inside.
+  Resurrected candidates now leave the ledger and start over.
+- **A deferred `incremental-repack` reported `objects_packed: 0`** although it
+  had written the consolidated pack. Only the old-pack deletion is deferred,
+  and the counts now say so.
+- **The maintenance lock was tracked per process, not per repository.** A
+  process holding repository A's lock could then publish into repository B
+  re-entrantly, without ever opening B's lock file, while another process
+  deleted B's objects. State is keyed by canonical lock path now — one
+  process legitimately touches several repositories (alternates, a task
+  worktree, an agent working on a clone).
+- **`loose-objects` unlinks payloads**, so classifying it as a shared-only
+  publisher was wrong. It follows `repack -d` now: shared through the pack
+  write, then exclusive for the removals, deferring them if a publisher is
+  running (the objects are already safe in the new pack).
+- **`ReflogError`'s display dropped its cause**, so every failure that
+  travelled through a reflog closure reached the command as a bare "failed to
+  update reflog". The classification that lives in the underlying error's
+  text went with it — a branch refused because another worktree had it
+  checked out was reported as an I/O fault.
+- **Two concurrent `repack -d` runs could fail the second one.** Both snapshot
+  the same loose set; the first removes them, and the second treated the
+  resulting `NotFound` as fatal despite having written a pack that contains
+  every object. Already-gone is now the goal state, not an error.
+- **`review`/`investigate` publish out of process-lifetime scope.** Their
+  runs last minutes, so they are excluded from the command-level hold — but
+  that left the objectize → manifest window unprotected, and a
+  content-addressed attachment can resolve to an oid `gc` has already
+  quarantined. The hold is taken at the publication seam itself, in both
+  stores and both `attach` paths.
+- **A pack was published without `fsync`, and its only other copy deleted.**
+  `repack -d` and the `loose-objects` task unlink the loose objects the pack
+  now holds; a pack that exists only in the page cache is not a copy, so a
+  power loss between the write and the unlink took reachable objects with it.
+  The writer now syncs the pack, its index and the directory entries naming
+  them, and reports whether the NAME is durable — deleting callers keep the
+  other copy when it is not.
+- **`agent clean`, `worktree doctor` and `agent doctor --repair` each broke a
+  rule this card had just written.** `agent clean` deletes object payloads
+  and never passed the alternates-borrower gate; `worktree doctor` — whose
+  contract is that a default invocation changes nothing — was classified as a
+  writer and so created the maintenance lock file; `agent doctor --repair`
+  republishes a findings blob outside any hold. All three are fixed, and the
+  doctor read-only regression now compares a full recursive listing of
+  `.libra` rather than three files that already existed.
+- **An unreadable `objects/info/borrowers` read as "nobody borrows".** That is
+  permission to delete objects another repository still needs. Absent is now
+  distinguished from unreadable at the one gate every deletion surface calls,
+  and an unreadable registration fails closed with `LBR-IO-002` — which
+  scheduled maintenance propagates instead of folding into a successful run.
+  Absence is likewise no longer proof that a borrower is gone (an unmounted
+  path answers the same), so retiring one is an explicit act: the new
+  `libra alternates prune [<path>] [--dry-run]`, documented EN/zh.
+- A borrower refusal from `file obliterate` carried `LBR-OBLITERATE-003`,
+  whose documented meaning is "re-run with `--yes`" — advice the user may
+  already have taken, about a condition that has nothing to do with
+  confirmation. It is `LBR-CONFLICT-002` now, at all three sites.
+- `libra agent clean` now retires agent-run directories whose manifest is
+  missing, unreadable, or not a JSON object, once they are past the retention
+  cutoff. This is the explicit route
+  the walk's fail-closed posture requires: without it, one interrupted run
+  would make the repository permanently unprunable. A run whose manifest
+  exists but is out of scope for this GC (a foreign `kind`, a non-terminal
+  state) is untouched, as before.
+
+### Added (plan-20260714 W0: read-only `worktree doctor`)
+
+- `libra worktree doctor` reports per-worktree scope diagnostics — layout,
+  identity, lifecycle state and what to do about each finding — and is
+  **strictly read-only**: registry, database, lease state and filesystem are
+  byte-identical before and after, pinned by a regression. Repair actions
+  arrive as explicit subcommands in later waves, which is why no error hint
+  promises that a bare `doctor` will fix anything.
+
+### Changed (plan-20260714 W0: mutating-command scope inventory)
+
+- Every command now declares a `CommandScope` (`Repository` / `Worktree` /
+  `Composite` / `ReadOnly`) through an exhaustive match over all 108 `Commands`
+  variants. A new command that does not declare its scope fails to **compile**,
+  rather than failing a test that can be filtered out. The legacy-layout and
+  corrupt-identity guards consult that inventory, which closes the holes the
+  previous hand-maintained list had for `fetch`, `apply`, `rerere`, `mv`,
+  `clean`, `restore`, `reset`, `rm`, `stash` and `pull`.
+
 ### Changed (plan-20260714 R0-1: `diff` now uses the shared rename engine)
 
 - **`diff` delegates rename pairing to `rename_detect::match_pairs`.** It had

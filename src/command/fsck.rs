@@ -655,7 +655,7 @@ async fn run_heal_pass(explicit: Option<ObjectHash>) -> CliResult<HealReport> {
                 Ok(None) => {}
                 Err(e) => {
                     return Err(CliError::fatal(format!(
-                        "cannot verify obliteration tombstones during heal; aborting to avoid                          resurrecting an obliterated object: {e}"
+                        "cannot verify obliteration tombstones during heal; aborting to avoid resurrecting an obliterated object: {e}"
                     ))
                     .with_stable_code(StableErrorCode::IoReadFailed));
                 }

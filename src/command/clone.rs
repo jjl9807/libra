@@ -1183,6 +1183,15 @@ fn map_local_branch_state_error(source: branch::BranchStoreError) -> CliError {
             "failed to inspect local branch state after fetch: failed to delete branch '{name}': {detail}"
         ))
         .with_stable_code(StableErrorCode::IoWriteFailed),
+        // §C.13 LBR-CONFLICT-002.
+        branch::BranchStoreError::CheckedOutElsewhere { .. } => CliError::fatal(format!(
+            "failed to inspect local branch state after fetch: {source}"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "the other worktree must switch away first; `libra worktree list` shows which one \
+             holds it",
+        ),
     }
 }
 
@@ -3694,7 +3703,9 @@ pub(crate) async fn setup_repository(
                         None,
                     )
                     .await?;
-                    Head::update_with_conn(txn, Head::Branch(branch_name.to_owned()), None).await;
+                    Head::update_result_with_conn(txn, Head::Branch(branch_name.to_owned()), None)
+                        .await
+                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
 
                     let merge_ref = format!("refs/heads/{}", branch_name);
                     let _ = ConfigKv::set_with_conn(

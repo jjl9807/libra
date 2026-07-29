@@ -36,6 +36,7 @@ EXAMPLES:
                                                    check it out
     libra worktree list                            List every registered worktree
     libra worktree list --porcelain                Machine-readable worktree list
+    libra worktree doctor                          Read-only per-worktree scope diagnostics
     libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
     libra worktree unlock ../feature-x             Release the lock
     libra worktree move ../old ../new              Rename a worktree
@@ -99,6 +100,16 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         porcelain: bool,
     },
+    /// Report per-worktree scope diagnostics. STRICTLY READ-ONLY.
+    ///
+    /// plan-20260714 Part C W0 (§C.11): this is the read-only diagnostic
+    /// skeleton. It never writes: no registry rewrite, no DB row, no lease
+    /// change, no filesystem mutation. Repair actions (legacy adopt/clear,
+    /// lease reclaim, provenance repair) arrive as EXPLICIT subcommands in
+    /// later waves, each requiring confirmation and emitting an audit event
+    /// — which is why no hint anywhere may promise that a bare `doctor` will
+    /// fix something (Codex R19/R20).
+    Doctor,
     /// Mark a worktree as locked to prevent it from being pruned or removed.
     Lock {
         /// Filesystem path of the worktree to lock.
@@ -425,6 +436,38 @@ pub(crate) struct WorktreeListOutput {
     pub(crate) worktrees: Vec<WorktreeListEntry>,
 }
 
+/// plan-20260714 W0 (§C.11): the read-only `worktree doctor` report.
+///
+/// `next_cursor` is present and always `null` here. W4 turns this into a
+/// paginated machine interface with a frozen envelope; carrying the field
+/// from the start means that wave ADDS pagination rather than reshaping a
+/// document consumers already parse.
+#[derive(Debug, Serialize)]
+pub(crate) struct WorktreeDoctorOutput {
+    pub(crate) schema_version: u32,
+    pub(crate) diagnostics: Vec<WorktreeDiagnostic>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WorktreeDiagnostic {
+    /// Stable worktree identity; `None` for main (`worktree_id IS NULL`).
+    pub(crate) worktree_id: Option<String>,
+    pub(crate) path: String,
+    pub(crate) is_main: bool,
+    /// Same vocabulary as `worktree list`: `main`, `linked-v2`,
+    /// `legacy-symlink`, `missing`, `corrupt`, `task-fuse`.
+    pub(crate) layout: &'static str,
+    /// `active`, `detached_from_registry`, or `tombstone`.
+    pub(crate) state: &'static str,
+    /// Whether the registry's identity for this entry is one the entry itself
+    /// still carries. `false` means mutations there are refused until
+    /// `worktree repair` restores it.
+    pub(crate) identity_registered: bool,
+    /// Human-readable findings; empty means nothing to report.
+    pub(crate) findings: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct WorktreeListEntry {
     pub(crate) kind: &'static str,
@@ -721,8 +764,16 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     #[cfg(not(unix))]
     let needs_repo = true;
 
+    // W0 §C.11: `doctor` skips the migration-applying open below. It is a
+    // read-only diagnostic, and applying migrations is a write — the one
+    // command you want available on a repository you have not yet decided to
+    // upgrade must not upgrade it as a side effect.
+    let applies_migrations = !matches!(&command, WorktreeSubcommand::Doctor);
+
     if needs_repo {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    }
+    if needs_repo && applies_migrations {
         // §C.7 ordering: apply pending repository migrations — including the
         // registry-v2 capability marker (2026072401) — BEFORE any
         // worktrees.json read or rewrite, so a pre-v2 binary is refused at
@@ -759,6 +810,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             render_add_worktree(&result, output)
         }
         WorktreeSubcommand::List { porcelain } => list_worktrees(output, porcelain).await,
+        WorktreeSubcommand::Doctor => run_worktree_doctor(output).await,
         WorktreeSubcommand::Lock { path, reason } => {
             let result = lock_worktree(path, reason).map_err(WorktreeError::into_cli_error)?;
             render_lock_worktree(&result, output)
@@ -954,6 +1006,27 @@ fn load_state_impl(heal_identity_invariants: bool) -> WorktreeResult<WorktreeSta
 /// touches the file — the durable v1→v2 upgrade happens only in the locked
 /// loader. Legacy v1 entries keep `worktree_id: None`; per-entry consumers
 /// fall back to the gitdir probe.
+/// Is `worktree_id` a linked worktree the registry actually knows about?
+///
+/// `current_worktree_id` SYNTHESIZES an id from the canonical path when the
+/// `worktree_id` file is missing, empty, or unreadable. That fallback is
+/// deliberately not `None` — aliasing to `Main` would graft this worktree
+/// onto main's HEAD — but a synthesized id is a guess, and a mutation
+/// performed under a guess writes rows no other process associates with this
+/// worktree. Callers use this to refuse the mutation instead.
+///
+/// Returns `None` when the registry itself cannot be read: "unknown" is not
+/// "absent", and a torn registry must not be reported as a corrupt identity.
+pub(crate) fn registry_knows_linked_worktree(worktree_id: &str) -> Option<bool> {
+    let state = load_state_readonly().ok()?;
+    Some(
+        state
+            .entries
+            .iter()
+            .any(|entry| entry.worktree_id.as_deref() == Some(worktree_id)),
+    )
+}
+
 fn load_state_readonly() -> WorktreeResult<WorktreeState> {
     let path = state_path();
     if !path.exists() {
@@ -2338,6 +2411,117 @@ pub(crate) async fn format_worktree_porcelain(
         out.push('\n');
     }
     Ok(out)
+}
+
+/// plan-20260714 W0 (§C.11): `worktree doctor` — read-only scope diagnostics.
+///
+/// Every value here comes from a READ: the registry (already loaded
+/// read-only), each entry's on-disk layout, and whether its identity is one
+/// the registry knows. Nothing is written, adopted, reclaimed or repaired,
+/// because a diagnostic that mutates cannot be run safely on a repository you
+/// do not yet understand — which is exactly when you reach for it.
+pub(crate) async fn run_worktree_doctor(output: &OutputConfig) -> CliResult<()> {
+    let listed = run_list_worktrees().map_err(WorktreeError::into_cli_error)?;
+    let mut diagnostics = Vec::with_capacity(listed.worktrees.len());
+    for entry in listed.worktrees {
+        // Compare the worktree's OWN on-disk identity against the registry —
+        // NOT `entry.worktree_id`, which `run_list_worktrees` already
+        // resolves from the registry and which would therefore always agree
+        // with it. The question this answers is whether the directory still
+        // knows which registry row it belongs to.
+        let identity_registered = if entry.is_main {
+            // Main is spelled "no id" by convention, not by damage.
+            true
+        } else {
+            resolve_entry_worktree_id(&entry.path, false)
+                .and_then(|id| registry_knows_linked_worktree(&id))
+                .unwrap_or(false)
+        };
+        let mut findings = Vec::new();
+        match entry.layout {
+            "legacy-symlink" => findings.push(
+                "uses the pre-isolation shared-`.libra` symlink layout; mutations here are \
+                 refused because they would move the MAIN worktree's HEAD/index. Migrate with \
+                 `libra worktree repair --migrate-layout <path>` from the main worktree."
+                    .to_string(),
+            ),
+            "missing" => findings.push(
+                "the registered directory is gone; `libra worktree prune` removes entries whose \
+                 path is confirmed missing."
+                    .to_string(),
+            ),
+            "corrupt" => findings.push(
+                "the worktree's `.libra` metadata could not be read; `libra worktree repair \
+                 <path>` restores its identity from the registry."
+                    .to_string(),
+            ),
+            _ => {}
+        }
+        if !identity_registered && entry.layout != "missing" {
+            findings.push(
+                "this worktree's identity is not one the registry knows, so mutations here are \
+                 refused; `libra worktree repair <path>` restores it from the registry's \
+                 persisted id."
+                    .to_string(),
+            );
+        }
+        if entry.state == "detached_from_registry" {
+            findings.push(
+                "detached from the registry: re-attach with `libra worktree add <path>`, or \
+                 finish the removal with `libra worktree remove --delete-dir <path>`."
+                    .to_string(),
+            );
+        }
+        if entry.state == "tombstone" {
+            findings.push(
+                "a removal did not finish cleaning up; `libra worktree repair` retries it."
+                    .to_string(),
+            );
+        }
+        diagnostics.push(WorktreeDiagnostic {
+            worktree_id: entry.worktree_id,
+            path: entry.path,
+            is_main: entry.is_main,
+            layout: entry.layout,
+            state: entry.state,
+            identity_registered,
+            findings,
+        });
+    }
+    // Stable order so a diff between two runs is meaningful.
+    diagnostics.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let report = WorktreeDoctorOutput {
+        schema_version: 1,
+        diagnostics,
+        next_cursor: None,
+    };
+    if output.is_json() {
+        return emit_json_data("worktree.doctor", &report, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    let mut healthy = true;
+    for diagnostic in &report.diagnostics {
+        let identity = diagnostic.worktree_id.as_deref().unwrap_or("(main)");
+        println!(
+            "{} [{}] identity {} layout {} state {}",
+            diagnostic.path,
+            if diagnostic.is_main { "main" } else { "linked" },
+            identity,
+            diagnostic.layout,
+            diagnostic.state
+        );
+        for finding in &diagnostic.findings {
+            healthy = false;
+            println!("  ! {finding}");
+        }
+    }
+    if healthy {
+        println!("no problems detected");
+    }
+    Ok(())
 }
 
 async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()> {

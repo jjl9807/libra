@@ -9,6 +9,7 @@ Manage multiple working trees attached to this repository.
 ```
 libra worktree add <path>
 libra worktree list
+libra worktree doctor
 libra worktree lock <path> [--reason <text>]
 libra worktree unlock <path>
 libra worktree move <src> <dest>
@@ -83,6 +84,33 @@ Structured output uses the `worktree.list` command envelope. Each entry reports
 `kind`, `path`, `is_main`, `locked`, `lock_reason`, whether the path currently
 exists on disk, the persisted `worktree_id`, and the lifecycle `state`
 (`active`, `detached_from_registry`, or `tombstone` — see `remove`), and the on-disk `layout` (`main`, `linked-v2`, `legacy-symlink`, `missing`, `corrupt`; porcelain adds a matching `layout` line per entry). In a `legacy-symlink` worktree (pre-isolation shared `.libra`), read-only commands keep working but state-mutating commands refuse with `LBR-REPO-003` — run `libra worktree repair --migrate-layout <path>` from the main worktree. Target-oriented lifecycle commands (`worktree remove <path>` in both modes and `worktree repair <path>`) also refuse a legacy-symlink target — the shared symlink would route their writes into MAIN storage — until the migration completes.
+
+### Subcommand: `doctor`
+
+Report per-worktree scope diagnostics. **Strictly read-only** (plan-20260714
+Part C W0 §C.11): the registry, the database, lease state and the filesystem
+are byte-identical before and after the call. A diagnostic has to be safe to
+run on a repository you do not yet understand, which is precisely when you
+reach for it — so it never adopts, reclaims or repairs on its own. Repair
+actions are separate, explicit subcommands, and no error hint anywhere
+promises that a bare `doctor` will fix something.
+
+```bash
+libra worktree doctor
+libra --json worktree doctor
+```
+
+For each worktree it reports the on-disk `layout` and lifecycle `state` (the
+same vocabulary as `worktree list`), whether the worktree's own identity is one
+the registry still knows (`identity_registered`), and a `findings` list naming
+what to do about each problem — for example that a legacy-symlink worktree
+needs `worktree repair --migrate-layout`, or that a worktree whose
+`.libra/worktree_id` no longer matches the registry needs `worktree repair`
+before it will accept mutations.
+
+Structured output uses the `worktree.doctor` command envelope with
+`schema_version`, `diagnostics[]`, and `next_cursor` (always `null` today;
+pagination arrives with the W4 machine interface).
 
 ### Subcommand: `lock`
 

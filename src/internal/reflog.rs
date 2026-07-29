@@ -52,8 +52,14 @@ pub enum ReflogError {
 impl Display for ReflogError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DatabaseError(_) => write!(f, "failed to access reflog storage"),
-            Self::TransactionError(_) => write!(f, "failed to update reflog"),
+            // The CAUSE is part of the message, not just the category. It
+            // was dropped, and with it went every classification that lives
+            // in the underlying error's text — a branch refused because
+            // another worktree has it checked out reached the command as a
+            // bare "failed to update reflog" and was reported as an I/O
+            // fault (plan-20260714 §C.13).
+            Self::DatabaseError(error) => write!(f, "failed to access reflog storage: {error}"),
+            Self::TransactionError(error) => write!(f, "failed to update reflog: {error}"),
             Self::Config(detail) => write!(f, "invalid reflog expire config: {detail}"),
         }
     }
@@ -839,18 +845,25 @@ mod tests {
 
     use super::ReflogError;
 
+    /// The cause is part of the message.
+    ///
+    /// This used to pin the causeless text, which is what let a branch
+    /// refused because another worktree had it checked out arrive at the
+    /// command as a bare "failed to update reflog" — classified as an I/O
+    /// fault, because the only thing that identified it had been thrown away
+    /// (plan-20260714 §C.13).
     #[test]
-    fn reflog_error_display_pins_static_messages() {
+    fn reflog_error_display_carries_its_cause() {
         assert_eq!(
-            ReflogError::DatabaseError(DbErr::Custom("ignored".to_string())).to_string(),
-            "failed to access reflog storage",
+            ReflogError::DatabaseError(DbErr::Custom("underlying detail".to_string())).to_string(),
+            "failed to access reflog storage: Custom Error: underlying detail",
         );
         assert_eq!(
             ReflogError::TransactionError(TransactionError::Transaction(DbErr::Custom(
-                "ignored".to_string()
+                "underlying detail".to_string()
             )))
             .to_string(),
-            "failed to update reflog",
+            "failed to update reflog: Custom Error: underlying detail",
         );
     }
 

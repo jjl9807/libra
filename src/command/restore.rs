@@ -974,6 +974,10 @@ fn map_restore_branch_store_error(error: BranchStoreError) -> RestoreError {
         BranchStoreError::Corrupt { .. } => RestoreError::ReadObject,
         BranchStoreError::NotFound(_) => RestoreError::ResolveSource,
         BranchStoreError::Delete { .. } => RestoreError::ReadObject,
+        // `restore` only READS HEAD through this mapper, so a checkout
+        // collision cannot originate here; classify it as a read fault
+        // rather than silently borrowing another variant's meaning.
+        BranchStoreError::CheckedOutElsewhere { .. } => RestoreError::ReadObject,
     }
 }
 

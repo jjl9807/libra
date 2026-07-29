@@ -32,6 +32,7 @@ pub mod dirty;
 pub mod head;
 pub mod layer;
 pub mod log;
+pub mod maintenance_lock;
 pub mod merge_base;
 pub mod metadata;
 pub mod model;

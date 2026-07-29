@@ -20,6 +20,13 @@ pub struct Model {
     /// linked = its stable instance id. Scopes the duplicate-submission
     /// window per-worktree.
     pub worktree_id: String,
+    /// How `worktree_id` came to hold its value (Part C W0 §C.11):
+    /// `"declared"` — the process that ran the operation recorded its own
+    /// scope; `"unknown"` — the row predates the scope column in a
+    /// repository with linked-worktree evidence, so its `""` means "not
+    /// recorded", not "main". `op restore` refuses `unknown` rows rather
+    /// than guess (ADR-0714-08).
+    pub scope_provenance: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

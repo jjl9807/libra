@@ -125,6 +125,72 @@ pub enum BranchStoreError {
     /// Delete failed at the storage layer (FK violation, locked).
     #[error("failed to delete branch '{name}': {detail}")]
     Delete { name: String, detail: String },
+    /// §C.4.4: the branch is checked out in ANOTHER worktree, so attaching a
+    /// second HEAD to it (or deleting it) is refused.
+    ///
+    /// This is a distinct variant rather than a `Corrupt`/`Delete` with a
+    /// descriptive message because the stable error code depends on it:
+    /// §C.13 requires `LBR-CONFLICT-002` for a checkout collision, and every
+    /// writer boundary derives its code from the variant. Folding it into a
+    /// generic storage failure reported the repository as corrupt for what is
+    /// an ordinary, recoverable conflict.
+    ///
+    /// The message deliberately uses [`CHECKED_OUT_ELSEWHERE_PHRASE`] verbatim,
+    /// so a boundary that only ever sees the error as TEXT (after sea_orm or
+    /// an intermediate wrapper has erased the type) still classifies it
+    /// correctly.
+    #[error(
+        "branch '{name}' is checked out at worktree '{worktree}'; one branch is never checked \
+         out in two worktrees"
+    )]
+    CheckedOutElsewhere { name: String, worktree: String },
+}
+
+/// The one phrase by which a checkout collision survives sea_orm's transaction
+/// plumbing (plan-20260714 §C.13).
+///
+/// `Branch::update_branch_with_conn` is called from inside `with_reflog`
+/// closures, whose error type sea_orm fixes at [`DbErr`] — a typed enum
+/// cannot pass through it, and by the time the failure reaches a command it
+/// has been wrapped twice more. So the collision is encoded ONCE, by
+/// [`checked_out_elsewhere_db_err`], and recognised ONCE, by
+/// [`checked_out_elsewhere_cli_error`]: no call site formats this text and no
+/// call site matches on it. The phrase is deliberately the natural
+/// user-facing wording rather than an internal tag, so nothing has to be
+/// stripped before display, and it is the same wording the command-level
+/// preflight already uses for the same condition.
+pub const CHECKED_OUT_ELSEWHERE_PHRASE: &str = "is checked out at worktree";
+
+/// Build the [`DbErr`] carrier for a checkout collision.
+pub fn checked_out_elsewhere_db_err(branch_name: &str, worktree: &str) -> DbErr {
+    DbErr::Custom(format!(
+        "branch '{branch_name}' {CHECKED_OUT_ELSEWHERE_PHRASE} '{worktree}', so moving it here \
+         would silently diverge that worktree's working tree from its own branch; run `libra \
+         worktree list` to inspect, then switch one of them to another branch"
+    ))
+}
+
+/// Boundary helper (§C.13): if `error` — at any wrapping depth — is a
+/// checkout collision, produce the `LBR-CONFLICT-002` error it must be
+/// reported as. Returns `None` for every other failure, so a caller keeps its
+/// own mapping with `unwrap_or_else`.
+///
+/// A collision is not corruption and not an I/O fault: the repository is
+/// intact, and the user has a next step. Reporting it with a storage code
+/// sends them looking for damage that does not exist, and escalates in any
+/// tooling keyed on the code.
+pub fn checked_out_elsewhere_cli_error(
+    error: &impl std::fmt::Display,
+) -> Option<crate::utils::error::CliError> {
+    let text = error.to_string();
+    if !text.contains(CHECKED_OUT_ELSEWHERE_PHRASE) {
+        return None;
+    }
+    Some(
+        crate::utils::error::CliError::fatal(text)
+            .with_stable_code(crate::utils::error::StableErrorCode::ConflictOperationBlocked)
+            .with_hint("switch that worktree to another branch first, or run the command there"),
+    )
 }
 
 /// Decode a raw `reference::Model` row into a [`Branch`].
@@ -469,6 +535,32 @@ impl Branch {
     where
         C: ConnectionTrait,
     {
+        // plan-20260714 §C.4.4: THE cross-worktree guard, on the writer's own
+        // connection, immediately before the write.
+        //
+        // It lives here rather than in each caller because "each caller"
+        // turned out to mean `merge`, `rebase`, `cherry-pick`, `revert`,
+        // `am`, `reset`, `commit`, `pull`, `fetch`, `fast-import`,
+        // `update-ref`, `branch` and `op restore` — and six of them had no
+        // guard at all while the rest checked BEFORE opening their
+        // transaction, leaving a window for another worktree to attach in
+        // between. Every local branch ref write in the process funnels
+        // through this function, so guarding it closes both holes at once
+        // and makes a future writer safe by default.
+        //
+        // Remote-tracking refs are exempt: nothing checks them out, and
+        // `branch_checked_out_elsewhere_result_with_conn` filters
+        // `remote IS NULL` anyway.
+        if remote.is_none()
+            && let Some(other) =
+                crate::internal::head::Head::branch_checked_out_elsewhere_result_with_conn(
+                    db,
+                    branch_name,
+                )
+                .await?
+        {
+            return Err(checked_out_elsewhere_db_err(branch_name, &other));
+        }
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let branch = match query_reference_with_conn(db, branch_name, remote).await {
                 Ok(branch) => branch,
@@ -523,7 +615,17 @@ impl Branch {
         remote: Option<&str>,
     ) -> Result<(), DbErr> {
         let db_conn = get_db_conn_instance().await;
-        Self::update_branch_with_conn(&db_conn, branch_name, commit_hash, remote).await
+        // §C.4.4: run the checked-out probe and the write in ONE transaction.
+        // On a pool connection they are two implicit transactions, so another
+        // worktree can attach the branch in between — the probe says "free",
+        // the write moves the tip, and that worktree is left pointing at the
+        // old one. SQLite's rollback journal makes the read half of this
+        // transaction block a concurrent attach until we commit, so the pair
+        // is genuinely atomic against it.
+        use sea_orm::TransactionTrait;
+        let txn = db_conn.begin().await?;
+        Self::update_branch_with_conn(&txn, branch_name, commit_hash, remote).await?;
+        txn.commit().await
     }
 
     /// Result-returning branch delete.
@@ -541,6 +643,25 @@ impl Branch {
     where
         C: ConnectionTrait,
     {
+        // §C.4.4: deleting a branch another worktree has checked out leaves
+        // that worktree's HEAD dangling. `switch -C` reached here directly —
+        // deleting first and recreating after — so the guard on the UPDATE
+        // path alone let the delete through and then failed the recreate,
+        // which is the worst of both.
+        if remote.is_none()
+            && let Some(other) =
+                crate::internal::head::Head::branch_checked_out_elsewhere_result_with_conn(
+                    db,
+                    branch_name,
+                )
+                .await
+                .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        {
+            return Err(BranchStoreError::CheckedOutElsewhere {
+                name: branch_name.to_string(),
+                worktree: other,
+            });
+        }
         let branch = query_reference_with_conn(db, branch_name, remote)
             .await
             .map_err(|err| BranchStoreError::Query(err.to_string()))?;
@@ -578,12 +699,30 @@ impl Branch {
     }
 
     /// Pool-acquiring counterpart of [`Branch::delete_branch_result_with_conn`].
+    ///
+    /// Must NOT be called from within an active transaction (would deadlock —
+    /// see the block comment near the top of `impl Branch`).
     pub async fn delete_branch_result(
         branch_name: &str,
         remote: Option<&str>,
     ) -> Result<(), BranchStoreError> {
         let db_conn = get_db_conn_instance().await;
-        Self::delete_branch_result_with_conn(&db_conn, branch_name, remote).await
+        // §C.4.4: probe, delete and metadata cascade in ONE transaction. On a
+        // pool connection they are three implicit transactions, so a worktree
+        // that attaches to this branch after the probe — `switch -C` reaches
+        // this entry point directly — passes its own probe (the branch is
+        // still there), and then loses the branch under it. The same
+        // transaction also makes the metadata cascade atomic with the ref
+        // delete, which the `_with_conn` form could only document as a gap.
+        use sea_orm::TransactionTrait;
+        let txn = db_conn
+            .begin()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        Self::delete_branch_result_with_conn(&txn, branch_name, remote).await?;
+        txn.commit()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))
     }
 
     /// ATOMIC tip-conditional delete (W2 §C.4.3 `stash branch` rollback):

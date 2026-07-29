@@ -2214,7 +2214,9 @@ async fn apply_fast_forward_merge(
                     }
                     Head::Detached(_) => {
                         // Merging into a detached HEAD is unusual but possible. We just move HEAD.
-                        Head::update_with_conn(txn, Head::Detached(target_commit.id), None).await;
+                        Head::update_result_with_conn(txn, Head::Detached(target_commit.id), None)
+                            .await
+                            .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
                     }
                 }
                 Ok(())
@@ -2328,7 +2330,9 @@ async fn update_head_with_reflog(
             let head_name = head_name.clone();
             Box::pin(async move {
                 if head_name == "HEAD" {
-                    Head::update_with_conn(txn, Head::Detached(new_oid), None).await;
+                    Head::update_result_with_conn(txn, Head::Detached(new_oid), None)
+                        .await
+                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
                 } else {
                     Branch::update_branch_with_conn(txn, &head_name, &new_oid.to_string(), None)
                         .await?;

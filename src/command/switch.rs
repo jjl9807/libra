@@ -259,9 +259,18 @@ impl From<SwitchError> for CliError {
                     "use 'libra switch {}' if you meant the existing local branch, or 'libra switch -C {0}' to reset it.",
                     name
                 )),
-            SwitchError::BranchDelete { ref branch, ref detail } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-                .with_hint(format!("branch '{branch}' could not be deleted before force-create: {detail}")),
+            // §C.13: `switch -C` deletes and recreates, so a branch another
+            // worktree holds surfaces HERE. It is a conflict, not an I/O
+            // fault — the delete did not fail, it was refused.
+            SwitchError::BranchDelete { ref branch, ref detail } => {
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(|| {
+                    CliError::fatal(error.to_string())
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                        .with_hint(format!(
+                            "branch '{branch}' could not be deleted before force-create: {detail}"
+                        ))
+                })
+            }
             SwitchError::InternalBranchBlocked(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
             SwitchError::DirtyUnstaged => CliError::fatal(error.to_string())
@@ -282,8 +291,16 @@ impl From<SwitchError> for CliError {
             SwitchError::BranchCreate { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            // §C.13: a HEAD/branch write refused because another worktree
+            // has the branch checked out is a CONFLICT, not a write fault —
+            // `switch -C` reaches the seam directly.
             SwitchError::HeadUpdate(..) => {
-                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(
+                    || {
+                        CliError::fatal(error.to_string())
+                            .with_stable_code(StableErrorCode::IoWriteFailed)
+                    },
+                )
             }
             SwitchError::DelegatedCli(cli_err) => cli_err,
         }
@@ -306,6 +323,16 @@ fn map_branch_store_error(error: repo_branch::BranchStoreError) -> SwitchError {
         repo_branch::BranchStoreError::Delete { name, detail } => SwitchError::DelegatedCli(
             CliError::fatal(format!("failed to delete branch '{name}': {detail}"))
                 .with_stable_code(StableErrorCode::IoWriteFailed),
+        ),
+        // §C.13 LBR-CONFLICT-002. `switch -C` reaches the delete seam
+        // directly, so this is the arm a real collision takes.
+        repo_branch::BranchStoreError::CheckedOutElsewhere { .. } => SwitchError::DelegatedCli(
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint(
+                    "the other worktree must switch away first; `libra worktree list` shows \
+                     which one holds it",
+                ),
         ),
     }
 }
@@ -1209,7 +1236,18 @@ pub(crate) async fn switch_to_orphan_branch(
             .with_stable_code(StableErrorCode::ConflictOperationBlocked),
         ));
     }
-    if let Some(other) = Head::branch_checked_out_elsewhere(&new_branch_name).await {
+    let checked_out = Head::branch_checked_out_elsewhere_result(&new_branch_name)
+        .await
+        .map_err(|error| {
+            SwitchError::WorktreeConflict(
+                CliError::fatal(format!(
+                    "cannot determine whether branch '{new_branch_name}' is checked out in \
+                     another worktree: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt),
+            )
+        })?;
+    if let Some(other) = checked_out {
         return Err(SwitchError::WorktreeConflict(
             CliError::fatal(format!(
                 "branch '{new_branch_name}' is already checked out at worktree '{other}'"

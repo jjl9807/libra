@@ -444,8 +444,19 @@ impl From<CommitError> for CliError {
             CommitError::ParentCommitLoad { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("the parent commit is missing or corrupted"),
+            // §C.13: the same failure variant carries two very different
+            // conditions. A branch another worktree has checked out is a
+            // CONFLICT (`LBR-CONFLICT-002`) — the repository is intact and
+            // the user has a next step; everything else here is a write
+            // fault. The predicate belongs to the storage layer, so this
+            // boundary asks it rather than matching on the message itself.
             CommitError::HeadUpdate(..) => {
-                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(
+                    || {
+                        CliError::fatal(error.to_string())
+                            .with_stable_code(StableErrorCode::IoWriteFailed)
+                    },
+                )
             }
             CommitError::PreCommitHook(..) | CommitError::RepositoryHook { .. } => {
                 CliError::failure(error.to_string())
@@ -2945,6 +2956,31 @@ async fn get_parents_ids() -> Vec<ObjectHash> {
 async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), CommitError> {
     match Head::current_with_conn(db).await {
         Head::Branch(name) => {
+            // plan-20260714 §C.4.4: `commit` and `amend` are current-branch ref
+            // writers, and they were the ones NOT wired to the checked-out
+            // guard. Normally this worktree is the only one on `name` and the
+            // probe returns None. It matters for a repository that already
+            // holds a duplicate checkout — created before the guard existed,
+            // or by a registry edit — where committing moves a branch a
+            // second worktree's HEAD is also on, silently diverging that
+            // worktree's working tree from its own branch. Fail closed before
+            // writing the ref, and say where the other checkout is.
+            if let Some(other) = Head::branch_checked_out_elsewhere_result_with_conn(db, &name)
+                .await
+                .map_err(|error| {
+                    CommitError::HeadUpdate(format!(
+                        "cannot determine whether branch '{name}' is checked out in another \
+                         worktree: {error}"
+                    ))
+                })?
+            {
+                return Err(CommitError::HeadUpdate(format!(
+                    "branch '{name}' is also checked out at worktree '{other}', so committing \
+                     here would move a pointer that worktree is using; run `libra worktree \
+                     list` to inspect, then `libra worktree repair` or switch one of them to \
+                     another branch"
+                )));
+            }
             Branch::update_branch_with_conn(db, &name, commit_id, None)
                 .await
                 .map_err(|e| {
@@ -2956,7 +2992,11 @@ async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), 
                 ObjectHash::from_str(commit_id)
                     .map_err(|e| CommitError::HeadUpdate(format!("invalid commit id: {e}")))?,
             );
-            Head::update_with_conn(db, head, None).await;
+            // Propagated: a swallowed HEAD write left `commit` reporting
+            // success with HEAD unmoved.
+            Head::update_result_with_conn(db, head, None)
+                .await
+                .map_err(|e| CommitError::HeadUpdate(format!("failed to update HEAD: {e}")))?;
         }
     }
     Ok(())

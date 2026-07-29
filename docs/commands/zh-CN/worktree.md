@@ -9,6 +9,7 @@
 ```
 libra worktree add <path>
 libra worktree list
+libra worktree doctor
 libra worktree lock <path> [--reason <text>]
 libra worktree unlock <path>
 libra worktree move <src> <dest>
@@ -69,6 +70,28 @@ libra --machine worktree list
 ```
 
 结构化输出使用 `worktree.list` 命令信封。每个条目报告 `kind`、`path`、`is_main`、`locked`、`lock_reason`，以及该路径当前是否存在于磁盘上。
+
+### 子命令：`doctor`
+
+报告每个 worktree 的 scope 诊断。**严格只读**（plan-20260714 Part C W0 §C.11）：
+调用前后 registry、数据库、lease 状态与文件系统逐字节不变。诊断命令必须能安全地
+在一个你尚未理解的仓库上运行——那正是你会用到它的时刻——所以它绝不自行 adopt、
+reclaim 或修复。修复动作是独立的显式子命令；任何错误提示都不会承诺裸 `doctor`
+会修好什么。
+
+```bash
+libra worktree doctor
+libra --json worktree doctor
+```
+
+对每个 worktree 报告磁盘 `layout` 与生命周期 `state`（与 `worktree list` 同一套
+取值）、该 worktree 自身的身份是否仍为 registry 所知（`identity_registered`），
+以及逐条说明处置方式的 `findings` 列表——例如 legacy-symlink 布局需要
+`worktree repair --migrate-layout`，或 `.libra/worktree_id` 与 registry 不符的
+worktree 需要先 `worktree repair` 才会接受 mutation。
+
+结构化输出使用 `worktree.doctor` 命令信封，含 `schema_version`、`diagnostics[]`
+与 `next_cursor`（当前恒为 `null`；分页随 W4 机器接口交付）。
 
 ### 子命令：`lock`
 

@@ -1181,15 +1181,28 @@ async fn run_bisect_reset(rev: Option<String>) -> CliResult<BisectOutput> {
     // Warn and end the session detached at the target commit instead.
     let target_branch = match target_branch {
         Some(branch_name) => {
-            if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
-                crate::utils::error::emit_warning(format!(
-                    "not re-attaching branch '{branch_name}': it is now checked out at \
-                     worktree '{other}'; bisect ends detached at {target_hash} \
-                     (use 'libra switch' to pick a branch)"
-                ));
-                None
-            } else {
-                Some(branch_name)
+            // §C.4.4: fail CLOSED on the DANGEROUS action. If the probe
+            // cannot answer, do not re-attach — ending detached is
+            // recoverable with one `switch`; two worktrees on one branch is
+            // not.
+            match Head::branch_checked_out_elsewhere_result(&branch_name).await {
+                Ok(Some(other)) => {
+                    crate::utils::error::emit_warning(format!(
+                        "not re-attaching branch '{branch_name}': it is now checked out at \
+                         worktree '{other}'; bisect ends detached at {target_hash} \
+                         (use 'libra switch' to pick a branch)"
+                    ));
+                    None
+                }
+                Ok(None) => Some(branch_name),
+                Err(error) => {
+                    crate::utils::error::emit_warning(format!(
+                        "not re-attaching branch '{branch_name}': cannot determine whether it \
+                         is checked out in another worktree ({error}); bisect ends detached at \
+                         {target_hash} (use 'libra switch' to pick a branch)"
+                    ));
+                    None
+                }
             }
         }
         None => None,
@@ -1232,6 +1245,16 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
             "failed to restore original branch '{branch_name}': {error}"
         ))
         .with_stable_code(StableErrorCode::IoWriteFailed),
+        // §C.13: a checkout collision is a CONFLICT, not corruption or an
+        // I/O fault — the repository is intact and the user has a next step.
+        BranchStoreError::CheckedOutElsewhere { .. } => CliError::fatal(format!(
+            "failed to restore original branch '{branch_name}': {error}"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "the other worktree must switch away first; `libra worktree list` shows which one \
+             holds it",
+        ),
     }
 }
 
@@ -1257,7 +1280,9 @@ async fn restore_to_branch(branch_name: String, commit_hash: ObjectHash) -> CliR
 
     // Update HEAD to point to the branch
     let new_head = Head::Branch(branch_name.clone());
-    Head::update_with_conn(&txn, new_head.clone(), None).await;
+    Head::update_result_with_conn(&txn, new_head.clone(), None)
+        .await
+        .map_err(|error| map_bisect_branch_store_error(&branch_name, error))?;
 
     txn.commit()
         .await
@@ -1518,7 +1543,12 @@ async fn checkout_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
         .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
 
     let new_head = Head::Detached(commit_hash);
-    Head::update_with_conn(&txn, new_head, None).await;
+    Head::update_result_with_conn(&txn, new_head, None)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to move HEAD to {commit_hash}: {error}"))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
 
     txn.commit()
         .await

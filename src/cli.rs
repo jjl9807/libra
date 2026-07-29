@@ -1482,6 +1482,21 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         Commands::Worktree(command::worktree::WorktreeArgs {
             command: command::worktree::WorktreeSubcommand::Umount { .. },
         }) => Ok(CommandPreflight::none()),
+        // W0 §C.11: `worktree doctor` is STRICTLY read-only, and applying
+        // pending migrations is a WRITE. A diagnostic that silently upgrades
+        // the schema of the repository you are diagnosing changes the thing
+        // you were trying to observe — and on a repository behind schema, it
+        // is the one command you most want to be able to run without
+        // committing to an upgrade first.
+        Commands::Worktree(command::worktree::WorktreeArgs {
+            command: command::worktree::WorktreeSubcommand::Doctor,
+        }) => {
+            let storage =
+                utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
         // Config global/system scopes don't require a repository.
         Commands::Config(cfg) if cfg.global || cfg.system => Ok(CommandPreflight::none()),
         Commands::Code(code_args) => {
@@ -1511,58 +1526,293 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
     }
 }
 
+/// plan-20260714 Part C W0 (§C.11): which mutable state a command owns.
+///
+/// Every command declares one. The declaration is the *inventory guard* the
+/// card requires, and it is enforced by the compiler rather than by a test:
+/// [`command_scope`] matches exhaustively with no wildcard arm, so adding a
+/// `Commands` variant without classifying it does not build. A test that
+/// merely fails is weaker — it can be skipped, filtered out, or land on a
+/// branch where the suite is not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandScope {
+    /// Mutates repository-wide state only: refs, config, the object store,
+    /// the worktree registry. Identical from any worktree, so a damaged
+    /// worktree does not make it unsafe.
+    Repository,
+    /// Mutates THIS worktree's HEAD, index, or working files.
+    Worktree,
+    /// Both — the reason `pull`, `fetch` and `stash` cannot be classified as
+    /// either one alone (§C.11).
+    Composite,
+    /// Reads only. Must stay available in a damaged worktree, because
+    /// diagnosing the damage is what these commands are for.
+    ReadOnly,
+}
+
+impl CommandScope {
+    /// Does this scope write the CURRENT worktree's HEAD / index / files?
+    fn mutates_worktree_state(self) -> bool {
+        matches!(self, Self::Worktree | Self::Composite)
+    }
+
+    /// Can this scope publish a reference to an object — a ref row, an index
+    /// entry, a sidecar, an agent-run manifest?
+    ///
+    /// Everything that is not read-only can. That is deliberately coarse:
+    /// under-claiming here is what lets a deletion phase run concurrently
+    /// with a publisher (§C.4.3 writer-vs-deleter), so the safe default for
+    /// a new command is "yes".
+    fn publishes_object_references(self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+}
+
+/// The scope inventory. See [`CommandScope`] — this match is deliberately
+/// exhaustive, so a new command must declare its scope to compile.
+fn command_scope(command: &Commands) -> CommandScope {
+    use CommandScope::{Composite, ReadOnly, Repository, Worktree};
+    match command {
+        // ── Worktree: HEAD / index / working files of THIS worktree ───────
+        Commands::Add(_)
+        | Commands::Rm(_)
+        | Commands::Mv(_)
+        | Commands::Restore(_)
+        | Commands::Clean(_)
+        | Commands::Reset(_)
+        | Commands::ReadTree(_)
+        | Commands::UpdateIndex(_)
+        | Commands::Hydrate(_)
+        | Commands::Dirty(_)
+        | Commands::Checkout(_)
+        | Commands::Switch(_)
+        | Commands::MergeFile(_)
+        | Commands::Apply(_)
+        // rerere's MERGE_RR is worktree-local (the rr-cache stays shared).
+        | Commands::Rerere(_) => Worktree,
+
+        // ── Composite: repository refs AND this worktree's state ──────────
+        Commands::Commit(_)
+        | Commands::Merge(_)
+        | Commands::Rebase(_)
+        | Commands::CherryPick(_)
+        | Commands::Revert(_)
+        | Commands::Am(_)
+        | Commands::Bisect(_)
+        // §C.11 pins these three explicitly. `fetch` earns Composite because
+        // FETCH_HEAD is worktree-local: run from a legacy shared-`.libra`
+        // worktree it lands in MAIN's gitdir.
+        | Commands::Pull(_)
+        | Commands::Fetch(_)
+        | Commands::Stash(_)
+        // These run tools that edit the working tree.
+        | Commands::Code(_)
+        | Commands::Automation(_)
+        | Commands::Sandbox(_) => Composite,
+
+        // ── Advisory stores: only their MUTATING subcommands ──────────────
+        Commands::SparseView(args) => {
+            if matches!(
+                args.command,
+                command::sparse_view::SparseViewCommand::List
+                    | command::sparse_view::SparseViewCommand::Status
+            ) {
+                ReadOnly
+            } else {
+                Worktree
+            }
+        }
+        Commands::Layer(args) => {
+            if matches!(
+                args.command,
+                command::layer::LayerCommand::List | command::layer::LayerCommand::Status
+            ) {
+                ReadOnly
+            } else {
+                Worktree
+            }
+        }
+        // The write form moves this worktree's HEAD directly.
+        Commands::SymbolicRef(args) => {
+            if args.target.is_some() {
+                Worktree
+            } else {
+                ReadOnly
+            }
+        }
+        // Non-dry-run restore rewrites HEAD/index/worktree from a snapshot.
+        Commands::Op(args) => {
+            if matches!(
+                &args.command,
+                command::op::OpCommand::Restore { dry_run: false, .. }
+            ) {
+                Composite
+            } else {
+                ReadOnly
+            }
+        }
+        // `worktree` manages the REGISTRY, not this worktree's HEAD/index —
+        // and `repair` is the documented recovery route out of a damaged
+        // identity, so it must never be gated behind a healthy one.
+        Commands::Worktree(args) => match &args.command {
+            command::worktree::WorktreeSubcommand::List { .. } => ReadOnly,
+            // `doctor` is STRICTLY read-only (§C.11 W0, Codex R15/R16):
+            // the repository — database, registry, lease state and
+            // FILESYSTEM — must be unchanged across a default invocation.
+            // Classifying it as a writer made the generic shared hold create
+            // `.libra/maintenance.lock`, which is a filesystem change, in the
+            // one command whose contract forbids any.
+            command::worktree::WorktreeSubcommand::Doctor => ReadOnly,
+            _ => Repository,
+        },
+
+        // ── Repository: refs, config, object store, registries ────────────
+        Commands::Init(_)
+        | Commands::Clone(_)
+        | Commands::Config(_)
+        | Commands::Branch(_)
+        | Commands::Tag(_)
+        | Commands::UpdateRef(_)
+        | Commands::Reflog(_)
+        | Commands::Notes(_)
+        | Commands::Replace(_)
+        | Commands::Remote(_)
+        | Commands::Push(_)
+        | Commands::Repack(_)
+        | Commands::Maintenance(_)
+        | Commands::Fsck(_)
+        | Commands::Cache(_)
+        | Commands::File(_)
+        | Commands::Alternates(_)
+        | Commands::Metadata(_)
+        | Commands::Revision(_)
+        | Commands::Hooks(_)
+        | Commands::Service(_)
+        | Commands::Lfs(_)
+        | Commands::Deps(_)
+        | Commands::Auth(_)
+        | Commands::Login(_)
+        | Commands::Logout(_)
+        | Commands::Credential(_)
+        | Commands::HashObject(_)
+        | Commands::WriteTree(_)
+        | Commands::CommitTree(_)
+        | Commands::FastImport(_)
+        | Commands::IndexPack(_)
+        | Commands::PackObjects(_)
+        | Commands::Bundle(_)
+        | Commands::Cloud(_)
+        | Commands::Publish(_)
+        // The agent surface keeps its state in the repository database. The
+        // parts that DO edit files go through `code` / task worktrees, which
+        // take a workspace lease of their own; `agent`, `review`,
+        // `investigate` and `code-control` must stay usable for diagnosis in
+        // a damaged worktree.
+        | Commands::Agent(_)
+        | Commands::Review(_)
+        | Commands::Investigate(_)
+        | Commands::CodeControl(_) => Repository,
+        #[cfg(feature = "fastcdc")]
+        Commands::Media(_) => Repository,
+
+        // ── ReadOnly ──────────────────────────────────────────────────────
+        Commands::Status(_)
+        | Commands::Log(_)
+        | Commands::Logfile(_)
+        | Commands::LsFiles(_)
+        | Commands::LsTree(_)
+        | Commands::LsRemote(_)
+        | Commands::ShowRef(_)
+        | Commands::ForEachRef(_)
+        | Commands::RevParse(_)
+        | Commands::RevList(_)
+        | Commands::Diff(_)
+        | Commands::DiffTree(_)
+        | Commands::DiffIndex(_)
+        | Commands::DiffFiles(_)
+        | Commands::MergeBase(_)
+        | Commands::Grep(_)
+        | Commands::Blame(_)
+        | Commands::Describe(_)
+        | Commands::Show(_)
+        | Commands::Shortlog(_)
+        | Commands::CatFile(_)
+        | Commands::CheckIgnore(_)
+        | Commands::CheckAttr(_)
+        | Commands::CheckMailmap(_)
+        | Commands::FastExport(_)
+        | Commands::Archive(_)
+        | Commands::FormatPatch(_)
+        | Commands::Mailinfo(_)
+        | Commands::VerifyPack(_)
+        | Commands::Completions(_)
+        | Commands::Usage(_)
+        | Commands::Graph(_)
+        | Commands::Open(_)
+        | Commands::Whoami(_) => ReadOnly,
+    }
+}
+
 /// The worktree-STATE mutation surface (W3-s3 §C.6.1): commands that move
 /// HEAD, rewrite the index, or restructure the working tree of the CURRENT
-/// worktree. Repository-scoped writers (branch/tag/remote/config/fetch/push,
-/// object plumbing) stay allowed in a legacy-symlink worktree — they behave
+/// worktree. Repository-scoped writers (branch/tag/remote/config/push, object
+/// plumbing) stay allowed in a legacy-symlink worktree — they behave
 /// identically from any scope.
 fn command_mutates_worktree_state(command: &Commands) -> bool {
-    matches!(
+    command_scope(command).mutates_worktree_state()
+}
+
+/// Does this command hold the SHARED maintenance lock for its whole run
+/// (plan-20260714 §C.4.3 writer-vs-deleter)?
+///
+/// Every non-read-only command does, EXCEPT the deletion family itself:
+/// `gc`/`prune`, `repack -d`, `cache evict` and `file obliterate` take the
+/// same lock EXCLUSIVELY around the phase that unlinks payloads, so taking
+/// it shared here first would only make them wait on themselves.
+fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
+    // The deletion family takes the lock itself, in the mode each phase
+    // needs — `maintenance` per task, `repack` shared for its pack write and
+    // exclusive for `-d`, `cache evict` / `file obliterate` / `agent clean`
+    // exclusive. A command-level shared hold here would be a hold they could
+    // not upgrade, so they would defer against themselves forever.
+    if matches!(
         command,
-        Commands::Add(_)
-            | Commands::Commit(_)
-            | Commands::Switch(_)
-            | Commands::Checkout(_)
-            | Commands::Restore(_)
-            | Commands::Reset(_)
-            | Commands::Merge(_)
-            | Commands::MergeFile(_)
-            | Commands::Rebase(_)
-            | Commands::CherryPick(_)
-            | Commands::Revert(_)
-            | Commands::Am(_)
-            | Commands::Bisect(_)
-            | Commands::Stash(_)
-            | Commands::Rm(_)
-            | Commands::Mv(_)
-            | Commands::Clean(_)
-            | Commands::Pull(_)
-            | Commands::Dirty(_)
-            | Commands::Hydrate(_)
-            | Commands::Rerere(_)
-            | Commands::ReadTree(_)
-            | Commands::UpdateIndex(_)
-    ) || match command {
-        // Scoped advisory stores: only their MUTATING subcommands touch
-        // worktree state; list/status stay readable in a legacy layout.
-        Commands::SparseView(args) => !matches!(
-            args.command,
-            command::sparse_view::SparseViewCommand::List
-                | command::sparse_view::SparseViewCommand::Status
-        ),
-        Commands::Layer(args) => !matches!(
-            args.command,
-            command::layer::LayerCommand::List | command::layer::LayerCommand::Status
-        ),
-        // The write form moves this worktree's HEAD directly.
-        Commands::SymbolicRef(args) => args.target.is_some(),
-        // Non-dry-run restore rewrites HEAD/index/worktree from a snapshot.
-        Commands::Op(args) => matches!(
-            &args.command,
-            command::op::OpCommand::Restore { dry_run: false, .. }
-        ),
-        _ => false,
+        Commands::Maintenance(_) | Commands::Repack(_) | Commands::Cache(_) | Commands::File(_)
+    ) {
+        return false;
     }
+    // Long-running commands and sessions are excluded on purpose (§C.10: no
+    // ordinary command holds a maintenance lock for its lifetime). A `libra
+    // code` session runs for hours; holding the lock across it would starve
+    // every deletion phase, and — worse — a shell command the user approves
+    // INSIDE that session cannot satisfy "wait for the other command to
+    // finish", because the other command is its own parent.
+    //
+    // Excluding them opens no hole, because their in-process publications
+    // are already covered by mechanisms that predate this lock:
+    //
+    // * VCS mutations from an agent go through `run_libra_vcs`, which spawns
+    //   `libra` as a SUBPROCESS (`internal/ai/mcp/resource.rs`) — the child
+    //   takes the shared hold like any other command;
+    // * an agent-run directory without a manifest fails the GC root walk
+    //   closed at any age, so the objectize → finalize window of a review or
+    //   investigate run cannot be pruned through;
+    // * capture checkpoint writes publish under a traces-inflight marker,
+    //   which defers destructive pruning for its (clamped) TTL.
+    if matches!(
+        command,
+        Commands::Code(_)
+            | Commands::Automation(_)
+            | Commands::Sandbox(_)
+            | Commands::Service(_)
+            | Commands::Agent(_)
+            | Commands::Review(_)
+            | Commands::Investigate(_)
+            | Commands::CodeControl(_)
+    ) {
+        return false;
+    }
+    command_scope(command).publishes_object_references()
 }
 
 fn command_requires_complete_object_index(command: &Commands) -> bool {
@@ -2001,12 +2251,68 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
              would move the MAIN worktree's HEAD/index"
                 .to_string(),
         )
+        // §C.13 offers "a new worktree-layout stable code OR LBR-REPO-002
+        // with a dedicated detail" — LBR-REPO-003 is that dedicated layout
+        // code. What it must never be is a generic "unsupported".
         .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
         .with_hint(
             "run `libra worktree repair --migrate-layout <this-path>` from the main \
              worktree to migrate it to the isolated layout (read-only commands still work)",
         ));
     }
+    // W0 §C.4.1: a linked worktree whose `worktree_id` is missing, empty, or
+    // unreadable gets a SYNTHESIZED id so it never aliases to main. That
+    // fallback keeps reads honest, but it is a guess — mutating under it
+    // writes HEAD/index/sequencer rows that no other process associates with
+    // this worktree, and the damage is silent. Refuse the mutation once,
+    // here, with a repair route. Reads and `worktree repair` still work.
+    if command_mutates_worktree_state(&args.command)
+        && let Some(worktree_id) = utils::util::current_worktree_id()
+    {
+        // UNKNOWN is not OK. `registry_knows_linked_worktree` returns `None`
+        // when the registry itself cannot be read, and treating that as
+        // permission to proceed is the same fail-open the rest of this card
+        // spent its time removing: with a corrupt `worktrees.json` and a
+        // missing `worktree_id`, a mutation writes a scoped HEAD row under a
+        // synthesized identity that nothing will ever look up again.
+        let detail = match command::worktree::registry_knows_linked_worktree(&worktree_id) {
+            Some(true) => None,
+            Some(false) => Some(format!(
+                "this linked worktree's identity '{worktree_id}' is not in the worktree \
+                 registry; its `worktree_id` file is missing or corrupt, so mutating state \
+                 here would write rows nothing else can find"
+            )),
+            None => Some(
+                "the worktree registry cannot be read, so this worktree's identity cannot be \
+                 confirmed; mutating state here risks writing rows nothing else can find"
+                    .to_string(),
+            ),
+        };
+        if let Some(detail) = detail {
+            return Err(CliError::fatal(detail)
+                // §C.13: corrupt/missing linked worktree identity →
+                // LBR-REPO-002.
+                .with_stable_code(utils::error::StableErrorCode::RepoCorrupt)
+                .with_hint(
+                    "run `libra worktree repair` from the main worktree to restore this \
+                     worktree's identity (read-only commands still work)",
+                ));
+        }
+    }
+    // §C.4.3 writer-vs-deleter: hold the repository maintenance lock SHARED
+    // for the whole command. A publisher and a deletion phase can then never
+    // overlap, so a reference can never appear for bytes a concurrent `gc`,
+    // `repack -d`, `cache evict` or `file obliterate` has already unlinked —
+    // including the publications that never touch SQLite (an index entry, a
+    // worktree sidecar, an agent-run manifest) and are therefore invisible to
+    // a database transaction. Publishers never block each other; the cost is
+    // one `flock` per command.
+    let _maintenance_lock = match preflight.storage.as_deref() {
+        Some(storage) if command_holds_shared_maintenance_lock(&args.command) => Some(
+            crate::internal::maintenance_lock::MaintenanceLock::shared(storage)?,
+        ),
+        _ => None,
+    };
     // Resolve global output flags into a single config before dispatching.
     let color = if args.no_color {
         "never"

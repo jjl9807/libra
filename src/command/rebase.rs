@@ -1012,6 +1012,8 @@ pub(crate) enum RebaseError {
     AuxStateLoad { path: String, detail: String },
     #[error("failed to save rebase auxiliary state '{path}': {detail}")]
     AuxStateSave { path: String, detail: String },
+    #[error("failed to update HEAD during rebase: {0}")]
+    HeadUpdate(String),
     #[error("not on a branch or in detached HEAD state, cannot rebase")]
     NotOnBranch,
     #[error("current branch '{branch}' has no commits")]
@@ -1102,6 +1104,19 @@ impl From<RebaseError> for CliError {
             RebaseError::NotOnBranch | RebaseError::BranchHasNoCommits { .. } => {
                 CliError::fatal(error.to_string())
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
+            }
+            // §C.13: a HEAD write refused because the branch is checked out
+            // in another worktree is a CONFLICT; anything else that fails
+            // here is a write fault. The classification comes from the
+            // storage layer's own predicate, not from a message match at
+            // this boundary.
+            RebaseError::HeadUpdate(..) => {
+                crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(
+                    || {
+                        CliError::fatal(error.to_string())
+                            .with_stable_code(StableErrorCode::IoWriteFailed)
+                    },
+                )
             }
             RebaseError::UpstreamResolve { .. }
             | RebaseError::OntoResolve { .. }
@@ -2383,7 +2398,9 @@ async fn run_rebase_start(
                         None,
                     )
                     .await?;
-                    Head::update_with_conn(txn, Head::Branch(branch_name_cloned), None).await;
+                    Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned), None)
+                        .await
+                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
                     Ok(())
                 })
             },
@@ -2535,7 +2552,9 @@ async fn run_rebase_start(
     db.transaction(|txn| {
         Box::pin(async move {
             reflog::Reflog::insert_single_entry(txn, &start_context, "HEAD").await?;
-            Head::update_with_conn(txn, Head::Detached(newbase_id), None).await;
+            Head::update_result_with_conn(txn, Head::Detached(newbase_id), None)
+                .await
+                .map_err(|error| ReflogError::from(sea_orm::DbErr::Custom(error.to_string())))?;
             Ok::<_, ReflogError>(())
         })
     })
@@ -2557,7 +2576,9 @@ async fn run_rebase_start(
     };
 
     state.save().await.map_err(RebaseError::StateSave)?;
-    Head::update_with_conn(&db, Head::Detached(newbase_id), None).await;
+    Head::update_result_with_conn(&db, Head::Detached(newbase_id), None)
+        .await
+        .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
 
     let replay = continue_replay(
         &mut state,
@@ -2716,7 +2737,9 @@ async fn continue_replay(
                 state.stopped_sha = None;
 
                 // Update HEAD
-                Head::update_with_conn(&db, Head::Detached(state.current_head), None).await;
+                Head::update_result_with_conn(&db, Head::Detached(state.current_head), None)
+                    .await
+                    .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
 
                 if emit_human {
                     println!(
@@ -2971,7 +2994,9 @@ async fn finalize_rebase(
                 }
 
                 // Also, re-attach HEAD to the newly moved branch.
-                Head::update_with_conn(txn, Head::Branch(branch_name_cloned.clone()), None).await;
+                Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned.clone()), None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
                 Ok(())
             })
         },
@@ -2979,8 +3004,14 @@ async fn finalize_rebase(
     )
     .await
     {
-        // Attempt to restore HEAD to a safe state
-        Head::update_with_conn(&db, Head::Detached(final_commit_id), None).await;
+        // Best-effort recovery path: the caller is already returning the
+        // original failure, so a second failure here is logged rather than
+        // replacing it — but it is no longer invisible.
+        if let Err(error) =
+            Head::update_result_with_conn(&db, Head::Detached(final_commit_id), None).await
+        {
+            tracing::error!(%error, "failed to restore HEAD after a rebase finish failure");
+        }
         return Err(e).context("failed to record reflog for rebase finish");
     }
 
@@ -3110,7 +3141,9 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
         state.stopped_sha = None;
 
         let db = get_db_conn_instance().await;
-        Head::update_with_conn(&db, Head::Detached(state.current_head), None).await;
+        Head::update_result_with_conn(&db, Head::Detached(state.current_head), None)
+            .await
+            .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
 
         applied_commits.push(RebaseAppliedCommitOutput {
             original_commit: stopped_sha.to_string(),
@@ -3254,7 +3287,9 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
                         ))
                     })?;
                 }
-                Head::update_with_conn(txn, Head::Branch(branch_name_cloned), None).await;
+                Head::update_result_with_conn(txn, Head::Branch(branch_name_cloned), None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
                 Ok(())
             })
         },

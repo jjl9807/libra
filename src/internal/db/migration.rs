@@ -1096,6 +1096,27 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072501_workspace_record.sql"),
             include_str!("../../../sql/migrations/2026072501_workspace_record_down.sql"),
         ),
+        // plan-20260714 Part C W0 (§C.11 "HEAD schema hardening"): at most one
+        // local HEAD row per worktree scope, enforced by partial unique
+        // indexes. Pre-existing duplicates FAIL the migration closed
+        // (ADR-0714-08) — an ambiguous scope is never resolved by guessing.
+        sql_migration(
+            2026072901,
+            "head_scope_unique",
+            include_str!("../../../sql/migrations/2026072901_head_scope_unique.sql"),
+            include_str!("../../../sql/migrations/2026072901_head_scope_unique_down.sql"),
+        ),
+        // plan-20260714 Part C W0 (§C.11 "operation scope schema/migration"):
+        // distinguish a DECLARED operation scope from one inherited by the
+        // 2026072201 backfill. `op restore` refuses `unknown` rows rather
+        // than rewrite a worktree from an operation that may never have run
+        // in it (ADR-0714-08).
+        sql_migration(
+            2026072902,
+            "operation_scope_provenance",
+            include_str!("../../../sql/migrations/2026072902_operation_scope_provenance.sql"),
+            include_str!("../../../sql/migrations/2026072902_operation_scope_provenance_down.sql"),
+        ),
     ]
 }
 

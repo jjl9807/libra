@@ -754,10 +754,21 @@ impl<R: BufRead> Importer<R> {
         // current worktree, so importing into this worktree's own branch stays
         // allowed.
         for refname in pending_refs.keys() {
-            if let Some(branch) = refname.strip_prefix("refs/heads/")
-                && let Some(other) =
-                    crate::internal::head::Head::branch_checked_out_elsewhere(branch).await
-            {
+            let Some(branch) = refname.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            // §C.4.4: fail CLOSED — a probe failure must not read as
+            // "no other worktree has it" right before a batch ref rewrite.
+            let checked_out =
+                crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
+                    .await
+                    .map_err(|error| {
+                        self.fatal(&format!(
+                            "cannot determine whether branch '{branch}' is checked out in \
+                             another worktree: {error}"
+                        ))
+                    })?;
+            if let Some(other) = checked_out {
                 return Err(self.fatal(&format!(
                     "cannot import into branch '{branch}': it is checked out at worktree '{other}'"
                 )));

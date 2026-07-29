@@ -62,6 +62,10 @@ pub struct OperationRecord {
     /// Worktree scope the operation ran in (Part C W1 §C.9): main = `""`,
     /// linked = its stable instance id.
     pub worktree_id: String,
+    /// W0 §C.11: how `worktree_id` came to hold its value. Every operation
+    /// this binary records is `"declared"`; `"unknown"` exists only for rows
+    /// migration 2026072902 could not attribute (see that file).
+    pub scope_provenance: String,
 }
 
 /// Parent edge for operation lineage.
@@ -219,6 +223,7 @@ impl OperationService {
             end_ts: model.end_ts,
             status,
             worktree_id: model.worktree_id,
+            scope_provenance: model.scope_provenance,
         })
     }
 
@@ -241,6 +246,7 @@ impl OperationService {
             end_ts: Set(record.end_ts),
             status: Set(record.status.as_db_value().to_string()),
             worktree_id: Set(record.worktree_id.clone()),
+            scope_provenance: Set(record.scope_provenance.clone()),
         };
 
         let inserted = model.insert(db).await.map_err(|err| {
@@ -977,6 +983,7 @@ mod tests {
             end_ts: Some(120),
             status: OperationStatus::Succeeded,
             worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
         }
     }
 
@@ -1304,7 +1311,7 @@ mod tests {
     async fn commit7_persist_and_find_operation_graph_roundtrip() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let ddl = concat!(
-            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '');",
+            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared');",
             "CREATE TABLE IF NOT EXISTS operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
             "CREATE TABLE IF NOT EXISTS operation_view(view_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,head_kind TEXT NOT NULL,head_target TEXT NOT NULL,created_at INTEGER NOT NULL);",
             "CREATE TABLE IF NOT EXISTS operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
@@ -1327,6 +1334,7 @@ mod tests {
                 end_ts: Some(205),
                 status: OperationStatus::Succeeded,
                 worktree_id: String::new(),
+                scope_provenance: "declared".to_string(),
             },
             parents: vec![OperationParentRecord {
                 op_id: "op_7".to_string(),
@@ -1387,7 +1395,7 @@ mod tests {
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '');",
+            "CREATE TABLE IF NOT EXISTS operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared');",
         ))
         .await
         .unwrap();
@@ -1405,6 +1413,7 @@ mod tests {
                 end_ts: Some(end_ts),
                 status: OperationStatus::Succeeded,
                 worktree_id: String::new(),
+                scope_provenance: "declared".to_string(),
             };
             OperationService::insert_operation_with_conn(&db, &record)
                 .await

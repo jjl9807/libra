@@ -969,6 +969,43 @@ async fn agent_object_gc_findings_reachability() {
         .expect("spawn touch");
     assert!(touch.success(), "backdate orphan object");
 
+    // §C.4.3 writer-vs-deleter quarantine: nothing is deleted the first time
+    // it is seen unreachable. The first run RECORDS the candidate; only a
+    // later run, finding it still unreachable after the grace window, deletes
+    // it. Drive both phases explicitly rather than waiting an hour.
+    let first = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert_cli_success(&first, "gc first pass records the candidate");
+    let first_out = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        first_out.contains("removed 0 unreachable loose objects"),
+        "the first pass must delete nothing: {first_out}"
+    );
+    assert!(
+        orphan_file.exists(),
+        "the first pass records the candidate, it does not delete it"
+    );
+
+    // Backdate the ledger entry so the candidate is past the grace window.
+    let ledger_path = repo.path().join(".libra").join("gc-prune-candidates.json");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).expect("ledger written by the first pass"))
+            .expect("ledger json");
+    let aged: serde_json::Map<String, serde_json::Value> = ledger
+        .as_object()
+        .expect("ledger object")
+        .keys()
+        .map(|oid| (oid.clone(), serde_json::json!(0)))
+        .collect();
+    assert!(
+        aged.contains_key(&orphan_oid),
+        "the orphan is in the ledger: {ledger}"
+    );
+    fs::write(
+        &ledger_path,
+        serde_json::to_vec(&serde_json::Value::Object(aged)).expect("serialize"),
+    )
+    .expect("age the ledger");
+
     // Dry-run: counts both sides, deletes nothing.
     let dry = run_libra_command(
         &["maintenance", "run", "--dry-run", "--task", "gc"],
@@ -1049,5 +1086,317 @@ async fn gc_ten_thousand_objects_within_budget() {
     assert!(
         elapsed < std::time::Duration::from_secs(60),
         "gc over 10k loose objects must stay within the wall-clock budget, took {elapsed:?}"
+    );
+}
+
+/// plan-20260714 §C.4.3 `Boundary`: GC stops at a shallow graft instead of
+/// reporting the clone as corrupt.
+///
+/// A shallow clone deliberately does not have its boundary commits' parents.
+/// The roots walk followed `parent_commit_ids` unconditionally, so the first
+/// absent parent surfaced as "reachable commit <oid> cannot be read while
+/// computing GC roots" and `gc`, `repack` and `prune` failed outright on
+/// every shallow repository — the one class of repository where routine
+/// maintenance matters most, because it was made small on purpose.
+#[test]
+fn gc_stops_at_a_shallow_boundary_instead_of_reporting_corruption() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+
+    // Two more commits, so there is a real parent edge to cut.
+    for n in 1..=2 {
+        fs::write(root.join(format!("f{n}.txt")), format!("{n}\n")).expect("write");
+        assert_cli_success(
+            &run_libra_command(&["add", &format!("f{n}.txt")], root),
+            "add",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("c{n}"), "--no-verify"], root),
+            "commit",
+        );
+    }
+
+    // HEAD~1 becomes the graft point: declare it a boundary and then remove
+    // its parent's object, exactly as a `--depth` clone would leave things.
+    let boundary =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], root).stdout)
+            .trim()
+            .to_string();
+    let cut = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~2"], root).stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !boundary.is_empty() && !cut.is_empty(),
+        "resolved both commits"
+    );
+
+    // A real `--depth` clone has no reflog entries for commits it never
+    // received; this synthetic one does, and they are reachability roots in
+    // their own right. Expire them so the fixture models the shape under
+    // test — the parent EDGE — rather than an unrelated dangling root.
+    //
+    // `--expire=all`, not `--expire=now`: the cutoff is `timestamp < c`, so
+    // entries written in the SAME second as the expire survive `now` and the
+    // fixture would keep the grafted-away commit alive depending on how the
+    // second boundary fell.
+    assert_cli_success(
+        &run_libra_command(&["reflog", "expire", "--expire=all", "--all"], root),
+        "expire reflog roots the graft would not have",
+    );
+
+    fs::write(root.join(".libra").join("shallow"), format!("{boundary}\n"))
+        .expect("write shallow metadata");
+    let cut_path = root
+        .join(".libra")
+        .join("objects")
+        .join(&cut[..2])
+        .join(&cut[2..]);
+    fs::remove_file(&cut_path).expect("remove the grafted-away parent object");
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], root);
+    let stderr = String::from_utf8_lossy(&gc.stderr);
+    assert!(
+        gc.status.success(),
+        "gc must stop at the boundary, not demand the parent this clone never had: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&cut),
+        "and must not name the grafted-away commit at all: {stderr}"
+    );
+
+    // The boundary commit itself survives — it is reachable, only its
+    // ancestry is absent.
+    assert_cli_success(
+        &run_libra_command(&["cat-file", "-t", &boundary], root),
+        "boundary commit still readable after gc",
+    );
+}
+
+/// Malformed shallow metadata fails CLOSED: reading it as "no boundaries"
+/// would put the walk straight back into the corruption report it is meant
+/// to prevent, and reading it as "everything is a boundary" would stop the
+/// walk early and let live objects be pruned.
+#[test]
+fn gc_refuses_to_prune_with_unparseable_shallow_metadata() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(
+        repo.path().join(".libra").join("shallow"),
+        "not-an-object-id\n",
+    )
+    .expect("write shallow metadata");
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&gc.stdout),
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(
+        !gc.status.success(),
+        "gc must refuse rather than prune under unreadable shallow metadata: {combined}"
+    );
+    assert!(
+        combined.contains("shallow"),
+        "and must say which metadata it could not trust: {combined}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// plan-20260714 §C.4.3 writer-vs-deleter: the maintenance exclusion lock
+// ---------------------------------------------------------------------------
+
+/// Hold the repository maintenance lock the way a concurrent publisher does.
+///
+/// A separate process is the honest fixture: `flock` is advisory and
+/// per-open-file-description, so a lock taken in THIS process would not be
+/// seen the same way by the spawned `libra` under test on every platform.
+/// Kills and reaps the helper on drop, including on an assertion unwind — a
+/// leaked holder keeps the lock (and a 600-second sleep) alive for every
+/// later test in this process.
+struct LockHolder(std::process::Child);
+
+impl Drop for LockHolder {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn hold_shared_maintenance_lock(repo: &std::path::Path) -> LockHolder {
+    let lock_path = repo.join(".libra").join("maintenance.lock");
+    let script = format!(
+        "import fcntl, sys, time\n\
+         f = open({path:?}, 'a+')\n\
+         fcntl.flock(f, fcntl.LOCK_SH)\n\
+         sys.stdout.write('locked\\n')\n\
+         sys.stdout.flush()\n\
+         time.sleep(600)\n",
+        path = lock_path.to_string_lossy().to_string()
+    );
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the publisher holding the maintenance lock");
+    // Wait for the lock to actually be held before returning.
+    use std::io::{BufRead, BufReader};
+    let stdout = child.stdout.take().expect("publisher stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("publisher ready line");
+    assert_eq!(line.trim(), "locked", "the publisher must hold the lock");
+    LockHolder(child)
+}
+
+/// §C.4.3: a deletion phase never unlinks while a publisher may be
+/// publishing — it DEFERS.
+///
+/// The two-scan quarantine proves an object was unreachable at two separated
+/// moments; it cannot prove nothing referenced it in between, and neither can
+/// a database transaction, because a worktree index, a sidecar and an
+/// agent-run manifest are files. This is the exclusion that closes that
+/// interval, and the test drives it end to end: with a publisher holding the
+/// lock the aged candidate SURVIVES and gc says so; once the publisher exits
+/// the same candidate is deleted.
+#[test]
+fn gc_defers_deletion_while_a_publisher_holds_the_maintenance_lock() {
+    let repo = create_committed_repo_via_cli();
+
+    fs::write(repo.path().join("orphan.md"), "orphan for the lock test\n").unwrap();
+    let hashed = run_libra_command(&["hash-object", "-w", "orphan.md"], repo.path());
+    assert_cli_success(&hashed, "hash-object -w");
+    let orphan_oid = String::from_utf8_lossy(&hashed.stdout).trim().to_string();
+    fs::remove_file(repo.path().join("orphan.md")).unwrap();
+    let orphan_file = loose_object_file(repo.path(), &orphan_oid);
+    assert!(orphan_file.exists(), "orphan loose object on disk");
+    // Age it past the loose-object grace window, as the PD-04 fixture does.
+    let touch = std::process::Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&orphan_file)
+        .status()
+        .expect("spawn touch");
+    assert!(touch.success(), "backdate the orphan object");
+
+    // Quarantine phase 1: record the candidate.
+    let first = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert_cli_success(&first, "gc records the candidate");
+    let ledger_path = repo.path().join(".libra").join("gc-prune-candidates.json");
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ledger_path).expect("ledger")).expect("ledger json");
+    let aged: serde_json::Map<String, serde_json::Value> = ledger
+        .as_object()
+        .expect("ledger object")
+        .keys()
+        .map(|oid| (oid.clone(), serde_json::json!(0)))
+        .collect();
+    assert!(aged.contains_key(&orphan_oid), "candidate recorded");
+    fs::write(&ledger_path, serde_json::to_vec(&aged).expect("serialize")).expect("age the ledger");
+
+    // A publisher is running: deletion must be deferred, not performed.
+    let publisher = hold_shared_maintenance_lock(repo.path());
+    let blocked = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    let blocked_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&blocked.stdout),
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(
+        blocked_out.contains("deferred the deletion"),
+        "gc must report the deferral rather than deleting: {blocked_out}"
+    );
+    assert!(
+        orphan_file.exists(),
+        "the candidate must survive while a publisher holds the lock: {blocked_out}"
+    );
+
+    // Publisher gone: the same candidate is now deleted.
+    drop(publisher);
+    let after = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    assert_cli_success(&after, "gc after the publisher exits");
+    let after_out = String::from_utf8_lossy(&after.stdout);
+    assert!(
+        !orphan_file.exists(),
+        "once nothing is publishing, the aged candidate is reclaimed: {after_out}"
+    );
+    // And it is reclaimed by the VERY NEXT run: a deferral must not reset the
+    // quarantine clock. If the deferred pass had dropped the candidate from
+    // the ledger, this run would re-quarantine it instead — which, in a
+    // repository with a long-running session, would mean pruning never
+    // happens at all.
+    assert!(
+        !after_out.contains("newly unreachable"),
+        "the deferral must preserve the candidate's first-seen timestamp: {after_out}"
+    );
+}
+
+/// §C.4.3: an agent-run directory whose manifest is missing fails the walk
+/// CLOSED, at any age.
+///
+/// The blobs an interrupted run owns are exactly as unlisted after a day as
+/// after a minute, so an age-bounded "skip it" turned "I cannot enumerate
+/// this run's roots" into "this run has none" — and pruned what it owned.
+#[test]
+fn gc_refuses_to_prune_with_an_unenumerable_agent_run() {
+    let repo = create_committed_repo_via_cli();
+    let run_dir = repo
+        .path()
+        .join(".libra")
+        .join("sessions")
+        .join("agent-runs")
+        .join("20260101T000000Z-abcdef01");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("findings.md"), "findings the run owns\n").expect("write findings");
+    // Backdate it well past any grace window: age must not buy permission.
+    let touch = std::process::Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(&run_dir)
+        .status()
+        .expect("spawn touch");
+    assert!(touch.success(), "backdate the run directory");
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&gc.stdout),
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(
+        !gc.status.success(),
+        "an unenumerable mandatory root must fail the walk closed: {combined}"
+    );
+    assert!(
+        combined.contains("no manifest") && combined.contains("agent clean"),
+        "and must name the explicit route out: {combined}"
+    );
+}
+
+/// A manifest that is valid JSON but not a JSON OBJECT (`[]`, `null`, a
+/// string) fails closed too: every field lookup on it returns `None`, which
+/// reads as "this run declares no roots" and prunes the blob it owned.
+#[test]
+fn gc_refuses_a_manifest_that_is_not_a_json_object() {
+    let repo = create_committed_repo_via_cli();
+    let run_dir = repo
+        .path()
+        .join(".libra")
+        .join("sessions")
+        .join("agent-runs")
+        .join("20260101T000000Z-abcdef02");
+    fs::create_dir_all(&run_dir).expect("create run dir");
+    fs::write(run_dir.join("manifest.json"), "[]").expect("write manifest");
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], repo.path());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&gc.stdout),
+        String::from_utf8_lossy(&gc.stderr)
+    );
+    assert!(
+        !gc.status.success(),
+        "a non-object manifest must fail closed: {combined}"
+    );
+    assert!(
+        combined.contains("not a JSON object"),
+        "and must say why: {combined}"
     );
 }

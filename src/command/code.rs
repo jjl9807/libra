@@ -825,7 +825,8 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             )
             .await?
         } else {
-            let storage_root = resolve_storage_root(&working_dir);
+            // §C.4.1: refuse rather than mint a phantom `<working_dir>/.libra`.
+            let storage_root = require_storage_root(&working_dir)?;
             let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
             let session_state =
                 load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
@@ -1856,7 +1857,12 @@ async fn prepare_control_runtime(
                 working_dir.display()
             ))
         })?;
-    let linked_evidence = repo_has_linked_evidence(&resolve_storage_root(working_dir));
+    // §C.4.1: an unresolvable storage root is itself evidence something is
+    // wrong with this worktree's linkage — treat it as linked (fail closed)
+    // rather than probing a path we would have had to invent.
+    let linked_evidence = resolve_storage_root(working_dir)
+        .as_deref()
+        .is_none_or(repo_has_linked_evidence);
 
     match args.control {
         ControlMode::Observe => Ok(ControlRuntimeConfig {
@@ -2803,7 +2809,13 @@ async fn load_code_ui_projection_bundle(
     working_dir: &Path,
     thread_id: Uuid,
 ) -> anyhow::Result<Option<ThreadBundle>> {
-    let storage_root = resolve_storage_root(working_dir);
+    let storage_root = resolve_storage_root(working_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot resolve the repository storage root for '{}' — if this is a linked \
+             worktree, run `libra worktree repair <worktree-path>`",
+            working_dir.display()
+        )
+    })?;
     let db_path = storage_root.join("libra.db");
     let db_path = db_path
         .to_str()
@@ -2993,7 +3005,7 @@ where
     // moved into `App::new`; the post-exit graph handoff hint needs it to
     // decide whether to surface a `--repo <path>` suffix for a non-cwd repo.
     let session_working_dir = registry.working_dir().to_path_buf();
-    let storage_root = resolve_storage_root(registry.working_dir());
+    let storage_root = require_storage_root(registry.working_dir())?;
     let session_store = SessionStore::from_storage_path(&storage_root);
     let session = if let Some(thread_id) = params.resume_thread_id.as_deref() {
         // The resume identifier may be either a canonical UUID (planning-bound
@@ -3749,7 +3761,23 @@ fn approval_cache_policy_from_project_config(working_dir: &Path) -> ApprovalCach
 /// setup failures into a read-only MCP server so AI clients can still inspect
 /// files and continue a degraded session.
 async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
-    let storage_dir = resolve_storage_root(working_dir);
+    // §C.4.1: an unresolvable storage root degrades to the SAME read-only,
+    // history-disabled server this function already falls back to when the
+    // directory or database cannot be opened — never to a phantom
+    // `<working_dir>/.libra` that would start accumulating real history.
+    let Some(storage_dir) = resolve_storage_root(working_dir) else {
+        eprintln!(
+            "Warning: cannot resolve the repository storage root for {}. Running in read-only \
+             mode (history/context disabled). If this is a linked worktree, run `libra worktree \
+             repair <worktree-path>`.",
+            working_dir.display()
+        );
+        return Arc::new(LibraMcpServer::new_with_working_dir(
+            None,
+            None,
+            working_dir.to_path_buf(),
+        ));
+    };
     let objects_dir = storage_dir.join("objects");
     let dot_libra = storage_dir;
 
@@ -3815,19 +3843,52 @@ async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
 /// Supports linked worktrees by delegating to `try_get_storage_path`, which
 /// follows `.libra` symlinks to the main repository's storage. Falls back to
 /// `<working_dir>/.libra` if resolution fails.
-pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> std::path::PathBuf {
-    try_get_storage_path(Some(working_dir.to_path_buf())).unwrap_or_else(|error| {
-        // Part C §C.4.1: the code runtime degrades rather than aborting, but the
-        // degradation must NOT be silent — a `<working_dir>/.libra` fallback on a
-        // linked worktree with a broken `commondir` would route at a phantom
-        // storage root. Annotate loudly so the split-brain is diagnosable.
-        tracing::warn!(
-            working_dir = %working_dir.display(),
-            %error,
-            "storage-root resolution failed; falling back to <working_dir>/.libra — if this is a linked worktree, run `libra worktree repair <worktree-path>`"
-        );
-        working_dir.join(".libra")
+/// The repository storage root for `working_dir`, or `None` when it cannot be
+/// resolved.
+///
+/// Part C §C.4.1 forbids the caller-side fallback this used to perform. On a
+/// linked worktree with a corrupt or empty `commondir`, minting
+/// `<working_dir>/.libra` does not degrade the session — it CREATES a second,
+/// phantom repository: a fresh `libra.db` and `objects/` beside the real ones,
+/// which then accumulate history, approvals and captured sessions that the
+/// actual repository never sees. A warning does not make that safe, because
+/// the damage is silent and the writes are real.
+///
+/// Callers degrade instead: no storage root means no history and no object
+/// store, which is the same read-only mode they already fall back to when the
+/// directory or database cannot be opened.
+/// [`resolve_storage_root`], but for the paths that genuinely cannot proceed
+/// without a storage root. `libra code`'s own CLI preflight already resolved
+/// one, so a failure here means the repository changed underneath the process
+/// — an actionable refusal, not a new repository beside the old one.
+pub(crate) fn require_storage_root(working_dir: &std::path::Path) -> CliResult<std::path::PathBuf> {
+    resolve_storage_root(working_dir).ok_or_else(|| {
+        CliError::fatal(format!(
+            "cannot resolve the repository storage root for '{}'",
+            working_dir.display()
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
+        .with_hint(
+            "if this is a linked worktree, run `libra worktree repair <worktree-path>` from \
+             the main worktree",
+        )
     })
+}
+
+pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    match try_get_storage_path(Some(working_dir.to_path_buf())) {
+        Ok(root) => Some(root),
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                %error,
+                "storage-root resolution failed; continuing WITHOUT a storage root rather than \
+                 minting a phantom one — if this is a linked worktree, run `libra worktree \
+                 repair <worktree-path>`"
+            );
+            None
+        }
+    }
 }
 
 /// CEX-S2-12 "single sub-agent behind flag" concurrency cap.
