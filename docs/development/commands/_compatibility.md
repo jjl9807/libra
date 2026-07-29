@@ -227,6 +227,27 @@ unsupported 子面。
 - 测试证据：`compat_clone_shallow_integrity` 钉死本地 Libra `--depth` 的 clone/fetch fail-closed 与 shallow 布尔查询。
 - 重启条件：出现真实的本地 Libra 浅克隆需求（如超大仓库 CI 本地缓存源），并完成 shallow 边界协议、deepen/unshallow 语义与 GC/fsck 联动设计后重启。
 
+### D21：上游测试语料中的外部 VCS / 服务桥接族
+
+- 状态：**out-of-scope**（2026-07-29，plan-20260729 CT0-02 裁定）。上游 Git 测试语料中依赖 `git svn`、`git p4`、CVS（`git cvsimport`/`cvsexportcommit`/`cvsserver`）、gitweb、`lib-httpd.sh` 与 `git daemon` 的测试文件不进入 Libra 的兼容证据账本；`tests/compat-ledger/` 中对应场景一律记 `category = "declined"`、`decision_id = "D21"`。
+- 原因：这些是 Perl/Python 编写的外部 VCS 与服务桥接，Libra 既无对应命令面，也无对应用户承诺（`src/cli.rs::Commands` 无 `svn`/`p4`/`cvs*`/`daemon`/`gitweb` variant）。为它们建立账本行只会产生大量永远无法转绿的 `blocked`，反而稀释真实缺口信号。以 pinned 语料复算，t9 族 137 个上游文件中 116 个（84.7%）落在本条。
+- 测试证据：无需新增守卫——`tests/compat-ledger/` 的 schema 守卫会强制每条 `declined` 绑定可解析的 `D` 编号；范围裁定与复算命令见 [`../gap/grit-suite-scope.md`](../gap/grit-suite-scope.md)。
+- 重启条件：Libra 出现任一外部 VCS 桥接的产品需求并完成其命令面与安全边界设计后，按族重新裁定并撤销本条。
+
+### D22：上游 `test-tool` C helper 依赖
+
+- 状态：**out-of-scope**（2026-07-29，plan-20260729 CT0-02 裁定）。凡直接调用上游 `test-tool` 的测试场景不进入迁移范围，账本记 `declined` + `D22`。
+- 原因：`test-tool` 是上游 Git 的 C 测试辅助程序（`git/t/helper/`，约 80 个子命令），其中 `ref-store` 等 verb 是对 Git refs 后端的直接 API shim。Libra 的 refs 存在 SQLite 中，复刻这类接口等于把内部存储结构固化成测试契约，与「机器接口先于交互外壳、但不暴露内部存储」的边界冲突。以 pinned 语料复算，162 个上游文件（15.6%）依赖它，并且是 t0/t1/t5 三族暂缓的主要原因。
+- 测试证据：同 `D21`，由账本 schema 守卫强制绑定；族级占比与复算命令见 [`../gap/grit-suite-scope.md`](../gap/grit-suite-scope.md)。
+- 重启条件：出现必须以 plumbing 级接口验证的兼容需求时，先设计 Libra 自有的等价可观测面（例如以既有 `update-ref`/`show-ref`/`for-each-ref` 覆盖 `ref-store` 的语义），再按 verb 逐条撤销本条，不整体引入 `test-tool`。
+
+### D23：上游 GPG keyring fixture 依赖
+
+- 状态：**out-of-scope**（2026-07-29，plan-20260729 CT0-02 裁定）。依赖上游 `lib-gpg.sh` 及其 keyring fixture 的签名测试场景不进入迁移范围，账本记 `declined` + `D23`。
+- 原因：上游这类测试依赖预置 keyring 与可启动的 `gpg-agent`；Libra 的签名模型走 vault（`vault.signing`、`~/.libra/vault-unseal-key`），与 Git 的外部 keyring 互操作本身已是独立议题（见 `plan-long.md`「不进入本长期 Top 10 的兼容增强」中的 GPG 外部 keyring 互操作项）。以 pinned 语料复算，23 个上游文件命中。
+- 测试证据：同 `D21`；Libra 侧的签名行为由既有 commit/tag 测试覆盖，不依赖上游 fixture。
+- 重启条件：Git GPG 外部 keyring 互操作从「兼容增强清单」升入排期后，连同本条一并重启。
+
 ## 维护要求
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
