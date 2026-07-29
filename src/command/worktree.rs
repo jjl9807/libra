@@ -17,7 +17,13 @@ use serde::{Deserialize, Serialize};
 use crate::utils::fuse as fuse_utils;
 use crate::{
     command::restore::{self, RestoreArgs},
-    internal::{branch::Branch, head::Head},
+    internal::{
+        branch::Branch,
+        head::Head,
+        workspace::{
+            self, RepoIdentity, WorkspaceKind, WorkspaceRecord, WorkspaceState, WorkspaceStore,
+        },
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -50,7 +56,11 @@ EXAMPLES:
     libra worktree repair --migrate-layout         Migrate every legacy shared-.libra
                                                    symlink worktree to the isolated layout
     libra worktree repair --migrate-layout --dry-run
-                                                   Report what would be migrated";
+                                                   Report what would be migrated
+    libra worktree doctor                          Read-only diagnosis of every Agent
+                                                   workspace scope (paginated)
+    libra --json worktree doctor --limit 20        One machine-readable page
+    libra worktree doctor ws-3f0c                  Diagnose a single workspace scope";
 
 /// Manage multiple working trees attached to this repository.
 //
@@ -141,6 +151,25 @@ pub enum WorktreeSubcommand {
         /// Remove the Libra task worktree root after unmounting its workspace mountpoint.
         #[clap(long)]
         cleanup: bool,
+    },
+    /// Diagnose Agent workspace scopes (READ-ONLY: reports, never repairs).
+    ///
+    /// Without an id this is a keyset-paginated view over every workspace
+    /// record that still has something to say — including records left behind
+    /// by a previous repository identity, which the identity-scoped listings
+    /// hide. With an id it is the single-scope view of that one workspace.
+    Doctor {
+        /// Diagnose exactly one workspace (ids come from `worktree doctor`
+        /// or `libra agent workspace list`). Cannot be combined with
+        /// `--limit`/`--cursor`: a single scope is not a page.
+        #[clap(value_name = "WORKSPACE_ID")]
+        workspace_id: Option<String>,
+        /// Maximum diagnostics per page (default 50, capped at 500).
+        #[clap(long, value_name = "N")]
+        limit: Option<u64>,
+        /// Keyset cursor: the `next_cursor` of the previous page, verbatim.
+        #[clap(long, value_name = "CURSOR")]
+        cursor: Option<String>,
     },
     /// Repair worktree metadata, attempting to recover from inconsistencies.
     /// With a path, restores that linked worktree's gitdir identity
@@ -790,6 +819,11 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             let result = umount_fuse_path(path, cleanup).map_err(WorktreeError::into_cli_error)?;
             render_umount_fuse_path(&result, output)
         }
+        WorktreeSubcommand::Doctor {
+            workspace_id,
+            limit,
+            cursor,
+        } => run_worktree_doctor(workspace_id, limit, cursor, output).await,
         WorktreeSubcommand::Repair {
             path,
             migrate_layout,
@@ -2380,6 +2414,445 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
         println!("{}", line);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `worktree doctor` — read-only scope diagnosis (plan-20260714 §C.8/C.13 W4)
+// ---------------------------------------------------------------------------
+//
+// Grammar is FROZEN (§C.8, Codex R18/R19):
+//
+//     libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]
+//
+// * no id  -> paginated view: `data.diagnostics[]` + `data.next_cursor`
+// * an id  -> single-scope view: `data.diagnostic` (singular, NO pagination)
+// * id together with `--limit`/`--cursor` -> usage error (`LBR-CLI-002`)
+//
+// The default invocation is STRICTLY READ-ONLY: it opens no write path, takes
+// no lease, never adopts a legacy row, and never rewrites the registry (it uses
+// the lockless `load_state_readonly` reader). Mutating recovery actions
+// (reclaim/adopt/clear/repair) are a separate, explicitly-confirmed grammar
+// that this slice deliberately does NOT ship — so no hint here may promise one.
+
+/// `data.schema_version` of both doctor payloads. Additive evolution only.
+const DOCTOR_SCHEMA_VERSION: u32 = 1;
+
+/// Version tag inside the opaque cursor. A cursor from a different listing (or
+/// a hand-written `workspace_id`) therefore fails to decode instead of silently
+/// paginating from an unrelated position.
+const DOCTOR_CURSOR_TAG: &str = "wtdoctor1:";
+
+fn encode_doctor_cursor(workspace_id: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(format!("{DOCTOR_CURSOR_TAG}{workspace_id}"))
+}
+
+/// Decode an opaque cursor back into the `workspace_id` to resume after.
+///
+/// Fails closed (`LBR-WORKTREE-001`) rather than restarting at page one: a
+/// caller walking the registry page by page would otherwise re-read rows it
+/// already processed and believe it had seen everything.
+fn decode_doctor_cursor(raw: &str) -> CliResult<String> {
+    use base64::Engine as _;
+    let invalid = || {
+        CliError::fatal(format!(
+            "pagination cursor '{raw}' was not issued by `libra worktree doctor` (or has expired)"
+        ))
+        .with_stable_code(StableErrorCode::WorktreeCursorInvalid)
+        .with_hint("drop the cursor and re-read the first page")
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(raw)
+        .map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let workspace_id = decoded
+        .strip_prefix(DOCTOR_CURSOR_TAG)
+        .ok_or_else(invalid)?;
+    if workspace_id.is_empty() {
+        return Err(invalid());
+    }
+    Ok(workspace_id.to_string())
+}
+
+/// A scope is corrupt or unreadable, so the report would be incomplete.
+/// The doctor never degrades to a partial diagnosis (§C.13): an operator
+/// acting on a silently-truncated report is worse off than one told the scope
+/// cannot be read.
+fn doctor_scope_corrupt(message: impl Into<String>) -> CliError {
+    CliError::fatal(message.into())
+        .with_stable_code(StableErrorCode::WorktreeScopeCorrupt)
+        .with_hint("repair the reported scope, then re-run `libra worktree doctor`")
+}
+
+/// One finding about a workspace scope. `code` is the stable machine key;
+/// `severity` is `warning` (needs attention) or `error` (blocks normal use).
+#[derive(Debug, Serialize)]
+struct ScopeDiagnostic {
+    code: &'static str,
+    severity: &'static str,
+    detail: String,
+}
+
+impl ScopeDiagnostic {
+    fn warning(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            severity: "warning",
+            detail: detail.into(),
+        }
+    }
+
+    fn error(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            severity: "error",
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The frozen per-workspace diagnostic record (§C.8 W4). `workspace_id`,
+/// `repo_id`, `lease_state` and `scope_diagnostics` are the required fields;
+/// the rest is additive context.
+#[derive(Debug, Serialize)]
+struct WorkspaceDiagnostic {
+    workspace_id: String,
+    repo_id: String,
+    kind: &'static str,
+    state: &'static str,
+    path: String,
+    worktree_id: Option<String>,
+    /// `none` (no lease taken) | `held` | `expired`.
+    lease_state: &'static str,
+    lease_owner: Option<String>,
+    lease_fence: i64,
+    lease_expires_at: Option<i64>,
+    scope_diagnostics: Vec<ScopeDiagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorktreeDoctorPage {
+    schema_version: u32,
+    diagnostics: Vec<WorkspaceDiagnostic>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorktreeDoctorSingle {
+    schema_version: u32,
+    diagnostic: WorkspaceDiagnostic,
+}
+
+/// The registry entry that owns this record's scope, matched by stable id
+/// first and canonical path second (a legacy v1 entry may still lack an id).
+fn doctor_registry_entry<'a>(
+    registry: &'a WorktreeState,
+    record: &WorkspaceRecord,
+) -> Option<&'a WorktreeEntry> {
+    if let Some(worktree_id) = record.worktree_id.as_deref()
+        && let Some(entry) = registry
+            .entries
+            .iter()
+            .find(|entry| entry.worktree_id.as_deref() == Some(worktree_id))
+    {
+        return Some(entry);
+    }
+    registry
+        .entries
+        .iter()
+        .find(|entry| paths_are_same(&entry.path, &record.path))
+}
+
+/// Compare two stored absolute paths, tolerating symlinked prefixes
+/// (`/tmp` vs `/private/tmp`) that only differ once resolved.
+fn paths_are_same(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Build one workspace's diagnosis from state that is already in hand — pure
+/// over the record, the registry snapshot and the clock, plus read-only
+/// filesystem probes.
+fn diagnose_workspace(
+    record: &WorkspaceRecord,
+    current_repo_id: &str,
+    registry: &WorktreeState,
+    now_ms: i64,
+) -> WorkspaceDiagnostic {
+    let lease_state = match (&record.lease_owner, record.lease_expires_at) {
+        (None, _) => "none",
+        (Some(_), Some(deadline)) if now_ms >= deadline => "expired",
+        (Some(_), _) => "held",
+    };
+    let mut findings = Vec::new();
+
+    if record.repo_id != current_repo_id {
+        findings.push(ScopeDiagnostic::error(
+            "foreign_repository_identity",
+            format!(
+                "the record was written under repository identity {} but this repository is \
+                 now {current_repo_id}; it is invisible to the normal listings and blocks new \
+                 workspace registrations until it is settled",
+                record.repo_id
+            ),
+        ));
+    }
+    if matches!(record.state, WorkspaceState::Orphaned) {
+        findings.push(ScopeDiagnostic::warning(
+            "workspace_orphaned",
+            "teardown failed or the owner vanished; the workspace still holds recovery state",
+        ));
+    }
+    if lease_state == "expired" {
+        findings.push(ScopeDiagnostic::warning(
+            "lease_expired",
+            format!(
+                "the lease deadline passed (expires_at {}, now {now_ms}); the lease still \
+                 belongs to its owner until it is explicitly reclaimed",
+                record.lease_expires_at.unwrap_or_default()
+            ),
+        ));
+    }
+    if !Path::new(&record.path).exists() {
+        findings.push(ScopeDiagnostic::warning(
+            "workspace_path_missing",
+            format!("no directory at the claimed path '{}'", record.path),
+        ));
+    }
+
+    if matches!(record.kind, WorkspaceKind::Linked) {
+        match doctor_registry_entry(registry, record) {
+            None => findings.push(ScopeDiagnostic::warning(
+                "registry_entry_missing",
+                format!(
+                    "no worktree registry entry owns this scope (worktree_id {}, path '{}')",
+                    record.worktree_id.as_deref().unwrap_or("<unset>"),
+                    record.path
+                ),
+            )),
+            Some(entry) => {
+                if !paths_are_same(&entry.path, &record.path) {
+                    findings.push(ScopeDiagnostic::error(
+                        "registry_path_mismatch",
+                        format!(
+                            "the registry entry for this scope lives at '{}' but the workspace \
+                             record claims '{}'",
+                            entry.path, record.path
+                        ),
+                    ));
+                }
+                match entry.state {
+                    WorktreeEntryState::Active => {}
+                    WorktreeEntryState::DetachedFromRegistry => {
+                        findings.push(ScopeDiagnostic::warning(
+                            "registry_entry_detached",
+                            "the worktree was unregistered with `worktree remove` (keep-dir); \
+                             commands inside it fail closed until it is re-added",
+                        ));
+                    }
+                    WorktreeEntryState::Tombstone => {
+                        findings.push(ScopeDiagnostic::warning(
+                            "registry_entry_tombstoned",
+                            "the worktree directory was deleted but its scoped rows are still \
+                             pending cleanup; `libra worktree repair` retries it",
+                        ));
+                    }
+                }
+                match detect_entry_layout(Path::new(&entry.path), entry.is_main) {
+                    "corrupt" => findings.push(ScopeDiagnostic::error(
+                        "scope_layout_corrupt",
+                        format!("the gitdir layout at '{}' is unrecognizable", entry.path),
+                    )),
+                    "legacy-symlink" => findings.push(ScopeDiagnostic::warning(
+                        "scope_layout_legacy_symlink",
+                        format!(
+                            "'{}' still uses the pre-isolation shared-`.libra` symlink layout; \
+                             migrate it with `libra worktree repair --migrate-layout`",
+                            entry.path
+                        ),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    WorkspaceDiagnostic {
+        workspace_id: record.workspace_id.clone(),
+        repo_id: record.repo_id.clone(),
+        kind: record.kind.as_db_value(),
+        state: record.state.as_db_value(),
+        path: record.path.clone(),
+        worktree_id: record.worktree_id.clone(),
+        lease_state,
+        lease_owner: record.lease_owner.clone(),
+        lease_fence: record.lease_fence,
+        lease_expires_at: record.lease_expires_at,
+        scope_diagnostics: findings,
+    }
+}
+
+/// `libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]`.
+async fn run_worktree_doctor(
+    workspace_id: Option<String>,
+    limit: Option<u64>,
+    cursor: Option<String>,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    // A single scope is not a page: rejecting the combination keeps the two
+    // frozen response shapes unambiguous (Codex R19).
+    if workspace_id.is_some() && (limit.is_some() || cursor.is_some()) {
+        return Err(CliError::command_usage(
+            "`libra worktree doctor <workspace-id>` diagnoses one scope and takes no \
+             --limit/--cursor; drop the id for the paginated view",
+        ));
+    }
+
+    // Read-only registry snapshot (lockless reader — never rewrites the file).
+    // A registry this command cannot parse IS corrupt scope state: refuse
+    // rather than report a diagnosis built on unknown ownership.
+    let registry = load_state_readonly().map_err(|error| {
+        doctor_scope_corrupt(format!("cannot read the worktree registry: {error}"))
+    })?;
+
+    let conn = crate::internal::db::get_db_conn_instance().await;
+    let now = workspace::now_ms();
+
+    if let Some(workspace_id) = workspace_id {
+        let record = WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id)
+            .await
+            .map_err(|error| {
+                doctor_scope_corrupt(format!(
+                    "cannot read the workspace record '{workspace_id}': {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                CliError::fatal(format!(
+                    "no workspace matches id '{workspace_id}'; list them with \
+                     `libra worktree doctor`"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+            })?;
+        let repo_id = doctor_repo_identity(&conn).await?;
+        let diagnostic = diagnose_workspace(&record, &repo_id, &registry, now);
+        return render_doctor_single(diagnostic, output);
+    }
+
+    let after = cursor.as_deref().map(decode_doctor_cursor).transpose()?;
+    let page = WorkspaceStore::doctor_page_with_conn(&conn, limit, after.as_deref())
+        .await
+        .map_err(|error| {
+            doctor_scope_corrupt(format!("cannot read the workspace registry: {error}"))
+        })?;
+    if page.items.is_empty() {
+        // Nothing to classify, so a missing/unreadable repository identity is
+        // not worth failing on: an empty diagnosis IS the whole truth here.
+        return render_doctor_page(
+            WorktreeDoctorPage {
+                schema_version: DOCTOR_SCHEMA_VERSION,
+                diagnostics: Vec::new(),
+                next_cursor: None,
+            },
+            output,
+        );
+    }
+    let repo_id = doctor_repo_identity(&conn).await?;
+    let diagnostics = page
+        .items
+        .iter()
+        .map(|record| diagnose_workspace(record, &repo_id, &registry, now))
+        .collect();
+    render_doctor_page(
+        WorktreeDoctorPage {
+            schema_version: DOCTOR_SCHEMA_VERSION,
+            diagnostics,
+            next_cursor: page.next_cursor.as_deref().map(encode_doctor_cursor),
+        },
+        output,
+    )
+}
+
+/// This repository's canonical identity, needed to tell a record of THIS
+/// repository from one left behind by a previous identity.
+///
+/// Deliberately the strict resolver: minting an identity would be a write, and
+/// the doctor's default invocation is read-only.
+async fn doctor_repo_identity(conn: &sea_orm::DatabaseConnection) -> CliResult<String> {
+    RepoIdentity::resolve(conn)
+        .await
+        .map(|identity| identity.as_str().to_string())
+        .map_err(|error| {
+            doctor_scope_corrupt(format!(
+                "cannot read this repository's identity, so workspace records cannot be \
+                 attributed: {error}"
+            ))
+        })
+}
+
+fn render_doctor_single(diagnostic: WorkspaceDiagnostic, output: &OutputConfig) -> CliResult<()> {
+    if output.is_json() {
+        let payload = WorktreeDoctorSingle {
+            schema_version: DOCTOR_SCHEMA_VERSION,
+            diagnostic,
+        };
+        return emit_json_data("worktree.doctor", &payload, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    println!("workspace_id: {}", diagnostic.workspace_id);
+    println!("repo_id:      {}", diagnostic.repo_id);
+    println!("kind:         {}", diagnostic.kind);
+    println!("state:        {}", diagnostic.state);
+    println!("path:         {}", diagnostic.path);
+    if let Some(worktree_id) = &diagnostic.worktree_id {
+        println!("worktree_id:  {worktree_id}");
+    }
+    println!("lease_state:  {}", diagnostic.lease_state);
+    if let Some(owner) = &diagnostic.lease_owner {
+        println!("lease_owner:  {owner} (fence {})", diagnostic.lease_fence);
+    }
+    print_scope_diagnostics(&diagnostic.scope_diagnostics);
+    Ok(())
+}
+
+fn render_doctor_page(page: WorktreeDoctorPage, output: &OutputConfig) -> CliResult<()> {
+    if output.is_json() {
+        return emit_json_data("worktree.doctor", &page, output);
+    }
+    if output.quiet {
+        return Ok(());
+    }
+    if page.diagnostics.is_empty() {
+        println!("(no workspace records to diagnose)");
+        return Ok(());
+    }
+    for diagnostic in &page.diagnostics {
+        println!(
+            "{}  {:12} lease={:7} {}",
+            diagnostic.workspace_id, diagnostic.state, diagnostic.lease_state, diagnostic.path
+        );
+        print_scope_diagnostics(&diagnostic.scope_diagnostics);
+    }
+    if let Some(cursor) = &page.next_cursor {
+        println!("(more rows: --cursor {cursor})");
+    }
+    Ok(())
+}
+
+fn print_scope_diagnostics(findings: &[ScopeDiagnostic]) {
+    for finding in findings {
+        println!(
+            "  {:7} {}: {}",
+            finding.severity, finding.code, finding.detail
+        );
+    }
 }
 
 /// Implements `worktree lock <path> [--reason <msg>]`.

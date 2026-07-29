@@ -500,7 +500,7 @@ fn remove_legacy_if_unambiguous(rr_dir: &Path) -> CliResult<LegacyRemoval> {
 fn print_ambiguous_legacy_notice(legacy: &Path) {
     eprintln!(
         "note: ignoring legacy '{}' — linked worktrees exist, so its owner is \
-         ambiguous; resolve it from the owning worktree (worktree doctor lands in W3)",
+         ambiguous; resolve it from the owning worktree (`libra worktree list` shows them)",
         legacy.display()
     );
 }

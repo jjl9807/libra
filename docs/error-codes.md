@@ -88,6 +88,8 @@ structured report is always present.
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
+| `128` | `LBR-WORKTREE-001` | `repo` | Pagination cursor is malformed, foreign, or expired | `libra worktree doctor --cursor <garbage>` |
+| `128` | `LBR-WORKTREE-002` | `repo` | A worktree/workspace scope is corrupt or unreadable, so the diagnosis would be incomplete | `libra worktree doctor` where a `workspace_record` row or the worktree registry cannot be read |
 | `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
 | `128` | `LBR-UPGRADE-001` | `config` | Reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt (unsupported `upgrade.*` config spellings are usage errors, `LBR-CLI-002`) | `libra config get --global upgrade.mode` on a hand-edited, non-JSON settings file |
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
@@ -153,6 +155,8 @@ structured report is always present.
 | `LBR-REPO-001` | Not inside a Libra repository |
 | `LBR-REPO-002` | Repository metadata is corrupt or incompatible |
 | `LBR-REPO-003` | Repository state blocks the operation |
+| `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
+| `LBR-WORKTREE-002` | A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report |
 
 ### Config
 

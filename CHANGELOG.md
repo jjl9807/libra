@@ -2,6 +2,34 @@
 
 ## [Unreleased]
 
+### Added (plan-20260714 W4: `worktree doctor` — read-only scope diagnosis)
+
+- **`libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]`** reports
+  what is wrong with each Agent workspace scope and repairs nothing. Every
+  invocation is strictly read-only: no row, registry entry, lease, or file is
+  written (pinned by a before/after comparison of the row dump, the registry
+  bytes, and the repository's file tree). Without an id it pages
+  `data.diagnostics[]` plus an opaque `data.next_cursor` (`workspace_id`
+  ascending, default limit 50, capped at 500); with an id it returns the
+  singular `data.diagnostic` and no pagination keys — combining the two is a
+  usage error.
+- **Records written under a previous repository identity are visible here and
+  nowhere else.** They are exactly the rows the identity-scoped listings hide
+  while they block new workspace registrations, so the doctor query is
+  deliberately not identity-filtered; each diagnostic carries its own
+  `repo_id`.
+- **Two new stable codes, `LBR-WORKTREE-001` and `LBR-WORKTREE-002`** (both in
+  the existing `repo` category, exit 128). A pagination cursor this command
+  did not issue is refused rather than silently restarting at page one — a
+  caller walking the registry page by page would otherwise re-read rows and
+  believe it had seen everything. A scope that cannot be read (unparseable
+  registry, unreadable record, missing repository identity) fails closed
+  instead of answering with a partial diagnosis.
+- **Workspace hints that mention the doctor no longer promise recovery actions
+  the CLI cannot perform.** The mutating grammar (reclaim/adopt/clear) is not
+  shipped, so every such hint is now inspect-only wording, pinned by a
+  regression that scans the sources for the forbidden verbs.
+
 ### Changed (plan-20260714 R0-1: `diff` now uses the shared rename engine)
 
 - **`diff` delegates rename pairing to `rename_detect::match_pairs`.** It had
