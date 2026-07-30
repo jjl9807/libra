@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed (HTTPS auth: a stored token was never attached to a request)
+
+- **`libra auth login` stored a token that no request could use.**
+  `HostScope::from_request_url` shared its parser with `HostScope::parse`,
+  which refuses a path, query or fragment because a user-supplied *host*
+  argument must not carry one. Every real request URL does: smart-HTTP
+  discovery is `https://host/owner/repo.git/info/refs?service=…`. So the
+  scope of a request was always `None`, the stored token was never attached,
+  and `libra push`/`fetch` over HTTPS failed with `LBR-AUTH-001` however
+  valid the stored credential was — while `libra auth status` reported it
+  `valid`. The 401 guidance that should name the host printed the literal
+  `<host>`, so the message could not even point at the right `auth login`.
+  Request scope is now computed from host and port alone; the checks that do
+  apply to a request — https (or http to a loopback host) and no credentials
+  embedded in the URL — still apply, and the host-argument parser keeps its
+  stricter rules. Regression:
+  `internal::auth::tests::request_url_scope_survives_paths_and_queries`.
+
 ### Fixed (plan-20260714 R0-4 review: argv is `OsString`, warnings are per-invocation)
 
 - **A non-UTF-8 argument killed the process.** `env::args()` panics on
