@@ -2863,7 +2863,11 @@ fn config_bare_read_sensitive_key_keeps_interactive_set() {
         stderr.contains("missing value for protected key"),
         "sensitive key must stay on the interactive-assignment path: {stderr}"
     );
-    assert_eq!(bare.status.code(), Some(2), "protected-key path keeps exit 2");
+    assert_eq!(
+        bare.status.code(),
+        Some(2),
+        "protected-key path keeps exit 2"
+    );
 }
 
 #[test]
@@ -2991,7 +2995,11 @@ fn config_bare_read_output_shape_machine() {
         body.contains("\"ok\":true") && body.contains("\"value\":\"v\""),
         "machine success payload: {body}"
     );
-    assert_eq!(body.lines().count(), 1, "machine output is single-line: {body}");
+    assert_eq!(
+        body.lines().count(),
+        1,
+        "machine output is single-line: {body}"
+    );
 
     let err = run_libra_command(&["--machine", "config", "shape.missing"], p);
     assert_eq!(err.status.code(), Some(1), "machine failure exit code");
