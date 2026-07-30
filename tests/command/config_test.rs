@@ -2755,3 +2755,244 @@ async fn test_config_upgrade_mode_isolated_by_global_db_override() {
         serde_json::from_str(&std::fs::read_to_string(&isolated).unwrap()).unwrap();
     assert_eq!(doc["mode"], "manual");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT1-01 (plan-20260729): bare `libra config <key>` reads for ordinary keys.
+//
+// Git's `git config <key>` is a read. Libra previously routed a single-positional
+// call with no value into set mode, which reported "missing value for key" with
+// LBR-INTERNAL-001 / exit 2. Ordinary keys now read; PROTECTED keys deliberately
+// keep Libra's interactive secure-assignment path (intentional divergence, see
+// COMPATIBILITY.md and docs/development/commands/config.md).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn config_bare_read_single_value() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "A U Thor"], p),
+        "seed user.name",
+    );
+
+    let bare = run_libra_command(&["config", "user.name"], p);
+    assert_cli_success(&bare, "bare read");
+    let via_get = run_libra_command(&["config", "get", "user.name"], p);
+    assert_cli_success(&via_get, "config get");
+    assert_eq!(
+        bare.stdout, via_get.stdout,
+        "bare read must be byte-identical to `config get`"
+    );
+    assert_eq!(String::from_utf8_lossy(&bare.stdout).trim(), "A U Thor");
+}
+
+#[test]
+#[serial]
+fn config_bare_read_multi_value_last_wins() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "multi.key", "one"], p),
+        "add first",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "multi.key", "two"], p),
+        "add second",
+    );
+
+    let bare = run_libra_command(&["config", "multi.key"], p);
+    assert_cli_success(&bare, "bare read of multi-valued key");
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stdout).trim(),
+        "two",
+        "Git returns the LAST value for a multi-valued key"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_missing_key_exit1() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let bare = run_libra_command(&["config", "nosuch.key"], p);
+    assert_eq!(
+        bare.status.code(),
+        Some(1),
+        "missing key exits 1, not the old 2: {}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_missing_key_error_code() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let bare = run_libra_command(&["config", "nosuch.key"], p);
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        stderr.contains("LBR-CLI-002"),
+        "missing key must be a CLI error, not LBR-INTERNAL-001: {stderr}"
+    );
+    assert!(
+        !stderr.contains("LBR-INTERNAL-001"),
+        "user input must never surface as an internal error: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_sensitive_key_keeps_interactive_set() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    // Protected keys keep the interactive secure-assignment path. Under the test
+    // harness that path is non-interactive, so it reports the protected-key error
+    // rather than reading. This is the pre-existing behaviour and must not change.
+    let bare = run_libra_command(&["config", "user.password"], p);
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        stderr.contains("missing value for protected key"),
+        "sensitive key must stay on the interactive-assignment path: {stderr}"
+    );
+    assert_eq!(bare.status.code(), Some(2), "protected-key path keeps exit 2");
+}
+
+#[test]
+#[serial]
+fn config_bare_read_upgrade_namespace_fail_closed() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+
+    let bare = run_libra_command(&["config", "upgrade.mode"], p);
+    assert!(
+        !bare.status.success(),
+        "reserved upgrade.* namespace must stay fail-closed on a bare read"
+    );
+    let stderr = String::from_utf8_lossy(&bare.stderr);
+    assert!(
+        stderr.contains("upgrade.*"),
+        "error must name the reserved namespace: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_scope_cascade() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "--global", "cascade.key", "from-global"], p),
+        "seed global",
+    );
+    let global_only = run_libra_command(&["config", "cascade.key"], p);
+    assert_cli_success(&global_only, "cascade read (global only)");
+    assert_eq!(
+        String::from_utf8_lossy(&global_only.stdout).trim(),
+        "from-global"
+    );
+
+    // Local must win over global, matching `config get`.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "cascade.key", "from-local"], p),
+        "seed local",
+    );
+    let bare = run_libra_command(&["config", "cascade.key"], p);
+    assert_cli_success(&bare, "cascade read (local wins)");
+    let via_get = run_libra_command(&["config", "get", "cascade.key"], p);
+    assert_eq!(
+        bare.stdout, via_get.stdout,
+        "bare read cascade must match `config get` cascade"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_output_shape_human() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "shape.key", "v"], p),
+        "seed shape.key",
+    );
+
+    let ok = run_libra_command(&["config", "shape.key"], p);
+    assert_cli_success(&ok, "human success");
+    assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), "v");
+
+    let err = run_libra_command(&["config", "shape.missing"], p);
+    assert_eq!(err.status.code(), Some(1), "human failure exit code");
+    assert!(
+        String::from_utf8_lossy(&err.stdout).trim().is_empty(),
+        "human failure must not print a value on stdout"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_output_shape_json() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "shape.key", "v"], p),
+        "seed shape.key",
+    );
+
+    let ok = run_libra_command(&["--json", "config", "shape.key"], p);
+    assert_cli_success(&ok, "json success");
+    let body = String::from_utf8_lossy(&ok.stdout);
+    // `--json` pretty-prints, so match on the fields rather than a compact spelling.
+    assert!(
+        body.contains("\"ok\": true") && body.contains("\"value\": \"v\""),
+        "json success payload: {body}"
+    );
+
+    let err = run_libra_command(&["--json", "config", "shape.missing"], p);
+    assert_eq!(err.status.code(), Some(1), "json failure exit code");
+    let ebody = String::from_utf8_lossy(&err.stderr);
+    assert!(
+        ebody.contains("\"ok\": false") && ebody.contains("LBR-CLI-002"),
+        "json failure payload: {ebody}"
+    );
+    assert!(
+        ebody.contains("\"exit_code\": 1"),
+        "json failure must carry exit_code 1: {ebody}"
+    );
+}
+
+#[test]
+#[serial]
+fn config_bare_read_output_shape_machine() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    init_repo_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "shape.key", "v"], p),
+        "seed shape.key",
+    );
+
+    let ok = run_libra_command(&["--machine", "config", "shape.key"], p);
+    assert_cli_success(&ok, "machine success");
+    // `--machine` emits a compact single-line JSON envelope (not a bare value).
+    let body = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        body.contains("\"ok\":true") && body.contains("\"value\":\"v\""),
+        "machine success payload: {body}"
+    );
+    assert_eq!(body.lines().count(), 1, "machine output is single-line: {body}");
+
+    let err = run_libra_command(&["--machine", "config", "shape.missing"], p);
+    assert_eq!(err.status.code(), Some(1), "machine failure exit code");
+}
