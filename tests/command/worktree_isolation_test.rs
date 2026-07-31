@@ -451,6 +451,54 @@ fn a_corrupt_sidecar_root_fails_the_prune_closed() {
     );
 }
 
+/// W2 r5: `worktree remove` refuses while a stash-branch rollback journal is
+/// pending — removing the gitdir would strand the half-created branch AND
+/// delete the only instruction for undoing it.
+#[test]
+fn worktree_remove_refuses_a_pending_stash_branch_journal() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("journaled-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    fs::write(
+        wt.join(".libra").join("stash-branch-journal.json"),
+        "{\"branch\":\"half\",\"base\":\"0000000000000000000000000000000000000000\",\
+         \"prior_branch\":null,\"prior_detached\":null}",
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "remove must refuse while the journal is pending: {text}"
+    );
+    assert!(
+        text.contains("stash-branch-journal.json"),
+        "and name it: {text}"
+    );
+
+    // Any stash command in that worktree completes the (no-op) rollback…
+    assert_cli_success(
+        &run_libra_command(&["stash", "list"], &wt),
+        "recovery clears the journal",
+    );
+    // …after which removal succeeds.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "remove succeeds once the journal is recovered",
+    );
+}
+
 /// W2 r4: a CORRUPT held-autostash sidecar is a hard stop, not a skip.
 ///
 /// The old `let Ok(...)` silently skipped the unreadable file; a later
@@ -7121,15 +7169,16 @@ fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
         sqlite_exec(
             &db,
             &[
-                "DELETE FROM worktree_registry_capability WHERE version = 3",
-                "DELETE FROM schema_versions WHERE version = 2026073005",
+                "DELETE FROM metadata_kv WHERE scope = 'repository' AND target = '' \
+                 AND key = 'stash.reflog.generation'",
+                "DELETE FROM schema_versions WHERE version = 2026073101",
             ],
         ),
         "put the repository one migration behind"
     );
     assert!(
-        sqlite_max_schema_version(&db) < 2026073005,
-        "2026073005 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026073101,
+        "2026073101 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

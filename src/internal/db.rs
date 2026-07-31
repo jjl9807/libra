@@ -192,9 +192,28 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
     }
 
     if let Some(conn) = connections.get(&db_path) {
-        return Ok(conn.clone());
+        let conn = conn.clone();
+        drop(connections);
+        // The fence must hold for CACHED connections too (W2 r5 #6): a
+        // long-lived process (the `libra code` server) connected before
+        // another process applied a newer migration would otherwise keep
+        // writing under a schema its code predates — for the stash fence,
+        // that is exactly the generation-less writer the migration exists to
+        // exclude. One indexed MAX() on a tiny table per hit; an upgrade
+        // requirement or a future schema evicts the entry and re-resolves.
+        match inspect_database_schema_for_connection(&conn).await {
+            Ok(SchemaCompatibility::Compatible { .. }) => return Ok(conn),
+            Ok(_) | Err(_) => {
+                let mut connections = TEST_DB_CONNECTIONS.lock().await;
+                connections.remove(&db_path);
+                drop(connections);
+                // Fall through: re-establish, which re-checks and either
+                // upgrades or reports the future schema with its hint.
+            }
+        }
+    } else {
+        drop(connections);
     }
-    drop(connections);
 
     let conn = get_db_conn_for_path(&db_path).await?;
 

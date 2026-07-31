@@ -498,17 +498,42 @@ impl MergeAutostash {
     }
 
     fn load_optional_sync_at(path: &std::path::Path) -> Result<Option<Self>, String> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = fs::read_to_string(path)
-            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        serde_json::from_str(&data)
-            .map(Some)
-            .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+        Ok(Self::load_snapshot_at(path)?.map(|snapshot| snapshot.sidecar))
+    }
+
+    /// ONE read that yields everything a consumer needs: the parsed sidecar
+    /// AND the recorded owner, from the same bytes. Verifying ownership by
+    /// re-reading the file (as the first cut did) let a concurrent
+    /// replacement validate sidecar B while sidecar A was applied — and then
+    /// delete B, the only durable reference to a newer stash.
+    fn load_snapshot_at(path: &std::path::Path) -> Result<Option<AutostashSnapshot>, String> {
+        let data = match fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+        };
+        let value: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        let sidecar: MergeAutostash = serde_json::from_value(value.clone())
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        let recorded_owner = value
+            .get("owner_scope")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Ok(Some(AutostashSnapshot {
+            sidecar,
+            recorded_owner,
+        }))
+    }
+
+    fn load_snapshot() -> Result<Option<AutostashSnapshot>, String> {
+        Self::load_snapshot_at(&Self::path())
     }
 
     fn save(&self) -> Result<(), PullMergeError> {
+        // Serialize with every consumer (W2 r5 #2): a save landing between a
+        // consumer's verify and its cleanup would be deleted unapplied.
+        let _lock = acquire_autostash_lock().map_err(PullMergeError::Autostash)?;
         let path = Self::path();
         // Record the writer's scope (W2, ADR-0714-08) — like MergeState: the
         // held autostash is promotable into the SHARED stash list, so an
@@ -539,6 +564,42 @@ impl MergeAutostash {
         crate::utils::atomic_write::remove_durably(&path)
             .map_err(|error| PullMergeError::Autostash(format!("{}: {error}", path.display())))
     }
+}
+
+/// One consistent read of the held-autostash sidecar: the parsed document and
+/// the owner it records, from the same bytes.
+struct AutostashSnapshot {
+    sidecar: MergeAutostash,
+    recorded_owner: Option<String>,
+}
+
+/// RAII guard serializing every held-autostash consumer and writer in ONE
+/// worktree (W2 r5 #2): load→verify→consume→cleanup must be atomic against a
+/// concurrent save, or a replacement between the verify and the cleanup
+/// deletes a sidecar that was never the one applied. Per-gitdir flock,
+/// blocking, released on drop.
+struct AutostashLockGuard {
+    file: fs::File,
+}
+
+impl Drop for AutostashLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn acquire_autostash_lock() -> Result<AutostashLockGuard, String> {
+    let lock_path = util::request_worktree_gitdir_strict().join("merge-autostash.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("{}: {error}", lock_path.display()))?;
+    file.lock()
+        .map_err(|error| format!("{}: {error}", lock_path.display()))?;
+    Ok(AutostashLockGuard { file })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1156,10 +1217,10 @@ async fn autostash_enabled(options: &PullMergeOptions) -> Result<bool, PullMerge
 /// * no record, MAIN scope, linked-worktree history → refused (an old
 ///   binary's common-storage file could be a removed linked worktree's);
 /// * no record otherwise → operable (a W1-era file in an unambiguous gitdir).
-fn verify_autostash_ownership() -> Result<(), String> {
+fn verify_autostash_ownership(recorded: Option<&str>) -> Result<(), String> {
     let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     let path = util::request_worktree_gitdir_strict().join("merge-autostash.json");
-    let recorded = crate::internal::sequencer::sidecar_recorded_owner(&path)?;
+    let recorded = recorded.map(str::to_string);
     match recorded {
         Some(owner) if owner == scope.storage_key() => Ok(()),
         Some(owner) => Err(format!(
@@ -1188,8 +1249,20 @@ fn verify_autostash_ownership() -> Result<(), String> {
 /// KEPT and a warning printed (the merge outcome itself is never changed).
 /// While merge state persists the stash simply stays held.
 async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
-    let sidecar = match MergeAutostash::load_optional_sync() {
-        Ok(Some(sidecar)) => sidecar,
+    // Serialize against every other consumer/writer in this worktree, and
+    // read ONCE: the sidecar applied, the owner verified and the file
+    // removed must all be the same document.
+    let _lock = match acquire_autostash_lock() {
+        Ok(lock) => lock,
+        Err(detail) => {
+            crate::utils::error::emit_warning(format!(
+                "cannot lock the held autostash ({detail}); leaving it in place"
+            ));
+            return None;
+        }
+    };
+    let snapshot = match MergeAutostash::load_snapshot() {
+        Ok(Some(snapshot)) => snapshot,
         Ok(None) => return None,
         Err(detail) => {
             crate::utils::error::emit_warning(format!(
@@ -1198,6 +1271,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             return None;
         }
     };
+    let sidecar = &snapshot.sidecar;
     match MergeState::load_optional_sync() {
         Ok(None) => {}
         // Merge still in progress (conflict / --no-commit): keep holding.
@@ -1209,7 +1283,7 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             return Some("kept".to_string());
         }
     }
-    if let Err(reason) = verify_autostash_ownership() {
+    if let Err(reason) = verify_autostash_ownership(snapshot.recorded_owner.as_deref()) {
         crate::utils::error::emit_warning(format!("{reason}; leaving it in place"));
         return Some("kept".to_string());
     }
@@ -1312,17 +1386,28 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // proceeding would let the later `--autostash` save OVERWRITE the corrupt
     // file — destroying the only durable reference to a held commit, which GC
     // may then collect.
-    let held_sidecar = if options.preserve_held_autostash {
+    // The lock is held across load, verify, promote AND cleanup — releasing
+    // it between any two of those reopens the replacement race. It is
+    // explicitly DROPPED before the `--autostash` save below, which takes the
+    // same non-reentrant lock.
+    let autostash_lock = if options.preserve_held_autostash {
         None
     } else {
-        MergeAutostash::load_optional_sync().map_err(PullMergeError::Autostash)?
+        Some(acquire_autostash_lock().map_err(PullMergeError::Autostash)?)
     };
-    if let Some(sidecar) = held_sidecar {
+    let held_snapshot = if options.preserve_held_autostash {
+        None
+    } else {
+        MergeAutostash::load_snapshot().map_err(PullMergeError::Autostash)?
+    };
+    if let Some(snapshot) = held_snapshot {
+        let sidecar = &snapshot.sidecar;
         // ADR-0714-08: promoting adopts the file into the SHARED stash list
         // and deletes the evidence — only a file this scope can PROVE its own
         // may be adopted, in any worktree (a foreign-marked file inside a
         // linked gitdir is a manual copy, not that worktree's autostash).
-        verify_autostash_ownership().map_err(PullMergeError::Autostash)?;
+        verify_autostash_ownership(snapshot.recorded_owner.as_deref())
+            .map_err(PullMergeError::Autostash)?;
         if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
             match crate::command::stash::store_stash_commit(&oid, "autostash").await {
                 Ok(()) => {
@@ -1344,6 +1429,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
             ));
         }
     }
+    drop(autostash_lock);
     let autostash_on = autostash_enabled(&options).await?;
     if autostash_on && Head::current_commit().await.is_some() {
         match crate::command::stash::create_held_stash_commit("autostash").await {
@@ -2108,12 +2194,25 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     Ok(())
 }
 
+/// Preflight for the merge control actions (W2 r5 #1): the held-autostash
+/// sidecar must be READABLE before HEAD/index/worktree are restored — an
+/// unreadable one surfaces AFTER the mutation otherwise, when `abort` has
+/// already deleted the merge state and the only stash reference is a file
+/// nothing can parse. The load result is discarded; the consumer re-reads
+/// under its own lock.
+fn preflight_held_autostash() -> Result<(), MergeError> {
+    MergeAutostash::load_optional_sync()
+        .map(|_| ())
+        .map_err(MergeError::StateLoad)
+}
+
 async fn run_merge_continue(
     output: &OutputConfig,
     skip_hooks_for_continue: bool,
     message_override: Option<String>,
 ) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
+    preflight_held_autostash()?;
     let state = MergeState::load_required()?;
     ensure_no_unstaged_changes_for_continue()?;
     let skip_hooks = state.skip_hooks || skip_hooks_for_continue;
@@ -2249,6 +2348,7 @@ async fn restore_pre_merge_state(
 /// unrelated-history permission is persisted and replayed below.
 async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
+    preflight_held_autostash()?;
     let state = MergeState::load_required()?;
     // A `--no-commit` merge also persists MergeState — with no conflicts.
     // Restarting it would silently discard the staged result and re-run with
@@ -2313,6 +2413,7 @@ fn refuse_ambiguous_common_merge_state() -> Result<(), MergeError> {
 
 async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
+    preflight_held_autostash()?;
     let state = MergeState::load_required()?;
     let orig_head = restore_pre_merge_state(&state, "abort").await?;
     // The held autostash re-applies onto the restored pre-merge tree (clean

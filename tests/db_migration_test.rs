@@ -4528,3 +4528,85 @@ async fn sparse_guard_matches_the_migration_case_sensitivity() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// W2 §C.10: the stash-generation fence's lifecycle (2026073101)
+// ---------------------------------------------------------------------------
+
+/// The marker is present after up, gone after down, and back after re-up —
+/// and its down migration removes ONLY the marker row.
+#[tokio::test]
+async fn stash_generation_fence_up_down_up_round_trip() {
+    async fn fence_marker_present(conn: &DatabaseConnection) -> bool {
+        use sea_orm::{ConnectionTrait, Statement};
+        conn.query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT value FROM metadata_kv WHERE scope = 'repository' AND target = '' \
+             AND key = 'stash.reflog.generation'"
+                .to_string(),
+        ))
+        .await
+        .expect("query the fence marker")
+        .is_some()
+    }
+
+    let conn = connect("sqlite::memory:").await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner.run_pending(&conn).await.expect("up");
+    assert!(
+        fence_marker_present(&conn).await,
+        "up writes the fence marker"
+    );
+    assert_eq!(
+        runner.current_version(&conn).await.expect("version"),
+        Some(2026073101),
+        "the fence is the newest migration — RETARGET this test when a newer one lands"
+    );
+
+    let rolled = runner
+        .rollback_to(&conn, 2026073005)
+        .await
+        .expect("down to the previous version");
+    assert_eq!(rolled, vec![2026073101], "exactly the fence rolled back");
+    assert!(
+        !fence_marker_present(&conn).await,
+        "down removes the marker"
+    );
+
+    runner.run_pending(&conn).await.expect("re-up");
+    assert!(
+        fence_marker_present(&conn).await,
+        "re-up restores the marker"
+    );
+}
+
+/// The MECHANISM the fence rides on: a database whose recorded schema version
+/// exceeds what this binary registers is refused at open, with the
+/// install-a-newer-binary hint — that refusal is what keeps an old (ABA-prone
+/// generation-less) stash writer out of the repository entirely.
+#[tokio::test]
+async fn a_future_schema_version_refuses_the_connection() {
+    use sea_orm::ConnectionTrait;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("libra.db");
+    let conn = libra::internal::db::create_database(db_path.to_str().expect("utf-8"))
+        .await
+        .expect("create the database");
+    conn.execute_unprepared(
+        "INSERT INTO schema_versions (version, name, applied_at) \
+         VALUES (2126010101, 'from-the-future', datetime('now'))",
+    )
+    .await
+    .expect("plant a future version");
+    drop(conn);
+
+    let error = libra::internal::db::establish_connection(db_path.to_str().expect("utf-8"))
+        .await
+        .expect_err("a future schema must refuse the connection");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("newer than this Libra binary supports"),
+        "the refusal says WHY and implies the fix: {rendered}"
+    );
+}

@@ -4934,13 +4934,18 @@ fn refuse_active_sidecar_state(gitdir: &Path, action: &str) -> WorktreeResult<()
         "merge-state.json",
         "revert-state.json",
         "merge-autostash.json",
+        // An interrupted `stash branch`'s rollback record: removing the
+        // gitdir would strand the half-created branch AND delete the only
+        // instruction for undoing it.
+        "stash-branch-journal.json",
     ] {
         let path = gitdir.join(name);
         match fs::symlink_metadata(&path) {
             Ok(_) => {
                 return Err(WorktreeError::OperationBlocked(format!(
-                    "'{}' holds in-progress state ({name}); finish or abort the \
-                     merge/revert there before {action}",
+                    "'{}' holds in-progress state ({name}); conclude the merge/revert \
+                     (or run any `libra stash` command there to finish a journaled \
+                     rollback) before {action}",
                     gitdir.display()
                 )));
             }

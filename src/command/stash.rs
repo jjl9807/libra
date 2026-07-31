@@ -1281,10 +1281,33 @@ async fn recover_stash_branch_journal() -> Result<(), StashError> {
             .await
             .map_err(|error| StashError::Other(format!("rollback cannot restore HEAD: {error}")))?;
     }
-    // Branch second, tip-conditionally: a branch the user committed to is
-    // theirs now and is kept.
-    if let Ok(base) = ObjectHash::from_str(&journal.base) {
-        let _ = InternalBranch::delete_branch_if_tip_result(&journal.branch, &base).await;
+    // Branch second, tip-conditionally. The journal is cleared ONLY when the
+    // branch's fate is provably concluded: deleted, already absent, or moved
+    // by the user (theirs now). A transient store error keeps the journal so
+    // the next invocation retries — clearing it would strand the half-created
+    // branch with no recovery record.
+    let base = ObjectHash::from_str(&journal.base).map_err(|error| {
+        StashError::Other(format!(
+            "the rollback journal's base '{}' is not a valid object id ({error}); \
+             inspect and remove '{}' manually",
+            journal.base,
+            path.display()
+        ))
+    })?;
+    use crate::internal::branch::ConditionalDeleteOutcome;
+    match InternalBranch::delete_branch_if_tip_result(&journal.branch, &base).await {
+        Ok(
+            ConditionalDeleteOutcome::Deleted
+            | ConditionalDeleteOutcome::NotFound
+            | ConditionalDeleteOutcome::TipMoved,
+        ) => {}
+        Err(error) => {
+            return Err(StashError::Other(format!(
+                "rollback cannot conclude branch '{}' ({error}); the journal is kept and \
+                 the next stash command will retry",
+                journal.branch
+            )));
+        }
     }
     StashBranchJournal::clear()?;
     crate::utils::error::emit_warning(format!(
@@ -1311,25 +1334,11 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
     // Capture the restore point BEFORE any persistent mutation (W2 §C.4.3):
     // both the branch creation and the HEAD switch may need rolling back.
     let prior_head = Head::current().await;
-    // CREATE, never upsert (Codex W2 r1 #4): `update_branch` moves an existing
-    // tip, and a name checked free a moment earlier can be taken by another
-    // worktree before the write — `stash branch` would then silently move
-    // THAT branch. The exclusive create does the check and the insert in one
-    // write-locked transaction, so a collision is refused, not overwritten.
-    InternalBranch::create_branch_exclusive(&branch_name, &base_hash.to_string(), None)
-        .await
-        .map_err(|error| match error {
-            crate::internal::branch::BranchStoreError::AlreadyExists(name) => {
-                StashError::BranchExists(name)
-            }
-            other => stash_branch_store_error(&branch_name, other),
-        })?;
-
-    // §C.10: record the rollback intent DURABLY before HEAD moves. If the
-    // apply fails and the in-process rollback also fails (or the process
-    // dies), the journal survives and the next stash invocation completes the
-    // rollback. A journal-write failure aborts here, where the only mutation
-    // so far is the branch row — rolled back tip-conditionally.
+    // §C.10: record the rollback intent DURABLY before ANY mutation — the
+    // journal precedes even the branch create, so there is no window in which
+    // a created branch exists without its recovery record. A journal whose
+    // branch was never created recovers as a no-op (the tip-conditional
+    // delete finds nothing, HEAD never moved).
     let journal = StashBranchJournal {
         branch: branch_name.clone(),
         base: base_hash.to_string(),
@@ -1342,9 +1351,27 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
             Head::Branch(_) => None,
         },
     };
-    if let Err(error) = journal.write() {
-        rollback_created_branch(&branch_name, &base_hash).await;
-        return Err(error);
+    journal.write()?;
+
+    // CREATE, never upsert (Codex W2 r1 #4): `update_branch` moves an existing
+    // tip, and a name checked free a moment earlier can be taken by another
+    // worktree before the write — `stash branch` would then silently move
+    // THAT branch. The exclusive create does the check and the insert in one
+    // write-locked transaction, so a collision is refused, not overwritten.
+    if let Err(error) =
+        InternalBranch::create_branch_exclusive(&branch_name, &base_hash.to_string(), None).await
+    {
+        // Nothing was mutated; a journal that cannot be cleared is harmless
+        // (recovery no-ops on it) but the user should know.
+        if let Err(clear_error) = StashBranchJournal::clear() {
+            eprintln!("warning: could not remove the rollback journal: {clear_error}");
+        }
+        return Err(match error {
+            crate::internal::branch::BranchStoreError::AlreadyExists(name) => {
+                StashError::BranchExists(name)
+            }
+            other => stash_branch_store_error(&branch_name, other),
+        });
     }
 
     // Switch HEAD to the new branch so apply runs on the right tip — via the
