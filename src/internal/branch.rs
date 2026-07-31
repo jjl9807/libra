@@ -624,6 +624,7 @@ impl Branch {
         branch_name: &str,
         commit_hash: &str,
         remote: Option<&str>,
+        provenance_key: Option<&str>,
     ) -> Result<(), BranchStoreError> {
         let db_conn = get_db_conn_instance().await;
         let txn = crate::internal::db::begin_write_transaction(&db_conn)
@@ -652,13 +653,124 @@ impl Branch {
         }
         .insert(&txn)
         .await;
-        if let Err(error) = insert {
+        let inserted = match insert {
+            Ok(inserted) => inserted,
+            Err(error) => {
+                let _ = txn.rollback().await;
+                return Err(BranchStoreError::Query(error.to_string()));
+            }
+        };
+        // Provenance, committed ATOMICALLY with the creation (W2 r7 #1): the
+        // caller's crash-recovery must know whether THIS create ever
+        // committed, and a file written before or after the transaction
+        // cannot say that. The row also records the created reference's ID,
+        // so a later rollback deletes exactly the row this create made —
+        // never a same-name same-tip branch the user recreated (r7 #2).
+        if let Some(provenance_key) = provenance_key {
+            use sea_orm::{ConnectionTrait, Statement};
+            let recorded = txn
+                .execute(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "INSERT INTO metadata_kv \
+                     (scope, target, key, value, value_type, created_at, updated_at) \
+                     VALUES ('stash_branch_journal', ?, 'reference_id', ?, 'text', \
+                     datetime('now'), datetime('now'))",
+                    [provenance_key.into(), inserted.id.to_string().into()],
+                ))
+                .await;
+            if let Err(error) = recorded {
+                let _ = txn.rollback().await;
+                return Err(BranchStoreError::Query(error.to_string()));
+            }
+        }
+        txn.commit()
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))
+    }
+
+    /// The fate a journaled `stash branch` creation is concluded to, by
+    /// PROVENANCE rather than by name+tip (W2 r7 #1/#2).
+    ///
+    /// One write-locked transaction reads the provenance row and, when it
+    /// exists, deletes the branch BY ITS RECORDED ROW ID, conditional on the
+    /// tip still being the journaled base — then removes the provenance row.
+    /// A branch the user deleted and recreated at the same base has a
+    /// DIFFERENT row id, so it is kept: name and tip are reusable, a rowid is
+    /// not.
+    pub async fn conclude_journaled_branch(
+        provenance_key: &str,
+        base_tip: &str,
+    ) -> Result<JournaledBranchFate, BranchStoreError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db_conn = get_db_conn_instance().await;
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let row = txn
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT value FROM metadata_kv WHERE scope = 'stash_branch_journal' \
+                 AND target = ? AND key = 'reference_id'",
+                [provenance_key.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let Some(row) = row else {
+            // The create never COMMITTED: there is nothing of ours to remove.
+            let _ = txn.rollback().await;
+            return Ok(JournaledBranchFate::NeverCreated);
+        };
+        let reference_id: String = row
+            .try_get_by_index(0)
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let deleted = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "DELETE FROM reference WHERE id = ? AND kind = 'Branch' AND `commit` = ?",
+                [reference_id.clone().into(), base_tip.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let fate = if deleted.rows_affected() > 0 {
+            JournaledBranchFate::Deleted
+        } else {
+            // Row gone (user deleted it) or its tip moved (user committed):
+            // either way it is not ours to touch any more.
+            JournaledBranchFate::KeptOrGone
+        };
+        let cleared = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
+                [provenance_key.into()],
+            ))
+            .await;
+        if let Err(error) = cleared {
             let _ = txn.rollback().await;
             return Err(BranchStoreError::Query(error.to_string()));
         }
         txn.commit()
             .await
-            .map_err(|error| BranchStoreError::Query(error.to_string()))
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        Ok(fate)
+    }
+
+    /// Remove a journaled creation's provenance row WITHOUT touching the
+    /// branch — the success path's conclusion (the branch is the user's).
+    pub async fn clear_journaled_branch_provenance(
+        provenance_key: &str,
+    ) -> Result<(), BranchStoreError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db_conn = get_db_conn_instance().await;
+        db_conn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
+                [provenance_key.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        Ok(())
     }
 
     /// Pool-acquiring counterpart of [`Branch::update_branch_with_conn`].
@@ -807,6 +919,17 @@ impl Branch {
             .map_err(|e| BranchStoreError::Query(e.to_string()))?;
         Ok(outcome)
     }
+}
+
+/// What [`Branch::conclude_journaled_branch`] found (W2 r7 #1/#2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournaledBranchFate {
+    /// No provenance row: the journaled create never committed.
+    NeverCreated,
+    /// The provenance-recorded row still sat at the journaled base — deleted.
+    Deleted,
+    /// The recorded row is gone or its tip moved: the user's now, untouched.
+    KeptOrGone,
 }
 
 /// Outcome of [`Branch::delete_branch_if_tip_result`].

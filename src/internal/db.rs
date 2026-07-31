@@ -210,12 +210,44 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
         // rather than accepting them).
         match inspect_database_schema_for_connection(&conn).await {
             Ok(SchemaCompatibility::Compatible { .. }) => return Ok(conn),
-            Ok(_) | Err(_) => {
+            // PROVEN incompatibility: evict, and CLOSE the shared pool so
+            // every already-returned clone is refused too (W2 r7 #4). The
+            // close is spawned: `Pool::close` marks the pool closed at once
+            // (clones fail from that moment) but then WAITS for outstanding
+            // connections — awaiting that here while another task holds an
+            // open transaction on this pool would deadlock the process.
+            Ok(_) => {
                 let mut connections = TEST_DB_CONNECTIONS.lock().await;
-                connections.remove(&db_path);
+                let evicted = connections.remove(&db_path);
                 drop(connections);
+                let closing_path = db_path.clone();
+                tokio::spawn(async move {
+                    if let Some(stale) = evicted
+                        && let Err(error) = stale.close().await
+                    {
+                        tracing::warn!(
+                            db_path = %closing_path.display(),
+                            error = %error,
+                            "failed to close a schema-incompatible cached connection"
+                        );
+                    }
+                    let _ = conn.close().await;
+                });
                 // Fall through: re-establish, which re-checks and either
                 // upgrades or reports the future schema with its hint.
+            }
+            // A FAILED inspection is not evidence of incompatibility — a
+            // legitimate writer's open transaction makes this read report
+            // BUSY, and evicting (let alone closing) on that would tear the
+            // pool out from under the writer. Hand back the cached
+            // connection; the next acquisition re-checks.
+            Err(error) => {
+                tracing::debug!(
+                    db_path = %db_path.display(),
+                    error = %error,
+                    "schema re-check on a cached connection failed transiently; keeping it"
+                );
+                return Ok(conn);
             }
         }
     } else {
@@ -951,6 +983,14 @@ mod tests {
         get_db_conn_instance_for_path(&path)
             .await
             .expect_err("still refused on the following acquisition");
+
+        // The RETAINED clone is dead too (W2 r7 #4): eviction closed the
+        // shared pool, so the old handle cannot keep writing under the stale
+        // schema from inside this process.
+        cached
+            .execute_unprepared("INSERT INTO config_kv (key, value) VALUES ('x', 'y')")
+            .await
+            .expect_err("the pre-eviction clone must be refused as well");
         reset_db_conn_instance_for_path(&path).await;
     }
 

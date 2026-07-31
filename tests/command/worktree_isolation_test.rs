@@ -480,11 +480,30 @@ fn recovery_keeps_and_reports_a_journaled_branch_the_user_committed_to() {
             "base": base,
             "prior_branch": "main",
             "prior_detached": null,
-            "phase": "created"
+            "phase": "prepared",
+            "nonce": "test-nonce-kept"
         })
         .to_string(),
     )
     .unwrap();
+    let db = main.join(".libra").join("libra.db");
+    let reference_id = sqlite_query(
+        &db,
+        "SELECT id FROM reference WHERE name = 'kept-branch' AND kind = 'Branch'",
+    )
+    .pop()
+    .expect("the branch has a row id");
+    assert!(
+        sqlite_exec(
+            &db,
+            &[&format!(
+                "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, \
+                 updated_at) VALUES ('stash_branch_journal', 'test-nonce-kept', \
+                 'reference_id', '{reference_id}', 'text', datetime('now'), datetime('now'))"
+            )],
+        ),
+        "record the creation provenance"
+    );
 
     let out = run_libra_command(&["stash", "list"], main);
     assert_cli_success(&out, "recovery runs");
@@ -523,8 +542,15 @@ fn worktree_remove_refuses_a_pending_stash_branch_journal() {
 
     fs::write(
         wt.join(".libra").join("stash-branch-journal.json"),
-        "{\"branch\":\"half\",\"base\":\"0000000000000000000000000000000000000000\",\
-         \"prior_branch\":null,\"prior_detached\":null}",
+        serde_json::json!({
+            "branch": "half",
+            "base": "0000000000000000000000000000000000000000",
+            "prior_branch": null,
+            "prior_detached": null,
+            "phase": "prepared",
+            "nonce": "test-nonce-guard"
+        })
+        .to_string(),
     )
     .unwrap();
 
@@ -552,6 +578,57 @@ fn worktree_remove_refuses_a_pending_stash_branch_journal() {
     assert_cli_success(
         &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
         "remove succeeds once the journal is recovered",
+    );
+}
+
+/// W2 r7 #3: a MERGE-mode `pull` claims the worktree control slot — it must
+/// be refused while a merge is already in progress here, BEFORE it fetches
+/// or touches anything.
+#[test]
+fn merge_mode_pull_is_refused_while_a_merge_is_in_progress() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-line", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "other"], main), "switch");
+    fs::write(main.join("a.txt"), "other-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add other");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other-line", "--no-verify"], main),
+        "commit other",
+    );
+    let merged = run_libra_command(&["merge", "main"], main);
+    assert!(!merged.status.success(), "the merge must conflict");
+    let state_before = fs::read(main.join(".libra/merge-state.json")).unwrap();
+
+    let out = run_libra_command(&["pull"], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        !out.status.success(),
+        "a merge-mode pull must be refused mid-merge: {text}"
+    );
+    assert!(
+        text.contains("merge"),
+        "the refusal names the in-progress operation, not a network error: {text}"
+    );
+    assert!(
+        !text.contains("network"),
+        "and it never got as far as fetching: {text}"
+    );
+    assert_eq!(
+        fs::read(main.join(".libra/merge-state.json")).unwrap(),
+        state_before,
+        "nothing was touched"
     );
 }
 
@@ -588,6 +665,7 @@ fn merge_controls_refuse_a_corrupt_held_autostash_before_mutating() {
     // The corrupt sidecar the controls must trip over.
     let sidecar = main.join(".libra").join("merge-autostash.json");
     fs::write(&sidecar, "{ not json").unwrap();
+    let sidecar_before = fs::read(&sidecar).unwrap();
 
     for control in [
         ["merge", "--continue"],
@@ -618,6 +696,11 @@ fn merge_controls_refuse_a_corrupt_held_autostash_before_mutating() {
             run_libra_command(&["rev-parse", "HEAD"], main).stdout,
             head_before,
             "{control:?} must not move HEAD"
+        );
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            sidecar_before,
+            "{control:?} must not touch the sidecar either"
         );
     }
 
@@ -734,7 +817,9 @@ fn an_interrupted_stash_branch_rollback_completes_from_the_journal() {
         .to_string();
 
     // The half-state an interrupted command leaves: the branch exists at its
-    // base, HEAD sits on it, and the journal records the rollback intent.
+    // base, HEAD sits on it, the journal records the rollback intent, and the
+    // PROVENANCE row — written atomically with the branch by the create's
+    // transaction — records the branch row's id.
     assert_cli_success(
         &run_libra_command(&["switch", "-c", "half-branch"], main),
         "enter the half-state",
@@ -745,11 +830,31 @@ fn an_interrupted_stash_branch_rollback_completes_from_the_journal() {
             "branch": "half-branch",
             "base": head,
             "prior_branch": "main",
-            "prior_detached": null
+            "prior_detached": null,
+            "phase": "prepared",
+            "nonce": "test-nonce-interrupted"
         })
         .to_string(),
     )
     .unwrap();
+    let db = main.join(".libra").join("libra.db");
+    let reference_id = sqlite_query(
+        &db,
+        "SELECT id FROM reference WHERE name = 'half-branch' AND kind = 'Branch'",
+    )
+    .pop()
+    .expect("the created branch has a row id");
+    assert!(
+        sqlite_exec(
+            &db,
+            &[&format!(
+                "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, \
+                 updated_at) VALUES ('stash_branch_journal', 'test-nonce-interrupted', \
+                 'reference_id', '{reference_id}', 'text', datetime('now'), datetime('now'))"
+            )],
+        ),
+        "record the creation provenance"
+    );
 
     // ANY stash command completes the rollback first.
     let out = run_libra_command(&["stash", "list"], main);

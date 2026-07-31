@@ -247,10 +247,13 @@ pub struct MergeArgs {
     #[arg(long = "no-verify-signatures", overrides_with = "verify_signatures")]
     pub no_verify_signatures: bool,
 
-    /// Do not update the rerere (reuse recorded resolution) index after the
-    /// merge. Accepted for Git parity and is a no-op: `libra rerere` exists as a
-    /// standalone command but is not yet auto-integrated into merge, so there is
-    /// nothing to update here. (Git's `--rerere-autoupdate` is not exposed.)
+    /// Do not auto-stage rerere-replayed resolutions for this merge. Rerere IS
+    /// integrated: with `rerere.enabled`, a conflicted merge records each
+    /// conflict's preimage and replays a recorded resolution when one matches;
+    /// whether a replayed file is auto-STAGED follows the `rerere.autoUpdate`
+    /// config. This flag is accepted for Git parity but the per-invocation
+    /// override is not implemented — staging follows the config either way.
+    /// (Git's positive `--rerere-autoupdate` is not exposed.)
     #[arg(long = "no-rerere-autoupdate")]
     pub no_rerere_autoupdate: bool,
 
