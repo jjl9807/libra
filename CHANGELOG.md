@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed (`rebase`: replayed commits recorded a hardcoded identity)
+
+- **Replayed commits now keep the original author and record the running user
+  as committer.** All four branches of `create_replayed_commit` (`pick`,
+  `fixup`, `squash`, `amend`) built their commit with `Commit::from_tree_id`,
+  which hardcodes `mega <admin@mega.org>` as *both* signatures — so a rebase
+  destroyed the original authorship and did not record who performed it. Per
+  Git's semantics the author is preserved and never re-stamped (a fold keeps
+  the target commit's author, i.e. the first commit of the group), while the
+  committer is resolved through the same path as `libra commit`.
+- **A missing identity is no longer reported as a corrupt object.** It was
+  folded into the `CommitLoad` / `RepoCorrupt` classification, which pointed at
+  the wrong fix; it now surfaces as `LBR-AUTH-001` with the
+  `libra config user.name/user.email` hints, via the new
+  `ReplayErrorKind::IdentityMissing` and `RebaseError::IdentityMissing`.
+
 ### Fixed (`merge`: merge commits recorded a hardcoded identity)
 
 - **Merge commits now carry the configured `user.name` / `user.email`.** Every

@@ -748,6 +748,8 @@ pub enum ReplayErrorKind {
     IndexRebuild,
     IndexSave,
     WorkdirReset,
+    /// No `user.name` / `user.email` to sign the replayed commit's committer with.
+    IdentityMissing,
 }
 
 impl ReplayErrorKind {
@@ -768,6 +770,7 @@ impl ReplayErrorKind {
             ReplayErrorKind::IndexRebuild => "index_rebuild",
             ReplayErrorKind::IndexSave => "index_save",
             ReplayErrorKind::WorkdirReset => "workdir_reset",
+            ReplayErrorKind::IdentityMissing => "identity_missing",
         }
     }
 
@@ -789,6 +792,7 @@ impl ReplayErrorKind {
             | ReplayErrorKind::IndexRebuild
             | ReplayErrorKind::IndexSave
             | ReplayErrorKind::WorkdirReset => StableErrorCode::IoWriteFailed,
+            ReplayErrorKind::IdentityMissing => StableErrorCode::AuthMissingCredentials,
         }
     }
 }
@@ -1065,6 +1069,8 @@ pub(crate) enum RebaseError {
     BranchRestore { branch: String, detail: String },
     #[error("failed to load commit '{commit}': {detail}")]
     CommitLoad { commit: String, detail: String },
+    #[error("failed to resolve the identity for the replayed commit: {0}")]
+    IdentityMissing(String),
     #[error("failed to load original commit '{commit}': {detail}")]
     OriginalCommitLoad { commit: String, detail: String },
     #[error("failed to load original tree '{tree}': {detail}")]
@@ -1186,16 +1192,33 @@ impl From<RebaseError> for CliError {
                 subject,
                 kind,
                 detail,
-            } => CliError::fatal(error.to_string())
-                .with_stable_code(kind.stable_code())
-                .with_hint("run 'libra rebase --abort' to return to the original branch.")
-                .with_detail("commit", commit.clone())
-                .with_detail("subject", subject.clone())
-                .with_detail("kind", kind.as_str())
-                .with_detail("detail", detail.clone()),
+            } => {
+                let mut cli = CliError::fatal(error.to_string())
+                    .with_stable_code(kind.stable_code())
+                    .with_detail("commit", commit.clone())
+                    .with_detail("subject", subject.clone())
+                    .with_detail("kind", kind.as_str())
+                    .with_detail("detail", detail.clone());
+                cli = cli.with_hint("run 'libra rebase --abort' to return to the original branch.");
+                // A missing identity is fixed by configuring one, not by aborting.
+                // The hint budget is 2, so this goes in front of the generic abort
+                // hint rather than after it, where it would be dropped.
+                if matches!(kind, ReplayErrorKind::IdentityMissing) {
+                    cli = cli.with_priority_hint(
+                        "set 'user.name' and 'user.email' with 'libra config', then run 'libra rebase --continue'",
+                    );
+                }
+                cli
+            }
             RebaseError::CommitLoad { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
             }
+            // Mirrors `CommitError::IdentityMissing`: a replayed commit needs the
+            // same committer identity as any other commit.
+            RebaseError::IdentityMissing(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthMissingCredentials)
+                .with_hint("run 'libra config --global user.name \"Your Name\"' and 'libra config --global user.email \"you@example.com\"'")
+                .with_hint("omit '--global' to set the identity only in this repository."),
             RebaseError::OriginalCommitLoad { .. } | RebaseError::OriginalTreeLoad { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
             }
@@ -3095,9 +3118,13 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
             .unwrap_or(RebaseTodoAction::Pick);
         let new_commit =
             create_replayed_commit(&original_commit, new_tree_id, state.current_head, action)
-                .map_err(|detail| RebaseError::CommitLoad {
-                    commit: state.current_head.to_string(),
-                    detail,
+                .await
+                .map_err(|error| match error {
+                    ReplayCommitError::Identity(detail) => RebaseError::IdentityMissing(detail),
+                    ReplayCommitError::ObjectLoad(detail) => RebaseError::CommitLoad {
+                        commit: state.current_head.to_string(),
+                        detail,
+                    },
                 })?;
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
@@ -4721,11 +4748,22 @@ async fn replay_commit_with_conflict_detection(
         return ReplayResult::BecameEmptyDropped { subject };
     }
 
-    let new_commit =
-        match create_replayed_commit(&commit_to_replay, new_tree_id, *new_parent_id, action) {
-            Ok(commit) => commit,
-            Err(e) => return ReplayResult::internal(ReplayErrorKind::CommitLoad, e),
-        };
+    let new_commit = match create_replayed_commit(
+        &commit_to_replay,
+        new_tree_id,
+        *new_parent_id,
+        action,
+    )
+    .await
+    {
+        Ok(commit) => commit,
+        Err(ReplayCommitError::Identity(detail)) => {
+            return ReplayResult::internal(ReplayErrorKind::IdentityMissing, detail);
+        }
+        Err(error) => {
+            return ReplayResult::internal(ReplayErrorKind::CommitLoad, error.into_detail());
+        }
+    };
 
     if let Err(e) = save_object(&new_commit, &new_commit.id) {
         return ReplayResult::internal(ReplayErrorKind::CommitSave, e.to_string());
@@ -4750,41 +4788,84 @@ async fn replay_commit_with_conflict_detection(
     ReplayResult::Success(new_commit.id)
 }
 
-fn create_replayed_commit(
+/// Why building a replayed commit failed. A missing identity is a configuration
+/// problem and an unreadable object is corruption; keeping them apart lets each
+/// reach the user with the right stable code and the right fix.
+enum ReplayCommitError {
+    Identity(String),
+    ObjectLoad(String),
+}
+
+impl ReplayCommitError {
+    fn into_detail(self) -> String {
+        match self {
+            ReplayCommitError::Identity(detail) | ReplayCommitError::ObjectLoad(detail) => detail,
+        }
+    }
+}
+
+/// Build the commit that replaces `original_commit` on the new base.
+///
+/// Authorship follows Git's rebase semantics, which `Commit::from_tree_id`
+/// cannot express because it hardcodes `mega <admin@mega.org>` for both
+/// signatures:
+///
+/// * **author** is *preserved*, never re-stamped — a rebase rewrites history's
+///   shape, not its authorship. `pick` keeps the replayed commit's own author;
+///   `fixup`/`squash`/`amend` fold into an earlier commit, so the result keeps
+///   *that* commit's author (Git: the author of the first commit in the group),
+///   which is why they read it off `target` rather than `original_commit`.
+/// * **committer** is the person running the rebase, resolved exactly as
+///   `libra commit` resolves it, with a fresh timestamp.
+async fn create_replayed_commit(
     original_commit: &Commit,
     tree_id: ObjectHash,
     new_parent_id: ObjectHash,
     action: RebaseTodoAction,
-) -> Result<Commit, String> {
+) -> Result<Commit, ReplayCommitError> {
+    let (committer, _) = crate::command::commit::create_committer_signature()
+        .await
+        .map_err(|error| ReplayCommitError::Identity(error.to_string()))?;
     match action {
-        RebaseTodoAction::Pick => Ok(Commit::from_tree_id(
+        RebaseTodoAction::Pick => Ok(Commit::new(
+            original_commit.author.clone(),
+            committer,
             tree_id,
             vec![new_parent_id],
             &original_commit.message,
         )),
         RebaseTodoAction::Fixup => {
-            let target: Commit = load_object(&new_parent_id).map_err(|error| error.to_string())?;
-            Ok(Commit::from_tree_id(
+            let target: Commit = load_object(&new_parent_id)
+                .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
+            Ok(Commit::new(
+                target.author.clone(),
+                committer,
                 tree_id,
                 target.parent_commit_ids.clone(),
                 &target.message,
             ))
         }
         RebaseTodoAction::Squash => {
-            let target: Commit = load_object(&new_parent_id).map_err(|error| error.to_string())?;
+            let target: Commit = load_object(&new_parent_id)
+                .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
             let mut message = target.message.clone();
             message.push_str("\n\n");
             message.push_str(original_commit.message.trim());
-            Ok(Commit::from_tree_id(
+            Ok(Commit::new(
+                target.author.clone(),
+                committer,
                 tree_id,
                 target.parent_commit_ids.clone(),
                 &message,
             ))
         }
         RebaseTodoAction::Amend => {
-            let target: Commit = load_object(&new_parent_id).map_err(|error| error.to_string())?;
+            let target: Commit = load_object(&new_parent_id)
+                .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
             let message = amend_replacement_message(&original_commit.message);
-            Ok(Commit::from_tree_id(
+            Ok(Commit::new(
+                target.author.clone(),
+                committer,
                 tree_id,
                 target.parent_commit_ids.clone(),
                 &message,
