@@ -1356,7 +1356,12 @@ pub async fn execute_safe(mut args: CloneArgs, output: &OutputConfig) -> CliResu
     }
 
     let original_dir = util::cur_dir();
+    // §C.4.2: same as `init` — the target repository does not exist yet, and
+    // clone creates it, enters it and checks out INSIDE it. A pin from an
+    // enclosing repository would send the checkout's index write there.
+    let scope = crate::internal::worktree_scope::WorktreeScope::unpinned();
     let (result, cleanup_warning) = execute_clone(&args, &original_dir, output).await;
+    drop(scope);
 
     // Always restore the working directory.
     if env::current_dir().ok().as_ref() != Some(&original_dir) {

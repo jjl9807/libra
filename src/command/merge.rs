@@ -379,7 +379,7 @@ impl MergeState {
         // worktree whose index holds the conflict, so its state lives in THIS
         // worktree's gitdir. Identical path for the main worktree (local ==
         // common storage), so a merge started by an older binary is still found.
-        util::worktree_gitdir().join("merge-state.json")
+        util::request_worktree_gitdir_strict().join("merge-state.json")
     }
 
     pub(crate) fn load_optional_sync() -> Result<Option<Self>, String> {
@@ -438,7 +438,7 @@ impl MergeAutostash {
         // in-progress merge, so it lives in this worktree's gitdir alongside
         // `merge-state.json`. It remains a fail-closed GC root; the held commit
         // is protected in a multi-worktree repo by GC's per-repo prune skip.
-        util::worktree_gitdir().join("merge-autostash.json")
+        util::request_worktree_gitdir_strict().join("merge-autostash.json")
     }
 
     pub(crate) fn load_optional_sync() -> Result<Option<Self>, String> {
@@ -1949,6 +1949,7 @@ async fn run_merge_continue(
     output: &OutputConfig,
     skip_hooks_for_continue: bool,
 ) -> Result<MergeOutput, MergeError> {
+    refuse_ambiguous_common_merge_state()?;
     let state = MergeState::load_required()?;
     ensure_no_unstaged_changes_for_continue()?;
     let skip_hooks = state.skip_hooks || skip_hooks_for_continue;
@@ -2081,6 +2082,7 @@ async fn restore_pre_merge_state(
 /// and are not replayed (documented limitation). The recovery-critical
 /// unrelated-history permission is persisted and replayed below.
 async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
+    refuse_ambiguous_common_merge_state()?;
     let state = MergeState::load_required()?;
     // A `--no-commit` merge also persists MergeState — with no conflicts.
     // Restarting it would silently discard the staged result and re-run with
@@ -2107,7 +2109,37 @@ async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeEr
     run_merge_for_pull_with_options(&target, &target_ref, output, options).await
 }
 
+/// Refuse a control action on a COMMON-storage merge sidecar whose owner cannot
+/// be established (§C.4.3) — same rule and same reasoning as revert's.
+fn refuse_ambiguous_common_merge_state() -> Result<(), MergeError> {
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+    if scope.is_linked() {
+        return Ok(());
+    }
+    if !crate::command::maintenance::repository_had_linked_worktrees() {
+        return Ok(());
+    }
+    let gitdir = util::request_worktree_gitdir().map_err(|error| {
+        MergeError::StateLoad(format!(
+            "cannot resolve this worktree's gitdir to check for ambiguous shared state: {error}"
+        ))
+    })?;
+    let sidecar = gitdir.join("merge-state.json");
+    if !sidecar.exists() {
+        return Ok(());
+    }
+    Err(MergeError::StateLoad(format!(
+        "a merge state file exists at '{}' in COMMON storage, and this repository has \
+         linked-worktree history, so it cannot be proven to be the main worktree's — \
+         continuing or aborting it would reset this worktree from another worktree's state. \
+         Inspect it with `libra worktree doctor`; remove it manually once you have confirmed \
+         it is stale.",
+        sidecar.display()
+    )))
+}
+
 async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
+    refuse_ambiguous_common_merge_state()?;
     let state = MergeState::load_required()?;
     let orig_head = restore_pre_merge_state(&state, "abort").await?;
     // The held autostash re-applies onto the restored pre-merge tree (clean

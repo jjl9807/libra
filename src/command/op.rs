@@ -404,6 +404,60 @@ async fn handle_op_restore(
     // before the dry-run report, so the preview cannot describe a restore
     // that is not permitted. Restoring the current worktree's own operations
     // is unaffected.
+    // W1 §C.9: the snapshot is HEAD and refs. An operation that also moved an
+    // index, a working tree or sequencer state declared itself non-restorable
+    // when it was recorded — replaying it would move HEAD while leaving
+    // `sequence_state` pointing at a todo that no longer matches. Checked
+    // FIRST, before the dry-run report, so the preview cannot describe a
+    // restore that will not happen. A stored property, not a guess from the
+    // command name.
+    if !target_op.restorable {
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: '{}' changed state this snapshot does not \
+             capture (the index, the working tree, or an in-progress sequence)",
+            &target_op_id[..8.min(target_op_id.len())],
+            target_op.command_name
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect it with `libra op show`, and undo a sequencer control with that \
+             command's own `--abort`",
+        ));
+    }
+    // §C.9: a repository-scope operation acts on state every worktree shares,
+    // and an `unknown` one was never attributed at all. Replaying either into
+    // ONE worktree is what the plan says must fail closed until LR-02, and the
+    // kind is what distinguishes them from a main-scope operation — their
+    // `worktree_id` is the same empty string.
+    // §C.9 fail-closed: `repository` (no worktree scope at all) and `unknown`
+    // (never recorded) are both refused. A `branch` operation is NOT
+    // repository-scoped — it is recorded with the worktree it ran in, so branch
+    // restore keeps working, and the shared refs it would move are protected by
+    // the checked-out-elsewhere guard further down (Codex R24).
+    if !matches!(target_op.scope_kind.as_str(), "main" | "linked") {
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: it is recorded with scope kind '{}', which this \
+             snapshot cannot be replayed into a single worktree",
+            &target_op_id[..8.min(target_op_id.len())],
+            target_op.scope_kind
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "inspect it with `libra op show`; repository-wide restore is deferred to the \
+             operation-recovery work",
+        ));
+    }
+    // A claim that was never closed: the command crashed, or is still running.
+    // Either way its recorded view is not the state it will end in.
+    if target_op.status != crate::internal::operation::OperationStatus::Succeeded {
+        return Err(CliError::fatal(format!(
+            "cannot restore operation {}: it is recorded as {}, not a completed success",
+            &target_op_id[..8.min(target_op_id.len())],
+            target_op.status.as_str()
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("wait for it to finish, then restore from a completed operation"));
+    }
     let current_scope = crate::utils::util::current_worktree_id().unwrap_or_default();
     // Accept ONLY the positive value. Testing for the literal "unknown"
     // instead would let any corrupted or mistyped provenance ("declraed")

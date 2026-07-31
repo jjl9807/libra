@@ -84,7 +84,7 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
     // W1 §C.4.1.1: the layer registry is worktree-scoped — resolve the scope
     // ONCE for this request and pass it down the whole LayerStore call chain
     // (the former W0 linked-worktree guard is lifted).
-    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     match args.command {
         LayerCommand::Add {
             name,
@@ -137,6 +137,15 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
         LayerCommand::Enable { name } => set_enabled(&scope, &name, true, output).await,
         LayerCommand::Disable { name } => set_enabled(&scope, &name, false, output).await,
         LayerCommand::Remove { name } => {
+            // §C.10: the same per-worktree lock as apply/unapply and `clean`.
+            // Unapplying, unregistering and refreshing the snapshot are three
+            // steps; a concurrent `apply` between them can leave a materialized
+            // file with no ownership row, which a later `clean` is then free to
+            // delete.
+            let _layer_lock = layer::layer_mutation_lock(&scope).map_err(|error| {
+                CliError::fatal(format!("cannot take this worktree's layer lock: {error}"))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
             // Remove the materialized files first (skipping user-edited ones),
             // then unregister.
             let (_removed, _skipped) = layer::unapply(&scope, Some(&name)).await?;
@@ -155,6 +164,14 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
             Ok(())
         }
         LayerCommand::Apply => {
+            // §C.10: the same per-worktree lock `clean` holds across
+            // snapshot-plus-delete. Recording ownership and materializing the
+            // files must not interleave with a destructive enumeration, or
+            // `clean` deletes a file it snapshotted before it existed.
+            let _layer_lock = layer::layer_mutation_lock(&scope).map_err(|error| {
+                CliError::fatal(format!("cannot take this worktree's layer lock: {error}"))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
             let report = layer::apply(&scope).await?;
             layer::refresh_exclusion_snapshot(&scope).await;
             if output.is_json() {
@@ -178,6 +195,11 @@ pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<(
             Ok(())
         }
         LayerCommand::Unapply { layer: filter } => {
+            // Same lock as `apply` and `clean` — see there.
+            let _layer_lock = layer::layer_mutation_lock(&scope).map_err(|error| {
+                CliError::fatal(format!("cannot take this worktree's layer lock: {error}"))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
             let (removed, skipped) = layer::unapply(&scope, filter.as_deref()).await?;
             layer::refresh_exclusion_snapshot(&scope).await;
             if output.is_json() {

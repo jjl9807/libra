@@ -301,8 +301,7 @@ impl ThreadProjection {
     /// # }
     /// ```
     pub async fn update(&self, db: &DatabaseConnection) -> Result<()> {
-        let txn = db
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(db)
             .await
             .context("Failed to start transaction for thread projection update")?;
 

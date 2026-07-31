@@ -767,7 +767,7 @@ fn relative_prefix(args: &DiffArgs) -> Option<String> {
 /// the stat totals. A no-op when the view is inactive.
 async fn apply_sparse_view_filter(result: &mut DiffOutput) {
     // W1 §C.4.1.1: per-worktree view (read-only display filter).
-    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     let view = crate::internal::sparse::SparseView::load(&scope).await;
     if !view.is_active() {
         return;

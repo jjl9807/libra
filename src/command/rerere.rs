@@ -93,7 +93,7 @@ pub async fn execute_safe(args: RerereArgs, _output: &OutputConfig) -> CliResult
     // W2 §C.4.3: MERGE_RR is per-worktree — resolve the scope ONCE for this
     // request and pass it down (the shared cache under `rr_dir` stays
     // repository-scoped).
-    let scope = WorktreeScope::current();
+    let scope = WorktreeScope::for_request();
     match args.command {
         // The bare `libra rerere` never auto-stages replayed resolutions — that
         // is what `rerere.autoUpdate` / `--rerere-autoupdate` control, and they
@@ -152,7 +152,7 @@ pub(crate) async fn auto_update(auto_update: bool) -> CliResult<()> {
         return Ok(());
     }
     let rr_dir = rerere_dir()?;
-    let scope = WorktreeScope::current();
+    let scope = WorktreeScope::for_request();
     let stage_replayed = auto_update || autoupdate_configured().await;
     apply(&scope, &rr_dir, stage_replayed).await
 }
@@ -440,18 +440,17 @@ fn legacy_merge_rr_file(rr_dir: &Path) -> PathBuf {
     rr_dir.join("MERGE_RR")
 }
 
-/// Whether the worktree registry shows (or cannot rule out) linked
-/// worktrees. A missing registry file is a single-worktree repository; an
-/// unreadable or corrupt one counts as evidence (ambiguous → fail safe).
+/// Whether the repository shows — or cannot rule out — that a linked worktree
+/// has EVER existed.
+///
+/// One durable-history helper for every legacy read/adopt/delete decision
+/// (§C.4.3): currently-registered entries are not enough, because a linked
+/// worktree removed earlier leaves no entry and this common `MERGE_RR` could
+/// have been its own. A missing registry with no recorded history is a
+/// single-worktree repository; anything unreadable counts as evidence
+/// (ambiguous → fail safe).
 fn registry_has_linked_evidence() -> bool {
-    let registry = util::storage_path().join("worktrees.json");
-    match fs::read_to_string(&registry) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Ok(raw) => crate::command::worktree::WorktreeState::parse(raw.as_bytes())
-            .map(|state| !state.is_single_main())
-            .unwrap_or(true),
-        Err(_) => true,
-    }
+    crate::command::maintenance::repository_had_linked_worktrees()
 }
 
 /// Whether the LEGACY common MERGE_RR is readable as this scope's active

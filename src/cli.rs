@@ -2039,6 +2039,123 @@ fn global_config_schema_future_error(
     )
 }
 
+/// Map a parsed command to the sequencer control action it performs, if any
+/// (§C.9's enumeration). `None` for everything else, including a `cherry-pick`
+/// or `rebase` invocation that is not a control action in this sense — a fresh
+/// `cherry-pick <commit>` IS one (`Start`), because it can leave a sequence
+/// behind.
+async fn sequencer_control_for(
+    command: &Commands,
+) -> Option<crate::internal::sequencer::SequencerControl> {
+    use crate::internal::sequencer::{SequenceKind, SequencerControl};
+
+    match command {
+        Commands::CherryPick(args) => Some(if args.continue_pick {
+            SequencerControl::Continue(SequenceKind::CherryPick)
+        } else if args.skip {
+            SequencerControl::Skip(SequenceKind::CherryPick)
+        } else if args.abort {
+            SequencerControl::Abort(SequenceKind::CherryPick)
+        } else if args.quit {
+            SequencerControl::Quit(SequenceKind::CherryPick)
+        } else {
+            SequencerControl::Start(SequenceKind::CherryPick)
+        }),
+        Commands::Revert(args) => Some(if args.continue_revert {
+            SequencerControl::Continue(SequenceKind::Revert)
+        } else if args.skip {
+            SequencerControl::Skip(SequenceKind::Revert)
+        } else if args.abort {
+            SequencerControl::Abort(SequenceKind::Revert)
+        } else {
+            SequencerControl::Start(SequenceKind::Revert)
+        }),
+        Commands::Rebase(args) => Some(if args.continue_rebase {
+            SequencerControl::Continue(SequenceKind::Rebase)
+        } else if args.skip {
+            SequencerControl::Skip(SequenceKind::Rebase)
+        } else if args.abort {
+            SequencerControl::Abort(SequenceKind::Rebase)
+        } else {
+            SequencerControl::Start(SequenceKind::Rebase)
+        }),
+        Commands::Am(args) => Some(if args.continue_am {
+            SequencerControl::AmContinue
+        } else if args.skip {
+            SequencerControl::AmSkip
+        } else if args.abort {
+            SequencerControl::AmAbort
+        } else {
+            SequencerControl::AmStart
+        }),
+        // §C.9: a pull that REBASES runs a rebase in this worktree, so it must
+        // hold the control slot for the whole command — the fetch and a
+        // possible autostash happen before the rebase begins, and starting
+        // them while another control owns the sequencer is how a pull ends up
+        // rebasing on top of someone else's half-finished sequence. The mode
+        // is resolved the way `pull` resolves it (flags, then
+        // `branch.<name>.rebase`, then `pull.rebase`), because a configured
+        // `pull.rebase = true` makes a bare `libra pull` one of these.
+        Commands::Pull(args) => {
+            return command::pull::will_rebase(args)
+                .await
+                .then_some(SequencerControl::Start(SequenceKind::Rebase));
+        }
+        // §C.9: merge's control actions enter the boundary too — `--continue`
+        // and `--restart` reset this worktree and rewrite its sequencer state,
+        // so they need the control slot, the declared scope and the operation
+        // record for the same reasons every other control does.
+        Commands::Merge(args) => {
+            // `--dry-run` promises no writes, and the boundary PERSISTS an
+            // operation row — so it must not take one.
+            if args.dry_run {
+                return None;
+            }
+            if args.continue_merge {
+                Some(SequencerControl::Continue(SequenceKind::Merge))
+            } else if args.restart {
+                Some(SequencerControl::Restart(SequenceKind::Merge))
+            } else if args.abort {
+                Some(SequencerControl::Abort(SequenceKind::Merge))
+            } else {
+                Some(SequencerControl::Start(SequenceKind::Merge))
+            }
+        }
+        Commands::Bisect(bisect) => Some(match bisect {
+            Bisect::Start { .. } => SequencerControl::BisectStart,
+            Bisect::Bad { .. } | Bisect::Good { .. } => SequencerControl::BisectMark,
+            Bisect::Skip { .. } => SequencerControl::BisectSkip,
+            Bisect::Reset { .. } => SequencerControl::BisectReset,
+            Bisect::Run { .. } => SequencerControl::BisectRun,
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+/// §C.4.2 resolve-once: pin THIS invocation's worktree scope and workdir
+/// before any handler runs, and RESTORE the previous pin when the returned
+/// guard drops.
+///
+/// The cwd is not a scope carrier — `ChangeDirGuard` and anything that calls
+/// `set_current_dir` move it mid-command — so a sequencer control that read
+/// its state in worktree A could otherwise save it into whichever worktree the
+/// cwd had become, erasing A's sequence. The guard matters for in-process
+/// hosts: without it, one dispatch's pin would answer for every later library
+/// call in the process.
+/// Outside a repository there is NOTHING to pin: `clone` and `init` are the
+/// commands that run there, and they create their target and step into it, so
+/// a pin taken here would name a directory that is not a repository. There is
+/// no probe here — `pin_request_scope` installs a pin only when every path
+/// resolved, so an unpinnable invocation simply stays ambient, with the
+/// pre-§C.4.2 behaviour and diagnostics. Probing first and pinning second
+/// would be a TOCTOU: a `.libra` removed in between would install a pin whose
+/// paths nothing could resolve.
+fn pin_invocation_scope() -> crate::internal::worktree_scope::ScopeOverrideGuard {
+    use crate::internal::worktree_scope::WorktreeScope;
+    WorktreeScope::pin_request_scope(utils::util::cur_dir())
+}
+
 fn prepare_cli_invocation_state() {
     utils::output::reset_warning_tracker();
     utils::client_storage::reset_global_config_schema_future_warning_for_invocation();
@@ -2212,6 +2329,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = status_resolution.argv.clone();
     // Same reasoning as above, for the consumers below that inspect argv.
     let utf8_argv = utf8_argv_view(&argv);
+    let _invocation_scope = pin_invocation_scope();
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
@@ -2400,6 +2518,21 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         command_handles_background_index_failures,
         background_index_scope,
     );
+
+    // §C.9 / §C.11 W1: sequencer control actions enter the operation log
+    // through BOUNDARY recording. The claim is taken here, once, before the
+    // handler runs — and released after it returns — because the wrapper's
+    // closure form holds a write transaction for the whole body, and every
+    // control action writes HEAD/refs through the POOLED entry points, which
+    // `internal/head.rs:41` and `internal/branch.rs:298` document as a
+    // deadlock. Doing it at dispatch also means one site covers every control
+    // rather than twenty call sites drifting apart.
+    let control_boundary = match sequencer_control_for(&args.command).await {
+        Some(control) => {
+            crate::internal::sequencer::begin_control_operation(control, &utf8_argv).await?
+        }
+        None => None,
+    };
 
     let command_result: CliResult<()> = async {
         match args.command {
@@ -2653,6 +2786,24 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     .await;
 
     background_index_guard.finish().await;
+
+    // Close the control-action claim BEFORE propagating the command's own
+    // error, so a failed control still records an operation with its outcome
+    // instead of leaving a `running` row behind. A failure to close is
+    // reported as a warning: the command already happened, and turning a
+    // bookkeeping error into a command failure would misreport it.
+    if let Some(boundary) = control_boundary {
+        let outcome = if command_result.is_ok() {
+            crate::internal::operation_wrapper::BoundaryOutcome::Succeeded
+        } else {
+            crate::internal::operation_wrapper::BoundaryOutcome::Failed
+        };
+        if let Err(err) = boundary.finish(outcome).await {
+            crate::utils::error::emit_warning(format!(
+                "the command finished, but its operation-log record could not be closed: {err}"
+            ));
+        }
+    }
     command_result?;
 
     // Check only after the queue outcome has been recorded, so
@@ -2725,6 +2876,73 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    /// §C.9: what the CLI actually maps, asserted by CALLING the mapper.
+    ///
+    /// The declaration-side test in `internal::sequencer` compares a hand-written
+    /// list against `SequencerControl::ALL` — which cannot see a change to
+    /// `sequencer_control_for` itself. This one parses each real argv and calls
+    /// the real function, so removing an arm, or reintroducing one that should
+    /// not exist, fails here.
+    #[tokio::test]
+    async fn sequencer_control_mapping_matches_the_cli_grammar() {
+        use crate::internal::sequencer::{SequenceKind, SequencerControl};
+
+        let cases: &[(&[&str], Option<SequencerControl>)] = &[
+            // A dry run promises no writes, and the boundary PERSISTS a row.
+            (&["libra", "merge", "--dry-run", "topic"], None),
+            (
+                &["libra", "merge", "topic"],
+                Some(SequencerControl::Start(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "merge", "--continue"],
+                Some(SequencerControl::Continue(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "merge", "--restart"],
+                Some(SequencerControl::Restart(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "merge", "--abort"],
+                Some(SequencerControl::Abort(SequenceKind::Merge)),
+            ),
+            (
+                &["libra", "revert", "--skip"],
+                Some(SequencerControl::Skip(SequenceKind::Revert)),
+            ),
+            (
+                &["libra", "cherry-pick", "--quit"],
+                Some(SequencerControl::Quit(SequenceKind::CherryPick)),
+            ),
+            (
+                &["libra", "rebase", "--continue"],
+                Some(SequencerControl::Continue(SequenceKind::Rebase)),
+            ),
+            (&["libra", "am", "--abort"], Some(SequencerControl::AmAbort)),
+            (
+                &["libra", "bisect", "reset"],
+                Some(SequencerControl::BisectReset),
+            ),
+            (
+                &["libra", "bisect", "run", "true"],
+                Some(SequencerControl::BisectRun),
+            ),
+            // Not a sequencer control at all.
+            (&["libra", "status"], None),
+            (&["libra", "log"], None),
+        ];
+
+        for (argv, expected) in cases {
+            let parsed = Cli::try_parse_from(argv.iter().map(std::ffi::OsString::from))
+                .unwrap_or_else(|error| panic!("{argv:?} must parse: {error}"));
+            let actual = sequencer_control_for(&parsed.command).await;
+            assert_eq!(
+                actual, *expected,
+                "{argv:?} maps to {actual:?}, expected {expected:?}"
+            );
+        }
+    }
 
     #[test]
     #[serial]

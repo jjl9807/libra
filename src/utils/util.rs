@@ -412,6 +412,14 @@ fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error>
     Ok((common, workdir))
 }
 
+/// `(common_storage, worktree_root, gitdir)` from ONE walk — what a request
+/// pin resolves at entry so its three paths cannot later disagree (§C.4.2).
+pub(crate) fn try_get_request_paths(
+    path: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    try_get_paths_full(path)
+}
+
 /// The LOCAL `.libra` gitdir for this working tree (lore.md 2.1): where the
 /// per-worktree `index` + `worktree_id` live. Equals the common storage for the
 /// main worktree; the linked worktree's own `.libra` otherwise.
@@ -423,6 +431,75 @@ pub fn try_get_worktree_gitdir(path: Option<PathBuf>) -> Result<PathBuf, io::Err
 /// The current worktree's gitdir (panics outside a repo — mirrors `storage_path`).
 pub fn worktree_gitdir() -> PathBuf {
     try_get_worktree_gitdir(None).expect("worktree_gitdir() called outside a libra repository")
+}
+
+/// The gitdir of the worktree THIS INVOCATION is acting on (§C.4.2
+/// resolve-once).
+///
+/// Worktree-local files — `FETCH_HEAD`, `rebase-aux.json`, `CHERRY_PICK_MSG` —
+/// must land in the same worktree whose database rows the command is reading.
+/// [`worktree_gitdir`] resolves from the process cwd, so a `set_current_dir`
+/// between the row read and the file write would pair scope A's state with
+/// scope B's sidecar. When dispatch pinned a request workdir, resolve from
+/// THAT; otherwise resolve from the cwd, which is what an unpinned in-process
+/// caller means. A pinned workdir that cannot be resolved is an error rather
+/// than a fallback.
+pub fn request_worktree_gitdir() -> Result<PathBuf, io::Error> {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        // The gitdir RESOLVED at pin time, so a later discovery failure cannot
+        // produce a different worktree's path — or a path that is not a gitdir
+        // at all, which is what deriving `<workdir>/.libra` from a
+        // subdirectory-invoked command would do. A pin only exists when all of
+        // its paths resolved, so there is no half-resolved case to report.
+        Some(pinned) => Ok(pinned.gitdir.clone()),
+        None => try_get_worktree_gitdir(None),
+    }
+}
+
+/// [`request_worktree_gitdir`] for callers whose path helper cannot fail.
+///
+/// Uses the gitdir resolved AT PIN TIME. It never re-resolves the cwd (the
+/// accident the pin exists to prevent) and never derives a path from the
+/// workdir (which is wrong whenever the command was invoked from a
+/// subdirectory). If the pin has no resolved gitdir the repository was
+/// unreadable when the command started, and there is nothing to be strict
+/// about — the same panic-on-missing-repo contract as [`worktree_gitdir`]
+/// applies, which is what every caller here already assumed.
+pub fn request_worktree_gitdir_strict() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.gitdir.clone(),
+        None => worktree_gitdir(),
+    }
+}
+
+/// The COMMON storage of the repository THIS INVOCATION is acting on (§C.4.2).
+///
+/// [`storage_path`] re-reads the cwd, so a command that steps into another
+/// repository mid-flight — or one whose library caller moved the cwd — would
+/// resolve a DIFFERENT repository's storage than the one whose rows it has
+/// been reading. The legacy sequencer sidecars (`rebase-merge`,
+/// `rebase-apply`) live there, so the pair has to hold: state read from
+/// repository A's database must never be finished against repository B's
+/// sidecar directory.
+///
+/// Unpinned callers resolve from the cwd, which is what they mean.
+pub fn request_storage_path() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.storage.clone(),
+        None => storage_path(),
+    }
+}
+
+/// The working-tree ROOT this invocation is acting on (§C.4.2).
+///
+/// [`working_dir`] re-reads the cwd; a rebase that resolved its plan against
+/// worktree A must not then reset worktree B's files because something moved
+/// the process cwd in between.
+pub fn request_working_dir() -> PathBuf {
+    match crate::internal::worktree_scope::WorktreeScope::request_scope() {
+        Some(pinned) => pinned.worktree_root.clone(),
+        None => working_dir(),
+    }
 }
 
 /// The current worktree's stable instance id (lore.md 2.1), read ambiently from
@@ -450,6 +527,17 @@ pub fn current_worktree_id() -> Option<String> {
 /// that same value, immune to a concurrent cwd switch in the process.
 pub fn worktree_id_for_base(base: Option<PathBuf>) -> Option<String> {
     let gitdir = try_get_worktree_gitdir(base).ok()?;
+    worktree_id_for_gitdir(&gitdir)
+}
+
+/// [`worktree_id_for_base`] for a caller that has ALREADY resolved the gitdir.
+///
+/// §C.4.2: a pin derives its scope from the same walk that produced its paths.
+/// Resolving the scope from the cwd and the paths from a workdir is two
+/// observations, and a `set_current_dir` between them yields worktree A's
+/// scope key paired with worktree B's gitdir — the exact mismatch the pin
+/// exists to prevent.
+pub fn worktree_id_for_gitdir(gitdir: &Path) -> Option<String> {
     if let Ok(id) = fs::read_to_string(gitdir.join("worktree_id")) {
         let id = id.trim();
         if !id.is_empty() {
@@ -463,7 +551,7 @@ pub fn worktree_id_for_base(base: Option<PathBuf>) -> Option<String> {
     // canonical workdir (matching creation's derivation) so a recovered
     // worktree stays isolated from main and keeps its rows.
     if gitdir.join("commondir").exists() {
-        let workdir = gitdir.parent().unwrap_or(&gitdir);
+        let workdir = gitdir.parent().unwrap_or(gitdir);
         let canonical = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
         return Some(worktree_instance_id(&canonical));
     }
@@ -1911,6 +1999,20 @@ pub fn prewarm_ignore_config(workdir: &Path) {
 }
 
 pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
+    check_gitignore_with_layers(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+    )
+}
+
+/// [`check_gitignore`] against an ALREADY-CAPTURED layer snapshot, for a walk
+/// that captured once and must not re-read process-global state per path.
+pub fn check_gitignore_with_layers(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+) -> bool {
     assert!(target_file.starts_with(work_dir));
 
     // Git hardcodes ignoring `.git`. Mirror that here, before consulting any
@@ -1926,9 +2028,15 @@ pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
     // swept into `status`/`add`. Zero overhead with no layers (empty
     // snapshot). The `add` staging guard is the airtight backstop for
     // `--force` (which extends ignored files back into the staged set).
-    if let Ok(relative) = target_file.strip_prefix(work_dir)
+    //
+    // The snapshot is a PARAMETER (§C.4.1.1): a walk captures once and threads
+    // it down, so a concurrent re-pin cannot change which worktree's exclusions
+    // the walk is applying halfway through. `check_gitignore` captures for
+    // callers that have no walk.
+    if !layers.is_empty()
+        && let Ok(relative) = target_file.strip_prefix(work_dir)
         && let Some(key) = crate::internal::layer::normalize_key(relative)
-        && crate::internal::layer::is_layer_owned(&key)
+        && layers.is_owned(&key)
     {
         return true;
     }

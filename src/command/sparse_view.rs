@@ -66,7 +66,7 @@ pub async fn execute_safe(args: SparseViewArgs, output: &OutputConfig) -> CliRes
     // W1 §C.4.1.1: the sparse view is worktree-scoped — resolve the scope
     // ONCE for this request and pass it down the whole SparseViewStore call
     // chain (the former W0 linked-worktree guard is lifted).
-    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     match args.command {
         SparseViewCommand::Set { patterns } => {
             validate_patterns(&patterns)?;

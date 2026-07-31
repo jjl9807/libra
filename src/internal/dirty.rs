@@ -32,10 +32,7 @@ use sea_orm::{
     QueryOrder, sea_query::OnConflict,
 };
 
-use crate::internal::{
-    db::get_db_conn_instance,
-    model::{working_dirty, working_dirty_meta},
-};
+use crate::internal::model::{working_dirty, working_dirty_meta};
 
 /// Row kinds for the unstaged dirty set.
 pub const KIND_NEW: &str = "new";
@@ -216,7 +213,11 @@ impl DirtyCache {
     /// This worktree's scope key for the dirty-cache tables (`""` = main
     /// worktree; plan-20260714 §C.4.1.1).
     fn scope_key() -> String {
-        crate::internal::worktree_scope::WorktreeScope::current()
+        // The invocation's scope (§C.4.2), so a cwd that moves mid-command
+        // cannot mark another worktree's paths — and so a caller acting
+        // deliberately on another scope (the service's scope-carrying
+        // dirty-mark) can say so with `WorktreeScope::override_scope`.
+        crate::internal::worktree_scope::WorktreeScope::for_request()
             .storage_key()
             .to_string()
     }
@@ -240,7 +241,9 @@ impl DirtyCache {
     }
 
     pub async fn meta() -> Result<Option<DirtyMeta>> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         Self::meta_with_conn(&db).await
     }
 
@@ -289,7 +292,9 @@ impl DirtyCache {
     }
 
     pub async fn list() -> Result<Vec<DirtyEntry>> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
         Self::list_with_conn(&db).await
     }
 
@@ -314,8 +319,43 @@ impl DirtyCache {
     pub async fn mark_paths(
         workdir_relative: &[std::path::PathBuf],
     ) -> std::result::Result<Vec<String>, MarkError> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
         Self::mark_paths_with_conn(&db, workdir_relative).await
+    }
+
+    /// Mark paths in an EXPLICIT scope, for a caller acting on behalf of
+    /// another worktree (§C.4.1.1: the service's scope-carrying dirty-mark).
+    ///
+    /// The scope is a parameter rather than process state on purpose: the
+    /// service handles requests concurrently, and a process-global scope
+    /// installed across an `await` can be overwritten by another request in
+    /// flight — putting one caller's mark in another caller's worktree.
+    pub async fn mark_paths_in_scope(
+        scope_key: &str,
+        workdir_relative: &[std::path::PathBuf],
+    ) -> std::result::Result<Vec<String>, MarkError> {
+        use sea_orm::TransactionTrait;
+
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+        let stored_paths = validate_mark_paths(workdir_relative).map_err(MarkError::Escaping)?;
+        // ONE transaction for the whole batch. The caller holds the registry
+        // lock across this call to fence the scope, so the work under that
+        // lock has to be bounded — a per-path awaited upsert is not.
+        let txn = db
+            .begin()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+        Self::mark_stored_paths_in_scope_with_conn(&txn, scope_key, &stored_paths)
+            .await
+            .map_err(MarkError::Store)?;
+        txn.commit()
+            .await
+            .map_err(|error| MarkError::Store(anyhow::anyhow!(error)))?;
+        Ok(stored_paths)
     }
 
     /// Raw insertion for PRE-VALIDATED stored paths (private: every public
@@ -325,6 +365,16 @@ impl DirtyCache {
         stored_paths: &[String],
     ) -> Result<()> {
         let scope = Self::scope_key();
+        Self::mark_stored_paths_in_scope_with_conn(db, &scope, stored_paths).await
+    }
+
+    /// [`Self::mark_stored_paths_with_conn`] against an explicit scope.
+    async fn mark_stored_paths_in_scope_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: &str,
+        stored_paths: &[String],
+    ) -> Result<()> {
+        let scope = scope.to_string();
         let now = now_timestamp();
         for path in stored_paths {
             let active = working_dirty::ActiveModel {

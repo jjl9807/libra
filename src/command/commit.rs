@@ -1047,6 +1047,15 @@ async fn run_commit_with_index(
 
         let index =
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        // lore.md 2.4 / §C.11 W1: the LAST gate before a commit is published.
+        // `add` has its own guard, but plumbing does not — `update-index --add`
+        // stages a path directly — so a materialized layer overlay could reach
+        // history and be pushed, and its content lives outside the repository.
+        // Checked here because this is the choke point every path goes through,
+        // and fail-closed: a lookup failure refuses rather than publishes.
+        crate::internal::layer::reject_layer_owned_entries(&index, "to commit")
+            .await
+            .map_err(CommitError::IndexLoad)?;
         let storage = ClientStorage::init(path::objects());
         let tracked_entries = index.tracked_entries(0);
 

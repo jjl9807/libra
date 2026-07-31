@@ -19,8 +19,7 @@ use git_internal::{
 };
 use indicatif::ProgressBar;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set,
-    TransactionError, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set, TransactionError,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -38,7 +37,6 @@ use crate::{
     internal::{
         branch::Branch,
         config::{ConfigKv, ConfigKvEntry, RemoteConfig},
-        db::get_db_conn_instance,
         head::Head,
         model::reference as ref_model,
         protocol::{
@@ -2785,7 +2783,9 @@ async fn compute_fetch_ref_preview(
     force_override: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let mut updates = Vec::new();
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let checked_out_branches = checked_out_local_branches_with_conn(&db).await?;
     for plan in plans {
         let (storage_name, remote_scope) =
@@ -2894,7 +2894,10 @@ fn fetch_head_path() -> Result<PathBuf, FetchError> {
     // now lives in this worktree's own local gitdir (identical path for the main
     // worktree, where local and common storage coincide), so a linked worktree's
     // fetch no longer touches the main worktree's `FETCH_HEAD`.
-    util::try_get_worktree_gitdir(None)
+    // Resolved from the INVOCATION's workdir (§C.4.2), not the process cwd: a
+    // `set_current_dir` between the fetch and this write would otherwise pair
+    // one worktree's refs with another worktree's `FETCH_HEAD`.
+    util::request_worktree_gitdir()
         .map(|gitdir| gitdir.join("FETCH_HEAD"))
         .map_err(|source| FetchError::LocalState {
             message: format!("failed to locate this worktree's gitdir for FETCH_HEAD: {source}"),
@@ -3059,11 +3062,15 @@ async fn prune_stale_remote_refs(
         return Ok(pruned);
     }
 
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let remote_owned = remote_name.to_string();
     let to_delete = pruned.clone();
     let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
-    db.transaction(|txn| {
+    // Reads the refs it is about to move/delete before writing them, so the
+    // write lock is taken up front (`db::begin_write_transaction`).
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             for entry in &to_delete {
                 // Record a non-lossy audit entry before deleting the ref. The
@@ -3115,11 +3122,13 @@ async fn update_references(
     capabilities: Vec<String>,
     force_override: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let remote_config = remote_config.clone();
     let plans = plans.to_vec();
     let ref_heads = ref_heads.to_vec();
-    db.transaction(|txn| {
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
             let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
@@ -3383,9 +3392,11 @@ async fn persist_fetched_tags(
     if tags.is_empty() {
         return Ok(Vec::new());
     }
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let tags = tags.to_vec();
-    db.transaction(|txn| {
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
             for tag in &tags {
@@ -3547,7 +3558,9 @@ async fn current_have_safe() -> Result<Vec<String>, FetchError> {
     // the tag objects and their history on every run (the bug that previously
     // forced tag fetching to be backed out). This is unconditional: the client
     // genuinely has these objects, so advertising them is always correct.
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|message| FetchError::LocalState { message })?;
     let tag_rows = ref_model::Entity::find()
         .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Tag))
         .all(&db)

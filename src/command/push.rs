@@ -24,7 +24,7 @@ use git_internal::{
         pack::{encode::PackEncoder, entry::Entry},
     },
 };
-use sea_orm::{TransactionError, TransactionTrait};
+use sea_orm::TransactionError;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use url::Url;
@@ -2500,8 +2500,8 @@ async fn update_remote_tracking(
     let remote_tracking_branch_for_error = remote_tracking_branch.clone();
 
     let db = get_db_conn_instance().await;
-    let transaction_result = db
-        .transaction(|txn| {
+    // Reads the remote-tracking ref before it moves it.
+    let transaction_result = crate::internal::db::write_transaction(&db, |txn| {
             Box::pin(async move {
                 let old_oid = Branch::find_branch_result_with_conn(
                     txn,
@@ -2544,9 +2544,9 @@ async fn update_remote_tracking(
                         .with_stable_code(StableErrorCode::IoWriteFailed)
                     })?;
                 Ok::<_, CliError>(())
-            })
         })
-        .await;
+    })
+    .await;
 
     if let Err(error) = transaction_result {
         return Err(match error {

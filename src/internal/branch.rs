@@ -23,7 +23,7 @@ use std::{str::FromStr, time::Duration};
 use git_internal::hash::ObjectHash;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    QueryFilter, TransactionTrait,
+    QueryFilter,
 };
 use tokio::time::sleep;
 
@@ -622,8 +622,9 @@ impl Branch {
         // old one. SQLite's rollback journal makes the read half of this
         // transaction block a concurrent attach until we commit, so the pair
         // is genuinely atomic against it.
-        use sea_orm::TransactionTrait;
-        let txn = db_conn.begin().await?;
+        // The update READS the existing row before writing it, so the write
+        // lock is taken up front (`db::begin_write_transaction`).
+        let txn = crate::internal::db::begin_write_transaction(&db_conn).await?;
         Self::update_branch_with_conn(&txn, branch_name, commit_hash, remote).await?;
         txn.commit().await
     }
@@ -714,9 +715,7 @@ impl Branch {
         // still there), and then loses the branch under it. The same
         // transaction also makes the metadata cascade atomic with the ref
         // delete, which the `_with_conn` form could only document as a gap.
-        use sea_orm::TransactionTrait;
-        let txn = db_conn
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
             .await
             .map_err(|e| BranchStoreError::Query(e.to_string()))?;
         Self::delete_branch_result_with_conn(&txn, branch_name, remote).await?;
@@ -735,8 +734,8 @@ impl Branch {
         expected_tip: &git_internal::hash::ObjectHash,
     ) -> Result<ConditionalDeleteOutcome, BranchStoreError> {
         let db_conn = get_db_conn_instance().await;
-        let txn = db_conn
-            .begin()
+        // Compare-and-swap on the tip: reads the row, then deletes it.
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
             .await
             .map_err(|e| BranchStoreError::Query(e.to_string()))?;
         let found = Self::find_branch_result_with_conn(&txn, branch_name, None).await?;
@@ -774,6 +773,65 @@ mod tests {
 
     use super::*;
     use crate::utils::test;
+
+    /// A ref mutation QUEUES behind a concurrent writer instead of failing.
+    ///
+    /// Both `Branch::update_branch` and `Head::update_result` read the current
+    /// row before replacing it. A deferred transaction that upgrades read→write
+    /// gets `SQLITE_BUSY` immediately — SQLite does not run the busy handler
+    /// for that case — so before `db::begin_write_transaction` a second writer
+    /// anywhere in the repository made these fail outright rather than wait.
+    #[tokio::test]
+    #[serial]
+    async fn a_ref_mutation_waits_for_a_concurrent_writer() {
+        use std::time::Duration;
+
+        let temp_path = tempdir().unwrap();
+        test::setup_with_new_libra_in(temp_path.path()).await;
+        let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+        // A SECOND connection to the same file, as another process would have.
+        let db_path = crate::utils::path::database();
+        let holder = crate::internal::db::establish_connection(db_path.to_str().expect("utf-8"))
+            .await
+            .expect("second connection");
+        let held = crate::internal::db::begin_write_transaction(&holder)
+            .await
+            .expect("hold the write lock");
+        held.execute_unprepared("INSERT INTO `config_kv` (`key`, `value`) VALUES ('holder', '1')")
+            .await
+            .expect("write under the held lock");
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            held.commit().await.expect("release the lock");
+        });
+
+        let tip = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let started = std::time::Instant::now();
+        Branch::update_branch("queued", &tip, None)
+            .await
+            .expect("the branch write waits for the other writer instead of failing");
+        crate::internal::head::Head::update_result(
+            crate::internal::head::Head::Branch("queued".to_string()),
+            None,
+        )
+        .await
+        .expect("and so does the HEAD write");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "it WAITED rather than racing past the holder"
+        );
+        release.await.expect("holder task");
+
+        assert!(
+            Branch::find_branch_result("queued", None)
+                .await
+                .expect("read back the branch")
+                .is_some(),
+            "and the write landed"
+        );
+    }
 
     /// W2 §C.4.3: the tip-conditional delete is ATOMIC — a branch whose tip
     /// moved is kept (TipMoved), an unmoved one is deleted, a missing one

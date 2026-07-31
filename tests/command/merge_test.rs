@@ -1666,6 +1666,7 @@ fn test_merge_dry_run_fast_forward_writes_nothing() {
     assert_cli_success(&run_libra_command(&["checkout", "main"], p), "co main");
 
     let head_before = head_commit(p);
+    let operations_before = operation_count(p);
     let out = run_libra_command(&["--json", "merge", "--dry-run", "feature"], p);
     assert_cli_success(&out, "dry-run ff");
     let json = parse_json_stdout(&out);
@@ -1679,6 +1680,24 @@ fn test_merge_dry_run_fast_forward_writes_nothing() {
         "worktree must not receive the feature file"
     );
     assert!(!p.join(".libra").join("merge-state.json").exists());
+    // And no OPERATION row (§C.9): the sequencer boundary persists one before
+    // the handler runs, so mapping a dry run to a control action would write to
+    // the operation log for a command documented to write nothing.
+    assert_eq!(
+        operation_count(p),
+        operations_before,
+        "a dry run must not record an operation"
+    );
+}
+
+/// How many operations the log holds — the assertion a dry run needs, since
+/// the control boundary writes its row before the handler is reached.
+fn operation_count(repo: &Path) -> u64 {
+    let out = run_libra_command(&["--json", "op", "log", "-n", "100"], repo);
+    assert_cli_success(&out, "op log");
+    parse_json_stdout(&out)["data"]["total"]
+        .as_u64()
+        .expect("op log total")
 }
 
 #[test]

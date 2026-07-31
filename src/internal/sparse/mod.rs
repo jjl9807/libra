@@ -20,10 +20,7 @@ use std::path::Path;
 use ignore::{Match, gitignore::Gitignore};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
-use crate::{
-    internal::{db::get_db_conn_instance, worktree_scope::WorktreeScope},
-    utils::util,
-};
+use crate::{internal::worktree_scope::WorktreeScope, utils::util};
 
 /// Single-owner store over `sparse_view` + the `sparse_view_meta` toggle.
 pub struct SparseViewStore;
@@ -44,7 +41,7 @@ impl SparseViewStore {
     /// tampered store, and a materialization gate (hydrate) must fail
     /// closed on it rather than see an empty (no-op) view.
     pub async fn list_strict(scope: &WorktreeScope) -> Result<Vec<String>, String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT pattern FROM sparse_view WHERE worktree_id = ? \
@@ -68,7 +65,7 @@ impl SparseViewStore {
     /// an unreadable or missing toggle store as "disabled" (the migration
     /// runner creates the table on every connection; absence = corruption).
     pub async fn is_enabled_strict(scope: &WorktreeScope) -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
@@ -89,7 +86,7 @@ impl SparseViewStore {
     }
 
     async fn set_enabled(scope: &WorktreeScope, enabled: bool) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         db.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
@@ -133,7 +130,7 @@ impl SparseViewStore {
     }
 
     async fn rewrite(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -177,7 +174,7 @@ impl SparseView {
     pub async fn load(scope: &WorktreeScope) -> Self {
         Self::try_load(scope).await.unwrap_or_else(|_| Self {
             matcher: None,
-            workdir: util::working_dir(),
+            workdir: util::request_working_dir(),
         })
     }
 
@@ -187,7 +184,10 @@ impl SparseView {
     /// materialize past the gate on a probe failure). A disabled or empty
     /// view still resolves Ok to a no-op view: that is its true state.
     pub async fn try_load(scope: &WorktreeScope) -> Result<Self, String> {
-        let workdir = util::working_dir();
+        // §C.4.2: patterns compiled for `scope` must be matched against THAT
+        // worktree's files. Reading the cwd here could compile scope A's
+        // patterns and apply them to worktree B.
+        let workdir = util::request_working_dir();
         if !SparseViewStore::is_enabled_strict(scope).await? {
             return Ok(Self {
                 matcher: None,
@@ -312,6 +312,50 @@ mod tests {
                 .is_empty()
         );
         assert!(!SparseViewStore::is_enabled(&scope).await);
+    }
+
+    /// §C.4.2: a compiled view matches the PINNED worktree's files, not
+    /// whatever directory the process cwd has become.
+    ///
+    /// The patterns come from the pinned scope's rows; if the workdir came
+    /// from the cwd instead, a `set_current_dir` between the row read and the
+    /// compile would judge worktree B's paths against worktree A's patterns —
+    /// and `contains()` decides what materialization and `clean` may touch.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_compiled_view_matches_the_pinned_worktree_not_the_cwd() {
+        let repo = tempfile::tempdir().expect("repo");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let original = std::env::current_dir().expect("cwd");
+        {
+            let _guard = ChangeDirGuard::new(repo.path());
+            setup_with_new_libra_in(repo.path()).await;
+            SparseViewStore::replace(&WorktreeScope::Main, &["src/**".to_string()])
+                .await
+                .expect("replace");
+        }
+
+        let _pin = crate::internal::worktree_scope::WorktreeScope::pin_request_scope(
+            repo.path().to_path_buf(),
+        );
+        std::env::set_current_dir(elsewhere.path()).expect("move the cwd");
+
+        let view = SparseView::try_load(&WorktreeScope::Main)
+            .await
+            .expect("the pinned scope's view loads");
+        let canonical_repo =
+            std::fs::canonicalize(repo.path()).unwrap_or_else(|_| repo.path().to_path_buf());
+        let view_workdir =
+            std::fs::canonicalize(&view.workdir).unwrap_or_else(|_| view.workdir.clone());
+        assert_eq!(
+            view_workdir, canonical_repo,
+            "the view is anchored at the PINNED worktree, not the cwd"
+        );
+        assert!(view.is_active(), "and the patterns did load");
+        assert!(view.contains_str("src/a.txt"));
+        assert!(!view.contains_str("docs/d.txt"));
+
+        std::env::set_current_dir(&original).expect("restore the cwd");
     }
 
     /// W1 §C.4.1.1: two scopes hold patterns and enabled state independently

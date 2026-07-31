@@ -415,6 +415,12 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         .ok_or(StashError::NoInitialCommit)?;
     let head_commit_hash_str = head_commit_hash.to_string();
 
+    // lore.md 2.4 / §C.11 W1: `stash push` turns the current index into a tree
+    // and publishes it through `refs/stash` — reachable history, so the same
+    // guard as `commit` and `write-tree`.
+    crate::internal::layer::reject_layer_owned_entries(&index, "to stash")
+        .await
+        .map_err(StashError::WriteObject)?;
     let index_tree =
         tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
     let index_tree_data = index_tree

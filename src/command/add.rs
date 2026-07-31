@@ -623,12 +623,15 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         // this request stages into would no longer belong to `layer_scope` —
         // refuse rather than guard the wrong tree (fail closed).
         crate::internal::layer::verify_staging_context(&workdir, &layer_scope)?;
-        // Fail-CLOSED (Codex P1): a real DB read failure here must NOT allow
-        // staging (the invariant is never-enters-commit). `materialized_paths`
-        // is absence-tolerant for a missing table (fresh repo) but propagates
-        // any other error.
+        // Fail-CLOSED (§C.4.1.1): a read failure here must NOT allow staging —
+        // the invariant is that a materialized overlay never enters a commit.
+        // The STRICT reader, because `materialized_paths` is absence-tolerant:
+        // it answers "no overlays" for a missing `layer_path` table so a fresh
+        // or pre-migration repository still works, and on a corrupt or partially
+        // migrated database that same answer would let `add --force` stage an
+        // overlay that is still on disk.
         let owned: std::collections::HashSet<String> =
-            crate::internal::layer::LayerStore::materialized_paths(&layer_scope)
+            crate::internal::layer::LayerStore::owned_path_set_strict(&layer_scope)
                 .await
                 .map_err(|e| {
                     CliError::fatal(format!(
@@ -637,7 +640,6 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                     .with_stable_code(StableErrorCode::IoReadFailed)
                 })?
                 .into_iter()
-                .map(|p| p.path)
                 .collect();
         if !owned.is_empty() {
             let blocked: Vec<String> = files

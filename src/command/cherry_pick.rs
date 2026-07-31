@@ -836,7 +836,14 @@ async fn run_cherry_pick(
                     todo: commit_ids[i + 1..].iter().copied().collect(),
                     opts_json: opts_json.clone(),
                 };
-                state.save().await.map_err(CherryPickError::SaveFailed)?;
+                // The FIRST persistence of a fresh sequence: an atomic claim,
+                // not a replace (§C.4.4). `resume_picks` keeps the upsert —
+                // by then the caller owns the row and advancing it is the
+                // point.
+                state
+                    .claim_start()
+                    .await
+                    .map_err(CherryPickError::SaveFailed)?;
                 return Err(CherryPickError::Conflict {
                     commit: label,
                     reason: format!("conflicts in {} path(s)", paths.len()),
@@ -911,6 +918,10 @@ async fn run_cherry_pick_continue(
     // The conflicted index must be fully resolved (no stage 1/2/3 left).
     let index = Index::load(path::index())
         .map_err(|e| CherryPickError::LoadObject(format!("failed to load index: {e}")))?;
+    // Same guard: `--continue` builds a commit from the current index.
+    crate::internal::layer::reject_layer_owned_entries(&index, "to continue the cherry-pick")
+        .await
+        .map_err(CherryPickError::LoadObject)?;
     if !merge::unresolved_conflicted_paths(&index, &[]).is_empty() {
         return Err(CherryPickError::Conflict {
             commit: short_display_hash(&state.current_oid.to_string()).to_string(),
@@ -1444,7 +1455,9 @@ async fn edit_cherry_pick_message(
     // lives in THIS worktree's gitdir. On shared storage two worktrees editing a
     // message concurrently would truncate each other's buffer. Unchanged for the
     // main worktree, where local and common storage are the same directory.
-    let path = util::worktree_gitdir().join("CHERRY_PICK_MSG");
+    let path = util::request_worktree_gitdir()
+        .map(|gitdir| gitdir.join("CHERRY_PICK_MSG"))
+        .map_err(|error| CherryPickSingleError::SaveFailed(error.to_string()))?;
     crate::command::editor::edit_message(&path, message, editor, false)
         .await
         .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))
@@ -1855,6 +1868,12 @@ impl CherryPickState {
     /// Persist via the unified sequencer (atomic DELETE+INSERT txn).
     pub async fn save(&self) -> Result<(), String> {
         sequencer::save(&self.to_sequence()).await
+    }
+
+    /// Persist the FIRST write of a starting sequence as an atomic claim, so
+    /// two starts racing in one worktree cannot both proceed (§C.4.4).
+    pub async fn claim_start(&self) -> Result<(), String> {
+        sequencer::claim_start(&self.to_sequence()).await
     }
 
     /// Load the active cherry-pick sequence, if the active sequence is a

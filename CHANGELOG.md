@@ -2,6 +2,63 @@
 
 ## [Unreleased]
 
+### Added (plan-20260714 W1: sequencer, rebase and bisect are worktree-scoped)
+
+- **Sequencer control actions are recorded in the operation log.**
+  `cherry-pick`/`revert`/`rebase`/`am`/`bisect` start, continue, skip, abort,
+  quit, mark, reset and run now write an `operation` row through *boundary
+  recording*: a short transaction takes a cross-process atomic claim, the
+  control action runs outside any transaction, and a second short transaction
+  records the outcome. The closure form of the wrapper could not be used —
+  it holds a write transaction for the whole body, while every control action
+  writes HEAD and refs through the pooled entry points, which deadlocks
+  (`internal/head.rs`, `internal/branch.rs` document the rule).
+- **One control action per worktree, enforced across processes.** The claim is
+  a worktree-wide *slot* backed by a partial unique index, not a per-command
+  key: two `am` starts with different patches, or an `am --continue` racing a
+  `rebase --skip`, are different identities that would both have passed a
+  per-identity check and then both replaced that worktree's single sequencer
+  row, losing one sequence while its checkout stayed on disk. A claim left by
+  a killed process is released only when its owner is *proven* gone (recorded
+  `<host>/<pid>`), and the abandoned row is kept as failed rather than
+  deleted — age alone is not proof of death, and a control action may sit for
+  a long time in an editor or a hook.
+- **`libra op restore` refuses operations it cannot actually restore.** The
+  snapshot covers HEAD and refs; a sequencer control also moved an index, a
+  working tree and sequencer state, so restoring one would move HEAD while
+  leaving an in-progress sequence pointing at a todo that no longer matches.
+  Such operations are recorded as non-restorable and refused with
+  `LBR-CONFLICT-002` before the dry-run report. Operations that are still
+  `running` — including a claim left behind by a crash — are refused too.
+
+### Fixed (plan-20260714 W1)
+
+- **A `cwd` change mid-command could write another worktree's sequencer row.**
+  The scope was re-read from the process working directory at each layer, and
+  `ChangeDirGuard` (or any library calling `set_current_dir`) moves it under a
+  running command: a control action that read its state in worktree A could
+  save it into whichever worktree the cwd had become, erasing A's sequence.
+  Each invocation now pins its scope once at dispatch.
+- **Two concurrent starts in one worktree could both proceed.** The start-time
+  mutex was a check followed by an upsert, so two `bisect start` runs both saw
+  no session, both checked out a candidate, and the loser's write replaced the
+  winner's `orig_head` — leaving `bisect reset` to return HEAD to the wrong
+  commit. The first write of a starting session is now an atomic claim against
+  the scoped primary key; the loser gets the ordinary "already in progress"
+  refusal, and an established owner still advances its own row.
+- **Duplicate suppression no longer misreads a normal sequence.** `libra bisect
+  good` twice in a row is how a bisect is driven, and the two invocations have
+  byte-identical arguments. The dedup identity now covers the sequence position
+  as well as the arguments, and control actions are exempt from the
+  five-second succeeded-window heuristic altogether: re-running `rebase
+  --continue` at an unchanged position is ordinary (the last one dropped an
+  empty commit, a hook was fixed, an editor was aborted), and the worktree-wide
+  control slot is a real mutex rather than a heuristic.
+- **A second local HEAD row for a scope is refused rather than stored.** The
+  W0 partial unique index made this an invariant; one internal test still
+  asserted the old contract, where a detached HEAD could land beside an
+  attached one.
+
 ### Fixed (HTTPS auth: a stored token was never attached to a request)
 
 - **`libra auth login` stored a token that no request could use.**

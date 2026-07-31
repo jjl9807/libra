@@ -1115,7 +1115,9 @@ async fn refresh_current_link(
     let Some(stable_id) = source.stable_subagent_id.as_deref() else {
         return Ok(());
     };
-    let txn = conn.begin().await.context("begin subagent link refresh")?;
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .context("begin subagent link refresh")?;
     let current = txn
         .query_one(Statement::from_sql_and_values(
             txn.get_database_backend(),

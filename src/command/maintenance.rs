@@ -550,6 +550,44 @@ pub(crate) fn repository_has_linked_worktrees() -> bool {
     }
 }
 
+/// Whether this repository has EVER registered a linked worktree (§C.4.3
+/// linked-history rule).
+///
+/// Currently-registered entries are not enough for the ambiguous-sidecar
+/// decision: a linked worktree that has been fully removed leaves no entry, so
+/// a common-storage sidecar whose owner might have been that worktree would
+/// look unambiguously main's. The registry records the history durably
+/// (`linked_history`), and a promoted pre-v3 registry records it as UNKNOWN
+/// rather than "never" — because a pre-v3 removal left nothing to read. The
+/// generation counter is a second witness.
+///
+/// This is the SINGLE helper behind every legacy read/adopt/delete decision
+/// (rebase state, rerere `MERGE_RR`), so the answer cannot differ between the
+/// path that adopts and the path that deletes.
+///
+/// Fail-closed: an unreadable registry answers "yes".
+pub(crate) fn repository_had_linked_worktrees() -> bool {
+    if repository_has_linked_worktrees() {
+        return true;
+    }
+    let registry = crate::utils::util::storage_path().join("worktrees.json");
+    let raw = match std::fs::read_to_string(&registry) {
+        // No registry: a single-worktree repository that never had one.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Ok(raw) => raw,
+        // Exists but unreadable — an unknown answer, which is evidence.
+        Err(_) => return true,
+    };
+    // Through the VALIDATED parser, not ad-hoc JSON: it is the one place that
+    // knows a pre-v3 registry's history is `Unknown` rather than `Never`, and
+    // that a v1 shape predates every generation.
+    match crate::command::worktree::WorktreeState::parse(raw.as_bytes()) {
+        Ok(state) => state.ever_had_linked_worktree(),
+        // Unparseable: evidence.
+        Err(_) => true,
+    }
+}
+
 async fn run_gc(
     repo_path: &Path,
     dry_run: bool,

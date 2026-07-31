@@ -17,7 +17,6 @@ use tokio::time::sleep;
 
 use crate::internal::{
     config,
-    db::get_db_conn_instance,
     head::Head,
     model::{
         reflog,
@@ -47,6 +46,9 @@ pub enum ReflogError {
     TransactionError(TransactionError<DbErr>),
     /// A `gc.reflog*` config value could not be read or parsed.
     Config(String),
+    /// The repository database this invocation is scoped to could not be
+    /// opened — distinct from a query that failed against an open one.
+    Storage(String),
 }
 
 impl Display for ReflogError {
@@ -61,6 +63,7 @@ impl Display for ReflogError {
             Self::DatabaseError(error) => write!(f, "failed to access reflog storage: {error}"),
             Self::TransactionError(error) => write!(f, "failed to update reflog: {error}"),
             Self::Config(detail) => write!(f, "invalid reflog expire config: {detail}"),
+            Self::Storage(detail) => write!(f, "failed to open reflog storage: {detail}"),
         }
     }
 }
@@ -410,19 +413,39 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), DbErr>> + Send + 'b>>,
     F: Send + 'static,
 {
-    let db = get_db_conn_instance().await;
-    db.transaction(|txn| {
-        Box::pin(async move {
-            operation(txn).await.map_err(ReflogError::from)?;
-            Reflog::insert(txn, context, insert_ref).await?;
-            Ok::<_, ReflogError>(())
-        })
-    })
-    .await
-    .map_err(|err| match err {
-        TransactionError::Connection(err) => ReflogError::from(err),
-        TransactionError::Transaction(err) => err,
-    })
+    // §C.4.2: the reflog entry and the ref move it describes must land in the
+    // database of the worktree this INVOCATION is acting on — the ambient
+    // connection follows the cwd, so a moved cwd would record the move in
+    // another repository's log (or fail to find the row it just wrote).
+    let db = crate::internal::worktree_scope::request_db()
+        .await
+        .map_err(|error| {
+            ReflogError::Storage(format!(
+                "cannot open the repository database for this reflog write: {error}"
+            ))
+        })?;
+    // The caller's `operation` almost always READS before it writes (resolve
+    // the branch, read HEAD, then move them), and a deferred transaction that
+    // upgrades read→write gets `SQLITE_BUSY` immediately, without the busy
+    // timeout — so a second worktree writing its own refs at the same moment
+    // failed this one outright instead of queueing. Take the write lock up
+    // front; see `db::begin_write_transaction`.
+    let txn = crate::internal::db::begin_write_transaction(&db)
+        .await
+        .map_err(ReflogError::from)?;
+    let result = async {
+        operation(&txn).await.map_err(ReflogError::from)?;
+        Reflog::insert(&txn, context, insert_ref).await?;
+        Ok::<_, ReflogError>(())
+    }
+    .await;
+    match result {
+        Ok(()) => txn.commit().await.map_err(ReflogError::from),
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(err)
+        }
+    }
 }
 
 /// Check whether the current libra repo have a `reflog` table
@@ -827,15 +850,16 @@ where
 {
     let ref_name = ref_name.to_string();
     let options = options.clone();
-    let result = db
-        .transaction(move |txn| {
-            Box::pin(async move {
-                expire_reflog_with_conn(txn, &ref_name, &options, load_parents, is_commit)
-                    .await
-                    .map_err(|e| DbErr::Custom(e.to_string()))
-            })
+    // Expiry READS the ref's entries before it deletes any, so it takes the
+    // write lock up front (`db::begin_write_transaction`).
+    let result = crate::internal::db::write_transaction(db, move |txn| {
+        Box::pin(async move {
+            expire_reflog_with_conn(txn, &ref_name, &options, load_parents, is_commit)
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))
         })
-        .await?;
+    })
+    .await?;
     Ok(result)
 }
 

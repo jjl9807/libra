@@ -1230,6 +1230,22 @@ async fn sequence_notice() -> CliResult<Option<String>> {
         Some(ActiveSequenceKind::Known(SequenceKind::Rebase)) => {
             Some("rebase in progress; run 'libra rebase --continue' or '--abort'".to_string())
         }
+        // An ambiguous legacy directory is REPORTED, not fatal: this worktree
+        // has no sequencer state, so status is exactly the command that should
+        // still work and tell the user what is there. (A sequence-START path
+        // refuses it — see `ensure_none_for`.)
+        // `bisect` has its own dedicated status rendering elsewhere; the
+        // sequence advisory does not duplicate it.
+        Some(ActiveSequenceKind::Bisect) => None,
+        Some(ActiveSequenceKind::AmbiguousLegacy(state)) => {
+            // Medium-accurate guidance: a table is not a file, and telling a
+            // user to delete a directory that does not exist is advice they
+            // cannot act on.
+            let (what, how) = state.describe();
+            Some(format!(
+                "{what}, and this repository has linked-worktree history. {how}."
+            ))
+        }
         // Merge has its own dedicated rendering below.
         Some(ActiveSequenceKind::Known(SequenceKind::Merge)) | None => None,
     })
@@ -1257,7 +1273,7 @@ async fn collect_status_data(
     // files (a no-op with no layers). W1 §C.4.1.1: refreshed with this
     // request's resolved worktree scope.
     crate::internal::layer::refresh_exclusion_snapshot(
-        &crate::internal::worktree_scope::WorktreeScope::current(),
+        &crate::internal::worktree_scope::WorktreeScope::for_request(),
     )
     .await;
     if is_bare_repository().await? {
@@ -1551,7 +1567,7 @@ async fn collect_status_data(
         merge_state,
         sequence_notice: sequence_notice().await?,
         sparse_view_active: crate::internal::sparse::SparseView::load(
-            &crate::internal::worktree_scope::WorktreeScope::current(),
+            &crate::internal::worktree_scope::WorktreeScope::for_request(),
         )
         .await
         .is_active(),
@@ -2659,14 +2675,13 @@ async fn run_status_scan(
     extras: StatusConfigExtras,
     output: &OutputConfig,
 ) -> CliResult<()> {
-    use crate::internal::{
-        db::get_db_conn_instance,
-        dirty::{DirtyCache, ScanLockOutcome},
-    };
+    use crate::internal::dirty::{DirtyCache, ScanLockOutcome};
 
     let index_path =
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
     let mut cache_warnings: Vec<StatusWarning> = Vec::new();
     let pid = std::process::id() as i64;
     match DirtyCache::try_acquire_scan_lock_with_conn(&db, pid)
@@ -2740,10 +2755,7 @@ async fn run_status_scan_locked_inner(
 ) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
-    use crate::internal::{
-        db::get_db_conn_instance,
-        dirty::{DirtyCache, current_index_fingerprint},
-    };
+    use crate::internal::dirty::{DirtyCache, current_index_fingerprint};
 
     let fingerprint_before =
         current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
@@ -2878,7 +2890,9 @@ async fn run_status_scan_locked_inner(
         ));
     }
     let row_count = rows.len();
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
     let txn = db
         .begin()
         .await
@@ -3057,17 +3071,16 @@ async fn run_status_cache_mode(
 ) -> CliResult<()> {
     use sea_orm::TransactionTrait;
 
-    use crate::internal::{
-        db::get_db_conn_instance,
-        dirty::{self, CacheState, DirtyCache, current_index_fingerprint},
-    };
+    use crate::internal::dirty::{self, CacheState, DirtyCache, current_index_fingerprint};
 
     let index_path =
         path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
     let fingerprint =
         current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
     let head_oid = Head::current_commit().await.map(|oid| oid.to_string());
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
     let meta = DirtyCache::meta_with_conn(&db)
         .await
         .map_err(|e| dirty_cache_error("read", e))?;
@@ -3454,7 +3467,7 @@ async fn run_status_cache_mode(
         merge_state,
         sequence_notice: sequence_notice().await?,
         sparse_view_active: crate::internal::sparse::SparseView::load(
-            &crate::internal::worktree_scope::WorktreeScope::current(),
+            &crate::internal::worktree_scope::WorktreeScope::for_request(),
         )
         .await
         .is_active(),
@@ -6456,6 +6469,11 @@ fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>,
     let mut files = Vec::new();
     let mut ignored = Vec::new();
     let mut pending_dirs = vec![workdir.clone()];
+    // ONE snapshot for the whole walk (§C.4.1.1): capturing per path would
+    // re-read process-global state thousands of times, and a concurrent re-pin
+    // between two paths would switch which worktree's exclusions this walk is
+    // applying halfway through.
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
 
     while let Some(dir) = pending_dirs.pop() {
         for entry in std::fs::read_dir(&dir)? {
@@ -6475,13 +6493,13 @@ fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>,
                 .map_err(|err| io::Error::other(err.to_string()))?
                 .to_path_buf();
             if file_type.is_dir() {
-                if util::check_gitignore(workdir, &path) {
+                if util::check_gitignore_with_layers(workdir, &path, &layers) {
                     ignored.push(relative);
                 } else {
                     pending_dirs.push(path);
                 }
             } else if file_type.is_file() || file_type.is_symlink() {
-                if util::check_gitignore(workdir, &path) {
+                if util::check_gitignore_with_layers(workdir, &path, &layers) {
                     ignored.push(relative);
                 } else {
                     files.push(relative);
@@ -6699,7 +6717,7 @@ mod test {
 
     use super::*;
     use crate::{
-        internal::db::{get_db_conn_instance, reset_db_conn_instance_for_path},
+        internal::db::reset_db_conn_instance_for_path,
         utils::{
             error::StableErrorCode,
             test::{self, ChangeDirGuard},
@@ -6795,7 +6813,9 @@ mod test {
         test::setup_with_new_libra_in(repo.path()).await;
         let _guard = ChangeDirGuard::new(repo.path());
         let db_path = repo.path().join(".libra").join("libra.db");
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .expect("test fixture database");
         db.execute(Statement::from_string(
             db.get_database_backend(),
             "INSERT INTO sequence_state \
@@ -6826,7 +6846,9 @@ mod test {
         let _guard = ChangeDirGuard::new(repo.path());
         let db_path = repo.path().join(".libra").join("libra.db");
 
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .expect("test fixture database");
         db.execute(Statement::from_string(
             db.get_database_backend(),
             "DROP TABLE config_kv",

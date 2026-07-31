@@ -43,8 +43,7 @@ use git_internal::{
     },
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set,
-    Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set, Statement,
 };
 
 use crate::{
@@ -775,8 +774,7 @@ impl<R: BufRead> Importer<R> {
             }
         }
         let db = get_db_conn_instance().await;
-        let written = db
-            .transaction(|txn| {
+        let written = crate::internal::db::write_transaction(&db, |txn| {
                 Box::pin(async move {
                     let mut written = 0u64;
                     for (refname, oid) in &pending_refs {
@@ -889,9 +887,9 @@ impl<R: BufRead> Importer<R> {
                     written += note_refs.len() as u64;
                     Ok::<u64, DbErr>(written)
                 })
-            })
-            .await
-            .map_err(|error| self.fatal(&format!("failed to publish refs atomically: {error}")))?;
+        })
+        .await
+        .map_err(|error| self.fatal(&format!("failed to publish refs atomically: {error}")))?;
         self.pending_refs.clear();
         self.pending_notes.clear();
         self.pending_note_replacements.clear();

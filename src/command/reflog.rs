@@ -10,8 +10,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use sea_orm::{
-    ConnectionTrait, DbBackend, DbErr, Statement, TransactionError, TransactionTrait,
-    sqlx::types::chrono,
+    ConnectionTrait, DbBackend, DbErr, Statement, TransactionError, sqlx::types::chrono,
 };
 use serde::Serialize;
 
@@ -785,7 +784,7 @@ async fn delete_single_group(group: &[(String, usize)]) -> CliResult<usize> {
     // clone this to move it into async block to make compiler happy :(
     let group = group.to_vec();
 
-    db.transaction(|txn| {
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let ref_name = &group[0].0;
             let logs = Reflog::find_all(txn, ref_name)

@@ -516,60 +516,80 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     let branch_for_txn = branch.clone();
     let target_for_txn = args.target.clone();
     let new_for_txn = target_commit;
-    let result = with_operation_log(meta, OperationScope::default(), move |txn| {
-        Box::pin(async move {
-            // Authoritative, fail-closed policy gate (the 1.5 contract).
-            let protected =
-                crate::internal::metadata::MetadataKv::is_protected_with_conn(txn, &branch_for_txn)
-                    .await
-                    .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-            if protected {
-                return Err(DbErr::Custom(format!(
-                    "{SENTINEL_PROTECTED}{branch_for_txn}"
-                )));
-            }
-            let archived =
-                crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_for_txn)
-                    .await
-                    .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
-            if archived {
-                return Err(DbErr::Custom(format!(
-                    "{SENTINEL_ARCHIVED}{branch_for_txn}"
-                )));
-            }
-            // Re-check the checked-out branch in-txn: a concurrent `switch`
-            // between preflight and here must not produce phantom staged
-            // diffs on a silently-moved current branch.
-            if let Head::Branch(current) = Head::current_with_conn(txn).await
-                && current == branch_for_txn
-            {
-                return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
-            }
-            let live = Branch::find_branch_result_with_conn(txn, &branch_for_txn, None)
+    let result = with_operation_log(
+        meta,
+        // §C.9: recorded with the INVOKING worktree's scope, not `repository`.
+        // A branch ref is shared, but `op restore` is documented to restore
+        // HEAD/branches — and the protection §C.9 actually asks for is
+        // enforced by the checked-out-elsewhere guard, which refuses the whole
+        // restore before any ref moves. `repository` is reserved for operations
+        // with no worktree scope at all, and restore fails closed on it
+        // (Codex R24).
+        OperationScope::default(),
+        move |txn| {
+            Box::pin(async move {
+                // Authoritative, fail-closed policy gate (the 1.5 contract).
+                let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
+                    txn,
+                    &branch_for_txn,
+                )
                 .await
-                .map_err(|e| DbErr::Custom(e.to_string()))?
-                .ok_or_else(|| {
-                    DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
-                })?;
-            Branch::update_branch_with_conn(txn, &branch_for_txn, &new_for_txn.to_string(), None)
+                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+                if protected {
+                    return Err(DbErr::Custom(format!(
+                        "{SENTINEL_PROTECTED}{branch_for_txn}"
+                    )));
+                }
+                let archived = crate::internal::metadata::MetadataKv::is_archived_with_conn(
+                    txn,
+                    &branch_for_txn,
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+                if archived {
+                    return Err(DbErr::Custom(format!(
+                        "{SENTINEL_ARCHIVED}{branch_for_txn}"
+                    )));
+                }
+                // Re-check the checked-out branch in-txn: a concurrent `switch`
+                // between preflight and here must not produce phantom staged
+                // diffs on a silently-moved current branch.
+                if let Head::Branch(current) = Head::current_with_conn(txn).await
+                    && current == branch_for_txn
+                {
+                    return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
+                }
+                let live = Branch::find_branch_result_with_conn(txn, &branch_for_txn, None)
+                    .await
+                    .map_err(|e| DbErr::Custom(e.to_string()))?
+                    .ok_or_else(|| {
+                        DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
+                    })?;
+                Branch::update_branch_with_conn(
+                    txn,
+                    &branch_for_txn,
+                    &new_for_txn.to_string(),
+                    None,
+                )
                 .await?;
-            let context = crate::internal::reflog::ReflogContext {
-                old_oid: live.commit.to_string(),
-                new_oid: new_for_txn.to_string(),
-                action: crate::internal::reflog::ReflogAction::Reset {
-                    target: target_for_txn.clone(),
-                },
-            };
-            crate::internal::reflog::Reflog::insert_single_entry(
-                txn,
-                &context,
-                &format!("refs/heads/{branch_for_txn}"),
-            )
-            .await
-            .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
-            Ok::<String, DbErr>(live.commit.to_string())
-        })
-    })
+                let context = crate::internal::reflog::ReflogContext {
+                    old_oid: live.commit.to_string(),
+                    new_oid: new_for_txn.to_string(),
+                    action: crate::internal::reflog::ReflogAction::Reset {
+                        target: target_for_txn.clone(),
+                    },
+                };
+                crate::internal::reflog::Reflog::insert_single_entry(
+                    txn,
+                    &context,
+                    &format!("refs/heads/{branch_for_txn}"),
+                )
+                .await
+                .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
+                Ok::<String, DbErr>(live.commit.to_string())
+            })
+        },
+    )
     .await;
     let old_commit = match result {
         Ok(op) => op.payload,
@@ -1496,27 +1516,33 @@ async fn create_branch_impl(
 
         let branch_for_operation = new_branch.clone();
         let commit_for_operation = commit_id_display.clone();
-        with_operation_log(meta, OperationScope::default(), move |txn| {
-            Box::pin(async move {
-                let exists = Branch::exists_result_with_conn(txn, &branch_for_operation, None)
-                    .await
-                    .map_err(|error| DbErr::Custom(error.to_string()))?;
-                if exists {
-                    return Err(DbErr::Custom(format!(
-                        "a branch named '{}' already exists",
-                        branch_for_operation
-                    )));
-                }
-                Branch::update_branch_with_conn(
-                    txn,
-                    &branch_for_operation,
-                    &commit_for_operation,
-                    None,
-                )
-                .await?;
-                Ok::<(), DbErr>(())
-            })
-        })
+        with_operation_log(
+            meta,
+            // Same as the reset path above: the invoking worktree's scope, so
+            // branch restore keeps working (Codex R24).
+            OperationScope::default(),
+            move |txn| {
+                Box::pin(async move {
+                    let exists = Branch::exists_result_with_conn(txn, &branch_for_operation, None)
+                        .await
+                        .map_err(|error| DbErr::Custom(error.to_string()))?;
+                    if exists {
+                        return Err(DbErr::Custom(format!(
+                            "a branch named '{}' already exists",
+                            branch_for_operation
+                        )));
+                    }
+                    Branch::update_branch_with_conn(
+                        txn,
+                        &branch_for_operation,
+                        &commit_for_operation,
+                        None,
+                    )
+                    .await?;
+                    Ok::<(), DbErr>(())
+                })
+            },
+        )
         .await
         .map_err(|error| BranchError::CreateFailed {
             branch: new_branch.clone(),

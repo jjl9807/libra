@@ -304,16 +304,67 @@ impl MigrationRunner {
             {
                 continue;
             }
+            // A guard SQL cannot express (§C.4.3): the layer/sparse scope
+            // migrations decide "main-only" from scoped rows, which a linked
+            // worktree removed BEFORE the migration no longer has.
             // No pre-flight `migration_already_applied` check here: that
             // would be a TOCTOU race with concurrent processes (Codex r1
             // P1#2). `apply_one_migration` uses `INSERT OR IGNORE` and
             // reports whether this call actually wrote the row.
-            let inserted = apply_one_migration(conn, migration).await?;
+            let inserted = if HISTORY_GUARDED_VERSIONS.contains(&migration.version) {
+                // §C.4.1.1/§C.4.3 fail-closed: the scope migrations' SQL guards
+                // see only a LIVE non-main `reference` row, and removing a
+                // linked worktree deletes that row — so old linked layer/sparse
+                // state would be adopted into main. The registry is the durable
+                // witness and it is a FILE, so its verdict is read here and the
+                // row half of the decision runs inside the claim transaction.
+                //
+                // A blocked repository has no in-binary escape in this card
+                // (Codex R23): a bulk discard would destroy the `layer_path`
+                // ownership that keeps retained overlay files unstageable, so
+                // the escape must be an explicit per-row adopt/unapply with
+                // provenance and audit, and that is deferred.
+                let history = registry_linked_history(conn).await;
+                apply_one_migration_guarded(conn, migration, history).await?
+            } else {
+                apply_one_migration(conn, migration).await?
+            };
             if inserted {
                 applied.push(migration.version);
             }
         }
 
+        Ok(applied)
+    }
+
+    /// Apply pending migrations up to and including `target`, leaving anything
+    /// newer unapplied.
+    ///
+    /// For tests that need to stand in the schema window a migration was
+    /// written for: applying everything and rolling back lands on the *down*
+    /// migration's reconstruction of the old shape, which is not the same
+    /// artifact a real repository of that vintage has.
+    pub async fn run_pending_up_to(
+        &self,
+        conn: &DatabaseConnection,
+        target: i64,
+    ) -> Result<Vec<i64>, MigrationError> {
+        ensure_schema_versions_table(conn).await?;
+        let current = self.current_version(conn).await?;
+        let mut applied = Vec::new();
+        for migration in &self.migrations {
+            if migration.version > target {
+                break;
+            }
+            if let Some(current) = current
+                && migration.version <= current
+            {
+                continue;
+            }
+            if apply_one_migration(conn, migration).await? {
+                applied.push(migration.version);
+            }
+        }
         Ok(applied)
     }
 
@@ -385,6 +436,13 @@ impl MigrationRunner {
                     version: migration.version,
                     name: migration.name,
                 })?;
+            // A guard SQL cannot express: rolling registry v3 away while the
+            // registry carries live generations re-opens the old-writer hole
+            // the marker exists to close. Checked in PHASE 1, so a refusal
+            // happens before any `down` DDL runs.
+            if migration.version == REGISTRY_V3_CAPABILITY_VERSION {
+                registry_v3_rollback_preflight(conn).await?;
+            }
             plan.push((migration, down));
         }
 
@@ -461,6 +519,56 @@ async fn apply_one_migration(
     conn: &DatabaseConnection,
     migration: &Migration,
 ) -> Result<bool, MigrationError> {
+    apply_one_migration_guarded(conn, migration, RegistryLinkedHistory::Never).await
+}
+
+/// Versions whose guard needs a witness SQL cannot see: the worktree registry.
+const HISTORY_GUARDED_VERSIONS: [i64; 3] = [2026072303, 2026072304, 2026072902];
+
+/// What the REGISTRY can say about linked-worktree history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryLinkedHistory {
+    /// Proven never: no linked worktree has ever existed here.
+    Never,
+    /// One has existed, or its history cannot be established. Both take the
+    /// same fail-closed branch — only a PROVEN `Never` is safe — and are
+    /// distinguished only in the message.
+    Existed,
+    Unreadable,
+}
+
+/// Read the registry's linked-worktree history through the VALIDATED parser.
+///
+/// Never fails: whether an unreadable registry MATTERS depends on legacy state
+/// that is only known inside the migration transaction, and erroring here would
+/// refuse an upgrade for a repository with nothing to mis-adopt. Only `NotFound`
+/// is `Never`; a v1 shape, a v2 without recorded history, an unreadable file and
+/// a parse failure are all treated as history that cannot be ruled out, because
+/// the parser is the one place that knows a pre-v3 registry's history is
+/// unknowable.
+async fn registry_linked_history(conn: &DatabaseConnection) -> RegistryLinkedHistory {
+    let Some(storage) = sqlite_database_dir(conn).await else {
+        return RegistryLinkedHistory::Never;
+    };
+    let raw = match std::fs::read_to_string(storage.join("worktrees.json")) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RegistryLinkedHistory::Never;
+        }
+        Err(_) => return RegistryLinkedHistory::Unreadable,
+    };
+    match crate::command::worktree::WorktreeState::parse(raw.as_bytes()) {
+        Ok(state) if state.ever_had_linked_worktree() => RegistryLinkedHistory::Existed,
+        Ok(_) => RegistryLinkedHistory::Never,
+        Err(_) => RegistryLinkedHistory::Unreadable,
+    }
+}
+
+async fn apply_one_migration_guarded(
+    conn: &DatabaseConnection,
+    migration: &Migration,
+    registry_history: RegistryLinkedHistory,
+) -> Result<bool, MigrationError> {
     let now: DateTime<Utc> = Utc::now();
     let inserted = conn
         .transaction::<_, _, DbErr>(|txn| {
@@ -468,6 +576,7 @@ async fn apply_one_migration(
             let name = migration.name;
             let up = migration.up;
             let applied_at = now.to_rfc3339();
+            let history = registry_history;
             Box::pin(async move {
                 let backend = txn.get_database_backend();
                 // Claim the version row FIRST (W1-hardening review P1#1):
@@ -501,8 +610,52 @@ async fn apply_one_migration(
                     // to do and nothing to record.
                     return Ok::<bool, DbErr>(false);
                 }
+                // §C.4.3, inside the claim with the write lock held: no
+                // concurrent writer can add legacy state between this read and
+                // the DDL.
+                // 2026072902 does not BLOCK: operations are history, and the
+                // right answer for one whose worktree cannot be established is
+                // the `unknown` provenance the migration already defines — `op
+                // restore` refuses those. Its marking runs AFTER the up DDL,
+                // which is what creates the column; see below.
+                if version != 2026072902
+                    && history != RegistryLinkedHistory::Never
+                    && historic_state_would_be_misattributed(txn, version).await?
+                {
+                    let why = if history == RegistryLinkedHistory::Unreadable {
+                        "its worktree registry cannot be read or parsed, so whether a linked \
+                         worktree existed is unknown"
+                    } else {
+                        "its worktree registry shows a linked worktree has existed"
+                    };
+                    return Err(DbErr::Custom(format!(
+                        "cannot apply migration {version}: this repository holds \
+                         repository-global state that the migration would attribute to the MAIN \
+                         worktree, and {why} — so that state may belong to a worktree removed \
+                         earlier. Adopting it would let its overlay files be staged, or apply a \
+                         foreign sparse filter. Resolving this needs an explicit per-row \
+                         adopt/unapply pass, which is not yet available; until then, restore a \
+                         backup taken before the upgrade or remove the legacy state with the \
+                         previous binary"
+                    )));
+                }
                 apply_migration_compatibility(txn, version, name).await?;
                 txn.execute(Statement::from_string(backend, up)).await?;
+                if version == 2026072902 && history != RegistryLinkedHistory::Never {
+                    // The registry witness the migration's SQL cannot see
+                    // (§C.9): a linked worktree removed before this upgrade
+                    // leaves no HEAD row, so its old operations would be
+                    // backfilled as trusted `main`. Mark every unscoped row
+                    // `unknown` instead — inside this transaction, so the
+                    // version row and the marking commit together.
+                    txn.execute(Statement::from_string(
+                        backend,
+                        "UPDATE `operation` SET `scope_provenance` = 'unknown' \
+                         WHERE (`worktree_id` IS NULL OR `worktree_id` = '')"
+                            .to_string(),
+                    ))
+                    .await?;
+                }
                 Ok::<bool, DbErr>(true)
             })
         })
@@ -1117,7 +1270,240 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026072902_operation_scope_provenance.sql"),
             include_str!("../../../sql/migrations/2026072902_operation_scope_provenance_down.sql"),
         ),
+        // plan-20260714 Part C W1 (§C.9): canonicalize `operation.args_digest`
+        // so the duplicate window's SQL equality matches rows written before
+        // the writer started normalizing.
+        sql_migration(
+            2026073001,
+            "operation_args_digest_canonical",
+            include_str!("../../../sql/migrations/2026073001_operation_args_digest_canonical.sql"),
+            include_str!(
+                "../../../sql/migrations/2026073001_operation_args_digest_canonical_down.sql"
+            ),
+        ),
+        // plan-20260714 Part C W1 (§C.9): the composite index the scoped
+        // duplicate point query needs — without it the check scans every
+        // operation this repository recorded inside the window.
+        sql_migration(
+            2026073002,
+            "operation_dedup_index",
+            include_str!("../../../sql/migrations/2026073002_operation_dedup_index.sql"),
+            include_str!("../../../sql/migrations/2026073002_operation_dedup_index_down.sql"),
+        ),
+        // plan-20260714 Part C W1 (§C.9): boundary recording — a cross-process
+        // atomic `running` claim, and an explicit `restorable` property so a
+        // sequencer control's HEAD/refs-only snapshot can never be replayed
+        // over sequencer state it cannot restore.
+        sql_migration(
+            2026073003,
+            "operation_boundary_claim",
+            include_str!("../../../sql/migrations/2026073003_operation_boundary_claim.sql"),
+            include_str!("../../../sql/migrations/2026073003_operation_boundary_claim_down.sql"),
+        ),
+        // plan-20260714 Part C W1 (§C.9): the typed scope KIND, so a
+        // repository-scope operation is distinguishable from a main-scope one
+        // and `op restore` can refuse it by kind.
+        sql_migration(
+            2026073004,
+            "operation_scope_kind",
+            include_str!("../../../sql/migrations/2026073004_operation_scope_kind.sql"),
+            include_str!("../../../sql/migrations/2026073004_operation_scope_kind_down.sql"),
+        ),
+        // plan-20260714 Part C W1 (§C.4.1.1): registry v3 — the durable
+        // registration-generation counter the service fence depends on. The
+        // marker keeps a v2-era binary from rewriting the registry without it.
+        sql_migration(
+            2026073005,
+            "worktree_registry_v3_capability",
+            include_str!("../../../sql/migrations/2026073005_worktree_registry_v3_capability.sql"),
+            include_str!(
+                "../../../sql/migrations/2026073005_worktree_registry_v3_capability_down.sql"
+            ),
+        ),
     ]
+}
+
+/// Whether this repository holds state the migration at `version` would
+/// attribute to the MAIN worktree while its real owner cannot be established.
+///
+/// Defined exactly as each migration defines it — including sparse's last-wins
+/// `config_kv.sparse.enabled`, TRIMMED and compared case-SENSITIVELY, which is
+/// what migration 2026072304's own predicate does. The probe conforms to the
+/// migration rather than the reverse: migrations are immutable once applied, so
+/// a probe that case-folded would refuse an upgrade over a `TRUE` the migration
+/// itself projects as disabled.
+///
+/// Read inside the migration's transaction. Every failure propagates: a table
+/// CONFIRMED absent contributes nothing, but a locked database or an undecodable
+/// value is an unknown answer, and an unknown answer must not read as "nothing
+/// at stake".
+async fn historic_state_would_be_misattributed(
+    txn: &sea_orm::DatabaseTransaction,
+    version: i64,
+) -> Result<bool, DbErr> {
+    let tables: &[&str] = match version {
+        2026072303 => &["layer", "layer_path"],
+        2026072304 => &["sparse_view"],
+        // 2026072902: an operation row with no recorded scope is the state that
+        // would be backfilled as trusted `main`.
+        _ => &[],
+    };
+    for table in tables {
+        if count_rows(txn, table, None).await? > 0 {
+            return Ok(true);
+        }
+    }
+    if version == 2026072902
+        && count_rows(
+            txn,
+            "operation",
+            Some("`worktree_id` IS NULL OR `worktree_id` = ''"),
+        )
+        .await?
+            > 0
+    {
+        return Ok(true);
+    }
+    if version == 2026072304 {
+        match txn
+            .query_one(Statement::from_string(
+                txn.get_database_backend(),
+                "SELECT TRIM(COALESCE((SELECT `value` FROM `config_kv` \
+                 WHERE `key` = 'sparse.enabled' ORDER BY `id` DESC LIMIT 1), ''))"
+                    .to_string(),
+            ))
+            .await
+        {
+            Ok(Some(row)) => {
+                let value: String = row.try_get_by_index(0).map_err(|error| {
+                    DbErr::Custom(format!("`sparse.enabled` is undecodable: {error}"))
+                })?;
+                // EXACTLY the migration's predicate: `TRIM` in the SQL above,
+                // then a case-SENSITIVE match against the same truthy set.
+                // Migrations are immutable once applied, so the probe conforms
+                // to the migration rather than the reverse — a probe that
+                // case-folded would refuse an upgrade for a `TRUE` the
+                // migration itself treats as disabled.
+                if matches!(value.as_str(), "true" | "1" | "yes" | "on") {
+                    return Ok(true);
+                }
+            }
+            Ok(None) => {}
+            Err(error) if is_missing_table_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+/// `SELECT COUNT(*)` with a confirmed-absent table treated as zero and every
+/// other failure propagated.
+async fn count_rows(
+    txn: &sea_orm::DatabaseTransaction,
+    table: &str,
+    predicate: Option<&str>,
+) -> Result<i64, DbErr> {
+    let sql = match predicate {
+        Some(predicate) => format!("SELECT COUNT(*) FROM `{table}` WHERE {predicate}"),
+        None => format!("SELECT COUNT(*) FROM `{table}`"),
+    };
+    match txn
+        .query_one(Statement::from_string(txn.get_database_backend(), sql))
+        .await
+    {
+        Ok(Some(row)) => row
+            .try_get_by_index(0)
+            .map_err(|error| DbErr::Custom(format!("`{table}` count is undecodable: {error}"))),
+        Ok(None) => Ok(0),
+        Err(error) if is_missing_table_error(&error) => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_missing_table_error(error: &DbErr) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("no such table")
+}
+
+/// The directory holding this connection's SQLite file, via
+/// `PRAGMA database_list`. `None` for `:memory:` and anything path-less.
+async fn sqlite_database_dir(conn: &DatabaseConnection) -> Option<std::path::PathBuf> {
+    let row = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "PRAGMA database_list".to_string(),
+        ))
+        .await
+        .ok()??;
+    let file: String = row.try_get_by_index(2).ok()?;
+    if file.is_empty() {
+        return None;
+    }
+    std::path::Path::new(&file)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+}
+
+/// The version whose rollback needs a check SQL cannot express.
+const REGISTRY_V3_CAPABILITY_VERSION: i64 = 2026073005;
+
+/// Refuse to roll back registry v3 while the registry carries live
+/// registration generations (plan-20260714 §C.4.1.1).
+///
+/// The marker is what keeps a v2-era binary from rewriting `worktrees.json`
+/// and dropping the generations the service fence depends on. Rolling it away
+/// with generations in the file re-opens exactly that hole, and nothing can
+/// detect it afterwards because the evidence is what gets dropped. The check
+/// cannot be SQL — the registry is a file — so it is here, at the one place
+/// that decides whether the down migration runs.
+///
+/// A repository with no registry, or one whose entries carry no generations
+/// (every worktree registered before v3), rolls back freely.
+async fn registry_v3_rollback_preflight(conn: &DatabaseConnection) -> Result<(), MigrationError> {
+    // The registry belongs to the repository whose DATABASE is being rolled
+    // back — asked of the connection itself, not of the process cwd. A rollback
+    // run from a linked worktree, or against an explicitly-pathed database,
+    // must consult THAT repository's `worktrees.json`; resolving ambiently
+    // would check whichever repository the caller happens to be standing in.
+    let Some(storage) = sqlite_database_dir(conn).await else {
+        // An in-memory or path-less database: no repository to protect.
+        return Ok(());
+    };
+    let path = storage.join("worktrees.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        // Unreadable registry: the rollback is not the place to adjudicate it,
+        // and refusing here would block recovery from an unrelated problem.
+        return Ok(());
+    };
+    let counter = document
+        .get("epoch_counter")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let entry_generations = document
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .get("epoch")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|epoch| epoch > 0)
+            })
+        });
+    if counter > 0 || entry_generations {
+        return Err(MigrationError::Other(anyhow::anyhow!(
+            "cannot roll back registry v3: '{}' carries live registration generations, and an \
+             older binary would silently drop them — remove the linked worktrees first, or \
+             restore a backup taken before the upgrade",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn sql_migration(
@@ -1158,6 +1544,10 @@ pub async fn current_builtin_schema_version_readonly(
 ) -> Result<Option<i64>, MigrationError> {
     builtin_runner()?.current_version_readonly(conn).await
 }
+
+/// The later of the two sequencer re-key migrations. A database at or past it
+/// needs no shape normalization, because both rebuilds have already run.
+const BISECT_STATE_SCOPE_MIGRATION: i64 = 2026072301;
 
 /// Normalize `rebase_state` to the full pre-scope column set so the static
 /// `2026072101_rebase_state_worktree_scope` rebuild can reference every
@@ -1282,8 +1672,21 @@ pub async fn run_builtin_migrations(conn: &DatabaseConnection) -> Result<Vec<i64
     // The rebase_state/bisect_state shape normalizations must precede the
     // runner: the 2026072101/2026072301 static rebuilds name every pre-scope
     // column, and pre-existing databases carry a lazy-DDL-era subset of them.
-    normalize_rebase_state_shape(conn).await?;
-    normalize_bisect_state_shape(conn).await?;
+    //
+    // They run ONLY while those rebuilds are still pending. W1 requires the
+    // production path to be free of lazy DDL, and on an already-migrated
+    // database these were four DDL statements per connection open forever —
+    // no-ops that still took SQLite's schema lock. A database at or past the
+    // later rebuild has the re-keyed shape by definition, so there is nothing
+    // to normalize.
+    let applied = runner
+        .current_version_readonly(conn)
+        .await
+        .with_context(|| "failed to read the current schema version")?;
+    if applied.unwrap_or(0) < BISECT_STATE_SCOPE_MIGRATION {
+        normalize_rebase_state_shape(conn).await?;
+        normalize_bisect_state_shape(conn).await?;
+    }
     runner
         .run_pending(conn)
         .await
@@ -1362,9 +1765,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 42);
+        assert_eq!(runner.len(), 49);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026072501));
+        assert_eq!(runner.max_registered_version(), Some(2026073005));
     }
 
     #[test]

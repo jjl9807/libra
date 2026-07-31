@@ -29,7 +29,7 @@ use std::{
 };
 
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use serde::Serialize;
 
 use crate::{
@@ -41,7 +41,6 @@ use crate::{
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
-        db::get_db_conn_instance,
         head::Head,
     },
     utils::{
@@ -85,14 +84,14 @@ impl BisectState {
     /// Returns true when a non-completed bisect session row exists. Used by
     /// the bare-repo guard and by `start` to refuse re-entry.
     pub async fn is_in_progress() -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::has_active_state_in_db(&db).await
     }
 
     /// Returns true when any row exists, including converged sessions whose
     /// state was preserved for `bisect reset`.
     pub async fn has_state() -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::has_any_state_in_db(&db).await
     }
 
@@ -102,9 +101,68 @@ impl BisectState {
     /// - Upserts on the `worktree_id` primary key in one statement, so
     ///   concurrent writers in the same worktree get last-writer-wins
     ///   semantics instead of one of them hitting a UNIQUE violation.
+    ///   Last-writer-wins is right for an OWNER advancing its own session; a
+    ///   STARTING session must use [`BisectState::claim_start`] instead.
     pub async fn save(&self) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::save_with_conn(&db, self).await
+    }
+
+    /// Claim this worktree's bisect slot for a STARTING session (§C.4.4).
+    ///
+    /// `ensure_none_for_bisect` is a check, and a check followed by an upsert
+    /// is a TOCTOU window: two `bisect start` runs in one worktree both see no
+    /// row, both check out a candidate, and the loser's upsert overwrites the
+    /// winner's `orig_head` — so `bisect reset` afterwards returns HEAD to the
+    /// wrong place, which is the one thing a bisect must not get wrong. A bare
+    /// `INSERT` against `worktree_id PRIMARY KEY` lets exactly one starter
+    /// win; the loser gets the ordinary "already in progress" refusal.
+    pub async fn claim_start(&self) -> Result<(), String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        let good_json = serde_json::to_string(&self.good)
+            .map_err(|e| format!("failed to serialize good commits: {e}"))?;
+        let skipped_json = serde_json::to_string(&self.skipped)
+            .map_err(|e| format!("failed to serialize skipped commits: {e}"))?;
+        let scope_key = crate::internal::worktree_scope::WorktreeScope::for_request()
+            .storage_key()
+            .to_string();
+        let result = db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, \
+                 skipped, steps, completed, first_parent, worktree_id) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    self.orig_head.to_string().into(),
+                    self.orig_head_name
+                        .clone()
+                        .map(|name| name.into())
+                        .unwrap_or(Value::String(None)),
+                    self.bad
+                        .map(|h| h.to_string().into())
+                        .unwrap_or(Value::String(None)),
+                    good_json.into(),
+                    self.current
+                        .map(|h| h.to_string().into())
+                        .unwrap_or(Value::String(None)),
+                    skipped_json.into(),
+                    self.steps
+                        .map(|s| s as i64)
+                        .map(|v| v.into())
+                        .unwrap_or(Value::BigInt(None)),
+                    (self.completed as i64).into(),
+                    (self.first_parent as i64).into(),
+                    scope_key.into(),
+                ],
+            ))
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if crate::internal::sequencer::is_unique_violation(&err) => {
+                Err("a bisect is already in progress in this worktree".to_string())
+            }
+            Err(err) => Err(format!("failed to claim bisect_state: {err}")),
+        }
     }
 
     /// Load the persisted bisect state.
@@ -113,7 +171,7 @@ impl BisectState {
     /// - Returns `Err("No bisect in progress")` if the row is missing — this
     ///   propagates as a fatal CLI error in every caller.
     pub async fn load() -> Result<Self, String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::load_from_db(&db)
             .await?
             .ok_or_else(|| "No bisect in progress".to_string())
@@ -121,13 +179,13 @@ impl BisectState {
 
     /// Drop the bisect state row. Idempotent on an empty table.
     pub async fn cleanup() -> Result<(), String> {
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::clear_state_in_db(&db).await
     }
 
     /// This worktree's scope key for `bisect_state` (`""` = main worktree).
     fn scope_key() -> String {
-        crate::internal::worktree_scope::WorktreeScope::current()
+        crate::internal::worktree_scope::WorktreeScope::for_request()
             .storage_key()
             .to_string()
     }
@@ -741,6 +799,18 @@ async fn run_bisect_start(
             .with_hint("bisect requires a working tree to check out commits for testing"));
     }
 
+    // §C.4.4 bisect/sequencer mutual exclusion: a rebase, cherry-pick, revert,
+    // merge or am owning THIS worktree's scope blocks a new bisect, exactly as
+    // an active bisect now blocks them. Bisect was outside the symmetric mutex
+    // entirely, so a `bisect start` could begin beside an in-progress sequence
+    // and then check out candidates underneath it.
+    //
+    // Checked BEFORE the clean-tree requirement: an in-progress sequence is
+    // the more fundamental blocker, and it is usually what made the tree
+    // dirty — "working tree contains uncommitted changes" would send the user
+    // to commit conflict markers.
+    crate::internal::sequencer::ensure_none_for_bisect().await?;
+
     // Require a clean working tree to prevent data loss: each bisect checkout
     // resets tracked paths in the index and working tree to the candidate
     // commit (uncommitted tracked changes would be lost), and a candidate that
@@ -811,7 +881,9 @@ async fn run_bisect_start(
         }
     }
 
-    state.save().await.map_err(CliError::fatal)?;
+    // The first write of a STARTING session is a claim, not an upsert
+    // (§C.4.4) — see `BisectState::claim_start`.
+    state.claim_start().await.map_err(CliError::fatal)?;
 
     if bad_hash.is_some() && good_hash.is_none() {
         return Ok(BisectOutput::Start {
@@ -1271,10 +1343,11 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
 /// - Transaction begin/commit failures and HEAD-mismatch detection both
 ///   return fatal `CliError`s with diagnostic messages.
 async fn restore_to_branch(branch_name: String, commit_hash: ObjectHash) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
 
-    let txn = db
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(&db)
         .await
         .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
 
@@ -1535,10 +1608,11 @@ async fn resolve_ref(ref_str: &str) -> CliResult<ObjectHash> {
 ///   restore runs after commit, so a partial failure between them leaves the
 ///   worktree out of sync until `bisect reset`.
 async fn checkout_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| CliError::fatal(error).with_stable_code(StableErrorCode::IoReadFailed))?;
 
-    let txn = db
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(&db)
         .await
         .map_err(|e| CliError::fatal(format!("Failed to begin transaction: {e}")))?;
 

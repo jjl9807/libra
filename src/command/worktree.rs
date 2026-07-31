@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::utils::fuse as fuse_utils;
 use crate::{
     command::restore::{self, RestoreArgs},
-    internal::{branch::Branch, head::Head},
+    internal::{branch::Branch, head::Head, sequencer::WorktreeControl},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -170,6 +170,23 @@ pub enum WorktreeSubcommand {
         /// nothing.
         #[clap(long, requires = "migrate_layout")]
         dry_run: bool,
+        /// Resolve an AMBIGUOUS registry by unregistering the entry at
+        /// `<path>` (W1 §C.7).
+        ///
+        /// `add A` → `move A B` → `add A` under an older binary leaves two
+        /// entries claiming one path-derived identity. Every mutation is
+        /// refused while that holds — including the remove that would fix it —
+        /// so this is the one action that runs against the ambiguous registry.
+        /// It DETACHES the named entry: the directory and its scoped rows are
+        /// kept, and every command inside that directory fails closed until
+        /// you re-add it or finish with `remove --delete-dir`. The surviving
+        /// claimant owns the identity again. Requires --yes, because choosing
+        /// which entry to detach is a judgement only the user can make.
+        #[clap(long, requires = "path", conflicts_with = "migrate_layout")]
+        resolve_identity: bool,
+        /// Confirm a --resolve-identity unregistration.
+        #[clap(long, requires = "resolve_identity")]
+        yes: bool,
     },
 }
 
@@ -198,6 +215,43 @@ pub(crate) struct WorktreeEntry {
     /// serde defaults it to `Active`.
     #[serde(default, skip_serializing_if = "WorktreeEntryState::is_active")]
     state: WorktreeEntryState,
+    /// Registration generation (W1 §C.4.1.1 service fence).
+    ///
+    /// Instance ids are PATH-DERIVED, so a worktree removed and re-added at
+    /// the same place has the same id and the same path as its predecessor —
+    /// which means neither can fence a request that was in flight across the
+    /// re-add. The epoch is bumped for every registration, so a client holding
+    /// the old one is refused instead of marking the successor's cache.
+    /// Absent in files written before this field existed; `0` then, which no
+    /// live registration uses.
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    epoch: u64,
+}
+
+fn is_zero_epoch(epoch: &u64) -> bool {
+    *epoch == 0
+}
+
+/// What this registry can say about linked-worktree HISTORY (W1 §C.4.3).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LinkedHistory {
+    /// No linked worktree has ever been registered — asserted only by a
+    /// registry this binary created and has maintained since.
+    #[default]
+    Never,
+    /// A linked worktree once existed.
+    Existed,
+    /// Unknowable: the registry was promoted from a pre-v3 shape, whose
+    /// removals left no trace. Treated as evidence by every ambiguous-sidecar
+    /// decision.
+    Unknown,
+}
+
+impl LinkedHistory {
+    fn is_never(&self) -> bool {
+        matches!(self, Self::Never)
+    }
 }
 
 /// Lifecycle state of a registry entry (W3-s1b, §C.7).
@@ -240,7 +294,16 @@ impl WorktreeEntryState {
 pub(crate) const DETACHED_MARKER: &str = "detached_from_registry";
 
 /// Registry schema version this binary reads and writes.
-const REGISTRY_SCHEMA_VERSION: u32 = 2;
+/// The on-disk `worktrees.json` schema.
+///
+/// v3 adds the durable registration-generation counter (`epoch_counter`) and
+/// each entry's `epoch` — the §C.4.1.1 service fence. Bumped rather than
+/// carried on `#[serde(default)]` alone: a v2-era binary would parse a v3 file,
+/// drop the counter on rewrite, and the next registration would reissue a
+/// generation a live client is still fenced on. Migration 2026073005 records
+/// the matching capability marker so those binaries refuse the repository at
+/// connect time instead.
+const REGISTRY_SCHEMA_VERSION: u32 = 3;
 
 /// Top-level registry v2 persisted in `worktrees.json` (plan-20260714 §C.7).
 ///
@@ -253,6 +316,21 @@ const REGISTRY_SCHEMA_VERSION: u32 = 2;
 pub(crate) struct WorktreeState {
     pub(crate) schema_version: u32,
     pub(crate) entries: Vec<WorktreeEntry>,
+    /// Whether a linked worktree has ever existed in this repository (W1
+    /// §C.4.3). `Never` is only ever written by a registry this binary
+    /// created; a promoted pre-v3 file records `Unknown`, because its history
+    /// cannot be reconstructed.
+    #[serde(default, skip_serializing_if = "LinkedHistory::is_never")]
+    pub(crate) linked_history: LinkedHistory,
+    /// The highest registration generation this registry has ever handed out
+    /// (W1 §C.4.1.1 service fence).
+    ///
+    /// Kept at the REGISTRY level, not derived from the entries, because the
+    /// case the fence exists for is a worktree that was REMOVED: its entry is
+    /// gone, so a maximum over the survivors would hand its generation out
+    /// again and a client fenced on it would be served.
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub(crate) epoch_counter: u64,
 }
 
 impl Default for WorktreeState {
@@ -260,6 +338,8 @@ impl Default for WorktreeState {
         Self {
             schema_version: REGISTRY_SCHEMA_VERSION,
             entries: Vec::new(),
+            linked_history: LinkedHistory::Never,
+            epoch_counter: 0,
         }
     }
 }
@@ -311,12 +391,28 @@ impl WorktreeState {
         if has_v2_keys {
             let state: WorktreeState = serde_json::from_value(document)
                 .map_err(|error| format!("registry v2 parse failed: {error}"))?;
-            if state.schema_version != REGISTRY_SCHEMA_VERSION {
+            // v2 files are READ as-is and upgraded in place by the mutation
+            // loader: their entries simply have no generations yet, which is
+            // what `epoch = 0` means. A version we do not know is refused.
+            if state.schema_version != REGISTRY_SCHEMA_VERSION && state.schema_version != 2 {
                 return Err(format!(
                     "unsupported registry schema_version {}",
                     state.schema_version
                 ));
             }
+            let mut state = state;
+            if state.schema_version != REGISTRY_SCHEMA_VERSION {
+                // Promoting a PRE-v3 registry: whether this repository ever had
+                // a linked worktree is unknowable from it — a worktree removed
+                // before v3 left no entry and no generation. Recording that
+                // explicitly is the difference between "never had one" and "we
+                // cannot tell", and the ambiguous-sidecar rules (§C.4.3) must
+                // treat the second as evidence. Without this, a repository
+                // whose only linked worktree was removed pre-v3 would
+                // auto-adopt and DELETE that worktree's old common state.
+                state.linked_history = LinkedHistory::Unknown;
+            }
+            state.schema_version = REGISTRY_SCHEMA_VERSION;
             return Ok((state, RegistryShape::V2));
         }
         if has_v1_keys {
@@ -335,8 +431,12 @@ impl WorktreeState {
                             lock_reason: entry.lock_reason,
                             worktree_id: None,
                             state: WorktreeEntryState::Active,
+                            epoch: 0,
                         })
                         .collect(),
+                    // A v1 file predates every generation too.
+                    linked_history: LinkedHistory::Unknown,
+                    epoch_counter: 0,
                 },
                 RegistryShape::V1,
             ));
@@ -429,6 +529,115 @@ impl WorktreeState {
     pub(crate) fn is_single_main(&self) -> bool {
         matches!(self.entries.as_slice(), [entry] if entry.is_main)
     }
+
+    /// Whether a linked worktree has EVER existed here (§C.4.3).
+    ///
+    /// The single answer behind every ambiguous-sidecar decision. A live linked
+    /// entry, a recorded history other than `never`, or a non-zero generation
+    /// counter all count — and so does the `Unknown` a pre-v3 registry is
+    /// promoted to on load, because a worktree removed before v3 left nothing
+    /// to read.
+    pub(crate) fn ever_had_linked_worktree(&self) -> bool {
+        self.entries.iter().any(|entry| !entry.is_main)
+            || !self.linked_history.is_never()
+            || self.epoch_counter > 0
+    }
+
+    /// Registry identity invariants beyond the per-entry shape: linked ids are
+    /// unique, and none of them is a reserved spelling.
+    ///
+    /// `main` is reserved because callers address the main worktree by name in
+    /// places where only a string can travel; a linked worktree literally
+    /// called `main` would let a corrupt registry redirect an explicit
+    /// main-scope request into it.
+    /// The generation to stamp on the next registration: one past every epoch
+    /// the registry has ever handed out, INCLUDING tombstoned and detached
+    /// entries, so a re-add at a freed path never reuses a live client's fence.
+    pub(crate) fn next_epoch(&mut self) -> u64 {
+        let issued = self
+            .entries
+            .iter()
+            .map(|entry| entry.epoch)
+            .max()
+            .unwrap_or(0)
+            .max(self.epoch_counter)
+            .saturating_add(1);
+        self.epoch_counter = issued;
+        issued
+    }
+
+    /// [`Self::identity_conflict`] extended with an id about to be ADDED.
+    pub(crate) fn identity_conflict_with(&self, candidate: &str) -> Option<String> {
+        if candidate == "main" {
+            return Some("a linked worktree may not use the reserved id 'main'".to_string());
+        }
+        if self
+            .entries
+            .iter()
+            .any(|entry| !entry.is_main && entry.worktree_id.as_deref() == Some(candidate))
+        {
+            return Some(format!(
+                "another registry entry already uses the id '{candidate}'"
+            ));
+        }
+        self.identity_conflict()
+    }
+
+    pub(crate) fn identity_conflict(&self) -> Option<String> {
+        let mut seen: Vec<&str> = Vec::new();
+        for entry in &self.entries {
+            if entry.is_main {
+                continue;
+            }
+            // Only a LIVE registration claims an identity. A detached or
+            // tombstoned entry keeps its id so its rows stay attributable and
+            // a re-add can identity-check against it, but it is not competing
+            // for the scope — which is what makes detaching one side the way
+            // out of a collision.
+            if !entry.state.is_active() {
+                continue;
+            }
+            let Some(id) = entry.worktree_id.as_deref() else {
+                continue;
+            };
+            if id == "main" {
+                return Some("a linked worktree may not use the reserved id 'main'".to_string());
+            }
+            if seen.contains(&id) {
+                return Some(format!("two linked worktrees share the id '{id}'"));
+            }
+            seen.push(id);
+        }
+        None
+    }
+}
+
+impl WorktreeEntry {
+    /// Whether this entry is the main worktree.
+    pub(crate) fn is_main(&self) -> bool {
+        self.is_main
+    }
+
+    /// The stable worktree identity (`None` for main, and for v1 entries that
+    /// predate the field).
+    pub(crate) fn worktree_id(&self) -> Option<&str> {
+        self.worktree_id.as_deref()
+    }
+
+    /// The path this entry is registered at.
+    pub(crate) fn registered_path(&self) -> &str {
+        &self.path
+    }
+
+    /// This registration's generation — see the field.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Whether this entry is a LIVE registration (not detached or tombstoned).
+    pub(crate) fn is_active(&self) -> bool {
+        self.state.is_active()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -483,6 +692,13 @@ pub(crate) struct WorktreeListEntry {
     /// Lifecycle state (W3-s1b): `active`, `detached_from_registry`, or
     /// `tombstone`.
     pub(crate) state: &'static str,
+    /// Registration generation (W1 §C.4.1.1 service fence). A client that
+    /// caches a worktree's identity must carry this too: ids and paths are
+    /// both reused when a worktree is re-added in place, and the epoch is what
+    /// tells the two registrations apart. `0` for main and for entries written
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub(crate) epoch: u64,
     /// On-disk layout (W3-s3 §C.6.1): `main`, `linked-v2`, `legacy-symlink`
     /// (a pre-isolation `.libra` symlink sharing main's HEAD/index),
     /// `missing`, `corrupt`, or `task-fuse` for FUSE task worktrees.
@@ -846,7 +1062,33 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             path,
             migrate_layout,
             dry_run,
+            resolve_identity,
+            yes,
         } => {
+            if resolve_identity {
+                let Some(path) = path else {
+                    return Err(WorktreeError::OperationBlocked(
+                        "--resolve-identity needs the path of the entry to unregister".to_string(),
+                    )
+                    .into_cli_error());
+                };
+                if !yes {
+                    return Err(WorktreeError::OperationBlocked(format!(
+                        "--resolve-identity detaches '{path}' from the registry — its files and \
+                         scoped state are kept, and every command inside it will fail closed \
+                         until you re-add it or run `remove --delete-dir`; re-run with --yes to \
+                         confirm"
+                    ))
+                    .into_cli_error());
+                }
+                let result = resolve_identity_collision(&path)
+                    .await
+                    .map_err(WorktreeError::into_cli_error)?;
+                if !output.is_json() {
+                    println!("{result}");
+                }
+                return Ok(());
+            }
             if migrate_layout {
                 let result = migrate_layout_run(path, dry_run)
                     .await
@@ -864,6 +1106,146 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             render_repair_worktrees(&result, output)
         }
     }
+}
+
+/// What main-scope layer/sparse state exists, for the doctor finding above.
+///
+/// `Ok(None)` means "nothing, and that is known". Every read failure — a
+/// missing table included — is an `Err`, and the caller reports it: §C.13
+/// requires doctor to be fail-closed, and a diagnostic that silently reports
+/// "nothing to see" because it could not look is worse than one that says so.
+async fn adopted_scope_settings_present() -> Result<Option<String>, String> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let count = async |sql: &str| -> Result<i64, String> {
+        db.query_one(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+            .await
+            .map_err(|error| format!("{error}"))?
+            .ok_or_else(|| "a COUNT query returned no row".to_string())?
+            .try_get_by_index::<i64>(0)
+            .map_err(|error| format!("{error}"))
+    };
+
+    let mut parts = Vec::new();
+    let layers = count("SELECT COUNT(*) FROM `layer` WHERE `worktree_id` = ''").await?;
+    if layers > 0 {
+        parts.push(format!("{layers} layer registration(s)"));
+    }
+    // The ownership rows matter more than the registrations: they are what keeps
+    // a retained overlay file unstageable.
+    let owned = count("SELECT COUNT(*) FROM `layer_path` WHERE `worktree_id` = ''").await?;
+    if owned > 0 {
+        parts.push(format!("{owned} materialized overlay path(s)"));
+    }
+    let patterns = count("SELECT COUNT(*) FROM `sparse_view` WHERE `worktree_id` = ''").await?;
+    if patterns > 0 {
+        parts.push(format!("{patterns} sparse pattern(s)"));
+    }
+    // A legacy `sparse.enabled = true` with NO patterns migrates into
+    // `sparse_view_meta`, so counting patterns alone would miss it.
+    let sparse_enabled = count(
+        "SELECT COUNT(*) FROM `sparse_view_meta` \
+         WHERE `worktree_id` = '' AND `enabled` <> 0",
+    )
+    .await?;
+    if sparse_enabled > 0 {
+        parts.push("an enabled sparse view".to_string());
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts.join(", ")))
+}
+
+/// Unregister one side of an identity collision so the registry becomes
+/// unambiguous again (W1 §C.7).
+///
+/// Runs against the AMBIGUOUS registry on purpose: `load_state` refuses it,
+/// which is what makes every other repair impossible, so this uses the repair
+/// loader and does its own narrow validation. The directory on disk is never
+/// touched — only the registry entry and that scope's rows go, so the user can
+/// re-add it afterwards and get a fresh identity and generation.
+async fn resolve_identity_collision(path: &str) -> WorktreeResult<String> {
+    let _lock = acquire_registry_lock()?;
+    let mut state = load_state_for_repair()?;
+    let target = resolve_path(path, "worktree path")?;
+    let target_key = target.to_string_lossy().to_string();
+
+    let Some(index) = state
+        .entries
+        .iter()
+        .position(|entry| !entry.is_main && entry.path == target_key)
+    else {
+        return Err(WorktreeError::NoSuchWorktree {
+            path: path.to_string(),
+        });
+    };
+    let Some(identity) = state.entries[index].worktree_id.clone() else {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "the entry at '{target_key}' carries no identity, so it is not part of a collision"
+        )));
+    };
+    let claimants = state
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.is_main
+                && entry.state.is_active()
+                && entry.worktree_id.as_deref() == Some(identity.as_str())
+        })
+        .count();
+    if claimants < 2 {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "'{target_key}' is the only live entry claiming identity '{identity}' — there is \
+             no collision to resolve here"
+        )));
+    }
+
+    // DETACH, do not delete. The directory on disk is a real worktree with the
+    // user's files in it: dropping the entry outright would leave a gitdir
+    // that still resolves the duplicated identity and could mutate the
+    // survivor's scope, and sweeping the identity-keyed rows would take the
+    // SURVIVOR's HEAD and reflog with them. Detaching is the lifecycle state
+    // that already means "unregistered, rows kept, every command in that
+    // directory fails closed until re-add or --delete-dir" — and a detached
+    // entry no longer claims the identity, so the collision is resolved.
+    //
+    // JOURNALLED first, exactly like every other lifecycle action: the marker
+    // and the registry are two writes that cannot be joined into one
+    // transaction, and a crash between them leaves a frozen directory that the
+    // registry still calls active. Reconciliation would then read the marker
+    // as stale and lift it, silently undoing the repair. The intent row is
+    // what makes `worktree repair` finish it instead.
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let payload = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "delete_dir": false,
+        "reason": "resolve_identity",
+    });
+    let journal_id = journal_append(
+        &db,
+        WorktreeControl::Remove.declare(),
+        Some(&identity),
+        &payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
+
+    write_detached_marker(&target, &identity)?;
+    state.entries[index].state = WorktreeEntryState::DetachedFromRegistry;
+    save_state(&state).map_err(|error| {
+        WorktreeError::IoWrite(format!("failed to write the worktree registry: {error}"))
+    })?;
+    if let Err(error) = journal_resolve(&db, journal_id).await {
+        tracing::warn!(error, "detach journal row not resolved; repair reconciles");
+    }
+    Ok(format!(
+        "Detached '{target_key}' from the registry (identity '{identity}'). Its files and \
+         scoped state are kept and every command inside it now fails closed; the remaining \
+         claimant owns the identity again. Finish with `libra worktree remove --delete-dir \
+         {target_key}`, or `libra worktree add {target_key}` to re-attach it."
+    ))
 }
 
 /// Returns the path to the on-disk worktree state file.
@@ -930,7 +1312,23 @@ pub(crate) fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
 /// `load_state_for_repair`). Lockless readers use `load_state_readonly`
 /// instead (a lockless writer could overwrite a concurrent locked mutation).
 fn load_state() -> WorktreeResult<WorktreeState> {
-    load_state_impl(false)
+    let state = load_state_impl(false)?;
+    // Cross-entry identity invariants are checked HERE rather than in the
+    // parser: a registry an older binary could produce (`add A` → `move A B`
+    // → `add A`, where move keeps A's path-derived id) has duplicate ids, and
+    // refusing it at parse time would take `worktree list` and `worktree
+    // doctor` down with every mutation — leaving the user no way to even see
+    // the problem. Reads load it and report; MUTATIONS refuse, because there
+    // is no fact of the matter about which worktree they would act on.
+    if let Some(conflict) = state.identity_conflict() {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "the worktree registry is ambiguous: {conflict}. Run `libra worktree doctor` to see \
+             which entries collide, then \
+             `libra worktree repair <path> --resolve-identity --yes` to unregister the one you \
+             do not want (the directory is left on disk)"
+        )));
+    }
+    Ok(state)
 }
 
 /// The no-arg `worktree repair` loader: like `load_state` but HEALS v2
@@ -1206,6 +1604,7 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
             lock_reason: None,
             worktree_id: None,
             state: WorktreeEntryState::Active,
+            epoch: 0,
         });
         return Ok(true);
     }
@@ -1247,6 +1646,7 @@ fn ensure_main_entry(state: &mut WorktreeState) -> io::Result<bool> {
             lock_reason: None,
             worktree_id: None,
             state: WorktreeEntryState::Active,
+            epoch: 0,
         });
         Ok(true)
     }
@@ -1485,6 +1885,24 @@ async fn add_worktree(
         AddCheckout::DetachedAtSource
     };
 
+    // §C.7 identity preflight, BEFORE the directory exists: instance ids are
+    // path-derived, so a collision means another entry already claims this
+    // identity. Persisting it would produce the registry state `validate_v2`
+    // refuses to load — locking the user out of every worktree command — and
+    // creating the directory first would leave an unregistered one behind on
+    // the refusal path.
+    {
+        let candidate = util::worktree_instance_id(
+            &std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone()),
+        );
+        if let Some(conflict) = state.identity_conflict_with(&candidate) {
+            return Err(WorktreeError::OperationBlocked(format!(
+                "cannot register worktree '{}': {conflict}",
+                target.display()
+            )));
+        }
+    }
+
     let mut created_target = false;
     if !target.exists() {
         fs::create_dir_all(&target).map_err(|source| {
@@ -1535,9 +1953,14 @@ async fn add_worktree(
             "start": start.to_string(),
         });
     }
-    let add_journal_id = journal_append(&db, "add", Some(&worktree_id), &add_payload)
-        .await
-        .map_err(WorktreeError::OperationBlocked)?;
+    let add_journal_id = journal_append(
+        &db,
+        WorktreeControl::Add.declare(),
+        Some(&worktree_id),
+        &add_payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
     create_worktree_gitdir(&storage, &link_path, &worktree_id).map_err(|source| {
         WorktreeError::IoWrite(format!(
             "failed to create per-worktree .libra gitdir in '{}': {source}",
@@ -1692,13 +2115,22 @@ async fn add_worktree(
             }
         };
         let created_branch = created_branch.clone();
-        // lore.md 2.1: cwd is now the new worktree, so `current_worktree_id()`
-        // resolves to its private id. Seed its OWN HEAD per the resolved
+        // §C.4.2: this block acts on ANOTHER worktree than the one the user
+        // invoked from, so it re-pins rather than inheriting the invoker's
+        // pin. Without this the pinned resolvers — `path::index()` above all
+        // — would seed the INVOKER's index from the new worktree's HEAD:
+        // main's staged state overwritten, and the new worktree left with an
+        // empty index in which every checked-out file reads as deleted.
+        let _scope = crate::internal::worktree_scope::WorktreeScope::override_scope(target.clone());
+        // lore.md 2.1: seed the NEW worktree's OWN HEAD per the resolved
         // checkout (detached commit, attached branch, or the just-created
         // `-b` branch), so `Head::current()` resolves here and the populate
         // below can read it. A seed-update failure rolls EVERYTHING back —
         // including a `-b` branch row.
         if let Err(e) = Head::update_result(seed_head, None).await {
+            // Both the scope and the cwd go back to the invoker BEFORE the
+            // rollbacks: those act on the invoking repository's rows.
+            drop(_scope);
             drop(_guard);
             rollback_partial_add();
             rollback_created_branch(created_branch).await;
@@ -1731,9 +2163,11 @@ async fn add_worktree(
         })
         .await
         {
-            // Restore the invoker's cwd BEFORE the rollbacks: deleting the
-            // target while it is the cwd would break the branch rollback's
-            // storage resolution (and strand the shell in a removed dir).
+            // Restore the invoker's scope and cwd BEFORE the rollbacks:
+            // deleting the target while it is the cwd would break the branch
+            // rollback's storage resolution (and strand the shell in a
+            // removed dir).
+            drop(_scope);
             drop(_guard);
             rollback_partial_add();
             rollback_created_branch(created_branch).await;
@@ -1744,6 +2178,11 @@ async fn add_worktree(
         }
     }
 
+    let registration_epoch = state.next_epoch();
+    // A linked worktree exists from here on, and that fact must OUTLIVE its
+    // entry: the ambiguous-sidecar rules ask "did one ever exist", and a later
+    // removal deletes the entry (§C.4.3).
+    state.linked_history = LinkedHistory::Existed;
     state.entries.push(WorktreeEntry {
         path: canonical_target.to_string_lossy().to_string(),
         is_main: false,
@@ -1754,6 +2193,9 @@ async fn add_worktree(
         // the registry.
         worktree_id: Some(worktree_id.clone()),
         state: WorktreeEntryState::Active,
+        // A fresh generation for every registration, so a client fenced on the
+        // previous one at this same path/id is refused rather than served.
+        epoch: registration_epoch,
     });
     if let Err(e) = write_state(&state) {
         rollback_partial_add();
@@ -1851,15 +2293,41 @@ async fn reattach_worktree(
         "path": target.to_string_lossy(),
         "reattach": true,
     });
-    let journal_id = journal_append(&db, "add", Some(&expected_id), &payload)
-        .await
-        .map_err(WorktreeError::OperationBlocked)?;
+    let journal_id = journal_append(
+        &db,
+        WorktreeControl::Add.declare(),
+        Some(&expected_id),
+        &payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
 
     // Publish Active FIRST, then lift the marker: a crash in between leaves
     // an Active entry whose gitdir still carries the marker — repair's
     // reconcile pass removes a stale marker whose entry is Active with a
     // matching id (and the pending journal row rolls the re-attach
     // forward). The reverse order would leave an UNFROZEN detached entry.
+    // §C.7 identity check immediately before ACTIVATION. Re-attaching is the
+    // one path that turns a dormant claim on an identity back into a live one,
+    // so it is where a former collision can be recreated: detach one side,
+    // re-add both directories, and without this the second activation restores
+    // two active entries at one identity — poisoning every later registry
+    // load, including the doctor that would explain it.
+    if let Some(identity) = state.entries[index].worktree_id.clone()
+        && state.entries.iter().enumerate().any(|(other, entry)| {
+            other != index
+                && !entry.is_main
+                && entry.state.is_active()
+                && entry.worktree_id.as_deref() == Some(identity.as_str())
+        })
+    {
+        return Err(WorktreeError::OperationBlocked(format!(
+            "cannot re-attach '{}': identity '{identity}' is already claimed by another ACTIVE \
+             worktree. Run `libra worktree doctor`, then \
+             `libra worktree repair <path> --resolve-identity --yes` on the one you do not want",
+            state.entries[index].path
+        )));
+    }
     state.entries[index].state = WorktreeEntryState::Active;
     write_state(state)?;
     let marker = gitdir.join(DETACHED_MARKER);
@@ -2278,6 +2746,7 @@ pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
                 worktree_id,
                 state: w.state.as_str(),
                 layout,
+                epoch: w.epoch,
                 path: w.path,
                 is_main: w.is_main,
                 locked: w.locked,
@@ -2422,6 +2891,20 @@ pub(crate) async fn format_worktree_porcelain(
 /// do not yet understand — which is exactly when you reach for it.
 pub(crate) async fn run_worktree_doctor(output: &OutputConfig) -> CliResult<()> {
     let listed = run_list_worktrees().map_err(WorktreeError::into_cli_error)?;
+    // Which identities are claimed by more than one entry, and by which paths.
+    let mut duplicate_identity_paths: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for entry in &listed.worktrees {
+        if entry.is_main {
+            continue;
+        }
+        if let Some(id) = entry.worktree_id.as_deref() {
+            duplicate_identity_paths
+                .entry(id.to_string())
+                .or_default()
+                .push(entry.path.clone());
+        }
+    }
     let mut diagnostics = Vec::with_capacity(listed.worktrees.len());
     for entry in listed.worktrees {
         // Compare the worktree's OWN on-disk identity against the registry —
@@ -2477,6 +2960,56 @@ pub(crate) async fn run_worktree_doctor(output: &OutputConfig) -> CliResult<()> 
                 "a removal did not finish cleaning up; `libra worktree repair` retries it."
                     .to_string(),
             );
+        }
+        // §C.4.3: layer/sparse settings whose provenance cannot be established.
+        //
+        // The scope migrations attributed pre-existing repository-global rows to
+        // MAIN. That is right when main was always the only worktree, and
+        // unprovable once a linked worktree existed and was removed before the
+        // migration — its entry, and its HEAD row, are gone. Adoption is not
+        // destructive (the overlay files stay on disk and their ownership rows
+        // keep them unstageable), so this is REPORTED rather than blocked: the
+        // user is the only one who knows whether these settings are theirs, and
+        // `layer remove` / `sparse-view clear` are the ordinary way to drop them.
+        if entry.is_main && crate::command::maintenance::repository_had_linked_worktrees() {
+            match adopted_scope_settings_present().await {
+                Ok(Some(kinds)) => findings.push(format!(
+                    "this worktree holds {kinds} that may have been adopted from a linked \
+                     worktree removed before the scope migration — their provenance cannot be \
+                     established (§C.4.3). Review them with `libra layer list` / \
+                     `libra sparse-view list`; `libra layer remove <name>` and \
+                     `libra sparse-view clear` drop the ones that are not yours. No file in the \
+                     working tree is affected either way."
+                )),
+                Ok(None) => {}
+                // Fail closed (§C.13): a diagnostic that could not look must say
+                // so, not report "nothing to see".
+                Err(error) => findings.push(format!(
+                    "this repository has linked-worktree history, and whether it holds \
+                     layer/sparse settings of unknown provenance COULD NOT BE DETERMINED: \
+                     {error}. Treat the answer as unknown until the repository database is \
+                     readable."
+                )),
+            }
+        }
+        // A registry an older binary could produce: `add A` → `move A B` →
+        // `add A` keeps A's path-derived id on the moved entry, so two entries
+        // claim one identity. Every MUTATION is refused while that holds, so
+        // doctor has to be the place it becomes visible — and has to name both
+        // paths, because the fix is choosing which one to keep.
+        if let Some(id) = entry.worktree_id.as_deref()
+            && !entry.is_main
+            && let Some(other) = duplicate_identity_paths.get(id)
+            && other.len() > 1
+        {
+            findings.push(format!(
+                "this identity ('{id}') is claimed by {} entries ({}); every worktree MUTATION \
+                 is refused until one is unregistered — \
+                 `libra worktree repair <path> --resolve-identity --yes` on the one you do not \
+                 want. Ordinary remove cannot do it: it needs the same loader that is refusing.",
+                other.len(),
+                other.join(", ")
+            ));
         }
         diagnostics.push(WorktreeDiagnostic {
             worktree_id: entry.worktree_id,
@@ -2731,9 +3264,14 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
         "dest": dest_path.to_string_lossy(),
     });
     let db = crate::internal::db::get_db_conn_instance().await;
-    let journal_id = journal_append(&db, "move", journal_worktree_id.as_deref(), &payload)
-        .await
-        .map_err(WorktreeError::OperationBlocked)?;
+    let journal_id = journal_append(
+        &db,
+        WorktreeControl::Move.declare(),
+        journal_worktree_id.as_deref(),
+        &payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
 
     let old_path = state.entries[index].path.clone();
     state.entries[index].path = dest_path.to_string_lossy().to_string();
@@ -2834,7 +3372,7 @@ async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
             let payload = serde_json::json!({
                 "paths": eligible.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
             });
-            let journal_id = journal_append(&db, "prune", None, &payload)
+            let journal_id = journal_append(&db, WorktreeControl::Prune.declare(), None, &payload)
                 .await
                 .map_err(WorktreeError::OperationBlocked)?;
             let mut mirror_failed = false;
@@ -3054,9 +3592,14 @@ async fn remove_worktree_detach(
         "path": target.to_string_lossy(),
         "delete_dir": false,
     });
-    let journal_id = journal_append(db, "remove", Some(&worktree_id), &payload)
-        .await
-        .map_err(WorktreeError::OperationBlocked)?;
+    let journal_id = journal_append(
+        db,
+        WorktreeControl::Remove.declare(),
+        Some(&worktree_id),
+        &payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
 
     // Recovery-ordered: lifecycle mirror → registry state → journal → the
     // gitdir marker LAST. The marker fail-closes every storage resolution
@@ -3112,9 +3655,14 @@ async fn remove_worktree_delete_dir(
         "path": target.to_string_lossy(),
         "delete_dir": true,
     });
-    let journal_id = journal_append(db, "remove", worktree_id.as_deref(), &payload)
-        .await
-        .map_err(WorktreeError::OperationBlocked)?;
+    let journal_id = journal_append(
+        db,
+        WorktreeControl::Remove.declare(),
+        worktree_id.as_deref(),
+        &payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
 
     // A DETACHED worktree's marker fail-closes the in-worktree dirty check;
     // lift it for the check and restore it on refusal. Under the registry
@@ -3453,9 +4001,14 @@ async fn migrate_one_worktree(
         "path": target.to_string_lossy(),
         "head": head_commit.to_string(),
     });
-    let journal_id = journal_append(db, "migrate", Some(&worktree_id), &payload)
-        .await
-        .map_err(WorktreeError::OperationBlocked)?;
+    let journal_id = journal_append(
+        db,
+        WorktreeControl::MigrateLayout.declare(),
+        Some(&worktree_id),
+        &payload,
+    )
+    .await
+    .map_err(WorktreeError::OperationBlocked)?;
     let set_stage = |stage: &'static str| {
         let db = db.clone();
         async move {
@@ -3611,6 +4164,11 @@ async fn seed_migrated_worktree(
 ) -> WorktreeResult<()> {
     let _guard = DirGuard::change_to(target)
         .map_err(|e| WorktreeError::IoRead(format!("cannot enter '{}': {e}", target.display())))?;
+    // §C.4.2: the private index this builds belongs to `target`, not to the
+    // worktree the invocation pinned — re-pin so `path::index()` writes it
+    // there instead of rebuilding the invoker's index from `target`'s HEAD.
+    let _scope =
+        crate::internal::worktree_scope::WorktreeScope::override_scope(target.to_path_buf());
     Head::update_result(Head::Detached(head_commit), None)
         .await
         .map_err(|e| {
@@ -3806,6 +4364,12 @@ async fn worktree_is_dirty(target: &Path) -> WorktreeResult<bool> {
     let _guard = DirGuard::change_to(target).map_err(|e| {
         WorktreeError::IoRead(format!("cannot enter worktree '{}': {e}", target.display()))
     })?;
+    // §C.4.2: this gate decides whether a DESTRUCTIVE delete may proceed, and
+    // it must judge `target`'s own index. Inheriting the invoker's pin would
+    // compare `target`'s files against ANOTHER worktree's staged state — a
+    // clean invoker would then read a dirty target as clean and delete it.
+    let _scope =
+        crate::internal::worktree_scope::WorktreeScope::override_scope(target.to_path_buf());
     // W1 §C.4.1.1: applied layer overlays are excluded from status by
     // design, so they alone are not "uncommitted changes". This is a
     // DESTRUCTIVE gate (`remove_dir_all` follows), so it must NOT consult
@@ -3977,7 +4541,7 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
         find_entry(&state, &target).ok_or(WorktreeError::NoSuchWorktree { path: path.clone() })?;
     if entry.is_main {
         return Err(WorktreeError::MainWorktree {
-            action: "repair",
+            action: WorktreeControl::Repair.declare(),
             path: target.to_string_lossy().to_string(),
         });
     }
@@ -4055,6 +4619,11 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    // §C.9: declare before the first possible write. `repair` writes identity
+    // FILES rather than a journal row (there is no crash window a journal
+    // could roll forward — each write is a single atomic rename), so the
+    // declaration is asserted here rather than at an append site.
+    let _declared = WorktreeControl::Repair.declare();
     let worktree_id_restored = current_id.as_deref() != Some(stable_id.as_str());
     if worktree_id_restored {
         crate::utils::atomic_write::write_atomic(
@@ -5318,9 +5887,37 @@ mod tests {
 
     #[test]
     fn registry_parse_refuses_future_schema_version() {
-        let data = br#"{"schema_version": 3, "entries": []}"#;
+        // 3 is CURRENT since the service-fence generations (migration
+        // 2026073005); 4 is the future one. A version this binary does not know
+        // is refused rather than reinterpreted — the whole point of the field.
+        let data = br#"{"schema_version": 4, "entries": []}"#;
         let err = WorktreeState::parse(data).expect_err("future version fails closed");
-        assert!(err.contains("schema_version 3"), "{err}");
+        assert!(err.contains("schema_version 4"), "{err}");
+
+        // The refusal is about the VERSION, not the shape: the same document
+        // at the current version gets past it and fails on the main-entry
+        // invariant instead.
+        let current = br#"{"schema_version": 3, "entries": []}"#;
+        let err = WorktreeState::parse(current).expect_err("no main entry");
+        assert!(
+            !err.contains("schema_version"),
+            "the current version is not refused for its version: {err}"
+        );
+
+        // v2 is still READ and promoted in memory — its entries simply carry
+        // no service-fence generations yet.
+        let v2 = br#"{"schema_version": 2, "entries":
+            [{"path": "/w", "is_main": true, "locked": false}]}"#;
+        let parsed = WorktreeState::parse(v2).expect("a v2 registry is read");
+        assert_eq!(
+            parsed.schema_version, REGISTRY_SCHEMA_VERSION,
+            "and is promoted to the current version in memory"
+        );
+        assert_eq!(
+            parsed.linked_history,
+            LinkedHistory::Unknown,
+            "a pre-v3 registry cannot say its history was `never` (§C.4.3)"
+        );
     }
 
     /// The second belt (§C.7): a v1 binary's `{ worktrees: [...] }` parser
@@ -5329,8 +5926,11 @@ mod tests {
     #[test]
     fn v1_parser_fails_on_v2_bytes() {
         let v2 = serde_json::to_vec(&WorktreeState {
+            epoch_counter: 0,
+            linked_history: LinkedHistory::Never,
             schema_version: REGISTRY_SCHEMA_VERSION,
             entries: vec![WorktreeEntry {
+                epoch: 0,
                 path: "/w".to_string(),
                 is_main: false,
                 locked: false,

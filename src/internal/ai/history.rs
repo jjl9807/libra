@@ -1517,9 +1517,7 @@ impl HistoryManager {
                 bail!("checkpoint append exceeded the historical import execution deadline");
             }
             let result: Result<()> = async {
-                let txn = self
-                    .db_conn
-                    .begin()
+                let txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
                     .await
                     .context("begin checkpoint object ownership update")?;
                 let entry = crate::internal::metadata::MetadataKv::get_with_conn(
@@ -1608,9 +1606,7 @@ impl HistoryManager {
                 bail!("checkpoint append exceeded the historical import execution deadline");
             }
             let result: Result<()> = async {
-                let txn = self
-                    .db_conn
-                    .begin()
+                let txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
                     .await
                     .context("begin checkpoint object ownership finalization")?;
                 let entry = crate::internal::metadata::MetadataKv::get_with_conn(
@@ -1936,17 +1932,18 @@ impl HistoryManager {
 
     async fn update_ref(&self, ref_name: &str, hash: ObjectHash) -> Result<()> {
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            let txn: DatabaseTransaction = match self.db_conn.begin().await {
-                Ok(txn) => txn,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to begin transaction"),
-            };
+            let txn: DatabaseTransaction =
+                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                    Ok(txn) => txn,
+                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                        sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => return Err(err).context("Failed to begin transaction"),
+                };
 
             let existing = match reference::Entity::find()
                 .filter(reference::Column::Name.eq(ref_name))
@@ -2050,17 +2047,18 @@ impl HistoryManager {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 bail!("checkpoint append exceeded the historical import execution deadline");
             }
-            let txn: DatabaseTransaction = match self.db_conn.begin().await {
-                Ok(txn) => txn,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => return Err(err).context("Failed to begin transaction"),
-            };
+            let txn: DatabaseTransaction =
+                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                    Ok(txn) => txn,
+                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                        sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => return Err(err).context("Failed to begin transaction"),
+                };
 
             // An expired ordinary marker may have been fenced and retired by
             // crash recovery while this writer was stalled. The marker check
@@ -2995,9 +2993,7 @@ impl HistoryManager {
         // append to its caller. This happens before any optional background
         // queue wait, so a timeout can never erase the only durable record of
         // newly-created object ownership.
-        let txn = self
-            .db_conn
-            .begin()
+        let txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
             .await
             .context("begin rejected checkpoint cleanup registration")?;
         let existing = crate::internal::metadata::MetadataKv::get_with_conn(
@@ -4029,19 +4025,20 @@ impl HistoryManager {
             })?;
 
         'retry_sqlite: for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-            let txn: DatabaseTransaction = match self.db_conn.begin().await {
-                Ok(txn) => txn,
-                Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
-                    sleep(Duration::from_millis(
-                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    continue;
-                }
-                Err(err) => {
-                    return Err(err).context("Failed to begin checkpoint prune transaction");
-                }
-            };
+            let txn: DatabaseTransaction =
+                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                    Ok(txn) => txn,
+                    Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                        sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).context("Failed to begin checkpoint prune transaction");
+                    }
+                };
 
             let existing = match reference::Entity::find()
                 .filter(reference::Column::Name.eq(&self.ref_name))
@@ -5426,8 +5423,7 @@ pub async fn register_traces_write_attempt(
     marker: &TracesInflightMarker,
     coverage_fences: &[TracesCoverageFence<'_>],
 ) -> Result<()> {
-    let txn = conn
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin traces writer-attempt registration")?;
     let writable = txn
@@ -6610,6 +6606,17 @@ mod tests {
         let schema = Schema::new(builder);
         let stmt = schema.create_table_from_entity(reference::Entity);
         db.execute(builder.build(&stmt)).await.unwrap();
+        // Present in every real repository (bootstrap schema). The write-lock
+        // primitive in `db::begin_write_transaction` issues a no-op write
+        // against it, so a fixture without it is not a repository database.
+        db.execute(Statement::from_string(
+            builder,
+            "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,\
+             value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0)"
+                .to_string(),
+        ))
+        .await
+        .unwrap();
         db
     }
 

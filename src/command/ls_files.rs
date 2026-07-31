@@ -145,7 +145,7 @@ pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
     let output = OutputConfig::default();
     // W1 §C.4.1.1: the sparse view is per-worktree — filter with THIS
     // worktree's view.
-    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     let view = crate::internal::sparse::SparseView::load(&scope).await;
     let result = run_ls_files(&args, &view)?;
     render_output(&result, &args, &output)?;
@@ -153,7 +153,7 @@ pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
 }
 
 pub async fn execute_safe(args: LsFilesArgs, output: &OutputConfig) -> CliResult<()> {
-    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     let view = crate::internal::sparse::SparseView::load(&scope).await;
     let result = run_ls_files(&args, &view)?;
     render_output(&result, &args, output)?;

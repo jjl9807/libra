@@ -4899,9 +4899,13 @@ async fn restore_agent_capture_from_rows_with_subagents(
         claim_rows,
         "restored remote",
     )?;
-    let txn = db_conn.begin().await.map_err(|error| {
-        CloudError::Generic(format!("begin atomic agent capture restore: {error}"))
-    })?;
+    // Reads the existing refs/rows before rewriting them (`restore fenced
+    // traces ref` below), so the write lock is taken up front.
+    let txn = crate::internal::db::begin_write_transaction(db_conn)
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!("begin atomic agent capture restore: {error}"))
+        })?;
     let backend = txn.get_database_backend();
 
     // An ordinary retention prune is a durable local deletion intent. The

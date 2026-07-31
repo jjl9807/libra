@@ -1620,9 +1620,13 @@ impl WorkspaceStore {
         // the transaction read-then-write, which two concurrent acquirers
         // cannot resolve without one of them hitting SQLITE_BUSY.
         let identity = RepoIdentity::resolve(conn).await?;
-        let txn = conn.begin().await.map_err(|error| {
-            WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
-        })?;
+        // Reads the existing lease before writing one, so the write lock is
+        // taken up front (`db::begin_write_transaction`).
+        let txn = crate::internal::db::begin_write_transaction(conn)
+            .await
+            .map_err(|error| {
+                WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
+            })?;
         let lease = match Self::acquire_with_conn(&txn, &identity, request, now_ms).await {
             Ok(lease) => lease,
             Err(error) => return Err(rollback_after(txn, error).await),
@@ -1642,9 +1646,13 @@ impl WorkspaceStore {
         now_ms: i64,
     ) -> WorkspaceResult<WorkspaceLease> {
         let identity = RepoIdentity::resolve(conn).await?;
-        let txn = conn.begin().await.map_err(|error| {
-            WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
-        })?;
+        // Reads the existing lease before writing one, so the write lock is
+        // taken up front (`db::begin_write_transaction`).
+        let txn = crate::internal::db::begin_write_transaction(conn)
+            .await
+            .map_err(|error| {
+                WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
+            })?;
         let lease = match Self::reclaim_expired_with_conn(
             &txn,
             &identity,

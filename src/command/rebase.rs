@@ -19,8 +19,7 @@ use git_internal::{
     },
 };
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement,
-    TransactionTrait, Value,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement, Value,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +29,6 @@ use crate::{
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
         branch::Branch,
-        db::get_db_conn_instance,
         head::Head,
         model::{reference as ref_model, reflog as reflog_model},
         reflog,
@@ -120,7 +118,7 @@ impl RebaseAuxState {
     /// worktree's local gitdir. For the main worktree the local gitdir IS the
     /// common `.libra`, so main-worktree paths are unchanged.
     fn path() -> PathBuf {
-        util::worktree_gitdir().join("rebase-aux.json")
+        util::request_worktree_gitdir_strict().join("rebase-aux.json")
     }
 
     fn load_optional() -> Result<Option<Self>, RebaseError> {
@@ -199,61 +197,176 @@ pub(crate) fn held_autostash_oid_in_gitdir(
 
 impl RebaseState {
     /// Get the path to the legacy rebase-merge directory
-    fn legacy_rebase_dir() -> PathBuf {
-        util::storage_path().join("rebase-merge")
+    /// The legacy common-storage rebase directory Git writes as `rebase-merge`
+    /// (interactive) or `rebase-apply` (am-based). Both are recognized: §C.4.3
+    /// names both, and recognizing only one meant `--continue`/`--abort`
+    /// reported "no rebase" while the sequencer's broader probe still blocked a
+    /// new start — the worst of both answers.
+    const LEGACY_REBASE_DIRS: [&'static str; 2] = ["rebase-merge", "rebase-apply"];
+
+    /// The legacy directory that EXISTS, if any (checked in the order above,
+    /// so `rebase-merge` wins when a repository somehow has both).
+    fn legacy_rebase_dir_present() -> Option<PathBuf> {
+        let storage = util::request_storage_path();
+        Self::LEGACY_REBASE_DIRS
+            .iter()
+            .map(|name| storage.join(name))
+            .find(|path| path.exists())
     }
 
-    /// Check if a rebase is in progress
+    fn legacy_rebase_dir() -> PathBuf {
+        Self::legacy_rebase_dir_present()
+            .unwrap_or_else(|| util::request_storage_path().join(Self::LEGACY_REBASE_DIRS[0]))
+    }
+
+    /// Check if a rebase is in progress.
+    ///
+    /// A READ, and reads never consume legacy state (§C.4.2 / ADR-0714-08):
+    /// the presence of a legacy `rebase-merge/` directory is REPORTED, not
+    /// adopted. `libra status` asking whether a rebase is in progress must not
+    /// be the thing that migrates and deletes crash-recovery state whose owner
+    /// it has not established.
     pub async fn is_in_progress() -> Result<bool, String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_rebase_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         if Self::has_state_in_db(&db).await? {
             return Ok(true);
         }
+        Self::legacy_state_is_adoptable()
+    }
 
-        if Self::legacy_rebase_dir().exists() {
-            return Self::migrate_legacy_state(&db)
-                .await
-                .map(|state| state.is_some());
+    /// Whether a legacy directory exists that THIS worktree could adopt.
+    ///
+    /// Read-only. Refuses (as an error) when the owner is ambiguous, so a
+    /// caller reports the situation instead of guessing — and returns `false`
+    /// for a linked worktree, because a common-storage directory is not its
+    /// rebase.
+    fn legacy_state_is_adoptable() -> Result<bool, String> {
+        let Some(legacy_dir) = Self::legacy_rebase_dir_present() else {
+            return Ok(false);
+        };
+        if crate::internal::worktree_scope::WorktreeScope::for_request().is_linked() {
+            return Ok(false);
         }
-        Ok(false)
+        // EVER registered, not merely currently registered (§C.4.3): a linked
+        // worktree that has since been removed leaves no entry, and this
+        // directory could have been its rebase.
+        if crate::command::maintenance::repository_had_linked_worktrees() {
+            return Err(Self::ambiguous_legacy_message(&legacy_dir));
+        }
+        Ok(true)
     }
 
-    /// Save rebase state to the database
+    fn ambiguous_legacy_message(legacy_dir: &Path) -> String {
+        format!(
+            "a legacy rebase state directory exists at '{}' but linked worktrees are \
+             registered, so its owner is ambiguous and it will not be adopted automatically; \
+             finish or abort that legacy rebase, or remove the directory manually once you \
+             have confirmed it is stale",
+            legacy_dir.display()
+        )
+    }
+
+    /// Save rebase state to the database.
+    ///
+    /// One TRANSACTION around the scoped delete and the insert: a failure
+    /// between them would leave this worktree with no rebase state at all —
+    /// and callers have already moved HEAD by then, so the user would be
+    /// mid-rebase with nothing to continue or abort.
     pub async fn save(&self) -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_rebase_state_table_exists(&db).await?;
-        Self::save_with_conn(&db, self).await
+        use sea_orm::TransactionTrait;
+
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        let txn = db
+            .begin()
+            .await
+            .map_err(|error| format!("failed to begin the rebase_state transaction: {error}"))?;
+        Self::save_with_conn(&txn, self).await?;
+        txn.commit()
+            .await
+            .map_err(|error| format!("failed to commit the rebase_state transaction: {error}"))
     }
 
-    /// Load rebase state from the database (migrates legacy files if present)
+    /// The FIRST write of a starting rebase, as an atomic claim (§C.4.4).
+    ///
+    /// [`Self::save`] is a scoped DELETE + INSERT — correct for an owner
+    /// advancing its own rebase, wrong for a start: two starts racing in one
+    /// worktree both pass the mutex check (nothing is in progress yet) and the
+    /// loser's replace erases the winner's todo while the winner's checkout
+    /// stays on disk. A bare INSERT against `worktree_id PRIMARY KEY` lets
+    /// exactly one starter win.
+    pub async fn claim_start(&self) -> Result<(), String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        match Self::insert_with_conn(&db, self).await {
+            Ok(()) => Ok(()),
+            Err(err) if crate::internal::sequencer::is_unique_violation_text(&err) => {
+                Err("a rebase is already in progress in this worktree".to_string())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Load rebase state.
+    ///
+    /// Reads the scoped row, then — for the main worktree with no ambiguity —
+    /// READS a legacy directory without adopting it: no DB row is written and
+    /// nothing is deleted (§C.4.2 / ADR-0714-08). Adoption is an explicit act,
+    /// performed by a control action through [`Self::adopt_legacy_state`].
     pub async fn load() -> Result<Self, String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_rebase_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         if let Some(state) = Self::load_from_db(&db).await? {
             return Ok(state);
         }
-
-        if let Some(state) = Self::migrate_legacy_state(&db).await? {
-            return Ok(state);
+        if Self::legacy_state_is_adoptable()? {
+            return Self::load_from_legacy_dir();
         }
-
         Err("No rebase in progress".to_string())
+    }
+
+    /// EXPLICITLY adopt a legacy directory into this worktree's scoped row.
+    ///
+    /// Called only from a control action (`--continue` / `--skip` / `--abort`),
+    /// where the user has said "act on this rebase" — never from a read. The
+    /// same ambiguity rule applies: a linked worktree never adopts, and the
+    /// main worktree refuses while linked worktrees are registered.
+    pub(crate) async fn adopt_legacy_state() -> Result<Option<Self>, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        Self::migrate_legacy_state(&db).await
     }
 
     /// Remove the rebase state from the database (and any legacy state on disk)
     pub async fn cleanup() -> Result<(), String> {
-        let db = get_db_conn_instance().await;
-        Self::ensure_rebase_state_table_exists(&db).await?;
+        let db = crate::internal::sequencer::request_db_checked().await?;
         Self::clear_state_in_db(&db).await?;
 
-        // The COMMON legacy dir is main-owned (see `migrate_legacy_state`):
-        // a linked worktree's cleanup clears only its own DB row above and
-        // must not delete another worktree's crash-recovery directory.
-        if !crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
+        // The COMMON legacy dir has no owner metadata, and the SAME
+        // ambiguity rule that governs adopting it governs deleting it
+        // (§C.4.2 / ADR-0714-08). A linked worktree's cleanup clears only its
+        // own DB row above; and the main worktree may delete the directory
+        // only when it is the unambiguous owner — with linked worktrees
+        // registered, `migrate_legacy_state` refuses to ADOPT it precisely
+        // because it might be theirs, so `--abort` must not destroy it
+        // either. It is left for `worktree doctor` / an explicit removal.
+        let scope_is_linked =
+            crate::internal::worktree_scope::WorktreeScope::for_request().is_linked();
+        if !scope_is_linked && Self::legacy_rebase_dir_present().is_some() {
+            // Destructive, so the same lock and the same DURABLE evidence as
+            // adoption: `repository_has_linked_worktrees` (registered NOW) is
+            // not enough — a linked worktree removed earlier leaves no entry,
+            // and this directory could have been its rebase (§C.4.3).
+            let _registry = crate::command::worktree::acquire_registry_lock()
+                .map_err(|error| format!("cannot take the worktree registry lock: {error}"))?;
             let legacy_dir = Self::legacy_rebase_dir();
             if legacy_dir.exists() {
-                fs::remove_dir_all(&legacy_dir).map_err(|e| e.to_string())?;
+                if crate::command::maintenance::repository_had_linked_worktrees() {
+                    emit_warning(format!(
+                        "a legacy rebase state directory remains at '{}': linked worktrees are \
+                         registered, so its owner is ambiguous and it was NOT removed. Remove it \
+                         manually once you have confirmed it is stale.",
+                        legacy_dir.display()
+                    ));
+                } else {
+                    fs::remove_dir_all(&legacy_dir).map_err(|e| e.to_string())?;
+                }
             }
         }
         Ok(())
@@ -264,44 +377,18 @@ impl RebaseState {
     /// the `worktree_id TEXT NOT NULL` storage convention shared with
     /// `sequence_state`/`bisect_state`.
     fn scope_key() -> String {
-        crate::internal::worktree_scope::WorktreeScope::current()
+        crate::internal::worktree_scope::WorktreeScope::for_request()
             .storage_key()
             .to_string()
     }
 
-    /// Ensure `rebase_state` exists in its migrated per-worktree shape.
-    ///
-    /// The schema is owned by migration `2026072101_rebase_state_worktree_scope`
-    /// (which retired the historical lazy ADD-COLUMN DDL); production
-    /// connections have always run it by the time rebase code executes. This
-    /// idempotent CREATE covers only bare test databases that skip the
-    /// migration runner.
-    async fn ensure_rebase_state_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let create_table_stmt = Statement::from_string(
-            DbBackend::Sqlite,
-            r#"
-                CREATE TABLE IF NOT EXISTS `rebase_state` (
-                    `worktree_id`  TEXT PRIMARY KEY NOT NULL,
-                    `head_name`    TEXT NOT NULL,
-                    `onto`         TEXT NOT NULL,
-                    `orig_head`    TEXT NOT NULL,
-                    `current_head` TEXT NOT NULL,
-                    `todo`         TEXT NOT NULL,
-                    `todo_actions` TEXT NOT NULL DEFAULT '',
-                    `done`         TEXT NOT NULL,
-                    `stopped_sha`  TEXT,
-                    `autosquash`   INTEGER NOT NULL DEFAULT 0,
-                    `empty_mode`   TEXT NOT NULL DEFAULT 'keep'
-                );
-            "#
-            .to_string(),
-        );
-
-        db.execute(create_table_stmt)
-            .await
-            .map_err(|e| format!("failed to create rebase_state table: {e}"))?;
-        Ok(())
-    }
+    // W1, §C.11 "clear the lazy DDL": `rebase_state` is created by migration
+    // `2026072101_rebase_state_worktree_scope`, which every connection open
+    // applies before any command runs, so nothing here creates it. The read
+    // path used to `CREATE TABLE IF NOT EXISTS` on every call — DDL on a
+    // READ, taking SQLite's schema lock, and quietly papering over a database
+    // that never got migrated. A missing table now surfaces as the storage
+    // error it is.
 
     async fn has_state_in_db<C: ConnectionTrait>(db: &C) -> Result<bool, String> {
         let stmt = Statement::from_sql_and_values(
@@ -413,7 +500,15 @@ impl RebaseState {
         db.execute(delete_stmt)
             .await
             .map_err(|e| format!("failed to clear existing rebase_state: {e}"))?;
+        Self::insert_with_conn(db, state).await
+    }
 
+    /// The INSERT half of [`Self::save_with_conn`], without the scoped delete
+    /// — so a STARTING rebase can claim the slot instead of replacing it.
+    async fn insert_with_conn<C: ConnectionTrait>(
+        db: &C,
+        state: &RebaseState,
+    ) -> Result<(), String> {
         let todo = Self::format_hash_list(state.todo.iter().cloned());
         let todo_actions = if state.todo_actions.len() == state.todo.len() {
             Self::format_action_list(state.todo_actions.iter().copied())
@@ -476,10 +571,20 @@ impl RebaseState {
     }
 
     async fn migrate_legacy_state<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {
-        let legacy_dir = Self::legacy_rebase_dir();
-        if !legacy_dir.exists() {
+        if Self::legacy_rebase_dir_present().is_none() {
             return Ok(None);
         }
+        // The REGISTRY LOCK wraps the whole decision: a concurrent `worktree
+        // add` between the ambiguity check and the unlink would make this
+        // directory ambiguous after we had already decided it was not. Taken
+        // before the checks, and every check re-run inside it — the probe above
+        // is only a cheap early exit.
+        let _registry = crate::command::worktree::acquire_registry_lock()
+            .map_err(|error| format!("cannot take the worktree registry lock: {error}"))?;
+        let Some(legacy_dir) = Self::legacy_rebase_dir_present() else {
+            // Another process adopted it while we waited for the lock.
+            return Ok(None);
+        };
 
         // Part C W1 (§C.4.2 ambiguous-common-sidecar rule): the legacy
         // `rebase-merge/` directory lives in COMMON storage with no owner
@@ -489,17 +594,11 @@ impl RebaseState {
         // consume it while linked worktrees are registered: with more than
         // one candidate owner, adopting-and-destroying here could wipe
         // another worktree's crash-recovery state.
-        if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
+        if crate::internal::worktree_scope::WorktreeScope::for_request().is_linked() {
             return Ok(None);
         }
-        if crate::command::maintenance::repository_has_linked_worktrees() {
-            return Err(format!(
-                "a legacy rebase state directory exists at '{}' but linked worktrees are \
-                 registered, so its owner is ambiguous and it will not be adopted \
-                 automatically; finish or abort that legacy rebase, or remove the directory \
-                 manually once you have confirmed it is stale",
-                legacy_dir.display()
-            ));
+        if crate::command::maintenance::repository_had_linked_worktrees() {
+            return Err(Self::ambiguous_legacy_message(&legacy_dir));
         }
 
         let state = Self::load_from_legacy_dir()?;
@@ -511,10 +610,9 @@ impl RebaseState {
     }
 
     fn load_from_legacy_dir() -> Result<Self, String> {
-        let dir = Self::legacy_rebase_dir();
-        if !dir.exists() {
+        let Some(dir) = Self::legacy_rebase_dir_present() else {
             return Err("No rebase in progress".to_string());
-        }
+        };
 
         let head_name_raw = fs::read_to_string(dir.join("head-name"))
             .map_err(|e| format!("Failed to read head-name: {}", e))?;
@@ -1303,6 +1401,23 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         }
     }
 
+    // §C.4.2 / ADR-0714-08: adoption of a legacy `rebase-merge/` directory is
+    // an EXPLICIT act, and this is the only place it happens — the user has
+    // asked to continue, skip or abort THIS rebase, which is the statement of
+    // ownership a read cannot make. Reads above only reported that it exists.
+    if args.continue_rebase || args.abort || args.skip {
+        // A bare repository has no working tree to rebase, and the
+        // control-action path does not reach the start-path preflight — so it is
+        // rejected HERE, before adoption. Otherwise a bare repo holding legacy
+        // state would gain a scoped row and lose its recovery directory on its
+        // way to an error.
+        crate::command::worktree::reject_bare_repository().await?;
+        RebaseState::adopt_legacy_state().await.map_err(|err| {
+            CliError::fatal(format!("failed to adopt the legacy rebase state: {err}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    }
+
     preflight_rebase(&args).await?;
     // Validate `--empty` before any dispatch (start or sequencer control) so a bad
     // mode fails fast (exit 129) rather than slipping through.
@@ -1940,7 +2055,9 @@ async fn resolve_rebase_autostash() -> Result<(), RebaseError> {
 }
 
 async fn checked_out_local_branches() -> Result<HashSet<String>, RebaseError> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(RebaseError::StateSave)?;
     ref_model::Entity::find()
         .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
         .filter(ref_model::Column::Remote.is_null())
@@ -2074,7 +2191,7 @@ async fn run_sandboxed_rebase_exec(
         ToolSandboxContext, run_shell_command,
     };
 
-    let cwd = util::working_dir();
+    let cwd = util::request_working_dir();
     let sandbox = ToolSandboxContext {
         // The exec command is explicit user CLI input (not repo content) and
         // may legitimately run nested VCS operations (`libra add`/`commit`),
@@ -2239,7 +2356,9 @@ async fn reflog_fork_point(
     let Some(ref_name) = upstream_reflog_name(upstream).await? else {
         return Ok(None);
     };
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(RebaseError::StateSave)?;
     let entries = reflog_model::Entity::find()
         .filter(reflog_model::Column::RefName.eq(ref_name))
         .order_by_desc(reflog_model::Column::Timestamp)
@@ -2298,7 +2417,9 @@ async fn run_rebase_start(
     fork_point: bool,
     output: &OutputConfig,
 ) -> Result<RebaseOutput, RebaseError> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(RebaseError::StateSave)?;
 
     let current_branch_name = match Head::current().await {
         Head::Branch(name) if !name.is_empty() => name,
@@ -2549,7 +2670,11 @@ async fn run_rebase_start(
         new_oid: newbase_id.to_string(),
         action: start_action,
     };
-    db.transaction(|txn| {
+    // The reflog insert reads `user.name`/`user.email` before either write,
+    // so this transaction must take the write lock up front — otherwise a
+    // second worktree rebasing at the same moment makes it fail rather than
+    // wait (`db::begin_write_transaction`).
+    crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             reflog::Reflog::insert_single_entry(txn, &start_context, "HEAD").await?;
             Head::update_result_with_conn(txn, Head::Detached(newbase_id), None)
@@ -2575,7 +2700,8 @@ async fn run_rebase_start(
         empty_mode,
     };
 
-    state.save().await.map_err(RebaseError::StateSave)?;
+    // The first write of a STARTING rebase is a claim, not a replace (§C.4.4).
+    state.claim_start().await.map_err(RebaseError::StateSave)?;
     Head::update_result_with_conn(&db, Head::Detached(newbase_id), None)
         .await
         .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
@@ -2675,7 +2801,9 @@ async fn continue_replay(
     emit_human: bool,
     output: &OutputConfig,
 ) -> Result<RebaseReplaySummary, RebaseError> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(RebaseError::StateSave)?;
     let mut summary = RebaseReplaySummary::default();
 
     if emit_human {
@@ -2851,7 +2979,9 @@ async fn finalize_rebase(
     emit_human: bool,
     output: &OutputConfig,
 ) -> anyhow::Result<()> {
-    let db = get_db_conn_instance().await;
+    let db = crate::internal::sequencer::request_db_checked()
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
     let final_commit_id = state.current_head;
     let aux = RebaseAuxState::load_optional().context("failed to load rebase auxiliary state")?;
     let mut ref_updates = Vec::new();
@@ -3098,6 +3228,10 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
         let index_file = path::index();
         let index = git_internal::internal::index::Index::load(&index_file)
             .map_err(|e| RebaseError::IndexLoad(e.to_string()))?;
+        // Same guard: `--continue` builds a commit from the current index.
+        crate::internal::layer::reject_layer_owned_entries(&index, "to continue the rebase")
+            .await
+            .map_err(RebaseError::IndexLoad)?;
 
         if has_unmerged_entries(&index) {
             return Err(RebaseError::UnresolvedConflicts);
@@ -3140,7 +3274,9 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
         state.done.push(stopped_sha);
         state.stopped_sha = None;
 
-        let db = get_db_conn_instance().await;
+        let db = crate::internal::sequencer::request_db_checked()
+            .await
+            .map_err(RebaseError::StateSave)?;
         Head::update_result_with_conn(&db, Head::Detached(state.current_head), None)
             .await
             .map_err(|error| RebaseError::HeadUpdate(error.to_string()))?;
@@ -4589,7 +4725,7 @@ async fn replay_commit_with_conflict_detection(
 
     let mut merged_items: HashMap<PathBuf, RebaseTreeEntry> = HashMap::new();
     let mut conflict_items: Vec<(PathBuf, ConflictKind)> = Vec::new();
-    let workdir = util::working_dir();
+    let workdir = util::request_working_dir();
     let commit_abbrev = commit_to_replay_id.to_string();
     let commit_short = &commit_abbrev[..7];
     let marker_eol = conflict_marker_eol();
@@ -4986,7 +5122,7 @@ fn reset_workdir_tracked_only(
     current_index: &git_internal::internal::index::Index,
     new_index: &git_internal::internal::index::Index,
 ) -> Result<(), String> {
-    let workdir = util::working_dir();
+    let workdir = util::request_working_dir();
     let untracked_paths = worktree::untracked_workdir_paths(current_index)?;
     if let Some(conflict) = worktree::untracked_overwrite_path(&untracked_paths, new_index) {
         return Err(format!(

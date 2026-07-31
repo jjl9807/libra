@@ -57,7 +57,7 @@ pub struct PullArgs {
 
     /// Rebase the current branch onto the upstream after fetching instead of merging
     #[clap(long, short = 'r', overrides_with = "no_rebase")]
-    rebase: bool,
+    pub(crate) rebase: bool,
 
     /// Merge instead of rebasing, countermanding an earlier
     /// `--rebase`/`-r` (last one on the command line wins), matching `git pull
@@ -513,6 +513,37 @@ async fn current_branch_for_pull() -> Result<String, PullError> {
         Head::Branch(name) => name,
         Head::Detached(_) => return Err(PullError::NotOnBranch),
     })
+}
+
+/// Whether this `pull` will REBASE, resolved exactly as the command itself
+/// resolves it — flags first, then `branch.<name>.rebase`, then `pull.rebase`.
+///
+/// Dispatch needs the answer BEFORE the handler runs, because a pull that
+/// rebases must hold the worktree's sequencer control slot across the whole
+/// command: the fetch and a possible autostash happen before the rebase
+/// begins, and starting them beside another worktree-local sequence is how a
+/// pull ends up rebasing on top of someone else's half-finished work. A
+/// configured `pull.rebase = true` makes a bare `libra pull` such a command,
+/// so keying the slot on the `--rebase` FLAG would miss it.
+///
+/// Errors are answered `false`: a pull that cannot resolve its own branch or
+/// config is about to fail in the handler with a better message, and taking a
+/// control slot for it would only change which error the user sees.
+pub(crate) async fn will_rebase(args: &PullArgs) -> bool {
+    // The branch is resolved FIRST, even for an explicit `--rebase`: on a
+    // detached HEAD the handler refuses the pull outright, and claiming a
+    // sequencer control slot for it would record a failed control operation
+    // for a command that never touched the sequencer.
+    let Ok(branch) = current_branch_for_pull().await else {
+        return false;
+    };
+    if args.rebase {
+        return true;
+    }
+    match resolve_effective_pull_options(args, &branch).await {
+        Ok(options) => options.rebase,
+        Err(_) => false,
+    }
 }
 
 async fn resolve_effective_pull_options(

@@ -53,7 +53,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
-            2026072901, 2026072902
+            2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     assert_eq!(
@@ -103,13 +103,18 @@ fn builtin_migrations_register_current_schema_migrations() {
             "workspace_record",
             "head_scope_unique",
             "operation_scope_provenance",
+            "operation_args_digest_canonical",
+            "operation_dedup_index",
+            "operation_boundary_claim",
+            "operation_scope_kind",
+            "worktree_registry_v3_capability",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 44);
-    assert_eq!(runner.max_registered_version(), Some(2026072902));
+    assert_eq!(runner.len(), 49);
+    assert_eq!(runner.max_registered_version(), Some(2026073005));
 }
 
 // ---------------------------------------------------------------------------
@@ -1102,7 +1107,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
-            2026072901, 2026072902
+            2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1291,7 +1296,8 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             .expect("restore 1407 after the 1406 link-only rollback guard"),
         vec![
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
-            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902,
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     conn.execute(Statement::from_string(
@@ -1355,7 +1361,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
         vec![
             2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
             2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901,
-            2026072902
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
@@ -1457,7 +1463,8 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             .expect("upgrade immutable 1406 schema"),
         vec![
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
-            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902,
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     let claim = conn
@@ -1589,7 +1596,8 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             .expect("upgrade evolved 1406 schema"),
         vec![
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
-            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902,
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     let cursor = conn
@@ -1633,9 +1641,10 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404, 2026071403, 2026071402
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401, 2026072304, 2026072303, 2026072302,
+            2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405,
+            2026071404, 2026071403, 2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1652,7 +1661,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
         vec![
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
             2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
-            2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072402, 2026072403, 2026072501, 2026072901, 2026072902, 2026073001, 2026073002,
+            2026073003, 2026073004, 2026073005
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1683,9 +1693,10 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401, 2026072304, 2026072303, 2026072302,
+            2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405,
+            2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1702,7 +1713,8 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         vec![
             2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
             2026072301, 2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403,
-            2026072501, 2026072901, 2026072902
+            2026072501, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
+            2026073005
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2047,12 +2059,13 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901, 2026071407,
-            2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301,
-            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
-            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
-            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401, 2026072304, 2026072303, 2026072302,
+            2026072301, 2026072201, 2026072101, 2026071901, 2026071407, 2026071406, 2026071405,
+            2026071404, 2026071403, 2026071402, 2026071401, 2026071301, 2026070803, 2026070802,
+            2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202,
+            2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101,
+            2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -2081,7 +2094,8 @@ async fn approved_permission_up_down_up_round_trip() {
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
             2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
-            2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072402, 2026072403, 2026072501, 2026072901, 2026072902, 2026073001, 2026073002,
+            2026073003, 2026073004, 2026073005
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2227,6 +2241,69 @@ async fn rebase_down_migration_rejects_linked_rows() {
         .expect("main row survives the rollback");
     let head_name: String = row.try_get_by_index(0).expect("head_name");
     assert_eq!(head_name, "refs/heads/main");
+}
+
+/// §C.12 named regression `sequence_migration_preserves_main_active_state`:
+/// the UPGRADE direction. A repository that was mid-cherry-pick when it was
+/// upgraded must find its sequence exactly where it left it, under the main
+/// scope — losing it would mean an interrupted sequence silently becomes "no
+/// sequence in progress", with a conflicted tree and nothing to continue.
+///
+/// The existing `sequence_down_migration_rejects_linked_rows` exercises the
+/// DOWN direction from an already-scoped table, which cannot catch this.
+#[tokio::test]
+async fn sequence_migration_preserves_main_active_state() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    let runner = builtin_runner().expect("builtin runner");
+
+    // Stop one migration BEFORE the scope rewrite, so the legacy single-row
+    // shape (`id INTEGER PRIMARY KEY CHECK (id = 1)`) is what exists.
+    runner
+        .run_pending_up_to(&conn, 2026071407)
+        .await
+        .expect("apply up to the pre-scope schema");
+    assert!(!column_exists(&conn, "sequence_state", "worktree_id").await);
+
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state (id, kind, head_name, head_orig, current_oid, todo, payload) \
+         VALUES (1, 'cherry_pick', 'refs/heads/main', \
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+                 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', \
+                 'cccccccccccccccccccccccccccccccccccccccc', '{\"signoff\":true}');"
+            .to_string(),
+    ))
+    .await
+    .expect("an in-progress cherry-pick in the legacy shape");
+
+    runner.run_pending(&conn).await.expect("upgrade");
+
+    let row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT worktree_id, kind, head_name, head_orig, current_oid, todo, payload \
+             FROM sequence_state"
+                .to_string(),
+        ))
+        .await
+        .expect("query the migrated row")
+        .expect("the active sequence survives the upgrade");
+    let worktree_id: String = row.try_get_by_index(0).expect("worktree_id");
+    let kind: String = row.try_get_by_index(1).expect("kind");
+    let head_name: String = row.try_get_by_index(2).expect("head_name");
+    let head_orig: String = row.try_get_by_index(3).expect("head_orig");
+    let current_oid: String = row.try_get_by_index(4).expect("current_oid");
+    let todo: String = row.try_get_by_index(5).expect("todo");
+    let payload: String = row.try_get_by_index(6).expect("payload");
+    assert_eq!(worktree_id, "", "a pre-scope row belongs to main");
+    assert_eq!(kind, "cherry_pick");
+    assert_eq!(head_name, "refs/heads/main");
+    assert_eq!(head_orig, "a".repeat(40));
+    assert_eq!(current_oid, "b".repeat(40), "the position is not reset");
+    assert_eq!(todo, "c".repeat(40), "the remaining todo is not dropped");
+    assert_eq!(payload, "{\"signoff\":true}", "options survive verbatim");
 }
 
 /// The 2026071901 down migration FAILS CLOSED while a linked worktree's
@@ -2793,8 +2870,8 @@ async fn layer_migration_fails_closed_with_linked_evidence() {
             .await
             .expect("rollback layer scope"),
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304,
-            2026072303
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401, 2026072304, 2026072303
         ]
     );
     conn.execute(Statement::from_string(
@@ -2846,7 +2923,7 @@ async fn layer_migration_fails_closed_with_linked_evidence() {
         runner.run_pending(&conn).await.expect("retry succeeds"),
         vec![
             2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901,
-            2026072902
+            2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     let row = conn
@@ -3123,7 +3200,8 @@ async fn sparse_migration_projects_last_wins_toggle() {
             .await
             .expect("rollback sparse scope"),
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401, 2026072304
         ]
     );
     // Duplicate legacy rows: stale `true` (lower id) then effective `false`
@@ -3157,7 +3235,8 @@ async fn sparse_migration_projects_last_wins_toggle() {
             .await
             .expect("falsy effective toggle does not trip the guard"),
         vec![
-            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902,
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     let row = conn
@@ -3192,7 +3271,8 @@ async fn sparse_migration_fails_closed_with_linked_evidence() {
             .await
             .expect("rollback sparse scope"),
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401, 2026072304
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401, 2026072304
         ]
     );
     conn.execute(Statement::from_string(
@@ -3233,7 +3313,8 @@ async fn sparse_migration_fails_closed_with_linked_evidence() {
     assert_eq!(
         runner.run_pending(&conn).await.expect("retry succeeds"),
         vec![
-            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902,
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
@@ -3446,7 +3527,8 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
             .await
             .expect("rollback capability marker"),
         vec![
-            2026072902, 2026072901, 2026072501, 2026072403, 2026072402, 2026072401
+            2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
+            2026072501, 2026072403, 2026072402, 2026072401
         ]
     );
     assert!(!table_exists(&conn, "worktree_registry_capability").await);
@@ -3455,7 +3537,8 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
     assert_eq!(
         runner.run_pending(&conn).await.expect("re-apply"),
         vec![
-            2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902
+            2026072401, 2026072402, 2026072403, 2026072501, 2026072901, 2026072902, 2026073001,
+            2026073002, 2026073003, 2026073004, 2026073005
         ]
     );
     assert!(table_exists(&conn, "worktree_registry_capability").await);
@@ -3575,7 +3658,10 @@ async fn registry_v2_down_migration_rejects_nonterminal_state() {
     assert!(!table_exists(&conn, "worktree_intent_journal").await);
     assert_eq!(
         runner.run_pending(&conn).await.expect("re-apply"),
-        vec![2026072402, 2026072403, 2026072501, 2026072901, 2026072902]
+        vec![
+            2026072402, 2026072403, 2026072501, 2026072901, 2026072902, 2026073001, 2026073002,
+            2026073003, 2026073004, 2026073005
+        ]
     );
 }
 
@@ -3652,7 +3738,10 @@ async fn workspace_record_down_migration_rejects_nonterminal_state() {
     assert!(!index_exists(&conn, "idx_workspace_active_path").await);
     assert_eq!(
         runner.run_pending(&conn).await.expect("re-apply"),
-        vec![2026072501, 2026072901, 2026072902]
+        vec![
+            2026072501, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
+            2026073005
+        ]
     );
 
     // Transitivity: a live lease blocks a DEEPER rollback too, and nothing
@@ -3981,5 +4070,450 @@ fn gc_object_source_inventory_is_typed_across_all_four_kinds() {
             "{} has no substantive note",
             source.location
         );
+    }
+}
+
+/// plan-20260714 §C.9: the scoped duplicate point query USES its index.
+///
+/// The predicate was moved into SQL so a busy repository cannot hide a
+/// duplicate — but without a matching index that same query scans every
+/// operation the repository recorded inside the window, on the hot path of
+/// every logged command. `EXPLAIN QUERY PLAN` is the only assertion that can
+/// tell the two apart.
+#[tokio::test]
+async fn operation_dedup_query_uses_its_index() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    let plan = conn
+        .query_all(Statement::from_string(
+            conn.get_database_backend(),
+            "EXPLAIN QUERY PLAN SELECT op_id FROM operation \
+             WHERE repo_id = 'r' AND worktree_id = '' AND command_name = 'commit' \
+               AND args_digest = 'd' AND status = 'succeeded' AND end_ts >= 0"
+                .to_string(),
+        ))
+        .await
+        .expect("explain");
+    let detail: String = plan
+        .iter()
+        .filter_map(|row| row.try_get_by::<String, _>("detail").ok())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        detail.contains("idx_operation_dedup_scope"),
+        "the duplicate query must use its composite index, not scan: {detail}"
+    );
+    assert!(
+        !detail.contains("SCAN operation"),
+        "and must not scan the operation table: {detail}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Registry v3 rollback guard (plan-20260714 W1 §C.4.1.1).
+//
+// The capability marker is what keeps a v2-era binary from rewriting
+// `worktrees.json` and dropping the service-fence generations. Rolling it away
+// while generations are live re-opens exactly that hole, and nothing can detect
+// it afterwards — the evidence is what gets dropped. The guard cannot be SQL
+// (the registry is a file), so it lives in `rollback_to`'s pre-validation
+// phase, and these tests are its coverage: a refusal must run NO down DDL.
+// ---------------------------------------------------------------------------
+
+/// Write a `worktrees.json` into a repository's storage and return its path.
+fn seed_registry(storage: &std::path::Path, body: serde_json::Value) {
+    std::fs::create_dir_all(storage).expect("storage dir");
+    std::fs::write(
+        storage.join("worktrees.json"),
+        serde_json::to_vec_pretty(&body).expect("serialize registry"),
+    )
+    .expect("write registry");
+}
+
+/// A repository whose registry carries a LIVE generation: the rollback is
+/// refused, and the v3 marker is still there afterwards — proving no down DDL
+/// ran rather than merely that the call returned an error.
+#[tokio::test]
+async fn registry_v3_rollback_refuses_live_generations() {
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    seed_registry(
+        &storage,
+        serde_json::json!({
+            "schema_version": 3,
+            "epoch_counter": 7,
+            "entries": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+                {
+                    "path": repo.path().join("wt").to_string_lossy(),
+                    "is_main": false,
+                    "locked": false,
+                    "worktree_id": "wt-live",
+                    "epoch": 7,
+                },
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+    run_builtin_migrations(&conn).await.expect("migrations");
+    let runner = builtin_runner().expect("builtin runner");
+
+    let err = runner
+        .rollback_to(&conn, 2026073004)
+        .await
+        .expect_err("a live generation must refuse the rollback");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("live registration generations"),
+        "the refusal must say why: {rendered}"
+    );
+    // NO down DDL ran: the marker is intact, so an older binary is still
+    // refused at connect time.
+    assert!(
+        marker_has_version(&conn, 3).await,
+        "the v3 capability marker survives a refused rollback"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026073005),
+        "and the schema is untouched"
+    );
+}
+
+/// The converse, so the refusal above is not vacuous: a registry with NO
+/// generations (every worktree registered before v3) rolls back, as do a
+/// missing registry and an unparseable one — a rollback is not the place to
+/// adjudicate an unrelated corruption.
+#[tokio::test]
+async fn registry_v3_rollback_allows_absent_generations() {
+    for (label, registry) in [
+        (
+            "no generations",
+            Some(serde_json::json!({
+                "schema_version": 3,
+                "entries": [
+                    {"path": "/tmp/main", "is_main": true, "locked": false},
+                    {
+                        "path": "/tmp/wt",
+                        "is_main": false,
+                        "locked": false,
+                        "worktree_id": "wt-old",
+                    },
+                ],
+            })),
+        ),
+        ("no registry at all", None),
+    ] {
+        let repo = tempfile::tempdir().expect("repo");
+        let storage = repo.path().join(".libra");
+        std::fs::create_dir_all(&storage).expect("storage dir");
+        if let Some(body) = registry {
+            seed_registry(&storage, body);
+        }
+        let db_path = storage.join("libra.db");
+        std::fs::File::create(&db_path).expect("touch sqlite file");
+        let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+        run_builtin_migrations(&conn).await.expect("migrations");
+        let runner = builtin_runner().expect("builtin runner");
+        let rolled = runner
+            .rollback_to(&conn, 2026073004)
+            .await
+            .unwrap_or_else(|error| panic!("{label} must roll back: {error:?}"));
+        assert_eq!(rolled, vec![2026073005], "{label}: exactly v3 rolled back");
+        assert!(
+            !marker_has_version(&conn, 3).await,
+            "{label}: the marker is gone after a successful rollback"
+        );
+    }
+}
+
+/// An unparseable registry rolls back too, for the same reason.
+#[tokio::test]
+async fn registry_v3_rollback_allows_unreadable_registry() {
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    std::fs::create_dir_all(&storage).expect("storage dir");
+    std::fs::write(storage.join("worktrees.json"), b"{ not json").expect("write");
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+    run_builtin_migrations(&conn).await.expect("migrations");
+    let runner = builtin_runner().expect("builtin runner");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026073004)
+            .await
+            .expect("an unparseable registry does not block the rollback"),
+        vec![2026073005]
+    );
+}
+
+async fn marker_has_version(conn: &DatabaseConnection, version: i64) -> bool {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    conn.query_one(Statement::from_string(
+        conn.get_database_backend(),
+        format!("SELECT version FROM worktree_registry_capability WHERE version = {version}"),
+    ))
+    .await
+    .expect("query the capability marker")
+    .is_some()
+}
+
+/// Write a `worktrees.json` into a repository's storage.
+fn seed_registry_v2(storage: &std::path::Path, body: serde_json::Value) {
+    std::fs::create_dir_all(storage).expect("storage dir");
+    std::fs::write(
+        storage.join("worktrees.json"),
+        serde_json::to_vec_pretty(&body).expect("serialize registry"),
+    )
+    .expect("write registry");
+}
+
+/// §C.4.1.1/§C.4.3: a linked worktree REMOVED before the scope migration leaves
+/// no `reference` row, so the migration's own SQL guard sees a main-only
+/// repository and adopts its legacy layer state into main. The registry is the
+/// durable witness, and it is a file — so the guard is a Rust preflight whose
+/// row half runs inside the claim transaction.
+///
+/// Refusal must leave the migration UNAPPLIED: nothing adopted, nothing
+/// half-done.
+#[tokio::test]
+async fn layer_scope_migration_refuses_when_registry_shows_removed_linked_worktree() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    // v1 SHAPE: no history field at all, which the validated parser promotes to
+    // `Unknown` — a worktree removed before v3 left nothing else to read.
+    seed_registry_v2(
+        &storage,
+        serde_json::json!({
+            "worktrees": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026072302)
+        .await
+        .expect("apply up to the pre-layer-scope schema");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO layer (name, source, priority, enabled) \
+         VALUES ('legacy', '/src/legacy', 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("plant a legacy global layer row");
+
+    let err = runner
+        .run_pending(&conn)
+        .await
+        .expect_err("a pre-v3 registry cannot rule out a removed linked worktree");
+    assert!(
+        format!("{err:?}").contains("cannot be read or parsed")
+            || format!("{err:?}").contains("linked worktree has existed"),
+        "the refusal must name the registry as the reason: {err:?}"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026072302),
+        "unapplied: nothing was adopted"
+    );
+}
+
+/// The converse: a v3 registry that PROVES no linked worktree ever existed
+/// migrates the same legacy rows into main. Without this the refusal above could
+/// be passing for the wrong reason.
+#[tokio::test]
+async fn layer_scope_migration_adopts_when_registry_proves_main_only() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    seed_registry_v2(
+        &storage,
+        serde_json::json!({
+            "schema_version": 3,
+            "entries": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026072302)
+        .await
+        .expect("apply up to the pre-layer-scope schema");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO layer (name, source, priority, enabled) \
+         VALUES ('legacy', '/src/legacy', 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("plant a legacy global layer row");
+
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("a proven main-only history adopts the legacy rows");
+    let row = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT worktree_id FROM layer WHERE name = 'legacy'".to_string(),
+        ))
+        .await
+        .expect("query the migrated row")
+        .expect("the legacy row survives");
+    let scope: String = row.try_get_by_index(0).expect("worktree_id");
+    assert_eq!(scope, "", "and lands in the main scope");
+}
+
+/// §C.9: the operation provenance migration does NOT block — operations are
+/// history. With registry evidence of a linked worktree it marks every unscoped
+/// row `unknown` instead of trusting it as `main`, which is what makes
+/// `op restore` refuse to replay it.
+#[tokio::test]
+async fn operation_provenance_marks_unknown_on_removed_linked_worktree() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let storage = repo.path().join(".libra");
+    seed_registry_v2(
+        &storage,
+        serde_json::json!({
+            "schema_version": 3,
+            "linked_history": "existed",
+            "entries": [
+                {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+            ],
+        }),
+    );
+    let db_path = storage.join("libra.db");
+    std::fs::File::create(&db_path).expect("touch sqlite file");
+    let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026072901)
+        .await
+        .expect("apply up to the pre-provenance schema");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
+         args_digest, start_ts, end_ts, status, worktree_id) \
+         VALUES ('op-old', 'repo_1', 'view-old', 'commit', 'old', 'alice', NULL, 1, 1, \
+         'succeeded', '')"
+            .to_string(),
+    ))
+    .await
+    .expect("plant an unscoped historic operation");
+
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("provenance marking must not block the upgrade");
+    let row = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT scope_provenance FROM operation WHERE op_id = 'op-old'".to_string(),
+        ))
+        .await
+        .expect("query the marked row")
+        .expect("the operation survives");
+    let provenance: String = row.try_get_by_index(0).expect("scope_provenance");
+    assert_eq!(
+        provenance, "unknown",
+        "an unscoped historic operation in a repository with linked history is UNKNOWN, \
+         not trusted main"
+    );
+}
+
+/// The guard's predicate must agree with the MIGRATION's, character for
+/// character. Migration 2026072304 trims but does not case-fold, so `TRUE` is
+/// not truthy there — and a guard that case-folded would refuse an upgrade over
+/// a value the migration itself projects as disabled.
+///
+/// Both directions, under identical registry history, so the difference is the
+/// value and nothing else.
+#[tokio::test]
+async fn sparse_guard_matches_the_migration_case_sensitivity() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    for (value, should_refuse) in [(" TRUE ", false), (" true ", true)] {
+        let repo = tempfile::tempdir().expect("repo");
+        let storage = repo.path().join(".libra");
+        seed_registry_v2(
+            &storage,
+            serde_json::json!({
+                "schema_version": 3,
+                "linked_history": "existed",
+                "entries": [
+                    {"path": repo.path().to_string_lossy(), "is_main": true, "locked": false},
+                ],
+            }),
+        );
+        let db_path = storage.join("libra.db");
+        std::fs::File::create(&db_path).expect("touch sqlite file");
+        let conn = connect(&format!("sqlite://{}", db_path.display())).await;
+
+        let runner = builtin_runner().expect("builtin runner");
+        runner
+            .run_pending_up_to(&conn, 2026072303)
+            .await
+            .expect("apply up to the pre-sparse-scope schema");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE IF NOT EXISTS config_kv (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             configuration TEXT, name TEXT, key TEXT NOT NULL, value TEXT NOT NULL)"
+                .to_string(),
+        ))
+        .await
+        .expect("create config_kv");
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO config_kv (key, value) VALUES ('sparse.enabled', ?)",
+            [value.into()],
+        ))
+        .await
+        .expect("plant the toggle");
+
+        let outcome = runner.run_pending(&conn).await;
+        if should_refuse {
+            assert!(
+                outcome.is_err(),
+                "'{value}' is truthy to the migration, so linked history must refuse it"
+            );
+        } else {
+            outcome.unwrap_or_else(|error| {
+                panic!(
+                    "'{value}' is NOT truthy to the migration (it does not case-fold), so the \
+                     guard must not refuse: {error:?}"
+                )
+            });
+        }
     }
 }

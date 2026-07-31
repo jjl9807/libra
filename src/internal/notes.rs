@@ -7,7 +7,7 @@
 use std::str::FromStr;
 
 use git_internal::{errors::GitError, hash::ObjectHash, internal::object::ObjectTrait};
-use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbErr, Statement};
 
 use crate::{internal::db::get_db_conn_instance, utils::util};
 
@@ -356,7 +356,7 @@ pub async fn remove(
     // Include `blob = ?` so that a concurrent `add -f` cannot overwrite
     // the blob between Phase 1 and Phase 2 — if the blob hash changed,
     // rows_affected() is 0 and we roll back the whole transaction.
-    let txn = db.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
     for (obj_str, blob_hash) in &to_delete {
         let result = txn
             .execute(Statement::from_sql_and_values(
@@ -434,7 +434,7 @@ pub async fn prune(notes_ref: &str, dry_run: bool) -> Result<Vec<String>, NotesE
     }
 
     let db = get_db_conn_instance().await;
-    let txn = db.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
     let mut pruned = Vec::new();
     for (object, blob) in stale {
         let result = match &blob {
@@ -552,7 +552,7 @@ pub async fn merge(
     // current blob (`AND blob = <expected>`). Any mismatch means another writer
     // changed the notes between classification and apply, so the whole merge
     // rolls back rather than clobbering concurrent work or applying partially.
-    let txn = db.begin().await?;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
     for (object, blob) in &to_copy {
         let result = txn
             .execute(Statement::from_sql_and_values(

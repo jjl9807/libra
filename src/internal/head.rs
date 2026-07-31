@@ -115,6 +115,13 @@ impl Head {
         if let Some(model) = Self::query_local_head_rows_with_conn(db).await? {
             return Ok(model);
         }
+        // `current()`, NOT `for_request()`, and deliberately: `worktree add`
+        // seeds the NEW worktree's HEAD by entering its directory, so this must
+        // follow the cwd. Answering with the invoking worktree's pinned scope
+        // leaves the new worktree with no HEAD row at all — every command in it
+        // then fails `LBR-REPO-002`. Worktree-local ADVISORY state (sequencer,
+        // dirty, layer, sparse) uses `for_request()`; HEAD is the exception
+        // because a command legitimately writes another scope's row.
         let scope = crate::internal::worktree_scope::WorktreeScope::current();
         let detail = match scope.worktree_id() {
             Some(id)
@@ -155,6 +162,13 @@ impl Head {
         // value object rather than re-interpreting a bare `Option<String>` —
         // `worktree_id()` encodes the `reference` table's convention that main
         // is spelled NULL, so a linked worktree can never alias onto main.
+        // `current()`, NOT `for_request()`, and deliberately: `worktree add`
+        // seeds the NEW worktree's HEAD by entering its directory, so this must
+        // follow the cwd. Answering with the invoking worktree's pinned scope
+        // leaves the new worktree with no HEAD row at all — every command in it
+        // then fails `LBR-REPO-002`. Worktree-local ADVISORY state (sequencer,
+        // dirty, layer, sparse) uses `for_request()`; HEAD is the exception
+        // because a command legitimately writes another scope's row.
         let scope = crate::internal::worktree_scope::WorktreeScope::current();
         let worktree_id = scope.worktree_id().map(str::to_string);
         for attempt in 0..=Self::SQLITE_BUSY_MAX_RETRIES {
@@ -647,9 +661,8 @@ impl Head {
         // prevent. Callers that already hold a transaction (`switch`,
         // `checkout`, `worktree add`) were always atomic; this closes the
         // pooled entry point that `symbolic-ref` and `stash branch` use.
-        use sea_orm::TransactionTrait;
-        let txn = db_conn
-            .begin()
+        // HEAD's update reads the current row before replacing it.
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
             .await
             .map_err(|e| BranchStoreError::Query(e.to_string()))?;
         Self::update_result_with_conn(&txn, new_head, remote).await?;

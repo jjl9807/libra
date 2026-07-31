@@ -159,7 +159,7 @@ pub async fn execute_safe(args: HydrateArgs, output: &OutputConfig) -> CliResult
     // W1 §C.4.1.1: hydrate MATERIALIZES files, so an unreadable view must
     // fail closed instead of degrading to "everything in view" (which would
     // bypass the sparse gate on a probe failure).
-    let scope = crate::internal::worktree_scope::WorktreeScope::current();
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
     let sparse = SparseView::try_load(&scope).await.map_err(|e| {
         CliError::fatal(format!("cannot load the sparse view before hydrating: {e}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
