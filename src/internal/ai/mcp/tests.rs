@@ -26,6 +26,16 @@ async fn setup_test_db() -> sea_orm::DatabaseConnection {
     let schema = Schema::new(builder);
     let stmt = schema.create_table_from_entity(reference::Entity);
     db.execute(builder.build(&stmt)).await.unwrap();
+    // Present in every real repository (bootstrap schema) — the write-lock
+    // primitive in `db::begin_write_transaction` writes against it.
+    db.execute(sea_orm::Statement::from_string(
+        builder,
+        "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,\
+         value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0)"
+            .to_string(),
+    ))
+    .await
+    .unwrap();
     db
 }
 

@@ -18,7 +18,7 @@
 //!   by session cascade — the provider session may not exist locally.
 
 use anyhow::{Context, Result, anyhow};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 
 /// Lease length for one export run: must cover the export subprocess
 /// deadline (≤3s, GC-DR-04) plus parse/redact/claim with margin.
@@ -56,8 +56,7 @@ pub async fn observe_idle(
     owner: &str,
     now_ms: i64,
 ) -> Result<IdleOutcome> {
-    let txn = conn
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin export generation transaction")?;
     let tombstoned = txn

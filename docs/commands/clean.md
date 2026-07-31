@@ -90,6 +90,16 @@ Override configured ignore sources. Without this flag, ignored files (build
 artifacts, caches, etc.) are skipped. With `-x`, they are treated like
 any other untracked file and removed.
 
+**One exception, under every mode** (`-x` and `-X` included): files materialized
+by an active `libra layer` overlay are never removed. They are untracked by
+construction, so `clean` would otherwise be free to delete them — and nothing
+but `libra layer apply` could bring them back, because their content lives
+outside the repository. A directory is likewise kept when an overlay file
+exists anywhere beneath it, since `-d` removes whole trees. `libra layer
+unapply` is the way to remove overlay files. If `clean` cannot determine which
+paths an overlay owns (a locked or unreadable layer store) it REFUSES rather
+than deleting.
+
 **`-X`**
 
 Inverse of `-x`. Removes only the files that ignore sources would

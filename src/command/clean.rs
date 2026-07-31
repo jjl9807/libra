@@ -138,6 +138,31 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
         )
     };
 
+    // lore.md 2.4 / §C.4.1.1 / §C.10: load THIS worktree's layer-exclusion
+    // snapshot before enumerating anything, under the layer MUTATION LOCK held
+    // across the deletion.
+    //
+    // Three separate hazards, all ending in a deleted overlay that only a
+    // re-apply could restore: a fresh process that never refreshed sees an
+    // EMPTY snapshot; a failed ownership read that resolves to an empty set
+    // looks the same; and without the lock a concurrent `layer apply` can
+    // record and materialize between the snapshot and the delete. So: strict
+    // (fallible) refresh, and the lock spans snapshot-plus-delete.
+    let layer_scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+    let _layer_lock =
+        crate::internal::layer::layer_mutation_lock(&layer_scope).map_err(|error| {
+            clean_cli_error(CleanError::ScanUntracked(format!(
+                "cannot take this worktree's layer lock (refusing to delete without it): {error}"
+            )))
+        })?;
+    crate::internal::layer::refresh_exclusion_snapshot_strict(&layer_scope)
+        .await
+        .map_err(|error| {
+            clean_cli_error(CleanError::ScanUntracked(format!(
+                "{error} — refusing to delete without knowing which paths layer overlays own"
+            )))
+        })?;
+
     let clean_output = run_clean(args, pathspecs).map_err(clean_cli_error)?;
 
     if output.is_json() {
@@ -197,7 +222,21 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
         }
     }
     .map_err(|e| CleanError::ScanUntracked(e.to_string()))?;
-    let filtered_files = ignore::filter_workdir_paths(workdir_files, policy, &index);
+    // ONE snapshot for this clean (§C.4.1.1), applied below to files AND to the
+    // directory scan. lore.md 2.4: a materialized layer overlay is protected
+    // from `clean` under EVERY policy — including `-x`, where the ignore
+    // engine's `IncludeIgnored` deliberately stops consulting layers (that
+    // policy exists for force-ADD, where the staging guard is the backstop).
+    // Here the stake is deletion, and only a re-apply could restore the file.
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
+    let filtered_files = ignore::filter_workdir_paths(workdir_files, policy, &index)
+        .into_iter()
+        .filter(|path| {
+            layers.is_empty()
+                || !crate::internal::layer::normalize_key(path)
+                    .is_some_and(|key| layers.is_owned(&key))
+        })
+        .collect::<Vec<_>>();
 
     // Find untracked files
     let mut untracked: Vec<PathBuf> = Vec::new();
@@ -212,7 +251,7 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
 
     // If -d, also find untracked directories
     if args.directories {
-        let untracked_dirs = find_untracked_dirs(&index, policy)?;
+        let untracked_dirs = find_untracked_dirs(&index, policy, &layers)?;
         for dir in untracked_dirs {
             // Skip the root directory (empty path)
             if dir.as_os_str().is_empty() {
@@ -300,7 +339,11 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
 
 /// Find untracked directories based on the ignore policy.
 /// A directory is considered untracked if it does not contain any tracked files.
-fn find_untracked_dirs(index: &Index, policy: IgnorePolicy) -> Result<Vec<PathBuf>, CleanError> {
+fn find_untracked_dirs(
+    index: &Index,
+    policy: IgnorePolicy,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+) -> Result<Vec<PathBuf>, CleanError> {
     let workdir = util::working_dir();
     let mut untracked_dirs = Vec::new();
 
@@ -309,8 +352,12 @@ fn find_untracked_dirs(index: &Index, policy: IgnorePolicy) -> Result<Vec<PathBu
         workdir: &Path,
         index: &Index,
         policy: IgnorePolicy,
+        layers: &crate::internal::layer::ExclusionSnapshot,
         untracked_dirs: &mut Vec<PathBuf>,
-    ) -> Result<(), CleanError> {
+        // Returns whether this subtree holds content that must SURVIVE (a
+        // tracked file or a materialized layer overlay), so the caller can
+        // refuse to queue the tree that contains it.
+    ) -> Result<bool, CleanError> {
         let entries = fs::read_dir(dir).map_err(|e| CleanError::ScanUntracked(e.to_string()))?;
         let mut has_tracked = false;
         let mut subdirs = Vec::new();
@@ -338,6 +385,27 @@ fn find_untracked_dirs(index: &Index, policy: IgnorePolicy) -> Result<Vec<PathBu
                 if index.tracked(path_str, 0) {
                     has_tracked = true;
                 }
+                // A materialized layer overlay counts as content that must
+                // SURVIVE, exactly like a tracked file: the file itself is
+                // protected, so removing the directory holding it would
+                // destroy it anyway (`clean -d` removes the tree).
+                if !layers.is_empty()
+                    && crate::internal::layer::normalize_key(relative)
+                        .is_some_and(|key| layers.is_owned(&key))
+                {
+                    has_tracked = true;
+                }
+            }
+        }
+
+        // RECURSE FIRST, then decide about this directory. `clean -d` removes a
+        // directory TREE, so content that must survive anywhere beneath it
+        // protects the whole path — deciding before the recursion queued
+        // `dst` for removal while `dst/nested/overlay.txt` was still
+        // undiscovered, and the tree took the protected file with it.
+        for subdir in subdirs {
+            if scan_dir(&subdir, workdir, index, policy, layers, untracked_dirs)? {
+                has_tracked = true;
             }
         }
 
@@ -362,15 +430,19 @@ fn find_untracked_dirs(index: &Index, policy: IgnorePolicy) -> Result<Vec<PathBu
             }
         }
 
-        // Recurse into subdirs
-        for subdir in subdirs {
-            scan_dir(&subdir, workdir, index, policy, untracked_dirs)?;
-        }
-
-        Ok(())
+        // Report upward whether anything here must survive, so a parent cannot
+        // queue a tree that contains it.
+        Ok(has_tracked)
     }
 
-    scan_dir(&workdir, &workdir, index, policy, &mut untracked_dirs)?;
+    scan_dir(
+        &workdir,
+        &workdir,
+        index,
+        policy,
+        layers,
+        &mut untracked_dirs,
+    )?;
     Ok(untracked_dirs)
 }
 

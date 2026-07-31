@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use clap::Parser;
 use git_internal::hash::{ObjectHash, get_hash_kind};
-use sea_orm::{TransactionError, TransactionTrait};
+use sea_orm::TransactionError;
 use serde::Serialize;
 
 use crate::{
@@ -191,128 +191,125 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     let delete = args.delete;
 
     let db = get_db_conn_instance().await;
-    let outcome = db
-        .transaction(move |txn| {
-            Box::pin(async move {
-                // Branch policy (lore.md 1.13): protect/archive metadata is
-                // enforced INSIDE the authoritative txn for every local-head
-                // writer — update-ref would otherwise be a silent bypass of
-                // `branch reset`'s policy layer. Fail-closed: metadata read
-                // errors refuse the update. (update-ref stays plumbing-sharp
-                // otherwise — it may still move the checked-out branch, like
-                // git update-ref.)
-                let protected = crate::internal::metadata::MetadataKv::is_protected_with_conn(
-                    txn,
-                    &branch_name,
-                )
-                .await
-                .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                if protected {
-                    return Err(UpdateRefTxError::PolicyBlocked {
-                        branch: branch_name.clone(),
-                        policy: "protected".to_string(),
-                    });
-                }
-                let archived =
-                    crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_name)
-                        .await
-                        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                if archived {
-                    return Err(UpdateRefTxError::PolicyBlocked {
-                        branch: branch_name.clone(),
-                        policy: "archived".to_string(),
-                    });
-                }
-                let current = Branch::find_branch_result_with_conn(txn, &branch_name, None)
+    // A compare-and-swap on a ref: it READS the current value and the branch
+    // policy before it writes, so it must take the write lock up front or a
+    // concurrent writer makes it fail instead of wait (see
+    // `db::begin_write_transaction`).
+    let outcome = crate::internal::db::write_transaction(&db, move |txn| {
+        Box::pin(async move {
+            // Branch policy (lore.md 1.13): protect/archive metadata is
+            // enforced INSIDE the authoritative txn for every local-head
+            // writer — update-ref would otherwise be a silent bypass of
+            // `branch reset`'s policy layer. Fail-closed: metadata read
+            // errors refuse the update. (update-ref stays plumbing-sharp
+            // otherwise — it may still move the checked-out branch, like
+            // git update-ref.)
+            let protected =
+                crate::internal::metadata::MetadataKv::is_protected_with_conn(txn, &branch_name)
                     .await
-                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?
-                    .map(|b| b.commit.to_string());
-
-                // Compare-and-swap precondition.
-                if let Some(expected) = &old_spec {
-                    match (expected, &current) {
-                        // `0{40}` => the ref must not exist.
-                        (OldValue::MustNotExist, Some(actual)) => {
-                            return Err(UpdateRefTxError::MustNotExist {
-                                ref_name: full_ref.clone(),
-                                actual: actual.clone(),
-                            });
-                        }
-                        (OldValue::MustNotExist, None) => {}
-                        (OldValue::Exact(want), actual)
-                            if actual.as_deref() != Some(want.as_str()) =>
-                        {
-                            return Err(UpdateRefTxError::CasMismatch {
-                                ref_name: full_ref.clone(),
-                                expected: want.clone(),
-                                actual: actual.clone().unwrap_or_else(|| zero.clone()),
-                            });
-                        }
-                        (OldValue::Exact(_), _) => {}
-                    }
-                }
-
-                if delete {
-                    let Some(old) = current.clone() else {
-                        return Err(UpdateRefTxError::DoesNotExist {
-                            ref_name: full_ref.clone(),
-                        });
-                    };
-                    Branch::delete_branch_result_with_conn(txn, &branch_name, None)
-                        .await
-                        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                    write_reflog(txn, &full_ref, &old, &zero, &reflog_reason).await?;
-                    Ok(UpdateRefOutcome {
-                        old: Some(old),
-                        new: None,
-                    })
-                } else {
-                    // INVARIANT: in the non-delete branch the positional
-                    // disambiguation above always set `new_oid` to `Some`.
-                    let new = new_oid.expect("new value validated for non-delete");
-                    Branch::update_branch_with_conn(txn, &branch_name, &new, None)
-                        .await
-                        .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
-                    let old = current.clone().unwrap_or_else(|| zero.clone());
-                    write_reflog(txn, &full_ref, &old, &new, &reflog_reason).await?;
-                    Ok::<_, UpdateRefTxError>(UpdateRefOutcome {
-                        old: current,
-                        new: Some(new),
-                    })
-                }
-            })
-        })
-        .await
-        .map_err(|error| {
-            // Preserve the policy refusal's dedicated stable code.
-            if let TransactionError::Transaction(UpdateRefTxError::PolicyBlocked {
-                branch,
-                policy,
-            }) = &error
-            {
-                let policy_key = if policy == "protected" {
-                    "protect"
-                } else {
-                    "archive"
-                };
-                CliError::fatal(format!(
-                    "branch '{branch}' is {policy}; refusing to update its ref"
-                ))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
-                .with_hint(format!(
-                    "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
-                ))
-            } else {
-                let message = match error {
-                    TransactionError::Connection(error) => error.to_string(),
-                    TransactionError::Transaction(error) => error.to_string(),
-                };
-                CliError::fatal(message)
-                    .with_exit_code(128)
-                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+            if protected {
+                return Err(UpdateRefTxError::PolicyBlocked {
+                    branch: branch_name.clone(),
+                    policy: "protected".to_string(),
+                });
             }
-        })?;
+            let archived =
+                crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_name)
+                    .await
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+            if archived {
+                return Err(UpdateRefTxError::PolicyBlocked {
+                    branch: branch_name.clone(),
+                    policy: "archived".to_string(),
+                });
+            }
+            let current = Branch::find_branch_result_with_conn(txn, &branch_name, None)
+                .await
+                .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?
+                .map(|b| b.commit.to_string());
+
+            // Compare-and-swap precondition.
+            if let Some(expected) = &old_spec {
+                match (expected, &current) {
+                    // `0{40}` => the ref must not exist.
+                    (OldValue::MustNotExist, Some(actual)) => {
+                        return Err(UpdateRefTxError::MustNotExist {
+                            ref_name: full_ref.clone(),
+                            actual: actual.clone(),
+                        });
+                    }
+                    (OldValue::MustNotExist, None) => {}
+                    (OldValue::Exact(want), actual) if actual.as_deref() != Some(want.as_str()) => {
+                        return Err(UpdateRefTxError::CasMismatch {
+                            ref_name: full_ref.clone(),
+                            expected: want.clone(),
+                            actual: actual.clone().unwrap_or_else(|| zero.clone()),
+                        });
+                    }
+                    (OldValue::Exact(_), _) => {}
+                }
+            }
+
+            if delete {
+                let Some(old) = current.clone() else {
+                    return Err(UpdateRefTxError::DoesNotExist {
+                        ref_name: full_ref.clone(),
+                    });
+                };
+                Branch::delete_branch_result_with_conn(txn, &branch_name, None)
+                    .await
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+                write_reflog(txn, &full_ref, &old, &zero, &reflog_reason).await?;
+                Ok(UpdateRefOutcome {
+                    old: Some(old),
+                    new: None,
+                })
+            } else {
+                // INVARIANT: in the non-delete branch the positional
+                // disambiguation above always set `new_oid` to `Some`.
+                let new = new_oid.expect("new value validated for non-delete");
+                Branch::update_branch_with_conn(txn, &branch_name, &new, None)
+                    .await
+                    .map_err(|error| UpdateRefTxError::Storage(error.to_string()))?;
+                let old = current.clone().unwrap_or_else(|| zero.clone());
+                write_reflog(txn, &full_ref, &old, &new, &reflog_reason).await?;
+                Ok::<_, UpdateRefTxError>(UpdateRefOutcome {
+                    old: current,
+                    new: Some(new),
+                })
+            }
+        })
+    })
+    .await
+    .map_err(|error| {
+        // Preserve the policy refusal's dedicated stable code.
+        if let TransactionError::Transaction(UpdateRefTxError::PolicyBlocked { branch, policy }) =
+            &error
+        {
+            let policy_key = if policy == "protected" {
+                "protect"
+            } else {
+                "archive"
+            };
+            CliError::fatal(format!(
+                "branch '{branch}' is {policy}; refusing to update its ref"
+            ))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
+            .with_hint(format!(
+                "clear it first: 'libra metadata unset --branch {branch} {policy_key}'"
+            ))
+        } else {
+            let message = match error {
+                TransactionError::Connection(error) => error.to_string(),
+                TransactionError::Transaction(error) => error.to_string(),
+            };
+            CliError::fatal(message)
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        }
+    })?;
 
     if output.is_json() {
         emit_json_data(

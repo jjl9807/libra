@@ -397,8 +397,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         return run_push_pathspec(options).await;
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let index_path = path::index();
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
@@ -415,6 +414,12 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         .ok_or(StashError::NoInitialCommit)?;
     let head_commit_hash_str = head_commit_hash.to_string();
 
+    // lore.md 2.4 / §C.11 W1: `stash push` turns the current index into a tree
+    // and publishes it through `refs/stash` — reachable history, so the same
+    // guard as `commit` and `write-tree`.
+    crate::internal::layer::reject_layer_owned_entries(&index, "to stash")
+        .await
+        .map_err(StashError::WriteObject)?;
     let index_tree =
         tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
     let index_tree_data = index_tree
@@ -461,7 +466,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let worktree_tree =
         create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
     let worktree_tree_data = worktree_tree
@@ -543,8 +548,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
 pub(crate) async fn create_held_stash_commit(
     message: &str,
 ) -> Result<Option<ObjectHash>, StashError> {
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let index_path = path::index();
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
@@ -578,7 +582,7 @@ pub(crate) async fn create_held_stash_commit(
     let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let worktree_tree =
         create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
     let worktree_tree_data = worktree_tree
@@ -618,8 +622,7 @@ pub(crate) async fn reset_to_head_for_held_stash() -> Result<(), StashError> {
 /// Enter an existing stash COMMIT into refs/stash (promote a held autostash
 /// into the visible stash list, e.g. after its re-apply conflicted).
 pub(crate) async fn store_stash_commit(hash: &ObjectHash, message: &str) -> Result<(), StashError> {
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let (_, committer) = util::create_signatures().await;
     update_stash_ref_locked(&git_dir, hash, &committer, message).map(|_| ())
 }
@@ -709,11 +712,10 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
         return Err(StashError::PathspecWithOption("--keep-index".into()));
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let index_path = path::index();
     let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
 
     let head_commit_hash = Head::current_commit()
         .await
@@ -1028,8 +1030,11 @@ pub(crate) async fn autostash_pop_by_entry(
 
 /// One consistent read of the shared stack's entries (empty when absent).
 fn stack_entries() -> Result<Vec<StashLogEntry>, StashError> {
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    // §C.10: repair a tip left stale by a crash before reporting the stack, so
+    // a reader and a later mutation cannot disagree about what the top entry
+    // is. Repair is idempotent and a no-op on a consistent pair.
+    reconcile_stash_ref(&util::request_storage_path())?;
+    let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Ok(Vec::new());
@@ -1044,8 +1049,7 @@ async fn run_list() -> Result<StashOutput, StashError> {
         });
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Ok(StashOutput::List {
@@ -1080,8 +1084,7 @@ async fn run_show(
     patch: bool,
 ) -> Result<StashOutput, StashError> {
     let (index, stash_id_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
 
     let stash_hash =
         ObjectHash::from_str(&stash_id_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1189,13 +1192,6 @@ async fn rollback_created_branch(branch_name: &str, base_hash: &ObjectHash) {
 }
 
 async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashOutput, StashError> {
-    if InternalBranch::exists_result(&branch_name, None)
-        .await
-        .map_err(|error| stash_branch_store_error(&branch_name, error))?
-    {
-        return Err(StashError::BranchExists(branch_name));
-    }
-
     // Resolve stash & metadata for the new branch base. The raw reflog line
     // is the unambiguous entry identity for the post-apply CAS delete.
     let (index, stash_id_str, raw_line) = resolve_stash_to_commit_hash(stash)?;
@@ -1211,9 +1207,19 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
     // Capture the restore point BEFORE any persistent mutation (W2 §C.4.3):
     // both the branch creation and the HEAD switch may need rolling back.
     let prior_head = Head::current().await;
-    InternalBranch::update_branch(&branch_name, &base_hash.to_string(), None)
+    // CREATE, never upsert (Codex W2 r1 #4): `update_branch` moves an existing
+    // tip, and a name checked free a moment earlier can be taken by another
+    // worktree before the write — `stash branch` would then silently move
+    // THAT branch. The exclusive create does the check and the insert in one
+    // write-locked transaction, so a collision is refused, not overwritten.
+    InternalBranch::create_branch_exclusive(&branch_name, &base_hash.to_string(), None)
         .await
-        .map_err(|e| StashError::Other(format!("failed to create branch '{branch_name}': {e}")))?;
+        .map_err(|error| match error {
+            crate::internal::branch::BranchStoreError::AlreadyExists(name) => {
+                StashError::BranchExists(name)
+            }
+            other => stash_branch_store_error(&branch_name, other),
+        })?;
 
     // Switch HEAD to the new branch so apply runs on the right tip — via the
     // RESULT-returning API (W2 §C.4.3 scoped HEAD guard): a swallowed HEAD
@@ -1285,8 +1291,7 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
         return Ok(StashOutput::Clear { cleared_count: 0 });
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_ref_path = git_dir.join("refs/stash");
     let stash_log_path = git_dir.join("logs/refs/stash");
 
@@ -1463,8 +1468,7 @@ async fn apply_stash_commit_inner(
     restore_index: bool,
 ) -> Result<(), StashError> {
     let stash_commit_hash = *hash;
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
 
     let stash_commit: Commit =
         load_object(&stash_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1487,7 +1491,7 @@ async fn apply_stash_commit_inner(
         None
     };
 
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let index_path = path::index();
 
     // "ours" for the three-way apply is the CURRENT working tree, NOT HEAD. This
@@ -1624,6 +1628,140 @@ fn ensure_untracked_restore_paths_clear(
     )))
 }
 
+/// Publish a stash-stack state so a crash can never leave the tip and the log
+/// describing different stacks (§C.10).
+///
+/// `refs/stash` and `logs/refs/stash` are two files, and the old code wrote
+/// them as two independent operations: a crash, a full disk or a kill between
+/// them left a tip naming an entry the log did not list, or a log whose first
+/// entry the tip did not name. Neither is recoverable by inspection, because
+/// nothing recorded which of the two was meant to win.
+///
+/// The fix is not a second journal but an ORDER plus an authority. The LOG is
+/// the stack — every entry, with the chaining that makes each line a unique
+/// identity — and `refs/stash` is a derived pointer to its first line. So:
+///
+/// 1. the log is written first, atomically (temp file + rename) and fsynced,
+///    so it is never torn and never lost after this call returns;
+/// 2. the ref is written second, from the log that was just committed.
+///
+/// A crash between them leaves a STALE REF over a correct log, and that state
+/// is repairable by anyone who reads it — which is what
+/// [`reconcile_stash_ref`] does, under the same lock, before every read and
+/// every mutation. There is no window in which the log is wrong, so there is
+/// no window in which recovery has to guess.
+fn publish_stash_stack(storage: &Path, entries: &[StashLogEntry]) -> Result<(), StashError> {
+    let log_path = storage.join("logs/refs/stash");
+    let ref_path = storage.join("refs/stash");
+    let write_error = |path: &Path, error: std::io::Error| {
+        StashError::WriteObject(format!("{}: {error}", path.display()))
+    };
+
+    if entries.is_empty() {
+        // Removing the LOG first keeps the same authority order: an empty
+        // stack with a leftover ref is repairable; a ref-less log is a stack
+        // that would silently reappear.
+        match fs::remove_file(&log_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(write_error(&log_path, error)),
+        }
+        match fs::remove_file(&ref_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(write_error(&ref_path, error)),
+        }
+        return Ok(());
+    }
+
+    let body = entries
+        .iter()
+        .map(|entry| entry.raw_line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| write_error(&log_path, error))?;
+    }
+    // fsync unconditionally: this pair is recovery-critical state, like the
+    // sequencer's, so it does not wait for `--sync-data`.
+    crate::utils::atomic_write::write_atomic(&log_path, body.as_bytes(), true)
+        .map_err(|error| write_error(&log_path, error))?;
+
+    if let Some(parent) = ref_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| write_error(&ref_path, error))?;
+    }
+    let tip = format!("{}\n", entries[0].stash_id);
+    crate::utils::atomic_write::write_atomic(&ref_path, tip.as_bytes(), true)
+        .map_err(|error| write_error(&ref_path, error))
+}
+
+/// Repair a tip left stale by a crash between the two writes of
+/// [`publish_stash_stack`] (§C.10 expected-state recovery).
+///
+/// Call under the stack lock, before reading or mutating the stack. The log is
+/// the authority: whatever it says the top entry is, the ref must name — and
+/// when the log is gone, no ref may survive it. Returns whether it repaired
+/// something, so a caller can report it.
+///
+/// A repository whose log cannot be read is NOT repaired: an unreadable log is
+/// not evidence that the tip is wrong, and deleting a tip on that basis would
+/// turn a transient read failure into lost stash entries.
+fn reconcile_stash_ref(storage: &Path) -> Result<bool, StashError> {
+    let log_path = storage.join("logs/refs/stash");
+    let ref_path = storage.join("refs/stash");
+    let recorded_tip = match fs::read_to_string(&ref_path) {
+        Ok(contents) => Some(contents.trim().to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(StashError::WriteObject(format!(
+                "{}: {error}",
+                ref_path.display()
+            )));
+        }
+    };
+
+    if !log_path.exists() {
+        // No stack. A ref that outlived its log names an entry no `pop` can
+        // ever find; `stash list` shows nothing while `refs/stash` claims a
+        // tip, and a later push would chain onto a line that does not exist.
+        if recorded_tip.is_some() {
+            match fs::remove_file(&ref_path) {
+                Ok(()) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(StashError::WriteObject(format!(
+                        "{}: {error}",
+                        ref_path.display()
+                    )));
+                }
+            }
+        }
+        return Ok(false);
+    }
+
+    let entries = parse_stash_log_entries(read_stash_log_lines(&log_path)?)?;
+    let Some(top) = entries.first() else {
+        // An empty log file is an empty stack.
+        if recorded_tip.is_some() {
+            let _ = fs::remove_file(&ref_path);
+            return Ok(true);
+        }
+        return Ok(false);
+    };
+    let expected = top.stash_id.clone();
+    if recorded_tip.as_deref() == Some(expected.as_str()) {
+        return Ok(false);
+    }
+    if let Some(parent) = ref_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| StashError::WriteObject(format!("{}: {error}", ref_path.display())))?;
+    }
+    crate::utils::atomic_write::write_atomic(&ref_path, format!("{expected}\n").as_bytes(), true)
+        .map_err(|error| StashError::WriteObject(format!("{}: {error}", ref_path.display())))?;
+    Ok(true)
+}
+
 /// RAII guard over the shared stash-STACK mutation lock (W2 §C.4.3):
 /// `refs/stash` + its reflog are repository-shared across worktrees, so every
 /// stack mutation (push/store, drop, pop's drop phase, clear, branch's drop)
@@ -1679,9 +1817,11 @@ fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOu
         return Err(missing(expected_line.is_some()));
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let stash_ref_path = git_dir.join("refs/stash");
+    let git_dir = util::request_storage_path();
+    // §C.10 recovery: a tip left stale by a crash between the two writes is
+    // repaired from the log BEFORE this mutation reads the stack, so the CAS
+    // below never matches against an inconsistent pair.
+    reconcile_stash_ref(&git_dir)?;
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Err(missing(expected_line.is_some()));
@@ -1719,30 +1859,10 @@ fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOu
     let removed_entry = entries.remove(index_to_drop);
     let stash_commit_hash = removed_entry.stash_id;
 
-    if entries.is_empty() {
-        std::fs::remove_file(&stash_log_path)
-            .map_err(|e| StashError::WriteObject(e.to_string()))?;
-        if stash_ref_path.exists() {
-            std::fs::remove_file(&stash_ref_path)
-                .map_err(|e| StashError::WriteObject(e.to_string()))?;
-        }
-    } else {
-        let new_content = entries
-            .iter()
-            .map(|entry| entry.raw_line.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        std::fs::write(&stash_log_path, new_content)
-            .map_err(|e| StashError::WriteObject(e.to_string()))?;
-
-        if index_to_drop == 0
-            && let Some(new_top_entry) = entries.first()
-        {
-            std::fs::write(&stash_ref_path, format!("{}\n", new_top_entry.stash_id))
-                .map_err(|e| StashError::WriteObject(e.to_string()))?;
-        }
-    }
+    // ONE crash-safe publication (§C.10): log first and fsynced, then the tip
+    // derived from it. The old code wrote the log and then conditionally the
+    // ref, so a crash in between left a tip naming a dropped entry.
+    publish_stash_stack(&git_dir, &entries)?;
 
     Ok(StashOutput::Drop {
         index: index_to_drop,
@@ -1790,7 +1910,7 @@ async fn has_changes() -> bool {
         return true;
     }
 
-    let workdir = util::working_dir();
+    let workdir = util::request_working_dir();
     for entry in index.tracked_entries(0) {
         let file_path = workdir.join(&entry.name);
 
@@ -1822,11 +1942,12 @@ async fn has_changes() -> bool {
 }
 
 fn has_stash() -> Result<bool, StashError> {
-    let storage = util::try_get_storage_path(None).map_err(|error| {
-        StashError::ReadObject(format!(
-            "failed to resolve storage while inspecting the stash ref: {error}"
-        ))
-    })?;
+    // §C.4.2: the repository this INVOCATION acts on, like every other stash
+    // path. §C.10: repair a tip left stale by a crash before believing it —
+    // this predicate gates `list`/`pop`/`drop`, so a stale tip here would
+    // report a stack that is not there (or hide one that is).
+    let storage = util::request_storage_path();
+    reconcile_stash_ref(&storage)?;
     let stash_ref = storage.join("refs/stash");
     match fs::symlink_metadata(&stash_ref) {
         Ok(metadata) if metadata.is_file() => Ok(true),
@@ -1978,8 +2099,7 @@ fn resolve_stash_to_commit_hash(
         return Err(StashError::NoStashFound);
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Err(StashError::NoStashFound);
@@ -2036,15 +2156,6 @@ fn update_stash_ref(
         ObjectHash::default()
     };
 
-    if let Some(parent) = stash_ref_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&stash_ref_path, format!("{stash_hash}\n"))?;
-
-    if let Some(parent) = stash_log_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let reflog_entry = format!(
         "{} {} {} <{}> {} {}\t{}",
         old_hash,
@@ -2062,16 +2173,22 @@ fn update_stash_ref(
     } else {
         Vec::new()
     };
-
     lines.insert(0, reflog_entry.clone());
-    let new_content = lines.join("\n") + "\n";
-    fs::write(stash_log_path, new_content)?;
+
+    // ONE crash-safe publication (§C.10): the LOG is written first, atomically
+    // and fsynced, and the tip is derived from it. Writing the ref first — as
+    // this did — meant a crash before the log left `refs/stash` naming an
+    // entry `stash list` could not see and `pop` could not find.
+    let entries = parse_stash_log_entries(lines.clone())
+        .map_err(|error| GitError::CustomError(error.to_string()))?;
+    publish_stash_stack(git_dir, &entries)
+        .map_err(|error| GitError::CustomError(error.to_string()))?;
 
     Ok(reflog_entry)
 }
 
 async fn perform_hard_reset(target_commit_id: &ObjectHash) -> Result<(), String> {
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let index_path = path::index();
 
     let index_before_reset = Index::load(&index_path).unwrap_or_else(|_| Index::new());

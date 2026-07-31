@@ -479,6 +479,11 @@ impl WorkspaceError {
     /// by `worktree_doctor_hints_are_inspect_only`.
     fn hint(&self) -> Option<String> {
         match self {
+            // W0 (Codex R19/R20): `worktree doctor` is a READ-ONLY diagnostic
+            // until W4 lands its explicit mutation subcommands. Hints must not
+            // name `reclaim` / `adopt` / `release` actions that do not exist —
+            // a user who follows one gets an unknown-subcommand error while
+            // still holding the problem the hint promised to solve.
             Self::LeaseHeld(detail) => Some(if detail.path_conflict {
                 "another live workspace already claims this directory; run \
                  `libra worktree doctor` to inspect which one, and have its owner finish \
@@ -1698,9 +1703,13 @@ impl WorkspaceStore {
         // the transaction read-then-write, which two concurrent acquirers
         // cannot resolve without one of them hitting SQLITE_BUSY.
         let identity = RepoIdentity::resolve(conn).await?;
-        let txn = conn.begin().await.map_err(|error| {
-            WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
-        })?;
+        // Reads the existing lease before writing one, so the write lock is
+        // taken up front (`db::begin_write_transaction`).
+        let txn = crate::internal::db::begin_write_transaction(conn)
+            .await
+            .map_err(|error| {
+                WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
+            })?;
         let lease = match Self::acquire_with_conn(&txn, &identity, request, now_ms).await {
             Ok(lease) => lease,
             Err(error) => return Err(rollback_after(txn, error).await),
@@ -1720,9 +1729,13 @@ impl WorkspaceStore {
         now_ms: i64,
     ) -> WorkspaceResult<WorkspaceLease> {
         let identity = RepoIdentity::resolve(conn).await?;
-        let txn = conn.begin().await.map_err(|error| {
-            WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
-        })?;
+        // Reads the existing lease before writing one, so the write lock is
+        // taken up front (`db::begin_write_transaction`).
+        let txn = crate::internal::db::begin_write_transaction(conn)
+            .await
+            .map_err(|error| {
+                WorkspaceError::WriteFailed(format!("cannot open a workspace transaction: {error}"))
+            })?;
         let lease = match Self::reclaim_expired_with_conn(
             &txn,
             &identity,
@@ -2018,6 +2031,51 @@ fn record_from_row(row: &sea_orm::QueryResult) -> WorkspaceResult<WorkspaceRecor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W0 (Codex R19/R20): no user-facing hint may direct the user at a bare
+    /// `libra worktree doctor` MUTATION.
+    ///
+    /// Until W4 delivers the explicit `adopt` / `reclaim` / `release`
+    /// subcommands, doctor is a read-only diagnostic. A hint that promises
+    /// otherwise costs the user a second failure at the moment they are
+    /// already stuck — and, once those subcommands DO land, this test is what
+    /// forces the hints to be updated deliberately rather than by accident.
+    fn lease_held_detail(path_conflict: bool) -> LeaseHeldDetail {
+        LeaseHeldDetail {
+            identity: "ws-identity".to_string(),
+            workspace_id: None,
+            holder: None,
+            state: None,
+            expires_at: None,
+            path_conflict,
+        }
+    }
+
+    #[test]
+    fn doctor_hints_stay_inspect_only() {
+        let forbidden = ["reclaim", "adopt", "release"];
+        let mut checked = 0usize;
+        for error in [
+            WorkspaceError::LeaseHeld(Box::new(lease_held_detail(true))),
+            WorkspaceError::LeaseHeld(Box::new(lease_held_detail(false))),
+            WorkspaceError::Corrupt("workspace registry is unreadable".to_string()),
+            WorkspaceError::NotFound("ws-1".to_string()),
+        ] {
+            let Some(hint) = error.hint() else { continue };
+            checked += 1;
+            if !hint.contains("worktree doctor") {
+                continue;
+            }
+            for word in forbidden {
+                assert!(
+                    !hint.contains(word),
+                    "hint points at a `worktree doctor` mutation that does not exist \
+                     (found {word:?}): {hint}"
+                );
+            }
+        }
+        assert!(checked >= 3, "the hint surface was actually exercised");
+    }
 
     #[test]
     fn db_spellings_round_trip() {

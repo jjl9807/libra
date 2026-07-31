@@ -537,7 +537,7 @@ impl StableErrorCode {
                 "Paths that differ only by case collide on a case-insensitive filesystem."
             }
             Self::LayerConflict => {
-                "A layer overlay path collided with tracked content; a layer may only add                  untracked paths."
+                "A layer overlay path collided with tracked content; a layer may only add untracked paths."
             }
             Self::ObliterateNotFound => "No payload was found for the object to obliterate.",
             Self::ObliteratePacked => {
@@ -1554,6 +1554,13 @@ fn is_conflict_blocked_error(lower: &str) -> bool {
             "multiple root commits",
             "multiple sources moving to the same target path",
             "not under version control",
+            // plan-20260714 §C.13: a branch checked out in another worktree
+            // is a CONFLICT. The phrase is
+            // `internal::branch::CHECKED_OUT_ELSEWHERE_PHRASE`, produced by
+            // exactly one constructor; this arm is the fallback for paths
+            // that never set an explicit code, so no wrapping layer can
+            // silently downgrade the classification.
+            "is checked out at worktree",
         ],
     )
 }

@@ -67,7 +67,19 @@ EXAMPLES:
     libra --json service events            NDJSON event stream for tooling
     curl -H \"X-Libra-Service-Token: $(cat .libra/service/service-token)\" \\
          -X POST http://127.0.0.1:PORT/api/service/dirty/mark \\
-         -d '{\"paths\":[\"src/main.rs\"]}' -H 'content-type: application/json'
+         -d '{\"paths\":[\"src/main.rs\"],\"scope\":{\"kind\":\"main\",\"repo_id\":\"…\"}}' \\
+         -H 'content-type: application/json'
+                                           Name the worktree scope. Main:
+                                           {\"kind\":\"main\",\"repo_id\":\"…\"}. Linked, where
+                                           workdir and epoch are REQUIRED:
+                                           {\"kind\":\"linked\",\"repo_id\":\"…\",
+                                            \"worktree_id\":\"wt-…\",
+                                            \"workdir\":\"/abs/path\",\"epoch\":N}
+                                           `epoch` comes from `worktree list`; it
+                                           fences a request against a worktree
+                                           removed and re-added at the same path.
+                                           A scope-less body is refused in a
+                                           multi-worktree repository.
 
 NOTES:
     Local-only by construction: --host must be a loopback IP; every endpoint
@@ -225,6 +237,194 @@ async fn events_handler(
 #[derive(Debug, Deserialize)]
 struct MarkRequest {
     paths: Vec<String>,
+    /// §C.4.1.1 service contract: which worktree these paths belong to.
+    ///
+    /// A TAGGED scope, not a magic id string: `{"kind":"main"}` or
+    /// `{"kind":"linked","worktree_id":"wt-…"}`. Spelling main as a reserved
+    /// id would mean a corrupt registry with a linked entry literally called
+    /// `main` could redirect an explicit main request into that worktree.
+    ///
+    /// The dirty cache is per-worktree and the service process has its own
+    /// scope, which is not the caller's. A request that names its scope is
+    /// marked in THAT scope; a request without one is still rejected in a
+    /// multi-worktree repository rather than defaulted (see below).
+    #[serde(default)]
+    scope: Option<MarkScope>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum MarkScope {
+    Main {
+        /// The repository the caller believes it is addressing (§C.4.1.1
+        /// composite scope). REQUIRED: a watcher that has drifted onto another
+        /// checkout must fail loudly rather than mark this one, and an
+        /// optional proof is no proof.
+        repo_id: String,
+    },
+    Linked {
+        /// See the `Main` variant — REQUIRED here too.
+        repo_id: String,
+        worktree_id: String,
+        /// The worktree's path as the caller knows it. REQUIRED: instance ids
+        /// are path-derived, so an id alone does not pin down which directory
+        /// the caller meant.
+        workdir: String,
+        /// The registration generation the caller last saw (`worktree list`
+        /// reports it). REQUIRED, and the actual fence: a worktree removed and
+        /// re-added in place keeps both its id and its path, so only the epoch
+        /// distinguishes the successor from the registration this client was
+        /// watching. A request carrying the old one is refused instead of
+        /// marking the successor's cache.
+        epoch: u64,
+    },
+}
+
+/// Validate a requested scope against the registry and return its scope key.
+///
+/// An id the registry does not know is refused: marking paths for a worktree
+/// that does not exist writes rows no worktree will ever read, and silently
+/// succeeding would hide a mis-addressed client. Duplicate linked ids are
+/// refused too — with two entries claiming one id there is no fact of the
+/// matter about which worktree the caller meant.
+/// Prove the request means THIS repository (§C.4.1.1 composite scope).
+///
+/// Called BEFORE the registry lock: everything in `resolve_request_scope` is
+/// about WHICH WORKTREE, and that question only means anything once the
+/// repository agrees — so a request addressed to another checkout is rejected
+/// without ever contending for a lifecycle lock.
+async fn validate_request_repository(scope: &MarkScope) -> Result<(), (StatusCode, String)> {
+    let claimed = match scope {
+        MarkScope::Main { repo_id } | MarkScope::Linked { repo_id, .. } => repo_id.as_str(),
+    };
+    if claimed.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scope.repo_id must be non-empty".to_string(),
+        ));
+    }
+    let actual = crate::internal::config::ConfigKv::get("libra.repoid")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.value)
+        .unwrap_or_default();
+    if actual.is_empty() || actual != claimed {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "this service serves repository '{actual}', not '{claimed}' — the request is \
+                 addressed to a different checkout"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_request_scope(scope: &MarkScope) -> Result<String, (StatusCode, String)> {
+    // Repository identity was proven before the lock — see
+    // `validate_request_repository`. Re-checked here so this function is safe
+    // for any caller, and cheap because it is a config point query.
+    validate_request_repository(scope).await?;
+
+    let registry = crate::utils::util::storage_path().join("worktrees.json");
+    let state = match std::fs::read_to_string(&registry) {
+        Ok(raw) => {
+            crate::command::worktree::WorktreeState::parse(raw.as_bytes()).map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("the worktree registry is unreadable: {error}"),
+                )
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // No registry: a main-only repository. Only the main scope exists.
+            return match scope {
+                MarkScope::Main { .. } => Ok(String::new()),
+                MarkScope::Linked { worktree_id, .. } => Err((
+                    StatusCode::CONFLICT,
+                    format!("worktree '{worktree_id}' is not in this repository's registry"),
+                )),
+            };
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("cannot validate the requested worktree scope: {error}"),
+            ));
+        }
+    };
+
+    // Identity invariants first: a duplicate id, or a linked worktree using the
+    // reserved `main` spelling, means there is no fact of the matter about
+    // which worktree a request names.
+    if let Some(conflict) = state.identity_conflict() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("the worktree registry is inconsistent: {conflict}"),
+        ));
+    }
+    match scope {
+        MarkScope::Main { .. } => Ok(String::new()),
+        MarkScope::Linked {
+            worktree_id,
+            workdir,
+            epoch,
+            ..
+        } => {
+            // Exactly one ACTIVE entry. A detached entry keeps its id so its
+            // rows stay attributable, but it is not a live worktree: matching
+            // it would either reject a request meant for the survivor or write
+            // rows for a directory whose commands all fail closed.
+            let mut matches = state.entries.iter().filter(|entry| {
+                !entry.is_main()
+                    && entry.is_active()
+                    && entry.worktree_id() == Some(worktree_id.as_str())
+            });
+            let found = matches.next();
+            if matches.next().is_some() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "the registry has more than one active worktree with id \
+                         '{worktree_id}'; run `libra worktree doctor`"
+                    ),
+                ));
+            }
+            let Some(entry) = found else {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("worktree '{worktree_id}' is not in this repository's registry"),
+                ));
+            };
+            let canonical =
+                |path: &str| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+            let claimed_path = canonical(workdir);
+            let registered = canonical(entry.registered_path());
+            if claimed_path != registered {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "worktree '{worktree_id}' is registered at '{}', not '{}'",
+                        registered.display(),
+                        claimed_path.display()
+                    ),
+                ));
+            }
+            if entry.epoch() != *epoch {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!(
+                        "worktree '{worktree_id}' is at registration {}, not {epoch} — it was \
+                         removed and re-added since this client last looked; re-read \
+                         `libra worktree list` before marking",
+                        entry.epoch()
+                    ),
+                ));
+            }
+            Ok(worktree_id.clone())
+        }
+    }
 }
 
 async fn dirty_mark_handler(
@@ -238,51 +438,65 @@ async fn dirty_mark_handler(
     if request.paths.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "paths must be non-empty".into()));
     }
-    // §C.4.1.1 service contract: a legacy request carries only `paths` — in
-    // a multi-worktree repository it is REJECTED rather than defaulted to
-    // the service process's own scope (the dirty cache is per-worktree and
-    // the caller's worktree is unknown). Scope-carrying requests arrive with
-    // the composite-dispatcher work (W4-adjacent).
-    let registry = crate::utils::util::storage_path().join("worktrees.json");
-    match std::fs::read_to_string(&registry) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // No registry file: single (main-only) worktree repository.
-        }
-        Ok(raw) => {
-            // Parse the registry with the REAL persisted schema (the same
-            // `WorktreeState` type `libra worktree` writes) and only accept
-            // a validated single-main state. Everything else fails closed:
-            // deserialization failures (syntactically invalid JSON, `[null]`,
-            // entries missing required fields like `is_main`/`locked`) AND
-            // deserializable-but-corrupt shapes (an empty worktree list or a
-            // sole non-main entry — the real loader treats those as needing
-            // main-entry repair). Never guess the scope.
-            let single_main = crate::command::worktree::WorktreeState::parse(raw.as_bytes())
-                .is_ok_and(|state| state.is_single_main());
-            if !single_main {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "dirty-mark requests without a worktree scope are rejected in a \
-                     multi-worktree repository; run `libra dirty <paths>` in the \
-                     target worktree instead"
-                        .into(),
-                ));
-            }
-        }
-        Err(_) => {
-            // Unreadable registry: fail closed for the same reason.
+    // §C.4.1.1 service contract: a scope-carrying request is marked in the
+    // scope it names, once that scope is VALIDATED against the registry — an
+    // unknown id would otherwise create dirty rows for a worktree that does
+    // not exist, invisible to every real one. A legacy request carries only
+    // `paths` and is still REJECTED in a multi-worktree repository rather than
+    // defaulted to the service process's own scope.
+    //
+    // A scope-LESS request is still refused in a multi-worktree repository:
+    // the dirty cache is per-worktree and the caller's scope is unknown.
+    if request.scope.is_none() {
+        let registry = crate::utils::util::storage_path().join("worktrees.json");
+        let single_main = match std::fs::read_to_string(&registry) {
+            // No registry file: a main-only repository.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Ok(raw) => crate::command::worktree::WorktreeState::parse(raw.as_bytes())
+                .is_ok_and(|state| state.is_single_main()),
+            // Unreadable: fail closed for the same reason.
+            Err(_) => false,
+        };
+        if !single_main {
             return Err((
                 StatusCode::CONFLICT,
-                "the worktree registry is unreadable; scope-less dirty-mark \
-                 requests are rejected — run `libra dirty <paths>` in the \
-                 target worktree instead"
+                "dirty-mark requests without a worktree scope are rejected in a multi-worktree \
+                 repository (or when the registry is unreadable); name the scope, or run \
+                 `libra dirty <paths>` in the target worktree"
                     .into(),
             ));
         }
     }
+
     let workdir_relative: Vec<PathBuf> = request.paths.iter().map(util::to_workdir_path).collect();
-    // The owner API enforces the repo-escape gate (whole batch refused).
-    match DirtyCache::mark_paths(&workdir_relative).await {
+
+    // Repository identity is proven BEFORE the registry lock: a stale or
+    // cross-repository client must not be able to contend with `worktree
+    // add/remove/move` on its way to being rejected.
+    if let Some(scope) = request.scope.as_ref() {
+        validate_request_repository(scope).await?;
+    }
+
+    // Registry-ENTRY validation and the write then happen under ONE
+    // registry-lock hold, and the write is a SINGLE transaction over the whole
+    // batch — bounded work, so the lock cannot be held for an unbounded time by
+    // a large request. An earlier design released the lock and compensated
+    // afterwards; that could delete a legitimate successor's identical mark,
+    // because a withdrawal keyed by scope and path cannot tell whose row it is.
+    let marked = match request.scope.as_ref() {
+        Some(scope) => {
+            let _registry = crate::command::worktree::acquire_registry_lock().map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("cannot take the worktree registry lock: {error}"),
+                )
+            })?;
+            let scope_key = resolve_request_scope(scope).await?;
+            DirtyCache::mark_paths_in_scope(&scope_key, &workdir_relative).await
+        }
+        None => DirtyCache::mark_paths(&workdir_relative).await,
+    };
+    match marked {
         Ok(stored) => {
             state
                 .bus

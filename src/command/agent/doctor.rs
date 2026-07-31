@@ -2183,6 +2183,14 @@ async fn scan_agent_findings(
                 .filter(|bytes| blob_oid_hex(bytes) == findings_oid);
             if let Some(bytes) = recoverable {
                 let (repaired, detail) = if repair {
+                    // §C.4.3 writer-vs-deleter: rewriting the blob and
+                    // re-inserting its `object_index` row is a PUBLICATION,
+                    // and `agent` is excluded from the command-level shared
+                    // hold (its runs are long). Without this the repair could
+                    // land inside a deletion phase and be pruned right back
+                    // out — repairing the same run forever.
+                    let _publication =
+                        crate::internal::maintenance_lock::MaintenanceLock::shared(&repo_path)?;
                     crate::utils::object::write_git_object(&repo_path, "blob", bytes).map_err(
                         |e| {
                             CliError::fatal(format!(

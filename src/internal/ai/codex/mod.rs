@@ -991,17 +991,29 @@ fn build_plan_text(explanation: Option<&String>, plan_steps: &[TurnPlanStep]) ->
 /// # Arguments
 /// * `working_dir` — 代理的工作目录，用于定位 `.libra/` 存储路径。
 pub async fn init_mcp_server(working_dir: &Path) -> Arc<LibraMcpServer> {
-    let storage_dir = try_get_storage_path(Some(working_dir.to_path_buf())).unwrap_or_else(|error| {
-        // Part C §C.4.1: annotate the degrade fallback so a phantom storage root
-        // (a linked worktree with a broken `commondir`) is diagnosable rather
-        // than silently routing db/objects at `<working_dir>/.libra`.
-        tracing::warn!(
-            working_dir = %working_dir.display(),
-            %error,
-            "storage-root resolution failed for the MCP server; falling back to <working_dir>/.libra — run `libra worktree repair <worktree-path>` for a linked worktree"
-        );
-        working_dir.join(".libra")
-    });
+    // Part C §C.4.1: a `<working_dir>/.libra` fallback does not degrade the
+    // session, it creates a SECOND repository — a fresh `libra.db` and
+    // `objects/` beside the real ones, which then collect history the actual
+    // repository never sees. Degrade to the read-only server instead, the
+    // same way this function already handles an unopenable directory or
+    // database.
+    let storage_dir = match try_get_storage_path(Some(working_dir.to_path_buf())) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                %error,
+                "storage-root resolution failed for the MCP server; running read-only rather \
+                 than minting a phantom <working_dir>/.libra — run `libra worktree repair \
+                 <worktree-path>` for a linked worktree"
+            );
+            return Arc::new(LibraMcpServer::new_with_working_dir(
+                None,
+                None,
+                working_dir.to_path_buf(),
+            ));
+        }
+    };
     let (objects_dir, dot_libra) = (storage_dir.join("objects"), storage_dir);
 
     // Try to create the directory

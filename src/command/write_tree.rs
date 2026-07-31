@@ -72,6 +72,18 @@ pub async fn execute_safe(args: WriteTreeArgs, output: &OutputConfig) -> CliResu
         })?
     };
 
+    // lore.md 2.4 / §C.11 W1: the plumbing route into history.
+    // `commit` has its own guard, but `write-tree` → `commit-tree` →
+    // `update-ref` reaches a published branch without ever passing through it —
+    // and a materialized layer overlay's content lives OUTSIDE the repository,
+    // so publishing it produces a commit the repository cannot reproduce. The
+    // tree is where the index stops being local, so the guard belongs here too.
+    crate::internal::layer::reject_layer_owned_entries(&index, "to write a tree")
+        .await
+        .map_err(|message| {
+            CliError::fatal(message).with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+
     let tree = tree_plumbing::write_tree_from_index_with(&index, args.missing_ok)
         .map_err(map_tree_plumbing_error)?;
 

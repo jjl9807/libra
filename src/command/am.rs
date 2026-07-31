@@ -206,6 +206,14 @@ impl AmState {
             .map_err(|error| am_state_error(format!("failed to save am state: {error}")))
     }
 
+    /// The first persistence of a STARTING series, as an atomic claim.
+    async fn claim_start(&self) -> CliResult<()> {
+        let sequence = self.to_sequence()?;
+        sequencer::claim_start_am(&sequence)
+            .await
+            .map_err(am_state_error)
+    }
+
     async fn load() -> CliResult<Option<Self>> {
         match sequencer::load_am()
             .await
@@ -282,7 +290,8 @@ async fn start_am(paths: &[String], three_way: bool, output: &OutputConfig) -> C
             paused_in_conflict: false,
         },
     };
-    state.save().await?;
+    // The first write of a STARTING series is a claim, not a replace (§C.4.4).
+    state.claim_start().await?;
     if test_failpoint_enabled("LIBRA_TEST_AM_FAIL_AFTER_STATE") {
         return Err(am_state_error(
             "test-injected am interruption after saving initial state".to_string(),
@@ -769,7 +778,9 @@ async fn run_applypatch_msg_hook(
     mail: &MailPatch,
     output: &OutputConfig,
 ) -> CliResult<Option<String>> {
-    let message_path = util::try_get_worktree_gitdir(None)
+    // §C.4.3: the hook's writable buffer belongs to the worktree this `am` is
+    // acting on, resolved from the pinned workdir rather than the cwd.
+    let message_path = util::request_worktree_gitdir()
         .map(|gitdir| gitdir.join("COMMIT_EDITMSG"))
         .map_err(|error| {
             am_state_error(format!(

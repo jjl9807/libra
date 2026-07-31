@@ -1161,6 +1161,10 @@ fn map_checkout_error(source: RestoreError) -> CliError {
 
 fn map_local_branch_state_error(source: branch::BranchStoreError) -> CliError {
     match source {
+        branch::BranchStoreError::AlreadyExists(name) => {
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
         branch::BranchStoreError::Query(detail) => {
             CliError::fatal(format!(
                 "failed to inspect local branch state after fetch: {detail}"
@@ -1183,6 +1187,15 @@ fn map_local_branch_state_error(source: branch::BranchStoreError) -> CliError {
             "failed to inspect local branch state after fetch: failed to delete branch '{name}': {detail}"
         ))
         .with_stable_code(StableErrorCode::IoWriteFailed),
+        // §C.13 LBR-CONFLICT-002.
+        branch::BranchStoreError::CheckedOutElsewhere { .. } => CliError::fatal(format!(
+            "failed to inspect local branch state after fetch: {source}"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint(
+            "the other worktree must switch away first; `libra worktree list` shows which one \
+             holds it",
+        ),
     }
 }
 
@@ -1347,7 +1360,12 @@ pub async fn execute_safe(mut args: CloneArgs, output: &OutputConfig) -> CliResu
     }
 
     let original_dir = util::cur_dir();
+    // §C.4.2: same as `init` — the target repository does not exist yet, and
+    // clone creates it, enters it and checks out INSIDE it. A pin from an
+    // enclosing repository would send the checkout's index write there.
+    let scope = crate::internal::worktree_scope::WorktreeScope::unpinned();
     let (result, cleanup_warning) = execute_clone(&args, &original_dir, output).await;
+    drop(scope);
 
     // Always restore the working directory.
     if env::current_dir().ok().as_ref() != Some(&original_dir) {
@@ -3694,7 +3712,9 @@ pub(crate) async fn setup_repository(
                         None,
                     )
                     .await?;
-                    Head::update_with_conn(txn, Head::Branch(branch_name.to_owned()), None).await;
+                    Head::update_result_with_conn(txn, Head::Branch(branch_name.to_owned()), None)
+                        .await
+                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?;
 
                     let merge_ref = format!("refs/heads/{}", branch_name);
                     let _ = ConfigKv::set_with_conn(

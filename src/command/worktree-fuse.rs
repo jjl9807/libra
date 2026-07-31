@@ -27,7 +27,10 @@ mod legacy;
 // `worktree-fuse` feature routed compilation through this file or directly
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
-pub(crate) use legacy::{WorktreeError, WorktreeState, acquire_registry_lock, run_list_worktrees};
+pub(crate) use legacy::{
+    WorktreeError, WorktreeState, acquire_registry_lock, registry_knows_linked_worktree,
+    run_list_worktrees,
+};
 
 const FUSE_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 const FUSE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -92,6 +95,12 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         porcelain: bool,
     },
+    /// Report per-worktree scope diagnostics. STRICTLY READ-ONLY (W0 §C.11).
+    ///
+    /// Kept in parity with the non-FUSE build's subcommand set: this file
+    /// re-declares the whole enum, so a command added there is simply absent
+    /// here unless it is added here too.
+    Doctor,
     Lock {
         /// Filesystem path of the worktree to lock.
         path: String,
@@ -261,6 +270,15 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     let command = args.command;
     if !matches!(&command, WorktreeSubcommand::Umount { .. }) {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    }
+    // W0 §C.11: `doctor` is read-only, and applying migrations is a write.
+    // Kept in parity with the non-FUSE entry point, which makes the same
+    // exclusion — this file re-declares the dispatch, so the exclusion has
+    // to be re-stated or the FUSE build quietly upgrades what it diagnoses.
+    if !matches!(
+        &command,
+        WorktreeSubcommand::Umount { .. } | WorktreeSubcommand::Doctor
+    ) {
         // §C.7 ordering (same as the legacy entry point): apply pending
         // migrations — including the registry-v2 capability marker — before
         // any registry IO, and refuse a future-schema database gracefully.
@@ -323,6 +341,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             }
         }
         WorktreeSubcommand::List { porcelain } => list_all_worktrees(output, porcelain).await,
+        WorktreeSubcommand::Doctor => legacy::run_worktree_doctor(output).await,
         WorktreeSubcommand::Lock { path, reason } => {
             if lock_fuse_worktree(&path, reason.clone())
                 .map_err(|e| CliError::fatal(e.to_string()))?

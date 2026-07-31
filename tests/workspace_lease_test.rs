@@ -21,6 +21,9 @@ use libra::internal::{
     },
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+// Only the failpoint tests below are serialized, and those exist in debug
+// builds only — importing it unconditionally warns in a release build.
+#[cfg(debug_assertions)]
 use serial_test::serial;
 use tempfile::TempDir;
 

@@ -9,6 +9,7 @@
 ```
 libra worktree add <path>
 libra worktree list
+libra worktree doctor
 libra worktree lock <path> [--reason <text>]
 libra worktree unlock <path>
 libra worktree move <src> <dest>
@@ -24,7 +25,9 @@ libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 
 `libra worktree` 管理共享同一个仓库数据库和对象存储的多个工作树。这允许你同时拥有同一仓库的多个 checkout，适用于同时处理多个分支、编辑代码时运行构建，或隔离测试更改。
 
-每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；运行 `libra worktree repair` 检查。）registry 文件 `worktrees.json` 自 v0.19.57 起带版本号（`schema_version: 2`）：每个 linked 条目持久化其 stable `worktree_id`；旧 v1 文件在首个**变更类** worktree 命令时就地升级（id 从各 gitdir 回填，`worktree list` 等无锁读取不会重写文件）；旧版二进制在数据库层被拒绝，无法误读或重写 v2 文件。
+每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；运行 `libra worktree repair` 检查。）registry 文件 `worktrees.json` 带版本号（当前 `schema_version: 3`；v2 自 v0.19.57 起）：每个 linked 条目持久化其 stable `worktree_id`；旧 v1 文件在首个**变更类** worktree 命令时就地升级（id 从各 gitdir 回填，`worktree list` 等无锁读取不会重写文件）；旧版二进制在数据库层被拒绝，无法误读或重写该文件。v3 新增持久的**注册代次**——registry 上的 `epoch_counter` 与每个条目的 `epoch`（`worktree list` 输出）。instance id 由路径推导，因此原地 remove/re-add 后的 worktree 与前一次注册同 id、同路径；代次是区分两次注册的唯一依据，`libra service` 的 dirty-mark 端点将其作为 fence 强制要求。v2 时代的二进制会解析 v3 文件并在重写时丢弃代次，故 v3 capability marker 在 connect 时拒绝这些二进制；同理，只要仍有存活代次，该 migration 不允许回滚。
+
+**消解 registry 身份冲突。** 旧版二进制可能留下两个条目占用同一个由路径推导出的身份（`add A` → `move A B` → `add A`）。此时**所有**变更类 worktree 操作都被拒绝——包括本该用来修复的 `remove`，因为它走同一个 loader。`libra worktree doctor` 会指出冲突条目，而 `libra worktree repair <path> --resolve-identity --yes` 是唯一能在冲突 registry 上运行的动作：它把指定条目**detach**（文件与 scoped 状态保留，该目录内所有命令 fail closed），让剩下的那个重新独占身份。随后可用 `worktree remove --delete-dir <path>` 收尾，或 `worktree add <path>` 重新挂回。
 
 Worktree 元数据持久化在 `.libra` 存储目录内的 `worktrees.json` 文件中。每个条目记录文件系统路径、它是否是主工作树、锁定状态，以及可选锁定原因。状态文件通过临时文件重命名原子写入，以防损坏。
 
@@ -71,6 +74,28 @@ libra --machine worktree list
 ```
 
 结构化输出使用 `worktree.list` 命令信封。每个条目报告 `kind`、`path`、`is_main`、`locked`、`lock_reason`，以及该路径当前是否存在于磁盘上。
+
+### 子命令：`doctor`
+
+报告每个 worktree 的 scope 诊断。**严格只读**（plan-20260714 Part C W0 §C.11）：
+调用前后 registry、数据库、lease 状态与文件系统逐字节不变。诊断命令必须能安全地
+在一个你尚未理解的仓库上运行——那正是你会用到它的时刻——所以它绝不自行 adopt、
+reclaim 或修复。修复动作是独立的显式子命令；任何错误提示都不会承诺裸 `doctor`
+会修好什么。
+
+```bash
+libra worktree doctor
+libra --json worktree doctor
+```
+
+对每个 worktree 报告磁盘 `layout` 与生命周期 `state`（与 `worktree list` 同一套
+取值）、该 worktree 自身的身份是否仍为 registry 所知（`identity_registered`），
+以及逐条说明处置方式的 `findings` 列表——例如 legacy-symlink 布局需要
+`worktree repair --migrate-layout`，或 `.libra/worktree_id` 与 registry 不符的
+worktree 需要先 `worktree repair` 才会接受 mutation。
+
+结构化输出使用 `worktree.doctor` 命令信封，含 `schema_version`、`diagnostics[]`
+与 `next_cursor`（当前恒为 `null`；分页随 W4 机器接口交付）。
 
 ### 子命令：`lock`
 

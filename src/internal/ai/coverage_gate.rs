@@ -27,9 +27,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
 
 use crate::internal::ai::{
     history::{TracesCommitCtx, TracesTxnExtra},
@@ -473,8 +471,9 @@ async fn reserve_turn_claims_for_channel_inner(
     // ADR-DR-19: reserve the complete snapshot under one SQLite writer
     // transaction and establish the tombstone barrier before any claim
     // mutation. This closes both fresh-INSERT and re-own races with erasure.
-    let txn = conn
-        .begin()
+    // Reads the tombstone barrier before it writes the claim, so the write
+    // lock is taken up front (`db::begin_write_transaction`).
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin coverage reservation transaction")?;
     let writable = txn

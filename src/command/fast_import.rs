@@ -43,8 +43,7 @@ use git_internal::{
     },
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set,
-    Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, Set, Statement,
 };
 
 use crate::{
@@ -754,18 +753,28 @@ impl<R: BufRead> Importer<R> {
         // current worktree, so importing into this worktree's own branch stays
         // allowed.
         for refname in pending_refs.keys() {
-            if let Some(branch) = refname.strip_prefix("refs/heads/")
-                && let Some(other) =
-                    crate::internal::head::Head::branch_checked_out_elsewhere(branch).await
-            {
+            let Some(branch) = refname.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            // §C.4.4: fail CLOSED — a probe failure must not read as
+            // "no other worktree has it" right before a batch ref rewrite.
+            let checked_out =
+                crate::internal::head::Head::branch_checked_out_elsewhere_result(branch)
+                    .await
+                    .map_err(|error| {
+                        self.fatal(&format!(
+                            "cannot determine whether branch '{branch}' is checked out in \
+                             another worktree: {error}"
+                        ))
+                    })?;
+            if let Some(other) = checked_out {
                 return Err(self.fatal(&format!(
                     "cannot import into branch '{branch}': it is checked out at worktree '{other}'"
                 )));
             }
         }
         let db = get_db_conn_instance().await;
-        let written = db
-            .transaction(|txn| {
+        let written = crate::internal::db::write_transaction(&db, |txn| {
                 Box::pin(async move {
                     let mut written = 0u64;
                     for (refname, oid) in &pending_refs {
@@ -878,9 +887,9 @@ impl<R: BufRead> Importer<R> {
                     written += note_refs.len() as u64;
                     Ok::<u64, DbErr>(written)
                 })
-            })
-            .await
-            .map_err(|error| self.fatal(&format!("failed to publish refs atomically: {error}")))?;
+        })
+        .await
+        .map_err(|error| self.fatal(&format!("failed to publish refs atomically: {error}")))?;
         self.pending_refs.clear();
         self.pending_notes.clear();
         self.pending_note_replacements.clear();

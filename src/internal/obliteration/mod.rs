@@ -184,22 +184,34 @@ static TOMBSTONE_SNAPSHOT: std::sync::RwLock<Option<std::collections::HashSet<St
 /// start of any read-only pass that must distinguish intentional absence from
 /// corruption — e.g. fsck).
 pub async fn refresh_snapshot() {
+    let _ = refresh_snapshot_result().await;
+}
+
+/// [`refresh_snapshot`], but surfacing the load failure.
+///
+/// The infallible form treats an unreadable tombstone table as "nothing is
+/// obliterated", which is the WRONG default for any caller that materializes
+/// bytes: it would resurrect an obliterated object into the working tree and
+/// call it success. Callers that write must use this and fail closed;
+/// diagnostic readers (fsck) may keep the lenient form, where an empty
+/// snapshot only costs a less precise message.
+pub async fn refresh_snapshot_result() -> Result<(), sea_orm::DbErr> {
     let db = get_db_conn_instance().await;
     let stmt = Statement::from_string(
         DbBackend::Sqlite,
         "SELECT oid FROM object_obliteration".to_string(),
     );
-    let set: std::collections::HashSet<String> = match db.query_all(stmt).await {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|row| row.try_get_by_index::<String>(0).ok())
-            .collect(),
-        Err(_) => std::collections::HashSet::new(),
-    };
+    let set: std::collections::HashSet<String> = db
+        .query_all(stmt)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.try_get_by_index::<String>(0).ok())
+        .collect();
     let mut guard = TOMBSTONE_SNAPSHOT
         .write()
         .unwrap_or_else(|poison| poison.into_inner());
     *guard = Some(set);
+    Ok(())
 }
 
 /// SYNC: is `hash` intentionally absent (a tombstone exists in either state)?
@@ -264,6 +276,31 @@ pub fn classify_presence(hash: &ObjectHash) -> ObjectPresence {
 /// Physically delete the loose payload (idempotent) and purge the durable tier
 /// + in-memory cache via the storage layer. Never touches packs.
 pub async fn delete_payload(hash: &ObjectHash) -> CliResult<()> {
+    // W0 §C.11 release gate: the borrower gate belongs HERE, at the unlink,
+    // not only in `run_obliterate`. Crash recovery (`--recover`, and the
+    // recovery pass `run_obliterate` itself performs BEFORE its own check)
+    // reaches this function without passing that check, so a borrower that
+    // registered after an interrupted obliteration could have an object it
+    // still needs deleted out from under it. Re-checking here is cheap and
+    // makes the gate impossible to route around.
+    // §C.4.3 writer-vs-deleter, same reasoning and the same lock as `gc`:
+    // the unlink must not overlap a publisher. Obliteration REFUSES rather
+    // than defers — reporting an erasure the user asked for as done while
+    // skipping it is the one outcome worse than failing — and the guard is
+    // held until this function returns, covering the durable-tier purge too.
+    //
+    // Taken BEFORE the borrower gate, not after: registering a borrower is a
+    // publication, so a gate evaluated outside the hold can be overtaken by
+    // an `alternates add` that lands before the unlink.
+    let _deletion_lock = crate::internal::maintenance_lock::MaintenanceLock::exclusive_or_refuse(
+        &crate::utils::util::storage_path(),
+        "delete an obliterated object's payload",
+    )?;
+    crate::internal::alternates::ensure_no_live_borrowers(
+        "delete an obliterated object's payload",
+        // A borrowed store is a conflict, not a missing confirmation.
+        StableErrorCode::ConflictOperationBlocked,
+    )?;
     // Local loose file.
     if let Some(path) = loose_payload_path(hash)
         && let Err(e) = std::fs::remove_file(&path)

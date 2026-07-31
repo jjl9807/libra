@@ -224,7 +224,10 @@ fn write_with_backup(
 /// worktrees merging same-named files must not overwrite or clean up each
 /// other's backups — the file being backed up belongs to THIS worktree.
 fn backup_path(current_path: &str) -> Option<PathBuf> {
-    let gitdir = util::try_get_worktree_gitdir(None).ok()?;
+    // §C.4.2: the backup belongs to the worktree this INVOCATION acts on.
+    // Resolving from the cwd would drop worktree A's backup into worktree B
+    // whenever something moved the process cwd between the two.
+    let gitdir = util::request_worktree_gitdir().ok()?;
     let sanitized = current_path.replace(['/', '\\'], "_");
     Some(gitdir.join("merge-file-backup").join(sanitized))
 }

@@ -720,7 +720,18 @@ async fn switch_branch_with_output(
     // branch checked out in two worktrees. `branch_checked_out_elsewhere` only
     // returns Some when a real collision exists, so single-worktree repos are
     // unaffected and the flag is a silent no-op there.
-    if let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await {
+    let checked_out = Head::branch_checked_out_elsewhere_result(branch_name)
+        .await
+        .map_err(|error| {
+            CheckoutError::DelegatedCli(
+                crate::utils::error::CliError::fatal(format!(
+                    "cannot determine whether branch '{branch_name}' is checked out in another \
+                     worktree: {error}"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt),
+            )
+        })?;
+    if let Some(other) = checked_out {
         let hint = if ignore_other_worktrees {
             "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
              checked out in two worktrees): check out a different branch, or use --detach"

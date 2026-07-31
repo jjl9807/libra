@@ -6912,3 +6912,175 @@ fn quote_path_always_escapes_control_bytes() {
     );
     assert_eq!(quote_pathname(Path::new("café.txt"), false), "café.txt");
 }
+
+/// §B.4.3: the four VALID short clusters all work, and every one of them
+/// selects the format its letters name.
+///
+/// The existing cluster tests all exercise argv that clap REJECTS (`-bus`,
+/// `-buz` fail on `-u`'s value), so they prove the arity table is consulted
+/// but never that a successful cluster reaches the right renderer. These do:
+/// each of `-bz`, `-zb`, `-sz`, `-zs` must produce NUL-separated short
+/// output, in either letter order.
+#[test]
+fn valid_short_clusters_select_short_and_nul() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    fs::write(repo.path().join("b.txt"), "new\n").unwrap();
+
+    for cluster in ["-bz", "-zb", "-sz", "-zs"] {
+        let out = run_libra_command(&["status", cluster], repo.path());
+        assert!(
+            out.status.success(),
+            "`status {cluster}` must be accepted: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains('\0'),
+            "`{cluster}` includes -z, so records are NUL-separated: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains('\n'),
+            "`{cluster}` must not also emit newlines: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("?? b.txt"),
+            "`{cluster}` renders the short format: {stdout:?}"
+        );
+    }
+}
+
+/// §B.4.3: after `--`, a token that LOOKS like `--find-renames=…` is a
+/// pathspec and must be neither collected as an occurrence nor rewritten.
+#[test]
+fn find_renames_after_double_dash_is_a_pathspec() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    // A file whose name is exactly the flag spelling.
+    let literal = "--find-renames=505";
+    fs::write(repo.path().join(literal), "literal\n").unwrap();
+
+    // Untracked, so `status -- <literal>` reports it and nothing else.
+    let out = run_libra_command(&["status", "--porcelain", "--", literal], repo.path());
+    assert!(
+        out.status.success(),
+        "a pathspec after `--` must not be parsed as a flag: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(literal),
+        "the literal path is reported: {stdout:?}"
+    );
+
+    // And an INVALID raw value after `--` is still just a path — it must not
+    // reach the threshold parser and fail the command.
+    fs::write(repo.path().join("--find-renames=bogus"), "literal\n").unwrap();
+    let out = run_libra_command(
+        &["status", "--porcelain", "--", "--find-renames=bogus"],
+        repo.path(),
+    );
+    assert!(
+        out.status.success(),
+        "an invalid raw value after `--` is a path, not a flag: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// §B.4.3: argv is `OsString`, so a non-UTF-8 argument does not abort the
+/// process — and an invalid raw threshold that a LATER flag overrides is
+/// never interpreted at all.
+///
+/// `env::args()` panics on invalid Unicode, so before this the command died
+/// with a Rust panic message for an ordinary pathspec naming a file whose
+/// name is not UTF-8.
+#[cfg(unix)]
+#[test]
+fn non_utf8_arguments_do_not_abort_the_process() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    let bad = OsString::from_vec(vec![0xff, 0xfe]);
+
+    // A non-UTF-8 `--find-renames` value that a later occurrence overrides:
+    // last-one-wins means it is never interpreted, so this must SUCCEED.
+    let mut find = OsString::from("--find-renames=");
+    find.push(&bad);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .arg("status")
+        .arg(&find)
+        .arg("--find-renames=80")
+        .arg("--porcelain")
+        .current_dir(repo.path())
+        .output()
+        .expect("run libra");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a non-UTF-8 argument must not panic: {stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "an overridden invalid value is never interpreted: {stderr}"
+    );
+
+    // The same value as the WINNER is a clean usage error, not a panic.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .arg("status")
+        .arg("--find-renames=80")
+        .arg(&find)
+        .current_dir(repo.path())
+        .output()
+        .expect("run libra");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && !stderr.contains("panicked"),
+        "the winning invalid value fails cleanly: {stderr}"
+    );
+    assert!(stderr.contains("not valid UTF-8"), "and says why: {stderr}");
+
+    // A non-UTF-8 PATHSPEC is refused by the parser — `StatusArgs.pathspec`
+    // is `String` and stays that way, because the card requires the public
+    // type to keep source compatibility. What matters is that the refusal is
+    // a clean usage error and NOT a panic, which is what it used to be.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .arg("status")
+        .arg("--porcelain")
+        .arg("--")
+        .arg(&bad)
+        .current_dir(repo.path())
+        .output()
+        .expect("run libra");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "a non-UTF-8 pathspec must not panic: {stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-CLI-002"),
+        "it is a usage error, with a stable code: {stderr}"
+    );
+}
+
+/// A root global AFTER the subcommand is accepted, and its attached value is
+/// not read as a short cluster (`libra status -J=ndjson`).
+///
+/// The argv scan interprets clusters from an arity table; when that table
+/// omitted the root globals, `ndjson` scanned as a cluster and its `s` looked
+/// like `--short`, which the scan-vs-parser agreement check then refused.
+#[test]
+fn global_after_subcommand_is_not_scanned_as_a_cluster() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    let out = run_libra_command(&["status", "-J=ndjson"], repo.path());
+    assert!(
+        out.status.success(),
+        "`status -J=ndjson` must be accepted: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc: serde_json::Value =
+        serde_json::from_str(stdout.lines().next().expect("ndjson line")).expect("ndjson envelope");
+    assert_eq!(doc["command"], "status");
+    assert!(
+        !stdout.contains('\0'),
+        "no NUL records — nothing selected the short format: {stdout:?}"
+    );
+}

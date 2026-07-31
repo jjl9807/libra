@@ -206,6 +206,83 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
     Ok(conn)
 }
 
+/// The one statement that turns SQLite's DEFERRED `BEGIN` into a write
+/// transaction without writing anything: any DML acquires the database write
+/// lock before it evaluates its `WHERE`, so a clause that matches no row still
+/// takes the lock and still changes nothing. `config_kv` is created by the
+/// bootstrap schema, so it exists in every repository database.
+const ACQUIRE_WRITE_LOCK_SQL: &str = "UPDATE `config_kv` SET `id` = `id` WHERE 0";
+
+/// Begin a transaction that already holds SQLite's write lock.
+///
+/// SQLite will NOT run the busy handler for a transaction that holds a read
+/// lock and then asks for the write lock: two such upgraders could deadlock
+/// each other, so it returns `SQLITE_BUSY` ("database is locked") immediately
+/// and `busy_timeout` never applies. A transaction that reads before it writes
+/// — the natural shape of "look up the ref, then move it" — therefore FAILS
+/// outright whenever another process happens to be writing, instead of waiting
+/// its turn. Two worktrees rebasing at the same moment hit exactly this.
+///
+/// sea-orm cannot emit `BEGIN IMMEDIATE` for SQLite (`set_transaction_config`
+/// warns and ignores both isolation level and access mode), so the equivalent
+/// is a no-op write as the transaction's FIRST statement: the lock is acquired
+/// while no read lock is held, which is the case the busy handler DOES cover,
+/// so a losing writer queues for its `busy_timeout` instead of erroring.
+///
+/// Use this for any transaction that reads before it writes. A transaction
+/// whose first statement is already a write needs nothing.
+pub async fn begin_write_transaction<C: TransactionTrait>(
+    db: &C,
+) -> Result<sea_orm::DatabaseTransaction, DbErr> {
+    let txn = db.begin().await?;
+    // Every failure propagates, including a missing `config_kv`. Swallowing
+    // that one would silently downgrade to a deferred transaction in exactly
+    // the database that most needs reporting: the bootstrap creates the table
+    // and the upgrade path ensures it before any migration runs, so a
+    // current-schema repository without it is corrupt — and a
+    // schema-compatible open returns early without repairing it. A named
+    // failure beats intermittent "database is locked" on every read-then-write
+    // command.
+    if let Err(err) = txn.execute_unprepared(ACQUIRE_WRITE_LOCK_SQL).await {
+        let _ = txn.rollback().await;
+        return Err(err);
+    }
+    Ok(txn)
+}
+
+/// [`ConnectionTrait::transaction`] with the write lock taken up front.
+///
+/// Same shape and same `TransactionError` mapping as sea-orm's own, so a call
+/// site converts by replacing `db.transaction(...)` with
+/// `db::write_transaction(&db, ...)`. Use it wherever the closure reads before
+/// it writes — see [`begin_write_transaction`] for why that ordering fails
+/// instead of waiting.
+pub async fn write_transaction<C, F, T, E>(db: &C, callback: F) -> Result<T, TransactionError<E>>
+where
+    C: TransactionTrait,
+    F: for<'c> FnOnce(
+            &'c sea_orm::DatabaseTransaction,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'c>,
+        > + Send,
+    T: Send,
+    E: std::error::Error + Send,
+{
+    let txn = begin_write_transaction(db)
+        .await
+        .map_err(TransactionError::Connection)?;
+    match callback(&txn).await {
+        Ok(value) => {
+            txn.commit().await.map_err(TransactionError::Connection)?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = txn.rollback().await;
+            Err(TransactionError::Transaction(err))
+        }
+    }
+}
+
 /// Get global database connection instance for the current repository.
 ///
 /// Functional scope: discovers `.libra/libra.db` via [`path::database`] and
@@ -725,6 +802,89 @@ mod tests {
         }
     }
 
+    /// The defect `begin_write_transaction` exists for, and the fix, on ONE
+    /// database file through two independent connections — which is what two
+    /// processes in two worktrees are.
+    ///
+    /// Both halves must run: without the first, the second proves nothing (a
+    /// transaction that never contends succeeds either way), and without the
+    /// second, the first is just a description of SQLite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_read_then_write_transaction_cannot_wait_but_a_write_first_one_can() {
+        let test_db = TestDbPath::new("write_lock_upgrade.db").await;
+        let holder = establish_connection(&test_db.0).await.unwrap();
+        let waiter = establish_connection(&test_db.0).await.unwrap();
+
+        // The holder takes the write lock and keeps it.
+        let held = holder.begin().await.unwrap();
+        held.execute_unprepared("INSERT INTO `config_kv` (`key`, `value`) VALUES ('a', '1')")
+            .await
+            .unwrap();
+
+        // A DEFERRED transaction that reads first: the busy timeout is 30
+        // seconds, and it still fails at once, because SQLite does not run the
+        // busy handler for a read→write upgrade.
+        let upgrading = waiter.begin().await.unwrap();
+        upgrading
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT `id` FROM `config_kv`",
+            ))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let upgrade = upgrading
+            .execute_unprepared("INSERT INTO `config_kv` (`key`, `value`) VALUES ('b', '2')")
+            .await;
+        let elapsed = started.elapsed();
+        let error = upgrade.expect_err("the upgrade cannot take a lock another writer holds");
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("locked"),
+            "and it fails BECAUSE of the lock: {error}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "immediately, not after the 30s busy timeout — that is the defect: {elapsed:?}"
+        );
+        let _ = upgrading.rollback().await;
+
+        // Release the lock shortly, so the write-first transaction below has
+        // something to wait FOR rather than something to walk into.
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            held.commit().await.unwrap();
+        });
+
+        // The same read-then-write body, with the lock taken up front: it
+        // queues behind the holder and succeeds.
+        let started = std::time::Instant::now();
+        let txn = begin_write_transaction(&waiter).await.unwrap();
+        txn.query_all(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT `id` FROM `config_kv`",
+        ))
+        .await
+        .unwrap();
+        txn.execute_unprepared("INSERT INTO `config_kv` (`key`, `value`) VALUES ('b', '2')")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "it WAITED for the holder rather than racing past it"
+        );
+        release.await.unwrap();
+
+        let rows = waiter
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT `key` FROM `config_kv` WHERE `key` IN ('a', 'b') ORDER BY `key`",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both writers' rows are present");
+    }
+
     #[tokio::test]
     async fn test_create_database() {
         let mut db_path_buf = std::env::temp_dir();
@@ -808,7 +968,6 @@ mod tests {
         // test insert reference
         let entries = [
             (Some("master"), ConfigKind::Head, None, None), // attached head
-            (None, ConfigKind::Head, Some("2019"), None),   // detached head
             (Some("master"), ConfigKind::Branch, Some("2019"), None), // local branch
             (Some("release1"), ConfigKind::Tag, Some("2019"), None), // tag (remote tag store same as local tag)
             (
@@ -816,7 +975,7 @@ mod tests {
                 ConfigKind::Head,
                 None,
                 Some("origin".to_string()),
-            ), // remote head
+            ), // remote head — a remote HEAD is not a scope's HEAD
             (
                 Some("main"),
                 ConfigKind::Branch,
@@ -835,6 +994,25 @@ mod tests {
             let reference_entry = entry.save(&conn).await.unwrap();
             assert_eq!(reference_entry.name.unwrap(), name.map(|s| s.to_string()));
         }
+
+        // plan-20260714 W0 (§C.4.1, migration 2026072901): a scope has exactly
+        // ONE local HEAD row. This insert used to be part of the list above —
+        // a detached HEAD landing NEXT TO the attached one — and two HEAD rows
+        // for the main worktree is precisely the ambiguity the partial unique
+        // index exists to prevent, so it must now be refused rather than
+        // stored. Updating the existing row is how a detach is recorded.
+        let second_main_head = reference::ActiveModel {
+            name: Set(None),
+            kind: Set(ConfigKind::Head),
+            commit: Set(Some("2019".to_string())),
+            remote: Set(None),
+            ..Default::default()
+        };
+        let refused = second_main_head.save(&conn).await;
+        assert!(
+            refused.is_err(),
+            "a second local HEAD row for the main scope must be refused"
+        );
     }
 
     #[tokio::test]

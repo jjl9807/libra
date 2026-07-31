@@ -1359,8 +1359,7 @@ async fn finalize_noop_identity(
     now_ms: i64,
     deadline: Instant,
 ) -> Result<()> {
-    let txn = conn
-        .begin()
+    let txn = crate::internal::db::begin_write_transaction(conn)
         .await
         .context("begin import identity finalization")?;
     let tombstone = txn
@@ -2363,7 +2362,9 @@ pub async fn restore_tombstone(
     kind: AgentKind,
     provider_session_id: &str,
 ) -> Result<bool> {
-    let txn = conn.begin().await.context("begin erased-session restore")?;
+    let txn = crate::internal::db::begin_write_transaction(conn)
+        .await
+        .context("begin erased-session restore")?;
     let row = txn
         .query_one(Statement::from_sql_and_values(
             txn.get_database_backend(),

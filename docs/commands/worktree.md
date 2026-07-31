@@ -9,6 +9,7 @@ Manage multiple working trees attached to this repository.
 ```
 libra worktree add <path>
 libra worktree list
+libra worktree doctor
 libra worktree lock <path> [--reason <text>]
 libra worktree unlock <path>
 libra worktree move <src> <dest>
@@ -17,6 +18,7 @@ libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
 libra worktree repair [<path>]
 libra worktree repair --migrate-layout [--dry-run] [<path>]
+libra worktree repair <path> --resolve-identity --yes
 libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 ```
 
@@ -24,7 +26,9 @@ libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 
 `libra worktree` manages multiple working trees that share a single repository database and object store. This allows you to have several checkouts of the same repository simultaneously, which is useful for working on multiple branches at once, running builds while editing code, or testing changes in isolation.
 
-Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.) The registry file `worktrees.json` is versioned (`schema_version: 2` since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the v2 file.
+Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.) The registry file `worktrees.json` is versioned (`schema_version: 3`; v2 since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the file. v3 adds a durable registration GENERATION — `epoch_counter` on the registry and `epoch` on each entry, reported by `worktree list`. Instance ids are path-derived, so a worktree removed and re-added in the same place has the same id and path as its predecessor; the generation is what tells the two registrations apart, and the `libra service` dirty-mark endpoint requires it as a fence. A v2-era binary would parse a v3 file and drop the generations on rewrite, so the v3 capability marker refuses those binaries at connect time; for the same reason this migration does not roll back while any generation is live.
+
+**Resolving an ambiguous registry.** A registry written by an older binary can end up with two entries claiming one path-derived identity (`add A` → `move A B` → `add A`). Every worktree MUTATION is refused while that holds — including the `remove` that would fix it, because it goes through the same loader. `libra worktree doctor` names the colliding entries, and `libra worktree repair <path> --resolve-identity --yes` is the one action that runs against the ambiguous registry: it DETACHES the named entry (files and scoped state kept, every command inside that directory fails closed) so the remaining claimant owns the identity again. Finish with `worktree remove --delete-dir <path>`, or `worktree add <path>` to re-attach it.
 
 Worktree metadata is persisted in a `worktrees.json` file inside the `.libra` storage directory. Each entry tracks the filesystem path, whether it is the main worktree, its lock status, and an optional lock reason. The state file is written atomically via a temporary file rename to prevent corruption.
 
@@ -84,6 +88,33 @@ Structured output uses the `worktree.list` command envelope. Each entry reports
 `kind`, `path`, `is_main`, `locked`, `lock_reason`, whether the path currently
 exists on disk, the persisted `worktree_id`, and the lifecycle `state`
 (`active`, `detached_from_registry`, or `tombstone` — see `remove`), and the on-disk `layout` (`main`, `linked-v2`, `legacy-symlink`, `missing`, `corrupt`; porcelain adds a matching `layout` line per entry). In a `legacy-symlink` worktree (pre-isolation shared `.libra`), read-only commands keep working but state-mutating commands refuse with `LBR-REPO-003` — run `libra worktree repair --migrate-layout <path>` from the main worktree. Target-oriented lifecycle commands (`worktree remove <path>` in both modes and `worktree repair <path>`) also refuse a legacy-symlink target — the shared symlink would route their writes into MAIN storage — until the migration completes.
+
+### Subcommand: `doctor`
+
+Report per-worktree scope diagnostics. **Strictly read-only** (plan-20260714
+Part C W0 §C.11): the registry, the database, lease state and the filesystem
+are byte-identical before and after the call. A diagnostic has to be safe to
+run on a repository you do not yet understand, which is precisely when you
+reach for it — so it never adopts, reclaims or repairs on its own. Repair
+actions are separate, explicit subcommands, and no error hint anywhere
+promises that a bare `doctor` will fix something.
+
+```bash
+libra worktree doctor
+libra --json worktree doctor
+```
+
+For each worktree it reports the on-disk `layout` and lifecycle `state` (the
+same vocabulary as `worktree list`), whether the worktree's own identity is one
+the registry still knows (`identity_registered`), and a `findings` list naming
+what to do about each problem — for example that a legacy-symlink worktree
+needs `worktree repair --migrate-layout`, or that a worktree whose
+`.libra/worktree_id` no longer matches the registry needs `worktree repair`
+before it will accept mutations.
+
+Structured output uses the `worktree.doctor` command envelope with
+`schema_version`, `diagnostics[]`, and `next_cursor` (always `null` today;
+pagination arrives with the W4 machine interface).
 
 ### Subcommand: `lock`
 

@@ -21,7 +21,12 @@ async fn create_operation_schema(db: &DatabaseConnection) {
             start_ts INTEGER NOT NULL,\
             end_ts INTEGER,\
             status TEXT NOT NULL,\
-            worktree_id TEXT NOT NULL DEFAULT ''\
+            worktree_id TEXT NOT NULL DEFAULT '',
+            scope_provenance TEXT NOT NULL DEFAULT 'declared',
+            restorable INTEGER NOT NULL DEFAULT 1,
+            control_slot TEXT,
+            claim_owner TEXT,
+            scope_kind TEXT NOT NULL DEFAULT 'main'\
         );",
         "CREATE TABLE IF NOT EXISTS operation_parent(\
             op_id TEXT NOT NULL,\
@@ -75,6 +80,11 @@ fn sample_operation(op_id: &str, repo_id: &str, view_id: &str, end_ts: i64) -> O
         end_ts: Some(end_ts),
         status: OperationStatus::Succeeded,
         worktree_id: String::new(),
+        scope_provenance: "declared".to_string(),
+        restorable: true,
+        control_slot: None,
+        claim_owner: None,
+        scope_kind: "main".to_string(),
     }
 }
 
@@ -97,6 +107,11 @@ async fn invalid_arguments_are_rejected() {
             end_ts: Some(20),
             status: OperationStatus::Succeeded,
             worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
+            restorable: true,
+            control_slot: None,
+            claim_owner: None,
+            scope_kind: "main".to_string(),
         },
     )
     .await
@@ -540,6 +555,11 @@ async fn graph_roundtrip_and_duplicate_constraint_failure() {
             end_ts: Some(510),
             status: OperationStatus::Succeeded,
             worktree_id: String::new(),
+            scope_provenance: "declared".to_string(),
+            restorable: true,
+            control_slot: None,
+            claim_owner: None,
+            scope_kind: "main".to_string(),
         },
         parents: vec![OperationParentRecord {
             op_id: "op_graph".to_string(),
