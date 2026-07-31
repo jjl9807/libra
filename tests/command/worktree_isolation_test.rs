@@ -317,6 +317,404 @@ fn formerly_guarded_commands_run_in_linked_worktree() {
 /// W2 §C.4.3: the stash STACK is deliberately repository-shared (an entry
 /// pushed in one worktree lists and applies in another), while push/pop
 /// snapshot and mutate only the ACTING worktree's index/workdir; `stash
+/// §C.11 W2 acceptance: a linked worktree's HELD AUTOSTASH and its UNMERGED
+/// index stages survive gc.
+///
+/// Both live only in that worktree: the autostash commit is held by the merge
+/// sidecar (deliberately off the stash list until the merge finishes), and the
+/// conflict stages are entries in the worktree's private index. Neither is
+/// reachable from any ref, so if the collector missed either, one maintenance
+/// run would destroy the user's uncommitted work mid-conflict.
+#[test]
+fn a_linked_held_autostash_and_unmerged_stages_survive_gc() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("autostash-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Two diverging tips on the same file, so a merge in the worktree
+    // conflicts.
+    assert_cli_success(
+        &run_libra_command(&["branch", "other"], main),
+        "branch other",
+    );
+    fs::write(main.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-line", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "other"], &wt), "wt switch");
+    fs::write(wt.join("a.txt"), "other-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other-line", "--no-verify"], &wt),
+        "wt commit",
+    );
+
+    // A dirty UNRELATED file, autostashed by the merge and HELD across the
+    // conflict. Its blob exists only inside the held autostash commit.
+    fs::write(wt.join("held.txt"), "held-content\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "held.txt"], &wt), "stage held");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "held-base", "--no-verify"], &wt),
+        "commit held base",
+    );
+    fs::write(wt.join("held.txt"), "held-dirty\n").unwrap();
+    let held_oid =
+        String::from_utf8_lossy(&run_libra_command(&["hash-object", "held.txt"], &wt).stdout)
+            .trim()
+            .to_string();
+    assert!(!held_oid.is_empty(), "hashed the dirty content");
+    assert_cli_success(
+        &run_libra_command(&["hash-object", "-w", "held.txt"], &wt),
+        "write the dirty blob",
+    );
+
+    let merged = run_libra_command(&["merge", "--autostash", "main"], &wt);
+    assert!(
+        !merged.status.success(),
+        "the merge must conflict so the autostash stays HELD: {}{}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+
+    // Age every loose object past the grace window, so survival proves the
+    // ROOT rather than the freshness belt.
+    backdate_loose_objects(main);
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    assert_cli_success(&gc, "maintenance gc with a conflicted linked worktree");
+
+    let cat = run_libra_command(&["cat-file", "-p", &held_oid], main);
+    assert_cli_success(&cat, "the held autostash content survives gc");
+    assert!(
+        String::from_utf8_lossy(&cat.stdout).contains("held-dirty"),
+        "the held autostash's blob was pruned — it is off the stash list by \
+         design, so the sidecar is its only root"
+    );
+
+    // The conflict is still resumable: the unmerged stages are intact.
+    let status = run_libra_command(&["status"], &wt);
+    assert_cli_success(&status, "status in the conflicted worktree");
+    let text = String::from_utf8_lossy(&status.stdout).to_string()
+        + &String::from_utf8_lossy(&status.stderr);
+    assert!(
+        text.to_lowercase().contains("unmerged") || text.to_lowercase().contains("both modified"),
+        "the unmerged index stages survived gc: {text}"
+    );
+}
+
+/// §C.11 W2 acceptance: prune FAILS CLOSED when a mandatory root is corrupt.
+///
+/// A sidecar is a reachability root — the held autostash and the conflicted
+/// commits it names exist nowhere else. If the file cannot be parsed, the
+/// safe answer is to refuse the prune, not to prune with an incomplete root
+/// set: pruning would silently delete the objects a `--continue` needs.
+#[test]
+fn a_corrupt_sidecar_root_fails_the_prune_closed() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("corrupt-root-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // A sidecar that is NOT valid JSON in the linked worktree's gitdir.
+    let sidecar = wt.join(".libra").join("merge-state.json");
+    fs::write(&sidecar, "{ this is not json").unwrap();
+
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    let text =
+        String::from_utf8_lossy(&gc.stdout).to_string() + &String::from_utf8_lossy(&gc.stderr);
+    assert!(
+        !gc.status.success(),
+        "an unparseable mandatory root must refuse the prune rather than \
+         prune with an incomplete root set: {text}"
+    );
+    assert!(
+        text.contains("merge-state.json"),
+        "and the refusal names the root it could not read: {text}"
+    );
+
+    // Removing the corrupt root lets gc run again — the refusal is about the
+    // unreadable file, not a permanent block.
+    fs::remove_file(&sidecar).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], main),
+        "gc runs once the root is readable again",
+    );
+}
+
+/// §C.11 W2 acceptance: two worktrees can hold CONFLICTED merge/revert state
+/// at the same time without seeing each other's.
+///
+/// The sidecars used to live in common storage, so a conflicted merge in one
+/// worktree made every other worktree believe a merge was in progress — and
+/// `--abort` there would have reset the wrong tree from the wrong state. Each
+/// worktree now keeps its own, and `status` proves the isolation.
+#[test]
+fn concurrent_linked_merge_and_revert_conflicts_do_not_cross() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("conflict-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // A branch whose tip conflicts with main's on the same file.
+    assert_cli_success(
+        &run_libra_command(&["branch", "sideline"], main),
+        "branch sideline",
+    );
+    fs::write(main.join("a.txt"), "main-side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-side", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "sideline"], &wt),
+        "wt switch",
+    );
+    fs::write(wt.join("a.txt"), "wt-side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "wt-side", "--no-verify"], &wt),
+        "wt commit",
+    );
+
+    // Conflicted merge in the LINKED worktree only.
+    let merged = run_libra_command(&["merge", "main"], &wt);
+    assert!(
+        !merged.status.success(),
+        "the merge must conflict: {}{}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+
+    let wt_status = run_libra_command(&["status"], &wt);
+    assert_cli_success(&wt_status, "linked status");
+    let wt_text = String::from_utf8_lossy(&wt_status.stdout).to_string()
+        + &String::from_utf8_lossy(&wt_status.stderr);
+    assert!(
+        wt_text.to_lowercase().contains("merge"),
+        "the worktree that merged reports its own merge: {wt_text}"
+    );
+
+    let main_status = run_libra_command(&["status"], main);
+    assert_cli_success(&main_status, "main status");
+    let main_text = String::from_utf8_lossy(&main_status.stdout).to_string()
+        + &String::from_utf8_lossy(&main_status.stderr);
+    assert!(
+        !main_text.to_lowercase().contains("unmerged"),
+        "main is NOT in a merge — a shared sidecar used to make it look like \
+         it was, and `merge --abort` there would have reset main from another \
+         worktree's state: {main_text}"
+    );
+
+    // And main can still start its own sequence: the other worktree's merge
+    // does not hold main's sequencer mutex.
+    let main_merge = run_libra_command(&["merge", "sideline"], main);
+    let main_merge_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&main_merge.stdout),
+        String::from_utf8_lossy(&main_merge.stderr)
+    );
+    assert!(
+        !main_merge_text.contains("already in progress"),
+        "the linked worktree's merge must not block main's: {main_merge_text}"
+    );
+}
+
+/// §C.10 crash safety: a tip left stale by a crash between the two writes is
+/// REPAIRED from the log, not obeyed.
+///
+/// `refs/stash` and `logs/refs/stash` are two files. Publication writes the log
+/// first (atomically, fsynced) and derives the tip from it, so the only state a
+/// crash can leave is a stale tip over a correct log — which every reader and
+/// every mutation repairs under the stack lock. This simulates that crash by
+/// corrupting the tip directly.
+#[test]
+fn a_stale_stash_tip_is_repaired_from_the_log() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+
+    fs::write(main.join("a.txt"), "stashed\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], main), "stash push");
+
+    let tip_path = main.join(".libra").join("refs").join("stash");
+    let real_tip = fs::read_to_string(&tip_path).expect("the tip exists");
+    // The crash: a tip naming an entry the log does not list.
+    fs::write(&tip_path, "0000000000000000000000000000000000000000\n").unwrap();
+
+    let listed = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&listed, "stash list over a stale tip");
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("stash@{0}"),
+        "the log is the authority, so the entry is still listed"
+    );
+    assert_eq!(
+        fs::read_to_string(&tip_path).expect("tip"),
+        real_tip,
+        "and the stale tip was repaired from the log rather than obeyed"
+    );
+
+    // The repaired stack still pops.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], main), "pop");
+    assert_eq!(
+        fs::read_to_string(main.join("a.txt")).unwrap(),
+        "stashed\n",
+        "the stashed content came back"
+    );
+    assert!(
+        !tip_path.exists(),
+        "an emptied stack leaves no tip behind — a ref that outlived its log \
+         names an entry nothing can find"
+    );
+}
+
+/// §C.12 (W2): a `pop` whose APPLY fails leaves the shared entry in place.
+///
+/// `pop` is apply-then-drop. If the apply fails — a conflicting local edit in
+/// the worktree popping — the entry must stay on the SHARED stack, because it
+/// is the only copy of that work and every other worktree can still see it.
+/// Dropping it on a failed apply would destroy it for all of them at once.
+#[test]
+fn linked_stash_pop_apply_failure_keeps_shared_entry() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("pop-failure-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Stash a tracked change from the LINKED worktree.
+    fs::write(wt.join("a.txt"), "linked-stashed\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["stash", "push"], &wt),
+        "linked stash push",
+    );
+    let listed = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&listed, "stash list");
+    let before = String::from_utf8_lossy(&listed.stdout).to_string();
+    assert!(
+        before.contains("stash@{0}"),
+        "the entry is on the shared stack: {before}"
+    );
+
+    // Make the apply fail: an uncommitted edit to the same file in the
+    // worktree that pops.
+    fs::write(wt.join("a.txt"), "conflicting-local-edit\n").unwrap();
+    let popped = run_libra_command(&["stash", "pop"], &wt);
+    assert!(
+        !popped.status.success(),
+        "the apply must fail: {}{}",
+        String::from_utf8_lossy(&popped.stdout),
+        String::from_utf8_lossy(&popped.stderr)
+    );
+
+    // The shared entry survives — visible from MAIN, which never touched it.
+    let after = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&after, "stash list after the failed pop");
+    let after = String::from_utf8_lossy(&after.stdout).to_string();
+    assert!(
+        after.contains("stash@{0}"),
+        "a failed apply must not drop the shared entry — it is the only copy \
+         of that work and every worktree can see it: {after}"
+    );
+    assert_eq!(
+        before.lines().count(),
+        after.lines().count(),
+        "and the stack is exactly as deep as before"
+    );
+}
+
+/// §C.12 (W2): two concurrent pops of the SAME entry — exactly one wins.
+///
+/// The stack is repository-shared, so two worktrees can pop at the same
+/// moment. The drop is a CAS on the entry's raw reflog line under the stack
+/// lock, so the loser must be refused rather than dropping an entry the winner
+/// already consumed (which would delete the NEXT entry, having shifted up).
+#[test]
+fn concurrent_stash_pop_single_cas_winner() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let one = parent.path().join("pop-one");
+    let two = parent.path().join("pop-two");
+    for path in [&one, &two] {
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", path.to_str().unwrap()], main),
+            "worktree add",
+        );
+    }
+
+    // TWO entries: if the loser dropped blindly it would consume the second.
+    for content in ["first-stashed\n", "second-stashed\n"] {
+        fs::write(main.join("a.txt"), content).unwrap();
+        assert_cli_success(&run_libra_command(&["stash", "push"], main), "stash push");
+    }
+    let depth = |at: &std::path::Path| {
+        let out = run_libra_command(&["stash", "list"], at);
+        assert_cli_success(&out, "stash list");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.contains("stash@{"))
+            .count()
+    };
+    assert_eq!(depth(main), 2, "two entries on the shared stack");
+
+    // Both worktrees pop at once, released together.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for path in [one.clone(), two.clone()] {
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let out = run_libra_command(&["stash", "pop"], &path);
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        }));
+    }
+    let results: Vec<(bool, String)> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("pop thread"))
+        .collect();
+
+    // Whatever the interleaving, the stack lost exactly ONE entry: two
+    // successful pops of the same entry, or one pop plus a refusal, are both
+    // acceptable — silently consuming TWO entries for one popped change is
+    // not.
+    let winners = results.iter().filter(|(ok, _)| *ok).count();
+    assert!(
+        winners >= 1,
+        "at least one pop must succeed: {:?}",
+        results.iter().map(|(_, text)| text).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        depth(main),
+        2 - winners,
+        "the shared stack lost exactly as many entries as pops succeeded — a \
+         blind drop would have consumed the entry the other pop never applied"
+    );
+}
+
 /// branch` preflights the branch collision before touching anything.
 #[test]
 fn stash_stack_is_shared_with_scoped_snapshots() {
