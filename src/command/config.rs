@@ -566,6 +566,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 stdin,
                 value_type,
                 scope,
+                use_cascade,
                 output,
             )
             .await
@@ -1387,6 +1388,7 @@ async fn handle_set(
     stdin: bool,
     value_type: Option<ConfigValueType>,
     scope: ConfigScope,
+    use_cascade: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
     // Validate key format
@@ -1508,10 +1510,23 @@ async fn handle_set(
                 CliError::from_legacy_string(format!("error: failed to read input: {e}"))
             })?
         } else {
-            return Err(CliError::from_legacy_string(format!(
-                "error: missing value for key '{key}'"
-            ))
-            .with_exit_code(2));
+            // `libra config <key>` with no value is a READ for ordinary keys, matching
+            // `git config <key>` (and `libra config get <key>`). Protected keys are
+            // handled above: they keep Libra's interactive secure-assignment path, which
+            // is an intentional divergence from Git recorded in `COMPATIBILITY.md`.
+            return handle_get(
+                key,
+                false,
+                false,
+                false,
+                None,
+                scope,
+                use_cascade,
+                false,
+                value_type,
+                output,
+            )
+            .await;
         }
     };
 
