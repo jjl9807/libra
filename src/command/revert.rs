@@ -736,6 +736,11 @@ fn refuse_ambiguous_common_state() -> Result<(), RevertError> {
     if !sidecar.exists() {
         return Ok(());
     }
+    // W2: a sidecar whose writer recorded main's scope is PROVEN main's and
+    // stays operable; only an unmarked (old-binary) file keeps W1's guess.
+    if crate::internal::sequencer::sidecar_recorded_owner(&sidecar).as_deref() == Some("") {
+        return Ok(());
+    }
     Err(RevertError::StateIo(format!(
         "a revert state file exists at '{}' in COMMON storage, and this repository has \
          linked-worktree history, so it cannot be proven to be the main worktree's — \
@@ -865,8 +870,21 @@ impl RevertState {
 
     fn save(&self) -> Result<(), RevertError> {
         let path = Self::path();
+        // Record the writer's scope (W2, ADR-0714-08) — see MergeState::save.
+        let mut value =
+            serde_json::to_value(self).map_err(|e| RevertError::StateIo(e.to_string()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "owner_scope".to_string(),
+                serde_json::Value::String(
+                    crate::internal::worktree_scope::WorktreeScope::for_request()
+                        .storage_key()
+                        .to_string(),
+                ),
+            );
+        }
         let data =
-            serde_json::to_vec_pretty(self).map_err(|e| RevertError::StateIo(e.to_string()))?;
+            serde_json::to_vec_pretty(&value).map_err(|e| RevertError::StateIo(e.to_string()))?;
         // Atomic + fsynced write (lore.md §7.7): recovery-critical sequencer
         // state must never be left truncated by a crash.
         crate::utils::atomic_write::write_atomic(&path, &data, true)

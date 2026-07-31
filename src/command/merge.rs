@@ -430,7 +430,23 @@ impl MergeState {
 
     fn save(&self) -> Result<(), PullMergeError> {
         let path = Self::path();
-        let data = serde_json::to_vec_pretty(self)
+        // Record the writer's scope (W2, ADR-0714-08): the field is what lets
+        // a later control action PROVE this common-storage file is main's
+        // instead of guessing. Injected at the JSON layer so every
+        // constructor stays untouched; deserialization ignores unknown keys.
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| PullMergeError::StateSave(error.to_string()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "owner_scope".to_string(),
+                serde_json::Value::String(
+                    crate::internal::worktree_scope::WorktreeScope::for_request()
+                        .storage_key()
+                        .to_string(),
+                ),
+            );
+        }
+        let data = serde_json::to_vec_pretty(&value)
             .map_err(|error| PullMergeError::StateSave(error.to_string()))?;
         // Atomic + fsynced write (lore.md §7.7): sequencer state is
         // recovery-critical, so a crash must leave it either fully written or
@@ -2194,6 +2210,11 @@ fn refuse_ambiguous_common_merge_state() -> Result<(), MergeError> {
     })?;
     let sidecar = gitdir.join("merge-state.json");
     if !sidecar.exists() {
+        return Ok(());
+    }
+    // W2: a sidecar whose writer recorded main's scope is PROVEN main's and
+    // stays operable; only an unmarked (old-binary) file keeps W1's guess.
+    if crate::internal::sequencer::sidecar_recorded_owner(&sidecar).as_deref() == Some("") {
         return Ok(());
     }
     Err(MergeError::StateLoad(format!(

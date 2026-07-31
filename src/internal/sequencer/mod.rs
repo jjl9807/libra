@@ -971,7 +971,14 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         // another worktree's state and then delete the evidence. With
         // linked-worktree history and no way to prove ownership, it is
         // AMBIGUOUS: status reports it, control paths refuse.
-        if !scope.is_linked() && crate::command::maintenance::repository_had_linked_worktrees() {
+        // W2: a sidecar whose writer RECORDED main's scope is proven main's,
+        // even in a repository with linked history — the guess W1 had to make
+        // is only made for files that carry no record (an old binary's).
+        let proven_main = sidecar_recorded_owner(&sidecar).as_deref() == Some("");
+        if !proven_main
+            && !scope.is_linked()
+            && crate::command::maintenance::repository_had_linked_worktrees()
+        {
             return Ok(Some(ActiveSequenceKind::AmbiguousLegacy(
                 AmbiguousLegacyState::File(sidecar),
             )));
@@ -1064,6 +1071,25 @@ async fn scoped_bisect_state_active<C: ConnectionTrait>(
 ///
 /// Callers name this rather than a fixed `rebase-merge`: pointing a user at a
 /// path that is not there leaves them unable to clear the block.
+/// The scope RECORDED inside a merge/revert sidecar, if the writing binary
+/// recorded one (W2, ADR-0714-08).
+///
+/// W1 had to treat every common-storage sidecar with linked-worktree history
+/// as ambiguous, because ownership was a guess. W2 removes the guess for its
+/// own files: `merge`/`revert` record the writer's storage key as
+/// `owner_scope` when they save, so a sidecar main just wrote is PROVEN
+/// main's and stays operable. An absent field (an old binary's file) or an
+/// unreadable document answers `None`, which every caller treats as "cannot
+/// prove" — exactly the W1 rule.
+pub(crate) fn sidecar_recorded_owner(path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("owner_scope")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 pub(crate) fn ambiguous_legacy_dir(storage: &std::path::Path) -> Option<std::path::PathBuf> {
     ["rebase-merge", "rebase-apply"]
         .into_iter()

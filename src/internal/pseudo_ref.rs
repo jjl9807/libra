@@ -531,6 +531,86 @@ mod tests {
         );
     }
 
+    /// §C.5 / W2 acceptance: `REBASE_HEAD` follows its scope like the rest.
+    ///
+    /// Two worktrees can each hold a STOPPED rebase; each `WorktreePseudoRefs`
+    /// must project its own scope's `stopped_sha`, never the other's — and a
+    /// rebase that has not stopped defines no `REBASE_HEAD` at all.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn each_scope_projects_its_own_rebase_head() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let repo = tempfile::tempdir().expect("repo");
+        let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        register_linked_worktree(repo.path(), "wt-rebase");
+
+        let db = crate::internal::worktree_scope::request_db()
+            .await
+            .expect("repository db");
+        for (scope_key, stopped) in [
+            ("", Some("1111111111111111111111111111111111111111")),
+            (
+                "wt-rebase",
+                Some("2222222222222222222222222222222222222222"),
+            ),
+        ] {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, \
+                 current_head, todo, done, stopped_sha) VALUES (?, 'main', \
+                 '3333333333333333333333333333333333333333', \
+                 '4444444444444444444444444444444444444444', \
+                 '5555555555555555555555555555555555555555', '', '', ?)",
+                [scope_key.into(), stopped.into()],
+            ))
+            .await
+            .expect("seed a stopped rebase");
+        }
+
+        // Pin the LINKED scope, then ask MAIN: a projection reading the pin
+        // would answer 2222…
+        let _pin = WorktreeScope::pin_scope_for_test(
+            WorktreeScope::Linked("wt-rebase".to_string()),
+            repo.path().to_path_buf(),
+        );
+        let main_head = WorktreePseudoRefs::new(WorktreeScope::Main)
+            .resolve(PseudoRef::RebaseHead)
+            .await
+            .expect("main's REBASE_HEAD")
+            .expect("main's rebase is stopped");
+        assert_eq!(
+            main_head.oid, "1111111111111111111111111111111111111111",
+            "main's REBASE_HEAD is MAIN's stopped commit"
+        );
+        let linked_head = WorktreePseudoRefs::new(WorktreeScope::Linked("wt-rebase".to_string()))
+            .resolve(PseudoRef::RebaseHead)
+            .await
+            .expect("the linked worktree's REBASE_HEAD")
+            .expect("its rebase is stopped");
+        assert_eq!(
+            linked_head.oid, "2222222222222222222222222222222222222222",
+            "and the linked worktree's is its own"
+        );
+
+        // A rebase in progress that has NOT stopped defines no REBASE_HEAD.
+        db.execute(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE rebase_state SET stopped_sha = NULL WHERE worktree_id = ''".to_string(),
+        ))
+        .await
+        .expect("clear main's stop point");
+        assert!(
+            WorktreePseudoRefs::new(WorktreeScope::Main)
+                .resolve(PseudoRef::RebaseHead)
+                .await
+                .expect("main's REBASE_HEAD after the stop cleared")
+                .is_none(),
+            "an unstopped rebase defines no REBASE_HEAD"
+        );
+    }
+
     /// §C.5: the SIDECAR half follows the scope too.
     ///
     /// The database half was already scoped; the merge/revert sidecars and

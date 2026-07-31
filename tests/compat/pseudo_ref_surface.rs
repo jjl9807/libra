@@ -98,14 +98,29 @@ fn the_service_declares_exactly_the_same_names() {
         );
     }
 
+    // And the ROW's declared set, parsed rather than sampled: rejecting two
+    // hand-picked names could not see a third being added.
     let row = rev_parse_row();
-    for name in ["BISECT_HEAD", "AUTO_MERGE"] {
-        assert!(
-            !row.contains(name),
-            "the row names `{name}`, which the service does not define — a \
-             promise nothing projects"
-        );
+    let mut declared_in_row: Vec<String> = Vec::new();
+    for token in row.split(|c: char| !(c.is_ascii_uppercase() || c == '_')) {
+        // A pseudo-ref name is SCREAMING_SNAKE and ends in `_HEAD`; nothing
+        // else in this row has that shape.
+        if token.ends_with("_HEAD") && token.len() > "_HEAD".len() {
+            let token = token.to_string();
+            if !declared_in_row.contains(&token) {
+                declared_in_row.push(token);
+            }
+        }
     }
+    let mut expected: Vec<String> = DECLARED.iter().map(|name| name.to_string()).collect();
+    expected.sort();
+    declared_in_row.sort();
+    assert_eq!(
+        declared_in_row, expected,
+        "the rev-parse row must declare EXACTLY the names the service defines: \
+         a name in the row that nothing projects is a promise, and a name the \
+         service defines but the row omits is an undeclared surface"
+    );
 }
 
 /// The declaration is only true if `rev-parse` really refuses these names.

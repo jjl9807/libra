@@ -451,13 +451,14 @@ fn a_corrupt_sidecar_root_fails_the_prune_closed() {
     );
 }
 
-/// §C.11 W2 acceptance: two worktrees can hold CONFLICTED merge/revert state
-/// at the same time without seeing each other's.
+/// §C.11 W2 acceptance: a conflicted MERGE in one worktree and a conflicted
+/// REVERT in another, at the same time, with neither seeing the other's.
 ///
-/// The sidecars used to live in common storage, so a conflicted merge in one
-/// worktree made every other worktree believe a merge was in progress — and
-/// `--abort` there would have reset the wrong tree from the wrong state. Each
-/// worktree now keeps its own, and `status` proves the isolation.
+/// The sidecars used to live in common storage, so one worktree's conflict
+/// made every other worktree believe an operation was in progress — and a
+/// control action there would have reset the wrong tree from the wrong state.
+/// Both operations run here, each control action is exercised in BOTH scopes,
+/// and the wrong-scope one must fail closed.
 #[test]
 fn concurrent_linked_merge_and_revert_conflicts_do_not_cross() {
     let repo = repo_with_feature();
@@ -491,7 +492,7 @@ fn concurrent_linked_merge_and_revert_conflicts_do_not_cross() {
         "wt commit",
     );
 
-    // Conflicted merge in the LINKED worktree only.
+    // Conflicted MERGE in the LINKED worktree.
     let merged = run_libra_command(&["merge", "main"], &wt);
     assert!(
         !merged.status.success(),
@@ -500,37 +501,100 @@ fn concurrent_linked_merge_and_revert_conflicts_do_not_cross() {
         String::from_utf8_lossy(&merged.stderr)
     );
 
-    let wt_status = run_libra_command(&["status"], &wt);
-    assert_cli_success(&wt_status, "linked status");
-    let wt_text = String::from_utf8_lossy(&wt_status.stdout).to_string()
-        + &String::from_utf8_lossy(&wt_status.stderr);
+    // Conflicted REVERT in MAIN, at the same time: a second commit touches the
+    // same lines, so reverting the first no longer applies cleanly.
+    fs::write(main.join("a.txt"), "main-side-2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add 2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-side-2", "--no-verify"], main),
+        "commit 2",
+    );
+    let reverted = run_libra_command(&["revert", "HEAD~1"], main);
     assert!(
-        wt_text.to_lowercase().contains("merge"),
-        "the worktree that merged reports its own merge: {wt_text}"
+        !reverted.status.success(),
+        "the revert must conflict: {}{}",
+        String::from_utf8_lossy(&reverted.stdout),
+        String::from_utf8_lossy(&reverted.stderr)
     );
 
-    let main_status = run_libra_command(&["status"], main);
-    assert_cli_success(&main_status, "main status");
-    let main_text = String::from_utf8_lossy(&main_status.stdout).to_string()
-        + &String::from_utf8_lossy(&main_status.stderr);
+    // Each worktree's sidecar lives in ITS OWN gitdir.
     assert!(
-        !main_text.to_lowercase().contains("unmerged"),
-        "main is NOT in a merge — a shared sidecar used to make it look like \
-         it was, and `merge --abort` there would have reset main from another \
-         worktree's state: {main_text}"
+        wt.join(".libra/merge-state.json").exists(),
+        "the linked worktree holds its own merge sidecar"
+    );
+    assert!(
+        main.join(".libra/revert-state.json").exists(),
+        "main holds its own revert sidecar"
+    );
+    assert!(
+        !main.join(".libra/merge-state.json").exists(),
+        "the linked worktree's merge sidecar is not main's"
+    );
+    assert!(
+        !wt.join(".libra/revert-state.json").exists(),
+        "main's revert sidecar is not the linked worktree's"
     );
 
-    // And main can still start its own sequence: the other worktree's merge
-    // does not hold main's sequencer mutex.
-    let main_merge = run_libra_command(&["merge", "sideline"], main);
-    let main_merge_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&main_merge.stdout),
-        String::from_utf8_lossy(&main_merge.stderr)
+    // Scoped STATUS: each worktree reports its own operation and not the
+    // other's.
+    let text_of = |dir: &std::path::Path| {
+        let out = run_libra_command(&["status"], dir);
+        assert_cli_success(&out, "status");
+        (String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+            .to_lowercase()
+    };
+    let wt_text = text_of(&wt);
+    assert!(
+        wt_text.contains("merge"),
+        "the worktree that merged reports its merge: {wt_text}"
     );
     assert!(
-        !main_merge_text.contains("already in progress"),
-        "the linked worktree's merge must not block main's: {main_merge_text}"
+        !wt_text.contains("revert in progress"),
+        "and not main's revert: {wt_text}"
+    );
+    let main_text = text_of(main);
+    assert!(
+        main_text.contains("revert in progress"),
+        "main reports its revert: {main_text}"
+    );
+    assert!(
+        !main_text.contains("merge --continue"),
+        "and not the linked worktree's merge: {main_text}"
+    );
+
+    // Scoped CONTROLS: the wrong scope fails closed and mutates nothing…
+    let cross = run_libra_command(&["revert", "--abort"], &wt);
+    assert!(
+        !cross.status.success(),
+        "revert --abort in the merging worktree has no revert to abort"
+    );
+    assert!(
+        main.join(".libra/revert-state.json").exists(),
+        "and it must not have consumed MAIN's revert state"
+    );
+    let cross = run_libra_command(&["merge", "--abort"], main);
+    assert!(
+        !cross.status.success(),
+        "merge --abort in the reverting worktree has no merge to abort"
+    );
+    assert!(
+        wt.join(".libra/merge-state.json").exists(),
+        "and it must not have consumed the LINKED worktree's merge state"
+    );
+
+    // …while the right scope resolves its own operation.
+    assert_cli_success(
+        &run_libra_command(&["merge", "--abort"], &wt),
+        "the merging worktree aborts its own merge",
+    );
+    assert_cli_success(
+        &run_libra_command(&["revert", "--abort"], main),
+        "the reverting worktree aborts its own revert",
+    );
+    assert!(
+        !wt.join(".libra/merge-state.json").exists()
+            && !main.join(".libra/revert-state.json").exists(),
+        "both operations are cleanly gone"
     );
 }
 
@@ -578,6 +642,127 @@ fn a_stale_stash_tip_is_repaired_from_the_log() {
         !tip_path.exists(),
         "an emptied stack leaves no tip behind — a ref that outlived its log \
          names an entry nothing can find"
+    );
+}
+
+/// §C.12 (W2): two concurrent pops of the SAME entry — exactly one wins.
+///
+/// The stack is repository-shared, so two worktrees can pop at the same
+/// moment. The drop is a CAS on the entry's raw reflog line under the stack
+/// lock, so the LOSER must be refused — not allowed to drop whatever is on
+/// top by then, which after the winner's drop is a DIFFERENT entry.
+///
+/// The race is made real, not hoped for: both processes stop at a filesystem
+/// barrier (`LIBRA_TEST_STASH_DROP_BARRIER`) placed after each has resolved
+/// and applied its entry but before either takes the drop lock. Both
+/// therefore arrive holding the SAME resolved raw line, and only then race
+/// the CAS. Without the barrier, two back-to-back pops legitimately consume
+/// two entries and prove nothing about the CAS.
+#[test]
+fn concurrent_stash_pop_single_cas_winner() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let one = parent.path().join("pop-one");
+    let two = parent.path().join("pop-two");
+    for path in [&one, &two] {
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", path.to_str().unwrap()], main),
+            "worktree add",
+        );
+    }
+
+    // TWO entries: a loser that dropped blindly would consume the SECOND.
+    for content in ["first-stashed\n", "second-stashed\n"] {
+        fs::write(main.join("a.txt"), content).unwrap();
+        assert_cli_success(&run_libra_command(&["stash", "push"], main), "stash push");
+    }
+    let stack = |at: &std::path::Path| -> Vec<String> {
+        let out = run_libra_command(&["stash", "list"], at);
+        assert_cli_success(&out, "stash list");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.contains("stash@{"))
+            .map(str::to_string)
+            .collect()
+    };
+    let before = stack(main);
+    assert_eq!(before.len(), 2, "two entries on the shared stack");
+    // The message of the entry NEITHER pop may consume.
+    let survivor = before[1]
+        .split_once(':')
+        .map(|(_, rest)| rest.trim().to_string());
+
+    let barrier_dir = parent.path().join("drop-barrier");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for path in [one.clone(), two.clone()] {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let barrier_dir = barrier_dir.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let out = run_libra_command_with_stdin_and_env(
+                &["stash", "pop"],
+                &path,
+                "",
+                &[
+                    ("LIBRA_TEST", "1"),
+                    (
+                        "LIBRA_TEST_STASH_DROP_BARRIER",
+                        barrier_dir.to_str().unwrap(),
+                    ),
+                ],
+            );
+            (
+                out.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        }));
+    }
+    let results: Vec<(bool, String)> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("pop thread"))
+        .collect();
+
+    // Both processes arrived at the barrier — the race actually happened.
+    let arrived = fs::read_dir(&barrier_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        arrived, 2,
+        "both pops must reach the pre-drop rendezvous: {results:?}"
+    );
+
+    // Exactly ONE pop won the CAS; the loser was refused after its apply.
+    let winners = results.iter().filter(|(ok, _)| *ok).count();
+    assert_eq!(
+        winners, 1,
+        "exactly one pop may win the CAS on the same entry: {results:?}"
+    );
+    let loser = &results.iter().find(|(ok, _)| !*ok).expect("a loser").1;
+    assert!(
+        loser.contains("changed concurrently"),
+        "the loser is told the stack changed, not handed a different entry: {loser}"
+    );
+
+    // The stack lost exactly the ONE contested entry; the survivor is intact.
+    let after = stack(main);
+    assert_eq!(
+        after.len(),
+        1,
+        "one contested entry left the stack — a blind loser would have taken \
+         the survivor too: {after:?}"
+    );
+    assert_eq!(
+        after[0]
+            .split_once(':')
+            .map(|(_, rest)| rest.trim().to_string()),
+        survivor,
+        "and the surviving entry is the one neither pop resolved"
     );
 }
 
@@ -636,82 +821,6 @@ fn linked_stash_pop_apply_failure_keeps_shared_entry() {
         before.lines().count(),
         after.lines().count(),
         "and the stack is exactly as deep as before"
-    );
-}
-
-/// §C.12 (W2): two concurrent pops of the SAME entry — exactly one wins.
-///
-/// The stack is repository-shared, so two worktrees can pop at the same
-/// moment. The drop is a CAS on the entry's raw reflog line under the stack
-/// lock, so the loser must be refused rather than dropping an entry the winner
-/// already consumed (which would delete the NEXT entry, having shifted up).
-#[test]
-fn concurrent_stash_pop_single_cas_winner() {
-    let repo = repo_with_feature();
-    let main = repo.path();
-    let parent = tempfile::tempdir().expect("wt parent");
-    let one = parent.path().join("pop-one");
-    let two = parent.path().join("pop-two");
-    for path in [&one, &two] {
-        assert_cli_success(
-            &run_libra_command(&["worktree", "add", path.to_str().unwrap()], main),
-            "worktree add",
-        );
-    }
-
-    // TWO entries: if the loser dropped blindly it would consume the second.
-    for content in ["first-stashed\n", "second-stashed\n"] {
-        fs::write(main.join("a.txt"), content).unwrap();
-        assert_cli_success(&run_libra_command(&["stash", "push"], main), "stash push");
-    }
-    let depth = |at: &std::path::Path| {
-        let out = run_libra_command(&["stash", "list"], at);
-        assert_cli_success(&out, "stash list");
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|line| line.contains("stash@{"))
-            .count()
-    };
-    assert_eq!(depth(main), 2, "two entries on the shared stack");
-
-    // Both worktrees pop at once, released together.
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let mut handles = Vec::new();
-    for path in [one.clone(), two.clone()] {
-        let barrier = std::sync::Arc::clone(&barrier);
-        handles.push(std::thread::spawn(move || {
-            barrier.wait();
-            let out = run_libra_command(&["stash", "pop"], &path);
-            (
-                out.status.success(),
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                ),
-            )
-        }));
-    }
-    let results: Vec<(bool, String)> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("pop thread"))
-        .collect();
-
-    // Whatever the interleaving, the stack lost exactly ONE entry: two
-    // successful pops of the same entry, or one pop plus a refusal, are both
-    // acceptable — silently consuming TWO entries for one popped change is
-    // not.
-    let winners = results.iter().filter(|(ok, _)| *ok).count();
-    assert!(
-        winners >= 1,
-        "at least one pop must succeed: {:?}",
-        results.iter().map(|(_, text)| text).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        depth(main),
-        2 - winners,
-        "the shared stack lost exactly as many entries as pops succeeded — a \
-         blind drop would have consumed the entry the other pop never applied"
     );
 }
 
@@ -1243,21 +1352,101 @@ fn editor_buffers_are_worktree_local_not_shared() {
         );
     }
 
+    // The SAME contract for every W2-localized buffer, not just the tag's:
+    // reverting any one of them to common storage must fail this test.
+    // `notes add` composes via the editor when no `-m` is given, and
+    // `branch --edit-description` always does.
+    for (dir, target) in [(main, "HEAD"), (wt.as_path(), "HEAD")] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            // `-f`: notes are repository-shared and both worktrees annotate
+            // the same HEAD commit, so the second add is an overwrite.
+            .args(["notes", "add", "-f", target])
+            .current_dir(dir)
+            .env("GIT_EDITOR", probe.to_str().unwrap())
+            .output()
+            .expect("run libra notes add");
+        assert!(
+            out.status.success(),
+            "notes add in {dir:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // A fresh linked worktree is detached; give it a branch so
+    // `--edit-description` (current-branch form) has one to describe.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "wt-described"], &wt),
+        "attach the linked worktree to a branch",
+    );
+    for dir in [main, wt.as_path()] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["branch", "--edit-description"])
+            .current_dir(dir)
+            .env("GIT_EDITOR", probe.to_str().unwrap())
+            .output()
+            .expect("run libra branch --edit-description");
+        assert!(
+            out.status.success(),
+            "branch --edit-description in {dir:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // `revert --edit` composes through the same contract. Each worktree
+    // reverts its OWN head commit so the revert applies cleanly and the editor
+    // (the probe) records which REVERT_EDITMSG it was handed.
+    for dir in [main, wt.as_path()] {
+        fs::write(dir.join("reverted.txt"), format!("{}\n", dir.display())).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "reverted.txt"], dir),
+            "stage the revert fixture",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "to-revert", "--no-verify"], dir),
+            "commit the revert fixture",
+        );
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["revert", "--edit", "HEAD"])
+            .current_dir(dir)
+            .env("GIT_EDITOR", probe.to_str().unwrap())
+            .output()
+            .expect("run libra revert --edit");
+        assert!(
+            out.status.success(),
+            "revert --edit in {dir:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     let seen_text = fs::read_to_string(&seen).unwrap_or_default();
     let paths: Vec<&str> = seen_text.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(
         paths.len(),
-        2,
-        "the editor ran once per worktree: {paths:?}"
+        8,
+        "each editor-driven command ran once per worktree: {paths:?}"
     );
-    assert_ne!(
-        paths[0], paths[1],
-        "each worktree must get its OWN TAG_EDITMSG, not a shared one: {paths:?}"
-    );
-    // The linked worktree's buffer lives under ITS gitdir. Compare against the
-    // canonicalized worktree path rather than a raw prefix, which `/tmp` →
-    // `/private/tmp` symlink resolution would otherwise break.
     let wt_canon = wt.canonicalize().expect("canonicalize wt");
+    for (pair, name) in [
+        (&paths[0..2], "TAG_EDITMSG"),
+        (&paths[2..4], "NOTES_EDITMSG"),
+        (&paths[4..6], "BRANCH_DESCRIPTION_EDITMSG"),
+        (&paths[6..8], "REVERT_EDITMSG"),
+    ] {
+        assert_ne!(
+            pair[0], pair[1],
+            "each worktree must get its OWN {name}, not a shared one: {pair:?}"
+        );
+        // The linked worktree's buffer lives under ITS gitdir. Compare against
+        // the canonicalized worktree path rather than a raw prefix, which
+        // `/tmp` → `/private/tmp` symlink resolution would otherwise break.
+        let expected = wt_canon.join(".libra").join(name);
+        assert_eq!(
+            std::path::Path::new(pair[1]),
+            expected,
+            "the linked worktree's {name} lives in its own gitdir: {pair:?}"
+        );
+    }
+    // And the original tag assertion, now expressed through the loop above.
     let expected = wt_canon.join(".libra").join("TAG_EDITMSG");
     assert_eq!(
         std::path::Path::new(paths[1]),

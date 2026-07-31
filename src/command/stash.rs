@@ -1032,8 +1032,9 @@ pub(crate) async fn autostash_pop_by_entry(
 fn stack_entries() -> Result<Vec<StashLogEntry>, StashError> {
     // §C.10: repair a tip left stale by a crash before reporting the stack, so
     // a reader and a later mutation cannot disagree about what the top entry
-    // is. Repair is idempotent and a no-op on a consistent pair.
-    reconcile_stash_ref(&util::request_storage_path())?;
+    // is. The repair takes the STACK LOCK — an unlocked repair could overwrite
+    // a tip another process had just published.
+    reconcile_stash_ref_locked(&util::request_storage_path())?;
     let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
@@ -1043,6 +1044,9 @@ fn stack_entries() -> Result<Vec<StashLogEntry>, StashError> {
 }
 
 async fn run_list() -> Result<StashOutput, StashError> {
+    // §C.10: repair a stale tip before reporting the stack (unlocked entry
+    // point, so the locked form is safe).
+    reconcile_stash_ref_locked(&util::request_storage_path())?;
     if !has_stash()? {
         return Ok(StashOutput::List {
             entries: Vec::new(),
@@ -1287,12 +1291,14 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
     // The whole read→count→delete sequence runs under the stack lock (W2
     // §C.4.3) so a concurrent push/drop cannot interleave.
     let _stack_lock = acquire_stash_stack_lock()?;
+    let git_dir = util::request_storage_path();
+    // §C.10: repair under the lock this frame holds (bare form — flock is not
+    // reentrant) before the emptiness gate reads the ref.
+    reconcile_stash_ref(&git_dir)?;
     if !has_stash()? {
         return Ok(StashOutput::Clear { cleared_count: 0 });
     }
 
-    let git_dir = util::request_storage_path();
-    let stash_ref_path = git_dir.join("refs/stash");
     let stash_log_path = git_dir.join("logs/refs/stash");
 
     let cleared = if stash_log_path.exists() {
@@ -1302,14 +1308,10 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
         0
     };
 
-    if stash_log_path.exists() {
-        std::fs::remove_file(&stash_log_path)
-            .map_err(|e| StashError::WriteObject(e.to_string()))?;
-    }
-    if stash_ref_path.exists() {
-        std::fs::remove_file(&stash_ref_path)
-            .map_err(|e| StashError::WriteObject(e.to_string()))?;
-    }
+    // The SAME publication path as push and drop (§C.10): an empty stack is a
+    // published state, not a pair of ad-hoc unlinks, so `clear` gets the same
+    // order and the same durability.
+    publish_stash_stack(&git_dir, &[])?;
 
     Ok(StashOutput::Clear {
         cleared_count: cleared,
@@ -1660,17 +1662,13 @@ fn publish_stash_stack(storage: &Path, entries: &[StashLogEntry]) -> Result<(), 
     if entries.is_empty() {
         // Removing the LOG first keeps the same authority order: an empty
         // stack with a leftover ref is repairable; a ref-less log is a stack
-        // that would silently reappear.
-        match fs::remove_file(&log_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(write_error(&log_path, error)),
-        }
-        match fs::remove_file(&ref_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(write_error(&ref_path, error)),
-        }
+        // that would silently reappear. Each unlink is made DURABLE by
+        // fsyncing the parent directory — an unlink that has not reached the
+        // disk is exactly as lossy as a write that has not, and a power loss
+        // that restored the log while keeping the ref deletion would let
+        // reconciliation resurrect a stash the user just cleared.
+        remove_durably(&log_path)?;
+        remove_durably(&ref_path)?;
         return Ok(());
     }
 
@@ -1694,6 +1692,63 @@ fn publish_stash_stack(storage: &Path, entries: &[StashLogEntry]) -> Result<(), 
     let tip = format!("{}\n", entries[0].stash_id);
     crate::utils::atomic_write::write_atomic(&ref_path, tip.as_bytes(), true)
         .map_err(|error| write_error(&ref_path, error))
+}
+
+/// Block at the pre-drop rendezvous when the test harness asks.
+///
+/// `LIBRA_TEST=1` plus `LIBRA_TEST_STASH_DROP_BARRIER=<dir>` — debug builds
+/// only, gated on the same `LIBRA_TEST` sentinel as every other failpoint, so
+/// a release binary has no path to it. Each arriving process drops a unique
+/// marker file into `<dir>` and waits until TWO markers exist (or ten seconds
+/// pass, so a partner that failed early cannot hang the suite). A sleep is
+/// not a rendezvous: it proves overlap only when the scheduler cooperates,
+/// and a test that needs the scheduler's cooperation to fail is not a test.
+#[cfg(debug_assertions)]
+fn hold_for_drop_rendezvous() {
+    use std::time::{Duration, Instant};
+    if std::env::var_os("LIBRA_TEST").is_none() {
+        return;
+    }
+    let Some(dir) = std::env::var_os("LIBRA_TEST_STASH_DROP_BARRIER") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let _ = fs::create_dir_all(&dir);
+    let marker = dir.join(format!("arrived-{}", std::process::id()));
+    let _ = fs::write(&marker, b"1");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let arrived = fs::read_dir(&dir).map(Iterator::count).unwrap_or(0);
+        if arrived >= 2 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_for_drop_rendezvous() {}
+
+/// Unlink a file so the removal SURVIVES a power loss: the parent directory
+/// entry is fsynced, because an unlink that has not reached the disk leaves
+/// the file behind exactly as a lost write would.
+fn remove_durably(path: &Path) -> Result<(), StashError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(StashError::WriteObject(format!(
+                "{}: {error}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 /// Repair a tip left stale by a crash between the two writes of
@@ -1762,6 +1817,18 @@ fn reconcile_stash_ref(storage: &Path) -> Result<bool, StashError> {
     Ok(true)
 }
 
+/// [`reconcile_stash_ref`] for a caller that does NOT already hold the stack
+/// lock (§C.10).
+///
+/// The repair is itself a write to `refs/stash`, so running it unlocked could
+/// overwrite a tip a concurrent push had just published — the reader would
+/// "repair" the stack back to the state it read a moment earlier. Callers
+/// inside the lock use the bare form; everyone else comes through here.
+fn reconcile_stash_ref_locked(storage: &Path) -> Result<bool, StashError> {
+    let _lock = acquire_stash_stack_lock()?;
+    reconcile_stash_ref(storage)
+}
+
 /// RAII guard over the shared stash-STACK mutation lock (W2 §C.4.3):
 /// `refs/stash` + its reflog are repository-shared across worktrees, so every
 /// stack mutation (push/store, drop, pop's drop phase, clear, branch's drop)
@@ -1802,7 +1869,18 @@ fn acquire_stash_stack_lock() -> Result<StashStackLockGuard, StashError> {
 /// [`StashError::StackChanged`] — the caller keeps its successful apply and
 /// reports, never rolls back, never deletes a different entry.
 fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOutput, StashError> {
+    // Test rendezvous (§C.12): hold BEFORE the lock, after the caller has
+    // resolved and applied its entry, so two processes provably arrive with
+    // the SAME resolved raw line — then race the lock, and exactly one CAS
+    // may win. A hold inside the lock serializes the second process's
+    // resolve behind the first's publication, which tests nothing.
+    hold_for_drop_rendezvous();
     let _stack_lock = acquire_stash_stack_lock()?;
+    let git_dir = util::request_storage_path();
+    // §C.10 recovery: a tip left stale by a crash is repaired FIRST, under the
+    // lock this frame just took (the bare form — flock is not reentrant), so
+    // both the `has_stash` gate and the CAS below read a consistent pair.
+    reconcile_stash_ref(&git_dir)?;
     // A CAS caller APPLIED an entry that was on the stack moments ago — the
     // stack's wholesale disappearance IS a concurrent change, not a user
     // error about an empty stash.
@@ -1817,11 +1895,6 @@ fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOu
         return Err(missing(expected_line.is_some()));
     }
 
-    let git_dir = util::request_storage_path();
-    // §C.10 recovery: a tip left stale by a crash between the two writes is
-    // repaired from the log BEFORE this mutation reads the stack, so the CAS
-    // below never matches against an inconsistent pair.
-    reconcile_stash_ref(&git_dir)?;
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Err(missing(expected_line.is_some()));
@@ -1943,11 +2016,12 @@ async fn has_changes() -> bool {
 
 fn has_stash() -> Result<bool, StashError> {
     // §C.4.2: the repository this INVOCATION acts on, like every other stash
-    // path. §C.10: repair a tip left stale by a crash before believing it —
-    // this predicate gates `list`/`pop`/`drop`, so a stale tip here would
-    // report a stack that is not there (or hide one that is).
+    // path. Deliberately BARE — no lock, no repair: this predicate runs both
+    // under the stack lock (`do_drop`, `run_clear`) and outside it, and flock
+    // is not reentrant, so taking the lock here deadlocks the locked callers.
+    // Every ENTRY POINT reconciles first (locked outside the lock, bare
+    // inside), so by the time this reads the ref it has been repaired.
     let storage = util::request_storage_path();
-    reconcile_stash_ref(&storage)?;
     let stash_ref = storage.join("refs/stash");
     match fs::symlink_metadata(&stash_ref) {
         Ok(metadata) if metadata.is_file() => Ok(true),
@@ -2095,6 +2169,10 @@ pub(crate) fn gc_roots() -> Result<Vec<ObjectHash>, StashError> {
 fn resolve_stash_to_commit_hash(
     stash_ref: Option<String>,
 ) -> Result<(usize, String, String), StashError> {
+    // §C.10: repair a stale tip before resolving against the stack. This
+    // entry point never runs under the stack lock, so the locked form is
+    // safe here.
+    reconcile_stash_ref_locked(&util::request_storage_path())?;
     if !has_stash()? {
         return Err(StashError::NoStashFound);
     }
@@ -2133,6 +2211,12 @@ fn update_stash_ref_locked(
     message: &str,
 ) -> Result<String, StashError> {
     let _stack_lock = acquire_stash_stack_lock()?;
+    // §C.10: repair a stale tip BEFORE reading it as this entry's parent. A
+    // crash could have left the tip naming `B` while the log is headed by `A`;
+    // chaining the new entry onto `B` would record a reflog line whose parent
+    // no line in the log produces, and the CAS identity of every later entry
+    // would be built on it.
+    reconcile_stash_ref(git_dir)?;
     update_stash_ref(git_dir, stash_hash, committer, message)
         .map_err(|e| StashError::WriteObject(e.to_string()))
 }
@@ -2479,6 +2563,8 @@ fn merge_trees(base: &Tree, head: &Tree, stash: &Tree, git_dir: &Path) -> Result
 
 /// Get the number of stashes
 pub(crate) fn get_stash_num() -> Result<usize, String> {
+    // §C.10: unlocked entry point — repair before counting.
+    reconcile_stash_ref_locked(&util::request_storage_path()).map_err(|error| error.to_string())?;
     if !has_stash().map_err(|error| error.to_string())? {
         return Ok(0);
     }
