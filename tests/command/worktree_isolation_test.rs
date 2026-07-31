@@ -451,6 +451,152 @@ fn a_corrupt_sidecar_root_fails_the_prune_closed() {
     );
 }
 
+/// W2 r4: a CORRUPT held-autostash sidecar is a hard stop, not a skip.
+///
+/// The old `let Ok(...)` silently skipped the unreadable file; a later
+/// `--autostash` save then OVERWROTE it — destroying the only durable
+/// reference to the held commit, which GC could then collect.
+#[test]
+fn a_corrupt_held_autostash_refuses_the_merge_and_survives() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("b.txt"), "other\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other", "--no-verify"], main),
+        "commit",
+    );
+
+    let sidecar = main.join(".libra").join("merge-autostash.json");
+    fs::write(&sidecar, "{ not json").unwrap();
+    let before = fs::read(&sidecar).unwrap();
+
+    let out = run_libra_command(&["merge", "--autostash", "other"], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a merge over an unreadable held-autostash must refuse: {text}"
+    );
+    assert!(
+        text.contains("merge-autostash.json"),
+        "and name the file: {text}"
+    );
+    assert_eq!(
+        fs::read(&sidecar).unwrap(),
+        before,
+        "the corrupt sidecar was NOT overwritten — it is the only reference \
+         to the held commit"
+    );
+}
+
+/// W2 r4: a LINKED worktree may not promote a foreign-marked autostash
+/// either — a manually copied sidecar carries its true owner's scope, and
+/// promoting adopts its commit into the shared list and deletes the evidence.
+#[test]
+fn a_foreign_marked_autostash_is_refused_in_a_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("foreign-autostash-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("b.txt"), "other\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other", "--no-verify"], main),
+        "commit",
+    );
+
+    // A sidecar inside the LINKED gitdir, marked as someone else's.
+    let sidecar = wt.join(".libra").join("merge-autostash.json");
+    fs::write(
+        &sidecar,
+        serde_json::json!({
+            "stash_commit": "1111111111111111111111111111111111111111",
+            "owner_scope": "some-other-worktree"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["merge", "other"], &wt);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a foreign-marked sidecar must refuse the merge that would promote it: {text}"
+    );
+    assert!(
+        text.contains("some-other-worktree"),
+        "and the refusal names the recorded owner: {text}"
+    );
+    assert!(sidecar.exists(), "the evidence survives");
+}
+
+/// §C.10: an interrupted `stash branch` rollback is completed from its
+/// journal by the next stash invocation — HEAD restored, the branch deleted
+/// tip-conditionally, the journal removed, the working tree untouched.
+#[test]
+fn an_interrupted_stash_branch_rollback_completes_from_the_journal() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // The half-state an interrupted command leaves: the branch exists at its
+    // base, HEAD sits on it, and the journal records the rollback intent.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "half-branch"], main),
+        "enter the half-state",
+    );
+    fs::write(
+        main.join(".libra").join("stash-branch-journal.json"),
+        serde_json::json!({
+            "branch": "half-branch",
+            "base": head,
+            "prior_branch": "main",
+            "prior_detached": null
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // ANY stash command completes the rollback first.
+    let out = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&out, "stash list runs the recovery");
+
+    let status = run_libra_command(&["status"], main);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("On branch main"),
+        "HEAD is back on the prior branch: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let branches = run_libra_command(&["branch"], main);
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("half-branch"),
+        "the journaled branch was deleted at its base"
+    );
+    assert!(
+        !main
+            .join(".libra")
+            .join("stash-branch-journal.json")
+            .exists(),
+        "and the journal is gone"
+    );
+}
+
 /// §C.4.3: `worktree remove` refuses a worktree holding a conflicted merge —
 /// in BOTH modes. Detaching writes the fail-closed marker OVER the live
 /// sidecar (stranding the merge behind a gate the user cannot lift without
@@ -4612,8 +4758,8 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         assert_eq!(
             rolled,
             vec![
-                2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
-                2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+                2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
+                2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
             ]
         );
         conn.close().await.expect("close");

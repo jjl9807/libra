@@ -328,6 +328,11 @@ pub async fn execute(stash_cmd: Stash) {
 /// errors and exiting. Dispatches to stash sub-commands (push, pop, list,
 /// apply, drop, show, branch, clear).
 pub async fn execute_safe(stash_cmd: Stash, output: &OutputConfig) -> CliResult<()> {
+    // §C.10: finish any rollback an interrupted `stash branch` recorded.
+    recover_stash_branch_journal()
+        .await
+        .map_err(CliError::from)?;
+
     // W2 §C.4.3: the stash STACK (`refs/stash` + reflog) stays deliberately
     // repository-shared — a stash pushed in one worktree may be applied in
     // another — while push/apply/pop snapshot and mutate only the CURRENT
@@ -1195,6 +1200,101 @@ async fn rollback_created_branch(branch_name: &str, base_hash: &ObjectHash) {
     }
 }
 
+/// Durable rollback journal for `stash branch` (W2 §C.10).
+///
+/// The command is create-branch → switch-HEAD → apply → drop. A failure after
+/// the first two must undo them, and the UNDO itself can fail (or the process
+/// can die mid-way) — so the intent to roll back is recorded durably BEFORE
+/// HEAD moves, and [`recover_stash_branch_journal`] completes it on the next
+/// stash invocation. The working tree is never touched by recovery: a
+/// half-applied stash leaves dirty files, and deleting them would destroy the
+/// only copy of the user's changes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StashBranchJournal {
+    branch: String,
+    /// The branch's creation tip — deletion is tip-conditional, so a branch
+    /// the user has since committed to is KEPT.
+    base: String,
+    /// The HEAD to restore: a branch name, or a detached commit id.
+    prior_branch: Option<String>,
+    prior_detached: Option<String>,
+}
+
+impl StashBranchJournal {
+    fn path() -> PathBuf {
+        util::request_worktree_gitdir_strict().join("stash-branch-journal.json")
+    }
+
+    fn write(&self) -> Result<(), StashError> {
+        let data = serde_json::to_vec_pretty(self)
+            .map_err(|error| StashError::WriteObject(error.to_string()))?;
+        crate::utils::atomic_write::write_atomic(&Self::path(), &data, true)
+            .map_err(|error| StashError::WriteObject(error.to_string()))
+    }
+
+    fn clear() -> Result<(), StashError> {
+        remove_durably(&Self::path())
+    }
+
+    fn prior_head(&self) -> Option<Head> {
+        if let Some(branch) = &self.prior_branch {
+            return Some(Head::Branch(branch.clone()));
+        }
+        self.prior_detached
+            .as_deref()
+            .and_then(|oid| ObjectHash::from_str(oid).ok())
+            .map(Head::Detached)
+    }
+}
+
+/// Complete a rollback an earlier `stash branch` recorded but could not
+/// finish (§C.10 expected-state recovery). Runs at every stash entry point;
+/// a missing journal is the fast path. Unreadable journals refuse the
+/// command rather than guessing.
+async fn recover_stash_branch_journal() -> Result<(), StashError> {
+    let path = StashBranchJournal::path();
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(StashError::Other(format!(
+                "cannot read the stash-branch rollback journal '{}': {error}",
+                path.display()
+            )));
+        }
+    };
+    let journal: StashBranchJournal = serde_json::from_str(&data).map_err(|error| {
+        StashError::Other(format!(
+            "the stash-branch rollback journal '{}' is corrupt ({error}); inspect and \
+             remove it manually",
+            path.display()
+        ))
+    })?;
+
+    // HEAD first: if it still points at the journaled branch, restore the
+    // prior head; if the user already moved on, leave HEAD alone.
+    if let Head::Branch(current) = Head::current().await
+        && current == journal.branch
+        && let Some(prior) = journal.prior_head()
+    {
+        Head::update_result(prior, None)
+            .await
+            .map_err(|error| StashError::Other(format!("rollback cannot restore HEAD: {error}")))?;
+    }
+    // Branch second, tip-conditionally: a branch the user committed to is
+    // theirs now and is kept.
+    if let Ok(base) = ObjectHash::from_str(&journal.base) {
+        let _ = InternalBranch::delete_branch_if_tip_result(&journal.branch, &base).await;
+    }
+    StashBranchJournal::clear()?;
+    crate::utils::error::emit_warning(format!(
+        "completed the rollback of an interrupted `stash branch {}` (the working tree \
+         was left untouched)",
+        journal.branch
+    ));
+    Ok(())
+}
+
 async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashOutput, StashError> {
     // Resolve stash & metadata for the new branch base. The raw reflog line
     // is the unambiguous entry identity for the post-apply CAS delete.
@@ -1225,6 +1325,28 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
             other => stash_branch_store_error(&branch_name, other),
         })?;
 
+    // §C.10: record the rollback intent DURABLY before HEAD moves. If the
+    // apply fails and the in-process rollback also fails (or the process
+    // dies), the journal survives and the next stash invocation completes the
+    // rollback. A journal-write failure aborts here, where the only mutation
+    // so far is the branch row — rolled back tip-conditionally.
+    let journal = StashBranchJournal {
+        branch: branch_name.clone(),
+        base: base_hash.to_string(),
+        prior_branch: match &prior_head {
+            Head::Branch(name) => Some(name.clone()),
+            Head::Detached(_) => None,
+        },
+        prior_detached: match &prior_head {
+            Head::Detached(oid) => Some(oid.to_string()),
+            Head::Branch(_) => None,
+        },
+    };
+    if let Err(error) = journal.write() {
+        rollback_created_branch(&branch_name, &base_hash).await;
+        return Err(error);
+    }
+
     // Switch HEAD to the new branch so apply runs on the right tip — via the
     // RESULT-returning API (W2 §C.4.3 scoped HEAD guard): a swallowed HEAD
     // failure would apply the stash onto the wrong branch tip. On failure
@@ -1238,17 +1360,34 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
 
     // Apply BY HASH (pinned to the resolved entry's content).
     if let Err(apply_error) = apply_stash_commit(&stash_hash).await {
-        // Best-effort rollback of the half-created state (new branch +
-        // switched HEAD) so a failed apply does not strand the user on an
-        // empty branch; the ORIGINAL apply error surfaces either way.
+        // Roll back the half-created state (new branch + switched HEAD). If
+        // any step fails, the JOURNAL persists and the next stash invocation
+        // finishes the rollback — the user is never left with a silent
+        // half-state; the ORIGINAL apply error surfaces either way.
         match Head::update_result(prior_head, None).await {
-            Err(head_error) => eprintln!(
-                "warning: could not switch HEAD back after the failed stash apply: {head_error}"
-            ),
-            Ok(()) => rollback_created_branch(&branch_name, &base_hash).await,
+            Err(head_error) => {
+                eprintln!(
+                    "warning: could not switch HEAD back after the failed stash apply \
+                     ({head_error}); the rollback is journaled and will complete on the \
+                     next stash command"
+                );
+            }
+            Ok(()) => {
+                rollback_created_branch(&branch_name, &base_hash).await;
+                if let Err(journal_error) = StashBranchJournal::clear() {
+                    eprintln!(
+                        "warning: the completed rollback's journal could not be removed \
+                         ({journal_error}); the next stash command will re-verify it"
+                    );
+                }
+            }
         }
         return Err(apply_error);
     }
+    // The command succeeded past its mutating phase: the journaled rollback
+    // must not fire later. An unremovable journal is an error NOW — leaving
+    // it would roll back a branch the user is standing on.
+    StashBranchJournal::clear()?;
     let applied = true;
     let dropped = {
         // Unified CAS deletion (same do_drop path as pop): locate the applied
@@ -1684,9 +1823,11 @@ fn publish_stash_stack(storage: &Path, entries: &[StashLogEntry]) -> Result<(), 
         return Ok(());
     }
 
+    // Backfill: any line without a generation (written by an older binary)
+    // gets one now, so the whole stack is ABA-proof after its first mutation.
     let body = entries
         .iter()
-        .map(|entry| entry.raw_line.as_str())
+        .map(|entry| with_generation(&entry.raw_line))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
@@ -2069,6 +2210,41 @@ struct StashLogEntry {
     message: String,
 }
 
+/// Whether a trailing tab-separated field is a generation column THIS writer
+/// minted: `gen=` followed by exactly 32 lowercase hex digits (a simple
+/// uuid7). Anything else — including a user message that legitimately
+/// contains `\tgen=...` — is message content and must never be stripped.
+fn is_generation_column(field: &str) -> bool {
+    field.strip_prefix("gen=").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
+}
+
+/// Mint a fresh generation column.
+fn generation_column() -> String {
+    format!("gen={}", uuid::Uuid::now_v7().simple())
+}
+
+/// A raw line WITH a generation: the line itself when it already carries one,
+/// or the line with a fresh generation appended. Publication runs every line
+/// through this, so a stack written by an older binary becomes ABA-proof on
+/// its first mutation — and any raw-line handle a concurrent holder captured
+/// BEFORE the upgrade then misses its CAS, which fails in the safe direction
+/// (the entry is kept and the holder is told the stack changed).
+fn with_generation(raw_line: &str) -> String {
+    let has_generation = raw_line
+        .rsplit_once('\t')
+        .is_some_and(|(_, field)| is_generation_column(field));
+    if has_generation {
+        raw_line.to_string()
+    } else {
+        format!("{raw_line}\t{}", generation_column())
+    }
+}
+
 fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, StashError> {
     let mut entries = Vec::new();
 
@@ -2093,8 +2269,12 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
         let message = line
             .split_once('\t')
             .map(|(_, rest)| match rest.rsplit_once('\t') {
-                // The trailing `gen=` column is entry identity, not message.
-                Some((message, generation)) if generation.starts_with("gen=") => {
+                // The trailing generation column is entry identity, not
+                // message — but only the EXACT shape this writer mints
+                // (`gen=` + 32 lowercase hex) is stripped. A legacy `-m`
+                // message that happens to contain a tab and a `gen=` prefix
+                // keeps every byte it always had.
+                Some((message, generation)) if is_generation_column(generation) => {
                     message.to_string()
                 }
                 _ => rest.to_string(),
@@ -2256,7 +2436,7 @@ fn update_stash_ref(
     // distinct; readers that split on the first tab still see the message,
     // and old lines without one keep working.
     let reflog_entry = format!(
-        "{} {} {} <{}> {} {}\t{}\tgen={}",
+        "{} {} {} <{}> {} {}\t{}\t{}",
         old_hash,
         stash_hash,
         committer.name,
@@ -2264,7 +2444,7 @@ fn update_stash_ref(
         committer.timestamp,
         committer.timezone,
         message,
-        uuid::Uuid::now_v7().simple()
+        generation_column()
     );
 
     let mut lines = if stash_log_path.exists() {
@@ -2890,6 +3070,96 @@ mod tests {
         // ...while a plain drop still reports the ordinary empty-stash error.
         let err = do_drop(None, None).expect_err("plain drop on empty stack");
         assert!(matches!(err, StashError::NoStashFound), "{err:?}");
+    }
+
+    /// §C.10: only the EXACT generation shape is stripped from messages — a
+    /// legacy `-m` message that happens to contain `\tgen=...` keeps every
+    /// byte, while a real generation column never leaks into display.
+    #[test]
+    fn generation_stripping_never_eats_a_legacy_message() {
+        let zero = "0000000000000000000000000000000000000000";
+        let id = "1111111111111111111111111111111111111111";
+        let legacy = format!("{zero} {id} t <t@x> 1 +0000\tnote\tgen=keep-this");
+        let entries = parse_stash_log_entries(vec![legacy.clone()]).expect("parse legacy");
+        assert_eq!(
+            entries[0].message, "note\tgen=keep-this",
+            "a message that merely LOOKS like a generation keeps every byte"
+        );
+
+        let minted = format!("{zero} {id} t <t@x> 1 +0000\tnote\t{}", generation_column());
+        let entries = parse_stash_log_entries(vec![minted]).expect("parse minted");
+        assert_eq!(
+            entries[0].message, "note",
+            "a real generation column never leaks into the message"
+        );
+
+        // The shape predicate itself: exactly gen= + 32 lowercase hex.
+        assert!(is_generation_column(&generation_column()));
+        for not_a_generation in [
+            "gen=keep-this",
+            "gen=ABCDEF00112233445566778899AABBCC",
+            "gen=0123456789abcdef",
+            "generation=0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(
+                !is_generation_column(not_a_generation),
+                "{not_a_generation:?} must not be stripped"
+            );
+        }
+    }
+
+    /// §C.10: the first locked publication BACKFILLS generations onto lines
+    /// an older binary wrote — after it, a raw-line handle captured before
+    /// the upgrade misses its CAS (the safe direction), and every line on
+    /// disk is ABA-proof.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_backfills_generations_onto_legacy_lines() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let storage = util::storage_path();
+
+        // A two-entry stack exactly as an old binary would have written it.
+        let zero = "0000000000000000000000000000000000000000";
+        let id_top = "1111111111111111111111111111111111111111";
+        let id_old = "2222222222222222222222222222222222222222";
+        fs::create_dir_all(storage.join("refs")).unwrap();
+        fs::create_dir_all(storage.join("logs/refs")).unwrap();
+        fs::write(storage.join("refs/stash"), format!("{id_top}\n")).unwrap();
+        let legacy_top = format!("{zero} {id_top} t <t@x> 2 +0000\tWIP top");
+        let legacy_old = format!("{zero} {id_old} t <t@x> 1 +0000\tWIP old");
+        fs::write(
+            storage.join("logs/refs/stash"),
+            format!("{legacy_top}\n{legacy_old}\n"),
+        )
+        .unwrap();
+
+        // First locked mutation: drop the TOP entry via its legacy line.
+        do_drop(None, Some(&legacy_top)).expect("the pre-upgrade line still CASes once");
+
+        // The surviving line was rewritten WITH a generation…
+        let entries = stack_entries().expect("stack entries");
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .raw_line
+                .rsplit_once('\t')
+                .is_some_and(|(_, field)| is_generation_column(field)),
+            "the survivor was backfilled: {}",
+            entries[0].raw_line
+        );
+        assert_eq!(entries[0].message, "WIP old");
+
+        // …so the STALE legacy handle for it now misses, in the safe
+        // direction.
+        let err = do_drop(None, Some(&legacy_old)).expect_err("the stale handle misses");
+        assert!(matches!(err, StashError::StackChanged), "{err:?}");
+        assert_eq!(
+            stack_entries().expect("entries").len(),
+            1,
+            "nothing deleted"
+        );
     }
 
     /// §C.10 ABA: a drop-and-repush that reproduces every VISIBLE field of a

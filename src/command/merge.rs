@@ -1147,6 +1147,43 @@ async fn autostash_enabled(options: &PullMergeOptions) -> Result<bool, PullMerge
 /// (start, --continue, --abort; success or failure): if the sidecar exists
 /// and no merge is in progress, re-apply the held stash. Clean apply →
 /// sidecar dropped; apply conflict → stash promoted into refs/stash with a
+/// The ownership matrix every held-autostash CONSUMER must pass (W2,
+/// ADR-0714-08) before applying or promoting the sidecar — both adopt its
+/// commit into user-visible state and then delete the evidence.
+///
+/// * recorded owner == this scope → operable (proven ours);
+/// * recorded owner == some OTHER scope → refused (a copied/moved file);
+/// * no record, MAIN scope, linked-worktree history → refused (an old
+///   binary's common-storage file could be a removed linked worktree's);
+/// * no record otherwise → operable (a W1-era file in an unambiguous gitdir).
+fn verify_autostash_ownership() -> Result<(), String> {
+    let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+    let path = util::request_worktree_gitdir_strict().join("merge-autostash.json");
+    let recorded = crate::internal::sequencer::sidecar_recorded_owner(&path)?;
+    match recorded {
+        Some(owner) if owner == scope.storage_key() => Ok(()),
+        Some(owner) => Err(format!(
+            "the held-autostash sidecar at '{}' records owner scope '{owner}', not this \
+             worktree's — applying or promoting it would adopt another worktree's stashed \
+             changes and delete the evidence. Conclude the merge in the worktree that owns \
+             it, or remove the file after inspecting `libra stash show` against its commit",
+            path.display()
+        )),
+        None if !scope.is_linked()
+            && crate::command::maintenance::repository_had_linked_worktrees() =>
+        {
+            Err(format!(
+                "the held-autostash sidecar at '{}' carries no owner record, and this \
+                 repository has linked-worktree history, so it cannot be proven to be the \
+                 main worktree's. Inspect `libra stash show` against its commit, then \
+                 remove the file manually if it is stale",
+                path.display()
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
 /// notice (never lost — the lore 1.8 headline); other apply error → sidecar
 /// KEPT and a warning printed (the merge outcome itself is never changed).
 /// While merge state persists the stash simply stays held.
@@ -1171,6 +1208,10 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             ));
             return Some("kept".to_string());
         }
+    }
+    if let Err(reason) = verify_autostash_ownership() {
+        crate::utils::error::emit_warning(format!("{reason}; leaving it in place"));
+        return Some("kept".to_string());
     }
     let oid = match ObjectHash::from_str(&sidecar.stash_commit) {
         Ok(oid) => oid,
@@ -1267,29 +1308,21 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // (crash after a finalize apply, or an interrupted start) is promoted to
     // the stash list — never overwritten or lost. Skipped on --restart
     // re-entry, where the HELD sidecar legitimately exists without state.
-    if !options.preserve_held_autostash
-        && let Ok(Some(sidecar)) = MergeAutostash::load_optional_sync()
-    {
+    // A sidecar that EXISTS but cannot be read is a hard stop, not a skip:
+    // proceeding would let the later `--autostash` save OVERWRITE the corrupt
+    // file — destroying the only durable reference to a held commit, which GC
+    // may then collect.
+    let held_sidecar = if options.preserve_held_autostash {
+        None
+    } else {
+        MergeAutostash::load_optional_sync().map_err(PullMergeError::Autostash)?
+    };
+    if let Some(sidecar) = held_sidecar {
         // ADR-0714-08: promoting adopts the file into the SHARED stash list
-        // and deletes the evidence — main may only do that to a file PROVEN
-        // its own. An unmarked file (old binary) in a repository with linked
-        // history could be a removed linked worktree's; fail closed.
-        let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
-        if !scope.is_linked() && crate::command::maintenance::repository_had_linked_worktrees() {
-            let recorded = crate::internal::sequencer::sidecar_recorded_owner(
-                &util::request_worktree_gitdir_strict().join("merge-autostash.json"),
-            )
-            .map_err(PullMergeError::Autostash)?;
-            if recorded.as_deref() != Some("") {
-                return Err(PullMergeError::Autostash(format!(
-                    "a held-autostash sidecar exists in COMMON storage and cannot be \
-                     proven to be the main worktree's (recorded owner: {recorded:?}); \
-                     promoting it would adopt another worktree's stashed changes and \
-                     delete the evidence. Inspect it with `libra stash show` against \
-                     the recorded commit, then remove it manually if it is stale"
-                )));
-            }
-        }
+        // and deletes the evidence — only a file this scope can PROVE its own
+        // may be adopted, in any worktree (a foreign-marked file inside a
+        // linked gitdir is a manual copy, not that worktree's autostash).
+        verify_autostash_ownership().map_err(PullMergeError::Autostash)?;
         if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
             match crate::command::stash::store_stash_commit(&oid, "autostash").await {
                 Ok(()) => {

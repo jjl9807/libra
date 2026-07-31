@@ -1329,6 +1329,15 @@ pub fn builtin_migrations() -> Vec<Migration> {
                 "../../../sql/migrations/2026073005_worktree_registry_v3_capability_down.sql"
             ),
         ),
+        // plan-20260714 Part C W2 (§C.10): version fence for the stash
+        // reflog's generation column — an older binary writes reusable
+        // (ABA-prone) lines, so it must refuse the repository at connect time.
+        sql_migration(
+            2026073101,
+            "stash_generation_fence",
+            include_str!("../../../sql/migrations/2026073101_stash_generation_fence.sql"),
+            include_str!("../../../sql/migrations/2026073101_stash_generation_fence_down.sql"),
+        ),
     ]
 }
 
@@ -1774,9 +1783,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 50);
+        assert_eq!(runner.len(), 51);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026073005));
+        assert_eq!(runner.max_registered_version(), Some(2026073101));
     }
 
     #[test]
