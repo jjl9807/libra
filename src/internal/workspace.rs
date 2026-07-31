@@ -471,6 +471,12 @@ impl WorkspaceError {
     }
 
     /// Actionable next step for the user, mirroring the stable code.
+    ///
+    /// Every `libra worktree doctor` mention here is INSPECT-ONLY (§C.11 W0,
+    /// Codex R19/R20): the doctor's default invocation is strictly read-only,
+    /// and its mutating grammar (reclaim/adopt/clear/repair) is not frozen yet.
+    /// A hint must never name a recovery command that does not exist — pinned
+    /// by `worktree_doctor_hints_are_inspect_only`.
     fn hint(&self) -> Option<String> {
         match self {
             // W0 (Codex R19/R20): `worktree doctor` is a READ-ONLY diagnostic
@@ -479,12 +485,13 @@ impl WorkspaceError {
             // a user who follows one gets an unknown-subcommand error while
             // still holding the problem the hint promised to solve.
             Self::LeaseHeld(detail) => Some(if detail.path_conflict {
-                "another workspace already claims this directory; run `libra agent workspace \
-                 list` to see which one, and `libra worktree doctor` to inspect its state"
+                "another live workspace already claims this directory; run \
+                 `libra worktree doctor` to inspect which one, and have its owner finish \
+                 with the directory first"
                     .to_string()
             } else {
-                "wait for the holder to finish, or run `libra worktree doctor` to inspect \
-                 whether the lease has expired and its owner is still alive"
+                "wait for the holder to finish with this workspace; run \
+                 `libra worktree doctor` to inspect the lease deadline and its owner"
                     .to_string()
             }),
             Self::LeaseLost { .. } => Some(
@@ -817,9 +824,9 @@ impl WorkspaceStore {
                     current.as_str()
                 ))
             }
-            // W0 (Codex R19/R20): inspect-only guidance — "adopt or release"
-            // named W4 actions that do not exist yet, and contradicted the
-            // generic inspect hint this same error carries.
+            // INSPECT-ONLY wording (§C.11 W0, Codex R19/R20): the doctor's
+            // adopt/release grammar is not frozen yet, so this must not name
+            // an action the CLI cannot perform.
             Ok(current) => WorkspaceError::Corrupt(format!(
                 "workspaces registered under a previous repository identity are still live or \
                  awaiting recovery, so no new workspace can be registered under {current}; run \
@@ -1480,6 +1487,82 @@ impl WorkspaceStore {
             None
         };
         Ok(WorkspacePage { items, next_cursor })
+    }
+
+    /// One bounded, keyset-paginated page for `worktree doctor` (§C.8 W4).
+    ///
+    /// Deliberately NOT identity-scoped, unlike every other listing: the whole
+    /// point of the doctor view is to surface rows the normal machinery hides,
+    /// and a record left behind by a PREVIOUS repository identity is exactly
+    /// such a row — invisible to [`Self::list_with_conn`], unreclaimable, and
+    /// the reason `acquire` fails closed. The caller renders each row's own
+    /// `repo_id` so a foreign row is diagnosable rather than merely absent.
+    ///
+    /// `released` rows are excluded: they are settled history with nothing left
+    /// to diagnose, and letting them accumulate in the page would push live
+    /// problems behind a cursor. Strictly read-only.
+    pub async fn doctor_page_with_conn<C: ConnectionTrait>(
+        conn: &C,
+        limit: Option<u64>,
+        after_id: Option<&str>,
+    ) -> WorkspaceResult<WorkspacePage> {
+        let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT);
+        let mut sql =
+            format!("SELECT {SELECT_COLUMNS} FROM workspace_record WHERE state <> 'released'");
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(after_id) = after_id {
+            sql.push_str(" AND workspace_id > ?");
+            values.push(after_id.into());
+        }
+        // One extra row decides `has_more` without a second COUNT query.
+        sql.push_str(" ORDER BY workspace_id ASC LIMIT ?");
+        values.push((limit + 1).into());
+
+        let rows = conn
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .map_err(|error| {
+                WorkspaceError::ReadFailed(format!(
+                    "cannot list workspace records for diagnosis: {error}"
+                ))
+            })?;
+        let has_more = rows.len() as u64 > limit;
+        let mut items = Vec::with_capacity(rows.len().min(limit as usize));
+        for row in rows.iter().take(limit as usize) {
+            items.push(record_from_row(row)?);
+        }
+        let next_cursor = if has_more {
+            items.last().map(|record| record.workspace_id.clone())
+        } else {
+            None
+        };
+        Ok(WorkspacePage { items, next_cursor })
+    }
+
+    /// Load one record by id for `worktree doctor`, across repository
+    /// identities (see [`Self::doctor_page_with_conn`] for why the doctor is
+    /// not identity-scoped). Strictly read-only.
+    pub async fn doctor_record_with_conn<C: ConnectionTrait>(
+        conn: &C,
+        workspace_id: &str,
+    ) -> WorkspaceResult<Option<WorkspaceRecord>> {
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!("SELECT {SELECT_COLUMNS} FROM workspace_record WHERE workspace_id = ?"),
+                [workspace_id.into()],
+            ))
+            .await
+            .map_err(|error| {
+                WorkspaceError::ReadFailed(format!(
+                    "cannot read the workspace record for diagnosis: {error}"
+                ))
+            })?;
+        row.as_ref().map(record_from_row).transpose()
     }
 
     /// Live records whose lease deadline has passed — the scavenger's bounded

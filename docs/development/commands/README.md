@@ -144,6 +144,8 @@
 
 ## 汇总文档
 
-- [`_compatibility.md`](_compatibility.md)：Git 兼容治理、D1-D19 拒绝/延后决策、参数级缺口状态。
+- [`_compatibility.md`](_compatibility.md)：Git 兼容治理、D1-D23 拒绝/延后决策（数字编号止于 `D23`，`D11`-`D14` 不存在；另有 `D-clean-pathspec`、`D-empty-message` 两条具名决策）、参数级缺口状态。
 - [`_general.md`](_general.md)：跨命令实现规范、CLIG 现代化、测试和文档维护要求。
-- [`grit-gap.md`](grit-gap.md)：相对 Grit 的 Git 命令差距与分阶段补全执行计划（不含 submodule）。
+- [`../gap/grit-gap.md`](../gap/grit-gap.md)：相对 Grit 的 Git 命令差距与分阶段补全执行计划（不含 submodule）——**当前事实源**。
+- [`../gap/grit-suite-scope.md`](../gap/grit-suite-scope.md)：上游 Git 测试语料的族级 in/out 裁定与 `D` 编号绑定。
+- [`grit-gap.md`](grit-gap.md)：**已过期的历史留档副本**，仅为旧引用可解析而保留；请勿据此执行。

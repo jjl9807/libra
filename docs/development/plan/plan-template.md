@@ -189,6 +189,7 @@
    - **独立发布卡（`Release boundary = independent`）与发布点卡（`release` / `family release point`）**：自行执行完整 C 组门。
    - **`family child`**：不 bump、不构建、不推送，**继承**其家族唯一发布点的 C 覆盖——前提是该发布点的三门运行其被测树状态包含本子卡的最终变更；同时继承该发布点适用的 D 组。
    - **`no-release` 卡（`docs` / `audit` / `spike` / `handoff`）**：**继承**任务卡显式声明的承载发布点（或计划收口点）的 C 覆盖与其 D 组；该承载点必须在卡内写明 ID，不得留空。
+   - **`batch-release child`（任意 `Task type`，含 `implementation`）**：用于「逐卡提交并**推送**、全计划收口时统一发一次版本」的批量发布组（G-07a）。它**自行执行** C 组中的三门、提交与 `push`（因为它会推送，`CLAUDE.md` 的完成契约不可继承），**不** bump 版本面、**不**构建/安装、**不**打 tag、**不**产 artifact；版本面/artifact 这一段与 **D-02** 继承自其批量发布组的唯一发布点，**D-01 不继承**（每次推送各自触发，须自行取证）。其 `Acceptance` 在发布点完成前停在 `locally-accepted`。必须在卡内写明发布点 ID，并在「发布分组与并发窗口」登记该组。
    - 继承 D 组的卡同样要经过 `remote-pending`，直到被继承的 D 组证据全绿。
    - **不存在「用零命中守卫替代三门」的通道**——零命中守卫只用于证明这类卡未改代码，不改变其在取得 C 覆盖前仍是 `locally-accepted` 的事实。
 
@@ -367,11 +368,12 @@
 - **G-05 Agent 可独立执行:** 一张卡必须能在不阅读其它卡正文的前提下被执行：`Current evidence` 给出可核对的 `file:line` 锚点，`Acceptance criteria` 自洽可判定，`Verification` 是可直接复制执行的确切命令，`Dependencies` 只引用「依赖登记表」中的 `DEP-*` / 任务 ID。禁止「见上文」「同上一卡」式跨卡隐式约定；确属跨卡共享的约定要提升为全局工程约束或 ADR。
 - **G-06 依赖闭合且无环:** 依赖必须有向无环。本计划内依赖直接引用任务 ID；跨计划与外部前置必须先在「依赖登记表」登记为 `DEP-*` 再引用，不得在卡内自由描述。互相等待、循环依赖、以及「等某个 Phase 整体完成」都是拆分错误——把依赖收敛到具体前置卡。「实施顺序」的依赖边与各卡 `Dependencies` 必须一致；不一致时以「实施顺序」为准并当场修正卡片。
 - **G-07 发布切片对齐（按任务类型）:** 默认「一张卡 = 一个发布切片」（独立 review + ER-04 门 + 版本 + 提交 + 推送）。适用范围按 `Task type`（G-11）区分：`implementation` / `migration` / `removal` 必须走完整发布切片；`docs` / `audit` / `spike` / `handoff` 卡不 bump 版本、不产出 artifact，`Release boundary` 写 `no-release` 并说明其产物随哪次发布进入用户可见渠道；`release` 卡本身就是发布点（家族卡的唯一发布点必须是 `release` 卡，见 G-08）。任何「多卡合并发布」都是例外，必须在「发布分组与并发窗口」登记 `REL-*`：成员、唯一发布点、窗口期禁止插入的内容、失败时的逆序回滚顺序。例外必须先修订计划并通过 Codex review 才可开工，**不得**在开工时凭笔记临时合并。
+- **G-07a 批量发布组（`batch-release child`）:** 当一组卡各自都是完整、可独立回滚的变更，但**逐卡发版对用户没有独立价值**（例如同一 wave 内的文档/账本/测试产物，或版本号推进会与并发计划频繁抢号）时，可登记为「批量发布组」：成员卡逐张 review、逐张通过全部适用的 A/B 门与三门、逐张提交并**推送**，但不 bump、不构建、不 tag、不产 artifact；全组共用一个唯一发布点卡（`Task type` 必须是 `release`），由它一次性完成版本面与 tag/artifact。与 G-08 家族卡的区别是**成员会推送**且各自可独立回滚（前滚补偿），因此不要求「变更不可分割」；与 G-07 默认的区别是把「发布」从每卡收敛到一次。必须在「发布分组与并发窗口」登记 `REL-*`（成员、唯一发布点、窗口规则、失败回滚顺序、理由），并在每张成员卡的 `Release boundary` 写 `batch-release child of REL-<n>`。**成员卡的 `Acceptance` 在发布点完成前不得标为 `complete`，也不得对外报告完成。**
 - **G-08 家族卡（不可分割变更的唯一出路）:** 当一次公开 surface 删除、或 schema 与 reader 必须同时上线这类变更确实无法切成可独立发布的切片时，用「家族卡」表达：拆成多张各自 review、各自通过全部适用 ER-04 门、各自本地提交的子卡，共用一个唯一发布点卡；**该发布点卡的 `Task type` 必须是 `release`**（不引入新行为，只做版本、构建、安装、聚合守卫与发布证据），以保证它在 ER-04 的 B 组中唯一命中 `release` 行。家族内子卡仍受除 G-07 外的全部 `G-*` 约束；子卡 `Release boundary` 写 `family child`，发布点卡写 `family release point`，家族边界与「不推送窗口」写进 `REL-*` 登记。
 - **G-09 拆分协议:** 拆分已被引用的卡时，原编号保留给主轴，新子卡在所属 Phase 末尾追加新编号，不重排既有编号。原卡必须写明「拆出 `<ID>`、`<ID>`」，新卡写明「自 `<ID>` 拆出」，并同步实施顺序、依赖登记表、「发布分组与并发窗口」、追溯表、测试矩阵、里程碑、风险表，以及「修订历史」中的一行（日期、原因、原卡、新卡、受影响引用）。
 - **G-10 写集与并发:** 写集分三类，每张卡必须声明前两类（第三类由 ER-12 统一定义，卡内不重复）：
   - **`Implementation write set`（I）**：承载本卡行为的代码、测试、文档文件。
-  - **`Release write set`（R）**：ER-08 的版本面四处、`Cargo.lock`、release artifact。对所有发布卡相同；`family child` 与 `no-release` 卡写 `N/A`（它们不 bump、不构建、不推送）。
+  - **`Release write set`（R）**：ER-08 的版本面四处、`Cargo.lock`、release artifact。对所有发布卡相同；`family child` 与 `no-release` 卡写 `N/A`（它们不 bump、不构建、不推送）；`batch-release child` 同样写 `N/A`（它推送，但不 bump、不构建、不产 artifact——版本面归其批量发布组的唯一发布点）。
   - **协调写集（C）**：计划级的发布顺序与窗口记录（「发布分组与并发窗口」的发布者、发布顺序、`REL-*` 登记）。由 ER-12 的单一发布者串行维护，**不计入**任何卡的 I 或 R，也不参与并发判定。
 
   冲突规则：
@@ -528,7 +530,7 @@
 
 **Version increment:** `<patch（默认）| minor | major | N/A>`（ER-08）
 
-**Release boundary:** `<independent（默认）| family child of REL-<n>（k/n）| family release point of REL-<n> | no-release（docs/audit/spike/handoff）>`（合并发布须先按 G-07 登记 `REL-*`）
+**Release boundary:** `<independent（默认）| batch-release child of REL-<n>（G-07a：推送但不发版）| family child of REL-<n>（k/n）| family release point of REL-<n> | no-release（docs/audit/spike/handoff）>`（合并发布须先按 G-07/G-07a 登记 `REL-*`）
 
 **C/D coverage from:** `<self（自行执行 C 组）| <TASK-ID>（继承该发布点/收口点的 C 覆盖与其 D 组）>`（ER-04；`family child` 与 `no-release` 卡必填具体 ID，不得留空）
 

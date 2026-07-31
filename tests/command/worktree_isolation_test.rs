@@ -3958,7 +3958,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
             rolled,
             vec![
                 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
-                2026072501, 2026072403, 2026072402, 2026072401
+                2026072502, 2026072501, 2026072403, 2026072402, 2026072401
             ]
         );
         conn.close().await.expect("close");
@@ -6210,9 +6210,12 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
     let data = &json["data"];
     assert_eq!(data["schema_version"], 1);
     assert!(data["next_cursor"].is_null(), "W0 emits a single page");
-    let diagnostics = data["diagnostics"]
+    // The bare invocation carries BOTH halves of the diagnosis: `worktrees[]`
+    // is the worktree-scope half (§C.11 W0, this test), `diagnostics[]` the
+    // Agent-workspace half (W4).
+    let diagnostics = data["worktrees"]
         .as_array()
-        .expect("diagnostics is an array");
+        .expect("the worktree-scope section is an array");
     assert_eq!(diagnostics.len(), 2, "main + the linked worktree");
 
     let damaged = diagnostics

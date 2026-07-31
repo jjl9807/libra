@@ -17,7 +17,7 @@
 - git-sync：ref/object 复制、plan/policy、pack relay、仓库格式迁移。
 - Grok Build：可移植 Agent 定义、ACP/headless/PTY、hooks，以及 hermetic/fault-injection 测试基础设施。
 
-`agenta-ai/agenta` 的版本能力面向 prompt、workflow、evaluator、testset 和 environment 等领域对象，Grok Build 的主要事实模型则是 coding Agent runtime 与交互/测试基础设施；二者都不是源码版本控制系统，因此只作为相邻领域参考，不作为 Libra VCS 功能对标基线。
+`agenta-ai/agenta` 的版本能力面向 prompt、workflow、evaluator、testset 和 environment 等领域对象，Grok Build 的主要事实模型则是 coding Agent runtime 与交互/测试基础设施；`MachineWisdomAI/fava-trails` 与 `ruvnet/agentic-flow`（含 agentic-jujutsu）是构建在 Jujutsu 语义之上的 Agent 共享记忆/编排层，消费 VCS 原语而非实现 VCS。四者都不是源码版本控制系统，因此只作为相邻领域参考，不作为 Libra VCS 功能对标基线。
 
 状态定义如下：
 
@@ -35,54 +35,60 @@
 
 ## 本次竞品审计快照
 
-审计时间：**2026-07-25**。发现范围严格限定为 `/Volumes/Data/competition/*/*`；未扫描内部嵌套仓库、vendor 或 submodule。本轮发现 14 个直接仓库，全部在更新前证明工作区干净且存在 upstream，并使用各自原生 VCS 的 `pull --ff-only` 更新；表中 revision 是更新后实际审计 checkout。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新版本。
+审计时间：**2026-07-29**。发现范围严格限定为 `/Volumes/Data/competition/*/*`；未扫描内部嵌套仓库、vendor 或 submodule。本轮发现 16 个直接仓库（首次纳入 `MachineWisdomAI/fava-trails` 与 `ruvnet/agentic-flow`），全部在更新前证明工作区干净且存在 tracking/upstream，并使用各自原生 VCS 的 `pull --ff-only` 更新；表中 revision 是更新后实际审计 checkout。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新版本。
 
 | 竞品 | 类型 | 分支 | 审计 revision | 更新结果 | 最后审计 | 证据入口 |
 |---|---|---|---|---|---|---|
-| `agenta-ai/agenta` | Libra | `main` | `cb095f73ed87` | fast-forward：`b5d4596` → `cb095f7` | 2026-07-25 | `README.md`、`docs/`、agent session/HITL/runner 源码与测试 |
-| `cursor/agent-trace` | Git | `main` | `2754f077f3e5` | 已是最新 | 2026-07-25 | `README.md`、`schemas.ts`、`reference/` |
-| `entireio/cli-checkpoints` | Libra | `entire/checkpoints/v1` | `620170f3b452` | 已是最新 | 2026-07-25 | checkpoint object tree |
-| `entireio/cli` | Libra | `main` | `ec5d9a761003` | fast-forward：`7b0e934` → `ec5d9a7` | 2026-07-25 | `CHANGELOG.md`、`docs/`、`api/checkpoint/`、`cmd/entire/cli/`、测试 |
-| `entireio/git-sync` | Libra | `main` | `298c7f1f1be3` | 已是最新 | 2026-07-25 | `README.md`、`docs/`、`client.go`、`internal/` |
-| `epicgames/lore` | Git | `main` | `9664606f5a47` | fast-forward：`826ad5d` → `9664606` | 2026-07-25 | `docs/`、`lore-revision/src/`、`lore-revision/tests/`、`scripts/test/` |
-| `facebook/sapling` | Git | `main` | `2d413f4cbd1c` | fast-forward：`9675b972c702` → `2d413f4cbd1c` | 2026-07-25 | `eden/fs/inodes/{TreeInode,InodeMap}.cpp`、`eden/scm/lib/commands/commands/cmdworktree/`、restricted tree caching tests |
-| `GitButler/gitbutler` | Git | `master` | `5a3a59cea146` | fast-forward：`bdf6b6e3d4a1` → `5a3a59cea146` | 2026-07-25 | `crates/but/src/{id,command/legacy/{squash,move,uncommit,amend}.rs}`、`crates/but-branches/`、`crates/but-github/src/stacks.rs`、`crates/gitbutler-oplog/src/oplog.rs` |
-| `GitButler/grit` | Git | `main` | `dfb079967b9c` | 已是最新 | 2026-07-25 | `TESTING.md`、`data/tests/`、`scripts/run-tests.sh`、`docs/progress/` |
-| `graphwisdom/perstate` | Git | `master` | `95e27e3bb103` | 已是最新 | 2026-07-25 | `README.md`、`scripts/perstate-{prepare,commit,prune}.sh` |
-| `jj-vcs/jj` | Git | `main` | `732bbc0d2629` | fast-forward：`f296bc36b18d` → `732bbc0d2` | 2026-07-25 | `lib/src/{repo.rs,transaction.rs,converge.rs,copies.rs}`、`cli/src/commands/run.rs`、`cli/tests/test_run_command.rs` |
-| `mainline/mainline` | Git | `main` | `37bdcb7762a4` | 已是最新 | 2026-07-25 | `README.md`、`docs/specs/`、`internal/engine/`、测试 |
-| `StepzeroLab/research-git` | Libra | `main` | `bea0427e1708` | 已是最新 | 2026-07-25 | `src/rgit/store/objects.py`、pending capsule review 设计/计划、`tests/` |
-| `xai-org/grok-build` | Git | `main` | `6e386420825b` | fast-forward：`a5727c596045` → `6e38642` | 2026-07-25 | `crates/codegen/xai-grok-tools/src/util/shell_env_policy.rs`、`xai-grok-sandbox/src/{hook_write_deny,deny/mod}.rs`、`xai-grok-tools/src/implementations/grok_build/task/coordinator*.rs`、`xai-grok-update/src/version_policy.rs` |
+| `agenta-ai/agenta` | Libra | `main` | `a3e7fdf1c33c` | fast-forward：`cb095f7` → `a3e7fdf` | 2026-07-29 | `api/oss/src/core/sessions/{turns,records}/`、`docs/design/sessions-last-message-only/`、runner reconstruct/cancel 源码与测试 |
+| `cursor/agent-trace` | Git | `main` | `2754f077f3e5` | 已是最新 | 2026-07-29 | `README.md`、`schemas.ts`、`reference/` |
+| `entireio/cli-checkpoints` | Libra | `entire/checkpoints/v1` | `620170f3b452` | 已是最新 | 2026-07-29 | checkpoint object tree |
+| `entireio/cli` | Libra | `main` | `84942175831d` | fast-forward：`ec5d9a7` → `8494217` | 2026-07-29 | `CHANGELOG.md`、`cmd/entire/cli/gitrepo/reftable.go`、`cmd/entire/cli/strategy/manual_commit_session.go`、测试 |
+| `entireio/git-sync` | Libra | `main` | `298c7f1f1be3` | 已是最新 | 2026-07-29 | `README.md`、`docs/`、`client.go`、`internal/` |
+| `epicgames/lore` | Git | `main` | `1453a0dd9f47` | fast-forward：`9664606` → `1453a0d` | 2026-07-29 | `lore-revision/src/store/composite.rs`、`lore-storage/src/local/mutable_store.rs`、`lore-server/src/grpc/forwarded_*`、`lore-credential/src/jwt.rs` |
+| `facebook/sapling` | Git | `main` | `f74e59bab799` | fast-forward：`2d413f4` → `f74e59b` | 2026-07-29 | `eden/mononoke/scs/if/source_control.thrift`（run_as）、`eden/fs/cli_rs/edenfs-saved-state/`、`eden/scm/sapling/ext/fbcodereview.py` |
+| `GitButler/gitbutler` | Git | `master` | `315653459e75` | fast-forward：`5a3a59c` → `3156534` | 2026-07-29 | `crates/but-api/src/worktrees.rs`、`crates/but-core/src/commit/mod.rs`、`crates/but/src/utils/{merged_upstream,rejection}.rs`、`crates/but/skill/SKILL.md` |
+| `GitButler/grit` | Git | `main` | `dfb079967b9c` | 已是最新 | 2026-07-29 | `TESTING.md`、`data/tests/`、`scripts/run-tests.sh`、`docs/progress/` |
+| `graphwisdom/perstate` | Git | `master` | `95e27e3bb103` | 已是最新 | 2026-07-29 | `README.md`、`scripts/perstate-{prepare,commit,prune}.sh` |
+| `jj-vcs/jj` | Git | `main` | `6bacc36d3c72` | fast-forward：`732bbc0` → `6bacc36` | 2026-07-29 | `cli/src/complete.rs`、`cli/src/git_util.rs`、`CHANGELOG.md` |
+| `MachineWisdomAI/fava-trails` | Git | `main` | `5a8cdfd96d5e` | 首次纳入（已是最新） | 2026-07-29 | `README.md`、`src/fava_trails/vcs/jj_backend.py`、`src/fava_trails/{trust_gate,trail}.py` |
+| `mainline/mainline` | Git | `main` | `eb981310cbae` | fast-forward：`37bdcb7` → `eb98131` | 2026-07-29 | `CHANGELOG.md` v0.5.1、`internal/engine/pr_fork.go`、`internal/hooks/dispatcher.go`、`.github/workflows/mainline-pr-intent.yml` |
+| `ruvnet/agentic-flow` | Git | `main` | `d069fff77063` | 首次纳入（已是最新） | 2026-07-29 | `packages/agentic-jujutsu/`（`README.md`、`src/{operations,agent_coordination}.rs`）、`agentic-flow/src/harness/provenance.ts`、`docs/adr/` |
+| `StepzeroLab/research-git` | Libra | `main` | `3209501f82d5` | fast-forward：`bea0427` → `3209501`（docs-only） | 2026-07-29 | `README.md`、`src/rgit/{recall,compare}.py`、`src/rgit/mcp_server.py` |
+| `xai-org/grok-build` | Git | `main` | `02d9359435d0` | fast-forward：`6e38642` → `02d9359` | 2026-07-29 | `crates/codegen/xai-grok-shell/src/leader/mod.rs`、`xai-grok-tools/tests/test_subagent_soak.rs`、`xai-grok-config/src/signed_policy.rs`、`xai-grok-workspace/src/export_github.rs` |
 
 最近审计记录最多保留 12 次；超过上限后把更早记录压缩为 revision 集合与优先级结论，不保留逐仓 pull 日志。
 
 | 审计日期 | 仓库数 | 更新摘要 | 路线图结论 |
 |---|---:|---|---|
+| 2026-07-29 | 16 | 9 个 fast-forward、7 个已是最新（含首次纳入的 fava-trails、agentic-flow）；全部仓库更新前后均保持干净，无 blocked/失败 | 无优先级变化；GitButler worktree-aware operations 与 change-ID-in-transaction、Mainline fork-PR intent 与 hook context 预算强化 LR-01/LR-03/LR-06/LR-08 证据；reftable 互操作记入兼容增强清单；Libra 推进至 v0.19.81 |
 | 2026-07-25 | 14 | 6 个 fast-forward、8 个已是最新；全部仓库更新前后均保持干净，无 blocked/失败 | 无优先级变化；Libra 自 v0.19.52 推进至 v0.19.63，W2 全部入库（rerere/stash/merge-file/gc）、registry v2、legacy 迁移、Agent workspace lease 已交付；LR-01 剩余崩溃矩阵与 parallel lanes |
 | 2026-07-23 | 14 | 7 个 fast-forward、7 个已是最新；全部仓库更新前后均保持干净，无 blocked/失败 | 无优先级变化；LR-01 因 Libra Part C W1 多个已合入切片改为“实施中”，日期计划索引按当前完成事实纠偏 |
 | 2026-07-20 | 14 | 8 个 fast-forward，4 个已是最新，`agenta` pull timeout、`cli-checkpoints` status timeout 后安全跳过；首次纳入 Perstate | 无优先级变化；LR-01 的 sequencer 隔离缺口按当前源码收窄 |
 | 2026-07-17 | 13 | GitButler、Sapling、Jujutsu 快进；其余已是最新；首次纳入 Grok Build | 无优先级变化 |
 | 2026-07-16 | 12 | 10 个快进/已最新，2 个 `blocked-dirty` | 无优先级变化 |
 
-**本次结论：无长期优先级变化。**
+**本次结论：竞品审计本身不产生优先级变化；执行序列的变化来自用户决定。** 2026-07-29 按用户决定新增 **CT-01**（上游 Git 套件驱动的兼容性证据账本 / Grit Git 兼容测试迁移）并置于执行序列首位，UP-01 顺延；LR-01..LR-10 与 SB-01..SB-04 的优先级、状态和判据均不变。详见「长期功能总览」CT-01 行、CT-01 专节与「实施顺序」。
 
 竞品方面：
 
-- **GitButler `5a3a59cea146`**：本轮是命名收纳与 API 迁移--将 `squash2`/`move2`/`commit2`/`rub`/`stage`/`unstage` 旧命令收纳为 `squash`/`move`/`uncommit`/`amend`，用 `but-branches` 替代 `but-cherry-apply`，新增 `but-github/src/stacks.rs` 堆叠 PR 支持。继续强化 LR-03/LR-04 的“先稳定身份再建交互外壳”顺序和 LR-08 的 stacked review 证据。
-- **Grok Build `6e386420825b`**：新增 `shell_env_policy.rs`（可配置环境变量继承策略，默认 inherit-all）、`hook_write_deny.rs`（sandbox hook 写入拒绝与路径身份验证）、task coordinator 与 `version_policy.rs`，分别强化 SB-02 的 shell 环境隔离、mutation 边界和版本策略证据。但其默认 inherit-all 与 Libra SB-02 的 env_clear 要求方向相反，不构成新的 VCS LR。
-- **Jujutsu `732bbc0d2629`**：仅 3 个提交（`run` 冲突保留修复、copies 多父级 rename、revset 重构），不改变 LR-02/LR-05 判断。
-- **Sapling `2d413f4cbd1c`**：重构 EdenFS TreeInode/InodeMap 并新增 worktree add 与 restricted tree caching 测试，仍只支持 LR-09 的既有顺序。
-- **Lore `9664606f5a47`**：仅修复 credential JWT 并新增 auth/path 测试。
-- **Agenta 与 Entire CLI**：本轮仍为会话/前端/错误处理变化，不涉及 VCS 能力。
+- **GitButler `315653459e75`**（152 提交）：本轮最实质的变化。linked worktree 成为一等操作面——operations 与 rebase Editor 具备 worktree 感知，新增 feature-gated `crates/but-api/src/worktrees.rs`（list/archive/commit-from）；每个 mutation transaction 返回 `(sha, change_id)` 并在 CLI 输出打印（`crates/but-core/src/commit/mod.rs:868` 的 `CommitIdentifiers`），conflict 报告以 change ID 为键（`crates/but/src/command/legacy/conflict_notice.rs`）；新增 `MergedUpstream` 拒绝改写已上游合入历史（`crates/but/src/utils/merged_upstream.rs`）和 hunk 拒绝的事务回滚后依赖归因解释（`crates/but/src/utils/rejection.rs`）；agent 输出收紧为 human 输出子集并重写 SKILL.md 契约。分别强化 LR-01、LR-03、LR-04 与 LR-06 的既有判断。
+- **Mainline `eb981310cbae`（v0.5.1）**：新增 fork-PR intent comment（`internal/engine/pr_fork.go`）——以显式 refspec 拉取不受信 fork 的 actor log 到一次性 import ref、校验 head SHA 后重建 intent、upstream-wins 按 IntentID 去重、用完即删；`pull_request_target` workflow 双重 staleness 校验加 `persist-credentials: false`。另有 hook context 注入硬预算（session-start 32 KiB / turn-start 16 KiB / 字段 2 KiB，`internal/hooks/dispatcher.go:89-92`）与语义压缩。分别强化 LR-06/LR-08 的不可信来源发布证据与 LR-07/SB-02 的注入边界证据。
+- **Entire CLI `84942175831d`**：主要新增 reftable 后端支持——go-git 无法读 reftable refs，遂以 `reftableStorer` shell out 到 git CLI 并统一所有 repo open 入口（`cmd/entire/cli/gitrepo/reftable.go`）；另有跨 worktree session 归属歧义 warning（`strategy/manual_commit_session.go:239-260`）。reftable 是 Git 互操作兼容项，记入兼容增强清单；session 归属歧义强化 LR-01 的 attribution 缺口证据。
+- **Lore `1453a0dd9f47`**：edge 部署 RPC forwarding、CompositeStore `durable_delay` 读副本优先（`lore-revision/src/store/composite.rs:287`）、torn-write bucket 自愈（`lore-storage/src/local/mutable_store.rs:263`）、commit 预分配内存许可与目录扇出上限、JWT audience 标签边界修复（`lore-credential/src/jwt.rs:103-107`）。为 LR-09/tiered storage 与资源边界提供工程证据，无新 LR。
+- **Sapling `f74e59bab799`**：几乎全部是 Mononoke 服务端工作；值得记录的是 `run_as` hook dry-run（以其他身份预演 landing hooks，`source_control.thrift:1675-1697`，LR-06 发布 preflight 证据）、EdenFS saved-state 按 project_metadata 过滤（LR-09 hydration snapshot 证据）、smartlog 对 Phabricator 瞬时错误的降级（LR-08 Forge 装饰必须 best-effort 的证据）。
+- **Jujutsu `6bacc36d3c72`**：4 天 10 个 CLI 层提交（重复参数 last-wins、remote tags tracked、多 workspace `<name>@` 补全、colocation 错误修复），无 core 变化，不改变 LR-02/LR-05 判断。
+- **research-git `3209501f82d5`**：纯文档（README 重写，7 个提交零代码）。首次公开完整表述 recall-as-regeneration、byte-exact run freeze、`variant_of` 谱系与只读 MCP 共享记忆面；强化 LR-10/LR-07 的方向证据，无新代码能力。
+- **Grok Build `02d9359435d0`**：sandbox profile 拒绝逃逸到共享 leader 进程（fail-closed，`xai-grok-shell/src/leader/mod.rs:790`）、workspace 文件引用绕过 confinement 与 `acceptEdits` 信任扩大修复、subagent 生命周期 soak 测试（线程/fd/RSS 稳态断言）、managed-config 签名验证与远端 kill-switch、hook provenance。继续强化 SB-02/SB-04 证据，不构成新 VCS LR。
+- **Agenta `a3e7fdf1c33c`（v0.106.0）**：session_states 改为 append-only `session_turns` ledger 加带 drop tracking 的 durable record log、服务端 history reconstruction、cancel/steer 控制面。仍是 Agent 平台而非 VCS；其“resume 是对 ledger 的查询而非可变行”与“record 缺失即 fail loud”是 AgentRuntime session 持久化的可参考模式。
+- **Grit `dfb079967b9c`**（本轮首次给出结论条目，此前只有表行）：`tests/` 有 1,613 个 `t*.sh`（其中 `t[0-9]*.sh` 为 1,606 个；这些脚本合计 12.007 MiB，整个 `tests/` 目录树 13.77 MiB），其中 1,041 个与其自带上游 `git/t/` 快照同名（973 个字节一致、68 个被改），另 565 个为 Grit 自撰；`data/tests/<group>/<stem>.toml` 是每文件一行的 ledger（1,362 in-scope / 243 skip），`scripts/run-tests.sh` 是隔离 runner，`docs/progress/` 从 ledger 派生。其看板 99.3% 与 ledger 可复算一致，但**该数字不可作为兼容性事实引用**：`tests/test-lib-tap.sh:74-75` 把 skip 同时计入 pass，分母含 42% 自撰测试，整条 `apply`/`am` 子系统被 skip 排除，22 个文件 `status="timeout"`（其 `tests_total` 合计 350，`passed_last` 全为 0，即 0/350 被静默排除在通过率之外），`lib-httpd.sh` 的混合 wrapper 还会把部分操作交给宿主 `git`。工程做法中值得借鉴的是 per-file ledger（并行无需合并）、Rust `test-httpd` 替代 Apache、wrapper 目录置于工作树外。该证据是本轮新增 CT-01 的直接依据。
+- **首次纳入：fava-trails `5a8cdfd96d5e` 与 agentic-flow `d069fff77063`**：前者是 jj colocate 上的 Agent 共享记忆 MCP（op_log/op_restore 封装、结构化冲突、原子 supersession、LLM Trust Gate），后者是编排平台附带的 agentic-jujutsu（jj 的 NAPI 封装、operation 签名、启发式冲突预测）。二者验证 LR-02/LR-05/LR-06 方向的需求，但作为 VCS 原语消费者不构成对标基线（见“不采纳”节）。
 
 Libra 自身方面：
 
-- 自 v0.19.52 推进至 v0.19.63（`be73801`）。
-- Part C W2 全部入库（v0.19.53–v0.19.56）：rerere、stash、merge-file-backup、gc roots。
-- Worktree registry v2 与持久化身份（v0.19.57）；lifecycle detach/tombstone 与 durable intent journal（v0.19.58）；canonical add targets（v0.19.59）。
-- Legacy layout 检测与 `repair --migrate-layout`（v0.19.60）。
-- Agent workspace association 与 lease store（v0.19.61–v0.19.62，migration `2026072501`）。
-- LR-01 的 W1–W2、registry v2、legacy 迁移和 Agent lease 均已交付，剩余完整崩溃矩阵与 parallel lanes（依赖 LR-03/LR-04）。
+- 自 v0.19.63 推进至 v0.19.81（`Cargo.toml:3`；工作区 `main` @ `88b5cf4`，版本 bump 提交为 `dbe10c2`）。
+- plan-20260714 Part B R0-0..R0-9 全部入库（v0.19.64–v0.19.77）：status/diff 共享 rename 引擎、porcelain v2 rename records、预算/缓存互斥与文档收口，含 `compat_status_wave0_register`、`compat_r0_9_doc_closeout` 双向门禁。
+- Part C W4 机器接口 `agent workspace list|show` 入库（54eebfc）；control sidecar/resolver/审批/preflight 解除已移交 plan-20260715，W4 剩余 capture/export ownership 与 `worktree doctor`。
+- Part D：PD-02 checkpoint-scoped review/investigate（v0.19.78）、PD-03 session-erasure tombstone 传播（v0.19.79）、PD-04 findings blob GC（v0.19.80）、R0-1/PD-10 status 预算与 Windows lba shim（v0.19.81）、PD-09 `am` 扩展面五片全部完成；剩余 PD-01/PD-05/PD-07/PD-10 与 Part C 崩溃矩阵。
 - 其余 LR 状态与长期优先级不变。
 
 ## 规划原则
@@ -102,16 +108,16 @@ Libra 自身方面：
 
 ## 当前基础
 
-以下事实已在 2026-07-25 以当前 Libra checkout（v0.19.63，`be73801`）的源码、测试与兼容文档复核；历史计划不作为实现证据：
+以下事实已在 2026-07-29 以当前 Libra checkout（v0.19.81，`88b5cf4`）的源码、测试与兼容文档复核；历史计划不作为实现证据：
 
 | 基础能力 | 当前事实 | 长期规划中的用途 |
 |---|---|---|
-| Git 对象、index、pack、wire protocol | Git/SHA-1/SHA-256 兼容基础已存在 | 所有代码历史和远端互操作 |
-| SQLite refs、HEAD、reflog 与 worktree-scoped mutable state | 可变状态可事务化存储；`2026071901`–`2026072501` 已依次覆盖 sequencer、rebase、operation identity、bisect、dirty cache、layer、sparse-view、worktree registry v2、lifecycle journal 与 workspace lease scope，但 operation snapshot 和 conflict 模型仍未统一 | worktree 隔离、operation restore、conflict 和 rewrite |
+| Git 对象、index、pack、wire protocol | Git/SHA-1/SHA-256 兼容基础已存在；status/diff 共享 rename 引擎与 porcelain v2 rename records 已随 R0-0..R0-9 入库 | 所有代码历史和远端互操作 |
+| SQLite refs、HEAD、reflog 与 worktree-scoped mutable state | 可变状态可事务化存储；`2026071901`–`2026072502` 已依次覆盖 sequencer、rebase、operation identity、bisect、dirty cache、layer、sparse-view、worktree registry v2、lifecycle journal 与 workspace lease scope，但 operation snapshot 和 conflict 模型仍未统一 | worktree 隔离、operation restore、conflict 和 rewrite |
 | `libra op log/show/restore` | operation graph 已公开；生产 mutation 接入目前仅 branch create/reset 与 `op restore`，snapshot 含 HEAD/refs/workspace pointer，不含 index/worktree/sequencer | LR-02 的基础 |
-| linked worktree 新布局 | `worktree.rs`、`WorktreeScope`、`workspace.rs` 与 Part C W1–W2 migrations 已提供 private HEAD/index/HEAD reflog、sequence/rebase/bisect/operation-dedup/dirty/layer/sparse-view scope、rerere/stash/merge-file-backup/gc-roots 全面 worktree-scoped；worktree registry v2 与持久化身份、lifecycle detach/tombstone、legacy layout 检测与 `repair --migrate-layout`、Agent workspace association 与 lease store 均已入库；`worktree_isolation_test` 已覆盖 linked fetch、pull merge、cherry-pick 等路径，仍须完成崩溃矩阵与 parallel lanes | LR-01 实施中；剩余崩溃矩阵与 parallel lanes |
+| linked worktree 新布局 | `worktree.rs`、`WorktreeScope`、`workspace.rs` 与 Part C W1–W2 migrations 已提供 private HEAD/index/HEAD reflog、sequence/rebase/bisect/operation-dedup/dirty/layer/sparse-view scope、rerere/stash/merge-file-backup/gc-roots 全面 worktree-scoped；worktree registry v2 与持久化身份、lifecycle detach/tombstone、legacy layout 检测与 `repair --migrate-layout`、Agent workspace association 与 lease store 均已入库；W4 机器接口 `agent workspace list|show` 已落地（54eebfc），剩余 capture/export ownership 与 `worktree doctor`；`worktree_isolation_test` 已覆盖 linked fetch、pull merge、cherry-pick 等路径，仍须完成崩溃矩阵与 parallel lanes | LR-01 实施中；剩余 W4 残留、崩溃矩阵与 parallel lanes |
 | merge/rebase/cherry-pick/revert/rerere | Git-compatible conflict-stop、index stages、status/diff/restore 与 whole-file rerere 已存在 | LR-05 的兼容入口；一等 conflict object/modeless 模型仍缺失 |
-| Agent session/checkpoint/review/investigate | 外部 Agent capture、只读 review、redaction、artifact objectization 已存在 | LR-06、LR-07、LR-10 的证据源 |
+| Agent session/checkpoint/review/investigate | 外部 Agent capture、只读 review、redaction、artifact objectization 已存在；PD-02 checkpoint-scoped review/investigate materialization、PD-03 session-erasure cloud tombstone 传播、PD-04 findings blob 可达性 GC 已入库 | LR-06、LR-07、LR-10 的证据源 |
 | `--json`/`--machine` 和稳定 `LBR-*` | Agent 可驱动的 CLI 基础已存在 | 十项能力的公共机器契约 |
 | tiered storage、cloud、alternates、deps、hydrate | 大仓库和跨机器对象读取基础已存在 | LR-09 的基础 |
 | AI history、IntentSpec、Decision、projection | 本地 AI 工作流对象已存在 | LR-06、LR-07 的私有源 |
@@ -121,17 +127,18 @@ Libra 自身方面：
 
 | ID | 能力 | 优先级 | 状态 | 当前判断 | 主要竞品证据 | 已关联日期计划 | 最近验证 |
 |---|---|---:|---|---|---|---|---|
-| UP-01 | 自动升级签名发布链（officially signed auto-upgrade） | P0 | 实施中（**下一个执行任务**） | 客户端子系统 code-complete 但构造性 inert（`PRODUCTION_TRUSTED_KEYS` 为空）；剩余 release-key ceremony、§A.9 发布/签名 job、§A.4 install.sh 验签与官方 marker | —（横切 release safety，非竞品对标项；规格见本文 UP-01 节） | 原 [`plan-20260714.md`](plan-20260714.md) Part A（2026-07-22 已迁移至本文） | 2026-07-25 |
-| LR-01 | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | Part C W1–W2 已合并入库（sequence/rebase/bisect/operation-dedup/dirty/layer/sparse-view/rerere/stash/merge-file-backup/gc-roots scope）、worktree registry v2、legacy layout 迁移、Agent workspace lease；剩余崩溃矩阵与 parallel lanes | GitButler `5a3a59cea146` worktree/status/squash projection；Lore `9664606f5a47` revision state/path tests；Sapling `2d413f4cbd1c` worktree add/snapshot tests | [`plan-20260714.md`](plan-20260714.md) Part C W0–W4 窄切片；W1–W2、registry v2、legacy 迁移、Agent lease 已合入 | 2026-07-25 |
-| LR-02 | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 已验证 | operation 记录已具 worktree identity/dedup，但生产 mutation 仍仅 branch create/reset 与 `op restore` 接入，snapshot 不含 index/worktree/sequencer | Jujutsu `732bbc0d2629` operation/view/converge；GitButler `5a3a59cea146` preview/oplog/squash | 无 | 2026-07-25 |
-| LR-03 | 稳定 Change ID 与历史重写谱系 | P0 | 已验证 | Libra 无 stable change identity 或持久 lineage；review/intent/Forge 仍依赖 commit/session 身份 | GitButler `5a3a59cea146` `crates/but/src/id/mod.rs`、id/parser.rs、CLI identity收纳；Jujutsu evolution predecessor tests | 无 | 2026-07-25 |
-| LR-04 | 非交互 Hunk API、Hunk 归属与 Stack 编辑 | P0 | 已验证 | `diff --json` 可读 hunks；稳定 ID、assignment、hunk mutation 与 stack rewrite 缺失 | GitButler `5a3a59cea146` squash/move/uncommit/amend 与 commit/branch/file/hunk tests；Sapling linelog | `plan-20260708.md` 仅记录相邻基础，D15 仍延后 | 2026-07-25 |
-| LR-05 | 一等冲突对象与 Modeless Sequencer | P1 | 已验证 | Git-compatible conflict 基础较完整；versioned conflict object、record-conflicts 和 descendant rebase 缺失 | Jujutsu `732bbc0d2629` operation/view/converge tests；Sapling `2d413f4cbd1c` linelog/stacks | 无 | 2026-07-25 |
-| LR-06 | Intent Seal、Intent-Commit Pin 与安全团队发布 | P1 | 已验证 | 本地 Intent/Decision/checkpoint 已有；seal、stable pin 与白名单团队 publication 缺失 | Mainline `37bdcb7762a4` `internal/engine/seal.go`、`merge.go`、property tests | `plan-20260713.md` 已完成 capture/coverage 前置，不覆盖 seal/publication | 2026-07-25 |
-| LR-07 | 开工前意图检索与语义冲突 Preflight | P1 | 已验证 | skill/session/context 基础存在；团队 intent projection、确定性 overlap receipt 与 pre-edit gate 缺失 | Mainline `37bdcb7762a4` `internal/engine/preflight.go`、`context_retrieval.go`、tests | `plan-20260713.md` 已完成 capture 前置；`plan-20260715.md` 仅排期 runtime/UI | 2026-07-25 |
-| LR-08 | Forge/PR/CI 集成与 Stacked Review | P1 | 已验证 | remote/auth/open/local Agent review 已有；Forge trait、PR/CI 状态与 stacked mapping 缺失 | GitButler `5a3a59cea146` forge capability/open/workspace projection；but-github/stacks.rs | 无 | 2026-07-25 |
-| LR-09 | Materializing Sparse Checkout、Partial Clone 与 VFS Hydration | P2 | 已验证 | sparse-view 已 worktree-scoped，explicit hydrate、alternates/tiered storage 已有；materialization、promisor 和 transparent VFS 缺失 | Lore `9664606f5a47` revision materialization/path tests；Sapling `2d413f4cbd1c` EdenFS checkout/overlay tests | `plan-20260708.md` 仅记录相邻基础；D10/D18 仍延后 | 2026-07-25 |
-| LR-10 | Feature/Research Capsule 与实验谱系 | P2 | 已验证 | Agent artifacts/semantic extraction 可复用；capsule lifecycle、run lineage、compare/ablation 缺失 | research-git `bea0427e1708` atomic object writes、pending review、curation/runner/provenance；Entire `ec5d9a7` checkpoint provenance | `plan-20260713.md` 已完成 capture source，非 capsule 实施 | 2026-07-25 |
+| CT-01 | 上游 Git 套件驱动的兼容性证据账本（Grit Git 兼容测试迁移） | P0 | 已验证（**下一个执行任务**，2026-07-29 按用户决定排定） | 兼容承诺目前完全自证：`COMPATIBILITY.md` 主表 108 行里 72 行 `partial`，但全文无任何外部套件证据；`grit-gap.md` 的 GGT-00A 全部验收项未启动。整体 vendor 被 GPLv2→MIT 与 `grit-gap.md:93`/`:413` 既有决策否决，只能走 clean-room 场景重写 + 离线发现器（代码入库、上游语料不入库） | Grit `dfb079967b9c`：1,613 个 `t*.sh`（其中 `t[0-9]*.sh` 1,606 个，与上游同名 1,041）、`data/tests/` per-file ledger、`scripts/run-tests.sh` 隔离 runner；其 99.3% 因 skip 计入 pass（`tests/test-lib-tap.sh:74-75`）不可直接引用 | [`plan-20260729.md`](plan-20260729.md)（S0 + S1 前两项 + S3 + S4 首个 wave）；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A | 2026-07-29 |
+| UP-01 | 自动升级签名发布链（officially signed auto-upgrade） | P0 | 实施中（排在 CT-01 之后） | 客户端子系统 code-complete 但构造性 inert（`PRODUCTION_TRUSTED_KEYS` 为空）；剩余 release-key ceremony、§A.9 发布/签名 job、§A.4 install.sh 验签与官方 marker | —（横切 release safety，非竞品对标项；规格见本文 UP-01 节） | 原 [`plan-20260714.md`](plan-20260714.md) Part A（2026-07-22 已迁移至本文） | 2026-07-29 |
+| LR-01 | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | Part C W1–W2 全部 scope、worktree registry v2、legacy layout 迁移、Agent workspace lease 与 W4 `agent workspace list/show` 已合并入库；剩余 W4 capture/export ownership、`worktree doctor`、崩溃矩阵与 parallel lanes | GitButler `315653459e75` worktree-aware operations 与 `but-api::worktrees`；Jujutsu `6bacc36d3c72` `<name>@` workspace symbols；Entire `8494217` 跨 worktree session 归属歧义 warning | [`plan-20260714.md`](plan-20260714.md) Part C W0–W4 窄切片；W1–W2、registry v2、legacy 迁移、Agent lease、W4 list/show 已合入 | 2026-07-29 |
+| LR-02 | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 已验证 | operation 记录已具 worktree identity/dedup，但生产 mutation 仍仅 branch create/reset 与 `op restore` 接入，snapshot 不含 index/worktree/sequencer | Jujutsu `6bacc36d3c72` operation/view/converge；GitButler `315653459e75` preview/oplog；fava-trails `5a8cdfd` op_log/op_restore Agent 面封装 | 无 | 2026-07-29 |
+| LR-03 | 稳定 Change ID 与历史重写谱系 | P0 | 已验证 | Libra 无 stable change identity 或持久 lineage；review/intent/Forge 仍依赖 commit/session 身份 | GitButler `315653459e75` `CommitIdentifiers{id,change_id}`（`but-core/src/commit/mod.rs:868`）、transaction outcomes 携带 change ID、conflict_notice 以 change ID 为键；Jujutsu evolution predecessor tests | 无 | 2026-07-29 |
+| LR-04 | 非交互 Hunk API、Hunk 归属与 Stack 编辑 | P0 | 已验证 | `diff --json` 可读 hunks；稳定 ID、assignment、hunk mutation 与 stack rewrite 缺失 | GitButler `315653459e75` squash/move/uncommit/amend 与 `utils/rejection.rs` per-hunk 依赖归因；Sapling linelog | `plan-20260708.md` 仅记录相邻基础，D15 仍延后 | 2026-07-29 |
+| LR-05 | 一等冲突对象与 Modeless Sequencer | P1 | 已验证 | Git-compatible conflict 基础较完整；versioned conflict object、record-conflicts 和 descendant rebase 缺失 | Jujutsu `6bacc36d3c72` operation/view/converge tests；GitButler `315653459e75` conflicted-commit 记录；fava-trails `5a8cdfd` 结构化 VcsConflict | 无 | 2026-07-29 |
+| LR-06 | Intent Seal、Intent-Commit Pin 与安全团队发布 | P1 | 已验证 | 本地 Intent/Decision/checkpoint 已有；seal、stable pin 与白名单团队 publication 缺失 | Mainline `eb981310cbae` `internal/engine/{seal,merge,pr_fork}.go`、property tests；Sapling `f74e59bab799` run_as hook dry-run | `plan-20260713.md` 已完成 capture/coverage 前置，不覆盖 seal/publication | 2026-07-29 |
+| LR-07 | 开工前意图检索与语义冲突 Preflight | P1 | 已验证 | skill/session/context 基础存在；团队 intent projection、确定性 overlap receipt 与 pre-edit gate 缺失 | Mainline `eb981310cbae` `internal/engine/{preflight,context_retrieval}.go`、`internal/hooks/dispatcher.go:89-92` context 预算 | `plan-20260713.md` 已完成 capture 前置；`plan-20260715.md` 仅排期 runtime/UI | 2026-07-29 |
+| LR-08 | Forge/PR/CI 集成与 Stacked Review | P1 | 已验证 | remote/auth/open/local Agent review 已有；Forge trait、PR/CI 状态与 stacked mapping 缺失 | GitButler `315653459e75` but-github/stacks.rs 与 MCP review card；Mainline `eb981310cbae` fork-PR workflow；Sapling `f74e59bab799` smartlog Forge 装饰降级 | 无 | 2026-07-29 |
+| LR-09 | Materializing Sparse Checkout、Partial Clone 与 VFS Hydration | P2 | 已验证 | sparse-view 已 worktree-scoped，explicit hydrate、alternates/tiered storage 已有；materialization、promisor 和 transparent VFS 缺失 | Lore `1453a0dd9f47` revision materialization/path tests 与 CompositeStore durable_delay；Sapling `f74e59bab799` EdenFS saved-state metadata filtering | `plan-20260708.md` 仅记录相邻基础；D10/D18 仍延后 | 2026-07-29 |
+| LR-10 | Feature/Research Capsule 与实验谱系 | P2 | 已验证 | Agent artifacts/semantic extraction 可复用；capsule lifecycle、run lineage、compare/ablation 缺失 | research-git `3209501f82d5`（docs-only README 重写）+ 既有 curation/runner/provenance；Entire `8494217` checkpoint provenance | `plan-20260713.md` 已完成 capture source，非 capsule 实施 | 2026-07-29 |
 
 ## 工程安全基线
 
@@ -240,7 +247,7 @@ Libra 自身方面：
 - 全局数据库连接 cache 会保留临时仓库连接；fixture teardown 没有统一关闭连接并清理路径相关 cache。
 - 固定 `/tmp/*.db` 名称可在 IDE、CI shard、不同 worktree 或两个 Cargo 进程并行时互相删除和覆盖。
 - 个别子进程、mock server 和端口探测采用手工 cleanup 或 bind-drop-connect，测试 panic 后可能泄漏 child/thread/port，或产生 TOCTOU 端口竞争。
-- Grok Build `6e386420825b` 的 `crates/codegen/xai-grok-test-support/src/{process,sandbox,leader,headless}.rs` 把 hermetic process spawn、`kill_on_drop`、sandbox 和 PTY/session recovery 场景做成共享设施；新增 `shell_env_policy.rs`（可配置环境变量继承策略，含 secret pattern exclusion）和 `hook_write_deny.rs`（sandbox hook 写入拒绝与路径身份验证）进一步强化 SB-02 证据。Libra 已在 review launcher、provider mocks、Code PTY harness 和若干 `env_clear` fixture 中分别具备部分能力，但尚未形成同等统一的资源/故障注入层。该证据强化本 SB，不新增产品 LR。
+- Grok Build `02d9359435d0` 的 `crates/codegen/xai-grok-test-support/src/{process,sandbox,leader,headless}.rs` 把 hermetic process spawn、`kill_on_drop`、sandbox 和 PTY/session recovery 场景做成共享设施；本轮新增 `xai-grok-tools/tests/test_subagent_soak.rs`（928 行 subagent 生命周期 soak，断言线程/fd/RSS 达到稳态，可选 dhat-heap）以及 sandbox profile 拒绝逃逸到共享 leader 进程的 fail-closed 边界（`xai-grok-shell/src/leader/mod.rs:790`，含专门回归测试）。Libra 已在 review launcher、provider mocks、Code PTY harness 和若干 `env_clear` fixture 中分别具备部分能力，但尚未形成同等统一的资源/故障注入层。该证据强化本 SB，不新增产品 LR。
 
 #### 修复要求
 
@@ -264,9 +271,85 @@ Libra 自身方面：
 
 ---
 
-## UP-01：自动升级签名发布链（原 plan-20260714 Part A；下一个执行任务）
+## CT-01：上游 Git 套件驱动的兼容性证据账本（Grit Git 兼容测试迁移；下一个执行任务）
 
-> **迁移与例外说明（2026-07-22）**：本节按用户决定从 [`plan-20260714.md`](plan-20260714.md) Part A **整体迁移**至本文，并登记为**下一个执行的任务**；规格正文逐字保留（仅把小节编号统一为 A.1–A.12，与代码、CI、CHANGELOG 中既有 `plan-20260714 §A.x` 历史引用同形）。本文档「具体设计只进日期计划」的惯例对本节记一次显式例外，直至任务完成或另立日期计划承接。评审历史（第 1–17 轮，最终 PASS）见下文 A.12 与 plan-20260714「最终复核结论」的历史记录。
+> **排定说明（2026-07-29）**：本节按用户决定新增，并登记为**下一个执行的任务**，UP-01 顺延为其后一项。本节保持路线图高度——只定义问题、边界、阶段准入/准出与完成判据；具体任务卡、断言分类与逐命令清单仍归 [`../gap/grit-gap.md`](../gap/grit-gap.md) 的 `GGT-00A`，不在本文展开，不构成第二次「规格进长期计划」例外。
+>
+> **对任务字面表述的一次澄清**：本项立项时的表述是「把 Grit 中 Git 兼容的测试迁移到 Libra」。按当前证据，**逐字迁移（vendor `t*.sh` + shell harness）不可执行**，理由见下文「真实阻塞点 B0」——它同时违反 GPLv2→MIT 净室边界和 `grit-gap.md:93` 已记录的形态决策。因此本节把「迁移」定义为**迁移测试覆盖面而非测试文件**：场景 clean-room 重写进 Libra 原生测试，外加一个离线 gap 发现器（**发现器代码入库、被它消费的上游 GPLv2 语料不入库**）。若所有者裁定改为逐字 vendor，需先撤销 `grit-gap.md:413` 的净室质量门并取得许可证裁定。
+
+### 开发者问题
+
+Libra 的 Git 兼容承诺目前是**自证的**。`COMPATIBILITY.md` 主表 108 行中 72 行标 `partial`、4 行 `supported`、32 行 `intentionally-different`，另有 3 行 `unsupported`；但全文没有任何外部测试套件证据，现有 65 个已注册 `tests/compat/*.rs` 守卫证明的是「矩阵、CLI 枚举、命令文档三者互不漂移」，不是「某个 tier 的行为与 Git 一致」。结果是三类问题无法回答：
+
+- 一个 `partial` 命令，「部分」的边界具体在哪里？套件里最高频的 21 个子命令中有 20 个是 `partial`，只有 `status` 是 `supported`。
+- 已宣称的行为在真实工作流组合下是否退化？逐条抽样对比 15 条命令序列，只有 6 条 stdout 在归一化 OID/路径后与 Git 一致；`init`/`add`/`status --porcelain`/`commit -m`/`config` 读写/`tag`/`update-ref`/`rev-parse --git-dir` 全部不同。其中 `libra update-ref refs/heads/x HEAD` 直接以 `LBR-CLI-002` 拒绝 revision 语法、`libra config <key>` 裸读以 `LBR-INTERNAL-001` 失败——这两个缺陷任何静态守卫都发现不了，只有跑起来才暴露。
+- 兼容缺口的收敛进度如何度量？`docs/development/commands/_compatibility.md` 的「兼容证据治理」条款已经要求「参数级缺口不能只停留在文字说明……证据必须落到具体测试、脚本或 D 编号说明中」，但当前没有可复算、按命令族分解的证据源。
+
+本项的正当性是**补上兼容证据闭环**，不是提高 Git flag parity——后者被本文「不进入本长期 Top 10 的兼容增强」一节明禁作为抢占理由。
+
+### 目标能力
+
+- 建立单一的**兼容证据账本**：每个上游测试场景一行，记录来源（上游 tag/commit + 文件）、对应 Libra 命令/flag、分类、结论和复核日期。
+- 分类沿用 `GGT-00A` 已定义的四值 `direct` / `adapted` / `declined` / `blocked`（`grit-gap.md:103`、`:172`），**不新造分类名**；`declined` 必须绑定 `_compatibility.md` 的 D 编号，`blocked` 必须绑定本节的阻塞编号或具体任务。
+- 账本 schema 强制包含 `reason` / `category` / `owner` / `review_date`，直接兑现本文「不采用 Grit 的二元 skip 元数据」条目的要求。
+- 统计口径把 `pass` / `fail` / `skip` / `xfail` / `timeout` **五者分列**，`skip` 与 `timeout` 永不并入 `pass`，分母定义随产物一同声明。
+- 高价值命令族按 wave 落成 Libra 原生 Rust 集成测试（`tests/command/*`、`tests/harness/`、`tools/integration-runner` 场景），并同步该族命令在 `COMPATIBILITY.md` 子面分级表中的行（当前只有 44/108 命令有子面信号）。
+- 可选的**离线 gap 发现器**：把上游语料按 pinned tag 在本地运行一次，用于把静态估计替换成实测数字。持久化模型统一为：**发现器代码入库**（`tools/` 下的独立 crate，不进根 test graph），**被它消费的上游 GPLv2 语料不入库**（运行时按 pin 获取，只留分类结果产物），且不进任何发布门禁。
+
+### 非目标
+
+- **不 vendor 上游 `t*.sh`、`test-lib*.sh`、`t/helper` 或其逐字预期输出**，也不把 Grit 的 shell harness 作为 Libra 的测试接入形态。
+- **不追求也不引用 Grit 的通过率数字**。其 99.3%（41,715/42,001）不是可引用的兼容性事实：`skip` 被同时计入 `pass`（`grit/tests/test-lib-tap.sh:74-75`）、分母含 42% 自撰测试、整条 `apply`/`am` 子系统（42 个 `t41xx-apply-*` 加 `t4150`–`t4153`、`t4252`–`t4258`）被 skip 排除、22 个文件 `status="timeout"`（其 `tests_total` 合计 350，`passed_last` 全为 0，即 0/350 被静默排除在通过率之外）、`lib-httpd.sh` 的混合 wrapper 把部分操作 `exec` 给宿主 `git`。Libra 自身也不发布合并 skip 的通过率。
+- **不静默修改测试语义**。Grit 侧有三类做法必须拒绝：删除上游 `KNOWN_FAILURE_*` 标志、删除 prereq skip 守卫（`t5551` 从 55 个 block 缩到 36）、无记录地把 `test_expect_failure` 翻成 `test_expect_success`。Libra 侧任何 `adapted` 都必须在账本写明改了什么、为什么。
+- **不让 `.libra` 变成 `.git`**，不新增 `--git-dir`/`--work-tree`/`-C` 兼容层，不做 `git → libra` 的 argv[0] 分派。仓库模型差异通过改写测试场景解决，不通过改 Libra 的仓库模型解决。
+- **不引入宿主 `git` 兜底**。发现器遇到不支持的操作必须硬失败，不得像 `lib-httpd.sh` 那样让真实 `git` 产生绿色结果。
+- 不覆盖 t9 族与 `apply`/`am` 族，不引入 apache/svn/p4/cvs/gitweb 依赖，不新建顶层 `scripts/` 目录，不复辟已被删除的独立参数元数据 YAML。
+
+### 分阶段方案
+
+| 阶段 | 范围 | 准入条件 | 准出判据 |
+|---|---|---|---|
+| S0 | 范围裁定与合规边界（无代码） | 本节合入 | 采纳形态写入 `grit-gap.md` 决策日志；逐族 in/out 裁定各自绑定 D 编号；`docs/development/commands/grit-gap.md` 过期副本退役或加横幅并重指向 `docs/development/gap/grit-gap.md` |
+| S1 | Libra 侧 test-oracle 前提修复（唯一改 Libra 行为的阶段） | S0 准出 | 每项一个 compat 回归 + 文档同步；fmt/clippy/`cargo test --all` 三门全绿 |
+| S2 | 离线 gap 发现器（**代码入库、上游语料不入库**，不进发布门禁） | S0 合规裁定明确允许「运行而不分发」；且必须复用 SB-04 的统一 command builder 与 RAII fixture | 对候选场景产出分类结果，把下文 405/301/77 三个静态估计替换为实测值，并交付 `pass`/`fail`/`skip`/`xfail`/`timeout` 五分列统计与分母声明 |
+| S3 | 账本 schema 与守卫 | S0 的 D 编号可解析；S2 的实测输出**非前置**（S2 延后或取消时由 S4 首个 wave 触发） | 新增 compat 守卫断言必填字段非空、分类取自四值闭集、`declined` 命中现存 D 编号、`blocked` 绑定具体承接项 |
+| S4 | 逐族 wave（clean-room 重写） | S3 守卫生效；**不要求 S1 全部候选项发布**——每个 wave 只以其候选集实际触及的 S1 项为前置 | 每族每个候选场景账本有行且分类已定；`direct` 场景落成 Libra 原生测试，`adapted` 可在同族后续切片承接但必须在账本中登记承接项；该族命令的子面分级行同批更新 |
+| S5 | CI 落点与证据面 | 至少两个 wave 收口，且账本或迁移用例的运行时间超出既有 offline-core job 的可接受范围 | 新建 self-hosted、`schedule`/`workflow_dispatch`、带显式 `timeout-minutes` 的 workflow，按既有政策**不设为 required check**；`tests/INDEX.md` 新增 Wave 并明示不在默认阻断门 |
+
+S1 的候选项分两类。**clean-room 重写路径所需**（任何 wave 都会撞上，优先做）：`config <key>` 裸读返回值、`update-ref` 的值操作数接受 revision 语法。**仅离线发现器所需**（随 S2 一并延后）：`.libraignore` 测试期抑制开关（`libra init` 无条件写入的 108 字节未跟踪文件，污染候选集的 26%——但 Libra 原生测试已各自处理该文件，不受影响）。**已判定不做**：读取 `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`——Libra 已有 `init.defaultBranch` 级联与 `-b/--initial-branch`（`src/command/init.rs:250-263`/`:496-521`），再读上游测试专用变量会制造第二个事实源。**外部 crate 或全仓 OID 面，各自独立立项**：`git-internal` index 扩展解析的裸 `println!`、index `assume_valid` 恒置的裁定、以及 `format_commit_msg` 缺失尾随换行（后者是全仓 commit/tag OID 变更，必须单独 RFC）。
+
+S4 的 wave 顺序按族级阻塞比排定：t4（diff/format-patch，候选集内占比最高且不碰 ref 存储与协议）→ t8（blame）→ t3 → t6 → t2 → t1 → t0 → t7；**显式延后 t5**（族内近半直接 poke `.git/`、约四分之一依赖 `test-tool`），**t9 整族出局**。
+
+### 完成判据
+
+- 账本文件存在，且守卫断言通过：每行 `reason`/`category`/`owner`/`review_date` 非空；`category` 取自四值闭集；每个 `declined` 行的 D 编号可在 `_compatibility.md` 解析到对应标题；每个 `blocked` 行绑定具体阻塞项或任务编号。
+- 统计产物把 `pass`/`fail`/`skip`/`xfail`/`timeout` 分列，`skip` 与 `timeout` 均不计入 `pass`，分母定义随产物声明并被守卫断言；用例↔账本行 1:1 无孤儿。
+- 新增测试目标在 `Cargo.toml` 有 `[[test]]`、在 `tests/compat/README.md` 有清单行、在 `tests/INDEX.md` 有 wave 行；若在集成测试计划中出现 `--test`/`--features`，对应的机器校验通过。
+- 顶层 `scripts/` 目录不存在的既有守卫仍通过（证明未新建顶层 runner 目录）；矩阵对齐、命令文档对齐、子面标签、root help 四个守卫全绿。
+- 仓库内不含任何 GPLv2 来源的测试脚本或其逐字预期输出（可由「仓库内 `test_expect_success` 只命中 Libra 自撰文件」这类守卫证明）。
+- S1 每项修复各有一条可复现的 CLI 输出断言；首两个 wave 的 `direct`+`adapted` 场景全部落成 Libra 原生测试，且该族命令在子面分级表中有行。
+- `cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && cargo test --all` 三门全绿。
+
+### 审计证据、真实缺口与提升条件
+
+- **竞品证据**：Grit `dfb079967b9c` 的 `tests/` 有 1,613 个 `t*.sh`（其中 `t[0-9]*.sh` 为 1,606 个；这些脚本合计 12.007 MiB，整个 `tests/` 目录树 13.77 MiB），其中 1,041 个与上游 `git/t/` 同名（973 个字节一致、68 个被改），另有 565 个是 Grit 自撰（272 个使用 5 位 `t1xxxx` 独立编号空间）。`data/tests/<group>/<stem>.toml` 是每文件一行的 ledger（1,605 行，1,362 in-scope，243 skip），`scripts/run-tests.sh` 是隔离 runner，`docs/progress/` 是从 ledger 派生的看板——这三件事本文已认定「值得继续用于兼容治理」。可直接借鉴的工程做法还有：用 Rust `test-httpd` 替换 Apache 依赖、每测试独占一个 ledger 文件因而并行运行无需合并、wrapper 目录放在工作树之外以避开 `clean -x` 与 ETXTBSY。
+- **Libra 现状证据**：`ROOT_DIR = ".libra"` 是硬编码常量（`src/utils/util.rs:44`），11 个全局 flag 中没有 `--git-dir`/`--work-tree`/`-C`，17 个定位/隔离类 `GIT_*` 环境变量的读取计数全部为 0；`config`/`HEAD`/`refs`/`reflog` 是 `.libra/libra.db` 的 SQLite 行，`libra init` 后不存在 HEAD、config、refs/、packed-refs、logs/ 任何文件。相对地，loose object 与 pack/idx v2 是字节兼容的，`GIT_AUTHOR_*`/`GIT_COMMITTER_*` 身份与日期被完整支持（`test_tick` 可直接移植），`.gitignore`/`.gitattributes` 仍被识别。测试侧已有可复用的形态：从 Cargo 测试目标驱动 POSIX 脚本的 `compat_install_alias`、以 `env_clear` 为基线的 `base_libra_command`、以及显式不在根 test graph 内的 `tools/integration-runner`。
+- **真实阻塞点（按阻断力排序）**：**B0 许可与既有政策**——Grit 的 `/git`、`/tests` 与 `grit-git` 是 GPLv2，Libra 是 MIT，`grit-gap.md:413` 已把「不得复制或翻译 GPLv2 来源的 shell harness、`t*.sh` 文本或其逐字预期输出」写成质量门并记入决策日志，`:93` 进一步禁止把 Grit 测试作为 shell harness 直接接入；**B1** `.git`→`.libra` 无任何重定向旋钮，约四分之一的语料直接 poke `.git/` 路径；**B2** config/HEAD/refs/reflog 在 SQLite，没有文件可 poke，且这部分不像 `.git/objects` 那样可以靠字节兼容缓解；**B3** `test-tool` 是 162 个上游文件的硬依赖（按 `command grep -c` 的行计口径约 1.3k 处调用，`ref-store` 是最高频 verb），Grit 用只覆盖 33/80 verb 的 shell stub 应对，这本身就是其上游覆盖率的天花板；**B4** 149 个上游文件依赖 svn/p4/httpd/cvs/daemon/gitweb，其中 116 个集中在 t9；**B5** `test-lib.sh` 的隔离契约（`GIT_CONFIG_NOSYSTEM`、`GIT_CEILING_DIRECTORIES`、`GIT_TEST_*`）在 Libra 下整体失效，必须改用 `HOME` + `LIBRA_CONFIG_GLOBAL_DB`/`LIBRA_CONFIG_SYSTEM_DB`；**B6** commit/tag 对象因缺尾随换行与 Git 全体 OID 分叉，index 恒置 `assume_valid` 位且只支持 DIRC v2 无扩展；**B7** 套件用到而 Libra 没有的子命令约 70 个（`mktree`、`pack-refs`、`checkout-index`、`show-index`、`count-objects`、`name-rev`、`mktag`、`var` 等），其中大半是廉价 plumbing。逐级筛除后，上游 1,041 个文件中约 405 个（38.9%）在结构上可能可跑，去掉 `.libraignore` 污染后约 301 个，完全不触碰任何已知输出分叉原语的只有 77 个。**这三个数字全部来自静态筛选，没有执行过任何测试文件**，是「可能可跑」而非「实测通过」——把它们换成实测值正是 S2 的首要产出。
+- **风险与边界**：本项的最大风险是把外部套件的通过率当成兼容性事实，其次是让 `skip` 成为无成本的逃逸阀——Grit 的整条 `apply`/`am` 子系统就是这样从指标中消失的。因此 S3 的账本守卫必须先于 S4 的规模化重写生效。S2 的探针天生要大量 spawn 子进程、设置环境变量并起本地 server，与 SB-04 的修复要求正面相关；在 SB-04 的统一 command builder 与 RAII fixture 就绪前落地 S2，会直接违反本文阶段零「不得新增直接修改父进程环境、固定全局临时路径或无 RAII teardown 的测试基础设施」的负向门禁。S1、S3、S4 不受该约束。
+
+### 已有计划关系
+
+以 [`../gap/grit-gap.md`](../gap/grit-gap.md) 的 `GGT-00A`（按 Libra 规范重写 Grit Git 兼容命令测试）为主要设计输入：其四个子阶段（P0 全量清单、P1 八个高风险命令、P2 其余已公开命令、P3 逐阶段刷新）与 `direct`/`adapted`/`declined`/`blocked` 分类直接沿用，本节只承接治理层（账本 schema、守卫、CI 落点、族级 wave 排序与合规裁定），机制细节不在本文重复。`GGT-00A` 当前全部验收项与验证项未勾选，全仓除该文件外零引用，因此本项是**停滞任务的升格**而非重复立项。
+
+本项**不新增 LR 产品能力编号**：它产出的是证据与门禁，不是用户可用的新 VCS 能力，与「工程安全基线」不新增 LR 编号的先例同类；它也不得以提高 Git flag parity 为立项理由。相关约束见下文「不采纳」三条（竞品指标不可直接引用、Grit 二元 skip 元数据不予采用、不逐字迁移 Grit/上游测试资产），本节是那三条的实施面而非修订。
+
+---
+
+## UP-01：自动升级签名发布链（原 plan-20260714 Part A；排在 CT-01 之后）
+
+> **排序变更（2026-07-29）**：本节原登记为「下一个执行的任务」（2026-07-22 排定）。按用户决定，执行序列首位改为 CT-01，UP-01 顺延为其后一项；范围、规格与完成判据不变。UP-01 与 CT-01 的 S1 阶段无耦合，可并行推进。
+>
+> **迁移与例外说明（2026-07-22）**：本节按用户决定从 [`plan-20260714.md`](plan-20260714.md) Part A **整体迁移**至本文；规格正文逐字保留（仅把小节编号统一为 A.1–A.12，与代码、CI、CHANGELOG 中既有 `plan-20260714 §A.x` 历史引用同形）。本文档「具体设计只进日期计划」的惯例对本节记一次显式例外，直至任务完成或另立日期计划承接。评审历史（第 1–17 轮，最终 PASS）见下文 A.12 与 plan-20260714「最终复核结论」的历史记录。
 
 ### 当前实现状态（2026-07-22，v0.19.42 源码核实）
 
@@ -467,8 +550,8 @@ README/CHANGELOG/config 中英文需说明：支持平台、第三方/手工安�
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：Lore `9664606f5a47` 的 `lore-revision/src/{state.rs,file/write.rs,util/path.rs}` 与并发 revision tests 把 parallel staging、路径发布和 tree corruption 回归作为存储正确性问题；GitButler `5a3a59cea146` 的 worktree/status projection 与 squash tests 继续说明 lane/worktree 展示必须建立在隔离后的 mutable state 和稳定 change/hunk identity 之上；Sapling `2d413f4cbd1c` 的 worktree add snapshot tests 进一步验证多 worktree 生命周期正确性。
-- **Libra 现状证据**：`src/command/worktree.rs`、`src/internal/worktree_scope.rs`、`src/internal/workspace.rs`、`src/internal/operation_wrapper.rs` 与 migrations `2026071901`–`2026072501` 已提供 private HEAD/index/reflog、sequence/rebase/bisect/operation-dedup/dirty/layer/sparse-view/rerere/stash/merge-file-backup/gc-roots scope、worktree registry v2、lifecycle journal 与 workspace lease；`tests/command/worktree_isolation_test.rs` 已覆盖 linked fetch、pull merge、cherry-pick、GC roots 和 cache modes；`workspace_lease_test` 已覆盖 DB-arbitrated lease、failpoint takeover、path alias refusal、fence conditional、expired reclaim 和 foreign-identity recovery，但完整崩溃矩阵仍未发布。
+- **竞品证据**：GitButler `315653459e75` 新增 feature-gated `crates/but-api/src/worktrees.rs`（worktrees_list/set_archived/linked_worktree_changes），operations 与 rebase Editor 具备 worktree 感知，并以 `shared_worktree_access()` 守卫“不得在持有数据库句柄时调用”的纪律——linked worktree 正成为一等操作面；Jujutsu `6bacc36d3c72` 在补全中提供多 workspace `<name>@` working-copy 符号（`cli/src/complete.rs:385-406`），延续其成熟并行 workspace UX；Entire `84942175831d` 的 `strategy/manual_commit_session.go:239-260` 在跨 sibling worktree session 归属歧义时改为显式 warning 而非静默丢弃 linkage，正是并行 Agent 工作区的 attribution 同类问题；Lore `1453a0dd9f47` 的并发 revision state/path tests 继续把 parallel staging 正确性作为存储问题回归。
+- **Libra 现状证据**：`src/command/worktree.rs`、`src/internal/worktree_scope.rs`、`src/internal/workspace.rs`、`src/internal/operation_wrapper.rs` 与 migrations `2026071901`–`2026072502` 已提供 private HEAD/index/reflog、sequence/rebase/bisect/operation-dedup/dirty/layer/sparse-view/rerere/stash/merge-file-backup/gc-roots scope、worktree registry v2、lifecycle journal 与 workspace lease；W4 机器接口 `agent workspace list|show` 已合入（54eebfc，`src/command/agent/workspace.rs`）；`tests/command/worktree_isolation_test.rs` 已覆盖 linked fetch、pull merge、cherry-pick、GC roots 和 cache modes；`workspace_lease_test` 已覆盖 DB-arbitrated lease、failpoint takeover、path alias refusal、fence conditional、expired reclaim 和 foreign-identity recovery，但完整崩溃矩阵仍未发布。
 - **当前实施切片与下一提升条件**：[`plan-20260714.md`](plan-20260714.md) Part C 已承接 W0–W4，当前代码证明 W1–W2 的全部 scope 切片、worktree registry v2、legacy layout 迁移和 Agent workspace lease 均已合入。下一阶段应补双 linked-worktree 的崩溃、continue/abort、crash/restart 故障注入矩阵，并验证 repair --migrate-layout 的原子性；不提前引入 parallel lanes。
 - **风险与边界**：共享 immutable objects/refs 不等于共享 mutable sequencer；不得用全局锁或独立 clone 冒充本 LR 完成。parallel lanes 继续等待 LR-03/LR-04。
 
@@ -517,7 +600,7 @@ Libra 已有 `libra op log/show/restore`、operation graph 和 transaction wrapp
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：Jujutsu `732bbc0d2629` 的 `lib/src/transaction.rs`、`lib/src/repo.rs`、`lib/src/converge.rs` 与 view/converge tests 保持 operation/view 与显式 graph convergence 的边界；GitButler `5a3a59cea146` 的 branch/squash preview 与 oplog tests 把 dry-run、oplog 和真正 materialize/persist 分开；Grok Build `6e386420825b` 的 task coordinator 与 scheduler occurrence journal 进一步证明自动化 mutation 需要 durable occurrence/recovery 记录。
+- **竞品证据**：Jujutsu `6bacc36d3c72` 的 `lib/src/transaction.rs`、`lib/src/repo.rs`、`lib/src/converge.rs` 与 view/converge tests 保持 operation/view 与显式 graph convergence 的边界（本轮 jj 无 core 变化）；GitButler `315653459e75` 的 preview/oplog 边界维持（本轮仅清理 oplog 死代码）；fava-trails `5a8cdfd96d5e` 把 `op_log`/`op_restore` 封装为 Agent 面向 MCP 工具（`src/fava_trails/vcs/jj_backend.py:402,419`），agentic-jujutsu `d069fff77063` 为 operation 增加签名/哈希（`packages/agentic-jujutsu/src/operations.rs:32`），说明 operation 级恢复已是 Agent 工具的竞争力基线；Grok Build `02d9359435d0` 的 task coordinator 与 scheduler occurrence journal 继续证明自动化 mutation 需要 durable occurrence/recovery 记录。
 - **Libra 现状证据**：`src/internal/operation_wrapper.rs` 已记录 `worktree_id` 并按 scope 隔离 duplicate-submission window，但 workspace snapshot 当前仍只有 HEAD pointer；`with_operation_log` 生产调用仅见 `src/command/branch.rs` 和 `src/command/op.rs`，`op restore` 只恢复 HEAD/local branches。
 - **最小可验证第一阶段**：建立 mutating-command coverage registry，并把 index、目标 worktree 内容摘要、pseudo-ref 和 sequencer 纳入 versioned snapshot；先交付 preview + 单步 undo，不先承诺任意 DAG redo。
 - **风险与边界**：working-tree snapshot 必须内容寻址、有容量上限且不覆盖未知用户文件。进入日期计划前需完成 snapshot schema、作用域和 restore collision policy RFC。
@@ -561,7 +644,7 @@ Commit OID 是内容身份，不是开发者心中的逻辑变更身份。amend�
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：GitButler `5a3a59cea146` 的 `crates/but/src/id/mod.rs`、`crates/but/src/id/parser.rs` 与 committed-file status paths 把 Change ID 继续扩展为命令主身份，commit SHA 退为辅助提示；本轮 squash/move/uncommit/amend 命令收纳进一步以 identity 为入口；Jujutsu 的 evolution predecessor tests 记录 rewrite predecessor 与 operation。
+- **竞品证据**：GitButler `315653459e75` 把 Change ID 推进到 transaction 边界——`crates/but-core/src/commit/mod.rs:868` 的 `CommitIdentifiers { id, change_id }` 由每个 mutation transaction 返回并在 CLI 输出打印，`crates/but/src/command/legacy/conflict_notice.rs:25-34` 以 change ID 为冲突报告键（因其“survives rebases”），`crates/but/skill/SKILL.md` 向 Agent 固化 stable change-ID 语义与 mutation 链式规则；`crates/but/src/id/{mod,parser}.rs` 继续以 Change ID 为命令主身份，commit SHA 退为辅助提示。Jujutsu 的 evolution predecessor tests 记录 rewrite predecessor 与 operation。
 - **Libra 现状证据**：`src/` 与 SQL 中没有 `change_id` schema、命令或 machine-output 字段；rebase 的 commit mapping 只服务单次 sequencer，不是持久逻辑身份。
 - **最小可验证第一阶段**：先定义 change identity 与一对一 amend/rebase successor，提供 `change show/trace --json` 和 doctor；split/fold/copy 等多值关系后置。
 - **风险与边界**：不能把 commit subject、tree equality 或 PR number当稳定身份。进入日期计划前必须决定 trailer/ref/SQLite 的真源与 Git-only clone 的降级行为。
@@ -620,7 +703,7 @@ libra stack move <change> --after <change>
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：GitButler `5a3a59cea146` 将 squash2 收纳为 squash、move2 为 move，新增 uncommit/amend 命令，`crates/but/tests/but/command/{squash,move}.rs` 与 status-TUI tests 覆盖 commit、branch、committed file、uncommitted file/hunk 向 branch/commit 的 squash/uncommit；其核心先解析 source/target identity，再由交互层消费。Sapling `2d413f4cbd1c` 的 linelog/stacks 仍提供可重写提交栈基础，本轮 EdenFS TreeInode 变化不改变本 LR 判断。
+- **竞品证据**：GitButler `315653459e75` 的 `crates/but/src/utils/rejection.rs:30-70` 在 hunk 被拒绝时回滚整个 transaction，随后在未变更的 workspace 上计算 per-hunk 依赖→branch 归因解释——这是 Agent 面向 hunk API 错误报告的强参考；squash/move/uncommit/amend 与 `MergedUpstream` 守卫（`utils/merged_upstream.rs:19-45`，拒绝改写已上游合入历史）继续以先解析 identity、再由交互层消费的模式运行。Sapling `f74e59bab799` 的 linelog/stacks 仍提供可重写提交栈基础，本轮无 client-core 变化。
 - **Libra 现状证据**：`src/command/diff.rs::DiffHunk` 已向 JSON 暴露 old/new range 与 lines，但没有 stable ID、hash、assignment、staleness 或 mutation API；D15 仍延后交互 patch mode。
 - **最小可验证第一阶段**：在既有 diff engine 上新增 deterministic hunk descriptor、list/preview 与按 descriptor stage/unstage；不先实现 TTY editor、absorb 或完整 stack UI。
 - **风险与边界**：行号不是 identity，fuzzy reconciliation 有歧义必须 fail loud。进入日期计划前需 LR-02 undo safety 与 LR-03 一对一 lineage 可用。
@@ -663,7 +746,7 @@ libra stack move <change> --after <change>
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：Jujutsu `732bbc0d2629` 的 operation/view 与 converge tests 展示冲突/并发 view 应以图状态继续处理，并将 descendant rewrite 保持为可观察、可选择的上层步骤，而非 operation merge 的隐藏副作用；本轮 run 命令冲突保留修复进一步验证冲突不应 panic。Sapling `2d413f4cbd1c` 的 linelog/stacks 继续强化 descendant rewrite 的工程价值。
+- **竞品证据**：Jujutsu `6bacc36d3c72` 的 operation/view 与 converge tests 保持既有判断（本轮无 core 变化）；GitButler `315653459e75` 的 `conflict_notice.rs:3-4` 延续“operations 不因冲突停止、rebased commits 记录为 conflicted”的 modeless 哲学并以 change ID 跟踪；fava-trails `5a8cdfd96d5e` 把 jj snapshot 冲突解析为结构化 `VcsConflict`（path、base、双侧内容，`vcs/jj_backend.py:424-557`）交给 Agent 处理，是冲突作为一等数据的消费侧验证。Sapling `f74e59bab799` 的 linelog/stacks 继续强化 descendant rewrite 的工程价值。
 - **Libra 现状证据**：`COMPATIBILITY.md` 与 conflict compat tests 证明 index stages、status/diff/restore、stop/continue 和 rerere 已较完整；`src/internal/sequencer/mod.rs` 同时说明状态存储仍非完全统一，无 conflict object/record-conflicts 命令面。
 - **最小可验证第一阶段**：先定义只读 versioned conflict descriptor 与 `conflict list/show --json`，由现有 index/sequencer 投影生成；随后再评估显式 `record-conflicts` mode。
 - **风险与边界**：默认 Git-compatible stop-on-conflict 不变，未解决 conflict 不得伪装为可推送 clean tree。进入日期计划前要求 LR-01/02/03 的对应基础达到可用门槛。
@@ -719,7 +802,7 @@ Libra 已经保存 Intent、Plan、Decision、Run、PatchSet、Evidence、Contex
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：Mainline `37bdcb7762a4` 的 `internal/engine/seal.go` 实现 prepare/submit、HEAD/branch drift 与 validation-before-mutation；`merge.go` 和 pin strategy/property tests 提供多策略 pin 与 manual fallback。
+- **竞品证据**：Mainline `eb981310cbae`（v0.5.1）的 `internal/engine/seal.go`（prepare/submit、HEAD/branch drift、validation-before-mutation）与 `merge.go` pin strategy/property tests 维持既有证据；本轮新增 `internal/engine/pr_fork.go`——对不受信 fork 的 actor log 以显式 refspec 拉入一次性 import ref、校验 head SHA、upstream-wins 按 IntentID 去重、用后即删，并在 `pull_request_target` workflow 中做双重 staleness 校验与 `persist-credentials: false`，为“不可信来源的 intent 发布”提供直接参考设计；Sapling `f74e59bab799` 的 `run_as` hook dry-run（`source_control.thrift:1675-1697`）展示以其他身份预演发布门禁的 preflight 模式。
 - **Libra 现状证据**：IntentSpec、Decision、Agent checkpoint 与安全 objectization 已存在，但没有 immutable seal、stable Change ID pin 或独立 team-safe publication plane；原始 AI history 仍不能直接成为共享事实。
 - **最小可验证第一阶段**：只做 local seal + explicit commit/tree pin + doctor，不做 team publication；seal payload 必须字段白名单、可重建 fingerprint 且失败不推进状态。
 - **风险与边界**：Mainline 的“near-100% auto-pin”缺代表性数据，Libra 不复制该承诺。提升为日期计划依赖 LR-03 identity 决策与 publication threat model。
@@ -763,7 +846,7 @@ Libra 已经保存 Intent、Plan、Decision、Run、PatchSet、Evidence、Contex
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：Mainline `37bdcb7762a4` 的 `internal/engine/preflight.go` 以 typed severity/evidence/next-action 区分 exact overlap blocker 与 heuristic goal warning；`context_retrieval.go` 提供 lifecycle-aware recall、supersession 和 current-code verification 提示。
+- **竞品证据**：Mainline `eb981310cbae` 的 `internal/engine/preflight.go`（typed severity/evidence/next-action 区分 exact overlap blocker 与 heuristic goal warning）与 `context_retrieval.go`（lifecycle-aware recall、supersession、current-code verification）维持既有证据；本轮 `internal/hooks/dispatcher.go:89-92` 为 hook context 注入增加硬预算（session-start 32 KiB、turn-start 16 KiB、单字段 2 KiB）与语义压缩（compact struct 替代盲目截断），截断时指引 Agent 改用按需命令——为 context bundle 注入边界提供具体预算模型。research-git `3209501f82d5` 的 README 明确 recall-as-regeneration（基于 intent/assumptions/resurrection guide 重新实现而非重放旧 patch），与本 LR 的语义检索方向一致。
 - **Libra 现状证据**：skills、semantic Rust extractor、Agent session/context 与 projection 可作为输入，但没有 team intent trust/visibility projection、selection receipt 或 mutation 前统一 gate。
 - **最小可验证第一阶段**：基于 local sealed intents 做纯确定性 file/symbol/base freshness preflight，输出可复现 receipt；不依赖 embedding，不自动注入 remote records。
 - **风险与边界**：文本相似度只可 warning，store/read failure 不得静默降低阻断等级。提升为日期计划依赖 LR-06 local seal 与明确的 policy/versioned scorer。
@@ -805,7 +888,7 @@ Libra 已经保存 Intent、Plan、Decision、Run、PatchSet、Evidence、Contex
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：GitButler `5a3a59cea146` 将 PR association 保持为 Forge cache 派生 projection，见 `crates/but-forge/association.rs`、`crates/but-forge/src/forge_info.rs` 和 workspace enrichment；新增 `crates/but-github/src/stacks.rs` 提供堆叠 PR 映射；其 provider capability gate 与 Change-ID-first status 继续证明 Forge 不应成为本地 change/operation 真源。
+- **竞品证据**：GitButler `315653459e75` 维持 PR association 为 Forge cache 派生 projection（`crates/but-forge/association.rs`、`forge_info.rs`）与 `but-github/src/stacks.rs` 堆叠映射，本轮新增 MCP review card（轮询 open review 与 CI 状态，`packages/but-mcp-app/`）作为评审状态分发渠道；Mainline `eb981310cbae` 的 fork-PR intent comment 与硬化 `pull_request_target` workflow（`.github/workflows/mainline-pr-intent.yml`）展示不受信贡献者场景下的 PR 集成安全姿态；Sapling `f74e59bab799` 的 smartlog 对 Phabricator 瞬时错误做两级降级（`fbcodereview.py:309-320`），证明 Forge 装饰必须 best-effort、绝不中断本地 UX。provider capability gate 与 Change-ID-first status 继续证明 Forge 不应成为本地 change/operation 真源。
 - **Libra 现状证据**：`src/command/auth.rs`、remote/push/pull、`open.rs` 和 local Agent review 是相邻原语，但没有 Forge provider trait、PR/CI schema 或 stacked mapping。
 - **最小可验证第一阶段**：只读 GitHub/GitLab status adapter，把 branch/commit 映射到 PR、review、CI、mergeability，并提供 JSON；任何写操作和 stacked publish 后置。
 - **风险与边界**：Forge cache 是可丢失 projection，不能成为 change/operation 真源；token、rate limit、partial failure 不得影响本地 refs。提升为日期计划至少依赖 LR-03，并需 provider-neutral API 设计。
@@ -868,7 +951,7 @@ Libra 已经保存 Intent、Plan、Decision、Run、PatchSet、Evidence、Contex
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：Lore `9664606f5a47` 的 `lore-revision/src/{projfs,file/write.rs,util/path.rs}` 与 service tests、Sapling `2d413f4cbd1c` 的 `eden/fs/inodes/{TreeInode,InodeMap}.cpp` 及 checkout/overlay/restricted-tree-caching tests 继续证明 VFS 之前必须解决 materialization、路径发布和并发 tree mutation 正确性；没有证据支持 Libra 跳过 sparse/promisor 基础直接建设同类服务。
+- **竞品证据**：Lore `1453a0dd9f47` 的 `lore-revision/src/{projfs,file/write.rs,util/path.rs}` 与 service tests 维持既有证据；本轮 `CompositeStore` 新增 `durable_delay`（`store/composite.rs:287`，读副本优先、可取消的 durable 层延迟扇出）是 tiered storage 读延迟的直接参考，torn-write bucket 自愈（`lore-storage/src/local/mutable_store.rs:263`）是可变状态存储恢复的模式；Sapling `f74e59bab799` 的 EdenFS saved-state 按 project_metadata 过滤与显式 repo path 选择（`edenfs-saved-state/src/lib.rs:40-155`）展示 hydration snapshot 的按工作区/profile 选择。没有证据支持 Libra 跳过 sparse/promisor 基础直接建设同类服务。
 - **Libra 现状证据**：`sparse-view` 已按 worktree scope 存储但仍只过滤展示，`hydrate` 是显式 whole-object 原子 materialization，`clone --filter` 仍 warning/no-op full clone；无 promisor metadata、skip-worktree 或透明 on-access hydrate。
 - **最小可验证第一阶段**：materializing sparse checkout 独立成第一日期计划，先保证 full HEAD + narrow worktree 的 status/add/commit 正确；partial clone 与 VFS 不与其捆绑发布。
 - **风险与边界**：missing object 不可被当作删除，offline/read policy 和 object verification 必须贯穿。提升为日期计划依赖 LR-01 mutable-state isolation 与大型仓库基准。
@@ -923,7 +1006,7 @@ Commit、branch、intent 和 checkpoint 都不能完整表达“一个未来值�
 
 ### 审计证据、真实缺口与提升条件
 
-- **竞品证据**：research-git `bea0427e1708` 本轮无变化；上一轮的 `src/rgit/{curation,runner,recall,provenance}.py` 与 `tests/test_e2e.py` 提供 proposal→approval→run→recall→compose→replay，`src/rgit/store/objects.py` 与 `tests/test_objects.py` 强化 object write 的原子性/校验。`provenance.py` 仍只证明选定 Python symbol slice 的 clean/adapted/missing，不是语义正确性证明。Entire CLI `ec5d9a761003` 本轮主要修复 session error handling 与 mid-turn trailer，未新增 capsule 本体能力。
+- **竞品证据**：research-git `3209501f82d5` 本轮为纯文档（README 重写，零代码变化），但首次完整公开两阶段 capture（确定性 hunk→symbol 加 agentic segmenter/edge-judge）、byte-exact run freeze 复现契约、`variant_of` 谱系边与只读 MCP 共享记忆面（`README.md:137-259`；代码核对 `src/rgit/cli.py:555,948`、`store/models.py:103`、`mcp_server.py:46-57` 与文档一致）；既有 `src/rgit/{curation,runner,recall,provenance}.py` 与 `tests/` 证据不变，`provenance.py` 仍只证明选定 Python symbol slice 的 clean/adapted/missing，不是语义正确性证明。agentic-flow `d069fff77063` 的 ReasoningBank trajectory store（`packages/agentic-jujutsu/src/reasoning_bank.rs:602`）是“从 VCS operation 轨迹学习”的浅层实现（千条环形缓冲），可作需求信号而非设计依据。Entire CLI `84942175831d` 本轮为 reftable/健壮性窗口，未新增 capsule 本体能力。
 - **Libra 现状证据**：checkpoint/artifact objectization、semantic Rust extractor、AgentRuntime 与 usage/goal 基础可复用，但没有 capsule lifecycle、typed research edges、metric lineage 或 compare/ablation API。
 - **最小可验证第一阶段**：只做 local proposal capture + human approval + immutable artifact/run link，slice 先 file/hunk、未知语言 raw diff fallback；recall/regenerate 后置。
 - **风险与边界**：不把 Agent 生成的 intent/resurrection guide 当已验证事实，不把 token usage 当实验 metric。提升为日期计划依赖 LR-02，并建议等待 LR-04 stable slices。
@@ -934,9 +1017,15 @@ Commit、branch、intent 和 checkpoint 都不能完整表达“一个未来值�
 
 十项功能按四个阶段推进。阶段之间是架构依赖，不要求每个阶段的所有增强都完全结束后才开始下一阶段的设计，但不得绕过前置安全能力直接开放高风险 mutation。
 
-### 下一个执行任务：UP-01 自动升级签名发布链（2026-07-22 排定）
+### 下一个执行任务：CT-01 上游 Git 套件驱动的兼容性证据账本（2026-07-29 排定）
 
-UP-01（见上文专节）是当前排定的下一个执行任务：客户端子系统已 code-complete 且构造性 inert，剩余工作集中在发布侧签名链——release-key ceremony、§A.9 发布/签名 job、§A.4 `install.sh` 验签与官方 marker。其实施不依赖也不阻塞 SB-01..SB-04，可与阶段零并行推进；但密钥保管与签名 job 的 fail-closed 边界须满足 SB-02 同级约束（私钥只进 protected-environment/KMS，构建/上传 matrix 永不接触私钥）。
+CT-01（见上文专节）是当前排定的下一个执行任务：Libra 的兼容 tier 目前只有自证证据，本项补上外部、可复算、按命令族分解的证据账本，并把 `grit-gap.md` 中停滞的 `GGT-00A` 升格为路线图任务。它先做 S0 合规裁定与 S1 的 test-oracle 前提修复，再进入账本守卫与逐族 wave；**S2 的离线发现器必须复用 SB-04 的统一 command builder 与 RAII fixture**，不得在 SB-04 之前以散落 subprocess/环境变量的形式落地——那会直接违反阶段零的负向门禁。S0/S1/S3/S4 不受该约束，可与阶段零并行推进。
+
+CT-01 不得以「更接近 Git flag parity」为由扩大范围；「不进入本长期 Top 10 的兼容增强」一节列出的能力不因本项而升优先级，只在账本中登记为 `declined` 并绑定 D 编号。
+
+### 其后：UP-01 自动升级签名发布链（2026-07-22 排定，2026-07-29 顺延至 CT-01 之后）
+
+UP-01（见上文专节）排在 CT-01 之后：客户端子系统已 code-complete 且构造性 inert，剩余工作集中在发布侧签名链——release-key ceremony、§A.9 发布/签名 job、§A.4 `install.sh` 验签与官方 marker。其实施不依赖也不阻塞 CT-01 与 SB-01..SB-04，可与阶段零及 CT-01 的 S1 并行推进；但密钥保管与签名 job 的 fail-closed 边界须满足 SB-02 同级约束（私钥只进 protected-environment/KMS，构建/上传 matrix 永不接触私钥）。
 
 ### 阶段零：工程安全基线
 
@@ -1062,24 +1151,28 @@ flowchart TD
 - `stash create`、`stash store`。
 - `commit --allow-empty-message`。
 - Git GPG 外部 keyring 全互操作。
+- reftable ref-storage 互操作（`extensions.refstorage=reftable` 仓库的 ref 读写；Entire `84942175831d` 的 `cmd/entire/cli/gitrepo/reftable.go` git-CLI storer 加严格错误分类是参考实现）。
 - `blame --reverse`、高级 copy/move detection。
 - `cat-file --follow-symlinks`。
 - 更多非首批 external Agent roster。
 
 这些项目继续由 `COMPATIBILITY.md`、`docs/development/commands/_compatibility.md` 和对应命令开发文档管理。若实际用户需求、生态互操作或生产阻塞证明其优先级上升，可以另行调整，但不应以“更接近 100% Git flag parity”为理由自动抢占长期架构项目。
 
+CT-01 不构成本条的例外：它治理的是**兼容证据**而非兼容范围，上表能力不因 CT-01 而升优先级——CT-01 遇到它们时只在账本中登记为 `declined` 并绑定既有 D 编号。若 CT-01 的账本证明某项确实构成生产阻塞，仍须按本条另行调整优先级，不得由账本自动提级。
+
 ## 日期计划索引
 
 日期计划只承接明确切片；它完成后仍须回到本表按 LR 完成判据复核。没有对应 LR 的计划表示它治理兼容性、交付或横切工程问题，不应被强行归入长期产品能力。
 
-本次复核未发现新增日期计划，但现有计划的状态与映射需要按当前事实纠偏：`plan-20260708.md` 主线已完成，活跃残留已转入 `plan-20260714.md` Part D；`plan-20260713.md` 已完成 M1–M6 并在 v0.19.40 clean publication 收口；`plan-20260714.md` Part C 是 LR-01 的窄日期切片，W1–W2 全部 scope、worktree registry v2、legacy layout 迁移和 Agent workspace lease 已合入，LR-01 仍为“实施中”，剩余崩溃矩阵与 parallel lanes 不等于 LR-01 完成；`plan-20260715.md` 仍只规划后续实现。其余 LR 状态与长期优先级不变。
+本次复核新增一份日期计划 [`plan-20260729.md`](plan-20260729.md) 承接 CT-01 的第一批可执行范围；其机制细节仍归 [`../gap/grit-gap.md`](../gap/grit-gap.md) 的 `GGT-00A`（gap 文档，非日期计划）。CT-01 的 S2、S5 与其余族 wave 仍留在本文，由后续日期计划承接。现有计划的状态与映射需要按当前事实纠偏：`plan-20260708.md` 主线已完成，活跃残留已转入 `plan-20260714.md` Part D；`plan-20260713.md` 已完成 M1–M6 并在 v0.19.40 clean publication 收口；`plan-20260714.md` Part B R0-0..R0-9 已全部入库并带双向 compat 门禁，Part C W4 的 `agent workspace list/show` 已合入（control sidecar/resolver/审批/preflight 解除移交 `plan-20260715.md`），Part D 的 PD-02/03/04/09 已完成，剩余 PD-01/05/07/10 与 Part C 崩溃矩阵，LR-01 仍为“实施中”；`plan-20260715.md` 仍只规划后续实现（评审修订至 R30）。其余 LR 状态与长期优先级不变。
 
 | 日期计划 | 对应 LR | 当前状态 | 范围与长期剩余缺口 |
 |---|---|---|---|
 | [`plan-20260708.md`](plan-20260708.md) | LR-04、LR-05、LR-09 的相邻基础；不等于这些 LR 已排期 | 主线已完成（历史计划） | 已交付 Git compatibility、conflict display、noninteractive history controls 与 Agent tracing 基础；活跃 deferred/未决定残留转入 `plan-20260714.md` Part D；未覆盖 stable hunk identity、first-class conflict 或 materializing sparse |
 | [`plan-20260713.md`](plan-20260713.md) | LR-06、LR-07、LR-10 的 capture/coverage 前置 | 已完成（M1–M6；v0.19.40 clean publication） | 已交付 coverage/revision、source discovery、OpenCode export、historical import/tombstone barrier、subagent content/link 和只读 agent graph；仍不覆盖 seal/publication、deterministic preflight 或 capsule lifecycle |
-| [`plan-20260714.md`](plan-20260714.md) | UP-01（原 Part A）；LR-01 窄切片（Part C）；Parts B/D 无直接 LR | Part A 迁入 UP-01 实施中；Part B 正在分片实施；Part C W1–W2 全部合入（scope/registry v2/legacy 迁移/Agent lease），剩余崩溃矩阵；Part D 部分完成 | Part C W0–W4 承接 worktree mutable-state/迁移/Agent lease；W1–W2、registry v2、legacy 迁移、Agent lease 已合入，剩余崩溃矩阵不覆盖 parallel lanes 或全部 LR-01 判据；Part D 的 PD-00/06/08 已收口，其余保持活跃；Part A 见本文 UP-01 |
-| [`plan-20260715.md`](plan-20260715.md) | LR-06/LR-07 的 AgentRuntime/交互承载前置 | 已排期 | 规划 UI-neutral runtime、Web adapter 与 TUI 迁移；不覆盖 intent team publication、stable pin 或 deterministic preflight |
+| [`plan-20260714.md`](plan-20260714.md) | UP-01（原 Part A）；LR-01 窄切片（Part C）；Parts B/D 无直接 LR | Part A 迁入 UP-01 实施中；Part B R0-0..R0-9 全部入库（v0.19.64–v0.19.77，含 `compat_status_wave0_register`/`compat_r0_9_doc_closeout` 双向门禁）；Part C W1–W2、registry v2、legacy 迁移、Agent lease 与 W4 list/show 已合入，剩余 capture/export ownership、`worktree doctor` 与崩溃矩阵；Part D PD-02/03/04/09 已完成，PD-01/05/07/10 活跃 | Part B 交付 status/diff 共享 rename 引擎与 porcelain v2 rename records；Part C W0–W4 承接 worktree mutable-state/迁移/Agent lease，剩余崩溃矩阵不覆盖 parallel lanes 或全部 LR-01 判据；Part D 剩余 mutating `review --fix` bridge、`write-tree --missing-ok`、clean pathspec、Windows lba shim；Part A 见本文 UP-01 |
+| [`plan-20260729.md`](plan-20260729.md) | CT-01 的 S0 + S1 前两项 + S3 + S4 首个 wave | 已排期（评审中） | 交付合规与族级范围裁定、`config <key>` 裸读与 `update-ref` 值操作数两项 Git 兼容修复、兼容证据账本 schema 与守卫、t4 首批 `direct` 场景的 clean-room 迁移；不覆盖 S2 离线发现器、S5 CI 落点与其余族 wave |
+| [`plan-20260715.md`](plan-20260715.md) | LR-06/LR-07 的 AgentRuntime/交互承载前置 | 已排期（评审修订至 R30，已吸收 2026-07-27 移交的 W4 control sidecar/resolver/审批/preflight 解除） | 规划 UI-neutral runtime、Web adapter 与 TUI 迁移；不覆盖 intent team publication、stable pin 或 deterministic preflight |
 
 ## 已替代 / 不采纳 / 已实现摘要
 
@@ -1089,13 +1182,16 @@ flowchart TD
 
 ### 不采纳
 
-- **不新增 LR：Agenta prompt/workflow/evaluator/testset/environment 版本化。** `agenta-ai/agenta@cb095f7` 已成功同步；本轮主要变化仍集中在 session rework、网站和前端体验，其事实模型是 Agent 应用平台，不是源码历史、workspace 或 Git 互操作问题。Libra 只参考 schema/versioning 与安全交互模式。
-- **不新增 LR：Grok Build 的 portable Agent definition 与 TUI/ACP 外壳。** `xai-org/grok-build@6e386420825b` 的 Agent/runtime、permission preflight、scheduler journal、sandbox/process harness、shell_env_policy 和 PTY/session recovery 可分别补强 SB-02、SB-04 与 LR-02 的实现证据；Libra 当前 `src/internal/ai/{goal,skills,agent}/` 与相关测试已有相邻核心，剩余 Code UI/runtime 迁移由 `plan-20260715.md` 承接，不值得复制成新的长期 VCS 能力。
+- **不新增 LR：Agenta prompt/workflow/evaluator/testset/environment 版本化。** `agenta-ai/agenta@a3e7fdf1c33c` 已成功同步；本轮 v0.106.0 主要是 session 存储重构（append-only `session_turns` ledger、带 drop tracking 的 durable record log、服务端 history reconstruction、cancel/steer 控制面），其事实模型仍是 Agent 应用平台，不是源码历史、workspace 或 Git 互操作问题。Libra 只参考其“resume 即对 ledger 的查询”与 record 缺失 fail-loud 的 session 持久化模式。
+- **不新增 LR：Grok Build 的 portable Agent definition 与 TUI/ACP 外壳。** `xai-org/grok-build@02d9359435d0` 本轮新增 sandbox leader 进程 confinement fail-closed、workspace 文件引用 confinement 修复、subagent soak 资源稳态测试、managed-config 签名验证与 hook provenance，可分别补强 SB-02 与 SB-04 的实现证据；Libra 当前 `src/internal/ai/{goal,skills,agent}/` 与相关测试已有相邻核心，剩余 Code UI/runtime 迁移由 `plan-20260715.md` 承接，不值得复制成新的长期 VCS 能力。
+- **不新增 LR：fava-trails 的 Agent 共享记忆 MCP（首次纳入）。** `MachineWisdomAI/fava-trails@5a8cdfd96d5e` 是 jj colocate 上的 Agent 共享记忆层：`drafts/` 隔离、LLM Trust Gate 提升、原子 supersession、`op_log`/`op_restore` 与结构化 `VcsConflict` 封装。它是 VCS 原语的消费侧，验证 LR-02/LR-05/LR-06 方向的需求；其单仓全局锁与 LLM Trust Gate 不是 Libra 的并发与发布模型，`trust_gate.py:120` 的 metadata-redaction-before-LLM 可作为 SB-02 参考。
+- **不新增 LR：agentic-flow / agentic-jujutsu 的编排层 VCS 封装（首次纳入）。** `ruvnet/agentic-flow@d069fff77063` 的 `packages/agentic-jujutsu` 是 jj 的 NAPI 封装加 MCP 分发，附 operation 签名、启发式文件重叠冲突预测与千条环形 trajectory store；其“QuantumDAG”等宣传多为路线图声明（README 自承 v2.4.0 才生产化）。它验证并行 Agent workspace 的市场需求，但无可移植 VCS 机制；Ed25519 harness provenance manifest 与 CWE-78 MCP 修复可作 SB-02 相邻证据。
 - **不新增 LR：Perstate 的 branch-as-identity 记忆仓与 shell worktree 管理。** `graphwisdom/perstate@95e27e3bb103` 把 agent state 绑定到 Git branch，并让 read/write 自动 pull/push；它可作为 LR-01 的并行工作区场景样本，却没有 Libra 的 SQLite 事务、object/storage policy、AgentRuntime lease、secret/redaction 或失败恢复边界。不得把自动网络写入或 shell 脚本约定当作 Libra 的并发安全模型。
 - **不采纳 Grok hook failure 的通用 fail-open 默认。** `xai-grok-hooks/src/dispatcher.rs` 明确把 timeout、crash、malformed output 等失败视为 allow，前提是其“受保护环境”威胁模型；Libra 的 MCP、外部 Agent、approval 和 mutation tool 面向不可信输入，SB-02 要求 authorizer/approval/secret boundary fail closed。可参考其 Claude-compatible envelope 与 matcher，但不能照搬失败策略。
 - **不新增 LR：纯 Turn Inspector、视觉样式或前端交互模式。** 这些可改进 `libra code`，但不应占用长期 VCS 组合名额；由 `plan-20260715.md` 和前端计划治理。
-- **不采纳未经限定的竞品指标。** Mainline 的“near-100% pin”、Grit 的 unskipped pass rate、research-git 的 provenance 都只能作为特定机制证据，不能直接成为 Libra 完成或优先级依据。
-- **不采用 Grit 的二元 skip 元数据和“绝不修改测试”原文策略。** `GitButler/grit@dfb079967` 的 per-file ledger、上游套件和隔离 runner 值得继续用于兼容治理，但 skip 应记录 reason/category/owner/review date，机械适配、上游 expected failure 与 Libra defect 必须分型。
+- **不采纳未经限定的竞品指标。** Mainline 的“near-100% pin”、Grit 的 unskipped pass rate、research-git 的 provenance 都只能作为特定机制证据，不能直接成为 Libra 完成或优先级依据。Grit 侧的具体失真机制（skip 计入 pass、42% 自撰测试进分母、`apply`/`am` 整族排除、22 个 timeout 文件的 0/350 被排除、宿主 `git` 兜底）见「本次竞品审计快照」的 Grit 条目；CT-01 的非目标已把该约束写成实施边界。
+- **不采用 Grit 的二元 skip 元数据和“绝不修改测试”原文策略。** `GitButler/grit@dfb079967` 的 per-file ledger、上游套件和隔离 runner 值得继续用于兼容治理，但 skip 应记录 reason/category/owner/review date，机械适配、上游 expected failure 与 Libra defect 必须分型。**本条的实施面是 CT-01**（见其 S3 账本 schema 与守卫）：分型直接复用 [`../gap/grit-gap.md`](../gap/grit-gap.md) 的 `direct`/`adapted`/`declined`/`blocked` 四值，不新造分类名。
+- **不逐字迁移 Grit/上游 Git 的测试资产。** Grit 的 `grit-git`、`/git`、`/tests` 是 GPLv2，Libra 是 MIT；`../gap/grit-gap.md` 的净室质量门已禁止复制或翻译 GPLv2 来源的源码、shell harness、C helper、`t*.sh` 文本及其逐字预期输出，并禁止把 Grit 的 shell harness 作为 Libra 的测试接入形态。CT-01 因此把「迁移」定义为迁移**覆盖面**——场景 clean-room 重写为 Libra 原生测试，配一个**代码入库、上游语料不入库**的离线发现器；「仅运行而不分发」是否合规仍待所有者裁定。
 
 ### 已实现
 

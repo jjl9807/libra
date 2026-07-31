@@ -1503,7 +1503,7 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         // is the one command you most want to be able to run without
         // committing to an upgrade first.
         Commands::Worktree(command::worktree::WorktreeArgs {
-            command: command::worktree::WorktreeSubcommand::Doctor,
+            command: command::worktree::WorktreeSubcommand::Doctor { .. },
         }) => {
             let storage =
                 utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
@@ -1676,7 +1676,7 @@ fn command_scope(command: &Commands) -> CommandScope {
             // Classifying it as a writer made the generic shared hold create
             // `.libra/maintenance.lock`, which is a filesystem change, in the
             // one command whose contract forbids any.
-            command::worktree::WorktreeSubcommand::Doctor => ReadOnly,
+            command::worktree::WorktreeSubcommand::Doctor { .. } => ReadOnly,
             _ => Repository,
         },
 

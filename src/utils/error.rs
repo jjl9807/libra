@@ -316,6 +316,18 @@ pub enum StableErrorCode {
     /// matches the stored lease — a doctor/scavenger reclaim took it over with
     /// a higher fence, or the record already settled (plan-20260714 §C.8 W4).
     AgentWorkspaceLeaseLost,
+    /// A `worktree doctor` pagination cursor is malformed, was issued by a
+    /// different listing, or has expired (plan-20260714 §C.13 W4). Fail closed
+    /// rather than silently restarting at page one: a caller walking a keyset
+    /// page by page would otherwise re-read rows it already processed and
+    /// believe it had seen the whole registry.
+    WorktreeCursorInvalid,
+    /// A worktree/workspace scope's state is corrupt or unreadable, so the
+    /// diagnostic report would be incomplete (plan-20260714 §C.13 W4). The
+    /// doctor never degrades to an empty or partial diagnosis — an operator
+    /// acting on a silently-truncated report is worse off than one told the
+    /// scope cannot be read.
+    WorktreeScopeCorrupt,
     /// The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`)
     /// is unreadable, corrupt, or written by an unsupported schema version
     /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
@@ -388,6 +400,8 @@ impl StableErrorCode {
             Self::AgentGraphSessionUnknown => "LBR-AGENT-021",
             Self::AgentWorkspaceLeaseHeld => "LBR-AGENT-022",
             Self::AgentWorkspaceLeaseLost => "LBR-AGENT-023",
+            Self::WorktreeCursorInvalid => "LBR-WORKTREE-001",
+            Self::WorktreeScopeCorrupt => "LBR-WORKTREE-002",
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
         }
     }
@@ -399,9 +413,15 @@ impl StableErrorCode {
             Self::CliUnknownCommand | Self::CliInvalidArguments | Self::CliInvalidTarget => {
                 CliErrorCategory::Cli
             }
-            Self::RepoNotFound | Self::RepoCorrupt | Self::RepoStateInvalid => {
-                CliErrorCategory::Repo
-            }
+            // The two worktree-doctor codes deliberately reuse the existing
+            // `repo` category (§C.13): both describe repository-side state a
+            // caller must repair, and a new category would force every
+            // exit-code branch in downstream scripts to grow a case.
+            Self::RepoNotFound
+            | Self::RepoCorrupt
+            | Self::RepoStateInvalid
+            | Self::WorktreeCursorInvalid
+            | Self::WorktreeScopeCorrupt => CliErrorCategory::Repo,
             Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
@@ -624,6 +644,12 @@ impl StableErrorCode {
             }
             Self::AgentWorkspaceLeaseLost => {
                 "The presented workspace lease owner/fence is stale; the lease was reclaimed or already released."
+            }
+            Self::WorktreeCursorInvalid => {
+                "The pagination cursor is malformed or expired; drop it and re-read the first page."
+            }
+            Self::WorktreeScopeCorrupt => {
+                "A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report."
             }
             Self::UpgradeSettingsInvalid => {
                 "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
@@ -2094,6 +2120,8 @@ mod tests {
             (StableErrorCode::AgentGraphSessionUnknown, "LBR-AGENT-021"),
             (StableErrorCode::AgentWorkspaceLeaseHeld, "LBR-AGENT-022"),
             (StableErrorCode::AgentWorkspaceLeaseLost, "LBR-AGENT-023"),
+            (StableErrorCode::WorktreeCursorInvalid, "LBR-WORKTREE-001"),
+            (StableErrorCode::WorktreeScopeCorrupt, "LBR-WORKTREE-002"),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -2139,6 +2167,17 @@ mod tests {
         );
         assert_eq!(
             StableErrorCode::RepoStateInvalid.category(),
+            CliErrorCategory::Repo,
+        );
+        // The worktree-doctor pair reuses `repo` deliberately (§C.13) —
+        // re-bucketing either one would change `fine_exit_code()` for
+        // scripts that branch on the doctor's refusals.
+        assert_eq!(
+            StableErrorCode::WorktreeCursorInvalid.category(),
+            CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::WorktreeScopeCorrupt.category(),
             CliErrorCategory::Repo,
         );
         assert_eq!(

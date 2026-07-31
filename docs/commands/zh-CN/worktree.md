@@ -17,6 +17,8 @@ libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
 libra worktree repair [<path>]
+libra worktree repair --migrate-layout [--dry-run] [<path>]
+libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 ```
 
 ## 说明
@@ -222,6 +224,42 @@ libra worktree repair ../experiment
 libra --json worktree repair ../experiment
 ```
 
+### 子命令：`doctor`
+
+诊断 Agent **workspace** scope。该子命令**只读**：只报告、绝不修复——任何调用都不会写入任何行、registry 条目、lease 或文件。（Libra 专有；Git 无对应命令。）
+
+*workspace* 是 Agent runtime 接管某个 worktree 时建立的关联记录（见 `libra agent workspace list`）。人类使用 linked worktree 从不需要它，因此没有 Agent 活动的仓库不会报告任何内容。
+
+| 参数 / 选项 | 说明 |
+|-------------|------|
+| `<workspace-id>` | 只诊断一个 workspace，而不是分页遍历全部。不能与 `--limit`/`--cursor` 同时使用（单 scope 不是一页）——组合使用是用法错误 `LBR-CLI-002`。 |
+| `--limit <n>` | 每页最多返回的诊断条数。默认 50，上限 500。 |
+| `--cursor <cursor>` | 从上一页继续：原样回传 `next_cursor` 的值。cursor 是 opaque 的；非本命令签发的 cursor 会以 `LBR-WORKTREE-001` 拒绝，而不是悄悄从第一页重来。 |
+
+每条诊断报告该 workspace 的身份（`workspace_id`、`repo_id`、`path`、`worktree_id`）、`lease_state`（`none`/`held`/`expired`），以及 `scope_diagnostics` 发现列表。每项发现带稳定的 `code` 与 `severity`（`warning` 或 `error`）：
+
+| Code | Severity | 含义 |
+|------|----------|------|
+| `foreign_repository_identity` | error | 该记录写于此前的仓库身份下：常规列表看不到它，且它会阻塞新 workspace 注册。 |
+| `registry_path_mismatch` | error | worktree registry 与 workspace 记录对 scope 所在路径的说法不一致。 |
+| `scope_layout_corrupt` | error | 该路径的 gitdir 布局无法识别。 |
+| `workspace_orphaned` | warning | 拆除失败或 owner 消失；该 workspace 仍持有恢复状态。 |
+| `lease_expired` | warning | lease 期限已过。在被显式回收之前，lease 仍属于其 owner。 |
+| `workspace_path_missing` | warning | 声称的路径上没有目录。 |
+| `registry_entry_missing` | warning | 没有 worktree registry 条目拥有该 scope。 |
+| `registry_entry_detached` | warning | 该 worktree 已被 `worktree remove`（保留目录）注销。 |
+| `registry_entry_tombstoned` | warning | 目录已删除但其 scoped 行仍待清理；`libra worktree repair` 会重试。 |
+| `scope_layout_legacy_symlink` | warning | 该 worktree 仍是隔离布局之前的共享 `.libra` 符号链接布局；用 `libra worktree repair --migrate-layout` 迁移。 |
+
+完全无法读取的 scope——无法解析的 registry、不可读的记录、缺失的仓库身份——一律以 `LBR-WORKTREE-002` fail-closed，而不是给出残缺诊断。
+
+```bash
+libra worktree doctor
+libra --json worktree doctor --limit 20
+libra --json worktree doctor --cursor "$cursor"
+libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
+```
+
 ## 常用命令
 
 ```bash
@@ -248,6 +286,9 @@ libra wt remove ../experiment-v2
 
 # 修复不一致的 worktree 元数据
 libra wt repair
+
+# 只读诊断全部 Agent workspace scope
+libra wt doctor
 ```
 
 ## 人工输出
@@ -428,6 +469,67 @@ No worktrees to prune
 }
 ```
 
+**`worktree.doctor`**（分页视图——`data.diagnostics[]` 加 `data.next_cursor`，
+最后一页为 `null`）：
+
+```json
+{
+  "ok": true,
+  "command": "worktree.doctor",
+  "data": {
+    "schema_version": 1,
+    "diagnostics": [
+      {
+        "workspace_id": "9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13",
+        "repo_id": "8f5b…",
+        "kind": "linked",
+        "state": "active",
+        "path": "/Users/alice/projects/my-feature",
+        "worktree_id": "1f0c…",
+        "lease_state": "expired",
+        "lease_owner": "agent-review-3",
+        "lease_fence": 2,
+        "lease_expires_at": 1785304730095,
+        "scope_diagnostics": [
+          {
+            "code": "lease_expired",
+            "severity": "warning",
+            "detail": "the lease deadline passed (expires_at 1785304730095, now 1785305330095); the lease still belongs to its owner until it is explicitly reclaimed"
+          }
+        ]
+      }
+    ],
+    "next_cursor": null
+  }
+}
+```
+
+**`worktree.doctor <workspace-id>`**（单 scope 视图——单数 `data.diagnostic`，
+无分页字段）：
+
+```json
+{
+  "ok": true,
+  "command": "worktree.doctor",
+  "data": {
+    "schema_version": 1,
+    "diagnostic": {
+      "workspace_id": "9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13",
+      "repo_id": "8f5b…",
+      "kind": "linked",
+      "state": "active",
+      "path": "/Users/alice/projects/my-feature",
+      "worktree_id": "1f0c…",
+      "lease_state": "held",
+      "lease_owner": "agent-review-3",
+      "lease_fence": 2,
+      "lease_expires_at": 1785305930095,
+      "scope_diagnostics": []
+    }
+  }
+}
+```
+
 ## 设计动机
 
 ### 为什么使用 JSON 文件持久化，而不是像 Git 那样使用文件系统链接？
@@ -493,3 +595,7 @@ Git 的 `git worktree lock` 也支持 `--reason`，Libra 保留了这一点。�
 | `LBR-IO-001` | 读取或检查 worktree 路径/状态/status 失败 |
 | `LBR-IO-002` | 写入 worktrees.json 失败 |
 | `LBR-IO-002` | 从 HEAD 填充 worktree 失败 |
+| `LBR-CLI-002` | `worktree doctor <workspace-id>` 与 `--limit`/`--cursor` 同时使用 |
+| `LBR-CLI-003` | `worktree doctor <workspace-id>` 指向不存在的 workspace |
+| `LBR-WORKTREE-001` | `worktree doctor --cursor` 收到非本命令签发（或已过期）的 cursor |
+| `LBR-WORKTREE-002` | `worktree doctor` 无法读取某个 scope（registry 无法解析、记录不可读、仓库身份缺失），拒绝给出残缺诊断 |

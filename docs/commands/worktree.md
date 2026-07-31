@@ -19,6 +19,7 @@ libra worktree umount <path> [--cleanup]
 libra worktree repair [<path>]
 libra worktree repair --migrate-layout [--dry-run] [<path>]
 libra worktree repair <path> --resolve-identity --yes
+libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 ```
 
 ## Description
@@ -272,6 +273,42 @@ libra worktree repair ../experiment
 libra --json worktree repair ../experiment
 ```
 
+### Subcommand: `doctor`
+
+Diagnose Agent **workspace** scopes. This subcommand is **read-only**: it reports and never repairs — no row, registry entry, lease, or file is written by any invocation. (Libra-only; Git has no equivalent.)
+
+A *workspace* is the association record an Agent runtime takes over a worktree (see `libra agent workspace list`). Human use of a linked worktree never needs one, so a repository with no Agent activity reports nothing.
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `<workspace-id>` | Diagnose exactly one workspace instead of paging over all of them. Cannot be combined with `--limit`/`--cursor` (a single scope is not a page) — the combination is a usage error, `LBR-CLI-002`. |
+| `--limit <n>` | Maximum diagnostics per page. Default 50, capped at 500. |
+| `--cursor <cursor>` | Resume after a previous page: pass the `next_cursor` value back verbatim. The cursor is opaque; one this command did not issue is refused with `LBR-WORKTREE-001` rather than silently restarting at page one. |
+
+Each diagnostic reports the workspace's identity (`workspace_id`, `repo_id`, `path`, `worktree_id`), its `lease_state` (`none`, `held`, or `expired`), and a `scope_diagnostics` array of findings. Findings carry a stable `code` and a `severity` of `warning` or `error`:
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `foreign_repository_identity` | error | The record was written under a previous repository identity: it is invisible to the normal listings and blocks new workspace registrations. |
+| `registry_path_mismatch` | error | The worktree registry and the workspace record disagree about where the scope lives. |
+| `scope_layout_corrupt` | error | The gitdir layout at that path is unrecognizable. |
+| `workspace_orphaned` | warning | Teardown failed or the owner vanished; the workspace still holds recovery state. |
+| `lease_expired` | warning | The lease deadline passed. The lease still belongs to its owner until it is explicitly reclaimed. |
+| `workspace_path_missing` | warning | No directory exists at the claimed path. |
+| `registry_entry_missing` | warning | No worktree registry entry owns this scope. |
+| `registry_entry_detached` | warning | The worktree was unregistered with `worktree remove` (keep-dir). |
+| `registry_entry_tombstoned` | warning | The directory was deleted but its scoped rows are still pending cleanup; `libra worktree repair` retries it. |
+| `scope_layout_legacy_symlink` | warning | The worktree still uses the pre-isolation shared-`.libra` symlink layout; migrate it with `libra worktree repair --migrate-layout`. |
+
+A scope that cannot be read at all — an unparseable registry, an unreadable record, or a repository whose identity is missing — fails closed with `LBR-WORKTREE-002` instead of answering with a partial diagnosis.
+
+```bash
+libra worktree doctor
+libra --json worktree doctor --limit 20
+libra --json worktree doctor --cursor "$cursor"
+libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
+```
+
 ## Common Commands
 
 ```bash
@@ -301,6 +338,9 @@ libra wt repair
 
 # Restore a linked worktree's gitdir identity from the registry
 libra wt repair ../experiment
+
+# Read-only diagnosis of every Agent workspace scope
+libra wt doctor
 ```
 
 ## Human Output
@@ -483,6 +523,67 @@ single-line JSON.
 }
 ```
 
+**`worktree.doctor`** (paginated view — `data.diagnostics[]` plus
+`data.next_cursor`, which is `null` on the last page):
+
+```json
+{
+  "ok": true,
+  "command": "worktree.doctor",
+  "data": {
+    "schema_version": 1,
+    "diagnostics": [
+      {
+        "workspace_id": "9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13",
+        "repo_id": "8f5b…",
+        "kind": "linked",
+        "state": "active",
+        "path": "/Users/alice/projects/my-feature",
+        "worktree_id": "1f0c…",
+        "lease_state": "expired",
+        "lease_owner": "agent-review-3",
+        "lease_fence": 2,
+        "lease_expires_at": 1785304730095,
+        "scope_diagnostics": [
+          {
+            "code": "lease_expired",
+            "severity": "warning",
+            "detail": "the lease deadline passed (expires_at 1785304730095, now 1785305330095); the lease still belongs to its owner until it is explicitly reclaimed"
+          }
+        ]
+      }
+    ],
+    "next_cursor": null
+  }
+}
+```
+
+**`worktree.doctor <workspace-id>`** (single-scope view — the singular
+`data.diagnostic`, with no pagination keys):
+
+```json
+{
+  "ok": true,
+  "command": "worktree.doctor",
+  "data": {
+    "schema_version": 1,
+    "diagnostic": {
+      "workspace_id": "9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13",
+      "repo_id": "8f5b…",
+      "kind": "linked",
+      "state": "active",
+      "path": "/Users/alice/projects/my-feature",
+      "worktree_id": "1f0c…",
+      "lease_state": "held",
+      "lease_owner": "agent-review-3",
+      "lease_fence": 2,
+      "lease_expires_at": 1785305930095,
+      "scope_diagnostics": []
+    }
+  }
+}
+```
+
 ## Design Rationale
 
 ### Why JSON-file persistence instead of filesystem links like Git?
@@ -548,3 +649,7 @@ Note: jj uses the term "workspace" instead of "worktree". Each workspace automat
 | `LBR-IO-001` | Failed to read or inspect worktree paths/state/status |
 | `LBR-IO-002` | Failed to write worktrees.json |
 | `LBR-IO-002` | Failed to populate worktree from HEAD |
+| `LBR-CLI-002` | `worktree doctor <workspace-id>` combined with `--limit`/`--cursor` |
+| `LBR-CLI-003` | `worktree doctor <workspace-id>` names an unknown workspace |
+| `LBR-WORKTREE-001` | `worktree doctor --cursor` was given a cursor this command did not issue (or one that expired) |
+| `LBR-WORKTREE-002` | `worktree doctor` cannot read a scope (unparseable registry, unreadable record, missing repository identity) and refuses to report a partial diagnosis |
