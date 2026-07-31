@@ -168,8 +168,18 @@ pub struct MergeArgs {
     #[arg(long = "no-log", overrides_with = "log", conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub no_log: bool,
 
-    /// Use the given message for the merge commit instead of the default.
-    #[arg(short = 'm', long = "message", value_name = "MSG", conflicts_with_all = ["continue_merge", "abort"])]
+    /// Use the given message for the merge commit instead of the default. May
+    /// also be given with `--continue` (a Libra extension — Git's
+    /// `git merge --continue` takes no arguments and only lets you edit the
+    /// stored message in an editor): it overrides the message recorded when the
+    /// conflicted merge started, which is otherwise unreachable because Libra
+    /// finalizes `--continue` without opening an editor.
+    #[arg(
+        short = 'm',
+        long = "message",
+        value_name = "MSG",
+        conflicts_with = "abort"
+    )]
     pub message: Option<String>,
 
     /// Merge changes but stage the result without committing or moving HEAD
@@ -565,6 +575,8 @@ pub(crate) enum PullMergeError {
     TreeCreate(String),
     #[error("failed to save merge commit: {0}")]
     CommitSave(String),
+    #[error("failed to resolve the identity for the merge commit: {0}")]
+    IdentityMissing(String),
     #[error("failed to reset working tree after merge: {0}")]
     WorkdirReset(String),
     #[error("failed to load tree '{tree_id}': {detail}")]
@@ -680,6 +692,13 @@ impl From<PullMergeError> for CliError {
             | PullMergeError::WorkdirReset(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            // Mirrors `CommitError::IdentityMissing`: a merge commit needs the same
+            // identity as any other commit, so it fails the same way and offers the
+            // same fix.
+            PullMergeError::IdentityMissing(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthMissingCredentials)
+                .with_hint("run 'libra config --global user.name \"Your Name\"' and 'libra config --global user.email \"you@example.com\"'")
+                .with_hint("omit '--global' to set the identity only in this repository."),
             PullMergeError::HeadResolve(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -834,11 +853,37 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
             };
             run_merge_for_pull_with_options(branch, branch, output, options).await
         }
-        (None, true, false) => run_merge_continue(output, args.no_verify).await,
+        (None, true, false) => {
+            run_merge_continue(output, args.no_verify, args.message.clone()).await
+        }
         (None, false, true) => run_merge_abort(output).await,
         (None, false, false) => Err(MergeError::MissingAction),
         _ => Err(MergeError::ConflictingAction),
     }
+}
+
+/// Build a merge commit that carries the repository's configured identity.
+///
+/// `Commit::from_tree_id` hardcodes `mega <admin@mega.org>` as both author and
+/// committer, so every merge commit built through it silently discards
+/// `user.name` / `user.email` (and the `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
+/// overrides). A merge commit is an ordinary commit as far as authorship goes,
+/// so it resolves its identity through the same path as `libra commit`.
+async fn build_merge_commit(
+    tree_id: ObjectHash,
+    parent_commit_ids: Vec<ObjectHash>,
+    message: &str,
+) -> Result<Commit, PullMergeError> {
+    let (author, committer, _) = crate::command::commit::create_commit_signatures(None, None)
+        .await
+        .map_err(|error| PullMergeError::IdentityMissing(error.to_string()))?;
+    Ok(Commit::new(
+        author,
+        committer,
+        tree_id,
+        parent_commit_ids,
+        message,
+    ))
 }
 
 async fn run_pre_merge_commit_hook(output: &OutputConfig) -> Result<(), PullMergeError> {
@@ -1550,11 +1595,12 @@ async fn perform_ours_merge(
     } else {
         resolved_message
     };
-    let merge_commit = Commit::from_tree_id(
+    let merge_commit = build_merge_commit(
         current_commit.tree_id,
         vec![current_commit.id, target_commit.id],
         &format_commit_msg(&message, None),
-    );
+    )
+    .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
     update_head_with_reflog(&head_name, merge_commit.id, upstream, "ours").await?;
@@ -1772,11 +1818,12 @@ async fn perform_three_way_merge(
     } else {
         resolved_message
     };
-    let merge_commit = Commit::from_tree_id(
+    let merge_commit = build_merge_commit(
         tree_id,
         vec![current_commit.id, target_commit.id],
         &format_commit_msg(&message, None),
-    );
+    )
+    .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| PullMergeError::CommitSave(error.to_string()))?;
     update_head_with_reflog(&head_name, merge_commit.id, upstream, "three-way").await?;
@@ -1966,6 +2013,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
 async fn run_merge_continue(
     output: &OutputConfig,
     skip_hooks_for_continue: bool,
+    message_override: Option<String>,
 ) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
     let state = MergeState::load_required()?;
@@ -1996,12 +2044,13 @@ async fn run_merge_continue(
     let index_items = index_tree_items(&index)?;
     let files_changed = count_item_map_changes(&original_items, &index_items);
     let tree_id = create_tree_from_items_map(&index_items).map_err(MergeError::TreeCreate)?;
-    // Replay the message resolved at merge start (`-m` or the generated
-    // default with the `merge.log` shortlog); states written by older
+    // A `-m` given to `--continue` wins: it is the only way to set the message
+    // of a conflicted merge, since Libra finalizes without opening an editor.
+    // Otherwise replay the message resolved at merge start (`-m` or the
+    // generated default with the `merge.log` shortlog); states written by older
     // binaries carry no message and keep the plain form.
-    let message = state
-        .message
-        .clone()
+    let message = message_override
+        .or_else(|| state.message.clone())
         .unwrap_or_else(|| format!("Merge {} into {}", state.target_ref, state.head_name));
     let message = if !skip_hooks {
         run_pre_merge_commit_hook(output).await?;
@@ -2012,11 +2061,12 @@ async fn run_merge_continue(
     } else {
         message
     };
-    let merge_commit = Commit::from_tree_id(
+    let merge_commit = build_merge_commit(
         tree_id,
         vec![orig_head, target],
         &format_commit_msg(&message, None),
-    );
+    )
+    .await?;
     save_object(&merge_commit, &merge_commit.id)
         .map_err(|error| MergeError::CommitSave(error.to_string()))?;
     let strategy = match state.strategy {
