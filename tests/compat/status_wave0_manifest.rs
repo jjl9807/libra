@@ -6,6 +6,12 @@
 //! against `cargo test --test command_test -- --list` and strict
 //! alphabetical ordering. Add or remove a test in the module and this list
 //! together — never edit only one side.
+//!
+//! Tests gated `#[cfg(unix)]` in the module are compiled (and therefore
+//! listed by `--list`) only on Unix hosts, so they must additionally be
+//! named in [`STATUS_WAVE0_TESTS_UNIX_ONLY`]; the gate excludes them from
+//! the expected set on non-Unix platforms. Both lists stay in this one
+//! file so the manifest remains the single source of truth.
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "api_warning_concurrent_isolated",
@@ -161,4 +167,42 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "worktree_exact_matches_known_index_oid",
     "worktree_read_failure_degrades_with_warning_not_silence",
     "worktree_type_race_between_stat_and_hash_drops_candidate",
+];
+
+/// Names in [`STATUS_WAVE0_TESTS`] whose test functions are gated
+/// `#[cfg(unix)]` in `tests/command/status_wave0_test.rs`. They are absent
+/// from `cargo test --test command_test -- --list` on non-Unix hosts, so
+/// the registration gate expects them only on Unix. Must be a subset of
+/// [`STATUS_WAVE0_TESTS`], strictly alphabetically sorted.
+pub const STATUS_WAVE0_TESTS_UNIX_ONLY: &[&str] = &[
+    "cache_fallback_still_fails_closed_on_io_blocked",
+    "check_dirty_blocked_rows_never_mutate_the_cache",
+    "check_dirty_ioblocked_emits_warning_and_exit_nine",
+    "diff_and_status_agree_on_inexact_stages",
+    "json_base_and_rename_completeness_matrix",
+    "json_io_blocked_non_utf8_path_reversible",
+    "json_io_blocked_rename_branch_schema",
+    "json_scan_with_pathspec_reports_blocks_outside_it",
+    "non_utf8_arguments_do_not_abort_the_process",
+    "non_utf8_path_skips_rename_not_status",
+    "object_read_unavailable_blob_skips_inexact_only",
+    "object_read_unavailable_warning_is_deduplicated",
+    "pathspec_filter_keeps_non_event_worktree_warnings",
+    "porcelain_z_non_utf8_base_status_raw_bytes",
+    "probe_eacces_then_truncated_keeps_both",
+    "probe_glob_pathspec_keeps_blocked_directory_relevant",
+    "probe_marker_collapse_is_per_root",
+    "probe_never_reads_a_non_regular_candidate",
+    "probe_pathspec_outside_eacces_not_propagated",
+    "probe_symlinked_escape_is_reported_not_followed",
+    "quiet_does_not_bypass_io_blocked_fail_closed",
+    "scan_survives_non_utf8_untracked_path",
+    "symlink_rename_hashes_target_bytes_not_referent",
+    "symlink_worktree_exact_with_rename_untracked",
+    "tracked_non_utf8_path_never_fails_status",
+    "tracked_scan_io_timeout_is_reported_not_hung",
+    "tracked_unreadable_path_fails_closed_not_deleted",
+    "worktree_candidate_not_found_between_scan_and_hash",
+    "worktree_candidate_vanishes_between_scan_and_hash",
+    "worktree_read_failure_degrades_with_warning_not_silence",
 ];
