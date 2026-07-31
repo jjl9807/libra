@@ -1218,6 +1218,20 @@ struct StashBranchJournal {
     /// The HEAD to restore: a branch name, or a detached commit id.
     prior_branch: Option<String>,
     prior_detached: Option<String>,
+    /// How far the command provably got — recovery's authority on what it
+    /// may touch (W2 r6 #1):
+    ///
+    /// * `prepared`  — recorded BEFORE the exclusive create. The branch may
+    ///   be someone else's pre-existing one (the create can still collide),
+    ///   so recovery touches NOTHING and only clears the journal.
+    /// * `created`   — the exclusive create succeeded, so the branch is
+    ///   provably ours; recovery restores HEAD and deletes it
+    ///   tip-conditionally.
+    /// * `committed` — the command succeeded past its mutating phase but the
+    ///   journal could not be cleared; recovery only clears it. Rolling back
+    ///   here would delete a branch the user is standing on.
+    #[serde(default = "StashBranchJournal::default_phase")]
+    phase: String,
 }
 
 impl StashBranchJournal {
@@ -1234,6 +1248,22 @@ impl StashBranchJournal {
 
     fn clear() -> Result<(), StashError> {
         remove_durably(&Self::path())
+    }
+
+    /// Pre-phase journals (written before this field existed) recorded only
+    /// AFTER their create succeeded, so `created` is their true phase.
+    fn default_phase() -> String {
+        "created".to_string()
+    }
+
+    fn with_phase(&self, phase: &str) -> Self {
+        Self {
+            branch: self.branch.clone(),
+            base: self.base.clone(),
+            prior_branch: self.prior_branch.clone(),
+            prior_detached: self.prior_detached.clone(),
+            phase: phase.to_string(),
+        }
     }
 
     fn prior_head(&self) -> Option<Head> {
@@ -1271,6 +1301,25 @@ async fn recover_stash_branch_journal() -> Result<(), StashError> {
         ))
     })?;
 
+    // The PHASE is recovery's authority on what it may touch.
+    match journal.phase.as_str() {
+        // Before the exclusive create: the branch may be a pre-existing one
+        // the create collided with; after the commit point: the branch is the
+        // user's success. Either way, touch NOTHING.
+        "prepared" | "committed" => {
+            StashBranchJournal::clear()?;
+            return Ok(());
+        }
+        "created" => {}
+        other => {
+            return Err(StashError::Other(format!(
+                "the stash-branch rollback journal '{}' records unknown phase '{other}'; \
+                 inspect and remove it manually",
+                path.display()
+            )));
+        }
+    }
+
     // HEAD first: if it still points at the journaled branch, restore the
     // prior head; if the user already moved on, leave HEAD alone.
     if let Head::Branch(current) = Head::current().await
@@ -1295,26 +1344,34 @@ async fn recover_stash_branch_journal() -> Result<(), StashError> {
         ))
     })?;
     use crate::internal::branch::ConditionalDeleteOutcome;
-    match InternalBranch::delete_branch_if_tip_result(&journal.branch, &base).await {
-        Ok(
-            ConditionalDeleteOutcome::Deleted
-            | ConditionalDeleteOutcome::NotFound
-            | ConditionalDeleteOutcome::TipMoved,
-        ) => {}
-        Err(error) => {
-            return Err(StashError::Other(format!(
-                "rollback cannot conclude branch '{}' ({error}); the journal is kept and \
+    let branch_note =
+        match InternalBranch::delete_branch_if_tip_result(&journal.branch, &base).await {
+            Ok(ConditionalDeleteOutcome::Deleted | ConditionalDeleteOutcome::NotFound) => None,
+            // The user committed to the branch: it is theirs now and is KEPT —
+            // said out loud, because a silently retained branch from a
+            // half-failed command looks like corruption when found later.
+            Ok(ConditionalDeleteOutcome::TipMoved) => Some(format!(
+                "branch '{}' was KEPT: its tip moved past the journaled base, so it now \
+             carries your commits — delete it with `libra branch -d {}` if unwanted",
+                journal.branch, journal.branch
+            )),
+            Err(error) => {
+                return Err(StashError::Other(format!(
+                    "rollback cannot conclude branch '{}' ({error}); the journal is kept and \
                  the next stash command will retry",
-                journal.branch
-            )));
-        }
-    }
+                    journal.branch
+                )));
+            }
+        };
     StashBranchJournal::clear()?;
     crate::utils::error::emit_warning(format!(
         "completed the rollback of an interrupted `stash branch {}` (the working tree \
          was left untouched)",
         journal.branch
     ));
+    if let Some(note) = branch_note {
+        crate::utils::error::emit_warning(note);
+    }
     Ok(())
 }
 
@@ -1350,6 +1407,7 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
             Head::Detached(oid) => Some(oid.to_string()),
             Head::Branch(_) => None,
         },
+        phase: "prepared".to_string(),
     };
     journal.write()?;
 
@@ -1372,6 +1430,16 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
             }
             other => stash_branch_store_error(&branch_name, other),
         });
+    }
+    // The branch is provably OURS from here: promote the journal so recovery
+    // may roll it back. A failed promotion aborts while the only mutation is
+    // the branch row, rolled back tip-conditionally.
+    if let Err(error) = journal.with_phase("created").write() {
+        rollback_created_branch(&branch_name, &base_hash).await;
+        if let Err(clear_error) = StashBranchJournal::clear() {
+            eprintln!("warning: could not remove the rollback journal: {clear_error}");
+        }
+        return Err(error);
     }
 
     // Switch HEAD to the new branch so apply runs on the right tip — via the
@@ -1412,9 +1480,19 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
         return Err(apply_error);
     }
     // The command succeeded past its mutating phase: the journaled rollback
-    // must not fire later. An unremovable journal is an error NOW — leaving
-    // it would roll back a branch the user is standing on.
-    StashBranchJournal::clear()?;
+    // must not fire later. If the journal cannot be REMOVED, it is demoted to
+    // `committed` — recovery only clears that phase — and only if even the
+    // demotion fails does the command error, naming the file.
+    if let Err(clear_error) = StashBranchJournal::clear() {
+        journal.with_phase("committed").write().map_err(|_| {
+            StashError::Other(format!(
+                "the command succeeded, but its rollback journal could not be removed OR \
+                 demoted ({clear_error}); remove '{}' manually before the next stash \
+                 command, or it will roll back the branch you are on",
+                StashBranchJournal::path().display()
+            ))
+        })?;
+    }
     let applied = true;
     let dropped = {
         // Unified CAS deletion (same do_drop path as pop): locate the applied

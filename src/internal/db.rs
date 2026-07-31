@@ -195,12 +195,19 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
         let conn = conn.clone();
         drop(connections);
         // The fence must hold for CACHED connections too (W2 r5 #6): a
-        // long-lived process (the `libra code` server) connected before
-        // another process applied a newer migration would otherwise keep
-        // writing under a schema its code predates — for the stash fence,
-        // that is exactly the generation-less writer the migration exists to
-        // exclude. One indexed MAX() on a tiny table per hit; an upgrade
-        // requirement or a future schema evicts the entry and re-resolves.
+        // long-lived process (the `libra code` server) whose cache predates
+        // another process's migration would otherwise keep writing under a
+        // schema its code does not know. One indexed MAX() on a tiny table
+        // per hit; an upgrade requirement or a future schema evicts the
+        // entry and re-resolves.
+        //
+        // SCOPE of the guarantee: this fences every acquisition THROUGH THIS
+        // CACHE. A different (old) binary is fenced by its own open-time
+        // check at its next connect; a connection handle an old process
+        // already holds is inherently beyond any new binary's reach — the
+        // migration protocol's claim-first transaction is what bounds the
+        // damage there (a schema rebuild fails the old writer's statements
+        // rather than accepting them).
         match inspect_database_schema_for_connection(&conn).await {
             Ok(SchemaCompatibility::Compatible { .. }) => return Ok(conn),
             Ok(_) | Err(_) => {
@@ -902,6 +909,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "both writers' rows are present");
+    }
+
+    /// W2 r6 #5: the REAL lifecycle of the cache fence — a connection this
+    /// process already cached is refused (and evicted) the moment the
+    /// database's recorded schema moves past what this binary registers.
+    #[tokio::test]
+    async fn a_cached_connection_is_refused_after_the_schema_moves_ahead() {
+        let test_db = TestDbPath::new("cache_fence_lifecycle.db").await;
+        let path = std::path::PathBuf::from(&test_db.0);
+
+        // Populate the cache.
+        let cached = get_db_conn_instance_for_path(&path)
+            .await
+            .expect("first acquisition caches");
+
+        // Another actor moves the schema ahead of this binary. The write goes
+        // through the CACHED handle on purpose: the file is the same either
+        // way, and this proves the eviction is not relying on a fresh open.
+        cached
+            .execute_unprepared(
+                "INSERT INTO schema_versions (version, name, applied_at) \
+                 VALUES (2126010101, 'from-the-future', datetime('now'))",
+            )
+            .await
+            .expect("plant a future version");
+
+        // The NEXT acquisition through the cache must refuse, not hand the
+        // stale-schema handle back.
+        let error = get_db_conn_instance_for_path(&path)
+            .await
+            .expect_err("a cache hit over a future schema must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("newer than this Libra binary supports"),
+            "the refusal says why: {error}"
+        );
+
+        // And it stays refused — the eviction did not accidentally re-cache.
+        get_db_conn_instance_for_path(&path)
+            .await
+            .expect_err("still refused on the following acquisition");
+        reset_db_conn_instance_for_path(&path).await;
     }
 
     #[tokio::test]

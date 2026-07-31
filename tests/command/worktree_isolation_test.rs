@@ -451,6 +451,62 @@ fn a_corrupt_sidecar_root_fails_the_prune_closed() {
     );
 }
 
+/// W2 r6 #2: a journaled branch whose tip MOVED is kept — it carries the
+/// user's commits now — and recovery SAYS so instead of silently retaining a
+/// branch that would later look like corruption.
+#[test]
+fn recovery_keeps_and_reports_a_journaled_branch_the_user_committed_to() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let base = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // The half-state, PLUS a user commit on the journaled branch.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "kept-branch"], main),
+        "switch",
+    );
+    fs::write(main.join("mine.txt"), "the user's work\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "mine.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "user work", "--no-verify"], main),
+        "the user's commit moves the tip past the journaled base",
+    );
+    fs::write(
+        main.join(".libra").join("stash-branch-journal.json"),
+        serde_json::json!({
+            "branch": "kept-branch",
+            "base": base,
+            "prior_branch": "main",
+            "prior_detached": null,
+            "phase": "created"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&out, "recovery runs");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains("KEPT"),
+        "recovery reports the retained branch out loud: {text}"
+    );
+    let branches = run_libra_command(&["branch"], main);
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("kept-branch"),
+        "the branch with the user's commit survives"
+    );
+    assert!(
+        !main
+            .join(".libra")
+            .join("stash-branch-journal.json")
+            .exists(),
+        "and the journal is concluded"
+    );
+}
+
 /// W2 r5: `worktree remove` refuses while a stash-branch rollback journal is
 /// pending — removing the gitdir would strand the half-created branch AND
 /// delete the only instruction for undoing it.
@@ -496,6 +552,80 @@ fn worktree_remove_refuses_a_pending_stash_branch_journal() {
     assert_cli_success(
         &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
         "remove succeeds once the journal is recovered",
+    );
+}
+
+/// W2 r6 #6: every merge CONTROL refuses a corrupt held-autostash BEFORE it
+/// mutates — `--abort` in particular must not restore HEAD/index and delete
+/// the merge state while the only stash reference is a file nothing can
+/// parse.
+#[test]
+fn merge_controls_refuse_a_corrupt_held_autostash_before_mutating() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    // Two diverging tips on the same file → a conflicted merge with state.
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-line", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "other"], main), "switch");
+    fs::write(main.join("a.txt"), "other-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add other");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other-line", "--no-verify"], main),
+        "commit other",
+    );
+    let merged = run_libra_command(&["merge", "main"], main);
+    assert!(!merged.status.success(), "the merge must conflict");
+    let state_path = main.join(".libra").join("merge-state.json");
+    assert!(state_path.exists(), "conflicted merge state persists");
+    let state_before = fs::read(&state_path).unwrap();
+    let head_before = run_libra_command(&["rev-parse", "HEAD"], main).stdout;
+
+    // The corrupt sidecar the controls must trip over.
+    let sidecar = main.join(".libra").join("merge-autostash.json");
+    fs::write(&sidecar, "{ not json").unwrap();
+
+    for control in [
+        ["merge", "--continue"],
+        ["merge", "--restart"],
+        ["merge", "--abort"],
+    ] {
+        let out = run_libra_command(&control, main);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "{control:?} must refuse over a corrupt sidecar: {text}"
+        );
+        assert!(
+            text.contains("merge-autostash.json"),
+            "{control:?} names the file: {text}"
+        );
+        // NOTHING moved: the merge state, HEAD and the sidecar are untouched.
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            state_before,
+            "{control:?} must not touch the merge state"
+        );
+        assert_eq!(
+            run_libra_command(&["rev-parse", "HEAD"], main).stdout,
+            head_before,
+            "{control:?} must not move HEAD"
+        );
+    }
+
+    // Removing the corrupt file lets the control conclude the merge.
+    fs::remove_file(&sidecar).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--abort"], main),
+        "abort succeeds once the sidecar is readable/absent",
     );
 }
 

@@ -484,10 +484,6 @@ impl MergeAutostash {
         util::request_worktree_gitdir_strict().join("merge-autostash.json")
     }
 
-    pub(crate) fn load_optional_sync() -> Result<Option<Self>, String> {
-        Self::load_optional_sync_at(&Self::path())
-    }
-
     /// Read a SPECIFIC worktree's held-autostash sidecar. GC enumerates every
     /// worktree's gitdir (Part C §C.9) — a held autostash is a first-class
     /// reachability root regardless of which worktree holds it.
@@ -1248,20 +1244,38 @@ fn verify_autostash_ownership(recorded: Option<&str>) -> Result<(), String> {
 /// notice (never lost — the lore 1.8 headline); other apply error → sidecar
 /// KEPT and a warning printed (the merge outcome itself is never changed).
 /// While merge state persists the stash simply stays held.
-async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
-    // Serialize against every other consumer/writer in this worktree, and
-    // read ONCE: the sidecar applied, the owner verified and the file
-    // removed must all be the same document.
-    let _lock = match acquire_autostash_lock() {
-        Ok(lock) => lock,
-        Err(detail) => {
-            crate::utils::error::emit_warning(format!(
-                "cannot lock the held autostash ({detail}); leaving it in place"
-            ));
-            return None;
+/// Remove the sidecar ONLY if it is still the document `snapshot` was read
+/// from (W2 r6 #3): the caller drops the autostash lock before taking the
+/// stash-stack lock (§C.10's order — repository lock never inside a local
+/// one), so a writer may replace the file in between. Deleting a replacement
+/// would destroy the only reference to a NEWER held stash; leaving it is
+/// always safe (stale-file recovery re-promotes it with a warning).
+fn cleanup_autostash_if_matches(snapshot: &AutostashSnapshot) -> Result<bool, String> {
+    let _lock = acquire_autostash_lock()?;
+    match MergeAutostash::load_snapshot()? {
+        Some(current)
+            if current.sidecar.stash_commit == snapshot.sidecar.stash_commit
+                && current.recorded_owner == snapshot.recorded_owner =>
+        {
+            MergeAutostash::cleanup().map_err(|error| error.to_string())?;
+            Ok(true)
         }
-    };
-    let snapshot = match MergeAutostash::load_snapshot() {
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
+
+/// Load one consistent snapshot of the held autostash under the lock, then
+/// RELEASE the lock (§C.10: the stash-stack — repository — lock taken by the
+/// consumers below must never nest inside this local one). `Err` = the file
+/// exists but cannot be read; the caller must not mutate past it.
+fn snapshot_held_autostash() -> Result<Option<AutostashSnapshot>, String> {
+    let _lock = acquire_autostash_lock()?;
+    MergeAutostash::load_snapshot()
+}
+
+async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
+    let snapshot = match snapshot_held_autostash() {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return None,
         Err(detail) => {
@@ -1271,6 +1285,16 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             return None;
         }
     };
+    resolve_pending_autostash_with(output, snapshot).await
+}
+
+/// The consumer half, taking a snapshot the CALLER loaded — the merge
+/// controls load theirs before mutating anything (W2 r6 #4), so the document
+/// they preflighted is the one consumed.
+async fn resolve_pending_autostash_with(
+    output: &OutputConfig,
+    snapshot: AutostashSnapshot,
+) -> Option<String> {
     let sidecar = &snapshot.sidecar;
     match MergeState::load_optional_sync() {
         Ok(None) => {}
@@ -1298,11 +1322,16 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
     };
     match crate::command::stash::apply_held_stash_commit(&oid).await {
         Ok(()) => {
-            if let Err(error) = MergeAutostash::cleanup() {
-                crate::utils::error::emit_warning(format!(
+            match cleanup_autostash_if_matches(&snapshot) {
+                Ok(true) => {}
+                Ok(false) => crate::utils::error::emit_warning(
+                    "the autostash sidecar changed while it was being applied; the newer \
+                     file was left in place",
+                ),
+                Err(error) => crate::utils::error::emit_warning(format!(
                     "the applied autostash's sidecar could not be removed ({error}); a later \
                      merge would re-promote it — remove it manually"
-                ));
+                )),
             }
             if !output.quiet {
                 eprintln!("Applied autostash.");
@@ -1314,11 +1343,17 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             // stash into the visible list so nothing is lost.
             match crate::command::stash::store_stash_commit(&oid, "autostash").await {
                 Ok(()) => {
-                    if let Err(error) = MergeAutostash::cleanup() {
-                        crate::utils::error::emit_warning(format!(
-                            "the promoted autostash's sidecar could not be removed ({error}); \
-                             a later merge would re-promote it — remove it manually"
-                        ));
+                    match cleanup_autostash_if_matches(&snapshot) {
+                        Ok(true) => {}
+                        Ok(false) => crate::utils::error::emit_warning(
+                            "the autostash sidecar changed while it was being promoted; \
+                             the newer file was left in place",
+                        ),
+                        Err(error) => crate::utils::error::emit_warning(format!(
+                            "the promoted autostash's sidecar could not be removed \
+                             ({error}); a later merge would re-promote it — remove it \
+                             manually"
+                        )),
                     }
                     if !output.quiet {
                         eprintln!(
@@ -1386,19 +1421,15 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // proceeding would let the later `--autostash` save OVERWRITE the corrupt
     // file — destroying the only durable reference to a held commit, which GC
     // may then collect.
-    // The lock is held across load, verify, promote AND cleanup — releasing
-    // it between any two of those reopens the replacement race. It is
-    // explicitly DROPPED before the `--autostash` save below, which takes the
-    // same non-reentrant lock.
-    let autostash_lock = if options.preserve_held_autostash {
-        None
-    } else {
-        Some(acquire_autostash_lock().map_err(PullMergeError::Autostash)?)
-    };
+    // §C.10 lock order: the snapshot is taken under the LOCAL autostash lock
+    // and the lock is RELEASED before `store_stash_commit` takes the
+    // repository-wide stash-stack lock — a repository lock never nests inside
+    // a local one. The cleanup afterwards is identity-checked, so a sidecar
+    // replaced in the unlocked window is preserved, never deleted.
     let held_snapshot = if options.preserve_held_autostash {
         None
     } else {
-        MergeAutostash::load_snapshot().map_err(PullMergeError::Autostash)?
+        snapshot_held_autostash().map_err(PullMergeError::Autostash)?
     };
     if let Some(snapshot) = held_snapshot {
         let sidecar = &snapshot.sidecar;
@@ -1411,7 +1442,19 @@ pub(crate) async fn run_merge_for_pull_with_options(
         if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
             match crate::command::stash::store_stash_commit(&oid, "autostash").await {
                 Ok(()) => {
-                    MergeAutostash::cleanup()?;
+                    match cleanup_autostash_if_matches(&snapshot) {
+                        Ok(true) => {}
+                        Ok(false) => crate::utils::error::emit_warning(
+                            "the autostash sidecar changed while it was being recovered; \
+                             the newer file was left in place",
+                        ),
+                        Err(error) => {
+                            return Err(PullMergeError::Autostash(format!(
+                                "the recovered autostash's sidecar could not be removed: \
+                                 {error}"
+                            )));
+                        }
+                    }
                     crate::utils::error::emit_warning(
                         "recovered a leftover autostash into the stash list (it may \
                          duplicate already-restored changes — inspect with 'libra stash show')",
@@ -1429,7 +1472,6 @@ pub(crate) async fn run_merge_for_pull_with_options(
             ));
         }
     }
-    drop(autostash_lock);
     let autostash_on = autostash_enabled(&options).await?;
     if autostash_on && Head::current_commit().await.is_some() {
         match crate::command::stash::create_held_stash_commit("autostash").await {
@@ -2194,16 +2236,16 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     Ok(())
 }
 
-/// Preflight for the merge control actions (W2 r5 #1): the held-autostash
-/// sidecar must be READABLE before HEAD/index/worktree are restored — an
-/// unreadable one surfaces AFTER the mutation otherwise, when `abort` has
-/// already deleted the merge state and the only stash reference is a file
-/// nothing can parse. The load result is discarded; the consumer re-reads
-/// under its own lock.
-fn preflight_held_autostash() -> Result<(), MergeError> {
-    MergeAutostash::load_optional_sync()
-        .map(|_| ())
-        .map_err(MergeError::StateLoad)
+/// Preflight for the merge control actions (W2 r5 #1, r6 #4): the
+/// held-autostash sidecar must be READABLE before HEAD/index/worktree are
+/// restored — an unreadable one would otherwise surface after `abort` had
+/// already deleted the merge state, leaving the only stash reference
+/// unparseable. The SNAPSHOT is returned and later CONSUMED, so the document
+/// the control preflighted is the one applied: a sidecar replaced between
+/// the preflight and the consumption is preserved by the identity-checked
+/// cleanup, never adopted or deleted.
+fn preflight_held_autostash() -> Result<Option<AutostashSnapshot>, MergeError> {
+    snapshot_held_autostash().map_err(MergeError::StateLoad)
 }
 
 async fn run_merge_continue(
@@ -2212,7 +2254,7 @@ async fn run_merge_continue(
     message_override: Option<String>,
 ) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
-    preflight_held_autostash()?;
+    let held_autostash = preflight_held_autostash()?;
     let state = MergeState::load_required()?;
     ensure_no_unstaged_changes_for_continue()?;
     let skip_hooks = state.skip_hooks || skip_hooks_for_continue;
@@ -2281,7 +2323,11 @@ async fn run_merge_continue(
     MergeState::cleanup()?;
     // Merge concluded: re-apply the held autostash onto the finalized tree
     // (clean → dropped; conflict → promoted to the stash list with a notice).
-    let autostash = resolve_pending_autostash(output).await;
+    // The control's pre-mutation snapshot is what is consumed (W2 r6 #4).
+    let autostash = match held_autostash {
+        Some(snapshot) => resolve_pending_autostash_with(output, snapshot).await,
+        None => None,
+    };
     if !skip_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
     }
@@ -2348,7 +2394,7 @@ async fn restore_pre_merge_state(
 /// unrelated-history permission is persisted and replayed below.
 async fn run_merge_restart(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
-    preflight_held_autostash()?;
+    let _held_autostash = preflight_held_autostash()?;
     let state = MergeState::load_required()?;
     // A `--no-commit` merge also persists MergeState — with no conflicts.
     // Restarting it would silently discard the staged result and re-run with
@@ -2413,13 +2459,18 @@ fn refuse_ambiguous_common_merge_state() -> Result<(), MergeError> {
 
 async fn run_merge_abort(output: &OutputConfig) -> Result<MergeOutput, MergeError> {
     refuse_ambiguous_common_merge_state()?;
-    preflight_held_autostash()?;
+    let held_autostash = preflight_held_autostash()?;
     let state = MergeState::load_required()?;
     let orig_head = restore_pre_merge_state(&state, "abort").await?;
     // The held autostash re-applies onto the restored pre-merge tree (clean
     // by construction — it was taken on that very tree; the conflict fallback
-    // still guards the path).
-    let autostash = resolve_pending_autostash(output).await;
+    // still guards the path). The SNAPSHOT taken before the restore is what
+    // is consumed (W2 r6 #4): a sidecar replaced in between is preserved by
+    // the identity-checked cleanup, never adopted by this control.
+    let autostash = match held_autostash {
+        Some(snapshot) => resolve_pending_autostash_with(output, snapshot).await,
+        None => None,
+    };
 
     Ok(PullMergeSummary {
         strategy: "abort".to_string(),
