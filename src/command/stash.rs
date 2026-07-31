@@ -1263,7 +1263,19 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
                 );
                 false
             }
-            Err(other) => return Err(other),
+            Err(other) => {
+                // The branch exists, HEAD moved, the apply landed — returning
+                // an error here would report failure for a command whose
+                // user-visible work all succeeded, with no rollback that
+                // could be non-destructive. The entry stays on the stack
+                // (nothing was published), which is the same safe state as a
+                // CAS miss; say so and succeed.
+                eprintln!(
+                    "warning: could not drop stash entry {stash_id_str} after the apply \
+                     ({other}); it remains on the stack — `libra stash drop` it explicitly"
+                );
+                false
+            }
         }
     };
 
@@ -1704,13 +1716,13 @@ fn publish_stash_stack(storage: &Path, entries: &[StashLogEntry]) -> Result<(), 
 /// not a rendezvous: it proves overlap only when the scheduler cooperates,
 /// and a test that needs the scheduler's cooperation to fail is not a test.
 #[cfg(debug_assertions)]
-fn hold_for_drop_rendezvous() {
+fn hold_for_drop_rendezvous() -> Result<(), StashError> {
     use std::time::{Duration, Instant};
     if std::env::var_os("LIBRA_TEST").is_none() {
-        return;
+        return Ok(());
     }
     let Some(dir) = std::env::var_os("LIBRA_TEST_STASH_DROP_BARRIER") else {
-        return;
+        return Ok(());
     };
     let dir = std::path::PathBuf::from(dir);
     let _ = fs::create_dir_all(&dir);
@@ -1720,35 +1732,33 @@ fn hold_for_drop_rendezvous() {
     while Instant::now() < deadline {
         let arrived = fs::read_dir(&dir).map(Iterator::count).unwrap_or(0);
         if arrived >= 2 {
-            return;
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A partner that never arrived means the race the test wanted did not
+    // happen. Proceeding would let a delayed partner resolve AFTER this drop
+    // publishes — two serialized winners, a flaky pass. Failing here turns a
+    // scheduler hiccup into an explicit error instead of a wrong verdict.
+    Err(StashError::StackLock(
+        "test rendezvous timed out waiting for the partner process".to_string(),
+    ))
 }
 
 #[cfg(not(debug_assertions))]
-fn hold_for_drop_rendezvous() {}
+fn hold_for_drop_rendezvous() -> Result<(), StashError> {
+    Ok(())
+}
 
 /// Unlink a file so the removal SURVIVES a power loss: the parent directory
 /// entry is fsynced, because an unlink that has not reached the disk leaves
 /// the file behind exactly as a lost write would.
 fn remove_durably(path: &Path) -> Result<(), StashError> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(StashError::WriteObject(format!(
-                "{}: {error}",
-                path.display()
-            )));
-        }
-    }
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    // Strict: a swallowed parent-fsync error would report a durable deletion
+    // that is not — a power loss could then restore the log after the ref
+    // deletion and resurrect a stash the user just cleared.
+    crate::utils::atomic_write::remove_durably(path)
+        .map_err(|error| StashError::WriteObject(format!("{}: {error}", path.display())))
 }
 
 /// Repair a tip left stale by a crash between the two writes of
@@ -1781,16 +1791,8 @@ fn reconcile_stash_ref(storage: &Path) -> Result<bool, StashError> {
         // ever find; `stash list` shows nothing while `refs/stash` claims a
         // tip, and a later push would chain onto a line that does not exist.
         if recorded_tip.is_some() {
-            match fs::remove_file(&ref_path) {
-                Ok(()) => return Ok(true),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(error) => {
-                    return Err(StashError::WriteObject(format!(
-                        "{}: {error}",
-                        ref_path.display()
-                    )));
-                }
-            }
+            remove_durably(&ref_path)?;
+            return Ok(true);
         }
         return Ok(false);
     }
@@ -1799,7 +1801,7 @@ fn reconcile_stash_ref(storage: &Path) -> Result<bool, StashError> {
     let Some(top) = entries.first() else {
         // An empty log file is an empty stack.
         if recorded_tip.is_some() {
-            let _ = fs::remove_file(&ref_path);
+            remove_durably(&ref_path)?;
             return Ok(true);
         }
         return Ok(false);
@@ -1874,7 +1876,7 @@ fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOu
     // the SAME resolved raw line — then race the lock, and exactly one CAS
     // may win. A hold inside the lock serializes the second process's
     // resolve behind the first's publication, which tests nothing.
-    hold_for_drop_rendezvous();
+    hold_for_drop_rendezvous()?;
     let _stack_lock = acquire_stash_stack_lock()?;
     let git_dir = util::request_storage_path();
     // §C.10 recovery: a tip left stale by a crash is repaired FIRST, under the
@@ -2090,7 +2092,13 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
         })?;
         let message = line
             .split_once('\t')
-            .map(|(_, message)| message.to_string())
+            .map(|(_, rest)| match rest.rsplit_once('\t') {
+                // The trailing `gen=` column is entry identity, not message.
+                Some((message, generation)) if generation.starts_with("gen=") => {
+                    message.to_string()
+                }
+                _ => rest.to_string(),
+            })
             .unwrap_or_default();
 
         entries.push(StashLogEntry {
@@ -2240,15 +2248,23 @@ fn update_stash_ref(
         ObjectHash::default()
     };
 
+    // A unique GENERATION as a third tab-separated column (§C.10). The raw
+    // line is every CAS's entry identity, and without this it is reusable: a
+    // drop-and-repush of the same commit onto the same parent within the same
+    // second reproduces the line byte for byte, and a delayed CAS then
+    // deletes the NEW entry (ABA). The generation makes every line minted
+    // distinct; readers that split on the first tab still see the message,
+    // and old lines without one keep working.
     let reflog_entry = format!(
-        "{} {} {} <{}> {} {}\t{}",
+        "{} {} {} <{}> {} {}\t{}\tgen={}",
         old_hash,
         stash_hash,
         committer.name,
         committer.email,
         committer.timestamp,
         committer.timezone,
-        message
+        message,
+        uuid::Uuid::now_v7().simple()
     );
 
     let mut lines = if stash_log_path.exists() {
@@ -2874,6 +2890,58 @@ mod tests {
         // ...while a plain drop still reports the ordinary empty-stash error.
         let err = do_drop(None, None).expect_err("plain drop on empty stack");
         assert!(matches!(err, StashError::NoStashFound), "{err:?}");
+    }
+
+    /// §C.10 ABA: a drop-and-repush that reproduces every VISIBLE field of a
+    /// reflog line must not satisfy a CAS taken against the original entry.
+    ///
+    /// The line's visible fields — parent OID, stash OID, identity,
+    /// second-resolution timestamp, message — are all reusable within one
+    /// second, which is exactly what "drop the held autostash, then
+    /// re-promote the same commit onto the same parent" produces. The minted
+    /// GENERATION column is what makes each line non-reusable: the delayed
+    /// CAS misses the reincarnation and the new entry survives.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reused_visible_line_does_not_satisfy_the_cas() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
+        crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
+        let storage = util::storage_path();
+        let hash = ObjectHash::from_str("00000000000000000000000000000000000000cc").expect("hash");
+        let committer = Signature::from_data(
+            "committer T <t@x> 1700000000 +0000"
+                .to_string()
+                .into_bytes(),
+        )
+        .expect("signature");
+
+        // The original entry, as a pop would resolve it.
+        let original =
+            update_stash_ref(&storage, &hash, &committer, "WIP").expect("push the original");
+
+        // Another actor drops it and re-pushes the SAME commit with the SAME
+        // identity, message and timestamp — every visible field reproduced.
+        do_drop(None, Some(&original)).expect("the other actor drops it");
+        let reincarnation =
+            update_stash_ref(&storage, &hash, &committer, "WIP").expect("repush the same commit");
+        assert_ne!(
+            original, reincarnation,
+            "the minted generation makes the reincarnated line distinct"
+        );
+
+        // The DELAYED pop's CAS, still holding the original line: it must
+        // MISS — dropping the reincarnation would delete an entry its owner
+        // intended to keep.
+        let err = do_drop(None, Some(&original)).expect_err("the stale CAS misses");
+        assert!(matches!(err, StashError::StackChanged), "{err:?}");
+        let entries = stack_entries().expect("stack entries");
+        assert_eq!(entries.len(), 1, "the reincarnated entry survives");
+        assert_eq!(entries[0].raw_line, reincarnation);
+        assert_eq!(
+            entries[0].message, "WIP",
+            "and the generation column never leaks into the message"
+        );
     }
 
     /// W2 §C.4.3: the raw line `update_stash_ref` RETURNS is byte-identical

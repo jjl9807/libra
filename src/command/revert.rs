@@ -738,8 +738,10 @@ fn refuse_ambiguous_common_state() -> Result<(), RevertError> {
     }
     // W2: a sidecar whose writer recorded main's scope is PROVEN main's and
     // stays operable; only an unmarked (old-binary) file keeps W1's guess.
-    if crate::internal::sequencer::sidecar_recorded_owner(&sidecar).as_deref() == Some("") {
-        return Ok(());
+    match crate::internal::sequencer::sidecar_recorded_owner(&sidecar) {
+        Ok(Some(owner)) if owner.is_empty() => return Ok(()),
+        Ok(_) => {}
+        Err(error) => return Err(RevertError::StateIo(error)),
     }
     Err(RevertError::StateIo(format!(
         "a revert state file exists at '{}' in COMMON storage, and this repository has \
@@ -893,10 +895,10 @@ impl RevertState {
 
     fn cleanup() -> Result<(), RevertError> {
         let path = Self::path();
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| RevertError::StateIo(e.to_string()))?;
-        }
-        Ok(())
+        // Durable (§C.10): a resurrected revert-state replays a revert the
+        // user already concluded.
+        crate::utils::atomic_write::remove_durably(&path)
+            .map_err(|e| RevertError::StateIo(format!("{}: {e}", path.display())))
     }
 }
 

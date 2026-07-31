@@ -3460,7 +3460,7 @@ fn diagnose_workspace(
 }
 
 /// `libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]`.
-async fn run_worktree_doctor(
+pub(crate) async fn run_worktree_doctor(
     workspace_id: Option<String>,
     limit: Option<u64>,
     cursor: Option<String>,
@@ -4109,6 +4109,9 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
             target.display()
         )));
     }
+    // …and the FILE-backed half of the same rule: merge/revert sidecars and a
+    // held autostash live in the target's gitdir, not in DB rows.
+    refuse_active_sidecar_state(&target.join(util::ROOT_DIR), "removing the worktree")?;
 
     if delete_dir {
         remove_worktree_delete_dir(
@@ -4477,6 +4480,10 @@ async fn migrate_layout_run(
                 .to_string(),
         ));
     }
+    // A legacy-symlink worktree SHARES common storage, so an active merge/
+    // revert or held autostash there belongs to some worktree that must
+    // conclude it before the layout underneath it changes.
+    refuse_active_sidecar_state(&util::storage_path(), "migrating the layout")?;
     let head_commit = Head::current_commit_result()
         .await
         .map_err(|e| WorktreeError::IoRead(format!("cannot read the shared HEAD: {e}")))?
@@ -4912,6 +4919,41 @@ fn fsync_parent_best_effort(target: &Path) {
     {
         let _ = dir.sync_all();
     }
+}
+
+/// Refuse to remove/migrate a worktree whose gitdir holds an ACTIVE
+/// merge/revert or a held autostash (§C.4.3).
+///
+/// The DB check beside this covers rebase/cherry-pick/bisect rows; these
+/// three are FILES in the target's own gitdir, and detaching writes the
+/// fail-closed marker OVER them — the operation would be stranded behind a
+/// gate the user cannot lift without `repair`. A sidecar that cannot be
+/// STATed is treated as present: unreadable is not evidence of absence.
+fn refuse_active_sidecar_state(gitdir: &Path, action: &str) -> WorktreeResult<()> {
+    for name in [
+        "merge-state.json",
+        "revert-state.json",
+        "merge-autostash.json",
+    ] {
+        let path = gitdir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(WorktreeError::OperationBlocked(format!(
+                    "'{}' holds in-progress state ({name}); finish or abort the \
+                     merge/revert there before {action}",
+                    gitdir.display()
+                )));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(WorktreeError::IoRead(format!(
+                    "cannot inspect '{}' before {action}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The in-worktree dirty check shared by `--delete-dir` (staged or real —

@@ -457,10 +457,9 @@ impl MergeState {
 
     fn cleanup() -> Result<(), PullMergeError> {
         let path = Self::path();
-        if !path.exists() {
-            return Ok(());
-        }
-        fs::remove_file(&path)
+        // Durable (§C.10): a resurrected merge-state replays a merge the user
+        // already concluded — same stakes as the stash log.
+        crate::utils::atomic_write::remove_durably(&path)
             .map_err(|error| PullMergeError::StateCleanup(format!("{}: {error}", path.display())))
     }
 }
@@ -511,14 +510,34 @@ impl MergeAutostash {
 
     fn save(&self) -> Result<(), PullMergeError> {
         let path = Self::path();
-        let data = serde_json::to_vec_pretty(self)
+        // Record the writer's scope (W2, ADR-0714-08) — like MergeState: the
+        // held autostash is promotable into the SHARED stash list, so an
+        // unowned common-storage file must stay refusable.
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| PullMergeError::Autostash(error.to_string()))?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "owner_scope".to_string(),
+                serde_json::Value::String(
+                    crate::internal::worktree_scope::WorktreeScope::for_request()
+                        .storage_key()
+                        .to_string(),
+                ),
+            );
+        }
+        let data = serde_json::to_vec_pretty(&value)
             .map_err(|error| PullMergeError::Autostash(error.to_string()))?;
         crate::utils::atomic_write::write_atomic(&path, &data, true)
             .map_err(|error| PullMergeError::Autostash(format!("{}: {error}", path.display())))
     }
 
-    fn cleanup() {
-        let _ = fs::remove_file(Self::path());
+    fn cleanup() -> Result<(), PullMergeError> {
+        let path = Self::path();
+        // Durable and SURFACED: a swallowed failure here leaves a sidecar
+        // that a later merge would re-promote — duplicating changes the user
+        // already restored.
+        crate::utils::atomic_write::remove_durably(&path)
+            .map_err(|error| PullMergeError::Autostash(format!("{}: {error}", path.display())))
     }
 }
 
@@ -1164,7 +1183,12 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
     };
     match crate::command::stash::apply_held_stash_commit(&oid).await {
         Ok(()) => {
-            MergeAutostash::cleanup();
+            if let Err(error) = MergeAutostash::cleanup() {
+                crate::utils::error::emit_warning(format!(
+                    "the applied autostash's sidecar could not be removed ({error}); a later \
+                     merge would re-promote it — remove it manually"
+                ));
+            }
             if !output.quiet {
                 eprintln!("Applied autostash.");
             }
@@ -1175,7 +1199,12 @@ async fn resolve_pending_autostash(output: &OutputConfig) -> Option<String> {
             // stash into the visible list so nothing is lost.
             match crate::command::stash::store_stash_commit(&oid, "autostash").await {
                 Ok(()) => {
-                    MergeAutostash::cleanup();
+                    if let Err(error) = MergeAutostash::cleanup() {
+                        crate::utils::error::emit_warning(format!(
+                            "the promoted autostash's sidecar could not be removed ({error}); \
+                             a later merge would re-promote it — remove it manually"
+                        ));
+                    }
                     if !output.quiet {
                         eprintln!(
                             "Applying autostash resulted in conflicts.\nYour changes are safe in the stash (stash@{{0}}).\nYou can run \"libra stash pop\" or \"libra stash drop\" at any time."
@@ -1241,10 +1270,30 @@ pub(crate) async fn run_merge_for_pull_with_options(
     if !options.preserve_held_autostash
         && let Ok(Some(sidecar)) = MergeAutostash::load_optional_sync()
     {
+        // ADR-0714-08: promoting adopts the file into the SHARED stash list
+        // and deletes the evidence — main may only do that to a file PROVEN
+        // its own. An unmarked file (old binary) in a repository with linked
+        // history could be a removed linked worktree's; fail closed.
+        let scope = crate::internal::worktree_scope::WorktreeScope::for_request();
+        if !scope.is_linked() && crate::command::maintenance::repository_had_linked_worktrees() {
+            let recorded = crate::internal::sequencer::sidecar_recorded_owner(
+                &util::request_worktree_gitdir_strict().join("merge-autostash.json"),
+            )
+            .map_err(PullMergeError::Autostash)?;
+            if recorded.as_deref() != Some("") {
+                return Err(PullMergeError::Autostash(format!(
+                    "a held-autostash sidecar exists in COMMON storage and cannot be \
+                     proven to be the main worktree's (recorded owner: {recorded:?}); \
+                     promoting it would adopt another worktree's stashed changes and \
+                     delete the evidence. Inspect it with `libra stash show` against \
+                     the recorded commit, then remove it manually if it is stale"
+                )));
+            }
+        }
         if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
             match crate::command::stash::store_stash_commit(&oid, "autostash").await {
                 Ok(()) => {
-                    MergeAutostash::cleanup();
+                    MergeAutostash::cleanup()?;
                     crate::utils::error::emit_warning(
                         "recovered a leftover autostash into the stash list (it may \
                          duplicate already-restored changes — inspect with 'libra stash show')",
@@ -2214,8 +2263,10 @@ fn refuse_ambiguous_common_merge_state() -> Result<(), MergeError> {
     }
     // W2: a sidecar whose writer recorded main's scope is PROVEN main's and
     // stays operable; only an unmarked (old-binary) file keeps W1's guess.
-    if crate::internal::sequencer::sidecar_recorded_owner(&sidecar).as_deref() == Some("") {
-        return Ok(());
+    match crate::internal::sequencer::sidecar_recorded_owner(&sidecar) {
+        Ok(Some(owner)) if owner.is_empty() => return Ok(()),
+        Ok(_) => {}
+        Err(error) => return Err(MergeError::StateLoad(error)),
     }
     Err(MergeError::StateLoad(format!(
         "a merge state file exists at '{}' in COMMON storage, and this repository has \

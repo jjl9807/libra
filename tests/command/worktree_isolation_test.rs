@@ -451,6 +451,74 @@ fn a_corrupt_sidecar_root_fails_the_prune_closed() {
     );
 }
 
+/// §C.4.3: `worktree remove` refuses a worktree holding a conflicted merge —
+/// in BOTH modes. Detaching writes the fail-closed marker OVER the live
+/// sidecar (stranding the merge behind a gate the user cannot lift without
+/// `repair`); deleting destroys it outright.
+#[test]
+fn worktree_remove_refuses_an_in_progress_merge() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("mid-merge-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Diverge and start a conflicted merge in the linked worktree.
+    assert_cli_success(
+        &run_libra_command(&["branch", "sideline"], main),
+        "branch sideline",
+    );
+    fs::write(main.join("a.txt"), "main-side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-side", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "sideline"], &wt), "switch");
+    fs::write(wt.join("a.txt"), "wt-side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "wt-side", "--no-verify"], &wt),
+        "wt commit",
+    );
+    let merged = run_libra_command(&["merge", "main"], &wt);
+    assert!(!merged.status.success(), "the merge must conflict");
+
+    for args in [
+        vec!["worktree", "remove", wt.to_str().unwrap()],
+        vec!["worktree", "remove", "--delete-dir", wt.to_str().unwrap()],
+    ] {
+        let out = run_libra_command(&args, main);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "remove must refuse a worktree mid-merge ({args:?}): {text}"
+        );
+        assert!(
+            text.contains("merge-state.json"),
+            "and the refusal names the in-progress state: {text}"
+        );
+    }
+    assert!(
+        wt.join(".libra/merge-state.json").exists(),
+        "the merge state survives both refusals"
+    );
+
+    // Aborting the merge lifts the refusal.
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], &wt), "abort");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "remove succeeds once the merge is gone",
+    );
+}
+
 /// §C.11 W2 acceptance: a conflicted MERGE in one worktree and a conflicted
 /// REVERT in another, at the same time, with neither seeing the other's.
 ///
@@ -6210,6 +6278,54 @@ fn legacy_symlink_mutation_fails_closed() {
     assert!(
         String::from_utf8_lossy(&porcelain.stdout).contains("layout legacy-symlink"),
         "porcelain layout line present"
+    );
+}
+
+/// §C.4.3: `repair --migrate-layout` refuses while the SHARED storage holds
+/// an active merge/revert or held autostash — a legacy-symlink worktree
+/// shares that storage, so some worktree owns the operation and must
+/// conclude it before the layout underneath it changes.
+#[cfg(unix)]
+#[test]
+fn migrate_layout_refuses_active_shared_sidecar_state() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let _wt = create_legacy_symlink_worktree(main, "wt-blocked-migrate");
+
+    // An active merge in shared storage (owner unknowable in legacy layout).
+    fs::write(
+        main.join(".libra").join("merge-state.json"),
+        "{\"head_name\":\"main\"}",
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "migration must refuse over an active shared merge: {text}"
+    );
+    assert!(
+        text.contains("merge-state.json"),
+        "and the refusal names the state: {text}"
+    );
+    assert!(
+        fs::symlink_metadata(_wt.join(".libra"))
+            .expect("gitdir meta")
+            .file_type()
+            .is_symlink(),
+        "the refusal wrote nothing — the legacy symlink is untouched"
+    );
+
+    // Clearing the state lifts the refusal.
+    fs::remove_file(main.join(".libra").join("merge-state.json")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        "migration succeeds once the state is gone",
     );
 }
 
