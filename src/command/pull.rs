@@ -1027,6 +1027,12 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         | merge::PullMergeError::WorkdirReset(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        // Mirrors `CommitError::IdentityMissing`: the merge commit `pull` creates
+        // needs the same identity as any other commit, and fails the same way.
+        merge::PullMergeError::IdentityMissing(..) => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::AuthMissingCredentials)
+            .with_hint("run 'libra config --global user.name \"Your Name\"' and 'libra config --global user.email \"you@example.com\"'")
+            .with_hint("omit '--global' to set the identity only in this repository."),
         merge::PullMergeError::HeadResolve(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }

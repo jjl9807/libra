@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed (`merge`: merge commits recorded a hardcoded identity)
+
+- **Merge commits now carry the configured `user.name` / `user.email`.** Every
+  merge-commit path — the plain three-way merge, `--no-ff` / `-s ours`, and
+  `merge --continue` — built its commit through `Commit::from_tree_id`, which
+  hardcodes `mega <admin@mega.org>` as both author and committer. The
+  repository identity (and the `GIT_AUTHOR_*` / `GIT_COMMITTER_*` date
+  overrides) was silently discarded, so merge commits were misattributed while
+  every other commit was correct. Merge now resolves its identity through the
+  same path as `libra commit`, and reports the same actionable error
+  (`LBR-AUTH-…`, with the `libra config user.name/user.email` hint) when no
+  identity is configured.
+
+### Added (`merge --continue -m <msg>`)
+
+- **`libra merge --continue` accepts `-m`/`--message`** (a Libra extension —
+  `git merge --continue` takes no arguments). Libra finalizes a continued merge
+  without opening an editor, so the message recorded when the conflicted merge
+  started was previously unreachable; `-m` now overrides it. Without `-m` the
+  stored message is replayed exactly as before.
+
 ### Added (plan-20260714 W4: `worktree doctor` — read-only scope diagnosis)
 
 - **`libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]`** reports

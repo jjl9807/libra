@@ -6,7 +6,7 @@
 
 ```text
 libra merge [--ff | --ff-only | --no-ff] [-s ours | -X <ours|theirs>] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg>] [--no-verify] [--autostash | --no-autostash] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
-libra merge --continue
+libra merge --continue [-m <msg>] [--no-verify]
 libra merge --abort
 libra merge --restart
 ```
@@ -46,7 +46,7 @@ Libra 仍未实现 octopus merge、`ours` 以外的 merge strategy、`ours`/`the
 | 选项 | 说明 |
 |--------|-------------|
 | `<branch>` | 要合并的目标分支、提交或远程跟踪引用。 |
-| `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。 |
+| `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。也可与 `--continue` 同用，覆盖冲突合并开始时记录的消息——这是 Libra 扩展：Git 的 `--continue` 不接受参数，而 Libra 的 merge 从不打开编辑器。 |
 | `--ff` | 允许可行的快进，覆盖 `merge.ff=false|only`。 |
 | `--ff-only` | 仅当当前分支可快进时才合并，否则失败。 |
 | `--no-ff` | 即使可以快进也强制生成双父合并提交。 |
@@ -97,6 +97,7 @@ libra merge --allow-unrelated-histories imported-root
 libra merge --log=10 feature-x
 libra merge refs/remotes/origin/main
 libra merge --continue
+libra merge --continue -m "merge: reconcile release notes"
 libra merge --abort
 libra merge --dry-run feature-x
 libra merge --restart
