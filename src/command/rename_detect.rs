@@ -107,6 +107,11 @@ impl BlobEvidence {
     /// neither side is anchored in the object store, so the pair must go
     /// through the ordinary inexact path instead of being asserted exact
     /// (fail closed). `Unknown` never pairs exactly at all.
+    /// §B.4.1 exact 合法组合硬门禁：任一侧 Unknown 拒绝；C/C 拒绝（须至少
+    /// 一侧 known）。匹配引擎的热路径把该判定折叠进 known/computed 分桶
+    /// （桶内无 Unknown），本表保留为规范事实源：debug 构建对每条产出边
+    /// 交叉断言，单测直接钉住组合表。
+    #[cfg(any(test, debug_assertions))]
     fn exact_pair_allowed(old: &Self, new: &Self) -> bool {
         match (old, new) {
             (BlobEvidence::Unknown, _) | (_, BlobEvidence::Unknown) => false,
@@ -258,14 +263,53 @@ pub fn match_pairs(
 
     // ---- Stage 1: exact (bucket by oid + kind [+ gitlink mode]) ----------
     type BucketKey = (ObjectHash, BlobKind, Option<u32>);
-    let mut buckets: HashMap<BucketKey, BTreeSet<&PathBuf>> = HashMap::new();
+    // Destinations of one exact bucket, split by evidence kind. Inside a
+    // bucket every entry shares the same oid/kind[/mode] and neither side
+    // can be Unknown (Unknown has no OID and never enters a bucket), so
+    // `BlobEvidence::exact_pair_allowed` reduces to `old_known || new_known`
+    // and each pick is two BTreeSet head lookups instead of a scan.
+    #[derive(Default)]
+    struct ExactBucket {
+        known: BTreeSet<PathBuf>,
+        computed: BTreeSet<PathBuf>,
+    }
+    impl ExactBucket {
+        /// Smallest path (byte order) the old side may pair with, removed
+        /// from the bucket. A known old evidence pairs with any destination;
+        /// a computed one pairs only with a known destination — C/C exact is
+        /// forbidden (§B.4.1).
+        fn pop_first_allowed(&mut self, old_known: bool) -> Option<PathBuf> {
+            let picked = if old_known {
+                match (self.known.iter().next(), self.computed.iter().next()) {
+                    (Some(k), Some(c)) => {
+                        if k <= c {
+                            Some(k.clone())
+                        } else {
+                            Some(c.clone())
+                        }
+                    }
+                    (Some(k), None) => Some(k.clone()),
+                    (None, Some(c)) => Some(c.clone()),
+                    (None, None) => None,
+                }
+            } else {
+                self.known.iter().next().cloned()
+            }?;
+            self.known.remove(&picked);
+            self.computed.remove(&picked);
+            Some(picked)
+        }
+    }
+    let mut buckets: HashMap<BucketKey, ExactBucket> = HashMap::new();
     for (path, blob) in &remaining_new {
         if let Some(oid) = blob.evidence.oid() {
             let mode_key = (blob.kind == BlobKind::Gitlink).then_some(blob.mode);
-            buckets
-                .entry((*oid, blob.kind, mode_key))
-                .or_default()
-                .insert(path);
+            let bucket = buckets.entry((*oid, blob.kind, mode_key)).or_default();
+            if blob.evidence.is_known() {
+                bucket.known.insert((*path).clone());
+            } else {
+                bucket.computed.insert((*path).clone());
+            }
         }
     }
 
@@ -291,28 +335,30 @@ pub fn match_pairs(
     let mut consumed_old: BTreeSet<PathBuf> = BTreeSet::new();
     let mut consumed_new: BTreeSet<PathBuf> = BTreeSet::new();
     // (bucket, basename) → destinations, so the same-basename pass is a map
-    // lookup instead of a linear scan of the whole OID bucket.
-    let mut by_basename: HashMap<(BucketKey, Option<OsString>), Vec<PathBuf>> = HashMap::new();
-    for (key, paths) in &buckets {
-        for path in paths {
-            by_basename
-                .entry((*key, path.file_name().map(|name| name.to_os_string())))
-                .or_default()
-                .push((*path).clone());
+    // lookup instead of a linear scan of the whole OID bucket. Entries are
+    // REMOVED as they are consumed (same rule for the path-order level):
+    // leaving consumed destinations in place makes every later source
+    // rescan them, and N same-OID paths sharing one basename degenerate to
+    // Θ(N²) before `rename_limit` has had any say. With consumption every
+    // destination is examined O(1) times per stage and the whole selection
+    // stays O(N log N).
+    let mut by_basename: HashMap<(BucketKey, Option<OsString>), ExactBucket> = HashMap::new();
+    for (key, bucket) in &buckets {
+        for (is_known, paths) in [(true, &bucket.known), (false, &bucket.computed)] {
+            for path in paths {
+                let entry = by_basename
+                    .entry((*key, path.file_name().map(|name| name.to_os_string())))
+                    .or_default();
+                if is_known {
+                    entry.known.insert(path.clone());
+                } else {
+                    entry.computed.insert(path.clone());
+                }
+            }
         }
     }
-    let allowed_dest = |old_blob: &BlobRef, new_path: &PathBuf| -> bool {
-        remaining_new.get(new_path).is_some_and(|new_blob| {
-            BlobEvidence::exact_pair_allowed(&old_blob.evidence, &new_blob.evidence)
-        })
-    };
     // `remaining_old` is a BTreeMap, so both passes walk sources in path
     // byte order without an extra sort.
-    // Sources are visited in path order (BTreeMap), and each consumed
-    // destination is REMOVED from its bucket immediately. Without that
-    // removal, N delete/add pairs sharing one blob id make every source
-    // rescan the whole bucket — O(N²) work before `rename_limit` has had any
-    // say. With it, each destination is examined a bounded number of times.
     let old_keys: Vec<PathBuf> = remaining_old.keys().map(|p| (*p).clone()).collect();
     for same_basename_pass in [true, false] {
         for old_path in &old_keys {
@@ -327,39 +373,42 @@ pub fn match_pairs(
             };
             let mode_key = (old_blob.kind == BlobKind::Gitlink).then_some(old_blob.mode);
             let bucket_key = (*oid, old_blob.kind, mode_key);
-            let Some(candidates) = buckets.get(&bucket_key) else {
-                continue;
-            };
+            let old_known = old_blob.evidence.is_known();
             let picked = if same_basename_pass {
                 // Basename LOOKUP, not a bucket scan: with N same-OID files
                 // whose basenames all differ, scanning each bucket per
                 // source is O(N²) — and it happens before `rename_limit` can
                 // gate anything.
                 by_basename
-                    .get(&(bucket_key, old_path.file_name().map(|n| n.to_os_string())))
-                    .and_then(|paths| {
-                        paths
-                            .iter()
-                            .find(|new_path| {
-                                candidates.contains(new_path) && allowed_dest(old_blob, new_path)
-                            })
-                            .cloned()
-                    })
+                    .get_mut(&(bucket_key, old_path.file_name().map(|n| n.to_os_string())))
+                    .and_then(|bucket| bucket.pop_first_allowed(old_known))
             } else {
-                candidates
-                    .iter()
-                    .find(|new_path| allowed_dest(old_blob, new_path))
-                    .map(|found| (*found).clone())
+                buckets
+                    .get_mut(&bucket_key)
+                    .and_then(|bucket| bucket.pop_first_allowed(old_known))
             };
             if let Some(new_path) = picked {
-                if let Some(bucket) = buckets.get_mut(&bucket_key) {
-                    bucket.remove(&new_path);
+                #[cfg(debug_assertions)]
+                {
+                    // The split-bucket pick must agree with the legality
+                    // table on every emitted pair.
+                    let new_blob = remaining_new.get(&new_path);
+                    debug_assert!(new_blob.is_some_and(|b| {
+                        BlobEvidence::exact_pair_allowed(&old_blob.evidence, &b.evidence)
+                    }));
+                }
+                if same_basename_pass {
+                    // Keep the path-order level in sync for pass B.
+                    if let Some(bucket) = buckets.get_mut(&bucket_key) {
+                        bucket.known.remove(&new_path);
+                        bucket.computed.remove(&new_path);
+                    }
                 }
                 consumed_old.insert(old_path.clone());
                 consumed_new.insert(new_path.clone());
                 matches.push(RenameMatch {
                     old: old_path.clone(),
-                    new: new_path.clone(),
+                    new: new_path,
                     exact: true,
                     internal_score: EXACT_SCORE,
                 });
@@ -1259,6 +1308,44 @@ mod tests {
         assert!(outcome.matches[0].exact);
         assert_eq!(outcome.matches[0].internal_score, EXACT_SCORE);
         assert_eq!(source.reads, 0, "exact pairing must not read content");
+    }
+
+    #[test]
+    fn exact_same_basename_duplicate_blob_selection_is_linear() {
+        // N delete/add pairs sharing one blob id AND one basename: the
+        // same-basename pass must consume each destination as it is picked.
+        // Leaving consumed entries in place makes every later source rescan
+        // them — Θ(N²) before `rename_limit` (implementation-round Codex
+        // finding). With consumption the stage is O(N log N); the generous
+        // deadline below can only fail on a quadratic regression, never on
+        // machine speed.
+        let n = 20_000;
+        let blob = regular(known(b"duplicate payload\n"), 18);
+        let snap = RenameSnapshot {
+            old_map: (0..n)
+                .map(|i| (PathBuf::from(format!("old/{i:06}/same.txt")), blob.clone()))
+                .collect(),
+            new_map: (0..n)
+                .map(|i| (PathBuf::from(format!("new/{i:06}/same.txt")), blob.clone()))
+                .collect(),
+        };
+        let mut source = MapSource::new();
+        let started = std::time::Instant::now();
+        let outcome = match_pairs(&snap, &config(30000), &mut source);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.matches.len(), n);
+        assert!(
+            outcome
+                .matches
+                .iter()
+                .all(|m| m.exact && m.internal_score == EXACT_SCORE),
+            "every duplicate pair must match exactly"
+        );
+        assert_eq!(source.reads, 0, "known-OID exact must not read content");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "exact selection regressed to quadratic: {elapsed:?} for {n} pairs"
+        );
     }
 
     #[test]

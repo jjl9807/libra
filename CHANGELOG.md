@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 implementation review)
+
+- **Exact rename selection is linear again for duplicate blobs.** Consumed
+  destinations were removed from the OID bucket but not from the
+  same-basename index, so N delete/add pairs sharing one blob id and one
+  basename made every later source rescan them — Θ(N²) work before
+  `renameLimit` could gate anything. Both levels now consume on pick and
+  split destinations by evidence kind, keeping the stage O(N log N).
+- **The `rename_limit_product_skipped` warning now matches the documented
+  degrade contract.** It previously claimed "inexact matching" was skipped;
+  in reality exact and scored unique-basename pairs survive and only the
+  exhaustive stage is skipped, which is what the docs and the `diff` side
+  already said. The status text now states the survivor semantics.
+- **The untracked-rename pass accounts its budgets like every other pass.**
+  `detect_renames_with_destinations` drew down the call-level worktree and
+  object budgets but never restored them or recorded its comparisons, so a
+  detection pass added after it would have restarted with fresh budgets.
+
 ### Fixed (`rebase`: replayed commits recorded a hardcoded identity)
 
 - **Replayed commits now keep the original author and record the running user

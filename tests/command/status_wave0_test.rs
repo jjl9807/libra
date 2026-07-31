@@ -894,6 +894,19 @@ fn rename_limit_warning_exit_nine_over_dirty() {
         stderr.contains("warning:") && stderr.contains("renameLimit"),
         "text stderr carries the structured warning: {stderr}"
     );
+    // The FULL message is the public degrade contract (R0-1): only the
+    // exhaustive inexact stage is skipped — exact and scored unique-basename
+    // pairs survive — never "inexact matching" as a whole.
+    assert!(
+        stderr.contains(
+            "rename detection skipped the exhaustive inexact pass: too many candidates on one side (renameLimit); exact and unique-basename matches were kept"
+        ),
+        "text warning pins the complete survivor semantics: {stderr}"
+    );
+    assert!(
+        !stderr.contains("skipped inexact matching"),
+        "must not claim the whole inexact match was skipped: {stderr}"
+    );
 
     // JSON mode: warnings ride in data.warnings[], stderr stays clean, and
     // the same silent exit 9 wins.
@@ -914,6 +927,16 @@ fn rename_limit_warning_exit_nine_over_dirty() {
             .iter()
             .any(|w| w["code"] == "rename_limit_product_skipped"),
         "json data.warnings carries the code: {doc}"
+    );
+    let limit_warning = warnings
+        .iter()
+        .find(|w| w["code"] == "rename_limit_product_skipped")
+        .expect("rename_limit_product_skipped warning");
+    let limit_message = limit_warning["message"].as_str().expect("message str");
+    assert_eq!(
+        limit_message,
+        "rename detection skipped the exhaustive inexact pass: too many candidates on one side (renameLimit); exact and unique-basename matches were kept",
+        "json warning message pins the complete survivor semantics"
     );
     assert!(
         json.stderr.is_empty(),
