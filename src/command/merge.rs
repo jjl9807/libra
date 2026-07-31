@@ -341,6 +341,24 @@ pub(crate) struct PullMergeOptions {
     pub preserve_held_autostash: bool,
 }
 
+/// This worktree's merge sidecar, for the §C.5 pseudo-ref projection
+/// (`MERGE_HEAD` = `target`, `ORIG_HEAD` = `orig_head`). Read-only, and it
+/// resolves through the same request-bound path as every other consumer, so
+/// the projection can never answer from a different worktree's sidecar.
+pub(crate) fn merge_state_for_pseudo_refs(
+    gitdir: &std::path::Path,
+) -> Result<Option<MergeState>, String> {
+    let path = gitdir.join("merge-state.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct MergeState {
     pub head_name: String,

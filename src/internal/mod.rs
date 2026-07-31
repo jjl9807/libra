@@ -42,6 +42,7 @@ pub mod operation;
 pub mod operation_wrapper;
 pub mod pack_writer;
 pub mod protocol;
+pub mod pseudo_ref;
 pub mod publish;
 pub mod reflog;
 pub mod repo_hooks;

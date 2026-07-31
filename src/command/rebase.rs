@@ -403,7 +403,25 @@ impl RebaseState {
         Ok(row.is_some())
     }
 
+    /// The row of an EXPLICITLY resolved scope (§C.4.2), for the pseudo-ref
+    /// projections. Reads only the database — a legacy common directory is
+    /// deliberately not adopted here, because §C.4.3 forbids attributing it to
+    /// a scope that cannot be proven to own it.
+    pub(crate) async fn load_for_scope(
+        scope: &crate::internal::worktree_scope::WorktreeScope,
+    ) -> Result<Option<Self>, String> {
+        let db = crate::internal::sequencer::request_db_checked().await?;
+        Self::load_from_db_in_scope(&db, scope.storage_key()).await
+    }
+
     async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {
+        Self::load_from_db_in_scope(db, &Self::scope_key()).await
+    }
+
+    async fn load_from_db_in_scope<C: ConnectionTrait>(
+        db: &C,
+        scope_key: &str,
+    ) -> Result<Option<Self>, String> {
         let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             r#"
@@ -412,7 +430,7 @@ impl RebaseState {
                 WHERE worktree_id = ?
                 LIMIT 1
             "#,
-            [Self::scope_key().into()],
+            [scope_key.into()],
         );
         let row = db
             .query_one(stmt)
@@ -5115,6 +5133,28 @@ fn build_tree_recursively(
     let tree = Tree::from_tree_items(current_items).map_err(|e| e.to_string())?;
     save_object(&tree, &tree.id).map_err(|e| e.to_string())?;
     Ok(tree.id)
+}
+
+/// `ORIG_HEAD` for an explicitly resolved scope — the pseudo-ref projection
+/// (§C.5). `None` when that worktree has no rebase in progress; an unreadable
+/// row is an ERROR, never "nothing in progress".
+pub(crate) async fn orig_head_for_scope(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<String>, String> {
+    Ok(RebaseState::load_for_scope(scope)
+        .await?
+        .map(|state| state.orig_head.to_string()))
+}
+
+/// `REBASE_HEAD` for an explicitly resolved scope: the commit a STOPPED rebase
+/// is sitting on. A rebase in progress that has not stopped defines no
+/// `REBASE_HEAD`, which is why the column is nullable.
+pub(crate) async fn stopped_sha_for_scope(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<String>, String> {
+    Ok(RebaseState::load_for_scope(scope)
+        .await?
+        .and_then(|state| state.stopped_sha.map(|sha| sha.to_string())))
 }
 
 /// Reset the working directory to match the new index state without overwriting untracked files.

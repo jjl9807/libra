@@ -215,6 +215,29 @@ pub async fn load() -> Result<Option<SequenceState>, String> {
     }))
 }
 
+/// [`load`] for an ALREADY-RESOLVED scope (§C.4.2).
+///
+/// The pseudo-ref service (§C.5) projects `CHERRY_PICK_HEAD`/`REVERT_HEAD`
+/// from this row and must answer for the scope its CALLER resolved, not for
+/// whichever worktree the process cwd currently names.
+pub async fn load_for_scope(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<Option<SequenceState>, String> {
+    let Some(stored) = load_stored_in_scope(scope.storage_key()).await? else {
+        return Ok(None);
+    };
+    let kind = SequenceKind::from_token(&stored.kind)
+        .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))?;
+    Ok(Some(SequenceState {
+        kind,
+        head_name: stored.head_name,
+        head_orig: stored.head_orig,
+        current_oid: stored.current_oid,
+        todo: stored.todo,
+        payload: stored.payload,
+    }))
+}
+
 pub(crate) async fn load_am() -> Result<Option<AmSequenceState>, String> {
     let Some(stored) = load_stored().await? else {
         return Ok(None);

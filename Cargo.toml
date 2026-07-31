@@ -283,6 +283,10 @@ name = "compat_command_docs_examples_section"
 path = "tests/compat/command_docs_examples_section.rs"
 
 [[test]]
+name = "compat_pseudo_ref_surface"
+path = "tests/compat/pseudo_ref_surface.rs"
+
+[[test]]
 name = "compat_help_flag_descriptions"
 path = "tests/compat/help_flag_descriptions.rs"
 

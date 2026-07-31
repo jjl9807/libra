@@ -797,6 +797,23 @@ const CONFLICT_MARKER: &str = "<<<<<<<";
 /// Persisted state for an in-progress conflicted revert (`.libra/revert-state.json`),
 /// mirroring merge's file-based state so `revert --continue`/`--abort` can finish
 /// or unwind the revert.
+/// This worktree's revert sidecar, for the §C.5 pseudo-ref projection:
+/// `(ORIG_HEAD, REVERT_HEAD)`. Read-only; the tuple keeps `RevertState`
+/// private, since the projection needs exactly these two fields.
+pub(crate) fn revert_state_for_pseudo_refs(
+    gitdir: &std::path::Path,
+) -> Result<Option<(String, String)>, String> {
+    let path = gitdir.join("revert-state.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let state: RevertState = serde_json::from_str(&data)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    Ok(Some((state.orig_head, state.reverted_commit)))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RevertState {
     /// HEAD at the time the revert started — the `--abort` reset target and the

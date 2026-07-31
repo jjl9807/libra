@@ -1458,6 +1458,42 @@ pub(crate) fn registry_knows_linked_worktree(worktree_id: &str) -> Option<bool> 
     )
 }
 
+/// The LOCAL gitdir of an explicitly named scope (§C.5 pseudo-ref projection).
+///
+/// The pseudo-ref service is handed a scope and must read THAT worktree's
+/// sidecars — the request pin answers for the worktree the user invoked from,
+/// which is a different question whenever the two differ. Main resolves to the
+/// common storage; a linked scope is looked up by its stable id in the
+/// registry, so a scope naming a worktree this repository does not know is an
+/// error rather than a silent fallback to main's files.
+pub(crate) fn local_gitdir_for_scope(
+    scope: &crate::internal::worktree_scope::WorktreeScope,
+) -> Result<std::path::PathBuf, String> {
+    use crate::internal::worktree_scope::WorktreeScope;
+    let id = match scope {
+        WorktreeScope::Main => {
+            return util::try_get_storage_path(None)
+                .map_err(|error| format!("cannot resolve the repository storage: {error}"));
+        }
+        WorktreeScope::Linked(id) => id.as_str(),
+    };
+    let state = load_state_readonly()
+        .map_err(|error| format!("cannot read the worktree registry: {error}"))?;
+    let entry = state
+        .entries
+        .iter()
+        .find(|entry| entry.worktree_id.as_deref() == Some(id))
+        .ok_or_else(|| format!("no worktree with id '{id}' is registered in this repository"))?;
+    let gitdir = std::path::Path::new(&entry.path).join(util::ROOT_DIR);
+    if !gitdir.exists() {
+        return Err(format!(
+            "worktree '{id}' is registered at '{}', but its gitdir is missing",
+            entry.path
+        ));
+    }
+    Ok(gitdir)
+}
+
 fn load_state_readonly() -> WorktreeResult<WorktreeState> {
     let path = state_path();
     if !path.exists() {
