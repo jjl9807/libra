@@ -1320,6 +1320,10 @@ fn map_bisect_branch_store_error(branch_name: &str, error: BranchStoreError) -> 
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
         .with_hint("repair branch storage or reset to an explicit revision with 'libra bisect reset <rev>'."),
+        BranchStoreError::AlreadyExists(name) => CliError::fatal(format!(
+            "branch '{name}' already exists"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget),
         BranchStoreError::Corrupt { .. } => CliError::fatal(format!(
             "failed to restore original branch '{branch_name}': {error}"
         ))

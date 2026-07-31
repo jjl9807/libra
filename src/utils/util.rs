@@ -1219,6 +1219,7 @@ impl CommitBaseError {
             BranchStoreError::Query(_) | BranchStoreError::Delete { .. } => {
                 Self::ReadFailure(message)
             }
+            BranchStoreError::AlreadyExists(_) => Self::InvalidReference(message),
             BranchStoreError::Corrupt { .. } => Self::CorruptReference(message),
             BranchStoreError::NotFound(_) => Self::InvalidReference(message),
             // §C.4.4's checkout-collision refusal is raised only by the WRITE

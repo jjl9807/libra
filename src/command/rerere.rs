@@ -162,7 +162,7 @@ pub(crate) async fn auto_update(auto_update: bool) -> CliResult<()> {
 /// tracked conflict that has since been resolved, record its postimage. When
 /// `stage_replayed` is set, a file resolved by replay is also staged.
 async fn apply(scope: &WorktreeScope, rr_dir: &Path, stage_replayed: bool) -> CliResult<()> {
-    let workdir = util::working_dir();
+    let workdir = util::request_working_dir();
     let index = load_index()?;
     let mut merge_rr = read_merge_rr(scope, rr_dir)?;
 
@@ -288,7 +288,7 @@ fn status(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
 }
 
 fn diff(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
-    let workdir = util::working_dir();
+    let workdir = util::request_working_dir();
     for (path, id) in read_merge_rr(scope, rr_dir)? {
         let Ok(preimage) = fs::read_to_string(entry_path(rr_dir, &id, "preimage")) else {
             continue;

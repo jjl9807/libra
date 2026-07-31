@@ -593,7 +593,7 @@ async fn compose_note_via_editor(initial: &str, object: &str) -> CliResult<Strin
     // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
     // two worktrees composing a message concurrently would truncate each other's
     // buffer. Identical path for the main worktree (local == common storage).
-    let path = crate::utils::util::worktree_gitdir().join("NOTES_EDITMSG");
+    let path = crate::utils::util::request_worktree_gitdir_strict().join("NOTES_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, initial, &editor_cmd, true)
         .await
         .map_err(|e| {

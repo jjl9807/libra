@@ -963,6 +963,10 @@ fn map_head_resolution_error(error: BranchStoreError) -> CliError {
 
 fn map_symbolic_ref_resolution_error(spec: &str, error: BranchStoreError) -> CliError {
     match error {
+        BranchStoreError::AlreadyExists(name) => {
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
         BranchStoreError::Corrupt { detail, .. } => {
             CliError::fatal(format!("failed to resolve symbolic ref '{spec}': {detail}"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)

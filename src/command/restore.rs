@@ -970,7 +970,7 @@ async fn resolve_source_commit_io(
 
 fn map_restore_branch_store_error(error: BranchStoreError) -> RestoreError {
     match error {
-        BranchStoreError::Query(_) => RestoreError::ReadObject,
+        BranchStoreError::Query(_) | BranchStoreError::AlreadyExists(_) => RestoreError::ReadObject,
         BranchStoreError::Corrupt { .. } => RestoreError::ReadObject,
         BranchStoreError::NotFound(_) => RestoreError::ResolveSource,
         BranchStoreError::Delete { .. } => RestoreError::ReadObject,

@@ -122,6 +122,11 @@ pub enum BranchStoreError {
     /// Lookup or delete targeted a branch that does not exist.
     #[error("branch '{0}' not found")]
     NotFound(String),
+    /// An EXCLUSIVE create found the name already taken. Distinct from a
+    /// generic write failure because the caller's contract differs: `stash
+    /// branch` must refuse rather than move someone else's tip.
+    #[error("branch '{0}' already exists")]
+    AlreadyExists(String),
     /// Delete failed at the storage layer (FK violation, locked).
     #[error("failed to delete branch '{name}': {detail}")]
     Delete { name: String, detail: String },
@@ -604,6 +609,56 @@ impl Branch {
             }
         }
         unreachable!("sqlite retry loop must return")
+    }
+
+    /// Create a branch that must NOT already exist (W2 §C.4.3).
+    ///
+    /// [`Branch::update_branch`] is an UPSERT: it moves an existing tip. A
+    /// caller like `stash branch`, whose contract is "create this branch or
+    /// refuse", cannot use it — checking existence first leaves a window in
+    /// which another worktree creates the name and this call silently
+    /// overwrites its tip. The existence check and the insert therefore run in
+    /// ONE write-locked transaction, so a concurrent creator either loses the
+    /// lock (and this call refuses it) or wins it (and this call refuses).
+    pub async fn create_branch_exclusive(
+        branch_name: &str,
+        commit_hash: &str,
+        remote: Option<&str>,
+    ) -> Result<(), BranchStoreError> {
+        let db_conn = get_db_conn_instance().await;
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        let existing = query_reference_with_conn(&txn, branch_name, remote)
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()));
+        let existing = match existing {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+        };
+        if existing.is_some() {
+            let _ = txn.rollback().await;
+            return Err(BranchStoreError::AlreadyExists(branch_name.to_string()));
+        }
+        let insert = reference::ActiveModel {
+            name: Set(Some(branch_name.to_owned())),
+            kind: Set(reference::ConfigKind::Branch),
+            commit: Set(Some(commit_hash.to_owned())),
+            remote: Set(remote.map(|value| value.to_owned())),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await;
+        if let Err(error) = insert {
+            let _ = txn.rollback().await;
+            return Err(BranchStoreError::Query(error.to_string()));
+        }
+        txn.commit()
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))
     }
 
     /// Pool-acquiring counterpart of [`Branch::update_branch_with_conn`].

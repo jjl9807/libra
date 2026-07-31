@@ -1092,6 +1092,7 @@ async fn checked_out_elsewhere_or_refuse(branch: &str) -> Result<Option<String>,
 fn map_branch_store_error(error: branch::BranchStoreError) -> BranchError {
     match error {
         branch::BranchStoreError::Query(detail) => BranchError::StorageQueryFailed(detail),
+        branch::BranchStoreError::AlreadyExists(name) => BranchError::AlreadyExists(name),
         branch::BranchStoreError::Corrupt { name, detail } => BranchError::StoredReferenceCorrupt(
             format!("stored branch reference '{name}' is corrupt: {detail}"),
         ),
@@ -1349,7 +1350,8 @@ async fn edit_description_impl(branch: &str) -> Result<bool, BranchError> {
     // Part C §C.4.3: transient per-worktree editor scratch — on shared storage
     // two worktrees composing a message concurrently would truncate each other's
     // buffer. Identical path for the main worktree (local == common storage).
-    let path = crate::utils::util::worktree_gitdir().join("BRANCH_DESCRIPTION_EDITMSG");
+    let path =
+        crate::utils::util::request_worktree_gitdir_strict().join("BRANCH_DESCRIPTION_EDITMSG");
     let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
         .await
         .map_err(|e| BranchError::EditorFailed(e.to_string()))?;

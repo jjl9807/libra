@@ -2565,6 +2565,10 @@ fn map_update_remote_tracking_branch_error(
     error: BranchStoreError,
 ) -> CliError {
     match error {
+        BranchStoreError::AlreadyExists(name) => {
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
         BranchStoreError::Query(detail) => CliError::fatal(format!(
             "failed to inspect remote tracking branch '{remote_tracking_branch}': {detail}"
         ))

@@ -1161,6 +1161,10 @@ fn map_checkout_error(source: RestoreError) -> CliError {
 
 fn map_local_branch_state_error(source: branch::BranchStoreError) -> CliError {
     match source {
+        branch::BranchStoreError::AlreadyExists(name) => {
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        }
         branch::BranchStoreError::Query(detail) => {
             CliError::fatal(format!(
                 "failed to inspect local branch state after fetch: {detail}"

@@ -397,8 +397,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
         return run_push_pathspec(options).await;
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let index_path = path::index();
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
@@ -467,7 +466,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let worktree_tree =
         create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
     let worktree_tree_data = worktree_tree
@@ -549,8 +548,7 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
 pub(crate) async fn create_held_stash_commit(
     message: &str,
 ) -> Result<Option<ObjectHash>, StashError> {
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let index_path = path::index();
     let index = Index::load(&index_path)
         .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
@@ -584,7 +582,7 @@ pub(crate) async fn create_held_stash_commit(
     let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
         .map_err(|e| StashError::WriteObject(e.to_string()))?;
 
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let worktree_tree =
         create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
     let worktree_tree_data = worktree_tree
@@ -624,8 +622,7 @@ pub(crate) async fn reset_to_head_for_held_stash() -> Result<(), StashError> {
 /// Enter an existing stash COMMIT into refs/stash (promote a held autostash
 /// into the visible stash list, e.g. after its re-apply conflicted).
 pub(crate) async fn store_stash_commit(hash: &ObjectHash, message: &str) -> Result<(), StashError> {
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let (_, committer) = util::create_signatures().await;
     update_stash_ref_locked(&git_dir, hash, &committer, message).map(|_| ())
 }
@@ -715,11 +712,10 @@ async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, Sta
         return Err(StashError::PathspecWithOption("--keep-index".into()));
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let index_path = path::index();
     let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
 
     let head_commit_hash = Head::current_commit()
         .await
@@ -1034,8 +1030,7 @@ pub(crate) async fn autostash_pop_by_entry(
 
 /// One consistent read of the shared stack's entries (empty when absent).
 fn stack_entries() -> Result<Vec<StashLogEntry>, StashError> {
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Ok(Vec::new());
@@ -1050,8 +1045,7 @@ async fn run_list() -> Result<StashOutput, StashError> {
         });
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Ok(StashOutput::List {
@@ -1086,8 +1080,7 @@ async fn run_show(
     patch: bool,
 ) -> Result<StashOutput, StashError> {
     let (index, stash_id_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
 
     let stash_hash =
         ObjectHash::from_str(&stash_id_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1195,13 +1188,6 @@ async fn rollback_created_branch(branch_name: &str, base_hash: &ObjectHash) {
 }
 
 async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashOutput, StashError> {
-    if InternalBranch::exists_result(&branch_name, None)
-        .await
-        .map_err(|error| stash_branch_store_error(&branch_name, error))?
-    {
-        return Err(StashError::BranchExists(branch_name));
-    }
-
     // Resolve stash & metadata for the new branch base. The raw reflog line
     // is the unambiguous entry identity for the post-apply CAS delete.
     let (index, stash_id_str, raw_line) = resolve_stash_to_commit_hash(stash)?;
@@ -1217,9 +1203,19 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
     // Capture the restore point BEFORE any persistent mutation (W2 §C.4.3):
     // both the branch creation and the HEAD switch may need rolling back.
     let prior_head = Head::current().await;
-    InternalBranch::update_branch(&branch_name, &base_hash.to_string(), None)
+    // CREATE, never upsert (Codex W2 r1 #4): `update_branch` moves an existing
+    // tip, and a name checked free a moment earlier can be taken by another
+    // worktree before the write — `stash branch` would then silently move
+    // THAT branch. The exclusive create does the check and the insert in one
+    // write-locked transaction, so a collision is refused, not overwritten.
+    InternalBranch::create_branch_exclusive(&branch_name, &base_hash.to_string(), None)
         .await
-        .map_err(|e| StashError::Other(format!("failed to create branch '{branch_name}': {e}")))?;
+        .map_err(|error| match error {
+            crate::internal::branch::BranchStoreError::AlreadyExists(name) => {
+                StashError::BranchExists(name)
+            }
+            other => stash_branch_store_error(&branch_name, other),
+        })?;
 
     // Switch HEAD to the new branch so apply runs on the right tip — via the
     // RESULT-returning API (W2 §C.4.3 scoped HEAD guard): a swallowed HEAD
@@ -1291,8 +1287,7 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
         return Ok(StashOutput::Clear { cleared_count: 0 });
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_ref_path = git_dir.join("refs/stash");
     let stash_log_path = git_dir.join("logs/refs/stash");
 
@@ -1469,8 +1464,7 @@ async fn apply_stash_commit_inner(
     restore_index: bool,
 ) -> Result<(), StashError> {
     let stash_commit_hash = *hash;
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
 
     let stash_commit: Commit =
         load_object(&stash_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -1493,7 +1487,7 @@ async fn apply_stash_commit_inner(
         None
     };
 
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let index_path = path::index();
 
     // "ours" for the three-way apply is the CURRENT working tree, NOT HEAD. This
@@ -1685,8 +1679,7 @@ fn do_drop(stash: Option<String>, expected_line: Option<&str>) -> Result<StashOu
         return Err(missing(expected_line.is_some()));
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_ref_path = git_dir.join("refs/stash");
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
@@ -1796,7 +1789,7 @@ async fn has_changes() -> bool {
         return true;
     }
 
-    let workdir = util::working_dir();
+    let workdir = util::request_working_dir();
     for entry in index.tracked_entries(0) {
         let file_path = workdir.join(&entry.name);
 
@@ -1984,8 +1977,7 @@ fn resolve_stash_to_commit_hash(
         return Err(StashError::NoStashFound);
     }
 
-    let git_dir =
-        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let git_dir = util::request_storage_path();
     let stash_log_path = git_dir.join("logs/refs/stash");
     if !stash_log_path.exists() {
         return Err(StashError::NoStashFound);
@@ -2077,7 +2069,7 @@ fn update_stash_ref(
 }
 
 async fn perform_hard_reset(target_commit_id: &ObjectHash) -> Result<(), String> {
-    let workdir = &util::working_dir();
+    let workdir = &util::request_working_dir();
     let index_path = path::index();
 
     let index_before_reset = Index::load(&index_path).unwrap_or_else(|_| Index::new());

@@ -309,6 +309,10 @@ impl From<SwitchError> for CliError {
 
 fn map_branch_store_error(error: repo_branch::BranchStoreError) -> SwitchError {
     match error {
+        repo_branch::BranchStoreError::AlreadyExists(name) => SwitchError::DelegatedCli(
+            CliError::fatal(format!("branch '{name}' already exists"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget),
+        ),
         repo_branch::BranchStoreError::Query(detail) => SwitchError::DelegatedCli(
             CliError::fatal(format!("failed to read branch storage: {detail}"))
                 .with_stable_code(StableErrorCode::IoReadFailed),
