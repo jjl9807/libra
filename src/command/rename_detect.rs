@@ -107,6 +107,11 @@ impl BlobEvidence {
     /// neither side is anchored in the object store, so the pair must go
     /// through the ordinary inexact path instead of being asserted exact
     /// (fail closed). `Unknown` never pairs exactly at all.
+    /// §B.4.1 exact 合法组合硬门禁：任一侧 Unknown 拒绝；C/C 拒绝（须至少
+    /// 一侧 known）。匹配引擎的热路径把该判定折叠进 known/computed 分桶
+    /// （桶内无 Unknown），本表保留为规范事实源：debug 构建对每条产出边
+    /// 交叉断言，单测直接钉住组合表。
+    #[cfg(any(test, debug_assertions))]
     fn exact_pair_allowed(old: &Self, new: &Self) -> bool {
         match (old, new) {
             (BlobEvidence::Unknown, _) | (_, BlobEvidence::Unknown) => false,
@@ -258,14 +263,53 @@ pub fn match_pairs(
 
     // ---- Stage 1: exact (bucket by oid + kind [+ gitlink mode]) ----------
     type BucketKey = (ObjectHash, BlobKind, Option<u32>);
-    let mut buckets: HashMap<BucketKey, BTreeSet<&PathBuf>> = HashMap::new();
+    // Destinations of one exact bucket, split by evidence kind. Inside a
+    // bucket every entry shares the same oid/kind[/mode] and neither side
+    // can be Unknown (Unknown has no OID and never enters a bucket), so
+    // `BlobEvidence::exact_pair_allowed` reduces to `old_known || new_known`
+    // and each pick is two BTreeSet head lookups instead of a scan.
+    #[derive(Default)]
+    struct ExactBucket {
+        known: BTreeSet<PathBuf>,
+        computed: BTreeSet<PathBuf>,
+    }
+    impl ExactBucket {
+        /// Smallest path (byte order) the old side may pair with, removed
+        /// from the bucket. A known old evidence pairs with any destination;
+        /// a computed one pairs only with a known destination — C/C exact is
+        /// forbidden (§B.4.1).
+        fn pop_first_allowed(&mut self, old_known: bool) -> Option<PathBuf> {
+            let picked = if old_known {
+                match (self.known.iter().next(), self.computed.iter().next()) {
+                    (Some(k), Some(c)) => {
+                        if k <= c {
+                            Some(k.clone())
+                        } else {
+                            Some(c.clone())
+                        }
+                    }
+                    (Some(k), None) => Some(k.clone()),
+                    (None, Some(c)) => Some(c.clone()),
+                    (None, None) => None,
+                }
+            } else {
+                self.known.iter().next().cloned()
+            }?;
+            self.known.remove(&picked);
+            self.computed.remove(&picked);
+            Some(picked)
+        }
+    }
+    let mut buckets: HashMap<BucketKey, ExactBucket> = HashMap::new();
     for (path, blob) in &remaining_new {
         if let Some(oid) = blob.evidence.oid() {
             let mode_key = (blob.kind == BlobKind::Gitlink).then_some(blob.mode);
-            buckets
-                .entry((*oid, blob.kind, mode_key))
-                .or_default()
-                .insert(path);
+            let bucket = buckets.entry((*oid, blob.kind, mode_key)).or_default();
+            if blob.evidence.is_known() {
+                bucket.known.insert((*path).clone());
+            } else {
+                bucket.computed.insert((*path).clone());
+            }
         }
     }
 
@@ -291,28 +335,30 @@ pub fn match_pairs(
     let mut consumed_old: BTreeSet<PathBuf> = BTreeSet::new();
     let mut consumed_new: BTreeSet<PathBuf> = BTreeSet::new();
     // (bucket, basename) → destinations, so the same-basename pass is a map
-    // lookup instead of a linear scan of the whole OID bucket.
-    let mut by_basename: HashMap<(BucketKey, Option<OsString>), Vec<PathBuf>> = HashMap::new();
-    for (key, paths) in &buckets {
-        for path in paths {
-            by_basename
-                .entry((*key, path.file_name().map(|name| name.to_os_string())))
-                .or_default()
-                .push((*path).clone());
+    // lookup instead of a linear scan of the whole OID bucket. Entries are
+    // REMOVED as they are consumed (same rule for the path-order level):
+    // leaving consumed destinations in place makes every later source
+    // rescan them, and N same-OID paths sharing one basename degenerate to
+    // Θ(N²) before `rename_limit` has had any say. With consumption every
+    // destination is examined O(1) times per stage and the whole selection
+    // stays O(N log N).
+    let mut by_basename: HashMap<(BucketKey, Option<OsString>), ExactBucket> = HashMap::new();
+    for (key, bucket) in &buckets {
+        for (is_known, paths) in [(true, &bucket.known), (false, &bucket.computed)] {
+            for path in paths {
+                let entry = by_basename
+                    .entry((*key, path.file_name().map(|name| name.to_os_string())))
+                    .or_default();
+                if is_known {
+                    entry.known.insert(path.clone());
+                } else {
+                    entry.computed.insert(path.clone());
+                }
+            }
         }
     }
-    let allowed_dest = |old_blob: &BlobRef, new_path: &PathBuf| -> bool {
-        remaining_new.get(new_path).is_some_and(|new_blob| {
-            BlobEvidence::exact_pair_allowed(&old_blob.evidence, &new_blob.evidence)
-        })
-    };
     // `remaining_old` is a BTreeMap, so both passes walk sources in path
     // byte order without an extra sort.
-    // Sources are visited in path order (BTreeMap), and each consumed
-    // destination is REMOVED from its bucket immediately. Without that
-    // removal, N delete/add pairs sharing one blob id make every source
-    // rescan the whole bucket — O(N²) work before `rename_limit` has had any
-    // say. With it, each destination is examined a bounded number of times.
     let old_keys: Vec<PathBuf> = remaining_old.keys().map(|p| (*p).clone()).collect();
     for same_basename_pass in [true, false] {
         for old_path in &old_keys {
@@ -327,39 +373,42 @@ pub fn match_pairs(
             };
             let mode_key = (old_blob.kind == BlobKind::Gitlink).then_some(old_blob.mode);
             let bucket_key = (*oid, old_blob.kind, mode_key);
-            let Some(candidates) = buckets.get(&bucket_key) else {
-                continue;
-            };
+            let old_known = old_blob.evidence.is_known();
             let picked = if same_basename_pass {
                 // Basename LOOKUP, not a bucket scan: with N same-OID files
                 // whose basenames all differ, scanning each bucket per
                 // source is O(N²) — and it happens before `rename_limit` can
                 // gate anything.
                 by_basename
-                    .get(&(bucket_key, old_path.file_name().map(|n| n.to_os_string())))
-                    .and_then(|paths| {
-                        paths
-                            .iter()
-                            .find(|new_path| {
-                                candidates.contains(new_path) && allowed_dest(old_blob, new_path)
-                            })
-                            .cloned()
-                    })
+                    .get_mut(&(bucket_key, old_path.file_name().map(|n| n.to_os_string())))
+                    .and_then(|bucket| bucket.pop_first_allowed(old_known))
             } else {
-                candidates
-                    .iter()
-                    .find(|new_path| allowed_dest(old_blob, new_path))
-                    .map(|found| (*found).clone())
+                buckets
+                    .get_mut(&bucket_key)
+                    .and_then(|bucket| bucket.pop_first_allowed(old_known))
             };
             if let Some(new_path) = picked {
-                if let Some(bucket) = buckets.get_mut(&bucket_key) {
-                    bucket.remove(&new_path);
+                #[cfg(debug_assertions)]
+                {
+                    // The split-bucket pick must agree with the legality
+                    // table on every emitted pair.
+                    let new_blob = remaining_new.get(&new_path);
+                    debug_assert!(new_blob.is_some_and(|b| {
+                        BlobEvidence::exact_pair_allowed(&old_blob.evidence, &b.evidence)
+                    }));
+                }
+                if same_basename_pass {
+                    // Keep the path-order level in sync for pass B.
+                    if let Some(bucket) = buckets.get_mut(&bucket_key) {
+                        bucket.known.remove(&new_path);
+                        bucket.computed.remove(&new_path);
+                    }
                 }
                 consumed_old.insert(old_path.clone());
                 consumed_new.insert(new_path.clone());
                 matches.push(RenameMatch {
                     old: old_path.clone(),
-                    new: new_path.clone(),
+                    new: new_path,
                     exact: true,
                     internal_score: EXACT_SCORE,
                 });
@@ -873,32 +922,35 @@ pub(crate) struct WorktreeReadBudget {
     deadline: Instant,
 }
 
-/// Debug-only seam for the stat→read growth race (§B.3.4). A budget that
+/// Debug-only seam for the stat→read divergence (§B.3.4). A budget that
 /// charges the pre-read `stat` length bills a file that grew in between at
-/// the smaller stale price, so the regression has to be able to make the
-/// growth happen at exactly that point. Compiled out of release builds.
+/// the smaller stale price. The regression exercises that branch by having
+/// the seam report a STALE, smaller length for the named path's pre-read
+/// stat — the bounded read then pulls more bytes than the stat claimed,
+/// exactly as a growing file would, without the hook ever mutating the
+/// file. Gated on `LIBRA_TEST`; compiled out of release builds.
 #[cfg(debug_assertions)]
-fn grow_under_read_for_test(path: &Path) {
-    use std::io::Write;
-
-    let Ok(target) = std::env::var("LIBRA_TEST_RENAME_GROW_PATH") else {
-        return;
+fn stale_stat_len_for_test(path: &Path, real_len: u64) -> u64 {
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+        return real_len;
+    }
+    let Ok(target) = std::env::var("LIBRA_TEST_STALE_STAT_PATH") else {
+        return real_len;
     };
     if Path::new(&target) != path {
-        return;
+        return real_len;
     }
-    let extra: usize = std::env::var("LIBRA_TEST_RENAME_GROW_BYTES")
+    let shrink: u64 = std::env::var("LIBRA_TEST_STALE_STAT_BYTES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-        let _ = file.write_all(&vec![b'g'; extra]);
-        let _ = file.flush();
-    }
+    real_len.saturating_sub(shrink)
 }
 
 #[cfg(not(debug_assertions))]
-fn grow_under_read_for_test(_path: &Path) {}
+fn stale_stat_len_for_test(_path: &Path, real_len: u64) -> u64 {
+    real_len
+}
 
 impl WorktreeReadBudget {
     /// Remaining (total bytes, task slots); see [`ObjectReadBudget::remaining`].
@@ -1023,10 +1075,9 @@ impl WorktreeReadBudget {
             };
         }
         let cap = self.per_file_cap.min(self.remaining_total);
-        if metadata.len() > cap {
+        if stale_stat_len_for_test(abs_path, metadata.len()) > cap {
             return ContentOutcome::Skipped(SkipReason::WorktreeTooLarge);
         }
-        grow_under_read_for_test(abs_path);
         // §B.3.4 bounded read: `read` the file through a `take(cap + 1)`
         // limiter so a file that GREW between the metadata check and the
         // read (or a growing FIFO/FUSE path) can never allocate past the
@@ -1109,11 +1160,13 @@ impl WorktreeReadBudget {
             return Ok((oid, len, BlobKind::Symlink));
         }
         let cap = self.per_file_cap.min(self.remaining_total);
-        if metadata.len() > cap {
+        if stale_stat_len_for_test(abs_path, metadata.len()) > cap {
             return Err(SkipReason::WorktreeTooLarge);
         }
-        grow_under_read_for_test(abs_path);
-        if crate::utils::lfs::is_lfs_tracked(abs_path) {
+        // Both regular-content branches below produce the blob from bytes
+        // pulled through an open that FOLLOWS symlinks, so the kind is
+        // re-stated AFTER the read (see the tail of this function).
+        let (oid, len) = if crate::utils::lfs::is_lfs_tracked(abs_path) {
             // The POINTER is tiny, but producing it requires a full-file
             // SHA-256, so this read needs the same deadline as any other:
             // the size cap above already rejected anything over the
@@ -1138,34 +1191,56 @@ impl WorktreeReadBudget {
             self.remaining_total = self.remaining_total.saturating_sub(read);
             let len = pointer.len() as u64;
             let oid = git_internal::internal::object::blob::Blob::from_content(&pointer).id;
-            return Ok((oid, len, BlobKind::Regular));
-        }
-        // The cap is re-applied INSIDE the read: the stat above can be
-        // defeated by a file that grows before the bytes are consumed, and
-        // an unbounded hash of a now-huge file would blow the read budget
-        // it was supposed to respect.
-        let hash_path = abs_path.to_path_buf();
-        let (oid, read) =
+            (oid, len)
+        } else {
+            // The cap is re-applied INSIDE the read: the stat above can be
+            // defeated by a file that grows before the bytes are consumed, and
+            // an unbounded hash of a now-huge file would blow the read budget
+            // it was supposed to respect.
+            let hash_path = abs_path.to_path_buf();
+            let (oid, read) =
+                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                    super::stream_file_blob_hash_bounded(&hash_path, cap)
+                }) {
+                    Err(()) => return Err(SkipReason::IoTimeout),
+                    Ok(Ok((Some(oid), read))) => (oid, read),
+                    // Over the cap, or the file changed size mid-read: skip the
+                    // candidate rather than trust a hash of a moving target — but
+                    // still charge the bytes the attempt cost, or a growth race
+                    // would give an attacker unlimited free reads.
+                    Ok(Ok((None, read))) => {
+                        self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
+                        return Err(SkipReason::WorktreeTooLarge);
+                    }
+                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+                };
+            // Charge and report what the read ACTUALLY consumed. `metadata.len()`
+            // is a pre-read stat, and a file that grew in between would otherwise
+            // have the larger read billed at the smaller stale price.
+            self.remaining_total = self.remaining_total.saturating_sub(read);
+            (oid, read)
+        };
+        // Post-read type revalidation: the bytes above were pulled through
+        // an open that FOLLOWS symlinks, so a regular→symlink swap between
+        // the pre-read stat and the open would label the referent's blob
+        // `Regular` — clearing the exact gate against an unrelated blob and
+        // suppressing the truthful `D` + `??`. Re-stat AFTER the read and
+        // report the kind observed NOW; the caller drops the candidate when
+        // it disagrees with its own earlier stat. The residual window (the
+        // path flipping back to regular before this stat) is the documented
+        // path-level TOCTOU accepted for R0; fd-bound resolution is tracked
+        // by plan-20260715 WIO-02.
+        let restat_path = abs_path.to_path_buf();
+        let observed =
             match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                super::stream_file_blob_hash_bounded(&hash_path, cap)
+                restat_path.symlink_metadata()
             }) {
+                Ok(Ok(meta)) if meta.file_type().is_symlink() => BlobKind::Symlink,
+                Ok(Ok(meta)) if meta.file_type().is_file() => BlobKind::Regular,
+                Ok(Ok(_)) | Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
                 Err(()) => return Err(SkipReason::IoTimeout),
-                Ok(Ok((Some(oid), read))) => (oid, read),
-                // Over the cap, or the file changed size mid-read: skip the
-                // candidate rather than trust a hash of a moving target — but
-                // still charge the bytes the attempt cost, or a growth race
-                // would give an attacker unlimited free reads.
-                Ok(Ok((None, read))) => {
-                    self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                    return Err(SkipReason::WorktreeTooLarge);
-                }
-                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
             };
-        // Charge and report what the read ACTUALLY consumed. `metadata.len()`
-        // is a pre-read stat, and a file that grew in between would otherwise
-        // have the larger read billed at the smaller stale price.
-        self.remaining_total = self.remaining_total.saturating_sub(read);
-        Ok((oid, read, BlobKind::Regular))
+        Ok((oid, len, observed))
     }
 }
 
@@ -1259,6 +1334,44 @@ mod tests {
         assert!(outcome.matches[0].exact);
         assert_eq!(outcome.matches[0].internal_score, EXACT_SCORE);
         assert_eq!(source.reads, 0, "exact pairing must not read content");
+    }
+
+    #[test]
+    fn exact_same_basename_duplicate_blob_selection_is_linear() {
+        // N delete/add pairs sharing one blob id AND one basename: the
+        // same-basename pass must consume each destination as it is picked.
+        // Leaving consumed entries in place makes every later source rescan
+        // them — Θ(N²) before `rename_limit` (implementation-round Codex
+        // finding). With consumption the stage is O(N log N); the generous
+        // deadline below can only fail on a quadratic regression, never on
+        // machine speed.
+        let n = 20_000;
+        let blob = regular(known(b"duplicate payload\n"), 18);
+        let snap = RenameSnapshot {
+            old_map: (0..n)
+                .map(|i| (PathBuf::from(format!("old/{i:06}/same.txt")), blob.clone()))
+                .collect(),
+            new_map: (0..n)
+                .map(|i| (PathBuf::from(format!("new/{i:06}/same.txt")), blob.clone()))
+                .collect(),
+        };
+        let mut source = MapSource::new();
+        let started = std::time::Instant::now();
+        let outcome = match_pairs(&snap, &config(30000), &mut source);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.matches.len(), n);
+        assert!(
+            outcome
+                .matches
+                .iter()
+                .all(|m| m.exact && m.internal_score == EXACT_SCORE),
+            "every duplicate pair must match exactly"
+        );
+        assert_eq!(source.reads, 0, "known-OID exact must not read content");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "exact selection regressed to quadratic: {elapsed:?} for {n} pairs"
+        );
     }
 
     #[test]
@@ -1984,46 +2097,52 @@ mod tests {
     /// consumed, not by the pre-read `stat`. A file that grows between the
     /// stat and the hash used to be billed at the stale, smaller length,
     /// which let a growth race pull unlimited content through a bounded
-    /// budget. The seam grows the file at exactly that point so the race is
-    /// deterministic rather than timing-dependent.
+    /// budget. The seam reports a stale, smaller stat length at exactly that
+    /// point — the same accounting branch a growing file exercises, without
+    /// the test hook mutating the file.
     #[test]
     #[serial_test::serial]
     fn worktree_total_charges_bytes_read_not_stale_stat() {
         use std::time::Duration;
 
+        const SHRUNK: u64 = 4;
+        const GROWTH: u64 = 4096;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("grows.txt");
-        std::fs::write(&path, b"aaaa").expect("write the seed file");
+        std::fs::write(&path, vec![b'a'; (SHRUNK + GROWTH) as usize])
+            .expect("write the full-size file");
 
-        const GROWTH: u64 = 4096;
         // SAFETY: single-threaded test body, serialized against other tests
-        // that read the process environment.
+        // that read the process environment. LIBRA_TEST arms the harness
+        // gate the seam requires.
         unsafe {
-            std::env::set_var("LIBRA_TEST_RENAME_GROW_PATH", &path);
-            std::env::set_var("LIBRA_TEST_RENAME_GROW_BYTES", GROWTH.to_string());
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            std::env::set_var("LIBRA_TEST_STALE_STAT_PATH", &path);
+            std::env::set_var("LIBRA_TEST_STALE_STAT_BYTES", GROWTH.to_string());
         }
 
         let total = 1_000_000;
         let mut budget = WorktreeReadBudget::new(total, total, 8, Duration::from_secs(30));
         let (_, size, kind) = budget
             .worktree_blob_oid_and_size(&path)
-            .expect("the grown file still hashes");
+            .expect("the file still hashes");
 
         unsafe {
-            std::env::remove_var("LIBRA_TEST_RENAME_GROW_PATH");
-            std::env::remove_var("LIBRA_TEST_RENAME_GROW_BYTES");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            std::env::remove_var("LIBRA_TEST_STALE_STAT_PATH");
+            std::env::remove_var("LIBRA_TEST_STALE_STAT_BYTES");
         }
 
-        let grown = 4 + GROWTH;
+        let read = SHRUNK + GROWTH;
         assert_eq!(kind, BlobKind::Regular);
         assert_eq!(
-            size, grown,
-            "the reported size is what was read, not the 4-byte stat"
+            size, read,
+            "the reported size is what was read, not the stale 4-byte stat"
         );
         assert_eq!(
             budget.remaining_total,
-            total - grown,
-            "the budget was charged {grown} bytes, not the stale 4"
+            total - read,
+            "the budget was charged {read} bytes, not the stale 4"
         );
     }
 

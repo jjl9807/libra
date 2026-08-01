@@ -11,7 +11,7 @@ use std::collections::HashSet;
 #[path = "status_wave0_manifest.rs"]
 mod status_wave0_manifest;
 
-use status_wave0_manifest::STATUS_WAVE0_TESTS;
+use status_wave0_manifest::{STATUS_WAVE0_TESTS, STATUS_WAVE0_TESTS_UNIX_ONLY};
 
 const MODULE_PREFIX: &str = "command::status_wave0::";
 
@@ -46,16 +46,33 @@ fn status_wave0_manifest_matches_registered_tests() {
         .filter(|name| name.starts_with(MODULE_PREFIX))
         .collect();
 
+    let manifest: HashSet<&str> = STATUS_WAVE0_TESTS.iter().copied().collect();
+    assert_eq!(
+        STATUS_WAVE0_TESTS.len(),
+        manifest.len(),
+        "STATUS_WAVE0_TESTS contains duplicate names"
+    );
+
+    let unix_only: HashSet<&str> = STATUS_WAVE0_TESTS_UNIX_ONLY.iter().copied().collect();
+    assert_eq!(
+        STATUS_WAVE0_TESTS_UNIX_ONLY.len(),
+        unix_only.len(),
+        "STATUS_WAVE0_TESTS_UNIX_ONLY contains duplicate names"
+    );
+    assert!(
+        unix_only.is_subset(&manifest),
+        "STATUS_WAVE0_TESTS_UNIX_ONLY must be a subset of STATUS_WAVE0_TESTS"
+    );
+
+    // `#[cfg(unix)]` tests are compiled (and listed) only on Unix hosts, so
+    // they join the expected set only there; the manifest stays canonical
+    // for the full cross-platform test set.
     let expected: HashSet<String> = STATUS_WAVE0_TESTS
         .iter()
+        .filter(|name| cfg!(unix) || !unix_only.contains(**name))
         .map(|name| format!("{MODULE_PREFIX}{name}"))
         .collect();
 
-    assert_eq!(
-        STATUS_WAVE0_TESTS.len(),
-        expected.len(),
-        "STATUS_WAVE0_TESTS contains duplicate names"
-    );
     assert!(
         !expected.is_empty(),
         "STATUS_WAVE0_TESTS must not be empty — the wave-0 module would be silently dropped"
@@ -72,5 +89,9 @@ fn status_wave0_manifest_is_strictly_sorted() {
     assert!(
         STATUS_WAVE0_TESTS.windows(2).all(|w| w[0] < w[1]),
         "STATUS_WAVE0_TESTS must be strictly alphabetically sorted with no duplicates"
+    );
+    assert!(
+        STATUS_WAVE0_TESTS_UNIX_ONLY.windows(2).all(|w| w[0] < w[1]),
+        "STATUS_WAVE0_TESTS_UNIX_ONLY must be strictly alphabetically sorted with no duplicates"
     );
 }

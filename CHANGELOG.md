@@ -2,6 +2,57 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-3 implementation review)
+
+- **A metadata probe root hiding behind an escaping symlink is now reported,
+  not silently skipped.** The probe checked the `.git`/`.libra`/gitlink
+  exclusions before containment, so `status -- link/.git` (where `link`
+  points outside the worktree and the target happens to hold a `.git`)
+  vanished without a trace. Containment is now checked first and the escape
+  lands in `io_blocked[]`.
+- **Probe enumeration no longer gets a free entry per directory.** The
+  readdir loop pulled the truncation-detecting entry past the budget check
+  without charging it; every entry the OS yields is now charged exactly
+  once against the enumeration budget.
+- **The status I/O worker pool no longer detaches its threads.** Worker
+  `JoinHandle`s were dropped at spawn time; they are now owned by the pool,
+  matching the "reused pool, no detached threads" contract.
+- **New regression coverage**: a `--check-dirty` MODIFIED cache row whose
+  file stats fine but cannot be read is kept, reported in `io_blocked[]`,
+  and never rewritten; the truncated-probe ordering test now asserts the
+  qualified destinations through the rename records instead of the main
+  scan's listing.
+
+### Fixed (plan-20260714 R0-2 implementation review)
+
+- **A regular→symlink swap during rename hashing can no longer forge an
+  exact rename.** The worktree blob hash is produced through an open that
+  follows symlinks, so a candidate replaced between the pre-read stat and
+  the open could hand the exact gate a symlink referent's blob labelled
+  `Regular`, pairing a rename that never happened and suppressing the
+  truthful `D` + `??`. The file kind is now re-stated after the read and
+  the candidate is dropped (with a degradation warning) when it no longer
+  matches the snapshot stat. The residual path-level TOCTOU window is
+  documented and stays with plan-20260715 WIO-02 for fd-bound resolution.
+
+### Fixed (plan-20260714 R0-1 implementation review)
+
+- **Exact rename selection is linear again for duplicate blobs.** Consumed
+  destinations were removed from the OID bucket but not from the
+  same-basename index, so N delete/add pairs sharing one blob id and one
+  basename made every later source rescan them — Θ(N²) work before
+  `renameLimit` could gate anything. Both levels now consume on pick and
+  split destinations by evidence kind, keeping the stage O(N log N).
+- **The `rename_limit_product_skipped` warning now matches the documented
+  degrade contract.** It previously claimed "inexact matching" was skipped;
+  in reality exact and scored unique-basename pairs survive and only the
+  exhaustive stage is skipped, which is what the docs and the `diff` side
+  already said. The status text now states the survivor semantics.
+- **The untracked-rename pass accounts its budgets like every other pass.**
+  `detect_renames_with_destinations` drew down the call-level worktree and
+  object budgets but never restored them or recorded its comparisons, so a
+  detection pass added after it would have restarted with fresh budgets.
+
 ### Fixed (`rebase`: replayed commits recorded a hardcoded identity)
 
 - **Replayed commits now keep the original author and record the running user

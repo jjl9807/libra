@@ -1917,31 +1917,42 @@ fn build_rename_side(
                 // §B.3.3: this OPTIONAL stat runs under the deadline like
                 // every other worktree read — a hung mount must cost the
                 // rename candidate and a warning, not the whole command.
-                // Debug-only seam for the scan→stat disappearance race. It
-                // REMOVES the named path so the stat below returns a genuine
-                // `NotFound` from the OS — synthesizing the error instead
-                // would leave the real branch untested.
+                // Debug-only seam for the scan→stat disappearance race: the
+                // named path's stat is overridden with a genuine `NotFound`
+                // error kind — the same branch an OS-level deletion drives,
+                // without the hook mutating the worktree. Gated on
+                // `LIBRA_TEST` like every seam in this family.
                 #[cfg(debug_assertions)]
-                if std::env::var("LIBRA_TEST_VANISH_PATH")
-                    .ok()
-                    .filter(|target| !target.is_empty())
-                    .is_some_and(|target| repo_key == std::path::Path::new(&target))
-                {
-                    let _ = std::fs::remove_file(&abs);
-                }
+                let forced_vanish = std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+                    && std::env::var("LIBRA_TEST_VANISH_PATH")
+                        .ok()
+                        .filter(|target| !target.is_empty())
+                        .is_some_and(|target| repo_key == std::path::Path::new(&target));
+                #[cfg(not(debug_assertions))]
+                let forced_vanish = false;
                 let stat_target = abs.clone();
                 let stat = crate::command::status_probe::with_io_deadline(move || {
                     stat_target.symlink_metadata()
                 })
                 .unwrap_or_else(|()| Err(io::Error::new(io::ErrorKind::TimedOut, "reclaimed")));
+                let stat = if forced_vanish {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "simulated vanish for the test seam",
+                    ))
+                } else {
+                    stat
+                };
                 // Debug-only seam for the stat→hash race, which is far too
                 // narrow to hit reliably from a test: the named path is
                 // treated as having changed TYPE between the two reads.
                 #[cfg(debug_assertions)]
-                let forced_type_race = std::env::var("LIBRA_TEST_TYPE_RACE_PATH")
-                    .ok()
-                    .filter(|target| !target.is_empty())
-                    .is_some_and(|target| repo_key == std::path::Path::new(&target));
+                let forced_type_race = std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV)
+                    .is_some()
+                    && std::env::var("LIBRA_TEST_TYPE_RACE_PATH")
+                        .ok()
+                        .filter(|target| !target.is_empty())
+                        .is_some_and(|target| repo_key == std::path::Path::new(&target));
                 #[cfg(not(debug_assertions))]
                 let forced_type_race = false;
                 let stat_kind = stat.as_ref().err().map(|error| error.kind());
@@ -2014,7 +2025,8 @@ fn build_rename_side(
 /// allowance without generating 500k real comparisons.
 fn status_comparison_budget() -> u64 {
     #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var("LIBRA_TEST_STATUS_COMPARISON_BUDGET")
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+        && let Ok(value) = std::env::var("LIBRA_TEST_STATUS_COMPARISON_BUDGET")
         && let Ok(parsed) = value.parse::<u64>()
         && parsed > 0
     {
@@ -2143,7 +2155,7 @@ fn warnings_from_rename_stats(
     if stats.skipped_by_limit {
         warnings.push(StatusWarning {
             code: StatusWarningCode::RenameLimitProductSkipped,
-            message: "rename detection skipped inexact matching: too many candidates on one side (renameLimit)".to_string(),
+            message: "rename detection skipped the exhaustive inexact pass: too many candidates on one side (renameLimit); exact and unique-basename matches were kept".to_string(),
             source: StatusWarningCode::RenameLimitProductSkipped.source(),
         });
     }
@@ -2277,6 +2289,13 @@ fn detect_renames_with_destinations(
     };
     let narrowed = budgets.narrowed(config);
     let mut outcome = rename_detect::match_pairs(&snapshot, &narrowed, &mut source);
+    // Hand the drawn-down budgets back, exactly like the sibling detector:
+    // the run-level caps are call-level (§B.3.4), so this pass must neither
+    // keep the remainder nor spend comparisons off the books — a pass added
+    // after this one would otherwise restart with fresh budgets.
+    budgets.restore_objects(&mut source.objects);
+    budgets.restore_worktree(&source.worktree);
+    budgets.record_comparisons(outcome.stats.comparisons);
     // Snapshot-construction skips (optional worktree hash/stat failures)
     // join the engine's own content skips so ONE warning family covers
     // every candidate the run had to drop.
@@ -4826,7 +4845,8 @@ fn get_worktree_mode_result_for_workdir(workdir_path: &std::path::Path) -> Workt
     // reachable by winning a race between collection and rendering, so tests
     // name the path that must report as unreadable.
     #[cfg(debug_assertions)]
-    if let Ok(target) = std::env::var("LIBRA_TEST_UNREADABLE_MODE_PATH")
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+        && let Ok(target) = std::env::var("LIBRA_TEST_UNREADABLE_MODE_PATH")
         && !target.is_empty()
         && workdir_path == std::path::Path::new(&target)
     {
@@ -6961,5 +6981,161 @@ mod test {
             worktree_failed.message.contains("5 candidate(s)"),
             "{worktree_failed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod rename_destination_budget_test {
+    use super::*;
+    use crate::utils::test::ChangeDirGuard;
+
+    /// The destination (untracked-side) detector must hand its drawn-down
+    /// budgets back to the run-level `RenameBudgets` — remaining bytes and
+    /// tasks, the shared OID cache, and the spent comparisons. Without the
+    /// restore a detection pass added after it would restart with fresh
+    /// budgets, silently doubling the call-level caps (§B.3.4).
+    #[test]
+    fn destination_detector_restores_budgets_and_records_comparisons() {
+        let repo = tempfile::tempdir().expect("temp repo");
+        // Minimal bare-layout markers so path discovery treats the temp dir
+        // as a repository and object lookups fail as genuine misses.
+        std::fs::create_dir_all(repo.path().join("objects")).expect("objects dir");
+        std::fs::write(repo.path().join("libra.db"), b"").expect("db marker");
+        let _guard = ChangeDirGuard::new(repo.path());
+
+        let mut details: RenameDetails = HashMap::new();
+        let mut stats = rename_detect::RenameDetectStats::default();
+        let mut budgets = RenameBudgets::new();
+        let (worktree_before, tasks_before) = (budgets.worktree_total, budgets.worktree_tasks);
+        let (objects_before, slots_before) = (budgets.objects_total, budgets.objects_slots);
+        let config = rename_detect::RenameDetectConfig {
+            threshold: 30000,
+            rename_limit: 1000,
+            comparison_budget: Some(500_000),
+        };
+
+        // A scorable inexact pair (both sides worktree this call) spends
+        // worktree budget on hashing/reads and records real comparisons.
+        // The fixture is large enough that spanhash sees many shared spans.
+        let old_payload = b"alpha beta gamma delta\n".repeat(200);
+        let mut new_payload = old_payload.clone();
+        let mid = new_payload.len() / 2;
+        new_payload[mid] = b'X';
+        std::fs::write(repo.path().join("gone.txt"), &old_payload).expect("old");
+        std::fs::write(repo.path().join("came.txt"), &new_payload).expect("new");
+        let mut changes = Changes {
+            new: vec![],
+            modified: vec![],
+            deleted: vec![PathBuf::from("gone.txt")],
+            renamed: vec![],
+        };
+        let consumed = detect_renames_with_destinations(
+            &mut changes,
+            &config,
+            RenameBlobSide::Worktree,
+            &[PathBuf::from("came.txt")],
+            &mut details,
+            &mut stats,
+            &mut budgets,
+        );
+        assert!(
+            consumed.contains(&PathBuf::from("came.txt")),
+            "the similar pair should match inexact and consume the destination"
+        );
+        assert!(
+            budgets.worktree_total < worktree_before || budgets.worktree_tasks < tasks_before,
+            "worktree bytes/tasks spent by the destination pass must be restored \
+             to the shared budget (before={worktree_before}/{tasks_before} \
+             after={}/{})",
+            budgets.worktree_total,
+            budgets.worktree_tasks
+        );
+        assert!(
+            budgets.comparisons_spent > 0,
+            "inexact scoring comparisons must be recorded against the shared cap"
+        );
+        // The NEXT consumer sees the depleted remainder, not a fresh cap.
+        let narrowed = budgets.narrowed(&config);
+        assert_eq!(
+            narrowed.comparison_budget,
+            Some(500_000u64.saturating_sub(budgets.comparisons_spent)),
+            "a later pass must inherit the spent comparisons"
+        );
+
+        // A HEAD/index-side candidate whose object is missing consumes an
+        // object slot and lands in the SHARED OID cache; both must come back
+        // with the restored object budget.
+        let missing_oid = git_internal::internal::object::blob::Blob::from_content_bytes(
+            b"never stored in this repository".to_vec(),
+        )
+        .id;
+        std::fs::create_dir_all(repo.path().join("d")).expect("d dir");
+        std::fs::create_dir_all(repo.path().join("u")).expect("u dir");
+        std::fs::write(repo.path().join("u/same.txt"), b"payload\n").expect("dest");
+        let known: HashMap<PathBuf, (ObjectHash, u32)> =
+            [(PathBuf::from("d/same.txt"), (missing_oid, 0o100644))]
+                .into_iter()
+                .collect();
+        let mut changes2 = Changes {
+            new: vec![],
+            modified: vec![],
+            deleted: vec![PathBuf::from("d/same.txt")],
+            renamed: vec![],
+        };
+        detect_renames_with_destinations(
+            &mut changes2,
+            &config,
+            RenameBlobSide::Known(&known),
+            &[PathBuf::from("u/same.txt")],
+            &mut details,
+            &mut stats,
+            &mut budgets,
+        );
+        assert!(
+            !budgets.object_cache.is_empty(),
+            "the shared OID cache must return with the restored object budget"
+        );
+        assert!(
+            budgets.objects_slots < slots_before,
+            "the missing-object lookup consumed a slot that must be restored \
+             (before={slots_before} after={})",
+            budgets.objects_slots
+        );
+        assert!(
+            budgets.objects_total <= objects_before,
+            "object byte budget must never grow across a pass"
+        );
+    }
+}
+
+#[cfg(test)]
+mod seam_gate_test {
+    use super::*;
+
+    /// `LIBRA_TEST_STATUS_COMPARISON_BUDGET` must be honored only under the
+    /// test harness: without `LIBRA_TEST` the production cap stays in
+    /// effect; with the gate the override bites.
+    #[test]
+    #[serial_test::serial]
+    fn comparison_budget_override_requires_the_harness_gate() {
+        // SAFETY: serialized test body; every variable is removed again
+        // before the test returns.
+        unsafe {
+            std::env::set_var("LIBRA_TEST_STATUS_COMPARISON_BUDGET", "1");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            assert_eq!(
+                status_comparison_budget(),
+                rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS,
+                "without LIBRA_TEST the budget override must be ignored"
+            );
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            assert_eq!(
+                status_comparison_budget(),
+                1,
+                "with the gate the budget override applies"
+            );
+            std::env::remove_var("LIBRA_TEST_STATUS_COMPARISON_BUDGET");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+        }
     }
 }

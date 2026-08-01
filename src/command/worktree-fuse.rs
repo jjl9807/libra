@@ -28,8 +28,8 @@ mod legacy;
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
 pub(crate) use legacy::{
-    WorktreeError, WorktreeState, acquire_registry_lock, registry_knows_linked_worktree,
-    run_list_worktrees,
+    WorktreeError, WorktreeState, acquire_registry_lock, local_gitdir_for_scope,
+    registry_knows_linked_worktree, reject_bare_repository, run_list_worktrees,
 };
 
 const FUSE_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -95,12 +95,24 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         porcelain: bool,
     },
-    /// Report per-worktree scope diagnostics. STRICTLY READ-ONLY (W0 §C.11).
+    /// Diagnose worktree and Agent-workspace scopes. STRICTLY READ-ONLY
+    /// (W0 §C.11 / W4).
     ///
     /// Kept in parity with the non-FUSE build's subcommand set: this file
     /// re-declares the whole enum, so a command added there is simply absent
     /// here unless it is added here too.
-    Doctor,
+    Doctor {
+        /// Diagnose exactly one workspace. Cannot be combined with
+        /// `--limit`/`--cursor`.
+        #[clap(value_name = "WORKSPACE_ID")]
+        workspace_id: Option<String>,
+        /// Maximum diagnostics per page (default 50, capped at 500).
+        #[clap(long, value_name = "N")]
+        limit: Option<u64>,
+        /// Keyset cursor: the `next_cursor` of the previous page, verbatim.
+        #[clap(long, value_name = "CURSOR")]
+        cursor: Option<String>,
+    },
     Lock {
         /// Filesystem path of the worktree to lock.
         path: String,
@@ -277,7 +289,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     // to be re-stated or the FUSE build quietly upgrades what it diagnoses.
     if !matches!(
         &command,
-        WorktreeSubcommand::Umount { .. } | WorktreeSubcommand::Doctor
+        WorktreeSubcommand::Umount { .. } | WorktreeSubcommand::Doctor { .. }
     ) {
         // §C.7 ordering (same as the legacy entry point): apply pending
         // migrations — including the registry-v2 capability marker — before
@@ -341,7 +353,11 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             }
         }
         WorktreeSubcommand::List { porcelain } => list_all_worktrees(output, porcelain).await,
-        WorktreeSubcommand::Doctor => legacy::run_worktree_doctor(output).await,
+        WorktreeSubcommand::Doctor {
+            workspace_id,
+            limit,
+            cursor,
+        } => legacy::run_worktree_doctor(workspace_id, limit, cursor, output).await,
         WorktreeSubcommand::Lock { path, reason } => {
             if lock_fuse_worktree(&path, reason.clone())
                 .map_err(|e| CliError::fatal(e.to_string()))?
@@ -422,6 +438,10 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                         path,
                         migrate_layout,
                         dry_run,
+                        // Not exposed on the FUSE surface; the identity-repair
+                        // flow needs the canonical layout.
+                        resolve_identity: false,
+                        yes: false,
                     },
                 },
                 output,
@@ -717,6 +737,9 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 exists: Path::new(&entry.path).exists(),
                 state: "active",
                 layout: "task-fuse",
+                // FUSE worktrees live outside the registry, so no
+                // registration generation exists to fence on.
+                epoch: 0,
             });
         }
         return emit_json_data("worktree.list", &result, output);
@@ -740,6 +763,8 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 exists: Path::new(&entry.path).exists(),
                 state: "active",
                 layout: "task-fuse",
+                // FUSE worktrees live outside the registry — no generation.
+                epoch: 0,
             });
         }
         let porcelain = legacy::format_worktree_porcelain(&all)

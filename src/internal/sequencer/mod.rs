@@ -974,7 +974,7 @@ pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKin
         // W2: a sidecar whose writer RECORDED main's scope is proven main's,
         // even in a repository with linked history — the guess W1 had to make
         // is only made for files that carry no record (an old binary's).
-        let proven_main = sidecar_recorded_owner(&sidecar).as_deref() == Some("");
+        let proven_main = sidecar_recorded_owner(&sidecar)?.as_deref() == Some("");
         if !proven_main
             && !scope.is_linked()
             && crate::command::maintenance::repository_had_linked_worktrees()
@@ -1081,13 +1081,26 @@ async fn scoped_bisect_state_active<C: ConnectionTrait>(
 /// main's and stays operable. An absent field (an old binary's file) or an
 /// unreadable document answers `None`, which every caller treats as "cannot
 /// prove" — exactly the W1 rule.
-pub(crate) fn sidecar_recorded_owner(path: &std::path::Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value
+pub(crate) fn sidecar_recorded_owner(path: &std::path::Path) -> Result<Option<String>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // An UNREADABLE file is not evidence of anything — calling it
+        // "ownerless" would tell the user to inspect-or-delete a file whose
+        // real problem is a read error they need to see.
+        Err(error) => return Err(format!("cannot read '{}': {error}", path.display())),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        format!(
+            "'{}' is not valid JSON ({error}); the sidecar is corrupt, not merely \
+             unowned — repair or remove it after inspecting a backup",
+            path.display()
+        )
+    })?;
+    Ok(value
         .get("owner_scope")
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+        .map(str::to_string))
 }
 
 pub(crate) fn ambiguous_legacy_dir(storage: &std::path::Path) -> Option<std::path::PathBuf> {

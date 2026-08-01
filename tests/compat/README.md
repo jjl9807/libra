@@ -92,7 +92,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `r0_9_doc_closeout.rs` | plan-20260714 R0-9 | 文档收尾守卫：warning code/source 表、`io_blocked` schema（`reason` 枚举从 `io_blocked_reason_and_code` 源码提取，新增变体未同步文档即失败）、nested `renamed` 的 `{from, to}` 类型、三项 rename 配置键与 `COMPATIBILITY.md`、`diff.renameLimit` 降级语义（exact + unique-basename）与 CHANGELOG、警告投递矩阵（文本 stderr / JSON envelope，preflight 提示同规则），EN/zh 双语并行 |
 | `version_surface_sync.rs` | plan-20260714 PD-00 | 四处版本面（`Cargo.toml`、`web/package.json`、`worker/package.json`、`install.sh` `DEFAULT_VERSION`）必须一致，且 `DEFAULT_VERSION` 保留 `v` 前缀 |
 | `legacy_short_api_pre_r0_equivalence.rs` | plan-20260714 R0-6 | LEGACY tuple API `generate_short_format_status` keeps the pre-R0 decomposition (staged rename → `D `+`A `, unstaged rename → merged unstaged `D` + `??`, chain a→b→c → `D `/`AD`/`??` without duplicates); rename-aware consumers use `generate_short_status_entries` |
-| `compat_status_wave0_register.rs` (+ `status_wave0_manifest.rs`) | plan-20260714 R0-0 | `STATUS_WAVE0_TESTS` canonical manifest ↔ `tests/command/status_wave0_test.rs` bidirectional set equality via `cargo test --test command_test -- --list`; strict alphabetical ordering; non-empty guard |
+| `compat_status_wave0_register.rs` (+ `status_wave0_manifest.rs`) | plan-20260714 R0-0 | `STATUS_WAVE0_TESTS` canonical manifest ↔ `tests/command/status_wave0_test.rs` bidirectional set equality via `cargo test --test command_test -- --list`; strict alphabetical ordering; non-empty guard; `#[cfg(unix)]` cases are declared in the `STATUS_WAVE0_TESTS_UNIX_ONLY` subset and excluded from the expected set on non-Unix hosts |
 
 ## Authoring guidelines
 

@@ -192,9 +192,67 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
     }
 
     if let Some(conn) = connections.get(&db_path) {
-        return Ok(conn.clone());
+        let conn = conn.clone();
+        drop(connections);
+        // The fence must hold for CACHED connections too (W2 r5 #6): a
+        // long-lived process (the `libra code` server) whose cache predates
+        // another process's migration would otherwise keep writing under a
+        // schema its code does not know. One indexed MAX() on a tiny table
+        // per hit; an upgrade requirement or a future schema evicts the
+        // entry and re-resolves.
+        //
+        // SCOPE of the guarantee: this fences every acquisition THROUGH THIS
+        // CACHE. A different (old) binary is fenced by its own open-time
+        // check at its next connect; a connection handle an old process
+        // already holds is inherently beyond any new binary's reach — the
+        // migration protocol's claim-first transaction is what bounds the
+        // damage there (a schema rebuild fails the old writer's statements
+        // rather than accepting them).
+        match inspect_database_schema_for_connection(&conn).await {
+            Ok(SchemaCompatibility::Compatible { .. }) => return Ok(conn),
+            // PROVEN incompatibility: evict, and CLOSE the shared pool so
+            // every already-returned clone is refused too (W2 r7 #4). The
+            // close is spawned: `Pool::close` marks the pool closed at once
+            // (clones fail from that moment) but then WAITS for outstanding
+            // connections — awaiting that here while another task holds an
+            // open transaction on this pool would deadlock the process.
+            Ok(_) => {
+                let mut connections = TEST_DB_CONNECTIONS.lock().await;
+                let evicted = connections.remove(&db_path);
+                drop(connections);
+                let closing_path = db_path.clone();
+                tokio::spawn(async move {
+                    if let Some(stale) = evicted
+                        && let Err(error) = stale.close().await
+                    {
+                        tracing::warn!(
+                            db_path = %closing_path.display(),
+                            error = %error,
+                            "failed to close a schema-incompatible cached connection"
+                        );
+                    }
+                    let _ = conn.close().await;
+                });
+                // Fall through: re-establish, which re-checks and either
+                // upgrades or reports the future schema with its hint.
+            }
+            // A FAILED inspection is not evidence of incompatibility — a
+            // legitimate writer's open transaction makes this read report
+            // BUSY, and evicting (let alone closing) on that would tear the
+            // pool out from under the writer. Hand back the cached
+            // connection; the next acquisition re-checks.
+            Err(error) => {
+                tracing::debug!(
+                    db_path = %db_path.display(),
+                    error = %error,
+                    "schema re-check on a cached connection failed transiently; keeping it"
+                );
+                return Ok(conn);
+            }
+        }
+    } else {
+        drop(connections);
     }
-    drop(connections);
 
     let conn = get_db_conn_for_path(&db_path).await?;
 
@@ -883,6 +941,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2, "both writers' rows are present");
+    }
+
+    /// W2 r6 #5: the REAL lifecycle of the cache fence — a connection this
+    /// process already cached is refused (and evicted) the moment the
+    /// database's recorded schema moves past what this binary registers.
+    #[tokio::test]
+    async fn a_cached_connection_is_refused_after_the_schema_moves_ahead() {
+        let test_db = TestDbPath::new("cache_fence_lifecycle.db").await;
+        let path = std::path::PathBuf::from(&test_db.0);
+
+        // Populate the cache.
+        let cached = get_db_conn_instance_for_path(&path)
+            .await
+            .expect("first acquisition caches");
+
+        // Another actor moves the schema ahead of this binary. The write goes
+        // through the CACHED handle on purpose: the file is the same either
+        // way, and this proves the eviction is not relying on a fresh open.
+        cached
+            .execute_unprepared(
+                "INSERT INTO schema_versions (version, name, applied_at) \
+                 VALUES (2126010101, 'from-the-future', datetime('now'))",
+            )
+            .await
+            .expect("plant a future version");
+
+        // The NEXT acquisition through the cache must refuse, not hand the
+        // stale-schema handle back.
+        let error = get_db_conn_instance_for_path(&path)
+            .await
+            .expect_err("a cache hit over a future schema must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("newer than this Libra binary supports"),
+            "the refusal says why: {error}"
+        );
+
+        // And it stays refused — the eviction did not accidentally re-cache.
+        get_db_conn_instance_for_path(&path)
+            .await
+            .expect_err("still refused on the following acquisition");
+
+        // The RETAINED clone is dead too (W2 r7 #4): eviction closed the
+        // shared pool, so the old handle cannot keep writing under the stale
+        // schema from inside this process.
+        cached
+            .execute_unprepared("INSERT INTO config_kv (key, value) VALUES ('x', 'y')")
+            .await
+            .expect_err("the pre-eviction clone must be refused as well");
+        reset_db_conn_instance_for_path(&path).await;
     }
 
     #[tokio::test]

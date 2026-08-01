@@ -2097,9 +2097,15 @@ async fn sequencer_control_for(
         // `branch.<name>.rebase`, then `pull.rebase`), because a configured
         // `pull.rebase = true` makes a bare `libra pull` one of these.
         Commands::Pull(args) => {
-            return command::pull::will_rebase(args)
-                .await
-                .then_some(SequencerControl::Start(SequenceKind::Rebase));
+            // A MERGE-mode pull claims the slot too (W2 r7 #3): it fetches
+            // and then drives the internal merge, and starting that while a
+            // same-worktree merge/rebase control is active races its
+            // state/index/worktree exactly as a bare `merge` would.
+            return Some(if command::pull::will_rebase(args).await {
+                SequencerControl::Start(SequenceKind::Rebase)
+            } else {
+                SequencerControl::Start(SequenceKind::Merge)
+            });
         }
         // §C.9: merge's control actions enter the boundary too — `--continue`
         // and `--restart` reset this worktree and rewrite its sequencer state,

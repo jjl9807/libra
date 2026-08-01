@@ -451,6 +451,503 @@ fn a_corrupt_sidecar_root_fails_the_prune_closed() {
     );
 }
 
+/// W2 r6 #2: a journaled branch whose tip MOVED is kept — it carries the
+/// user's commits now — and recovery SAYS so instead of silently retaining a
+/// branch that would later look like corruption.
+#[test]
+fn recovery_keeps_and_reports_a_journaled_branch_the_user_committed_to() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let base = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // The half-state, PLUS a user commit on the journaled branch.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "kept-branch"], main),
+        "switch",
+    );
+    fs::write(main.join("mine.txt"), "the user's work\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "mine.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "user work", "--no-verify"], main),
+        "the user's commit moves the tip past the journaled base",
+    );
+    fs::write(
+        main.join(".libra").join("stash-branch-journal.json"),
+        serde_json::json!({
+            "branch": "kept-branch",
+            "base": base,
+            "prior_branch": "main",
+            "prior_detached": null,
+            "phase": "prepared",
+            "nonce": "test-nonce-kept"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let db = main.join(".libra").join("libra.db");
+    let reference_id = sqlite_query(
+        &db,
+        "SELECT id FROM reference WHERE name = 'kept-branch' AND kind = 'Branch'",
+    )
+    .pop()
+    .expect("the branch has a row id");
+    assert!(
+        sqlite_exec(
+            &db,
+            &[&format!(
+                "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, \
+                 updated_at) VALUES ('stash_branch_journal', 'test-nonce-kept', \
+                 'reference_id', '{reference_id}', 'text', datetime('now'), datetime('now'))"
+            )],
+        ),
+        "record the creation provenance"
+    );
+
+    let out = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&out, "recovery runs");
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        text.contains("KEPT"),
+        "recovery reports the retained branch out loud: {text}"
+    );
+    let branches = run_libra_command(&["branch"], main);
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).contains("kept-branch"),
+        "the branch with the user's commit survives"
+    );
+    assert!(
+        !main
+            .join(".libra")
+            .join("stash-branch-journal.json")
+            .exists(),
+        "and the journal is concluded"
+    );
+}
+
+/// W2 r5: `worktree remove` refuses while a stash-branch rollback journal is
+/// pending — removing the gitdir would strand the half-created branch AND
+/// delete the only instruction for undoing it.
+#[test]
+fn worktree_remove_refuses_a_pending_stash_branch_journal() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("journaled-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    fs::write(
+        wt.join(".libra").join("stash-branch-journal.json"),
+        serde_json::json!({
+            "branch": "half",
+            "base": "0000000000000000000000000000000000000000",
+            "prior_branch": null,
+            "prior_detached": null,
+            "phase": "prepared",
+            "nonce": "test-nonce-guard"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "remove must refuse while the journal is pending: {text}"
+    );
+    assert!(
+        text.contains("stash-branch-journal.json"),
+        "and name it: {text}"
+    );
+
+    // Any stash command in that worktree completes the (no-op) rollback…
+    assert_cli_success(
+        &run_libra_command(&["stash", "list"], &wt),
+        "recovery clears the journal",
+    );
+    // …after which removal succeeds.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "remove succeeds once the journal is recovered",
+    );
+}
+
+/// W2 r7 #3: a MERGE-mode `pull` claims the worktree control slot — it must
+/// be refused while a merge is already in progress here, BEFORE it fetches
+/// or touches anything.
+#[test]
+fn merge_mode_pull_is_refused_while_a_merge_is_in_progress() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-line", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "other"], main), "switch");
+    fs::write(main.join("a.txt"), "other-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add other");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other-line", "--no-verify"], main),
+        "commit other",
+    );
+    let merged = run_libra_command(&["merge", "main"], main);
+    assert!(!merged.status.success(), "the merge must conflict");
+    let state_before = fs::read(main.join(".libra/merge-state.json")).unwrap();
+
+    let out = run_libra_command(&["pull"], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        !out.status.success(),
+        "a merge-mode pull must be refused mid-merge: {text}"
+    );
+    assert!(
+        text.contains("merge"),
+        "the refusal names the in-progress operation, not a network error: {text}"
+    );
+    assert!(
+        !text.contains("network"),
+        "and it never got as far as fetching: {text}"
+    );
+    assert_eq!(
+        fs::read(main.join(".libra/merge-state.json")).unwrap(),
+        state_before,
+        "nothing was touched"
+    );
+}
+
+/// W2 r6 #6: every merge CONTROL refuses a corrupt held-autostash BEFORE it
+/// mutates — `--abort` in particular must not restore HEAD/index and delete
+/// the merge state while the only stash reference is a file nothing can
+/// parse.
+#[test]
+fn merge_controls_refuse_a_corrupt_held_autostash_before_mutating() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    // Two diverging tips on the same file → a conflicted merge with state.
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("a.txt"), "main-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-line", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "other"], main), "switch");
+    fs::write(main.join("a.txt"), "other-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add other");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other-line", "--no-verify"], main),
+        "commit other",
+    );
+    let merged = run_libra_command(&["merge", "main"], main);
+    assert!(!merged.status.success(), "the merge must conflict");
+    let state_path = main.join(".libra").join("merge-state.json");
+    assert!(state_path.exists(), "conflicted merge state persists");
+    let state_before = fs::read(&state_path).unwrap();
+    let head_before = run_libra_command(&["rev-parse", "HEAD"], main).stdout;
+
+    // The corrupt sidecar the controls must trip over.
+    let sidecar = main.join(".libra").join("merge-autostash.json");
+    fs::write(&sidecar, "{ not json").unwrap();
+    let sidecar_before = fs::read(&sidecar).unwrap();
+
+    for control in [
+        ["merge", "--continue"],
+        ["merge", "--restart"],
+        ["merge", "--abort"],
+    ] {
+        let out = run_libra_command(&control, main);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "{control:?} must refuse over a corrupt sidecar: {text}"
+        );
+        assert!(
+            text.contains("merge-autostash.json"),
+            "{control:?} names the file: {text}"
+        );
+        // NOTHING moved: the merge state, HEAD and the sidecar are untouched.
+        assert_eq!(
+            fs::read(&state_path).unwrap(),
+            state_before,
+            "{control:?} must not touch the merge state"
+        );
+        assert_eq!(
+            run_libra_command(&["rev-parse", "HEAD"], main).stdout,
+            head_before,
+            "{control:?} must not move HEAD"
+        );
+        assert_eq!(
+            fs::read(&sidecar).unwrap(),
+            sidecar_before,
+            "{control:?} must not touch the sidecar either"
+        );
+    }
+
+    // Removing the corrupt file lets the control conclude the merge.
+    fs::remove_file(&sidecar).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--abort"], main),
+        "abort succeeds once the sidecar is readable/absent",
+    );
+}
+
+/// W2 r4: a CORRUPT held-autostash sidecar is a hard stop, not a skip.
+///
+/// The old `let Ok(...)` silently skipped the unreadable file; a later
+/// `--autostash` save then OVERWROTE it — destroying the only durable
+/// reference to the held commit, which GC could then collect.
+#[test]
+fn a_corrupt_held_autostash_refuses_the_merge_and_survives() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("b.txt"), "other\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other", "--no-verify"], main),
+        "commit",
+    );
+
+    let sidecar = main.join(".libra").join("merge-autostash.json");
+    fs::write(&sidecar, "{ not json").unwrap();
+    let before = fs::read(&sidecar).unwrap();
+
+    let out = run_libra_command(&["merge", "--autostash", "other"], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a merge over an unreadable held-autostash must refuse: {text}"
+    );
+    assert!(
+        text.contains("merge-autostash.json"),
+        "and name the file: {text}"
+    );
+    assert_eq!(
+        fs::read(&sidecar).unwrap(),
+        before,
+        "the corrupt sidecar was NOT overwritten — it is the only reference \
+         to the held commit"
+    );
+}
+
+/// W2 r4: a LINKED worktree may not promote a foreign-marked autostash
+/// either — a manually copied sidecar carries its true owner's scope, and
+/// promoting adopts its commit into the shared list and deletes the evidence.
+#[test]
+fn a_foreign_marked_autostash_is_refused_in_a_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("foreign-autostash-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "other"], main), "branch");
+    fs::write(main.join("b.txt"), "other\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "other", "--no-verify"], main),
+        "commit",
+    );
+
+    // A sidecar inside the LINKED gitdir, marked as someone else's.
+    let sidecar = wt.join(".libra").join("merge-autostash.json");
+    fs::write(
+        &sidecar,
+        serde_json::json!({
+            "stash_commit": "1111111111111111111111111111111111111111",
+            "owner_scope": "some-other-worktree"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["merge", "other"], &wt);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "a foreign-marked sidecar must refuse the merge that would promote it: {text}"
+    );
+    assert!(
+        text.contains("some-other-worktree"),
+        "and the refusal names the recorded owner: {text}"
+    );
+    assert!(sidecar.exists(), "the evidence survives");
+}
+
+/// §C.10: an interrupted `stash branch` rollback is completed from its
+/// journal by the next stash invocation — HEAD restored, the branch deleted
+/// tip-conditionally, the journal removed, the working tree untouched.
+#[test]
+fn an_interrupted_stash_branch_rollback_completes_from_the_journal() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // The half-state an interrupted command leaves: the branch exists at its
+    // base, HEAD sits on it, the journal records the rollback intent, and the
+    // PROVENANCE row — written atomically with the branch by the create's
+    // transaction — records the branch row's id.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "half-branch"], main),
+        "enter the half-state",
+    );
+    fs::write(
+        main.join(".libra").join("stash-branch-journal.json"),
+        serde_json::json!({
+            "branch": "half-branch",
+            "base": head,
+            "prior_branch": "main",
+            "prior_detached": null,
+            "phase": "prepared",
+            "nonce": "test-nonce-interrupted"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let db = main.join(".libra").join("libra.db");
+    let reference_id = sqlite_query(
+        &db,
+        "SELECT id FROM reference WHERE name = 'half-branch' AND kind = 'Branch'",
+    )
+    .pop()
+    .expect("the created branch has a row id");
+    assert!(
+        sqlite_exec(
+            &db,
+            &[&format!(
+                "INSERT INTO metadata_kv (scope, target, key, value, value_type, created_at, \
+                 updated_at) VALUES ('stash_branch_journal', 'test-nonce-interrupted', \
+                 'reference_id', '{reference_id}', 'text', datetime('now'), datetime('now'))"
+            )],
+        ),
+        "record the creation provenance"
+    );
+
+    // ANY stash command completes the rollback first.
+    let out = run_libra_command(&["stash", "list"], main);
+    assert_cli_success(&out, "stash list runs the recovery");
+
+    let status = run_libra_command(&["status"], main);
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("On branch main"),
+        "HEAD is back on the prior branch: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let branches = run_libra_command(&["branch"], main);
+    assert!(
+        !String::from_utf8_lossy(&branches.stdout).contains("half-branch"),
+        "the journaled branch was deleted at its base"
+    );
+    assert!(
+        !main
+            .join(".libra")
+            .join("stash-branch-journal.json")
+            .exists(),
+        "and the journal is gone"
+    );
+}
+
+/// §C.4.3: `worktree remove` refuses a worktree holding a conflicted merge —
+/// in BOTH modes. Detaching writes the fail-closed marker OVER the live
+/// sidecar (stranding the merge behind a gate the user cannot lift without
+/// `repair`); deleting destroys it outright.
+#[test]
+fn worktree_remove_refuses_an_in_progress_merge() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("mid-merge-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Diverge and start a conflicted merge in the linked worktree.
+    assert_cli_success(
+        &run_libra_command(&["branch", "sideline"], main),
+        "branch sideline",
+    );
+    fs::write(main.join("a.txt"), "main-side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-side", "--no-verify"], main),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "sideline"], &wt), "switch");
+    fs::write(wt.join("a.txt"), "wt-side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "wt-side", "--no-verify"], &wt),
+        "wt commit",
+    );
+    let merged = run_libra_command(&["merge", "main"], &wt);
+    assert!(!merged.status.success(), "the merge must conflict");
+
+    for args in [
+        vec!["worktree", "remove", wt.to_str().unwrap()],
+        vec!["worktree", "remove", "--delete-dir", wt.to_str().unwrap()],
+    ] {
+        let out = run_libra_command(&args, main);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "remove must refuse a worktree mid-merge ({args:?}): {text}"
+        );
+        assert!(
+            text.contains("merge-state.json"),
+            "and the refusal names the in-progress state: {text}"
+        );
+    }
+    assert!(
+        wt.join(".libra/merge-state.json").exists(),
+        "the merge state survives both refusals"
+    );
+
+    // Aborting the merge lifts the refusal.
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], &wt), "abort");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "remove succeeds once the merge is gone",
+    );
+}
+
 /// §C.11 W2 acceptance: a conflicted MERGE in one worktree and a conflicted
 /// REVERT in another, at the same time, with neither seeing the other's.
 ///
@@ -4544,8 +5041,8 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         assert_eq!(
             rolled,
             vec![
-                2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902, 2026072901,
-                2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+                2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
+                2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
             ]
         );
         conn.close().await.expect("close");
@@ -6213,6 +6710,54 @@ fn legacy_symlink_mutation_fails_closed() {
     );
 }
 
+/// §C.4.3: `repair --migrate-layout` refuses while the SHARED storage holds
+/// an active merge/revert or held autostash — a legacy-symlink worktree
+/// shares that storage, so some worktree owns the operation and must
+/// conclude it before the layout underneath it changes.
+#[cfg(unix)]
+#[test]
+fn migrate_layout_refuses_active_shared_sidecar_state() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let _wt = create_legacy_symlink_worktree(main, "wt-blocked-migrate");
+
+    // An active merge in shared storage (owner unknowable in legacy layout).
+    fs::write(
+        main.join(".libra").join("merge-state.json"),
+        "{\"head_name\":\"main\"}",
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "migration must refuse over an active shared merge: {text}"
+    );
+    assert!(
+        text.contains("merge-state.json"),
+        "and the refusal names the state: {text}"
+    );
+    assert!(
+        fs::symlink_metadata(_wt.join(".libra"))
+            .expect("gitdir meta")
+            .file_type()
+            .is_symlink(),
+        "the refusal wrote nothing — the legacy symlink is untouched"
+    );
+
+    // Clearing the state lifts the refusal.
+    fs::remove_file(main.join(".libra").join("merge-state.json")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        "migration succeeds once the state is gone",
+    );
+}
+
 /// §C.6.2: migration preserves dirty/untracked FILES byte-for-byte, does
 /// not copy staged state, seeds a detached HEAD at the shared snapshot,
 /// and flips the layout to linked-v2. `--dry-run` writes nothing.
@@ -6859,15 +7404,16 @@ fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
         sqlite_exec(
             &db,
             &[
-                "DELETE FROM worktree_registry_capability WHERE version = 3",
-                "DELETE FROM schema_versions WHERE version = 2026073005",
+                "DELETE FROM metadata_kv WHERE scope = 'repository' AND target = '' \
+                 AND key = 'stash.reflog.generation'",
+                "DELETE FROM schema_versions WHERE version = 2026073101",
             ],
         ),
         "put the repository one migration behind"
     );
     assert!(
-        sqlite_max_schema_version(&db) < 2026073005,
-        "2026073005 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026073101,
+        "2026073101 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

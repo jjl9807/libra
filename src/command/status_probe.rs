@@ -40,6 +40,7 @@ impl ProbeLimits {
     pub(crate) fn effective() -> Self {
         let read = |name: &str, default: usize| -> usize {
             if cfg!(debug_assertions)
+                && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
                 && let Ok(value) = std::env::var(name)
                 && let Ok(parsed) = value.parse::<usize>()
                 && parsed > 0
@@ -92,6 +93,7 @@ impl IoBlockedReason {
 /// `LIBRA_TEST_STATUS_IO_TIMEOUT_MS` so tests can trip it deterministically.
 pub(crate) fn io_op_timeout() -> std::time::Duration {
     if cfg!(debug_assertions)
+        && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
         && let Ok(value) = std::env::var("LIBRA_TEST_STATUS_IO_TIMEOUT_MS")
         && let Ok(ms) = value.parse::<u64>()
         && ms > 0
@@ -113,6 +115,11 @@ type IoJob = Box<dyn FnOnce() + Send + 'static>;
 struct IoWorkerPool {
     queue: std::sync::Mutex<std::collections::VecDeque<IoJob>>,
     ready: std::sync::Condvar,
+    /// Join handles of every spawned worker. Workers park on `ready`
+    /// between jobs and are REUSED, but their handles stay owned by the
+    /// pool: dropping a handle would detach the thread, and the scan
+    /// contract is a bounded pool with NO detached threads (§B.3.4).
+    handles: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 static IO_POOL: std::sync::OnceLock<std::sync::Arc<IoWorkerPool>> = std::sync::OnceLock::new();
@@ -164,6 +171,7 @@ where
         std::sync::Arc::new(IoWorkerPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ready: std::sync::Condvar::new(),
+            handles: std::sync::Mutex::new(Vec::new()),
         })
     });
 
@@ -188,14 +196,20 @@ where
         .is_ok()
     {
         let worker_pool = std::sync::Arc::clone(pool);
-        if std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("libra-status-io".to_string())
             .spawn(move || run_io_worker(&worker_pool))
-            .is_err()
         {
-            IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
-            IO_BUSY.fetch_sub(1, Ordering::SeqCst);
-            return Err(());
+            Ok(handle) => pool
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(handle),
+            Err(_) => {
+                IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                IO_BUSY.fetch_sub(1, Ordering::SeqCst);
+                return Err(());
+            }
         }
     }
 
@@ -293,6 +307,7 @@ where
         std::sync::Arc::new(IoWorkerPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ready: std::sync::Condvar::new(),
+            handles: std::sync::Mutex::new(Vec::new()),
         })
     });
     if IO_BUSY
@@ -311,14 +326,20 @@ where
         .is_ok()
     {
         let worker_pool = std::sync::Arc::clone(pool);
-        if std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("libra-status-io".to_string())
             .spawn(move || run_io_worker(&worker_pool))
-            .is_err()
         {
-            IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
-            IO_BUSY.fetch_sub(1, Ordering::SeqCst);
-            return Err(());
+            Ok(handle) => pool
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(handle),
+            Err(_) => {
+                IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                IO_BUSY.fetch_sub(1, Ordering::SeqCst);
+                return Err(());
+            }
         }
     }
     let hash_kind = git_internal::hash::get_hash_kind();
@@ -651,6 +672,23 @@ pub(crate) fn probe_rename_destinations(
     let workdir = filter.workdir;
 
     'roots: for root in roots {
+        let blocked_before = outcome.io_blocked.len();
+        let truncated_before = outcome.truncated.is_some();
+        let root_abs = workdir.join(root);
+        // Containment is checked BEFORE anything else touches the root —
+        // including the metadata/gitlink exclusions below. An intermediate
+        // symlink can point a root like `link/.git` at a directory outside
+        // the worktree; if that outside directory happens to hold a
+        // `.git`/`.libra` marker the metadata check would "exclude a nested
+        // repository" and move on silently, never recording the escape.
+        if !root.as_os_str().is_empty() && !resolves_inside(&root_abs, workdir) {
+            outcome.io_blocked.push(IoBlockedEvent {
+                path: root.clone(),
+                reason: IoBlockedReason::IoError,
+                absorbed: false,
+            });
+            continue;
+        }
         // §B.3.2: repository metadata is excluded UNCONDITIONALLY, including
         // when a pathspec names it directly (`libra status -- .libra`). The
         // per-entry child filter below only sees children, so without this a
@@ -663,23 +701,6 @@ pub(crate) fn probe_rename_destinations(
         // `status -- nested-repo` (or a gitlink path) walks straight into a
         // foreign repository because the child filter never sees the root.
         if !root.as_os_str().is_empty() && filter.is_gitlink_dir(root) {
-            continue;
-        }
-        let blocked_before = outcome.io_blocked.len();
-        let truncated_before = outcome.truncated.is_some();
-        let root_abs = workdir.join(root);
-        // Containment is checked BEFORE anything else touches the root —
-        // including the marker probe. An intermediate symlink can point a
-        // root like `link/child` at a directory outside the worktree, and if
-        // that外部 directory happens to hold a `.git`/`.libra` marker the
-        // probe would have "excluded a nested repository" and moved on
-        // silently, never recording the escape.
-        if !root.as_os_str().is_empty() && !resolves_inside(&root_abs, workdir) {
-            outcome.io_blocked.push(IoBlockedEvent {
-                path: root.clone(),
-                reason: IoBlockedReason::IoError,
-                absorbed: false,
-            });
             continue;
         }
         let root_stat_target = root_abs.clone();
@@ -818,13 +839,18 @@ pub(crate) fn probe_rename_destinations(
                     let mut taken = 0usize;
                     let mut hit_cap = false;
                     for entry in reader {
-                        if taken == remaining {
-                            // One past the budget: stop reading immediately.
+                        taken += 1;
+                        ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if taken > remaining {
+                            // The entry that PROVES truncation cost a real
+                            // readdir, so it is charged too — but never
+                            // processed. Reading it PAST the cap check (the
+                            // `for` loop used to pull it uncharged) is how
+                            // a wide directory overran the budget by one
+                            // entry per directory.
                             hit_cap = true;
                             break;
                         }
-                        taken += 1;
-                        ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         match entry {
                             Ok(entry) => entries.push(entry.file_name()),
                             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -1055,4 +1081,55 @@ pub(crate) fn collapse_untracked_markers(
         // dir the probe never saw keeps its marker conservatively.
         !saw_candidate
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The debug-only env overrides must be honored only under the test
+    /// harness: with the variables set but `LIBRA_TEST` absent, production
+    /// defaults stay in effect; with the gate present, the overrides bite.
+    #[test]
+    #[serial_test::serial]
+    fn seam_timeouts_and_probe_limits_require_the_harness_gate() {
+        // SAFETY: serialized test body; every variable is removed again
+        // before the test returns.
+        unsafe {
+            std::env::set_var("LIBRA_TEST_STATUS_IO_TIMEOUT_MS", "1");
+            std::env::set_var("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET", "1");
+            std::env::set_var("LIBRA_TEST_STATUS_PROBE_DEST_BUDGET", "1");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+
+            assert_eq!(
+                io_op_timeout(),
+                std::time::Duration::from_secs(10),
+                "without LIBRA_TEST the timeout override must be ignored"
+            );
+            let limits = ProbeLimits::effective();
+            assert_eq!(
+                limits.max_enumerated_entries, PROBE_MAX_ENUMERATED_ENTRIES,
+                "without LIBRA_TEST the enum-budget override must be ignored"
+            );
+            assert_eq!(
+                limits.max_qualified_destinations, PROBE_MAX_QUALIFIED_DESTINATIONS,
+                "without LIBRA_TEST the dest-budget override must be ignored"
+            );
+
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            assert_eq!(
+                io_op_timeout(),
+                std::time::Duration::from_millis(1),
+                "with the gate the timeout override applies"
+            );
+            let limits = ProbeLimits::effective();
+            assert_eq!(limits.max_enumerated_entries, 1);
+            assert_eq!(limits.max_qualified_destinations, 1);
+
+            std::env::remove_var("LIBRA_TEST_STATUS_IO_TIMEOUT_MS");
+            std::env::remove_var("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET");
+            std::env::remove_var("LIBRA_TEST_STATUS_PROBE_DEST_BUDGET");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+        }
+    }
 }
