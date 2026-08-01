@@ -1917,31 +1917,42 @@ fn build_rename_side(
                 // §B.3.3: this OPTIONAL stat runs under the deadline like
                 // every other worktree read — a hung mount must cost the
                 // rename candidate and a warning, not the whole command.
-                // Debug-only seam for the scan→stat disappearance race. It
-                // REMOVES the named path so the stat below returns a genuine
-                // `NotFound` from the OS — synthesizing the error instead
-                // would leave the real branch untested.
+                // Debug-only seam for the scan→stat disappearance race: the
+                // named path's stat is overridden with a genuine `NotFound`
+                // error kind — the same branch an OS-level deletion drives,
+                // without the hook mutating the worktree. Gated on
+                // `LIBRA_TEST` like every seam in this family.
                 #[cfg(debug_assertions)]
-                if std::env::var("LIBRA_TEST_VANISH_PATH")
-                    .ok()
-                    .filter(|target| !target.is_empty())
-                    .is_some_and(|target| repo_key == std::path::Path::new(&target))
-                {
-                    let _ = std::fs::remove_file(&abs);
-                }
+                let forced_vanish = std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+                    && std::env::var("LIBRA_TEST_VANISH_PATH")
+                        .ok()
+                        .filter(|target| !target.is_empty())
+                        .is_some_and(|target| repo_key == std::path::Path::new(&target));
+                #[cfg(not(debug_assertions))]
+                let forced_vanish = false;
                 let stat_target = abs.clone();
                 let stat = crate::command::status_probe::with_io_deadline(move || {
                     stat_target.symlink_metadata()
                 })
                 .unwrap_or_else(|()| Err(io::Error::new(io::ErrorKind::TimedOut, "reclaimed")));
+                let stat = if forced_vanish {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "simulated vanish for the test seam",
+                    ))
+                } else {
+                    stat
+                };
                 // Debug-only seam for the stat→hash race, which is far too
                 // narrow to hit reliably from a test: the named path is
                 // treated as having changed TYPE between the two reads.
                 #[cfg(debug_assertions)]
-                let forced_type_race = std::env::var("LIBRA_TEST_TYPE_RACE_PATH")
-                    .ok()
-                    .filter(|target| !target.is_empty())
-                    .is_some_and(|target| repo_key == std::path::Path::new(&target));
+                let forced_type_race = std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV)
+                    .is_some()
+                    && std::env::var("LIBRA_TEST_TYPE_RACE_PATH")
+                        .ok()
+                        .filter(|target| !target.is_empty())
+                        .is_some_and(|target| repo_key == std::path::Path::new(&target));
                 #[cfg(not(debug_assertions))]
                 let forced_type_race = false;
                 let stat_kind = stat.as_ref().err().map(|error| error.kind());
@@ -2014,7 +2025,8 @@ fn build_rename_side(
 /// allowance without generating 500k real comparisons.
 fn status_comparison_budget() -> u64 {
     #[cfg(debug_assertions)]
-    if let Ok(value) = std::env::var("LIBRA_TEST_STATUS_COMPARISON_BUDGET")
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+        && let Ok(value) = std::env::var("LIBRA_TEST_STATUS_COMPARISON_BUDGET")
         && let Ok(parsed) = value.parse::<u64>()
         && parsed > 0
     {
@@ -4833,7 +4845,8 @@ fn get_worktree_mode_result_for_workdir(workdir_path: &std::path::Path) -> Workt
     // reachable by winning a race between collection and rendering, so tests
     // name the path that must report as unreadable.
     #[cfg(debug_assertions)]
-    if let Ok(target) = std::env::var("LIBRA_TEST_UNREADABLE_MODE_PATH")
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+        && let Ok(target) = std::env::var("LIBRA_TEST_UNREADABLE_MODE_PATH")
         && !target.is_empty()
         && workdir_path == std::path::Path::new(&target)
     {
@@ -7092,5 +7105,37 @@ mod rename_destination_budget_test {
             budgets.objects_total <= objects_before,
             "object byte budget must never grow across a pass"
         );
+    }
+}
+
+#[cfg(test)]
+mod seam_gate_test {
+    use super::*;
+
+    /// `LIBRA_TEST_STATUS_COMPARISON_BUDGET` must be honored only under the
+    /// test harness: without `LIBRA_TEST` the production cap stays in
+    /// effect; with the gate the override bites.
+    #[test]
+    #[serial_test::serial]
+    fn comparison_budget_override_requires_the_harness_gate() {
+        // SAFETY: serialized test body; every variable is removed again
+        // before the test returns.
+        unsafe {
+            std::env::set_var("LIBRA_TEST_STATUS_COMPARISON_BUDGET", "1");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            assert_eq!(
+                status_comparison_budget(),
+                rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS,
+                "without LIBRA_TEST the budget override must be ignored"
+            );
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            assert_eq!(
+                status_comparison_budget(),
+                1,
+                "with the gate the budget override applies"
+            );
+            std::env::remove_var("LIBRA_TEST_STATUS_COMPARISON_BUDGET");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+        }
     }
 }

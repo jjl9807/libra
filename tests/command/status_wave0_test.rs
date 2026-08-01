@@ -5096,6 +5096,127 @@ fn porcelain_v2_rename_unreadable_mode_fails_closed() {
     );
 }
 
+/// Debug test seams must be IGNORED outside the test harness: with the
+/// override variables set but `LIBRA_TEST` removed from the environment,
+/// the production defaults stay in effect. Three edited moves need real
+/// inexact comparisons, so an honored `LIBRA_TEST_STATUS_COMPARISON_BUDGET=1`
+/// would exhaust after the first edge and degrade the run; an honored
+/// `LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET=1` would truncate the probe and
+/// warn. The I/O-timeout and unreadable-mode overrides have their own
+/// negative coverage (`status_probe::tests` and
+/// `seam_unreadable_mode_override_is_ignored_without_the_harness_gate`).
+#[test]
+fn seam_env_overrides_are_ignored_without_the_harness_gate() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    // 40-line bodies score well above the 50% threshold, and the marker
+    // line makes the same-index edge the top score in the exhaustive stage.
+    for i in 0..3 {
+        let body: String = (0..40)
+            .map(|l| {
+                if l == 20 {
+                    format!("marker {i}\n")
+                } else {
+                    format!("line {l}\n")
+                }
+                .to_string()
+            })
+            .collect();
+        fs::write(repo.path().join(format!("src{i}.txt")), body).unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage base files");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit base files");
+    // Three moved AND edited destinations: every pair needs inexact
+    // scoring, so the comparison budget is spent per edge.
+    for i in 0..3 {
+        let body: String = (0..40)
+            .map(|l| {
+                if l == 20 {
+                    format!("marker {i}\n")
+                } else if l == 5 {
+                    "line five EDITED\n".to_string()
+                } else {
+                    format!("line {l}\n")
+                }
+                .to_string()
+            })
+            .collect();
+        fs::rename(
+            repo.path().join(format!("src{i}.txt")),
+            repo.path().join(format!("dest{i}.txt")),
+        )
+        .unwrap();
+        fs::write(repo.path().join(format!("dest{i}.txt")), body).unwrap();
+    }
+    enable_rename_untracked(repo.path());
+
+    let out = base_libra_command(&["--json", "status"], repo.path())
+        .env_remove("LIBRA_TEST")
+        .env("LIBRA_TEST_STATUS_COMPARISON_BUDGET", "1")
+        .env("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET", "1")
+        .output()
+        .expect("run status without the harness gate");
+    assert!(out.status.success(), "status runs: {out:?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    for i in 0..3 {
+        assert!(
+            doc["data"]["renames"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|x| x["to"] == format!("dest{i}.txt"))),
+            "dest{i}.txt must pair: the ungated overrides must not change the outcome: {doc}"
+        );
+    }
+    assert_eq!(
+        doc["data"]["rename_detection_complete"], true,
+        "and the run is not degraded by an ignored budget override: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["warnings"],
+        serde_json::json!([]),
+        "no probe/budget warning from ignored overrides: {doc}"
+    );
+}
+
+/// The unreadable-mode seam must be ignored without the harness gate: the
+/// porcelain v2 record renders the REAL worktree mode instead of failing
+/// closed (the positive arm is
+/// `porcelain_v2_rename_unreadable_mode_fails_closed`).
+#[test]
+fn seam_unreadable_mode_override_is_ignored_without_the_harness_gate() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), &edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage the rename");
+
+    let out = base_libra_command(&["status", "--porcelain=v2"], repo.path())
+        .env_remove("LIBRA_TEST")
+        .env("LIBRA_TEST_UNREADABLE_MODE_PATH", "moved.txt")
+        .output()
+        .expect("run status without the harness gate");
+    assert!(
+        out.status.success(),
+        "with the override ignored the record renders normally: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.lines().any(|l| l.starts_with("2 ")),
+        "the v2 rename record is emitted: {stdout}"
+    );
+    assert!(
+        stdout.contains("100644"),
+        "the real worktree mode is rendered, not the fail-closed branch: {stdout}"
+    );
+}
+
 /// §B.4.1: a candidate whose TYPE changes between the snapshot stat and the
 /// OID read is dropped, not paired. Otherwise a regular file replaced by a
 /// symlink hands the exact gate a symlink-target OID labelled `Regular`.
@@ -5201,14 +5322,13 @@ fn worktree_candidate_vanishes_between_scan_and_hash() {
 }
 
 /// §B.4.1 companion to the type-race case above, driving the OTHER branch:
-/// the candidate is genuinely GONE by the time the snapshot stats it, so
-/// `symlink_metadata()` returns a real `NotFound` from the OS. The type-race
-/// seam never reaches this arm — it takes the `observed_kind != kind` exit
-/// further down — so without this test `NotFound` could be special-cased
-/// into a silent skip and nothing would notice. A path that existed when the
-/// scan enumerated it and is missing a moment later cost a rename candidate;
-/// reporting the run as complete would claim a pairing was ruled out when it
-/// was never attempted.
+/// the candidate is reported `NotFound` by the time the snapshot stats it.
+/// The type-race seam never reaches this arm — it takes the
+/// `observed_kind != kind` exit further down — so without this test
+/// `NotFound` could be special-cased into a silent skip and nothing would
+/// notice. A path that existed when the scan enumerated it and is missing a
+/// moment later cost a rename candidate; reporting the run as complete
+/// would claim a pairing was ruled out when it was never attempted.
 #[test]
 #[cfg(unix)]
 fn worktree_candidate_not_found_between_scan_and_hash() {
@@ -5216,8 +5336,9 @@ fn worktree_candidate_not_found_between_scan_and_hash() {
     enable_rename_untracked(repo.path());
     fs::write(repo.path().join("other.txt"), "unrelated\n").unwrap();
 
-    // The seam DELETES the file just before the stat, so the error is the
-    // filesystem's own `NotFound` rather than a synthesized one.
+    // The seam overrides the candidate's stat with a genuine `NotFound`
+    // error kind — the same branch an OS-level deletion drives, without
+    // the hook mutating the worktree.
     let out = run_libra_command_with_stdin_and_env(
         &["--json", "status"],
         repo.path(),
@@ -5228,8 +5349,8 @@ fn worktree_candidate_not_found_between_scan_and_hash() {
     let doc: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
     assert!(
-        !repo.path().join("dest.txt").exists(),
-        "the seam really removed the candidate"
+        repo.path().join("dest.txt").exists(),
+        "the seam only simulates the failure — it must never mutate the worktree"
     );
     assert_eq!(
         doc["data"]["renames"],

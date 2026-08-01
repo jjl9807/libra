@@ -40,6 +40,7 @@ impl ProbeLimits {
     pub(crate) fn effective() -> Self {
         let read = |name: &str, default: usize| -> usize {
             if cfg!(debug_assertions)
+                && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
                 && let Ok(value) = std::env::var(name)
                 && let Ok(parsed) = value.parse::<usize>()
                 && parsed > 0
@@ -92,6 +93,7 @@ impl IoBlockedReason {
 /// `LIBRA_TEST_STATUS_IO_TIMEOUT_MS` so tests can trip it deterministically.
 pub(crate) fn io_op_timeout() -> std::time::Duration {
     if cfg!(debug_assertions)
+        && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
         && let Ok(value) = std::env::var("LIBRA_TEST_STATUS_IO_TIMEOUT_MS")
         && let Ok(ms) = value.parse::<u64>()
         && ms > 0
@@ -1055,4 +1057,55 @@ pub(crate) fn collapse_untracked_markers(
         // dir the probe never saw keeps its marker conservatively.
         !saw_candidate
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The debug-only env overrides must be honored only under the test
+    /// harness: with the variables set but `LIBRA_TEST` absent, production
+    /// defaults stay in effect; with the gate present, the overrides bite.
+    #[test]
+    #[serial_test::serial]
+    fn seam_timeouts_and_probe_limits_require_the_harness_gate() {
+        // SAFETY: serialized test body; every variable is removed again
+        // before the test returns.
+        unsafe {
+            std::env::set_var("LIBRA_TEST_STATUS_IO_TIMEOUT_MS", "1");
+            std::env::set_var("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET", "1");
+            std::env::set_var("LIBRA_TEST_STATUS_PROBE_DEST_BUDGET", "1");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+
+            assert_eq!(
+                io_op_timeout(),
+                std::time::Duration::from_secs(10),
+                "without LIBRA_TEST the timeout override must be ignored"
+            );
+            let limits = ProbeLimits::effective();
+            assert_eq!(
+                limits.max_enumerated_entries, PROBE_MAX_ENUMERATED_ENTRIES,
+                "without LIBRA_TEST the enum-budget override must be ignored"
+            );
+            assert_eq!(
+                limits.max_qualified_destinations, PROBE_MAX_QUALIFIED_DESTINATIONS,
+                "without LIBRA_TEST the dest-budget override must be ignored"
+            );
+
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            assert_eq!(
+                io_op_timeout(),
+                std::time::Duration::from_millis(1),
+                "with the gate the timeout override applies"
+            );
+            let limits = ProbeLimits::effective();
+            assert_eq!(limits.max_enumerated_entries, 1);
+            assert_eq!(limits.max_qualified_destinations, 1);
+
+            std::env::remove_var("LIBRA_TEST_STATUS_IO_TIMEOUT_MS");
+            std::env::remove_var("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET");
+            std::env::remove_var("LIBRA_TEST_STATUS_PROBE_DEST_BUDGET");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+        }
+    }
 }

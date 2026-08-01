@@ -147,6 +147,8 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "scan_complete_reports_all_untracked",
     "scan_snapshot_keeps_rename_endpoints_as_dirty_rows",
     "scan_survives_non_utf8_untracked_path",
+    "seam_env_overrides_are_ignored_without_the_harness_gate",
+    "seam_unreadable_mode_override_is_ignored_without_the_harness_gate",
     "short_quote_path_core_false",
     "short_z_rename_record_is_raw_new_then_old",
     "similarity_budget_warning",

@@ -922,32 +922,35 @@ pub(crate) struct WorktreeReadBudget {
     deadline: Instant,
 }
 
-/// Debug-only seam for the stat→read growth race (§B.3.4). A budget that
+/// Debug-only seam for the stat→read divergence (§B.3.4). A budget that
 /// charges the pre-read `stat` length bills a file that grew in between at
-/// the smaller stale price, so the regression has to be able to make the
-/// growth happen at exactly that point. Compiled out of release builds.
+/// the smaller stale price. The regression exercises that branch by having
+/// the seam report a STALE, smaller length for the named path's pre-read
+/// stat — the bounded read then pulls more bytes than the stat claimed,
+/// exactly as a growing file would, without the hook ever mutating the
+/// file. Gated on `LIBRA_TEST`; compiled out of release builds.
 #[cfg(debug_assertions)]
-fn grow_under_read_for_test(path: &Path) {
-    use std::io::Write;
-
-    let Ok(target) = std::env::var("LIBRA_TEST_RENAME_GROW_PATH") else {
-        return;
+fn stale_stat_len_for_test(path: &Path, real_len: u64) -> u64 {
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+        return real_len;
+    }
+    let Ok(target) = std::env::var("LIBRA_TEST_STALE_STAT_PATH") else {
+        return real_len;
     };
     if Path::new(&target) != path {
-        return;
+        return real_len;
     }
-    let extra: usize = std::env::var("LIBRA_TEST_RENAME_GROW_BYTES")
+    let shrink: u64 = std::env::var("LIBRA_TEST_STALE_STAT_BYTES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
-    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
-        let _ = file.write_all(&vec![b'g'; extra]);
-        let _ = file.flush();
-    }
+    real_len.saturating_sub(shrink)
 }
 
 #[cfg(not(debug_assertions))]
-fn grow_under_read_for_test(_path: &Path) {}
+fn stale_stat_len_for_test(_path: &Path, real_len: u64) -> u64 {
+    real_len
+}
 
 impl WorktreeReadBudget {
     /// Remaining (total bytes, task slots); see [`ObjectReadBudget::remaining`].
@@ -1072,10 +1075,9 @@ impl WorktreeReadBudget {
             };
         }
         let cap = self.per_file_cap.min(self.remaining_total);
-        if metadata.len() > cap {
+        if stale_stat_len_for_test(abs_path, metadata.len()) > cap {
             return ContentOutcome::Skipped(SkipReason::WorktreeTooLarge);
         }
-        grow_under_read_for_test(abs_path);
         // §B.3.4 bounded read: `read` the file through a `take(cap + 1)`
         // limiter so a file that GREW between the metadata check and the
         // read (or a growing FIFO/FUSE path) can never allocate past the
@@ -1158,11 +1160,13 @@ impl WorktreeReadBudget {
             return Ok((oid, len, BlobKind::Symlink));
         }
         let cap = self.per_file_cap.min(self.remaining_total);
-        if metadata.len() > cap {
+        if stale_stat_len_for_test(abs_path, metadata.len()) > cap {
             return Err(SkipReason::WorktreeTooLarge);
         }
-        grow_under_read_for_test(abs_path);
-        if crate::utils::lfs::is_lfs_tracked(abs_path) {
+        // Both regular-content branches below produce the blob from bytes
+        // pulled through an open that FOLLOWS symlinks, so the kind is
+        // re-stated AFTER the read (see the tail of this function).
+        let (oid, len) = if crate::utils::lfs::is_lfs_tracked(abs_path) {
             // The POINTER is tiny, but producing it requires a full-file
             // SHA-256, so this read needs the same deadline as any other:
             // the size cap above already rejected anything over the
@@ -1187,34 +1191,56 @@ impl WorktreeReadBudget {
             self.remaining_total = self.remaining_total.saturating_sub(read);
             let len = pointer.len() as u64;
             let oid = git_internal::internal::object::blob::Blob::from_content(&pointer).id;
-            return Ok((oid, len, BlobKind::Regular));
-        }
-        // The cap is re-applied INSIDE the read: the stat above can be
-        // defeated by a file that grows before the bytes are consumed, and
-        // an unbounded hash of a now-huge file would blow the read budget
-        // it was supposed to respect.
-        let hash_path = abs_path.to_path_buf();
-        let (oid, read) =
+            (oid, len)
+        } else {
+            // The cap is re-applied INSIDE the read: the stat above can be
+            // defeated by a file that grows before the bytes are consumed, and
+            // an unbounded hash of a now-huge file would blow the read budget
+            // it was supposed to respect.
+            let hash_path = abs_path.to_path_buf();
+            let (oid, read) =
+                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+                    super::stream_file_blob_hash_bounded(&hash_path, cap)
+                }) {
+                    Err(()) => return Err(SkipReason::IoTimeout),
+                    Ok(Ok((Some(oid), read))) => (oid, read),
+                    // Over the cap, or the file changed size mid-read: skip the
+                    // candidate rather than trust a hash of a moving target — but
+                    // still charge the bytes the attempt cost, or a growth race
+                    // would give an attacker unlimited free reads.
+                    Ok(Ok((None, read))) => {
+                        self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
+                        return Err(SkipReason::WorktreeTooLarge);
+                    }
+                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+                };
+            // Charge and report what the read ACTUALLY consumed. `metadata.len()`
+            // is a pre-read stat, and a file that grew in between would otherwise
+            // have the larger read billed at the smaller stale price.
+            self.remaining_total = self.remaining_total.saturating_sub(read);
+            (oid, read)
+        };
+        // Post-read type revalidation: the bytes above were pulled through
+        // an open that FOLLOWS symlinks, so a regular→symlink swap between
+        // the pre-read stat and the open would label the referent's blob
+        // `Regular` — clearing the exact gate against an unrelated blob and
+        // suppressing the truthful `D` + `??`. Re-stat AFTER the read and
+        // report the kind observed NOW; the caller drops the candidate when
+        // it disagrees with its own earlier stat. The residual window (the
+        // path flipping back to regular before this stat) is the documented
+        // path-level TOCTOU accepted for R0; fd-bound resolution is tracked
+        // by plan-20260715 WIO-02.
+        let restat_path = abs_path.to_path_buf();
+        let observed =
             match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                super::stream_file_blob_hash_bounded(&hash_path, cap)
+                restat_path.symlink_metadata()
             }) {
+                Ok(Ok(meta)) if meta.file_type().is_symlink() => BlobKind::Symlink,
+                Ok(Ok(meta)) if meta.file_type().is_file() => BlobKind::Regular,
+                Ok(Ok(_)) | Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
                 Err(()) => return Err(SkipReason::IoTimeout),
-                Ok(Ok((Some(oid), read))) => (oid, read),
-                // Over the cap, or the file changed size mid-read: skip the
-                // candidate rather than trust a hash of a moving target — but
-                // still charge the bytes the attempt cost, or a growth race
-                // would give an attacker unlimited free reads.
-                Ok(Ok((None, read))) => {
-                    self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                    return Err(SkipReason::WorktreeTooLarge);
-                }
-                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
             };
-        // Charge and report what the read ACTUALLY consumed. `metadata.len()`
-        // is a pre-read stat, and a file that grew in between would otherwise
-        // have the larger read billed at the smaller stale price.
-        self.remaining_total = self.remaining_total.saturating_sub(read);
-        Ok((oid, read, BlobKind::Regular))
+        Ok((oid, len, observed))
     }
 }
 
@@ -2071,46 +2097,52 @@ mod tests {
     /// consumed, not by the pre-read `stat`. A file that grows between the
     /// stat and the hash used to be billed at the stale, smaller length,
     /// which let a growth race pull unlimited content through a bounded
-    /// budget. The seam grows the file at exactly that point so the race is
-    /// deterministic rather than timing-dependent.
+    /// budget. The seam reports a stale, smaller stat length at exactly that
+    /// point — the same accounting branch a growing file exercises, without
+    /// the test hook mutating the file.
     #[test]
     #[serial_test::serial]
     fn worktree_total_charges_bytes_read_not_stale_stat() {
         use std::time::Duration;
 
+        const SHRUNK: u64 = 4;
+        const GROWTH: u64 = 4096;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("grows.txt");
-        std::fs::write(&path, b"aaaa").expect("write the seed file");
+        std::fs::write(&path, vec![b'a'; (SHRUNK + GROWTH) as usize])
+            .expect("write the full-size file");
 
-        const GROWTH: u64 = 4096;
         // SAFETY: single-threaded test body, serialized against other tests
-        // that read the process environment.
+        // that read the process environment. LIBRA_TEST arms the harness
+        // gate the seam requires.
         unsafe {
-            std::env::set_var("LIBRA_TEST_RENAME_GROW_PATH", &path);
-            std::env::set_var("LIBRA_TEST_RENAME_GROW_BYTES", GROWTH.to_string());
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            std::env::set_var("LIBRA_TEST_STALE_STAT_PATH", &path);
+            std::env::set_var("LIBRA_TEST_STALE_STAT_BYTES", GROWTH.to_string());
         }
 
         let total = 1_000_000;
         let mut budget = WorktreeReadBudget::new(total, total, 8, Duration::from_secs(30));
         let (_, size, kind) = budget
             .worktree_blob_oid_and_size(&path)
-            .expect("the grown file still hashes");
+            .expect("the file still hashes");
 
         unsafe {
-            std::env::remove_var("LIBRA_TEST_RENAME_GROW_PATH");
-            std::env::remove_var("LIBRA_TEST_RENAME_GROW_BYTES");
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            std::env::remove_var("LIBRA_TEST_STALE_STAT_PATH");
+            std::env::remove_var("LIBRA_TEST_STALE_STAT_BYTES");
         }
 
-        let grown = 4 + GROWTH;
+        let read = SHRUNK + GROWTH;
         assert_eq!(kind, BlobKind::Regular);
         assert_eq!(
-            size, grown,
-            "the reported size is what was read, not the 4-byte stat"
+            size, read,
+            "the reported size is what was read, not the stale 4-byte stat"
         );
         assert_eq!(
             budget.remaining_total,
-            total - grown,
-            "the budget was charged {grown} bytes, not the stale 4"
+            total - read,
+            "the budget was charged {read} bytes, not the stale 4"
         );
     }
 

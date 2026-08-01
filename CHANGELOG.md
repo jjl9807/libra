@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-2 implementation review)
+
+- **A regular→symlink swap during rename hashing can no longer forge an
+  exact rename.** The worktree blob hash is produced through an open that
+  follows symlinks, so a candidate replaced between the pre-read stat and
+  the open could hand the exact gate a symlink referent's blob labelled
+  `Regular`, pairing a rename that never happened and suppressing the
+  truthful `D` + `??`. The file kind is now re-stated after the read and
+  the candidate is dropped (with a degradation warning) when it no longer
+  matches the snapshot stat. The residual path-level TOCTOU window is
+  documented and stays with plan-20260715 WIO-02 for fd-bound resolution.
+
 ### Fixed (plan-20260714 R0-1 implementation review)
 
 - **Exact rename selection is linear again for duplicate blobs.** Consumed
