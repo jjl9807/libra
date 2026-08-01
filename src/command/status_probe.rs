@@ -115,6 +115,11 @@ type IoJob = Box<dyn FnOnce() + Send + 'static>;
 struct IoWorkerPool {
     queue: std::sync::Mutex<std::collections::VecDeque<IoJob>>,
     ready: std::sync::Condvar,
+    /// Join handles of every spawned worker. Workers park on `ready`
+    /// between jobs and are REUSED, but their handles stay owned by the
+    /// pool: dropping a handle would detach the thread, and the scan
+    /// contract is a bounded pool with NO detached threads (§B.3.4).
+    handles: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 static IO_POOL: std::sync::OnceLock<std::sync::Arc<IoWorkerPool>> = std::sync::OnceLock::new();
@@ -166,6 +171,7 @@ where
         std::sync::Arc::new(IoWorkerPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ready: std::sync::Condvar::new(),
+            handles: std::sync::Mutex::new(Vec::new()),
         })
     });
 
@@ -190,14 +196,20 @@ where
         .is_ok()
     {
         let worker_pool = std::sync::Arc::clone(pool);
-        if std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("libra-status-io".to_string())
             .spawn(move || run_io_worker(&worker_pool))
-            .is_err()
         {
-            IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
-            IO_BUSY.fetch_sub(1, Ordering::SeqCst);
-            return Err(());
+            Ok(handle) => pool
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(handle),
+            Err(_) => {
+                IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                IO_BUSY.fetch_sub(1, Ordering::SeqCst);
+                return Err(());
+            }
         }
     }
 
@@ -295,6 +307,7 @@ where
         std::sync::Arc::new(IoWorkerPool {
             queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ready: std::sync::Condvar::new(),
+            handles: std::sync::Mutex::new(Vec::new()),
         })
     });
     if IO_BUSY
@@ -313,14 +326,20 @@ where
         .is_ok()
     {
         let worker_pool = std::sync::Arc::clone(pool);
-        if std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("libra-status-io".to_string())
             .spawn(move || run_io_worker(&worker_pool))
-            .is_err()
         {
-            IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
-            IO_BUSY.fetch_sub(1, Ordering::SeqCst);
-            return Err(());
+            Ok(handle) => pool
+                .handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(handle),
+            Err(_) => {
+                IO_WORKERS.fetch_sub(1, Ordering::SeqCst);
+                IO_BUSY.fetch_sub(1, Ordering::SeqCst);
+                return Err(());
+            }
         }
     }
     let hash_kind = git_internal::hash::get_hash_kind();
@@ -653,6 +672,23 @@ pub(crate) fn probe_rename_destinations(
     let workdir = filter.workdir;
 
     'roots: for root in roots {
+        let blocked_before = outcome.io_blocked.len();
+        let truncated_before = outcome.truncated.is_some();
+        let root_abs = workdir.join(root);
+        // Containment is checked BEFORE anything else touches the root —
+        // including the metadata/gitlink exclusions below. An intermediate
+        // symlink can point a root like `link/.git` at a directory outside
+        // the worktree; if that outside directory happens to hold a
+        // `.git`/`.libra` marker the metadata check would "exclude a nested
+        // repository" and move on silently, never recording the escape.
+        if !root.as_os_str().is_empty() && !resolves_inside(&root_abs, workdir) {
+            outcome.io_blocked.push(IoBlockedEvent {
+                path: root.clone(),
+                reason: IoBlockedReason::IoError,
+                absorbed: false,
+            });
+            continue;
+        }
         // §B.3.2: repository metadata is excluded UNCONDITIONALLY, including
         // when a pathspec names it directly (`libra status -- .libra`). The
         // per-entry child filter below only sees children, so without this a
@@ -665,23 +701,6 @@ pub(crate) fn probe_rename_destinations(
         // `status -- nested-repo` (or a gitlink path) walks straight into a
         // foreign repository because the child filter never sees the root.
         if !root.as_os_str().is_empty() && filter.is_gitlink_dir(root) {
-            continue;
-        }
-        let blocked_before = outcome.io_blocked.len();
-        let truncated_before = outcome.truncated.is_some();
-        let root_abs = workdir.join(root);
-        // Containment is checked BEFORE anything else touches the root —
-        // including the marker probe. An intermediate symlink can point a
-        // root like `link/child` at a directory outside the worktree, and if
-        // that外部 directory happens to hold a `.git`/`.libra` marker the
-        // probe would have "excluded a nested repository" and moved on
-        // silently, never recording the escape.
-        if !root.as_os_str().is_empty() && !resolves_inside(&root_abs, workdir) {
-            outcome.io_blocked.push(IoBlockedEvent {
-                path: root.clone(),
-                reason: IoBlockedReason::IoError,
-                absorbed: false,
-            });
             continue;
         }
         let root_stat_target = root_abs.clone();
@@ -820,13 +839,18 @@ pub(crate) fn probe_rename_destinations(
                     let mut taken = 0usize;
                     let mut hit_cap = false;
                     for entry in reader {
-                        if taken == remaining {
-                            // One past the budget: stop reading immediately.
+                        taken += 1;
+                        ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if taken > remaining {
+                            // The entry that PROVES truncation cost a real
+                            // readdir, so it is charged too — but never
+                            // processed. Reading it PAST the cap check (the
+                            // `for` loop used to pull it uncharged) is how
+                            // a wide directory overran the budget by one
+                            // entry per directory.
                             hit_cap = true;
                             break;
                         }
-                        taken += 1;
-                        ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         match entry {
                             Ok(entry) => entries.push(entry.file_name()),
                             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,

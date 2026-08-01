@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-3 implementation review)
+
+- **A metadata probe root hiding behind an escaping symlink is now reported,
+  not silently skipped.** The probe checked the `.git`/`.libra`/gitlink
+  exclusions before containment, so `status -- link/.git` (where `link`
+  points outside the worktree and the target happens to hold a `.git`)
+  vanished without a trace. Containment is now checked first and the escape
+  lands in `io_blocked[]`.
+- **Probe enumeration no longer gets a free entry per directory.** The
+  readdir loop pulled the truncation-detecting entry past the budget check
+  without charging it; every entry the OS yields is now charged exactly
+  once against the enumeration budget.
+- **The status I/O worker pool no longer detaches its threads.** Worker
+  `JoinHandle`s were dropped at spawn time; they are now owned by the pool,
+  matching the "reused pool, no detached threads" contract.
+- **New regression coverage**: a `--check-dirty` MODIFIED cache row whose
+  file stats fine but cannot be read is kept, reported in `io_blocked[]`,
+  and never rewritten; the truncated-probe ordering test now asserts the
+  qualified destinations through the rename records instead of the main
+  scan's listing.
+
 ### Fixed (plan-20260714 R0-2 implementation review)
 
 - **A regular→symlink swap during rename hashing can no longer forge an

@@ -2723,19 +2723,64 @@ fn probe_complete_entries_sorted() {
         "a complete run reports entries in byte order"
     );
 
-    // Truncated probe: still sorted, and identical across repeated runs.
-    let env = [("LIBRA_TEST_STATUS_PROBE_ENUM_BUDGET", "3")];
-    let first = sorted_untracked(&["--json", "status", "-uall"], &env);
-    let second = sorted_untracked(&["--json", "status", "-uall"], &env);
-    let mut first_sorted = first.clone();
-    first_sorted.sort();
+    // Truncated probe: the qualified destinations are the alphabetically
+    // first two, surfaced through the RENAME RECORDS — the probe's own
+    // output contract — not merely the main scan's listing. Two deleted
+    // sources compete for a destination budget of two, so the pairing
+    // reveals exactly which destinations the probe qualified.
+    let repo2 = tempdir().expect("second repo");
+    init_repo_via_cli(repo2.path());
+    configure_identity_via_cli(repo2.path());
+    for name in ["src-a.txt", "src-b.txt"] {
+        fs::write(repo2.path().join(name), "shared body\nline two\n").unwrap();
+    }
+    let add = run_libra_command(&["add", "."], repo2.path());
+    assert_cli_success(&add, "stage sources");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo2.path());
+    assert_cli_success(&commit, "commit sources");
+    for name in ["src-a.txt", "src-b.txt"] {
+        fs::remove_file(repo2.path().join(name)).unwrap();
+    }
+    for name in ["zeta.txt", "alpha.txt", "mid.txt", "beta.txt"] {
+        fs::write(repo2.path().join(name), "shared body\nline two\n").unwrap();
+    }
+    enable_rename_untracked(repo2.path());
+
+    let truncated_probe = || {
+        let out = run_libra_command_with_stdin_and_env(
+            &["--json", "status"],
+            repo2.path(),
+            "",
+            &[("LIBRA_TEST_STATUS_PROBE_DEST_BUDGET", "2")],
+        );
+        assert_cli_success(&out, "status run");
+        let doc: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+        assert!(
+            doc["data"]["warnings"]
+                .as_array()
+                .is_some_and(|w| w.iter().any(|x| x["code"] == "probe_truncated")),
+            "the fixture really trips the destination budget: {doc}"
+        );
+        let mut to: Vec<String> = doc["data"]["renames"]
+            .as_array()
+            .expect("renames")
+            .iter()
+            .filter_map(|r| r["to"].as_str().map(str::to_string))
+            .collect();
+        to.sort();
+        to
+    };
+    let first = truncated_probe();
     assert_eq!(
-        first, first_sorted,
-        "a truncated run still reports what it collected in byte order"
+        first,
+        vec!["alpha.txt".to_string(), "beta.txt".to_string()],
+        "a truncated probe qualifies the sorted-first destinations"
     );
     assert_eq!(
-        first, second,
-        "and two runs on the same tree agree with each other"
+        first,
+        truncated_probe(),
+        "and deterministically so across runs"
     );
 }
 
@@ -2766,6 +2811,33 @@ fn probe_rejects_a_directly_selected_nested_repository_root() {
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("decoy"),
         "the nested repository's contents are never enumerated: {doc}"
+    );
+}
+
+/// A metadata root selected through an ESCAPING symlink is not silently
+/// skipped as "excluded metadata": the containment breach is recorded in
+/// `io_blocked[]`. The exclusions must never fire before containment, or
+/// `status -- link/.git` (where `link` points outside the worktree and the
+/// target happens to hold a `.git`) would vanish without a trace.
+#[cfg(unix)]
+#[test]
+fn probe_records_escape_for_a_metadata_root_behind_a_symlink() {
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    // `link` escapes the worktree; the OUTSIDE directory holds a `.git`.
+    let outside = tempdir().expect("outside dir");
+    fs::create_dir_all(outside.path().join(".git")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), repo.path().join("link")).unwrap();
+
+    let out = run_libra_command(&["--json", "status", "--", "link/.git"], repo.path());
+    assert_cli_success(&out, "an escaping metadata root degrades, it does not fail");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|e| e["path"]["display"] == "link/.git")),
+        "the escape is recorded as io_blocked, not silently skipped as metadata: {doc}"
     );
 }
 
@@ -3269,6 +3341,91 @@ fn check_dirty_ioblocked_does_not_mutate_cache() {
             .is_some_and(|u| u.iter().any(|p| p == "sub/cached-new.txt")),
         "the cache row was neither pruned nor rewritten: {doc}"
     );
+}
+
+/// `--check-dirty`: a cached MODIFIED row whose file STATS fine but cannot
+/// be READ (mode 000) is its own blocked case — the row is kept, reported
+/// in `io_blocked[]`, and the cache row is not rewritten, metadata
+/// included (proven by a full-row DB snapshot, not just the visible list).
+#[test]
+#[serial]
+#[cfg(unix)]
+fn check_dirty_modified_row_content_hash_failure_is_blocked_and_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = create_repo_with_committed_file("tracked.txt", "content\n");
+    fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+    let scan = run_libra_command(&["status", "--scan"], repo.path());
+    assert_cli_success(&scan, "initial scan caches the MODIFIED row");
+    let rows_before = dirty_rows_for(repo.path(), "tracked.txt");
+    assert_eq!(
+        rows_before.len(),
+        1,
+        "the fixture really seeds one MODIFIED cache row: {rows_before:?}"
+    );
+    assert!(
+        rows_before[0].contains("|modified|scan|"),
+        "and it is the scan-sourced modified row: {rows_before:?}"
+    );
+
+    let file = repo.path().join("tracked.txt");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    let check = run_libra_command(&["--json", "status", "--check-dirty"], repo.path());
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_cli_success(&check, "check-dirty with an unreadable MODIFIED row");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&check.stdout)).expect("json");
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|p| p == "tracked.txt")),
+        "the unreadable row is kept as modified (over-report), never pruned: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|b| !b.is_empty()),
+        "the content-hash failure is reported in io_blocked, not silent: {doc}"
+    );
+
+    // The whole cache row is untouched — a confirm that only flips
+    // source/verified_at while keeping the visible list must fail here.
+    assert_eq!(
+        dirty_rows_for(repo.path(), "tracked.txt"),
+        rows_before,
+        "a blocked row's cache entry is untouched, metadata included"
+    );
+}
+
+/// Full snapshot of the `working_dirty` cache entries for one path through
+/// the single-owner cache API (NOT raw SQL — the DB layer version must not
+/// leak into the assertion): every metadata field, in stable order, so a
+/// blocked run that secretly rewrote row metadata (source/verified_at/
+/// marked_at) cannot pass as "untouched".
+#[cfg(unix)]
+fn dirty_rows_for(repo: &Path, file: &str) -> Vec<String> {
+    let _guard = libra::utils::test::ChangeDirGuard::new(repo);
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async {
+        let mut rows: Vec<String> = libra::internal::dirty::DirtyCache::list()
+            .await
+            .expect("read dirty cache")
+            .into_iter()
+            .filter(|entry| entry.path == file)
+            .map(|entry| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    entry.path,
+                    entry.kind,
+                    entry.source,
+                    entry.marked_at,
+                    entry.verified_at.as_deref().unwrap_or("<null>")
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    })
 }
 
 // ── R0-8: object-read fault injection, non-UTF-8 contract, cache-fallback
