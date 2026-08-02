@@ -169,7 +169,7 @@ human/short/porcelain 模式在 stderr 打印 status 警告 `warning: …`（`--
 ```bash
 libra status --renames
 libra status --no-renames
-libra config status.renames false   # 默认禁用
+libra config status.renames false   # 禁用 rename 检测（对该配置作用域生效）
 ```
 
 ### `--scan` / `--cached` / `--check-dirty`（Libra 扩展，lore.md 1.1）

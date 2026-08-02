@@ -331,7 +331,7 @@ disable — the cache stores no rename information, so a request for it cannot b
 ```bash
 libra status --renames
 libra status --no-renames
-libra config status.renames false   # disable by default
+libra config status.renames false   # disable rename detection (for this config scope)
 ```
 
 ### `--scan` / `--cached` / `--check-dirty` (Libra extensions, lore.md 1.1)
