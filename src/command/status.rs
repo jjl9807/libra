@@ -8,7 +8,6 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use colored::Colorize;
 use git_internal::{
     errors::GitError,
     hash::{ObjectHash, get_hash_kind},
@@ -1317,7 +1316,12 @@ async fn collect_status_data(
     let ignored_files = worktree
         .ignored_files
         .into_iter()
-        .map(util::workdir_to_current)
+        .map(|path| {
+            // The marker-preserving projection (directory markers are
+            // built on the raw name; see `with_dir_marker`).
+            let projected = util::workdir_to_current(&path);
+            with_dir_marker(&path, projected)
+        })
         .collect();
     let mut io_blocked = worktree.io_blocked;
     let base_scan_blocked = !io_blocked.is_empty();
@@ -1621,6 +1625,22 @@ async fn collect_status_data(
     Ok(data)
 }
 
+/// Reattach a collapsed-directory trailing `/` marker that path projection
+/// (`to_workdir_path`/`workdir_to_current`/`current_to_workdir`) normalizes
+/// away — built from raw `OsString` bytes so a non-UTF-8 directory name
+/// survives intact (never `display()`).
+fn with_dir_marker(path: &Path, projected: PathBuf) -> PathBuf {
+    if path.as_os_str().as_encoded_bytes().ends_with(b"/")
+        && !projected.as_os_str().as_encoded_bytes().ends_with(b"/")
+    {
+        let mut marker = projected.into_os_string();
+        marker.push("/");
+        PathBuf::from(marker)
+    } else {
+        projected
+    }
+}
+
 impl StatusData {
     /// A copy whose change lists use repository-root-relative paths (the
     /// machine-format base, §B.6.4). Cheap enough for one render and
@@ -1631,12 +1651,7 @@ impl StatusData {
         /// path components and would eat it, making `?? dir/` render as
         /// `?? dir` — indistinguishable from an untracked FILE named `dir`.
         fn current_to_workdir_keeping_marker(path: &Path) -> PathBuf {
-            let rooted = current_to_workdir(path);
-            if path.to_string_lossy().ends_with('/') {
-                PathBuf::from(format!("{}/", rooted.display()))
-            } else {
-                rooted
-            }
+            with_dir_marker(path, current_to_workdir(path))
         }
         fn project(paths: &[PathBuf]) -> Vec<PathBuf> {
             paths
@@ -3804,8 +3819,9 @@ async fn render_status_to_writer(
                         write_raw_path(&mut buffer, file).map_err(write_error)?;
                         buffer.push(b'\0');
                     } else {
-                        writeln!(&mut buffer, "!! {}", quote_pathname(file, data.quote_path))
-                            .map_err(write_error)?;
+                        buffer.extend_from_slice(b"!! ");
+                        buffer.extend_from_slice(&quote_pathname_bytes(file, data.quote_path));
+                        buffer.push(b'\n');
                     }
                 }
             }
@@ -3856,8 +3872,9 @@ async fn render_status_to_writer(
                     write_raw_path(&mut buffer, file).map_err(write_error)?;
                     buffer.push(b'\0');
                 } else {
-                    writeln!(&mut buffer, "!! {}", quote_pathname(file, data.quote_path))
-                        .map_err(write_error)?;
+                    buffer.extend_from_slice(b"!! ");
+                    buffer.extend_from_slice(&quote_pathname_bytes(file, data.quote_path));
+                    buffer.push(b'\n');
                 }
             }
         }
@@ -3880,12 +3897,7 @@ fn data_with_repo_root_paths(data: &StatusData) -> StatusData {
     // `/` marker (see `status_untracked`); path conversion must not eat it,
     // or directories become indistinguishable from files in the output.
     fn convert(path: &Path) -> PathBuf {
-        let rooted = util::to_workdir_path(path);
-        if path.to_string_lossy().ends_with('/') {
-            PathBuf::from(format!("{}/", rooted.display()))
-        } else {
-            rooted
-        }
+        with_dir_marker(path, util::to_workdir_path(path))
     }
     fn changes(changes: &Changes) -> Changes {
         Changes {
@@ -4006,13 +4018,15 @@ fn render_human_status(
             "new file:",
             &data.staged.renamed,
             "renamed:",
+            data.quote_path,
         );
         if args.column {
             render_columnated_labeled_entries(buffer, &entries, colored::Color::BrightGreen)?;
         } else {
             for (label, path) in entries {
-                let line = format!("\t{label} {path}");
-                writeln!(buffer, "{}", line.bright_green()).map_err(write_error)?;
+                let mut line = format!("\t{label} ").into_bytes();
+                line.extend_from_slice(&path);
+                push_colored_line(buffer, &colored::Color::BrightGreen.to_fg_str(), &line);
             }
         }
     }
@@ -4043,13 +4057,15 @@ fn render_human_status(
             "",
             &data.unstaged.renamed,
             "renamed:",
+            data.quote_path,
         );
         if args.column {
             render_columnated_labeled_entries(buffer, &entries, colored::Color::BrightRed)?;
         } else {
             for (label, path) in entries {
-                let line = format!("\t{label} {path}");
-                writeln!(buffer, "{}", line.bright_red()).map_err(write_error)?;
+                let mut line = format!("\t{label} ").into_bytes();
+                line.extend_from_slice(&path);
+                push_colored_line(buffer, &colored::Color::BrightRed.to_fg_str(), &line);
             }
         }
     }
@@ -4069,7 +4085,7 @@ fn render_human_status(
             .map(|entry| {
                 (
                     unmerged_human_label(entry),
-                    entry.path.display().to_string(),
+                    quote_pathname_bytes(&entry.path, data.quote_path),
                 )
             })
             .collect::<Vec<_>>();
@@ -4077,8 +4093,9 @@ fn render_human_status(
             render_columnated_labeled_entries(buffer, &entries, colored::Color::BrightRed)?;
         } else {
             for (label, path) in entries {
-                let line = format!("\t{label} {path}");
-                writeln!(buffer, "{}", line.bright_red()).map_err(write_error)?;
+                let mut line = format!("\t{label} ").into_bytes();
+                line.extend_from_slice(&path);
+                push_colored_line(buffer, &colored::Color::BrightRed.to_fg_str(), &line);
             }
         }
     }
@@ -4092,11 +4109,12 @@ fn render_human_status(
         )
         .map_err(write_error)?;
         if args.column {
-            render_columnated_paths(buffer, &data.unstaged.new)?;
+            render_columnated_paths(buffer, &data.unstaged.new, data.quote_path)?;
         } else {
             for f in &data.unstaged.new {
-                let str = format!("\t{}", f.display());
-                writeln!(buffer, "{}", str.bright_red()).map_err(write_error)?;
+                let mut line = b"\t".to_vec();
+                line.extend_from_slice(&quote_pathname_bytes(f, data.quote_path));
+                push_colored_line(buffer, &colored::Color::BrightRed.to_fg_str(), &line);
             }
         }
     }
@@ -4110,11 +4128,12 @@ fn render_human_status(
         )
         .map_err(write_error)?;
         if args.column {
-            render_columnated_paths(buffer, &data.ignored_files)?;
+            render_columnated_paths(buffer, &data.ignored_files, data.quote_path)?;
         } else {
             for f in &data.ignored_files {
-                let str = format!("\t{}", f.display());
-                writeln!(buffer, "{}", str.bright_red()).map_err(write_error)?;
+                let mut line = b"\t".to_vec();
+                line.extend_from_slice(&quote_pathname_bytes(f, data.quote_path));
+                push_colored_line(buffer, &colored::Color::BrightRed.to_fg_str(), &line);
             }
         }
     }
@@ -4145,22 +4164,23 @@ fn build_human_entries<'a>(
     new_label: &'a str,
     renamed: &[(PathBuf, PathBuf)],
     renamed_label: &'a str,
-) -> Vec<(&'a str, String)> {
+    quote_path: bool,
+) -> Vec<(&'a str, Vec<u8>)> {
     let mut entries = Vec::new();
     for f in deleted {
-        entries.push((deleted_label, f.display().to_string()));
+        entries.push((deleted_label, quote_pathname_bytes(f, quote_path)));
     }
     for f in modified {
-        entries.push((modified_label, f.display().to_string()));
+        entries.push((modified_label, quote_pathname_bytes(f, quote_path)));
     }
     for (old, new) in renamed {
-        entries.push((
-            renamed_label,
-            format!("{} -> {}", old.display(), new.display()),
-        ));
+        let mut line = quote_pathname_bytes(old, quote_path);
+        line.extend_from_slice(b" -> ");
+        line.extend_from_slice(&quote_pathname_bytes(new, quote_path));
+        entries.push((renamed_label, line));
     }
     for f in new_files {
-        entries.push((new_label, f.display().to_string()));
+        entries.push((new_label, quote_pathname_bytes(f, quote_path)));
     }
     entries
 }
@@ -4168,36 +4188,57 @@ fn build_human_entries<'a>(
 /// Render labeled entries in aligned columns.
 fn render_columnated_labeled_entries(
     buffer: &mut Vec<u8>,
-    entries: &[(&str, String)],
+    entries: &[(&str, Vec<u8>)],
     color: colored::Color,
 ) -> CliResult<()> {
-    let write_error =
-        |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     if entries.is_empty() {
         return Ok(());
     }
     let max_label_width = entries.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
     for (label, path) in entries {
-        let line = format!("\t{label:max_label_width$} {path}");
-        let colored = match color {
-            colored::Color::BrightGreen => line.bright_green().to_string(),
-            colored::Color::BrightRed => line.bright_red().to_string(),
-            _ => line,
-        };
-        writeln!(buffer, "{colored}").map_err(write_error)?;
+        let mut line = format!("\t{label:max_label_width$} ").into_bytes();
+        line.extend_from_slice(path);
+        push_colored_line(buffer, &color.to_fg_str(), &line);
     }
     Ok(())
 }
 
+/// Wrap one content line in an ANSI fg color + reset and terminate it,
+/// honoring the colored crate's own colorize gate (so piped/test output
+/// stays plain, exactly like the `.bright_green()` call sites it
+/// replaces). The colored crate's API is `String`-only, so byte-faithful
+/// paths (raw non-UTF-8 bytes under `core.quotePath=false`) are colored
+/// manually with the same codes the crate emits.
+fn push_colored_line(buffer: &mut Vec<u8>, fg: &str, line: &[u8]) {
+    let colorize = colored::control::SHOULD_COLORIZE.should_colorize();
+    if colorize {
+        buffer.extend_from_slice(b"\x1b[");
+        buffer.extend_from_slice(fg.as_bytes());
+        buffer.extend_from_slice(b"m");
+    }
+    buffer.extend_from_slice(line);
+    if colorize {
+        buffer.extend_from_slice(b"\x1b[0m");
+    }
+    buffer.push(b'\n');
+}
+
 /// Render plain paths in multiple columns like `ls`.
-fn render_columnated_paths(buffer: &mut Vec<u8>, paths: &[PathBuf]) -> CliResult<()> {
+fn render_columnated_paths(
+    buffer: &mut Vec<u8>,
+    paths: &[PathBuf],
+    quote_path: bool,
+) -> CliResult<()> {
     let write_error =
         |err: io::Error| crate::utils::output::stdout_write_error("write status output", err);
     if paths.is_empty() {
         return Ok(());
     }
 
-    let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let names: Vec<Vec<u8>> = paths
+        .iter()
+        .map(|p| quote_pathname_bytes(p, quote_path))
+        .collect();
     let widths: Vec<usize> = names.iter().map(|n| n.len()).collect();
     let max_width = *widths.iter().max().unwrap_or(&0);
     let term_width = terminal_width().unwrap_or(80);
@@ -4218,10 +4259,11 @@ fn render_columnated_paths(buffer: &mut Vec<u8>, paths: &[PathBuf]) -> CliResult
                 break;
             }
             let name = &names[idx];
+            buffer.extend_from_slice(name);
             if col + 1 < num_cols {
-                write!(buffer, "{name:col_width$}").map_err(write_error)?;
-            } else {
-                write!(buffer, "{name}").map_err(write_error)?;
+                for _ in name.len()..col_width {
+                    buffer.push(b' ');
+                }
             }
         }
         writeln!(buffer).map_err(write_error)?;
@@ -4751,8 +4793,11 @@ fn output_porcelain_with_unmerged(
                     write_raw_path(writer, &path).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                 } else {
-                    writeln!(writer, "{x}{y} {}", quote_pathname(&path, quote_path))
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&path, quote_path))
                         .map_err(write_err)?;
+                    writer.write_all(b"\n").map_err(write_err)?;
                 }
             }
             ShortStatusEntry::Rename {
@@ -4768,13 +4813,15 @@ fn output_porcelain_with_unmerged(
                     write_raw_path(writer, &old).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
                 } else {
-                    writeln!(
-                        writer,
-                        "{x}{y} {} -> {}",
-                        quote_pathname(&old, quote_path),
-                        quote_pathname(&new, quote_path)
-                    )
-                    .map_err(write_err)?;
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&old, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b" -> ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&new, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b"\n").map_err(write_err)?;
                 }
             }
         }
@@ -5092,13 +5139,13 @@ fn write_rename_porcelain_v2(
         write_raw_path(writer, old).map_err(write_err)?;
         writer.write_all(b"\0").map_err(write_err)?;
     } else {
-        write!(
-            writer,
-            "{}\t{}",
-            quote_pathname(new, quote_path),
-            quote_pathname(old, quote_path)
-        )
-        .map_err(write_err)?;
+        writer
+            .write_all(&quote_pathname_bytes(new, quote_path))
+            .map_err(write_err)?;
+        writer.write_all(b"\t").map_err(write_err)?;
+        writer
+            .write_all(&quote_pathname_bytes(old, quote_path))
+            .map_err(write_err)?;
         writer.write_all(b"\n").map_err(write_err)?;
     }
     Ok(())
@@ -5223,7 +5270,10 @@ fn output_porcelain_v2(
                 write!(writer, "? ").map_err(write_err)?;
                 write_raw_path(writer, &file).map_err(write_err)?;
             } else {
-                write!(writer, "? {}", quote_pathname(&file, quote_path)).map_err(write_err)?;
+                write!(writer, "? ").map_err(write_err)?;
+                writer
+                    .write_all(&quote_pathname_bytes(&file, quote_path))
+                    .map_err(write_err)?;
             }
             if null_terminated {
                 writer.write_all(b"\0").map_err(write_err)?;
@@ -5281,7 +5331,9 @@ fn output_porcelain_v2(
             write_raw_path(writer, &file).map_err(write_err)?;
             writer.write_all(b"\0").map_err(write_err)?;
         } else {
-            write!(writer, "{}", quote_pathname(&file, quote_path)).map_err(write_err)?;
+            writer
+                .write_all(&quote_pathname_bytes(&file, quote_path))
+                .map_err(write_err)?;
             writer.write_all(b"\n").map_err(write_err)?;
         }
     }
@@ -5291,7 +5343,10 @@ fn output_porcelain_v2(
             write!(writer, "! ").map_err(write_err)?;
             write_raw_path(writer, file).map_err(write_err)?;
         } else {
-            write!(writer, "! {}", quote_pathname(file, quote_path)).map_err(write_err)?;
+            write!(writer, "! ").map_err(write_err)?;
+            writer
+                .write_all(&quote_pathname_bytes(file, quote_path))
+                .map_err(write_err)?;
         }
         if null_terminated {
             writer.write_all(b"\0").map_err(write_err)?;
@@ -5350,7 +5405,9 @@ fn write_unmerged_porcelain_v2(
         write_raw_path(writer, &entry.path).map_err(write_err)?;
         writer.write_all(b"\0").map_err(write_err)?;
     } else {
-        write!(writer, "{}", quote_pathname(&entry.path, quote_path)).map_err(write_err)?;
+        writer
+            .write_all(&quote_pathname_bytes(&entry.path, quote_path))
+            .map_err(write_err)?;
         writer.write_all(b"\n").map_err(write_err)?;
     }
     Ok(())
@@ -5638,6 +5695,29 @@ fn write_raw_path(writer: &mut impl Write, path: &Path) -> io::Result<()> {
 /// Public so the wave-0 suite can pin the §B.6.6 escape matrix on paths
 /// (LF/CR) that cannot be created as files on every filesystem.
 pub fn quote_pathname(path: &Path, quote_path: bool) -> String {
+    let bytes = quote_pathname_bytes(path, quote_path);
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        // String-typed callers can never hold raw non-UTF-8 bytes, so they
+        // keep the lossless octal-escaped form (every byte maps 1:1).
+        // Byte-oriented writers call `quote_pathname_bytes` and stay raw
+        // when `core.quotePath` is off (Git parity).
+        Err(_) => {
+            String::from_utf8(quote_pathname_bytes(path, true)).unwrap_or_else(|error| {
+                // INVARIANT: the quote_path=true form octal-escapes every
+                // byte >= 0x80, so it is pure ASCII and always valid UTF-8.
+                String::from_utf8_lossy(error.as_bytes()).into_owned()
+            })
+        }
+    }
+}
+
+/// Byte-faithful variant of [`quote_pathname`] for byte-oriented writers
+/// (§B.6.6): TAB/LF/CR/`"`/`\` are always escaped; bytes >= 0x80 are
+/// octal-escaped only while `quote_path` holds — with `core.quotePath=false`
+/// they are written RAW, including when the path is not valid UTF-8 (Git
+/// parity). `-z` surfaces never call this: they are raw end to end.
+pub fn quote_pathname_bytes(path: &Path, quote_path: bool) -> Vec<u8> {
     // Escape the RAW OS path bytes (Unix), not a lossy `display()` copy, so
     // a non-UTF-8 name renders its true bytes (`\377`) instead of U+FFFD
     // replacement bytes. On non-Unix `display()` is the platform's stable
@@ -5651,14 +5731,10 @@ pub fn quote_pathname(path: &Path, quote_path: bool) -> String {
     let display = path.display().to_string();
     #[cfg(not(unix))]
     let bytes: &[u8] = display.as_bytes();
-    // Non-UTF-8 bytes are always octal-escaped regardless of core.quotePath:
-    // the unquoted fast path must return valid UTF-8 (§B.6.6 readable
-    // escaping; `-z` is the raw-bytes surface).
-    let escape_high = quote_path || std::str::from_utf8(bytes).is_err();
     let needs_escape =
-        |b: u8| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || (escape_high && b >= 0x80);
+        |b: u8| b < 0x20 || b == 0x7f || b == b'"' || b == b'\\' || (quote_path && b >= 0x80);
     if !bytes.iter().copied().any(needs_escape) {
-        return String::from_utf8_lossy(bytes).into_owned();
+        return bytes.to_vec();
     }
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 8);
     out.push(b'"');
@@ -5669,18 +5745,14 @@ pub fn quote_pathname(path: &Path, quote_path: bool) -> String {
             b'\r' => out.extend_from_slice(b"\\r"),
             b'"' => out.extend_from_slice(b"\\\""),
             b'\\' => out.extend_from_slice(b"\\\\"),
-            _ if b < 0x20 || b == 0x7f || (escape_high && b >= 0x80) => {
+            _ if b < 0x20 || b == 0x7f || (quote_path && b >= 0x80) => {
                 out.extend_from_slice(format!("\\{b:03o}").as_bytes());
             }
             _ => out.push(b),
         }
     }
     out.push(b'"');
-    // INVARIANT: escapes are pure ASCII; bytes >= 0x80 pass through only
-    // when the input was verified valid UTF-8, so the result is valid UTF-8.
-    // The lossy fallback only guards against future edits breaking that.
-    String::from_utf8(out)
-        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    out
 }
 
 /// Short format output with color controlled by OutputConfig.
@@ -5713,14 +5785,21 @@ async fn output_short_format_with_config(
                     write!(writer, "{x}{y} ").map_err(write_err)?;
                     write_raw_path(writer, &path).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
+                } else if use_colors {
+                    // Only the XY letters are colored; the path is appended
+                    // byte-faithfully so `core.quotePath=false` keeps raw
+                    // high bytes even under forced color.
+                    let head = format_colored_status(x, y, "");
+                    writer.write_all(head.as_bytes()).map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&path, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b"\n").map_err(write_err)?;
                 } else {
-                    let quoted = quote_pathname(&path, quote_path);
-                    if use_colors {
-                        write!(writer, "{}", format_colored_status(x, y, &quoted))
-                            .map_err(write_err)?;
-                    } else {
-                        write!(writer, "{x}{y} {quoted}").map_err(write_err)?;
-                    }
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&path, quote_path))
+                        .map_err(write_err)?;
                     writer.write_all(b"\n").map_err(write_err)?;
                 }
             }
@@ -5737,16 +5816,29 @@ async fn output_short_format_with_config(
                     writer.write_all(b"\0").map_err(write_err)?;
                     write_raw_path(writer, &old).map_err(write_err)?;
                     writer.write_all(b"\0").map_err(write_err)?;
+                } else if use_colors {
+                    // Same byte-faithful shape as the Path arm: colored XY,
+                    // then raw quoted bytes, then the arrow and the new path.
+                    let head = format_colored_status(x, y, "");
+                    writer.write_all(head.as_bytes()).map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&old, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b" -> ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&new, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b"\n").map_err(write_err)?;
                 } else {
-                    let q_old = quote_pathname(&old, quote_path);
-                    let q_new = quote_pathname(&new, quote_path);
-                    if use_colors {
-                        let head = format_colored_status(x, y, &q_old);
-                        // `format_colored_status` renders `XY <old>`; append the arrow.
-                        writeln!(writer, "{head} -> {q_new}").map_err(write_err)?;
-                    } else {
-                        writeln!(writer, "{x}{y} {q_old} -> {q_new}").map_err(write_err)?;
-                    }
+                    write!(writer, "{x}{y} ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&old, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b" -> ").map_err(write_err)?;
+                    writer
+                        .write_all(&quote_pathname_bytes(&new, quote_path))
+                        .map_err(write_err)?;
+                    writer.write_all(b"\n").map_err(write_err)?;
                 }
             }
         }
@@ -6144,21 +6236,21 @@ pub(crate) fn collapse_untracked_directories(
     }
 
     for (dir, files) in dir_files {
-        let dir_prefix = format!("{}/", dir.display());
-        let has_tracked_files = index.tracked_files().iter().any(|f| {
-            f.to_str()
-                .map(|s| s.starts_with(&dir_prefix))
-                .unwrap_or(false)
-        });
+        // Component-wise prefix check, never a `display()` string: a
+        // non-UTF-8 directory name must not be flattened (U+FFFD would
+        // break the comparison AND corrupt the marker).
+        let has_tracked_files = index.tracked_files().iter().any(|f| f.starts_with(&dir));
 
         if has_tracked_files {
             for file in files {
                 result.insert(file);
             }
         } else {
-            let dir_str = format!("{}/", dir.display());
-            let dir_path = PathBuf::from(dir_str);
-            result.insert(dir_path);
+            // The marker is `<dir>/` built on the RAW name (see
+            // `status_untracked_paths::directory_marker`).
+            let mut marker = dir.into_os_string();
+            marker.push("/");
+            result.insert(PathBuf::from(marker));
         }
     }
 

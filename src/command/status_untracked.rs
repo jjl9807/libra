@@ -410,7 +410,10 @@ fn scan_workdir(
                 };
                 if ignored {
                     if include_ignored {
-                        scan.ignored.push(relative);
+                        // Mirror the untracked branch (§B.3.5): an ignored
+                        // DIRECTORY is reported with its `/` marker, never
+                        // as a file-shaped path.
+                        scan.ignored.push(directory_marker(&relative));
                     }
                     continue;
                 }

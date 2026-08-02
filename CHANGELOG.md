@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-6 implementation review)
+
+- **Human `status` output now quotes paths like every other surface.**
+  `build_human_entries` used `Path::display()`, so human output could emit
+  literal TAB/LF/CR, backslashes, quotes and replacement characters for
+  non-UTF-8 names, and `core.quotePath` had no effect. All human path
+  rendering (including the unmerged section and aligned columns) now goes
+  through the shared quoting helper.
+- **`core.quotePath=false` no longer forces octal escapes for high bytes.**
+  Invalid-UTF-8 path bytes above `0x7F` were always `\377`-escaped; they
+  now pass through raw in the non-`-z` short/human/porcelain surfaces
+  (Git parity), while `String`-typed message and JSON display strings keep
+  the lossless escaped form. Control characters and `"`/`\` are escaped in
+  all formats as before.
+
 ### Fixed (plan-20260714 R0-3 implementation review)
 
 - **A metadata probe root hiding behind an escaping symlink is now reported,
