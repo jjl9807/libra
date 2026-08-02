@@ -242,10 +242,13 @@ diff 驱动的 verbatim 输出。与 Git 一样，`commit -v` 始终使用内建
 廉价阶段仍然生效——exact（blob id）重命名**以及**已评分的唯一 basename 配对
 （两侧各只有一个 `foo.rs`，且相似度仍达到阈值时才配对）。取值为非负整数，
 经严格 local → global → system 级联；`0` 表示“无 per-side
-限制”；默认 1000。`diff.renameComparisonBudget` 限制 inexact 扫描的相似度比较
-总数：非负整数，`0` 表示“无上限”（默认）。预算耗尽时丢弃穷举扫描结果，仅保留
-exact 与唯一 basename 的重命名，并发出警告。两者在非法（非整数/负数）设置时于
-任何 diff 输出前以 `LBR-CLI-002` fail-closed。
+限制”；默认 1000。`diff.renameComparisonBudget` 限制相似度比较总数，按次
+计费并同时作用于唯一 basename 与穷举两个阶段：非负整数，`0` 表示“无上限”
+（默认）。预算耗尽时正在执行的阶段停止，不再进行任何比较——已评分的配对
+（exact 及届时已配对的唯一 basename 配对）保留，穷举阶段结果被整体丢弃
+（部分结果顺序相关），并发出警告。注意区分：renameLimit 总是保留全部已评分
+唯一 basename 配对；comparisonBudget 只保留耗尽前已评分的部分。两者在非法
+（非整数/负数）设置时于任何 diff 输出前以 `LBR-CLI-002` fail-closed。
 
 ## 人类可读输出
 

@@ -65,7 +65,10 @@ honored; an unreadable or unsupported system scope skipped):
   human-short and non-`-z` porcelain v1/v2 paths always C-style-escape
   control characters, `"` and `\` (wrapping the path in double quotes);
   under the default, bytes above `0x7F` are additionally escaped as `\ooo`
-  octal. `-z` records always carry raw unquoted path bytes.
+  octal. With `false`, bytes above `0x7F` are written RAW on the non-`-z`
+  byte-oriented surfaces (short, human, porcelain v1/v2) — including names
+  that are not valid UTF-8 (Git parity) — while control characters, `"`
+  and `\` remain escaped. `-z` records always carry raw unquoted path bytes.
 
 All six keys are validated up front: an invalid value fails closed with
 `LBR-CLI-002` and an unreadable local/global scope with `LBR-IO-001`, before
@@ -713,8 +716,9 @@ Every `StatusError` variant maps to an explicit `StableErrorCode`.
 - `--porcelain v2` emits the real v2 line grammar (`1`/`2`/`u`/`?`/`!` records with
   mode/hash columns); `--json` remains the richer structured surface
 - Under `-z`, Unix porcelain v1/v2 write RAW OS path bytes (no quoting, lossless for
-  non-UTF-8 names); non-`-z` formats octal-escape non-UTF-8 bytes via the
-  `core.quotePath` quoting rules. A non-UTF-8 name never fails status — it keeps its
+  non-UTF-8 names); non-`-z` formats follow `core.quotePath` for bytes above
+  `0x7F` — octal-escaped when `true` (the default), written raw when `false`.
+  A non-UTF-8 name never fails status — it keeps its
   base `??` row and only sits out rename scoring (with a
   `rename_path_encoding_unsupported` warning)
 - jj's `jj status` always uses a short format and does not distinguish staged from unstaged changes (jj has no staging area)

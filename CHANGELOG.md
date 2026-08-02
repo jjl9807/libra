@@ -695,11 +695,14 @@ unreadable — as opposed to absent — worktree mode.
   R0-9)**: when `diff.renameLimit` / `status.renameLimit` is exceeded on
   either side, exact renames AND unique-basename renames are still
   reported — only the exhaustive inexact stage is skipped, with a
-  `rename_limit_product_skipped` warning. When
+  `rename_limit_product_skipped` warning.
   `diff.renameComparisonBudget` (or status's similarity budget) is
-  exhausted, the exhaustive pass's results are discarded wholesale (a
-  partial exhaustive result would be order-dependent) while exact and
-  unique-basename pairs survive, with a `similarity_budget_exceeded`
+  charged per comparison across BOTH the unique-basename and exhaustive
+  stages: when it is spent, the stage then running stops, no further
+  comparisons happen, the exhaustive pass's results are discarded
+  wholesale (a partial exhaustive result would be order-dependent), and
+  only pairs already scored — exact plus the unique-basename pairs
+  already paired by then — survive, with a `similarity_budget_exceeded`
   warning. `diff` now runs the same staged order as `status`
   (exact → unique-basename → bounded exhaustive), so a degraded run can
   no longer demote a basename-proven rename to a delete + add pair.
