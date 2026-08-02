@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-8 implementation review)
+
+- **`status` now fails closed in text modes for EVERY blocked path.**
+  An unreadable untracked directory's I/O-blocked event was marked
+  "absorbed" and exempted from the fatal guard, so plain and `--quiet`
+  status could return a normal verdict for a path it never inspected,
+  violating the unconditional fail-closed contract (§B.6.0.1). The guard
+  no longer exempts absorbed events; the `?? dir/` marker is still
+  emitted (over-reporting is the safe direction), JSON keeps the partial
+  contract (`io_blocked[]`, `base_scan_complete: false`), and the dirty
+  cache is never rewritten from a guess. Regression:
+  `quiet_unreadable_untracked_dir_fails_closed`.
+
 ### Fixed (plan-20260714 R0-6 implementation review)
 
 - **Human `status` output now quotes paths like every other surface.**

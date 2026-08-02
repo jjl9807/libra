@@ -443,12 +443,13 @@ fn scan_workdir(
                             // base scan is not claimed complete and the
                             // dirty cache is not rewritten from a guess.
                             //
-                            // The block is ABSORBED: the marker is in the
-                            // output, so nothing the user would see is
-                            // missing and the command must not fail closed.
-                            // At worst we list a directory a readable scan
-                            // would have hidden — over-reporting, which is
-                            // the safe direction.
+                            // The block is ABSORBED in the listing sense:
+                            // the marker is in the output, so over-reporting
+                            // (a readable scan might hide the dir) is the
+                            // safe direction. §B.6.0.1 still fails text
+                            // modes closed — a marker is not an inspection
+                            // result — while JSON keeps the partial
+                            // contract with `base_scan_complete` false.
                             scan.untracked.push(directory_marker(&relative));
                             let mut event = io_blocked_event(&relative, &error);
                             event.absorbed = true;

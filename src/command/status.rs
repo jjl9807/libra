@@ -3723,17 +3723,15 @@ fn fail_closed_on_io_blocked(data: &StatusData, output: &OutputConfig) -> CliRes
     if output.is_json() {
         return Ok(());
     }
-    // An ABSORBED block was compensated for in the rendered output (today:
-    // an unreadable untracked directory whose `?? dir/` marker we emitted
-    // anyway). The message below claims the output "would be incomplete",
-    // and for those it simply is not — refusing the command over a path the
-    // user can already see would be wrong. They stay in `io_blocked[]` for
-    // `--json` and still keep `base_scan_complete` false.
-    let mut omitted = data.io_blocked.iter().filter(|event| !event.absorbed);
-    let Some(first) = omitted.next() else {
+    // §B.6.0.1: in text modes ANY blocked path is fatal — including an
+    // absorbed one. An unreadable untracked directory gets its `?? dir/`
+    // marker emitted (over-reporting, the safe direction), but a marker is
+    // not an inspection result, so the command still fails closed rather
+    // than claim a complete status.
+    let Some(first) = data.io_blocked.first() else {
         return Ok(());
     };
-    let count = 1 + omitted.count();
+    let count = data.io_blocked.len();
     Err(CliError::fatal(format!(
         "cannot inspect '{}' ({count} path(s) blocked); status output would be incomplete",
         quote_pathname(&first.path, data.quote_path),

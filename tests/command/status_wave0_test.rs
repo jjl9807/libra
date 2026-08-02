@@ -6050,6 +6050,59 @@ fn cache_fallback_still_fails_closed_on_io_blocked() {
     assert_eq!(doc["data"]["is_clean"], false, "{doc}");
 }
 
+/// An unreadable top-level UNTRACKED directory fails text modes closed
+/// (§B.6.0.1) even though its `?? dir/` marker is emitted — a marker is not
+/// an inspection result. `--quiet` suppresses only the body, never the
+/// verdict; JSON keeps the partial contract (marker + io_blocked +
+/// `base_scan_complete: false`).
+#[cfg(unix)]
+#[test]
+fn quiet_unreadable_untracked_dir_fails_closed() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    let blocked = repo.path().join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("inner.txt"), "y\n").unwrap();
+    lock_dir(&blocked);
+
+    let text = run_libra_command(&["status"], repo.path());
+    let quiet = run_libra_command(&["--quiet", "status"], repo.path());
+    let json = run_libra_command(&["--json", "status"], repo.path());
+    unlock_dir(&blocked);
+
+    for (name, out) in [("text", &text), ("quiet", &quiet)] {
+        assert!(
+            !out.status.success(),
+            "{name} must fail closed for an unreadable directory: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot inspect"),
+            "{name} names the block with the fatal contract: {stderr}"
+        );
+    }
+
+    assert_cli_success(&json, "json keeps the partial contract");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json.stdout)).expect("json");
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "blocked/")),
+        "the marker is still emitted: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|b| !b.is_empty()),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["data"]["base_scan_complete"], false,
+        "the base scan is not claimed complete: {doc}"
+    );
+}
+
 /// §B.6.0.1 delivery matrix, `--quiet` arm: quiet suppresses the BODY, never
 /// the verdict. A blocked path must still fail closed under `--quiet` — a
 /// silent exit 0 on a repository status could not fully inspect is the exact
