@@ -2,7 +2,7 @@
 --
 -- REFUSES while any 'migrate' intent exists (the narrower CHECK could not
 -- represent it — finish or recover the layout migration first via
--- `libra worktree repair`), then restores the pre-2026072403 shape.
+-- `libra worktree repair --confirm`), then restores the pre-2026072403 shape.
 CREATE TABLE IF NOT EXISTS `worktree_migrate_intent_down_guard` (
     `blocked` INTEGER NOT NULL CHECK (`blocked` = 0)
 );

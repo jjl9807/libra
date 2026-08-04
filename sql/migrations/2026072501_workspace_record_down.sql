@@ -3,7 +3,7 @@
 -- REFUSES while any NON-TERMINAL workspace exists (provisioning / active /
 -- releasing / orphaned): dropping the table would orphan live leases and
 -- lose the recovery state the scavenger/doctor needs. Release or recover
--- them first (`libra worktree repair`, agent lease release), then retry.
+-- them first (`libra worktree repair --confirm`, agent lease release), then retry.
 CREATE TABLE IF NOT EXISTS `workspace_record_down_guard` (
     `blocked` INTEGER NOT NULL CHECK (`blocked` = 0)
 );

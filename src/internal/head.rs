@@ -129,8 +129,8 @@ impl Head {
             {
                 format!(
                     "this linked worktree's identity '{id}' is not in the worktree registry, so \
-                     it has no HEAD of its own — run `libra worktree repair` from the main \
-                     worktree to restore it"
+                     it has no HEAD of its own — run `libra worktree repair --confirm` from \
+                     the main worktree to restore it"
                 )
             }
             _ => "HEAD reference is missing from storage".to_string(),

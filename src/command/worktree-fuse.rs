@@ -163,6 +163,11 @@ pub enum WorktreeSubcommand {
         /// nothing.
         #[clap(long, requires = "migrate_layout")]
         dry_run: bool,
+        /// Confirm a MUTATING repair action (W0 §C.11): required for every
+        /// repair that writes; the read-only `--migrate-layout --dry-run`
+        /// never needs it.
+        #[clap(long)]
+        confirm: bool,
     },
 }
 
@@ -265,6 +270,24 @@ pub async fn execute(args: WorktreeArgs) {
     }
 }
 
+/// W0 (§C.11, Codex R19 follow-up), in parity with
+/// `legacy::repair_invocation_refused_without_confirmation`: an unconfirmed
+/// mutating repair is refused before any side effect, so it must skip the
+/// migration-applying open above. The FUSE surface never exposes
+/// `--resolve-identity`, so the predicate collapses to "unconfirmed and not
+/// the dry-run preview".
+fn repair_invocation_refused_without_confirmation(command: &WorktreeSubcommand) -> bool {
+    match command {
+        WorktreeSubcommand::Repair {
+            migrate_layout,
+            dry_run,
+            confirm,
+            ..
+        } => !(*migrate_layout && *dry_run) && !*confirm,
+        _ => false,
+    }
+}
+
 /// Executes the worktree command and returns structured errors.
 ///
 /// Behavior summary:
@@ -287,10 +310,26 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     // Kept in parity with the non-FUSE entry point, which makes the same
     // exclusion — this file re-declares the dispatch, so the exclusion has
     // to be re-stated or the FUSE build quietly upgrades what it diagnoses.
+    // An UNCONFIRMED mutating repair is excluded for the same reason (Codex
+    // R19 follow-up): its refusal is documented as zero-side-effect. So is
+    // the `--migrate-layout --dry-run` preview (Codex R20 follow-up): it is
+    // documented as read-only end to end, and the legacy arm it delegates to
+    // never resolves a database connection.
+    let refused_repair = repair_invocation_refused_without_confirmation(&command);
+    let readonly_layout_preview = matches!(
+        &command,
+        WorktreeSubcommand::Repair {
+            migrate_layout: true,
+            dry_run: true,
+            ..
+        }
+    );
     if !matches!(
         &command,
         WorktreeSubcommand::Umount { .. } | WorktreeSubcommand::Doctor { .. }
-    ) {
+    ) && !refused_repair
+        && !readonly_layout_preview
+    {
         // §C.7 ordering (same as the legacy entry point): apply pending
         // migrations — including the registry-v2 capability marker — before
         // any registry IO, and refuse a future-schema database gracefully.
@@ -308,6 +347,12 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
         // Bare boundary (config-first, same as legacy): refused before any
         // registry IO.
         legacy::reject_bare_repository().await?;
+    } else if refused_repair || readonly_layout_preview {
+        // Bare boundary precedes even the confirmation refusal (same as the
+        // legacy entry point), classified through the no-migration open so
+        // the refused repair and the read-only layout preview stay
+        // zero-side-effect.
+        legacy::reject_bare_repository_without_migrations().await?;
     }
 
     match command {
@@ -428,16 +473,38 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             path,
             migrate_layout,
             dry_run,
+            confirm,
         } => {
             // Core registry first: a corrupt/zero-byte core registry must
             // fail the command BEFORE any fuse metadata is mutated.
             let run_fuse_repair = path.is_none() && !migrate_layout;
+            if run_fuse_repair {
+                // W0 §C.11: ONE audit boundary covering BOTH repairs — the
+                // core registry repair and the FUSE state repair. Delegating
+                // to the legacy arm would close the boundary before the FUSE
+                // mutation: a FUSE failure would then follow a row already
+                // closed as successful, and a FUSE success would go
+                // unrecorded.
+                legacy::require_repair_confirmation(confirm, "worktree repair")?;
+                let boundary = legacy::begin_repair_operation("worktree repair", None).await?;
+                let result = legacy::repair_worktrees()
+                    .await
+                    .map_err(|e| e.into_cli_error())
+                    .and_then(|repaired| {
+                        repair_fuse_worktrees()
+                            .map(|()| repaired)
+                            .map_err(|e| CliError::fatal(e.to_string()))
+                    });
+                let result = legacy::finish_repair_operation(boundary, result).await?;
+                return legacy::render_repair_worktrees(&result, output);
+            }
             legacy::execute_safe(
                 legacy::WorktreeArgs {
                     command: legacy::WorktreeSubcommand::Repair {
                         path,
                         migrate_layout,
                         dry_run,
+                        confirm,
                         // Not exposed on the FUSE surface; the identity-repair
                         // flow needs the canonical layout.
                         resolve_identity: false,
@@ -446,11 +513,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 },
                 output,
             )
-            .await?;
-            if run_fuse_repair {
-                repair_fuse_worktrees().map_err(|e| CliError::fatal(e.to_string()))?;
-            }
-            Ok(())
+            .await
         }
     }
 }

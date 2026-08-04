@@ -513,7 +513,7 @@ pub fn resolve_control_paths(
                 working_dir = %working_dir.display(),
                 %error,
                 "worktree gitdir resolution failed; control files fall back to the storage root — \
-                 if this is a linked worktree, run `libra worktree repair <worktree-path>`"
+                 if this is a linked worktree, run `libra worktree repair --confirm <worktree-path>`"
             );
             // §C.4.1: with no gitdir AND no storage root there is nowhere
             // legitimate to put control files — use the working directory

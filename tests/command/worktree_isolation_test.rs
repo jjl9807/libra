@@ -1591,6 +1591,30 @@ fn ignore_other_worktrees_flag_cannot_bypass_in_multi_worktree() {
         co_err.contains("already checked out") && co_err.contains("ignore-other-worktrees"),
         "error explains the flag is not honored: {co_err}"
     );
+    // §C.13: the explicit-flag refusal must offer the doctor/repair route for
+    // a recorded owner that looks stale — never a dead end.
+    assert!(
+        co_err.contains("libra worktree doctor")
+            && co_err.contains("libra worktree repair --confirm"),
+        "the refusal offers the doctor/repair route: {co_err}"
+    );
+
+    // `switch --ignore-other-worktrees feature` is refused the same way, with
+    // the same recovery route (§C.13).
+    let sw_flag = run_libra_command(&["switch", "--ignore-other-worktrees", "feature"], main);
+    assert_ne!(
+        sw_flag.status.code(),
+        Some(0),
+        "switch flag cannot bypass either"
+    );
+    let sw_flag_err = String::from_utf8_lossy(&sw_flag.stderr);
+    assert!(
+        sw_flag_err.contains("already checked out")
+            && sw_flag_err.contains("ignore-other-worktrees")
+            && sw_flag_err.contains("libra worktree doctor")
+            && sw_flag_err.contains("libra worktree repair --confirm"),
+        "switch refusal carries the intentionally-different note and the doctor/repair route: {sw_flag_err}"
+    );
 
     // Plain `switch feature` is also refused (the same-branch guard).
     let sw = run_libra_command(&["switch", "feature"], main);
@@ -4734,7 +4758,7 @@ fn registry_v1_file_upgrades_to_v2_with_backfilled_ids() {
     // The first MUTATING command (here: no-arg repair, which loads under the
     // registry lock) performs the durable upgrade.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair drives the durable upgrade",
     );
 
@@ -4844,7 +4868,10 @@ fn corrupt_linked_identity_refuses_mutations_and_points_at_repair() {
     // own remedy leaves the worktree permanently stuck, so `worktree` stays
     // classified as repository scope (it manages the registry, not this
     // worktree's HEAD/index).
-    let repair = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    let repair = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         repair.status.success(),
         "the repair route named in the error must run: {}",
@@ -4887,7 +4914,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
     std::fs::remove_file(gitdir.join("commondir")).expect("drop commondir");
 
     let repaired = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&repaired, "worktree repair <path>");
@@ -4927,7 +4960,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
 
     // Idempotent second run: nothing left to restore.
     let second = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&second, "second repair run");
@@ -4939,7 +4978,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
     // fails closed on — is restored too, not just a missing file.
     std::fs::write(gitdir.join("commondir"), "").expect("corrupt commondir");
     let third = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&third, "repair of a corrupt commondir");
@@ -4953,7 +4998,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
     // foreign against the caller's cwd.
     std::fs::write(gitdir.join("commondir"), "../../.libra\n").expect("relative commondir");
     let relative = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&relative, "repair with a valid relative commondir");
@@ -4970,7 +5021,10 @@ fn worktree_repair_path_restores_identity_from_registry() {
     let foreign_pointer = format!("{}\n", other.path().display());
     std::fs::write(gitdir.join("commondir"), &foreign_pointer).expect("foreign commondir");
     std::fs::write(gitdir.join("worktree_id"), "stale-or-corrupt\n").expect("stale id");
-    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    let refused = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         !refused.status.success(),
         "repair must refuse to re-home a worktree pointing at another storage"
@@ -4994,7 +5048,10 @@ fn worktree_repair_path_refuses_main_and_unregistered() {
     let dir = repo_with_feature();
     let main = dir.path();
 
-    let main_refused = run_libra_command(&["worktree", "repair", main.to_str().unwrap()], main);
+    let main_refused = run_libra_command(
+        &["worktree", "repair", main.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         !main_refused.status.success(),
         "repair <main> must be refused"
@@ -5002,7 +5059,15 @@ fn worktree_repair_path_refuses_main_and_unregistered() {
 
     let stranger = main.join("never-registered");
     std::fs::create_dir_all(&stranger).expect("mkdir");
-    let unregistered = run_libra_command(&["worktree", "repair", stranger.to_str().unwrap()], main);
+    let unregistered = run_libra_command(
+        &[
+            "worktree",
+            "repair",
+            stranger.to_str().unwrap(),
+            "--confirm",
+        ],
+        main,
+    );
     assert!(
         !unregistered.status.success(),
         "repair on an unregistered path must be refused"
@@ -5127,7 +5192,7 @@ fn v2_identity_invariant_violations_refuse_until_explicit_repair() {
     );
 
     // The explicit no-arg repair heals deterministically (gitdir backfill).
-    let repaired = run_libra_command(&["--json", "worktree", "repair"], main);
+    let repaired = run_libra_command(&["--json", "worktree", "repair", "--confirm"], main);
     assert_cli_success(&repaired, "no-arg repair heals the invariants");
     let payload = parse_json_stdout(&repaired);
     assert_eq!(
@@ -5178,8 +5243,8 @@ fn zero_byte_registry_fails_closed_everywhere() {
     for argv in [
         vec!["worktree", "list"],
         vec!["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
-        vec!["worktree", "repair"],
-        vec!["worktree", "repair", wt.to_str().unwrap()],
+        vec!["worktree", "repair", "--confirm"],
+        vec!["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
     ] {
         let out = run_libra_command(&argv, main);
         assert!(
@@ -5234,7 +5299,10 @@ fn worktree_repair_path_refuses_v1_registry_until_upgrade() {
     )
     .expect("write v1 registry");
 
-    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    let refused = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         !refused.status.success(),
         "path repair must refuse a v1 registry"
@@ -5247,11 +5315,14 @@ fn worktree_repair_path_refuses_v1_registry_until_upgrade() {
 
     // The explicit upgrade, then the path form works.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "no-arg repair upgrades the registry",
     );
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main),
+        &run_libra_command(
+            &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+            main,
+        ),
         "path repair works on the upgraded registry",
     );
 }
@@ -5296,7 +5367,7 @@ fn v1_upgrade_never_crowns_a_linked_entry_as_main() {
         )
         .expect("write malformed v1");
         assert_cli_success(
-            &run_libra_command(&["worktree", "repair"], main),
+            &run_libra_command(&["worktree", "repair", "--confirm"], main),
             "upgrade via no-arg repair",
         );
         let upgraded: serde_json::Value =
@@ -5578,7 +5649,7 @@ async fn worktree_remove_delete_crash_repair() {
     std::fs::remove_dir_all(&wt).expect("simulate deleted dir");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair completes the interrupted remove",
     );
 
@@ -5795,7 +5866,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
     );
     plant(payload.clone()).await;
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with ambiguous move (present/present)",
     );
     assert_eq!(
@@ -5808,7 +5879,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
     std::fs::remove_dir_all(&dest).expect("drop dest");
     std::fs::remove_dir_all(&wt).expect("drop src");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with ambiguous move (missing/missing)",
     );
     assert_eq!(
@@ -5831,7 +5902,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
     )
     .expect("restore commondir");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair settles the never-started move",
     );
     assert_eq!(
@@ -5919,7 +5990,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     conn.close().await.expect("close");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a foreign-destination move journal",
     );
 
@@ -5988,7 +6059,7 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     conn.close().await.expect("close");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a stale reattach journal",
     );
 
@@ -6073,7 +6144,7 @@ fn worktree_add_branch_collision_has_zero_side_effects() {
     // Materialize the registry (a locked no-op mutator) so the byte
     // comparison below has a baseline.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "initialize registry",
     );
     let registry_before = std::fs::read(&registry).expect("registry before");
@@ -6407,7 +6478,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     let lock_path = main.join(".libra").join("branch-attach.lock");
     std::fs::create_dir_all(&lock_path).expect("block the lock path");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with an unacquirable attach lock",
     );
     let kept = run_libra_command(&["rev-parse", "crash-topic"], main);
@@ -6436,7 +6507,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     // closed — branch and journal both survive.
     let libra = env!("CARGO_BIN_EXE_libra");
     let faulted = std::process::Command::new(libra)
-        .args(["worktree", "repair"])
+        .args(["worktree", "repair", "--confirm"])
         .env("LIBRA_TEST_FAULT", "branch-attach-probe")
         .current_dir(main)
         .output()
@@ -6464,7 +6535,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     }
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair rolls the orphan branch back",
     );
     let gone = run_libra_command(&["rev-parse", "crash-topic"], main);
@@ -6488,7 +6559,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     ))
     .await;
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a moved tip",
     );
     let kept = run_libra_command(&["rev-parse", "crash-topic-2"], main);
@@ -6567,7 +6638,7 @@ fn create_legacy_symlink_worktree(main: &std::path::Path, name: &str) -> std::pa
     // Register it (v2 entry with a persisted id, as the v1→v2 upgrade
     // would have backfilled by canonical-path synthesis).
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "materialize registry",
     );
     let registry = main.join(".libra").join("worktrees.json");
@@ -6668,7 +6739,7 @@ fn legacy_symlink_mutation_fails_closed() {
     let registry_before = std::fs::read(&registry).expect("registry bytes");
     for argv in [
         vec!["worktree", "remove", wt.to_str().unwrap()],
-        vec!["worktree", "repair", wt.to_str().unwrap()],
+        vec!["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
     ] {
         let out = run_libra_command(&argv, main);
         assert!(
@@ -6728,7 +6799,10 @@ fn migrate_layout_refuses_active_shared_sidecar_state() {
     )
     .unwrap();
 
-    let out = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    let out = run_libra_command(
+        &["worktree", "repair", "--migrate-layout", "--confirm"],
+        main,
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -6753,7 +6827,10 @@ fn migrate_layout_refuses_active_shared_sidecar_state() {
     // Clearing the state lifts the refusal.
     fs::remove_file(main.join(".libra").join("merge-state.json")).unwrap();
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        &run_libra_command(
+            &["worktree", "repair", "--migrate-layout", "--confirm"],
+            main,
+        ),
         "migration succeeds once the state is gone",
     );
 }
@@ -6827,7 +6904,10 @@ fn legacy_layout_migration_preserves_dirty_and_untracked() {
 
     // Real migration.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        &run_libra_command(
+            &["worktree", "repair", "--migrate-layout", "--confirm"],
+            main,
+        ),
         "migrate",
     );
     assert!(
@@ -6915,7 +6995,10 @@ fn legacy_layout_unmerged_index_refused_before_rename() {
     let merge = run_libra_command(&["merge", "main"], main);
     assert!(!merge.status.success(), "merge conflicts");
 
-    let refused = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    let refused = run_libra_command(
+        &["worktree", "repair", "--migrate-layout", "--confirm"],
+        main,
+    );
     assert!(
         !refused.status.success(),
         "unmerged shared index refuses migration"
@@ -7041,7 +7124,7 @@ async fn layout_migration_crash_matrix() {
     std::fs::create_dir_all(&prepared1).unwrap();
     std::fs::write(prepared1.join("migrate-marker"), format!("journal {id1}\n")).unwrap();
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair window 1",
     );
     assert!(
@@ -7085,7 +7168,7 @@ async fn layout_migration_crash_matrix() {
     )
     .unwrap();
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair window 2",
     );
     let head2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt2).stdout)
@@ -7128,7 +7211,7 @@ async fn layout_migration_crash_matrix() {
     )
     .await;
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a stale migrate journal",
     );
     let head3 = String::from_utf8_lossy(
@@ -7150,6 +7233,7 @@ async fn layout_migration_crash_matrix() {
             "worktree",
             "repair",
             "--migrate-layout",
+            "--confirm",
             wt3.to_str().unwrap(),
         ],
         main,
@@ -7180,7 +7264,7 @@ async fn layout_migration_crash_matrix() {
     let frozen = run_libra_command(&["status"], &wt4);
     assert!(!frozen.status.success(), "marker freezes the worktree");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair clears the resolved marker",
     );
     assert!(

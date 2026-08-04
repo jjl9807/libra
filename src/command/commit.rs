@@ -2986,8 +2986,8 @@ async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), 
                 return Err(CommitError::HeadUpdate(format!(
                     "branch '{name}' is also checked out at worktree '{other}', so committing \
                      here would move a pointer that worktree is using; run `libra worktree \
-                     list` to inspect, then `libra worktree repair` or switch one of them to \
-                     another branch"
+                     list` to inspect, then `libra worktree repair --confirm` or switch one \
+                     of them to another branch"
                 )));
             }
             Branch::update_branch_with_conn(db, &name, commit_id, None)

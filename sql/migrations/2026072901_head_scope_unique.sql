@@ -17,10 +17,23 @@
 -- holds two HEAD rows for one scope has a real ownership question that only
 -- the operator can answer, and picking one here would destroy the evidence
 -- needed to answer it. The guard table below aborts the migration with the
--- duplicate count; recover by inspecting `reference` (kind='Head',
--- remote IS NULL) and deleting the row that does not belong to the worktree,
--- or by running `libra worktree repair` if the extra row belongs to a
--- worktree that no longer exists.
+-- duplicate count; recover by deleting the duplicate rows BY HAND with a
+-- SQLite client — every migration-applying path (including
+-- `libra worktree repair --confirm`) hits this same guard before it can run,
+-- and an unconfirmed repair refuses outright, so neither can be the recovery
+-- route. `libra worktree doctor` IS safe to inspect with first: it opens the
+-- database without applying migrations. Then, for a HEAD row whose worktree
+-- no longer exists:
+--   DELETE FROM `reference`
+--    WHERE `kind` = 'Head' AND `remote` IS NULL
+--      AND `worktree_id` = '<the-orphaned-worktree-id>';
+-- For the main scope (spelled `worktree_id IS NULL`), keep exactly one row:
+--   DELETE FROM `reference`
+--    WHERE `kind` = 'Head' AND `remote` IS NULL AND `worktree_id` IS NULL
+--      AND `rowid` NOT IN (SELECT MIN(`rowid`) FROM `reference`
+--                           WHERE `kind` = 'Head' AND `remote` IS NULL
+--                             AND `worktree_id` IS NULL);
+-- Re-run any migration-applying command afterwards to resume the upgrade.
 CREATE TABLE IF NOT EXISTS `head_scope_unique_guard` (
     `duplicates` INTEGER NOT NULL CHECK (`duplicates` = 0)
 );

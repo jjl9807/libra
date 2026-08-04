@@ -1437,6 +1437,38 @@ impl CommandPreflight {
     }
 }
 
+/// plan-20260714 Part C W0 (§C.11, Codex R19 follow-up): an unconfirmed
+/// mutating repair is refused before any side effect, so it must not take
+/// the migration-applying preflight. Mirrors
+/// `command::worktree::legacy::repair_invocation_refused_without_confirmation`;
+/// the FUSE surface never exposes `--resolve-identity`, so that arm exists
+/// only when compilation routes straight to the legacy module.
+fn repair_invocation_refused_without_confirmation(
+    command: &command::worktree::WorktreeSubcommand,
+) -> bool {
+    use command::worktree::WorktreeSubcommand;
+    let WorktreeSubcommand::Repair {
+        migrate_layout,
+        dry_run,
+        confirm,
+        ..
+    } = command
+    else {
+        return false;
+    };
+    #[cfg(not(all(unix, feature = "worktree-fuse")))]
+    if matches!(
+        command,
+        WorktreeSubcommand::Repair {
+            resolve_identity: true,
+            ..
+        }
+    ) {
+        return !matches!(command, WorktreeSubcommand::Repair { yes: true, .. });
+    }
+    !(*migrate_layout && *dry_run) && !*confirm
+}
+
 fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
     match command {
         Commands::Init(_)
@@ -1505,6 +1537,42 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         Commands::Worktree(command::worktree::WorktreeArgs {
             command: command::worktree::WorktreeSubcommand::Doctor { .. },
         }) => {
+            let storage =
+                utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
+        // W0 §C.11 (Codex R20 follow-up): the `repair --migrate-layout
+        // --dry-run` preview is documented as read-only end to end — and
+        // applying pending migrations is a WRITE. It takes the same
+        // no-migration preflight as `doctor`; the dispatch layers in
+        // `worktree.rs`/`worktree-fuse.rs` re-state the same exclusion, and
+        // the preview itself never resolves a database connection.
+        Commands::Worktree(command::worktree::WorktreeArgs {
+            command:
+                command::worktree::WorktreeSubcommand::Repair {
+                    migrate_layout: true,
+                    dry_run: true,
+                    ..
+                },
+        }) => {
+            let storage =
+                utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
+            Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
+                storage,
+            ))
+        }
+        // W0 §C.11 (Codex R19 follow-up): an UNCONFIRMED mutating repair is
+        // refused as byte-for-byte side-effect free — and applying pending
+        // migrations is a write. Route the would-be-refused invocation
+        // through the same no-migration preflight as `doctor` so the refusal
+        // cannot irreversibly upgrade an older repository's schema on the
+        // way to saying no. Confirmed actions keep the standard preflight:
+        // their audit boundary writes by design.
+        Commands::Worktree(args)
+            if repair_invocation_refused_without_confirmation(&args.command) =>
+        {
             let storage =
                 utils::util::try_get_storage_path(None).map_err(|error| repo_resolution_error(error, None))?;
             Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
@@ -1677,6 +1745,25 @@ fn command_scope(command: &Commands) -> CommandScope {
             // `.libra/maintenance.lock`, which is a filesystem change, in the
             // one command whose contract forbids any.
             command::worktree::WorktreeSubcommand::Doctor { .. } => ReadOnly,
+            // The `--migrate-layout --dry-run` preview publishes nothing
+            // (§C.11 W0, Codex R21): it is documented as read-only end to
+            // end, so it must not take the shared maintenance hold either —
+            // the hold CREATES `.libra/maintenance.lock` when absent, which
+            // is a filesystem write on the repository being previewed.
+            command::worktree::WorktreeSubcommand::Repair {
+                migrate_layout: true,
+                dry_run: true,
+                ..
+            } => ReadOnly,
+            // An UNCONFIRMED mutating repair is refused before any side
+            // effect (Codex R21): the refusal is documented as byte-for-byte
+            // side-effect free, and the lock-file creation the shared hold
+            // performs is a side effect.
+            command::worktree::WorktreeSubcommand::Repair { .. }
+                if repair_invocation_refused_without_confirmation(&args.command) =>
+            {
+                ReadOnly
+            }
             _ => Repository,
         },
 
@@ -2418,8 +2505,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         // code. What it must never be is a generic "unsupported".
         .with_stable_code(utils::error::StableErrorCode::RepoStateInvalid)
         .with_hint(
-            "run `libra worktree repair --migrate-layout <this-path>` from the main \
-             worktree to migrate it to the isolated layout (read-only commands still work)",
+            "run `libra worktree repair --migrate-layout --confirm <this-path>` from the \
+             main worktree to migrate it to the isolated layout (read-only commands still \
+             work; `--dry-run` previews it without confirmation)",
         ));
     }
     // W0 §C.4.1: a linked worktree whose `worktree_id` is missing, empty, or
@@ -2456,8 +2544,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 // LBR-REPO-002.
                 .with_stable_code(utils::error::StableErrorCode::RepoCorrupt)
                 .with_hint(
-                    "run `libra worktree repair` from the main worktree to restore this \
-                     worktree's identity (read-only commands still work)",
+                    "run `libra worktree repair --confirm` from the main worktree to restore \
+                     this worktree's identity (read-only commands still work)",
                 ));
         }
     }

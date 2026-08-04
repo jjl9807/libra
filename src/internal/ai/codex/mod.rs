@@ -1005,7 +1005,7 @@ pub async fn init_mcp_server(working_dir: &Path) -> Arc<LibraMcpServer> {
                 %error,
                 "storage-root resolution failed for the MCP server; running read-only rather \
                  than minting a phantom <working_dir>/.libra — run `libra worktree repair \
-                 <worktree-path>` for a linked worktree"
+                 --confirm <worktree-path>` for a linked worktree"
             );
             return Arc::new(LibraMcpServer::new_with_working_dir(
                 None,
