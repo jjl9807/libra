@@ -88,6 +88,15 @@ pub struct SwitchArgs {
     #[clap(short = 'f', long = "force", visible_alias = "discard-changes")]
     pub force: bool,
 
+    /// Switch to a branch even if it is already checked out in another worktree.
+    /// Accepted for Git parity, but NOT honored against a real collision: each
+    /// worktree owns its HEAD, and one branch may be checked out by at most one
+    /// live worktree (ADR-0714-09), so switching to a branch held by another
+    /// worktree is refused with or without this flag. It is a silent no-op in a
+    /// single-worktree repository.
+    #[clap(long = "ignore-other-worktrees")]
+    pub ignore_other_worktrees: bool,
+
     /// When <branch> is not a local branch but matches exactly one
     /// remote-tracking branch, create a local branch tracking it and switch
     /// (Git's DWIM). Enabled by default; overrides `checkout.guess`.
@@ -901,6 +910,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
         detach,
         track,
         force,
+        ignore_other_worktrees,
         guess,
         no_guess,
     } = args;
@@ -939,7 +949,8 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
 
         branch::create_branch_safe(new_branch_name.clone(), branch).await?;
         let created_branch = resolve_created_branch(&new_branch_name).await?;
-        let commit = switch_to_resolved_branch(created_branch, output).await?;
+        // A freshly created branch cannot be checked out in another worktree.
+        let commit = switch_to_resolved_branch(created_branch, output, false).await?;
         return Ok(SwitchOutput {
             previous_branch,
             previous_commit,
@@ -983,7 +994,8 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
         }
         branch::create_branch_safe(new_branch_name.clone(), branch).await?;
         let created_branch = resolve_created_branch(&new_branch_name).await?;
-        let commit = switch_to_resolved_branch(created_branch, output).await?;
+        // A freshly (re)created branch cannot be checked out in another worktree.
+        let commit = switch_to_resolved_branch(created_branch, output, false).await?;
         return Ok(SwitchOutput {
             previous_branch,
             previous_commit,
@@ -1089,7 +1101,8 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             ensure_switch_clean_or_force(force, target_branch.commit, output).await?;
 
             let branch = target_branch.name.clone();
-            let commit = switch_to_resolved_branch(target_branch, output).await?;
+            let commit =
+                switch_to_resolved_branch(target_branch, output, ignore_other_worktrees).await?;
             Ok(SwitchOutput {
                 previous_branch,
                 previous_commit,
@@ -1213,6 +1226,8 @@ async fn switch_to_tracked_remote_branch(
             commit: target.commit,
         },
         output,
+        // A freshly created tracking branch cannot be checked out elsewhere.
+        false,
     )
     .await?;
     Ok(TrackedSwitchResult {
@@ -1409,8 +1424,15 @@ async fn move_to_commit(
 async fn switch_to_resolved_branch(
     target_branch: ResolvedSwitchBranch,
     output: &OutputConfig,
+    ignore_other_worktrees: bool,
 ) -> Result<ObjectHash, SwitchError> {
-    move_to_resolved_branch(target_branch, NavigationCommand::Switch, output, false).await
+    move_to_resolved_branch(
+        target_branch,
+        NavigationCommand::Switch,
+        output,
+        ignore_other_worktrees,
+    )
+    .await
 }
 
 pub(crate) async fn checkout_to_branch(
@@ -1479,7 +1501,8 @@ async fn move_to_resolved_branch(
         let hint = if ignore_other_worktrees {
             "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
              checked out in two worktrees): switch to a different branch, or use --detach to \
-             share its tip"
+             share its tip; if the recorded owner looks stale, inspect it with `libra \
+             worktree doctor` and settle the registry with `libra worktree repair --confirm`"
         } else {
             "switch to a different branch, or use --detach to share its tip"
         };

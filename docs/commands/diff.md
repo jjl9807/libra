@@ -262,10 +262,15 @@ unique-basename pairs (a lone `foo.rs` on each side, pairing only when its
 similarity still meets the threshold). The
 value is a non-negative integer through the strict local → global → system
 cascade; `0` means "no per-side limit"; the default is 1000. `diff.renameComparisonBudget`
-caps the total number of similarity comparisons in the inexact pass: a
-non-negative integer where `0` means "unlimited" (the default). When the budget
-is exhausted, the exhaustive-pass results are discarded and only exact plus
-unique-basename renames survive, with a warning. Both values fail closed with
+caps the total number of similarity comparisons, charged per comparison across
+BOTH the unique-basename and the exhaustive stages: a non-negative integer
+where `0` means "unlimited" (the default). When the budget is spent, the stage
+then running stops and no further comparisons happen — pairs already scored
+(exact, plus the unique-basename pairs already paired by then) survive, the
+exhaustive pass's results are discarded wholesale (a partial result would be
+order-dependent), and a warning is emitted. Note the distinction: the limit
+always keeps every scored unique-basename pair; the budget only keeps the ones
+already scored. Both values fail closed with
 `LBR-CLI-002` on an invalid (non-integer/negative) setting before any diff
 output.
 

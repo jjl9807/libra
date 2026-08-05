@@ -6,13 +6,13 @@
 --     directory but its scoped DB rows are KEPT; mutations in that directory
 --     fail closed until re-add/repair or `--delete-dir` completes.
 --   * tombstone — `worktree remove --delete-dir` deleted the directory but
---     the scoped-row cleanup failed; `worktree repair` retries it.
+--     the scoped-row cleanup failed; `worktree repair --confirm` retries it.
 --
 -- `worktree_intent_journal` is the durable intent record for registry
 -- mutators (add/move/remove/prune): the intent row is written BEFORE any
 -- filesystem/registry mutation and resolved (deleted) after publication, so
--- a crash leaves a pending row that `worktree repair` can roll forward or
--- back. SQLite cannot join a filesystem rename into one transaction — this
+-- a crash leaves a pending row that `worktree repair --confirm` can roll
+-- forward or back. SQLite cannot join a filesystem rename into one transaction — this
 -- is a recoverable state machine, not cross-medium ACID.
 --
 -- Both tables also make the v2 down-migration guard concrete: rolling back

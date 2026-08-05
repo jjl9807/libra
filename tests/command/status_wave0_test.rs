@@ -2041,6 +2041,243 @@ fn human_rename_long_format() {
     );
 }
 
+/// Human rendering routes every path through `quote_pathname` (§B.6.6): a
+/// TAB inside a rename destination is escaped, never emitted literally
+/// where it would break column parsing downstream.
+#[test]
+fn human_rename_quotes_control_characters() {
+    let repo = create_repo_with_committed_file("old.txt", "body\n");
+    let mv = run_libra_command(&["mv", "old.txt", "new\tname.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv to a tabbed name");
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.lines().any(|l| l.trim_start().starts_with("renamed:")
+            && l.contains("old.txt -> \"new\\tname.txt\"")),
+        "the tab is escaped through quote_pathname: {out}"
+    );
+    assert!(
+        !out.contains("new\tname.txt"),
+        "and never emitted as a literal tab: {out:?}"
+    );
+}
+
+/// Strip `ESC [ ... m` SGR sequences so a colored run can be compared
+/// byte-for-byte with the plain one.
+#[cfg(unix)]
+fn strip_ansi_codes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+            let mut end = index + 2;
+            while end < bytes.len() && bytes[end] != b'm' {
+                end += 1;
+            }
+            index = end + 1;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Forced color must not defeat `core.quotePath=false`: the XY status
+/// letters are ANSI-colored, but the path bytes stay raw (Git parity).
+#[cfg(unix)]
+#[test]
+fn short_forced_color_keeps_raw_high_bytes_with_quote_path_false() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = create_repo_with_committed_file("old.txt", "body\\n");
+    fs::write(
+        repo.path()
+            .join(std::ffi::OsStr::from_bytes(b"new-\xff.txt")),
+        "payload\\n",
+    )
+    .unwrap();
+    let cfg = run_libra_command(&["config", "core.quotePath", "false"], repo.path());
+    assert_cli_success(&cfg, "set core.quotePath false");
+
+    let out = run_libra_command(&["status", "--short", "--color=always"], repo.path());
+    assert_cli_success(&out, "forced-color short status");
+    assert!(
+        out.stdout.windows(5).any(|window| window == b"new-\xff"),
+        "raw high bytes under forced color: {:?}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.windows(4).any(|window| window == b"\\377"),
+        "no octal escaping under forced color: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.windows(2).any(|window| window == b"\x1b["),
+        "and the XY letters really are ANSI-colored (the forced mode works): {:?}",
+        out.stdout
+    );
+
+    // A rename row under forced color: stripping the SGR codes must leave
+    // exactly the plain run's bytes — the byte-faithful colored rename arm
+    // is identical to the former String renderer for valid UTF-8.
+    let repo2 = create_repo_with_committed_file("a.txt", "body\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo2.path());
+    assert_cli_success(&mv, "libra mv");
+    let plain = run_libra_command(&["status", "--short", "--color=never"], repo2.path());
+    assert_cli_success(&plain, "plain short status");
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        plain_text
+            .lines()
+            .any(|line| line.starts_with('R') && line.contains("a.txt -> b.txt")),
+        "the fixture really produces a rename row: {plain_text}"
+    );
+    let colored = run_libra_command(&["status", "--short", "--color=always"], repo2.path());
+    assert_cli_success(&colored, "forced-color short status");
+    assert!(
+        colored.stdout.windows(2).any(|window| window == b"\x1b["),
+        "the CLI-forced run really emitted SGR codes: {:?}",
+        colored.stdout
+    );
+    assert_eq!(
+        strip_ansi_codes(&colored.stdout),
+        plain.stdout,
+        "stripped forced-color output equals the plain output"
+    );
+    // The same through the config-scoped forced color: the byte-faithful
+    // colored branch runs and must not alter the bytes (the colored
+    // crate's own gate decides code emission; `--color=always` above is the
+    // route that forces SGR on a pipe).
+    let cfg = run_libra_command(&["config", "color.status.short", "always"], repo2.path());
+    assert_cli_success(&cfg, "set color.status.short=always");
+    let via_config = run_libra_command(&["status", "--short"], repo2.path());
+    assert_cli_success(&via_config, "config-forced short status");
+    assert_eq!(
+        strip_ansi_codes(&via_config.stdout),
+        plain.stdout,
+        "config-forced output equals the plain output after stripping"
+    );
+}
+
+/// A non-UTF-8 directory marker keeps its raw bytes end to end: collapsed
+/// `? dir/` markers are built from the raw name, never through `display()`.
+#[cfg(unix)]
+#[test]
+fn untracked_dir_marker_keeps_raw_bytes_with_quote_path_false() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = create_repo_with_committed_file("old.txt", "body\\n");
+    let dir = repo.path().join(std::ffi::OsStr::from_bytes(b"dir-\xff"));
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("file.txt"), "payload\\n").unwrap();
+
+    let on = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(
+        on.contains("dir-\\377/"),
+        "the default escapes the marker: {on}"
+    );
+
+    let cfg = run_libra_command(&["config", "core.quotePath", "false"], repo.path());
+    assert_cli_success(&cfg, "set core.quotePath false");
+    let out = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&out, "short status");
+    assert!(
+        out.stdout.windows(5).any(|window| window == b"dir-\xff"),
+        "the marker keeps its raw bytes: {:?}",
+        out.stdout
+    );
+
+    // The porcelain projection (`data_with_repo_root_paths`) keeps the raw
+    // marker bytes too — this is the surface even `-z` flows through.
+    let out = run_libra_command(&["status", "--porcelain"], repo.path());
+    assert_cli_success(&out, "porcelain status");
+    assert!(
+        out.stdout.windows(5).any(|window| window == b"dir-\xff"),
+        "porcelain keeps the raw marker bytes: {:?}",
+        out.stdout
+    );
+
+    // JSON carries the ESCAPED original bytes — never a U+FFFD corruption.
+    let out = run_libra_command(&["--json", "status"], repo.path());
+    assert_cli_success(&out, "json status");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let untracked = doc["data"]["untracked"].as_array().expect("untracked");
+    assert!(
+        untracked.iter().any(|p| p == "dir-\\377/"),
+        "JSON escapes the marker bytes without corrupting them: {doc}"
+    );
+    assert!(
+        !untracked.iter().any(|p| p.to_string().contains('\u{fffd}')),
+        "and never a replacement character: {doc}"
+    );
+
+    // Ignored markers ride the same raw-bytes projection (the ignore
+    // pattern itself is a UTF-8-safe glob — ignore files must be UTF-8).
+    fs::write(repo.path().join(".libraignore"), "dir-i*/\n").unwrap();
+    let ignored_dir = repo.path().join(std::ffi::OsStr::from_bytes(b"dir-i\xff"));
+    fs::create_dir(&ignored_dir).unwrap();
+    fs::write(ignored_dir.join("file.txt"), "payload\n").unwrap();
+    let out = run_libra_command(&["status", "--short", "--ignored"], repo.path());
+    assert_cli_success(&out, "short status --ignored");
+    let lines: Vec<&[u8]> = out.stdout.split(|b| *b == b'\n').collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| *line == b"!! dir-i\xff/".as_slice()),
+        "the ignored directory is reported with its `/` marker: {:?}",
+        out.stdout
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with(b"?? dir-i".as_slice())),
+        "and never as an untracked row: {:?}",
+        out.stdout
+    );
+}
+
+/// `core.quotePath` controls >0x7F bytes: with the default the invalid-UTF-8
+/// name is octal-escaped; with `false` the short format writes the RAW high
+/// bytes (Git parity) instead of forcing the escape.
+#[cfg(unix)]
+#[test]
+fn short_non_utf8_quote_path_false_writes_raw_high_bytes() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = create_repo_with_committed_file("old.txt", "body\n");
+    // An untracked name with an invalid-UTF-8 high byte; `libra add` refuses
+    // such paths, so the fixture stays at the `??` row.
+    fs::write(
+        repo.path()
+            .join(std::ffi::OsStr::from_bytes(b"new-\xff.txt")),
+        "payload\n",
+    )
+    .unwrap();
+
+    let on = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(
+        on.contains("\\377"),
+        "quotePath=true octal-escapes the high byte: {on}"
+    );
+
+    let cfg = run_libra_command(&["config", "core.quotePath", "false"], repo.path());
+    assert_cli_success(&cfg, "set core.quotePath false");
+    let out = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&out, "short status with quotePath false");
+    assert!(
+        out.stdout.windows(5).any(|window| window == b"new-\xff"),
+        "quotePath=false writes the raw high bytes: {:?}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.windows(4).any(|window| window == b"\\377"),
+        "and nothing is octal-escaped: {:?}",
+        out.stdout
+    );
+}
+
 // ── R0-4 residuals: cluster/value safety pins (§B.4.3) ───────────────────────
 
 /// A global short option's ATTACHED value must never leak letters into
@@ -5811,6 +6048,59 @@ fn cache_fallback_still_fails_closed_on_io_blocked() {
         "the blocked path rides in the fallback envelope: {doc}"
     );
     assert_eq!(doc["data"]["is_clean"], false, "{doc}");
+}
+
+/// An unreadable top-level UNTRACKED directory fails text modes closed
+/// (§B.6.0.1) even though its `?? dir/` marker is emitted — a marker is not
+/// an inspection result. `--quiet` suppresses only the body, never the
+/// verdict; JSON keeps the partial contract (marker + io_blocked +
+/// `base_scan_complete: false`).
+#[cfg(unix)]
+#[test]
+fn quiet_unreadable_untracked_dir_fails_closed() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    let blocked = repo.path().join("blocked");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("inner.txt"), "y\n").unwrap();
+    lock_dir(&blocked);
+
+    let text = run_libra_command(&["status"], repo.path());
+    let quiet = run_libra_command(&["--quiet", "status"], repo.path());
+    let json = run_libra_command(&["--json", "status"], repo.path());
+    unlock_dir(&blocked);
+
+    for (name, out) in [("text", &text), ("quiet", &quiet)] {
+        assert!(
+            !out.status.success(),
+            "{name} must fail closed for an unreadable directory: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cannot inspect"),
+            "{name} names the block with the fatal contract: {stderr}"
+        );
+    }
+
+    assert_cli_success(&json, "json keeps the partial contract");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&json.stdout)).expect("json");
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "blocked/")),
+        "the marker is still emitted: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|b| !b.is_empty()),
+        "{doc}"
+    );
+    assert_eq!(
+        doc["data"]["base_scan_complete"], false,
+        "the base scan is not claimed complete: {doc}"
+    );
 }
 
 /// §B.6.0.1 delivery matrix, `--quiet` arm: quiet suppresses the BODY, never

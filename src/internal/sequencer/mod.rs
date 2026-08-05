@@ -680,7 +680,7 @@ pub(crate) async fn request_db_checked() -> Result<sea_orm::DatabaseConnection, 
             format!(
                 "cannot open the repository database for '{workdir}': {error}. If this is a \
                  linked worktree, its `.libra/commondir` may be missing or corrupt — run \
-                 `libra worktree repair {workdir}` from the main worktree"
+                 `libra worktree repair --confirm {workdir}` from the main worktree"
             )
         })
 }

@@ -298,7 +298,7 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
 /// empty first line, the pointer is CORRUPT — we must NOT silently fall back to
 /// treating the library-less local gitdir as common storage, which would route
 /// every db/objects lookup at a phantom repository. Return an error so mutation
-/// paths refuse and point the user at `libra worktree repair`. Only a genuinely
+/// paths refuse and point the user at `libra worktree repair --confirm`. Only a genuinely
 /// absent `commondir` (a main worktree) resolves to the gitdir itself.
 fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     let commondir_file = gitdir.join("commondir");
@@ -316,7 +316,7 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
             io::ErrorKind::PermissionDenied,
             format!(
                 "this worktree has an unfinished layout migration; run `libra worktree \
-                 repair` from the main worktree ('{}')",
+                 repair --migrate-layout --confirm` from the main worktree ('{}')",
                 gitdir.display()
             ),
         ));
@@ -345,7 +345,7 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
                     io::ErrorKind::InvalidData,
                     format!(
                         "worktree commondir pointer at '{}' is empty; the linked worktree is \
-                         corrupt — run `libra worktree repair <worktree-path>` from the main \
+                         corrupt — run `libra worktree repair --confirm <worktree-path>` from the main \
                          worktree",
                         commondir_file.display()
                     ),
@@ -367,7 +367,7 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
             io::ErrorKind::InvalidData,
             format!(
                 "cannot read worktree commondir pointer at '{}': {err}; the linked worktree \
-                 is corrupt — run `libra worktree repair <worktree-path>` from the main \
+                 is corrupt — run `libra worktree repair --confirm <worktree-path>` from the main \
                  worktree",
                 commondir_file.display()
             ),

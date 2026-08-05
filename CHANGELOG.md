@@ -2,6 +2,176 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W0 implementation review)
+
+- **An unconfirmed `worktree repair` no longer upgrades the repository schema
+  on its way to refusing.** The confirmation refusal is documented as
+  byte-for-byte side-effect free, but the command used to apply pending
+  database migrations (an irreversible write) in its preflight before the
+  `--confirm` check ran. A would-be-refused invocation now skips every
+  migration-applying database open — the CLI preflight and both dispatch
+  entry points (legacy and FUSE) route it straight to the pure refusal.
+  Pinned by `unconfirmed_repair_applies_no_pending_migrations`, which drops
+  the newest applied-migration row and proves the refusal leaves it dropped.
+- **`worktree doctor` is now strictly read-only on a pre-upgrade
+  repository.** The scope report used to reach the shared, migration-applying
+  connection for one lookup, so the one command documented as safe to run
+  before you decide to upgrade could itself apply pending migrations. The
+  report path now threads the migration-free connection `run_worktree_doctor`
+  opens (`open_database_without_migrations`) through every lookup. Pinned by
+  `bare_doctor_applies_no_pending_migrations`: bare and `--json` doctor both
+  succeed against a repository with a pending migration and leave it pending
+  (`worktree list` re-applies it as the positive control). The duplicate-HEAD
+  migration's recovery guidance builds on this: inspect with doctor first,
+  then delete the duplicate rows by hand with the SQL statements the
+  migration comment spells out (no repair spelling can be the route — every
+  migration-applying path hits the same guard).
+- **The `worktree repair --migrate-layout --dry-run` preview is now read-only
+  in fact, not just in the docs.** The confirmation-free preview used to take
+  the migration-applying CLI preflight and dispatch-time database opens, and
+  resolved the global (migration-applying) connection before returning its
+  plan — so a documented read-only check could irreversibly upgrade a
+  repository's schema. The preview now skips every migration-applying open
+  (CLI preflight plus both legacy and FUSE dispatch entries) and never
+  resolves a database connection at all: `migrate_layout_run` defers the
+  connection until after the dry-run return. Pinned by
+  `migrate_layout_dry_run_applies_no_pending_migrations`: plain and `--json`
+  previews both succeed against a repository with a pending migration and
+  leave it pending (`worktree list` re-applies it as the positive control).
+- **Read-only repair modes no longer create `.libra/maintenance.lock`.** The
+  `--migrate-layout --dry-run` preview and every unconfirmed (would-be-refused)
+  `worktree repair` were classified as repository writers, so the generic
+  shared maintenance hold ran before dispatch and created the lock file — a
+  filesystem write on paths documented as byte-for-byte side-effect free.
+  Both modes are now classified read-only, so neither takes the hold, while
+  every confirmed repair keeps its lock. Pinned by
+  `read_only_repair_modes_create_no_maintenance_lock`: with the lock file
+  deleted, plain and `--json` previews plus all four unconfirmed-repair
+  refusals leave it absent (`worktree repair --confirm` re-creates it as the
+  positive control).
+- **The `--ignore-other-worktrees` refusal now names a recovery route
+  (§C.13).** `checkout` and `switch` still never honor the flag (the same
+  branch is never checked out in two worktrees). The `switch` CLI now
+  actually parses the flag too (only `checkout` did before, so
+  COMPATIBILITY's long-standing parity claim is finally true), but the
+  refusal used to be a dead end. It now points at `libra worktree doctor` and
+  `libra worktree
+  repair --confirm` for a recorded owner that looks stale, pinned for both
+  commands by `ignore_other_worktrees_flag_cannot_bypass_in_multi_worktree`.
+- **Every user-visible `worktree repair` suggestion now names its
+  confirmation.** CLI preflight hints, doctor findings, and recovery output
+  across the crate pointed at bare `libra worktree repair …` commands that
+  the W0 confirmation gate deterministically refuses. Each now carries
+  `--confirm` (or `--yes` for `--resolve-identity`, `--dry-run` for the
+  read-only preview), and the source-scan regression
+  `repair_guidance_in_source_always_names_its_confirmation` keeps every
+  backtick-quoted suggestion honest — including hints split across source
+  lines, since the scan first joins Rust string-literal line continuations
+  (`\`+newline) the way the compiler renders them — and the scan now covers
+  the C.3.3 developer documentation sources, COMPATIBILITY.md, and every
+  `sql/migrations/*.sql` comment as well (spans explicitly attributed to
+  Git's own CLI are exempt; upstream has no `--confirm`).
+- **The paginated `worktree.doctor` JSON examples now include the
+  `worktrees[]` half.** The bare invocation has always serialized both the
+  workspace page and the per-worktree findings in one envelope; the examples
+  in `docs/commands/worktree.md` and its zh-CN twin showed only the
+  workspace half. `worktree_doctor_json_schema_and_pagination_stable` now
+  also pins the frozen top-level `data` key set and the per-worktree
+  diagnostic key set.
+- **Every mutating `worktree repair` action now requires `--confirm`
+  (§C.11 W0, Codex R16/R17).** The no-arg registry repair, `repair <path>`,
+  and a non-dry-run `--migrate-layout` previously mutated the registry,
+  database and filesystem with no confirmation at all. Without the flag the
+  command is now refused with `LBR-CONFLICT-002` before any side effect; with
+  it the action runs inside one operation-log audit boundary, recording
+  exactly one row per executed action (`libra op log`), success or failure.
+  The read-only `--migrate-layout --dry-run` stays confirmation-free, and
+  `repair <path> --resolve-identity` keeps its dedicated `--yes`. The FUSE
+  surface (`--features worktree-fuse`) exposes and forwards the same
+  `--confirm` flag. Pinned by
+  the table-driven `worktree_doctor_mutations_require_confirmation_and_emit_audit`
+  (no confirmation → zero side effects; confirmed → only the target scope
+  changes; exactly one audit event).
+- **`worktree repair <path> --resolve-identity` is now audited too.**
+  `--yes` stays its dedicated confirmation (it is the one action that runs
+  against an ambiguous registry), but once confirmed the detach runs inside
+  the same one-row operation-log audit boundary as every other mutating
+  repair — a success closes the row `succeeded`, a failure closes it
+  `failed`. Previously the action detached the registry entry with no durable
+  outcome record at all. Regression:
+  `worktree_repair_resolve_identity_runs_inside_the_audit_boundary`.
+- **A failed audit-boundary close now fails the repair command instead of
+  being swallowed.** `finish_repair_operation` previously logged a warning and
+  returned the repair outcome when the operation-log row could not be closed —
+  silently violating the "exactly one row, closed with the outcome" contract.
+  It now returns a fatal `LBR-IO-002` stating the repair completed but the
+  record could not be closed, with a hint to inspect `libra op log`. Pinned by
+  the fault-injection unit test
+  `command::worktree::tests::finish_repair_operation_surfaces_close_failure`.
+- **The no-arg FUSE-surface `Repair` now shares ONE audit boundary with the
+  core registry repair** (`--features worktree-fuse`). Previously the legacy
+  arm closed its boundary before `repair_fuse_worktrees()` ran: a FUSE
+  failure followed a row already closed as successful, and a FUSE success
+  went unrecorded. The FUSE surface now opens the boundary itself, runs both
+  repairs inside it, and closes with the combined outcome. Regressions:
+  `fuse_repair_shares_one_audit_boundary_with_core_repair` and
+  `fuse_repair_failure_closes_the_shared_audit_row_failed`.
+- **`fsck --heal` now fails closed on repositories that have (or had) linked
+  worktrees.** Heal discovery walks only refs/reflogs/index roots — it does
+  not consume the full `GcObjectSource` per-worktree inventory (private
+  indexes, sequencer rows, sidecars, notes), so healing a multi-worktree
+  repository could miss and mis-report another scope's objects. The command
+  now refuses up front with `LBR-REPO-003` and points at
+  `libra maintenance run` (the inventory-complete reachability walk), exactly
+  like the W0 GC/repack/prune hard gate. Regression:
+  `test_fsck_heal_refused_with_linked_worktrees`.
+- **Worktree documentation now matches per-worktree HEAD semantics
+  (§C.3.3/ADR-0714-09).** The `--ignore-other-worktrees` help text no longer
+  claims worktrees share a single HEAD (it is accepted for Git parity but
+  never bypasses the one-branch-one-live-worktree refusal);
+  `worktree list --porcelain` integration assertions describe per-scope
+  `HEAD`/`branch`/`detached`/`layout` lines; `for-each-ref`'s
+  `%(worktreepath)` documentation now states the path comes from scoped HEAD
+  rows across all worktrees; COMPATIBILITY's `switch` and `config` rows
+  record the collision refusal (`LBR-CONFLICT-002`) and the probe-written,
+  tighten-only per-worktree config overlay (public `--worktree` writes
+  deferred as DEFER-09).
+- **The repair confirmation/audit table test compares JSON semantically.**
+  `worktree_doctor_mutations_require_confirmation_and_emit_audit` compared
+  fixture bytes against on-disk JSON, but the migration writes struct-field
+  order while the fixture round-trips through `serde_json` (alphabetical
+  keys) — pure key-order noise. The assertion now parses both sides to
+  `serde_json::Value`, so the W0 (§C.11, Codex R16/R17) confirmation+audit
+  contract is pinned without false failures.
+
+### Fixed (plan-20260714 R0-8 implementation review)
+
+- **`status` now fails closed in text modes for EVERY blocked path.**
+  An unreadable untracked directory's I/O-blocked event was marked
+  "absorbed" and exempted from the fatal guard, so plain and `--quiet`
+  status could return a normal verdict for a path it never inspected,
+  violating the unconditional fail-closed contract (§B.6.0.1). The guard
+  no longer exempts absorbed events; the `?? dir/` marker is still
+  emitted (over-reporting is the safe direction), JSON keeps the partial
+  contract (`io_blocked[]`, `base_scan_complete: false`), and the dirty
+  cache is never rewritten from a guess. Regression:
+  `quiet_unreadable_untracked_dir_fails_closed`.
+
+### Fixed (plan-20260714 R0-6 implementation review)
+
+- **Human `status` output now quotes paths like every other surface.**
+  `build_human_entries` used `Path::display()`, so human output could emit
+  literal TAB/LF/CR, backslashes, quotes and replacement characters for
+  non-UTF-8 names, and `core.quotePath` had no effect. All human path
+  rendering (including the unmerged section and aligned columns) now goes
+  through the shared quoting helper.
+- **`core.quotePath=false` no longer forces octal escapes for high bytes.**
+  Invalid-UTF-8 path bytes above `0x7F` were always `\377`-escaped; they
+  now pass through raw in the non-`-z` short/human/porcelain surfaces
+  (Git parity), while `String`-typed message and JSON display strings keep
+  the lossless escaped form. Control characters and `"`/`\` are escaped in
+  all formats as before.
+
 ### Fixed (plan-20260714 R0-3 implementation review)
 
 - **A metadata probe root hiding behind an escaping symlink is now reported,
@@ -667,11 +837,14 @@ unreadable — as opposed to absent — worktree mode.
   R0-9)**: when `diff.renameLimit` / `status.renameLimit` is exceeded on
   either side, exact renames AND unique-basename renames are still
   reported — only the exhaustive inexact stage is skipped, with a
-  `rename_limit_product_skipped` warning. When
+  `rename_limit_product_skipped` warning.
   `diff.renameComparisonBudget` (or status's similarity budget) is
-  exhausted, the exhaustive pass's results are discarded wholesale (a
-  partial exhaustive result would be order-dependent) while exact and
-  unique-basename pairs survive, with a `similarity_budget_exceeded`
+  charged per comparison across BOTH the unique-basename and exhaustive
+  stages: when it is spent, the stage then running stops, no further
+  comparisons happen, the exhaustive pass's results are discarded
+  wholesale (a partial exhaustive result would be order-dependent), and
+  only pairs already scored — exact plus the unique-basename pairs
+  already paired by then — survive, with a `similarity_budget_exceeded`
   warning. `diff` now runs the same staged order as `status`
   (exact → unique-basename → bounded exhaustive), so a degraded run can
   no longer demote a basename-proven rename to a delete + add pair.

@@ -1912,6 +1912,7 @@ async fn test_status_branch_detached_head() {
         detach: true,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })

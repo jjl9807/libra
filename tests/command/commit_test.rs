@@ -1626,6 +1626,38 @@ async fn test_commit_fixup_sets_subject() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_commit_porcelain_non_utf8_dir_marker_is_not_corrupted() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // A collapsed untracked directory with a non-UTF-8 name must keep its
+    // bytes through the legacy collapse helper — escaped with the default
+    // quotePath, never a U+FFFD replacement character.
+    let dir = p.join(std::ffi::OsStr::from_bytes(b"dir-\xff"));
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("file.txt"), "payload\n").unwrap();
+    std::fs::write(p.join("staged.txt"), "s\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "staged.txt"], p),
+        "add staged.txt",
+    );
+
+    let output = run_libra_command(&["commit", "--dry-run", "--porcelain", "-m", "preview"], p);
+    assert_cli_success(&output, "commit --dry-run --porcelain");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("dir-\\377/"),
+        "the marker keeps its real bytes (octal-escaped): {stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{fffd}'),
+        "and never a replacement character: {stdout}"
+    );
+}
+
 #[test]
 fn test_commit_porcelain_outputs_status_format() {
     let repo = create_committed_repo_via_cli();

@@ -345,7 +345,7 @@ fn diff_docs_and_changelog_carry_the_degradation_semantics() {
         }
         assert!(
             section.contains("basename"),
-            "{label} budgets section must say unique-basename pairs survive both degradations"
+            "{label} budgets section must say unique-basename pairs survive the renameLimit gate"
         );
     }
     // The comparison budget discards the WHOLE exhaustive pass (unlike the
@@ -358,6 +358,31 @@ fn diff_docs_and_changelog_carry_the_degradation_semantics() {
     assert!(
         zh_budgets.contains("丢弃"),
         "zh budgets section must say the exhaustive pass is discarded: {zh_budgets}"
+    );
+    // And the two degradations must NOT be conflated in the other direction:
+    // the limit always keeps every scored unique-basename pair, while the
+    // comparison budget only keeps pairs ALREADY scored when it is spent —
+    // docs that promise all basename pairs survive the budget describe a
+    // behavior the engine does not have.
+    assert!(
+        en_budgets.contains("already scored") || en_budgets.contains("already-paired"),
+        "EN budgets section must say the comparison budget only keeps pairs \
+         already scored: {en_budgets}"
+    );
+    assert!(
+        en_budgets.contains("always keeps every scored unique-basename pair"),
+        "EN budgets section must distinguish the limit from the budget on \
+         unique-basename survival: {en_budgets}"
+    );
+    assert!(
+        zh_budgets.contains("已评分"),
+        "zh budgets section must say the comparison budget only keeps pairs \
+         already scored: {zh_budgets}"
+    );
+    assert!(
+        zh_budgets.contains("总是保留"),
+        "zh budgets section must distinguish the limit from the budget on \
+         unique-basename survival: {zh_budgets}"
     );
     for needle in ["diff.renameLimit", "diff.renameComparisonBudget"] {
         assert!(

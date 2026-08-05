@@ -97,10 +97,17 @@ async fn create_reference_table_with_head(db: &DatabaseConnection) {
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    // HEAD resolution is scoped to `WorktreeScope::current()` (cwd-derived):
+    // seed the row for the scope this process actually runs in, so the suite
+    // also passes when invoked from inside a linked worktree (where main's
+    // NULL-worktree_id row is invisible to the scoped query).
+    let scope_worktree_id = libra::internal::worktree_scope::WorktreeScope::current()
+        .worktree_id()
+        .map(str::to_string);
+    db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Head', NULL, NULL)"
-            .to_string(),
+        "INSERT INTO reference(name, kind, \"commit\", remote, worktree_id) VALUES('main', 'Head', NULL, NULL, ?)",
+        [scope_worktree_id.into()],
     ))
     .await
     .unwrap();
@@ -768,14 +775,24 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
     create_reference_table_with_head(&db).await;
 
     // A pre-canonicalization row: same scope, same command, PADDED digest.
+    // The dedup window is a scope point query keyed by `storage_key()` — seed
+    // the rows for the scope this process actually runs in ('' for main, the
+    // id inside a linked worktree) so the suite passes from either cwd.
+    let scope_storage_key = libra::internal::worktree_scope::WorktreeScope::current()
+        .storage_key()
+        .to_string();
     let now = chrono::Utc::now().timestamp();
     db.execute(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
          VALUES ('op-legacy', 'repo_1', 'view-legacy', 'commit', 'legacy row', 'alice', \
-         '  sha256:legacy-pad  ', ?, ?, 'succeeded', '', 'declared')",
-        [(now - 1).into(), (now - 1).into()],
+         '  sha256:legacy-pad  ', ?, ?, 'succeeded', ?, 'declared')",
+        [
+            (now - 1).into(),
+            (now - 1).into(),
+            scope_storage_key.clone().into(),
+        ],
     ))
     .await
     .expect("seed a legacy padded row");
@@ -787,7 +804,7 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
             db.get_database_backend(),
             "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
              args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
-             VALUES (?, 'repo_1', ?, 'commit', 'legacy row', 'alice', ?, ?, ?, 'succeeded', '', \
+             VALUES (?, 'repo_1', ?, 'commit', 'legacy row', 'alice', ?, ?, ?, 'succeeded', ?, \
              'declared')",
             [
                 op_id.into(),
@@ -795,6 +812,7 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
                 digest.into(),
                 (now - 1).into(),
                 (now - 1).into(),
+                scope_storage_key.clone().into(),
             ],
         ))
         .await

@@ -64,11 +64,14 @@ Agent 机制是更高层的架构。它把 worktree 当作由 Libra 调度器（
   `worktree add` 按持久化 id 校验后重挂接）；`--delete-dir` 删除并
   fsync 父目录后才清理 scoped 行，失败保留 tombstone 由 repair 重试；
   add/move/remove/prune 均先写 durable intent journal。
-- `libra worktree repair` 会对注册表条目去重，并恢复
-  「恰有一个条目是主 worktree」这一不变量。`repair <path>` 则依据
-  registry 持久化的 stable id 恢复 linked worktree 缺失/损坏的
+- `libra worktree repair --confirm` 会对注册表条目去重，并恢复
+  「恰有一个条目是主 worktree」这一不变量。`repair <path> --confirm`
+  则依据 registry 持久化的 stable id 恢复 linked worktree 缺失/损坏的
   `.libra/worktree_id` 与 `commondir`（指向另一存储的有效指针会被
-  拒绝，且拒绝不产生写入）。
+  拒绝，且拒绝不产生写入）。每个 mutating repair 动作都要求
+  `--confirm`（`--resolve-identity` 用专属的 `--yes`，只读预览
+  `--migrate-layout --dry-run` 免确认）；未确认在任一写入前拒绝、
+  零副作用，确认后在 operation log 记录恰好一条审计行（W0 §C.11）。
 
 启用 `worktree-fuse` 特性后，Libra 还可以维护
 `worktrees-fuse.json`，以及位于 `.libra/worktrees-fuse/` 下的

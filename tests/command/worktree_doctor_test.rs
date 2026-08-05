@@ -304,6 +304,45 @@ async fn worktree_doctor_json_schema_and_pagination_stable() {
         "diagnostic key set is frozen schema v1: {doc}"
     );
 
+    // The paginated top-level `data` key set is frozen too: the workspace
+    // page plus the W0 worktree-scope half (`worktrees[]`).
+    let mut data_keys: Vec<String> = doc["data"]
+        .as_object()
+        .expect("data object")
+        .keys()
+        .cloned()
+        .collect();
+    data_keys.sort();
+    assert_eq!(
+        data_keys,
+        vec!["diagnostics", "next_cursor", "schema_version", "worktrees"],
+        "paginated data key set is frozen schema v1: {doc}"
+    );
+    let mut worktree_keys: Vec<String> = doc["data"]["worktrees"]
+        .as_array()
+        .expect("worktrees array")
+        .first()
+        .expect("at least the main worktree is diagnosed")
+        .as_object()
+        .expect("worktree diagnostic object")
+        .keys()
+        .cloned()
+        .collect();
+    worktree_keys.sort();
+    assert_eq!(
+        worktree_keys,
+        vec![
+            "findings",
+            "identity_registered",
+            "is_main",
+            "layout",
+            "path",
+            "state",
+            "worktree_id",
+        ],
+        "worktree diagnostic key set is frozen schema v1: {doc}"
+    );
+
     // An over-large --limit is capped at 500, not honoured.
     let capped = run_libra_command(
         &["--json", "worktree", "doctor", "--limit", "5000"],
@@ -466,4 +505,1014 @@ fn worktree_doctor_hints_are_inspect_only() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// W0 (§C.11, Codex R16/R17): mutating repair actions require `--confirm` and
+// emit exactly one operation-log audit event per executed action.
+// ---------------------------------------------------------------------------
+
+/// One worktree directory's full content tree (relative path -> bytes), with
+/// a symlink recorded as a `path -> target` entry so a legacy `.libra` link
+/// is compared as a link, never followed.
+#[cfg(unix)]
+fn worktree_dir_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut entries = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read_dir) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("walked path is beneath its root")
+                .to_string_lossy()
+                .to_string();
+            let file_type = entry.file_type().expect("file type");
+            if file_type.is_symlink() {
+                let target = fs::read_link(&path).expect("read symlink target");
+                entries.push((format!("{relative} -> {}", target.display()), Vec::new()));
+            } else if file_type.is_dir() {
+                stack.push(path);
+            } else {
+                entries.push((relative, fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// The repository's operation rows, newest first, read through the public
+/// operation service (the same API `libra op log` paginates).
+#[cfg(unix)]
+async fn operation_rows(repo: &Path) -> Vec<libra::internal::operation::OperationLogListItem> {
+    use libra::internal::operation::{OperationQueryPage, OperationService};
+
+    let conn = repo_db(repo).await;
+    let repo_id = repo_identity(&conn).await;
+    let page = OperationService::list_operations_by_repo_paginated_with_conn(
+        &conn,
+        &repo_id,
+        OperationQueryPage {
+            page: 1,
+            per_page: 200,
+        },
+    )
+    .await
+    .expect("list operation rows");
+    let mut rows = page.items;
+    rows.sort_by(|a, b| a.op_id.cmp(&b.op_id));
+    rows
+}
+
+/// W0 (§C.11, Codex R16/R17), table-driven over the three mutating repair
+/// actions — `repair <path>`, the no-arg registry repair, and a non-dry-run
+/// `--migrate-layout`:
+///
+/// 1. WITHOUT `--confirm` the action is refused with ZERO side effects: the
+///    registry file, the operation table and every watched worktree
+///    directory are byte-identical before and after.
+/// 2. WITH `--confirm` the action runs, exactly ONE new operation row names
+///    it (complete: actor, outcome, finish timestamp), and only the action's
+///    target scope changes — a bystander worktree is byte-identical.
+///
+/// Unix-only because the legacy-symlink layout the migration acts on cannot
+/// be built without `symlink(2)`.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
+    use libra::internal::operation::OperationStatus;
+
+    enum RepairAction {
+        IdentityPath,
+        RegistryAll,
+        MigrateLayout,
+    }
+
+    let table = [
+        (RepairAction::IdentityPath, "worktree repair <path>"),
+        (RepairAction::RegistryAll, "worktree repair"),
+        (
+            RepairAction::MigrateLayout,
+            "worktree repair --migrate-layout",
+        ),
+    ];
+
+    for (action, command_name) in table {
+        let repo = create_committed_repo_via_cli();
+        let main = repo.path();
+
+        // Two scopes in every row: the action's target and a bystander the
+        // action must never touch.
+        let target = main.join("wt-target");
+        let bystander = main.join("wt-bystander");
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", "wt-bystander"], main),
+            "add bystander worktree",
+        );
+
+        // Per-row setup: what the action repairs, and its argv.
+        let argv: Vec<String> = match action {
+            RepairAction::IdentityPath => {
+                assert_cli_success(
+                    &run_libra_command(&["worktree", "add", "wt-target"], main),
+                    "add target worktree",
+                );
+                fs::remove_file(target.join(".libra").join("worktree_id"))
+                    .expect("damage the target's gitdir identity");
+                vec!["worktree".into(), "repair".into(), "wt-target".into()]
+            }
+            RepairAction::RegistryAll => {
+                assert_cli_success(
+                    &run_libra_command(&["worktree", "add", "wt-target"], main),
+                    "add target worktree",
+                );
+                // A duplicated registry entry: exactly what the no-arg
+                // repair exists to remove.
+                let registry = main.join(".libra").join("worktrees.json");
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&registry).expect("read registry"))
+                        .expect("registry json");
+                let duplicate = doc["entries"]
+                    .as_array()
+                    .expect("entries")
+                    .iter()
+                    .find(|entry| {
+                        entry["path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("wt-target"))
+                    })
+                    .expect("target entry")
+                    .clone();
+                doc["entries"]
+                    .as_array_mut()
+                    .expect("entries")
+                    .push(duplicate);
+                fs::write(
+                    &registry,
+                    serde_json::to_vec_pretty(&doc).expect("serialize"),
+                )
+                .expect("plant the duplicate entry");
+                vec!["worktree".into(), "repair".into()]
+            }
+            RepairAction::MigrateLayout => {
+                // The target is a LEGACY shared-.libra symlink worktree;
+                // migration replaces its gitdir with a real one.
+                fs::create_dir_all(&target).expect("mkdir legacy target");
+                std::os::unix::fs::symlink(main.join(".libra"), target.join(".libra"))
+                    .expect("legacy symlink");
+                // Materialize the registry, then register the legacy entry
+                // the way the v1→v2 upgrade would have backfilled it.
+                assert_cli_success(
+                    &run_libra_command(&["worktree", "repair", "--confirm"], main),
+                    "materialize registry",
+                );
+                let registry = main.join(".libra").join("worktrees.json");
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&registry).expect("read registry"))
+                        .expect("registry json");
+                let canonical = target.canonicalize().expect("canonical target");
+                doc["entries"]
+                    .as_array_mut()
+                    .expect("entries")
+                    .push(serde_json::json!({
+                        "path": canonical.to_string_lossy(),
+                        "is_main": false,
+                        "locked": false,
+                        "lock_reason": null,
+                        "worktree_id": "legacy-wt-target",
+                    }));
+                fs::write(
+                    &registry,
+                    serde_json::to_vec_pretty(&doc).expect("serialize"),
+                )
+                .expect("register the legacy entry");
+                vec![
+                    "worktree".into(),
+                    "repair".into(),
+                    "--migrate-layout".into(),
+                ]
+            }
+        };
+
+        // ---- Phase 1: no `--confirm` -> refused, ZERO side effects. ----
+        let registry_path = main.join(".libra").join("worktrees.json");
+        let registry_before = fs::read(&registry_path).expect("registry before");
+        let operations_before = operation_rows(main).await;
+        let target_tree_before = worktree_dir_tree(&target);
+        let bystander_tree_before = worktree_dir_tree(&bystander);
+
+        let refused = run_libra_command(&argv.iter().map(String::as_str).collect::<Vec<_>>(), main);
+        assert!(
+            !refused.status.success(),
+            "{command_name} without --confirm must be refused: {}",
+            String::from_utf8_lossy(&refused.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("without confirmation; re-run with --confirm"),
+            "{command_name}: the refusal names the required flag: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&registry_path).expect("registry after refusal"),
+            registry_before,
+            "{command_name}: the refusal must not touch the registry"
+        );
+        assert_eq!(
+            operation_rows(main).await,
+            operations_before,
+            "{command_name}: the refusal must not write an operation row"
+        );
+        assert_eq!(
+            worktree_dir_tree(&target),
+            target_tree_before,
+            "{command_name}: the refusal must not touch the target worktree"
+        );
+        assert_eq!(
+            worktree_dir_tree(&bystander),
+            bystander_tree_before,
+            "{command_name}: the refusal must not touch the bystander worktree"
+        );
+
+        // ---- Phase 2: `--confirm` -> runs, exactly one audit row, only the
+        // target scope modified. ----
+        let mut confirmed = argv.clone();
+        confirmed.push("--confirm".into());
+        let ran = run_libra_command(
+            &confirmed.iter().map(String::as_str).collect::<Vec<_>>(),
+            main,
+        );
+        assert_cli_success(&ran, "confirmed repair action");
+
+        let operations_after = operation_rows(main).await;
+        assert_eq!(
+            operations_after.len(),
+            operations_before.len() + 1,
+            "{command_name}: exactly one audit row per executed action"
+        );
+        let new_rows: Vec<_> = operations_after
+            .iter()
+            .filter(|after| {
+                !operations_before
+                    .iter()
+                    .any(|before| before.op_id == after.op_id)
+            })
+            .collect();
+        assert_eq!(new_rows.len(), 1, "{command_name}: the audit row is unique");
+        let audit = new_rows[0];
+        assert_eq!(
+            audit.command_name, command_name,
+            "the audit row names the action"
+        );
+        assert_eq!(
+            audit.status,
+            OperationStatus::Succeeded,
+            "the audit row records the outcome"
+        );
+        assert!(
+            audit.description.contains(command_name),
+            "the audit row describes the action: {}",
+            audit.description
+        );
+        assert!(!audit.actor.is_empty(), "the audit row names an actor");
+        assert!(
+            audit.end_ts.is_some(),
+            "the audit row is finished, not left running"
+        );
+
+        // Only the target scope changed.
+        assert_eq!(
+            worktree_dir_tree(&bystander),
+            bystander_tree_before,
+            "{command_name}: the bystander worktree is untouched"
+        );
+        match action {
+            RepairAction::IdentityPath => {
+                // The target's identity was restored FROM THE REGISTRY, and
+                // the registry itself was not rewritten.
+                let restored = fs::read_to_string(target.join(".libra").join("worktree_id"))
+                    .expect("identity restored");
+                let doc: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&registry_path).expect("registry"))
+                        .expect("registry json");
+                let persisted = doc["entries"]
+                    .as_array()
+                    .expect("entries")
+                    .iter()
+                    .find(|entry| {
+                        entry["path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("wt-target"))
+                    })
+                    .and_then(|entry| entry["worktree_id"].as_str())
+                    .expect("persisted id");
+                assert_eq!(
+                    restored.trim(),
+                    persisted,
+                    "the restored identity is the registry's persisted id"
+                );
+                assert_eq!(
+                    fs::read(&registry_path).expect("registry after repair"),
+                    registry_before,
+                    "identity repair touches the target gitdir only"
+                );
+            }
+            RepairAction::RegistryAll => {
+                // The registry (this action's target scope) was healed: the
+                // duplicate is gone and neither worktree directory moved.
+                let healed = fs::read(&registry_path).expect("registry after repair");
+                assert_ne!(healed, registry_before, "the duplicate was removed");
+                let doc: serde_json::Value =
+                    serde_json::from_slice(&healed).expect("registry json");
+                let target_entries = doc["entries"]
+                    .as_array()
+                    .expect("entries")
+                    .iter()
+                    .filter(|entry| {
+                        entry["path"]
+                            .as_str()
+                            .is_some_and(|path| path.ends_with("wt-target"))
+                    })
+                    .count();
+                assert_eq!(target_entries, 1, "the duplicate entry is gone");
+                assert_eq!(
+                    worktree_dir_tree(&target),
+                    target_tree_before,
+                    "registry repair touches no worktree directory"
+                );
+            }
+            RepairAction::MigrateLayout => {
+                // The legacy target (this action's target scope) now has a
+                // REAL gitdir; the registry's SEMANTIC content is unchanged
+                // (compared as parsed JSON — the migration's save normalizes
+                // key order, which is not a scope mutation).
+                assert!(
+                    fs::symlink_metadata(target.join(".libra"))
+                        .expect("gitdir metadata")
+                        .file_type()
+                        .is_dir(),
+                    "the legacy symlink was replaced by a real gitdir"
+                );
+                let after: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&registry_path).expect("registry after migration"),
+                )
+                .expect("registry after migration parses");
+                let before: serde_json::Value =
+                    serde_json::from_slice(&registry_before).expect("registry before parses");
+                assert_eq!(
+                    after, before,
+                    "migration touches the target gitdir only (registry semantics)"
+                );
+            }
+        }
+    }
+}
+
+/// W0 (§C.11, Codex R18): `repair <path> --resolve-identity` keeps its
+/// dedicated `--yes` confirmation, but once confirmed the detach runs inside
+/// the SAME one-row operation-log audit boundary as every other mutating
+/// repair — the `--yes`-less refusal writes no row, a success closes its row
+/// `succeeded`, and a nothing-to-resolve failure closes its row `failed`.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn worktree_repair_resolve_identity_runs_inside_the_audit_boundary() {
+    use libra::internal::operation::OperationStatus;
+
+    let repo = create_committed_repo_via_cli();
+    let main = repo.path();
+
+    // Two live worktrees, then handcraft the legacy-binary identity
+    // collision: BOTH entries claim wt-b's identity.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", "wt-a"], main),
+        "add worktree a",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", "wt-b"], main),
+        "add worktree b",
+    );
+    let registry_path = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("read registry"))
+            .expect("registry json");
+    let identity_b = doc["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("wt-b"))
+        })
+        .and_then(|entry| entry["worktree_id"].as_str())
+        .expect("wt-b identity")
+        .to_string();
+    doc["entries"]
+        .as_array_mut()
+        .expect("entries")
+        .iter_mut()
+        .find(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("wt-a"))
+        })
+        .expect("wt-a entry")["worktree_id"] = serde_json::Value::String(identity_b);
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("plant the identity collision");
+
+    // 1. Without `--yes` the action is refused and writes NO operation row.
+    let operations_before = operation_rows(main).await;
+    let registry_before = fs::read(&registry_path).expect("registry before");
+    let refused = run_libra_command(&["worktree", "repair", "wt-a", "--resolve-identity"], main);
+    assert!(
+        !refused.status.success(),
+        "resolve-identity without --yes must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("--yes"),
+        "the refusal names its dedicated confirmation: {stderr}"
+    );
+    assert_eq!(
+        operation_rows(main).await,
+        operations_before,
+        "the refusal must not write an operation row"
+    );
+    assert_eq!(
+        fs::read(&registry_path).expect("registry after refusal"),
+        registry_before,
+        "the refusal must not touch the registry"
+    );
+
+    // 2. `--yes` detaches the named entry and closes exactly ONE new audit
+    //    row `succeeded`, named after the action.
+    let ran = run_libra_command(
+        &["worktree", "repair", "wt-a", "--resolve-identity", "--yes"],
+        main,
+    );
+    assert_cli_success(&ran, "resolve the identity collision");
+    let operations_after = operation_rows(main).await;
+    assert_eq!(
+        operations_after.len(),
+        operations_before.len() + 1,
+        "exactly one audit row per executed action"
+    );
+    let audit = operations_after
+        .iter()
+        .find(|after| {
+            !operations_before
+                .iter()
+                .any(|before| before.op_id == after.op_id)
+        })
+        .expect("the new audit row");
+    assert_eq!(
+        audit.command_name, "worktree repair wt-a --resolve-identity",
+        "the audit row names the action"
+    );
+    assert_eq!(
+        audit.status,
+        OperationStatus::Succeeded,
+        "the audit row records the outcome"
+    );
+    assert!(
+        audit.end_ts.is_some(),
+        "the audit row is finished, not left running"
+    );
+
+    // ... and the collision is actually resolved: wt-a is detached, so wt-b
+    // owns the identity alone again.
+    let healed: serde_json::Value =
+        serde_json::from_slice(&fs::read(&registry_path).expect("registry after repair"))
+            .expect("registry json");
+    let state_a = healed["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| {
+            entry["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("wt-a"))
+        })
+        .and_then(|entry| entry["state"].as_str());
+    assert_eq!(
+        state_a,
+        Some("detached_from_registry"),
+        "the named entry was detached"
+    );
+
+    // 3. A resolve with NOTHING left to resolve fails — and its audit row
+    //    closes `failed` (the boundary records the outcome either way).
+    let failed = run_libra_command(
+        &["worktree", "repair", "wt-b", "--resolve-identity", "--yes"],
+        main,
+    );
+    assert!(
+        !failed.status.success(),
+        "wt-b has no collision left: the resolve must fail"
+    );
+    let operations_final = operation_rows(main).await;
+    assert_eq!(
+        operations_final.len(),
+        operations_after.len() + 1,
+        "the failure is audited too"
+    );
+    let failed_row = operations_final
+        .iter()
+        .find(|row| {
+            !operations_after
+                .iter()
+                .any(|before| before.op_id == row.op_id)
+        })
+        .expect("the failure audit row");
+    assert_eq!(
+        failed_row.command_name, "worktree repair wt-b --resolve-identity",
+        "the failure row names the attempted action"
+    );
+    assert_eq!(failed_row.status, OperationStatus::Failed);
+    assert!(failed_row.end_ts.is_some());
+}
+
+/// W0 (§C.11, Codex R18 follow-up): every user-visible `libra worktree
+/// repair` suggestion in the crate source names its confirmation inside the
+/// same backticks — `--confirm` for the ordinary mutating actions, `--yes`
+/// for `--resolve-identity`, `--dry-run` for the read-only preview. A bare
+/// suggestion refuses deterministically (W0 repair gate), so printing one
+/// sends the user to a second failure at the moment they are already stuck.
+/// This scan keeps hints, doctor findings and recovery output honest.
+///
+/// Rust string literals treat `\` + newline (+ leading whitespace) as a line
+/// continuation — the RENDERED string joins the pieces, so a hint split that
+/// way would hide from a raw-source search. The scan normalizes the source
+/// the same way the compiler does before looking for spans.
+///
+/// The C.3.3 documentation sources that prescribe repair invocations are
+/// held to the same contract (Codex R19 follow-up): a developer doc showing
+/// a bare command sends its reader to the same refusal. COMPATIBILITY.md
+/// and the migration SQL comments prescribe them too (Codex W0-r7
+/// follow-up); they spell the command without the `libra` prefix, so they
+/// are scanned with the bare `worktree repair` needle, and a span
+/// explicitly attributed to Git's own CLI is exempt.
+#[test]
+fn repair_guidance_in_source_always_names_its_confirmation() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut violations = Vec::new();
+    let mut stack = vec![manifest.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read src directory") {
+            let entry = entry.expect("directory entry");
+            let path = entry.path();
+            if entry.file_type().expect("file type").is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("read source file");
+            let text = join_rust_string_continuations(&text);
+            scan_repair_spans(&path, &text, "libra worktree repair", &mut violations);
+        }
+    }
+    for doc in [
+        "docs/development/libra-worktree-architecture.md",
+        "docs/development/commands/worktree.md",
+    ] {
+        let path = manifest.join(doc);
+        let text = fs::read_to_string(&path).expect("read doc file");
+        scan_repair_spans(&path, &text, "libra worktree repair", &mut violations);
+    }
+    // COMPATIBILITY.md and the migration SQL comments also prescribe repair
+    // invocations (Codex W0-r7 follow-up). They spell the command without
+    // the `libra` prefix, so they are scanned with the bare needle.
+    let compat = manifest.join("COMPATIBILITY.md");
+    let text = fs::read_to_string(&compat).expect("read COMPATIBILITY.md");
+    scan_repair_spans(&compat, &text, "worktree repair", &mut violations);
+    let mut migration_files: Vec<_> = fs::read_dir(manifest.join("sql/migrations"))
+        .expect("read sql/migrations")
+        .map(|entry| entry.expect("migration entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
+        .collect();
+    migration_files.sort();
+    for path in migration_files {
+        let text = fs::read_to_string(&path).expect("read migration file");
+        scan_repair_spans(&path, &text, "worktree repair", &mut violations);
+    }
+    assert!(
+        violations.is_empty(),
+        "repair guidance that would refuse as written:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Flag every backtick-quoted span in `text` that contains `needle` (a
+/// `worktree repair` command spelling) yet names none of the confirmation
+/// flags. Sources that prescribe Libra's own CLI are scanned with
+/// "libra worktree repair"; sources that spell the command without the
+/// prefix (COMPATIBILITY.md, migration SQL comments) use the bare
+/// "worktree repair" needle. A span explicitly attributed to Git's own CLI
+/// (its opening backtick immediately preceded by "Git's ") is exempt —
+/// upstream has no `--confirm`.
+fn scan_repair_spans(path: &Path, text: &str, needle: &str, violations: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let span_start = text.len() - rest.len() + open + 1;
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('`') else {
+            break;
+        };
+        let span = &rest[..close];
+        if span.contains(needle)
+            && !span.contains("--confirm")
+            && !span.contains("--yes")
+            && !span.contains("--dry-run")
+            && !text[..span_start].ends_with("Git's `")
+        {
+            violations.push(format!("{}: `{span}`", path.display()));
+        }
+        rest = &rest[close + 1..];
+    }
+}
+
+/// Join Rust string-literal line continuations the way the compiler renders
+/// them: a `\` immediately followed by a newline drops the newline and the
+/// next line's leading indentation. Without this a hint written as
+/// `"... worktree \`<newline>`repair ..."` would stay invisible to the scan.
+fn join_rust_string_continuations(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("\\\n") {
+        out.push_str(&rest[..pos]);
+        rest = &rest[pos + 2..];
+        rest = rest.trim_start_matches([' ', '\t']);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// W0 (§C.11, Codex R19 follow-up): an UNCONFIRMED mutating repair applies NO
+/// pending schema migration on its way to the refusal. The refusal is
+/// documented as byte-for-byte side-effect free, and a migration is an
+/// irreversible write — a bare `worktree repair` run against an older
+/// repository must not upgrade its schema while saying no.
+#[tokio::test]
+async fn unconfirmed_repair_applies_no_pending_migrations() {
+    let repo = create_committed_repo_via_cli();
+    let main = repo.path();
+
+    // Simulate a pending migration: drop the newest applied-migration row.
+    // The migration's own DDL is idempotent (INSERT ... ON CONFLICT DO
+    // NOTHING), so the positive control below can cleanly re-apply it.
+    let newest: i64 = {
+        let conn = repo_db(main).await;
+        let row = conn
+            .query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT MAX(version) FROM schema_versions".to_string(),
+            ))
+            .await
+            .expect("query newest schema version")
+            .expect("at least one applied migration");
+        let version = row.try_get_by_index::<i64>(0).expect("version value");
+        conn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM schema_versions WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .expect("drop the newest migration row");
+        version
+    };
+
+    // The unconfirmed invocation is refused — and the row must STAY deleted.
+    let refused = run_libra_command(&["worktree", "repair"], main);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "unconfirmed repair must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("--confirm"),
+        "the refusal names --confirm: {stderr}"
+    );
+    let remaining: i64 = {
+        let conn = repo_db(main).await;
+        conn.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
+            [newest.into()],
+        ))
+        .await
+        .expect("re-query the dropped row")
+        .expect("count row")
+        .try_get_by_index::<i64>(0)
+        .expect("count value")
+    };
+    assert_eq!(
+        remaining, 0,
+        "the unconfirmed refusal must not apply the pending migration"
+    );
+
+    // Positive control: an ordinary (migration-applying) worktree command
+    // DOES bring the schema current, proving the probe can see application.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "list"], main),
+        "worktree list",
+    );
+    let reapplied: i64 = {
+        let conn = repo_db(main).await;
+        conn.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
+            [newest.into()],
+        ))
+        .await
+        .expect("re-query after the control command")
+        .expect("count row")
+        .try_get_by_index::<i64>(0)
+        .expect("count value")
+    };
+    assert_eq!(
+        reapplied, 1,
+        "the migration-applying control re-applied the pending migration"
+    );
+}
+
+/// Codex R19 gate finding (round 7): a BARE `worktree doctor` must not apply
+/// pending migrations either — the §C.11 guarantee is that doctor is the one
+/// command safe to run on a repository you have not yet decided to upgrade.
+/// The regression hole this pins: with linked-worktree history present, the
+/// doctor's adopted-provenance probe (`adopted_scope_settings_present`)
+/// resolved the GLOBAL (migration-applying) connection instead of doctor's
+/// no-migration one.
+#[tokio::test]
+async fn bare_doctor_applies_no_pending_migrations() {
+    let repo = create_committed_repo_via_cli();
+    let main = repo.path();
+    // Linked-worktree history is required to reach the adopted-provenance probe.
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Simulate a pending migration: drop the newest applied-migration row (the
+    // same simulation as `unconfirmed_repair_applies_no_pending_migrations`).
+    let newest: i64 = {
+        let conn = repo_db(main).await;
+        let row = conn
+            .query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT MAX(version) FROM schema_versions".to_string(),
+            ))
+            .await
+            .expect("query newest schema version")
+            .expect("at least one applied migration");
+        let version = row.try_get_by_index::<i64>(0).expect("version value");
+        conn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM schema_versions WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .expect("drop the newest migration row");
+        version
+    };
+    let count_row = async |version: i64| -> i64 {
+        let conn = repo_db(main).await;
+        conn.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .expect("re-query the dropped row")
+        .expect("count row")
+        .try_get_by_index::<i64>(0)
+        .expect("count value")
+    };
+
+    // Bare doctor must succeed AND leave the row dropped.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "doctor"], main),
+        "bare worktree doctor",
+    );
+    assert_eq!(
+        count_row(newest).await,
+        0,
+        "bare doctor must not apply the pending migration"
+    );
+
+    // The JSON surface shares the same no-migration path.
+    assert_cli_success(
+        &run_libra_command(&["--json", "worktree", "doctor"], main),
+        "--json worktree doctor",
+    );
+    assert_eq!(
+        count_row(newest).await,
+        0,
+        "--json doctor must not apply the pending migration"
+    );
+
+    // Positive control: an ordinary (migration-applying) worktree command DOES
+    // bring the schema current, proving the probe can see application.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "list"], main),
+        "worktree list",
+    );
+    assert_eq!(
+        count_row(newest).await,
+        1,
+        "the migration-applying control re-applied the pending migration"
+    );
+}
+
+/// Codex R20 gate finding (round 8): the read-only `worktree repair
+/// --migrate-layout --dry-run` preview must not apply pending migrations
+/// either — it is documented as confirmation-free and read-only end to end,
+/// and applying migrations is a WRITE. The regression hole this pins: the
+/// preview took the migration-applying CLI preflight and dispatch-time opens,
+/// and `migrate_layout_run` resolved the GLOBAL (migration-applying)
+/// connection before returning its plan.
+#[tokio::test]
+async fn migrate_layout_dry_run_applies_no_pending_migrations() {
+    let repo = create_committed_repo_via_cli();
+    let main = repo.path();
+
+    // Simulate a pending migration: drop the newest applied-migration row
+    // (the same simulation as `bare_doctor_applies_no_pending_migrations`).
+    let newest: i64 = {
+        let conn = repo_db(main).await;
+        let row = conn
+            .query_one(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT MAX(version) FROM schema_versions".to_string(),
+            ))
+            .await
+            .expect("query newest schema version")
+            .expect("at least one applied migration");
+        let version = row.try_get_by_index::<i64>(0).expect("version value");
+        conn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM schema_versions WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .expect("drop the newest migration row");
+        version
+    };
+    let count_row = async |version: i64| -> i64 {
+        let conn = repo_db(main).await;
+        conn.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
+            [version.into()],
+        ))
+        .await
+        .expect("re-query the dropped row")
+        .expect("count row")
+        .try_get_by_index::<i64>(0)
+        .expect("count value")
+    };
+
+    // The dry-run preview must succeed AND leave the row dropped.
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "repair", "--migrate-layout", "--dry-run"],
+            main,
+        ),
+        "worktree repair --migrate-layout --dry-run",
+    );
+    assert_eq!(
+        count_row(newest).await,
+        0,
+        "the dry-run layout preview must not apply the pending migration"
+    );
+
+    // The JSON surface shares the same no-migration path.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "--json",
+                "worktree",
+                "repair",
+                "--migrate-layout",
+                "--dry-run",
+            ],
+            main,
+        ),
+        "--json worktree repair --migrate-layout --dry-run",
+    );
+    assert_eq!(
+        count_row(newest).await,
+        0,
+        "the --json dry-run layout preview must not apply the pending migration"
+    );
+
+    // Positive control: an ordinary (migration-applying) worktree command DOES
+    // bring the schema current, proving the probe can see application.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "list"], main),
+        "worktree list",
+    );
+    assert_eq!(
+        count_row(newest).await,
+        1,
+        "the migration-applying control re-applied the pending migration"
+    );
+}
+
+/// Codex R21 gate finding (round 9): the read-only repair modes — the
+/// `--migrate-layout --dry-run` preview and every UNCONFIRMED (would-be-
+/// refused) repair — must not create `.libra/maintenance.lock` either: the
+/// shared maintenance hold creates the file when absent, and a filesystem
+/// write breaks the byte-for-byte side-effect-free contract the preview and
+/// the refusals are documented to keep. The regression hole this pins:
+/// `command_scope` classified every `Repair` invocation as a Repository
+/// writer, so the generic shared hold ran before dispatch.
+#[tokio::test]
+async fn read_only_repair_modes_create_no_maintenance_lock() {
+    let repo = create_committed_repo_via_cli();
+    let main = repo.path();
+    let lock = main.join(".libra").join("maintenance.lock");
+    // The setup commands legitimately took the shared hold and created the
+    // file; start the probe from a genuinely lock-free repository.
+    if lock.exists() {
+        std::fs::remove_file(&lock).expect("remove the setup-created maintenance lock");
+    }
+    let assert_lock_absent = |context: &str| {
+        assert!(
+            !lock.exists(),
+            "{context} must not create .libra/maintenance.lock"
+        );
+    };
+
+    // The read-only layout preview: plain and --json.
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "repair", "--migrate-layout", "--dry-run"],
+            main,
+        ),
+        "worktree repair --migrate-layout --dry-run",
+    );
+    assert_lock_absent("the dry-run layout preview");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "--json",
+                "worktree",
+                "repair",
+                "--migrate-layout",
+                "--dry-run",
+            ],
+            main,
+        ),
+        "--json worktree repair --migrate-layout --dry-run",
+    );
+    assert_lock_absent("the --json dry-run layout preview");
+
+    // Every unconfirmed-repair variant is refused — and creates nothing.
+    for (argv, context) in [
+        (vec!["worktree", "repair"], "unconfirmed bare repair"),
+        (
+            vec!["worktree", "repair", "--migrate-layout"],
+            "unconfirmed migrate-layout",
+        ),
+        (
+            vec!["worktree", "repair", "wt"],
+            "unconfirmed identity repair",
+        ),
+        (
+            vec!["worktree", "repair", "wt", "--resolve-identity"],
+            "unconfirmed resolve-identity",
+        ),
+    ] {
+        let refused = run_libra_command(&argv, main);
+        assert_ne!(
+            refused.status.code(),
+            Some(0),
+            "{context} must be refused without its confirmation"
+        );
+        assert_lock_absent(context);
+    }
+
+    // Positive control: a CONFIRMED mutating repair takes the shared hold and
+    // creates the lock file, proving the probe can see creation.
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
+        "worktree repair --confirm",
+    );
+    assert!(
+        lock.exists(),
+        "the confirmed repair must take the shared maintenance hold"
+    );
 }

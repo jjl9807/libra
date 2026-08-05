@@ -406,16 +406,18 @@ pub(crate) struct IoBlockedEvent {
     /// Reason taxonomy (§B.6.0.1), consumed by the io_blocked[] JSON
     /// contract (R0-8) and its worktree-family warning mapping.
     pub(crate) reason: IoBlockedReason,
-    /// The scan ABSORBED this block by over-reporting conservatively, so the
-    /// rendered output is still complete and must not fail closed.
+    /// The scan ABSORBED this block into the listing by over-reporting
+    /// conservatively: the affected path still appears in the output, so the
+    /// omission is compensated in the listing sense only.
     ///
     /// The only case today is an unreadable top-level untracked directory:
     /// we cannot prove it holds a visible file, so we emit its `?? dir/`
-    /// marker anyway. Nothing is missing from what the user sees — at worst
-    /// a directory is listed that a readable scan would have hidden — so
-    /// refusing the whole command would be disproportionate. The event is
-    /// still recorded, so `--json` lists it and `base_scan_complete` stays
-    /// false, and the dirty cache is not rewritten from a guess.
+    /// marker anyway (a marker is not an inspection result, and listing a
+    /// directory a readable scan would have hidden is the safe direction).
+    /// §B.6.0.1 still fails TEXT modes closed for every blocked event,
+    /// absorbed or not — while `--json` keeps the partial contract: the
+    /// event is listed in `io_blocked[]`, `base_scan_complete` stays false,
+    /// and the dirty cache is not rewritten from a guess.
     pub(crate) absorbed: bool,
 }
 
