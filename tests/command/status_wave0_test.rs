@@ -48,6 +48,29 @@ fn add_index_stage(index: &mut Index, file: &str, content: &str, stage: u8) {
     index.add(entry);
 }
 
+/// True when the host filesystem can create a file whose name is not valid
+/// UTF-8. Linux filesystems accept arbitrary non-NUL bytes, but APFS
+/// (macOS) rejects such names with EILSEQ, so the byte-level path fixtures
+/// cannot exist there at all. Callers return early after this prints the
+/// standard `skipped (...)` notice — the same convention as the gated
+/// L2/L3 tests — instead of failing on hosts that cannot express the name.
+#[cfg(unix)]
+fn fs_supports_non_utf8_names(dir: &Path) -> bool {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let canary = dir.join(OsStr::from_bytes(b"non-utf8-\xff-canary"));
+    match fs::write(&canary, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&canary);
+            true
+        }
+        Err(error) => {
+            eprintln!("skipped (filesystem refuses non-UTF-8 file names: {error})");
+            false
+        }
+    }
+}
+
 #[test]
 #[serial]
 fn porcelain_v2_unmerged_u_line() {
@@ -2091,6 +2114,9 @@ fn short_forced_color_keeps_raw_high_bytes_with_quote_path_false() {
     use std::os::unix::ffi::OsStrExt;
 
     let repo = create_repo_with_committed_file("old.txt", "body\\n");
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     fs::write(
         repo.path()
             .join(std::ffi::OsStr::from_bytes(b"new-\xff.txt")),
@@ -2168,6 +2194,9 @@ fn untracked_dir_marker_keeps_raw_bytes_with_quote_path_false() {
     use std::os::unix::ffi::OsStrExt;
 
     let repo = create_repo_with_committed_file("old.txt", "body\\n");
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     let dir = repo.path().join(std::ffi::OsStr::from_bytes(b"dir-\xff"));
     fs::create_dir(&dir).unwrap();
     fs::write(dir.join("file.txt"), "payload\\n").unwrap();
@@ -2247,6 +2276,9 @@ fn short_non_utf8_quote_path_false_writes_raw_high_bytes() {
     use std::os::unix::ffi::OsStrExt;
 
     let repo = create_repo_with_committed_file("old.txt", "body\n");
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     // An untracked name with an invalid-UTF-8 high byte; `libra add` refuses
     // such paths, so the fixture stays at the `??` row.
     fs::write(
@@ -4439,6 +4471,9 @@ fn scan_survives_non_utf8_untracked_path() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
     let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     fs::write(
         repo.path().join(OsStr::from_bytes(b"bad\xffname.txt")),
         "x\n",
@@ -4786,6 +4821,9 @@ fn tracked_non_utf8_path_never_fails_status() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
     configure_identity_via_cli(repo.path());
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     let name = OsStr::from_bytes(b"tracked\xffname.txt");
     fs::write(repo.path().join(name), "committed\n").unwrap();
     fs::write(repo.path().join("plain.txt"), "plain\n").unwrap();
@@ -6346,6 +6384,9 @@ fn non_utf8_path_skips_rename_not_status() {
 
     let body = "probe rename content\nline two\n";
     let repo = create_repo_with_committed_file("moved-src.txt", body);
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     enable_rename_untracked(repo.path());
     fs::remove_file(repo.path().join("moved-src.txt")).unwrap();
     let twin = repo.path().join(OsStr::from_bytes(b"nu\xff-dest.txt"));
@@ -6395,6 +6436,9 @@ fn porcelain_z_non_utf8_base_status_raw_bytes() {
     let repo = tempdir().expect("temp repo");
     init_repo_via_cli(repo.path());
     configure_identity_via_cli(repo.path());
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     fs::write(
         repo.path().join(OsStr::from_bytes(b"raw\xff.txt")),
         "payload\n",
@@ -6433,6 +6477,9 @@ fn json_io_blocked_non_utf8_path_reversible() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 
     let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    if !fs_supports_non_utf8_names(repo.path()) {
+        return;
+    }
     let blocked = repo.path().join(OsStr::from_bytes(b"blk\xff"));
     fs::create_dir(&blocked).unwrap();
     fs::write(blocked.join("inner.txt"), "hidden\n").unwrap();

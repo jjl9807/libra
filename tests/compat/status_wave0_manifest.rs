@@ -3,15 +3,17 @@
 //!
 //! This constant is the single source of truth for the wave-0 status test
 //! set: `compat_status_wave0_register` asserts bidirectional set equality
-//! against `cargo test --test command_test -- --list` and strict
-//! alphabetical ordering. Add or remove a test in the module and this list
-//! together — never edit only one side.
+//! against the `#[test]`/`#[tokio::test]` declarations parsed from the
+//! module source (it must not recursively invoke Cargo — see the gate's
+//! module docs) and strict alphabetical ordering. Add or remove a test in
+//! the module and this list together — never edit only one side.
 //!
-//! Tests gated `#[cfg(unix)]` in the module are compiled (and therefore
-//! listed by `--list`) only on Unix hosts, so they must additionally be
-//! named in [`STATUS_WAVE0_TESTS_UNIX_ONLY`]; the gate excludes them from
-//! the expected set on non-Unix platforms. Both lists stay in this one
-//! file so the manifest remains the single source of truth.
+//! Tests gated `#[cfg(unix)]` in the module must additionally be named in
+//! [`STATUS_WAVE0_TESTS_UNIX_ONLY`], the canonical platform inventory
+//! (asserted unique and a subset of the full list). Source-level parsing
+//! is `cfg`-independent, so the gate compares the full set on every
+//! platform. Both lists stay in this one file so the manifest remains the
+//! single source of truth.
 
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "api_warning_concurrent_isolated",
@@ -179,9 +181,10 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
 ];
 
 /// Names in [`STATUS_WAVE0_TESTS`] whose test functions are gated
-/// `#[cfg(unix)]` in `tests/command/status_wave0_test.rs`. They are absent
-/// from `cargo test --test command_test -- --list` on non-Unix hosts, so
-/// the registration gate expects them only on Unix. Must be a subset of
+/// `#[cfg(unix)]` in `tests/command/status_wave0_test.rs` — the canonical
+/// platform inventory. The gate's source-level collection sees every
+/// declaration regardless of `cfg`, so this list is not used to filter the
+/// expected set; it is asserted unique and a subset of
 /// [`STATUS_WAVE0_TESTS`], strictly alphabetically sorted.
 pub const STATUS_WAVE0_TESTS_UNIX_ONLY: &[&str] = &[
     "cache_fallback_still_fails_closed_on_io_blocked",
