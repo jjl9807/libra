@@ -487,6 +487,23 @@ async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
     // `--heal` repairs FIRST, so the checks below (and therefore the exit code)
     // observe the post-repair state. The repair itself is reported separately.
     let heal_report = if args.heal {
+        // plan-20260714 W0 hard gate: `--heal` discovery walks only
+        // refs/reflogs/index roots — it does NOT cover every worktree's
+        // private index, sequencer rows, sidecars and notes. Until it
+        // consumes the full `GcObjectSource` inventory, healing a repo that
+        // ever had linked worktrees could miss (and mis-report) another
+        // scope's objects, so it fails closed, exactly like the W0 GC gate.
+        if crate::command::maintenance::repository_had_linked_worktrees() {
+            return Err(CliError::fatal(
+                "fsck --heal does not yet cover the per-worktree object inventory; \
+                 it is refused on repositories that have (or had) linked worktrees",
+            )
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint(
+                "run `libra maintenance run` for the inventory-complete reachability walk, \
+                 or retry `--heal` after removing linked worktrees",
+            ));
+        }
         // A well-formed `--heal <OBJECT>` seeds that OID so it is healed even if
         // unreachable; a malformed one is left to the single-object check below
         // to report as invalid.

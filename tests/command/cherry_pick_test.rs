@@ -1867,7 +1867,7 @@ async fn cherry_pick_malformed_todo_oid_errors_not_panics() {
     let conn = Database::connect(db_url).await.expect("connect repo db");
     // lore.md 2.6: cherry-pick state now lives in the unified `sequence_state`
     // table (kind='cherry_pick'), not the retired `cherry_pick_state` table.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         "UPDATE sequence_state SET todo = 'not-a-valid-oid' WHERE kind = 'cherry_pick'".to_string(),
     ))

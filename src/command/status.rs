@@ -6926,7 +6926,7 @@ mod test {
         let db = crate::internal::sequencer::request_db_checked()
             .await
             .expect("test fixture database");
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "INSERT INTO sequence_state \
              (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
@@ -6959,7 +6959,7 @@ mod test {
         let db = crate::internal::sequencer::request_db_checked()
             .await
             .expect("test fixture database");
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "DROP TABLE config_kv",
         ))

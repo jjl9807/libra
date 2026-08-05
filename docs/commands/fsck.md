@@ -180,6 +180,12 @@ Safety guarantees:
 - **Bounded and redacted.** The durable-tier fetch uses the same bounded
   429/`Retry-After` backoff as other remote operations, and failure messages are
   credential-redacted.
+- **Fails closed with linked worktrees (W0 hard gate).** `--heal` discovery
+  walks only the shared refs/reflogs/index roots — it does not cover every
+  worktree's private index, sequencer rows or sidecars, so on a repository that
+  has (or had) linked worktrees it refuses up front with `LBR-REPO-003`. Run
+  `libra maintenance run` for the inventory-complete reachability walk, or
+  remove the linked worktrees first.
 
 Heal runs *before* the integrity checks, so the exit code reflects the
 post-repair state: if every problem object was healed, `fsck` exits `0`; objects

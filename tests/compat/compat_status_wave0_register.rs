@@ -5,46 +5,87 @@
 //!    `tests/command/mod.rs` (CI would silently skip every wave-0 test).
 //! 2. The canonical manifest (`STATUS_WAVE0_TESTS`) drifts from the module
 //!    contents in either direction.
+//!
+//! This target must not spawn `cargo test --test command_test -- --list` to
+//! discover registrations: Cargo holds the target-directory lock while this
+//! test runs, so that child Cargo process waits on its parent indefinitely.
+//! The source-level parser below verifies the same module wiring and test-name
+//! contract without recursively invoking Cargo.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, fs, path::Path};
 
 #[path = "status_wave0_manifest.rs"]
 mod status_wave0_manifest;
 
 use status_wave0_manifest::{STATUS_WAVE0_TESTS, STATUS_WAVE0_TESTS_UNIX_ONLY};
 
-const MODULE_PREFIX: &str = "command::status_wave0::";
+fn read(relative: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {relative}: {error}"))
+}
 
-fn listed_command_tests() -> HashSet<String> {
-    let output = std::process::Command::new(env!("CARGO"))
-        .args(["test", "--test", "command_test", "--", "--list"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .env("LIBRA_SKIP_WEB_BUILD", "1")
-        .output()
-        .expect("run `cargo test --test command_test -- --list`");
+/// Return the names of direct `#[test]`/`#[tokio::test]` functions declared
+/// by the Wave-0 module. The module deliberately keeps this simple shape; if
+/// it needs a macro-generated test in future, extend this parser and its test
+/// alongside that change rather than silently dropping it from the manifest.
+fn declared_wave0_tests(source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut pending_test_attribute = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[test]" || trimmed.starts_with("#[tokio::test") {
+            pending_test_attribute = true;
+            continue;
+        }
+        if !pending_test_attribute {
+            continue;
+        }
+        // Test attributes such as `#[serial]` and conditional compilation can
+        // appear between the test marker and its function declaration.
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+
+        let declaration = trimmed
+            .strip_prefix("pub ")
+            .unwrap_or(trimmed)
+            .strip_prefix("async fn ")
+            .or_else(|| trimmed.strip_prefix("fn "));
+        let Some(declaration) = declaration else {
+            panic!(
+                "expected a function declaration after a Wave-0 test attribute, found: {trimmed}"
+            );
+        };
+        let name = declaration
+            .split(|character: char| {
+                character == '(' || character == '<' || character.is_whitespace()
+            })
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| panic!("test declaration has no function name: {trimmed}"));
+        assert!(
+            names.insert(name.to_string()),
+            "Wave-0 source declares duplicate test function `{name}`"
+        );
+        pending_test_attribute = false;
+    }
 
     assert!(
-        output.status.success(),
-        "`cargo test --test command_test -- --list` failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        !pending_test_attribute,
+        "Wave-0 source ends after a test attribute without a function declaration"
     );
-
-    String::from_utf8(output.stdout)
-        .expect("test list output should be utf-8")
-        .lines()
-        .filter_map(|line| line.strip_suffix(": test"))
-        .map(str::to_owned)
-        .collect()
+    names
 }
 
 #[test]
 fn status_wave0_manifest_matches_registered_tests() {
-    let actual: HashSet<String> = listed_command_tests()
-        .into_iter()
-        // Prefix filter (not substring) so an unrelated module containing
-        // "status_wave0" in a test name cannot satisfy the gate.
-        .filter(|name| name.starts_with(MODULE_PREFIX))
-        .collect();
+    let command_module = read("tests/command/mod.rs");
+    assert!(
+        command_module.contains("#[path = \"status_wave0_test.rs\"]\nmod status_wave0;"),
+        "tests/command/status_wave0_test.rs must be registered by tests/command/mod.rs"
+    );
+    let actual = declared_wave0_tests(&read("tests/command/status_wave0_test.rs"));
 
     let manifest: HashSet<&str> = STATUS_WAVE0_TESTS.iter().copied().collect();
     assert_eq!(
@@ -64,13 +105,12 @@ fn status_wave0_manifest_matches_registered_tests() {
         "STATUS_WAVE0_TESTS_UNIX_ONLY must be a subset of STATUS_WAVE0_TESTS"
     );
 
-    // `#[cfg(unix)]` tests are compiled (and listed) only on Unix hosts, so
-    // they join the expected set only there; the manifest stays canonical
-    // for the full cross-platform test set.
+    // Parse source rather than Cargo's host-specific test listing: the
+    // manifest is canonical across platforms, including `#[cfg(unix)]`
+    // functions that a Windows binary intentionally does not compile.
     let expected: HashSet<String> = STATUS_WAVE0_TESTS
         .iter()
-        .filter(|name| cfg!(unix) || !unix_only.contains(**name))
-        .map(|name| format!("{MODULE_PREFIX}{name}"))
+        .map(|name| (*name).to_string())
         .collect();
 
     assert!(

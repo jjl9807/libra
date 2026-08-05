@@ -556,7 +556,7 @@ mod tests {
                 Some("2222222222222222222222222222222222222222"),
             ),
         ] {
-            db.execute(Statement::from_sql_and_values(
+            db.execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, \
                  current_head, todo, done, stopped_sha) VALUES (?, 'main', \
@@ -595,7 +595,7 @@ mod tests {
         );
 
         // A rebase in progress that has NOT stopped defines no REBASE_HEAD.
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
             "UPDATE rebase_state SET stopped_sha = NULL WHERE worktree_id = ''".to_string(),
         ))

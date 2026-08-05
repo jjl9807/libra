@@ -788,7 +788,7 @@ impl WorkspaceStore {
         );
 
         test_hooks::before_write().await;
-        match conn.execute(statement).await {
+        match conn.execute_raw(statement).await {
             Ok(result) if result.rows_affected() == 1 => Ok(WorkspaceLease {
                 workspace_id,
                 owner: normalized.lease_owner,
@@ -1136,7 +1136,7 @@ impl WorkspaceStore {
         );
         test_hooks::before_write().await;
         let updated = match conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 &sql,
                 [
@@ -1228,7 +1228,7 @@ impl WorkspaceStore {
     ) -> WorkspaceResult<Option<WorkspaceRecord>> {
         let repo_id = RepoIdentity::resolve(conn).await?;
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "SELECT {SELECT_COLUMNS} FROM workspace_record \
@@ -1260,7 +1260,7 @@ impl WorkspaceStore {
         worktree_id: &str,
     ) -> WorkspaceResult<Option<WorkspaceRecord>> {
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "SELECT {SELECT_COLUMNS} FROM workspace_record \
@@ -1285,7 +1285,7 @@ impl WorkspaceStore {
         let repo_id = RepoIdentity::resolve(conn).await?;
         let canonical = canonical_path_string(path)?;
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "SELECT {SELECT_COLUMNS} FROM workspace_record \
@@ -1332,7 +1332,7 @@ impl WorkspaceStore {
         values.push((limit + 1).into());
 
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 sql,
                 values,
@@ -1377,7 +1377,7 @@ impl WorkspaceStore {
              WHERE workspace_id = ? AND repo_id <> ? AND ? = {REPO_IDENTITY_SUBQUERY}"
         );
         let affected = match conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 &sql,
                 [
@@ -1466,7 +1466,7 @@ impl WorkspaceStore {
         values.push((limit + 1).into());
 
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 sql,
                 values,
@@ -1519,7 +1519,7 @@ impl WorkspaceStore {
         values.push((limit + 1).into());
 
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 sql,
                 values,
@@ -1551,7 +1551,7 @@ impl WorkspaceStore {
         workspace_id: &str,
     ) -> WorkspaceResult<Option<WorkspaceRecord>> {
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!("SELECT {SELECT_COLUMNS} FROM workspace_record WHERE workspace_id = ?"),
                 [workspace_id.into()],
@@ -1576,7 +1576,7 @@ impl WorkspaceStore {
         let repo_id = RepoIdentity::resolve(conn).await?;
         let limit = limit.clamp(1, MAX_LIST_LIMIT);
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "SELECT {SELECT_COLUMNS} FROM workspace_record \
@@ -1601,7 +1601,7 @@ impl WorkspaceStore {
         values: I,
         action: &str,
     ) -> WorkspaceResult<u64> {
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             sql,
             values,
@@ -1647,7 +1647,7 @@ impl WorkspaceStore {
         }
 
         let by_path = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 format!(
                     "SELECT {SELECT_COLUMNS} FROM workspace_record \
@@ -1694,7 +1694,9 @@ impl WorkspaceStore {
     /// after the failed INSERT, and the write lock it may still hold must be
     /// released before the caller retries — not whenever the guard happens to
     /// be dropped.
-    pub async fn acquire<C: ConnectionTrait + TransactionTrait>(
+    pub async fn acquire<
+        C: ConnectionTrait + TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
+    >(
         conn: &C,
         request: &AcquireRequest,
         now_ms: i64,
@@ -1721,7 +1723,9 @@ impl WorkspaceStore {
     }
 
     /// [`Self::reclaim_expired_with_conn`] in its own transaction.
-    pub async fn reclaim_expired<C: ConnectionTrait + TransactionTrait>(
+    pub async fn reclaim_expired<
+        C: ConnectionTrait + TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
+    >(
         conn: &C,
         workspace_id: &str,
         new_owner: &str,

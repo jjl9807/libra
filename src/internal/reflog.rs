@@ -460,7 +460,7 @@ async fn reflog_table_exists<C: ConnectionTrait>(db_conn: &C) -> Result<bool, Re
         ["reflog".into()],
     );
 
-    if let Some(result) = db_conn.query_one(stmt).await? {
+    if let Some(result) = db_conn.query_one_raw(stmt).await? {
         let count = result.try_get_by_index(0).unwrap_or(0);
         if count == 0 {
             return Ok(false);
@@ -497,7 +497,7 @@ async fn ensure_reflog_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), Re
     );
 
     for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-        match db.execute(create_table_stmt.clone()).await {
+        match db.execute_raw(create_table_stmt.clone()).await {
             Ok(_) => break,
             Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
                 sleep(Duration::from_millis(
@@ -518,7 +518,7 @@ async fn ensure_reflog_table_exists<C: ConnectionTrait>(db: &C) -> Result<(), Re
     );
 
     for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
-        match db.execute(create_index_stmt.clone()).await {
+        match db.execute_raw(create_index_stmt.clone()).await {
             Ok(_) => break,
             Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
                 sleep(Duration::from_millis(
@@ -791,7 +791,7 @@ where
         for window in survivors.windows(2) {
             let (newer, older) = (window[0], window[1]);
             if newer.old_oid != older.new_oid {
-                conn.execute(Statement::from_sql_and_values(
+                conn.execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
                     "UPDATE reflog SET old_oid = ? WHERE id = ?;",
                     [older.new_oid.clone().into(), newer.id.into()],
@@ -804,7 +804,7 @@ where
 
     for entry in &entries {
         if doomed_ids.contains(&entry.id) {
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "DELETE FROM reflog WHERE id = ?;",
                 [entry.id.into()],
@@ -844,7 +844,7 @@ pub async fn expire_reflog<C, LP, LC>(
     is_commit: LC,
 ) -> Result<ExpireResult, ReflogError>
 where
-    C: TransactionTrait,
+    C: TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
     LP: FnMut(&str) -> Option<Vec<String>> + Send + 'static,
     LC: Fn(&str) -> bool + Send + 'static,
 {

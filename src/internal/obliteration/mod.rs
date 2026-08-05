@@ -72,7 +72,7 @@ impl ObliterationStore {
             "SELECT oid, hash_kind, state, reason FROM object_obliteration WHERE oid = ? LIMIT 1",
             [oid.into()],
         );
-        let row = match db.query_one(stmt).await {
+        let row = match db.query_one_raw(stmt).await {
             Ok(row) => row,
             Err(e) if e.to_string().contains("no such table") => return Ok(None),
             Err(e) => return Err(format!("failed to read obliteration tombstone: {e}")),
@@ -98,7 +98,7 @@ impl ObliterationStore {
         approval_source: Option<&str>,
     ) -> Result<(), String> {
         let db = get_db_conn_instance().await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT OR IGNORE INTO object_obliteration \
              (oid, hash_kind, state, reason, actor, approval_source) \
@@ -124,7 +124,7 @@ impl ObliterationStore {
             [hash.to_string().into(), hash_kind_str().into()],
         );
         let row = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to verify obliteration tombstone: {e}"))?;
         match row {
@@ -139,7 +139,7 @@ impl ObliterationStore {
     /// Obliterating → Obliterated: record the payload as physically removed.
     pub async fn mark_obliterated(hash: &ObjectHash) -> Result<(), String> {
         let db = get_db_conn_instance().await;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "UPDATE object_obliteration \
              SET state = 'obliterated', payload_deleted_at = CURRENT_TIMESTAMP, \
@@ -159,7 +159,7 @@ impl ObliterationStore {
             DbBackend::Sqlite,
             "SELECT oid FROM object_obliteration WHERE state = 'obliterating'".to_string(),
         );
-        let rows = match db.query_all(stmt).await {
+        let rows = match db.query_all_raw(stmt).await {
             Ok(rows) => rows,
             Err(e) if e.to_string().contains("no such table") => return Ok(Vec::new()),
             Err(e) => return Err(format!("failed to scan incomplete obliterations: {e}")),
@@ -202,7 +202,7 @@ pub async fn refresh_snapshot_result() -> Result<(), sea_orm::DbErr> {
         "SELECT oid FROM object_obliteration".to_string(),
     );
     let set: std::collections::HashSet<String> = db
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await?
         .into_iter()
         .filter_map(|row| row.try_get_by_index::<String>(0).ok())

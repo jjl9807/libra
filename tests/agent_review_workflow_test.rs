@@ -1308,7 +1308,7 @@ async fn seed_v1_checkpoint(
     opts.sqlx_logging(false);
     let conn = Database::connect(opts).await.expect("open repo db");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, \
          working_dir, started_at, last_event_at) \
@@ -1317,7 +1317,7 @@ async fn seed_v1_checkpoint(
     ))
     .await
     .expect("seed agent_session");
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_checkpoint (checkpoint_id, session_id, scope, parent_commit, \
          tree_oid, metadata_blob_oid, traces_commit, created_at) \

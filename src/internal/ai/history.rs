@@ -2650,7 +2650,7 @@ impl HistoryManager {
                 || !marker.time_fields_trustworthy(now_ms)
         }) {
             let cataloged = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     conn.get_database_backend(),
                     "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ?",
                     [marker.attempt_id.clone().into()],
@@ -2663,7 +2663,7 @@ impl HistoryManager {
         }
 
         let mut root_rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT `commit` AS oid FROM reference WHERE `commit` IS NOT NULL LIMIT 250001"
                     .to_string(),
@@ -2671,7 +2671,7 @@ impl HistoryManager {
             .await
             .context("list reference roots for rejected object cleanup")?;
         let reflog_exists = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                 ["reflog".into()],
@@ -2681,7 +2681,7 @@ impl HistoryManager {
             .is_some();
         if reflog_exists && root_rows.len() <= REJECTED_CLEANUP_MAX_VISITED_OBJECTS {
             root_rows.extend(
-                conn.query_all(Statement::from_string(
+                conn.query_all_raw(Statement::from_string(
                     conn.get_database_backend(),
                     "SELECT old_oid AS oid FROM reflog
                      UNION ALL SELECT new_oid AS oid FROM reflog
@@ -2714,7 +2714,7 @@ impl HistoryManager {
         let mut active_operations = Vec::new();
         for table in ["rebase_state", "sequence_state"] {
             let table_exists = conn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     conn.get_database_backend(),
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
                     [table.into()],
@@ -2724,7 +2724,7 @@ impl HistoryManager {
                 .is_some();
             if table_exists
                 && conn
-                    .query_one(Statement::from_string(
+                    .query_one_raw(Statement::from_string(
                         conn.get_database_backend(),
                         format!("SELECT 1 FROM {table} LIMIT 1"),
                     ))
@@ -3212,7 +3212,7 @@ impl HistoryManager {
             .begin()
             .await
             .context("begin rejected checkpoint object cleanup")?;
-        txn.execute(Statement::from_string(
+        txn.execute_raw(Statement::from_string(
             txn.get_database_backend(),
             "UPDATE metadata_kv SET updated_at = updated_at
              WHERE scope = 'agent_traces_inflight'"
@@ -3493,7 +3493,7 @@ impl HistoryManager {
         // it in the meantime.
         let identity = self
             .db_conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT agent_kind, provider_session_id, metadata_json
                  FROM agent_session WHERE session_id = ?",
@@ -3523,7 +3523,7 @@ impl HistoryManager {
                 .context("begin agent erasure tombstone transaction")?;
             let incarnation_namespace = uuid::Uuid::new_v4().simple().to_string();
             let incarnation = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "INSERT INTO agent_capture_incarnation (
                         agent_kind, provider_session_id, next_session_sync_revision,
@@ -3559,7 +3559,7 @@ impl HistoryManager {
                     "agent session disappeared while preserving its cloud replication incarnation; retry the erase"
                 );
             }
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_import_tombstone (
                     tombstone_id, agent_kind, provider_session_id,
@@ -3583,7 +3583,7 @@ impl HistoryManager {
             ))
             .await
             .context("write agent import anti-resurrection tombstone")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_import_identity
                  SET state = 'failed', owner = NULL, lease_expires_at = NULL,
@@ -3598,7 +3598,7 @@ impl HistoryManager {
             ))
             .await
             .context("fence import identity holders during erasure")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_coverage_claim
                  SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
@@ -3611,7 +3611,7 @@ impl HistoryManager {
             ))
             .await
             .context("fence coverage claim holders during erasure")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "UPDATE agent_export_job
                  SET state = 'failed', owner = NULL, lease_expires_at = NULL,
@@ -3661,7 +3661,7 @@ impl HistoryManager {
         // Enumerate the session's checkpoints from the catalog.
         let rows = self
             .db_conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id FROM agent_checkpoint WHERE session_id = ?",
                 [Value::from(session_id.to_string())],
@@ -3692,14 +3692,14 @@ impl HistoryManager {
             .await
             .context("begin agent session catalog erasure")?;
         let deleted = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_session WHERE session_id = ?",
                 [Value::from(session_id.to_string())],
             ))
             .await
             .context("delete agent_session row for erasure")?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM metadata_kv WHERE scope = ? AND target = ?",
             [
@@ -3712,7 +3712,7 @@ impl HistoryManager {
         .await
         .context("delete import object-index repair marker for erased session")?;
         if let Some((agent_kind, provider_session_id)) = provider_identity {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_import_identity
                  WHERE agent_kind = ? AND provider_session_id = ?",
@@ -3723,7 +3723,7 @@ impl HistoryManager {
             ))
             .await
             .context("delete import identity rows for erased session")?;
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_export_job
                  WHERE agent_kind = ? AND provider_session_id = ?",
@@ -3787,7 +3787,7 @@ impl HistoryManager {
         // closed on every unexpired reservation just as we do for markers.
         let reserved = self
             .db_conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 self.db_conn.get_database_backend(),
                 "SELECT parent_session_id, attempt_checkpoint_id, lease_expires_at
                  FROM agent_subagent_content_claim
@@ -3858,7 +3858,7 @@ impl HistoryManager {
         let backend = self.db_conn.get_database_backend();
         let rows = self
             .db_conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 backend,
                 "SELECT cp.checkpoint_id, cp.session_id, cp.scope, cp.parent_commit, \
                         cp.traces_commit, cp.tree_oid, cp.metadata_blob_oid, cp.created_at, \
@@ -4099,7 +4099,7 @@ impl HistoryManager {
             let backend = txn.get_database_backend();
             for item in rewritten {
                 if let Err(err) = txn
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         backend,
                         "UPDATE agent_checkpoint SET traces_commit = ?, tree_oid = ?, \
                             sync_revision = sync_revision + 1 \
@@ -4127,7 +4127,7 @@ impl HistoryManager {
             let mut removed = 0;
             for id in remove_ids {
                 if record_cloud_tombstones {
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         backend,
                         "INSERT INTO agent_checkpoint_prune_tombstone (
                             checkpoint_id, session_id, pruned_at
@@ -4154,7 +4154,7 @@ impl HistoryManager {
                 // cascades its revision/link.  Keep an empty claim as the
                 // durable revision high-water mark so a later capture cannot
                 // reuse an audited revision number for different content.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_subagent_content_revision
                      WHERE checkpoint_id = ?",
@@ -4162,7 +4162,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete subagent content revision for pruned checkpoint")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_subagent_content_claim
                      SET sync_revision = sync_revision + 1,
@@ -4205,7 +4205,7 @@ impl HistoryManager {
                 // attempt cursors are part of the same catalog fact as the
                 // checkpoint. Reconcile them before deleting the row so no
                 // committed claim can point at a pruned checkpoint.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_conflict
                      WHERE incumbent_checkpoint_id = ?
@@ -4220,14 +4220,14 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete conflict evidence whose incumbent checkpoint is pruned")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_revision WHERE checkpoint_id = ?",
                     [Value::from(id.clone())],
                 ))
                 .await
                 .context("delete coverage revisions for pruned checkpoint")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_claim
                      WHERE checkpoint_id = ?
@@ -4241,7 +4241,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete coverage claims emptied by checkpoint prune")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_coverage_claim
                      SET revision = (
@@ -4298,7 +4298,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("repoint coverage claim after checkpoint prune")?;
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_import_identity SET attempt_checkpoint_id = NULL
                      WHERE attempt_checkpoint_id = ?",
@@ -4307,7 +4307,7 @@ impl HistoryManager {
                 .await
                 .context("clear pruned import attempt checkpoint pointer")?;
                 match txn
-                    .execute(Statement::from_sql_and_values(
+                    .execute_raw(Statement::from_sql_and_values(
                         backend,
                         "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
                         [Value::from(id.clone())],
@@ -4328,7 +4328,7 @@ impl HistoryManager {
             }
 
             let deleted_import_identities = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_import_identity
                  WHERE state IN ('discovered','partial','committed','failed')
@@ -5427,7 +5427,7 @@ pub async fn register_traces_write_attempt(
         .await
         .context("begin traces writer-attempt registration")?;
     let writable = txn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
             "SELECT 1 AS writable
              FROM agent_session s
@@ -5447,7 +5447,7 @@ pub async fn register_traces_write_attempt(
     }
     for fence in coverage_fences {
         let owned = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
                 "SELECT 1 AS owned FROM agent_coverage_claim
                  WHERE session_id = ? AND logical_turn_key = ?
@@ -5516,7 +5516,7 @@ pub async fn update_traces_inflight_marker_if_generation<C: ConnectionTrait>(
     let value =
         serde_json::to_string(marker).context("failed to serialize traces in-flight marker")?;
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE metadata_kv
              SET value = ?, value_type = 'text', updated_at = ?
@@ -5561,7 +5561,7 @@ pub async fn clear_traces_inflight_marker_if_generation<C: ConnectionTrait>(
     generation: &str,
 ) -> Result<bool> {
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM metadata_kv
              WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
@@ -5583,7 +5583,7 @@ pub async fn clear_non_cleanup_traces_inflight_marker<C: ConnectionTrait>(
     generation: &str,
 ) -> Result<bool> {
     let result = conn
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "DELETE FROM metadata_kv
              WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
@@ -5674,7 +5674,7 @@ pub async fn agent_checkpoint_id_for_traces_commit<C: ConnectionTrait>(
 ) -> Result<Option<String>> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id FROM agent_checkpoint WHERE traces_commit = ? LIMIT 1",
             [Value::from(commit_hash)],
@@ -5752,7 +5752,7 @@ pub(crate) async fn checkpoint_snapshot_durable_oids<C: ConnectionTrait>(
         return Ok(HashSet::new());
     }
     let catalog_rows = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT traces_commit FROM agent_checkpoint ORDER BY traces_commit".to_string(),
         ))
@@ -5808,7 +5808,7 @@ async fn checkpoint_snapshot_durable_oids_with_catalog<C: ConnectionTrait>(
     deadline: Option<Instant>,
 ) -> Result<HashSet<String>> {
     let head_row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT `commit` FROM reference
              WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
@@ -6605,11 +6605,11 @@ mod tests {
         let builder = db.get_database_backend();
         let schema = Schema::new(builder);
         let stmt = schema.create_table_from_entity(reference::Entity);
-        db.execute(builder.build(&stmt)).await.unwrap();
+        db.execute_raw(builder.build(&stmt)).await.unwrap();
         // Present in every real repository (bootstrap schema). The write-lock
         // primitive in `db::begin_write_transaction` issues a no-op write
         // against it, so a fixture without it is not a repository database.
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             builder,
             "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,\
              value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0)"
@@ -6749,7 +6749,7 @@ mod tests {
         .expect("failed to open lock holder connection");
         let backend = locker.get_database_backend();
         locker
-            .execute(Statement::from_string(backend, "BEGIN EXCLUSIVE"))
+            .execute_raw(Statement::from_string(backend, "BEGIN EXCLUSIVE"))
             .await
             .expect("failed to acquire sqlite exclusive lock");
 
@@ -6759,7 +6759,7 @@ mod tests {
                 sleep(Duration::from_millis(250)).await;
                 let backend = locker.get_database_backend();
                 locker
-                    .execute(Statement::from_string(backend, "COMMIT"))
+                    .execute_raw(Statement::from_string(backend, "COMMIT"))
                     .await
                     .expect("failed to release sqlite exclusive lock");
             })
@@ -6818,13 +6818,13 @@ mod tests {
     }
 
     async fn prepare_checkpoint_test_schema(conn: &DatabaseConnection) {
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
         ))
         .await
         .expect("create checkpoint marker registry");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE IF NOT EXISTS agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)"
                 .to_string(),
@@ -7379,14 +7379,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7502,7 +7502,7 @@ mod tests {
                 .expect("write reflog candidate");
         assert!(created);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE reflog (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7517,7 +7517,7 @@ mod tests {
             .await
             .expect("create reflog root table");
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO reflog (
                     ref_name, old_oid, new_oid, timestamp, committer_name,
@@ -7620,21 +7620,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
             .await
             .expect("create cleanup catalog probe");
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO metadata_kv (
                     scope, target, `key`, value, value_type, created_at, updated_at
@@ -7672,14 +7672,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7716,14 +7716,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -7749,7 +7749,7 @@ mod tests {
         encoder.write_all(b"blob 15\0different bytes").unwrap();
         encoder.finish().unwrap();
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
                  VALUES ('broken-ref', 'Branch', ?, NULL, NULL)",
@@ -8042,14 +8042,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
             ))
             .await
             .expect("create marker registry");
         db_conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db_conn.get_database_backend(),
                 "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
             ))
@@ -8069,7 +8069,7 @@ mod tests {
         let tag = write_git_object(&repo_path, "tag", tag_data.as_bytes())
             .expect("write annotated tag object");
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db_conn.get_database_backend(),
                 "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
                  VALUES ('keep-candidate', 'Tag', ?, NULL, NULL)",

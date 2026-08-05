@@ -60,7 +60,7 @@ async fn create_operation_schema(db: &DatabaseConnection) {
     ];
 
     for sql in ddl {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .unwrap();
     }
@@ -149,23 +149,23 @@ async fn duplicate_constraints_are_enforced_for_view_refs_and_workspace() {
         DbBackend::Sqlite,
         "INSERT INTO operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-1');",
     );
-    db.execute(ref_insert).await.unwrap();
+    db.execute_raw(ref_insert).await.unwrap();
     let duplicate_ref = Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO operation_view_ref(view_id, ref_kind, ref_name, ref_remote, target_oid) VALUES ('view_dup', 'branch', 'main', '', 'oid-2');",
     );
-    assert!(db.execute(duplicate_ref).await.is_err());
+    assert!(db.execute_raw(duplicate_ref).await.is_err());
 
     let workspace_insert = Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-1');",
     );
-    db.execute(workspace_insert).await.unwrap();
+    db.execute_raw(workspace_insert).await.unwrap();
     let duplicate_workspace = Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO operation_view_workspace(view_id, pointer_kind, pointer_value) VALUES ('view_dup', 'index', 'oid-2');",
     );
-    assert!(db.execute(duplicate_workspace).await.is_err());
+    assert!(db.execute_raw(duplicate_workspace).await.is_err());
 }
 
 #[tokio::test]

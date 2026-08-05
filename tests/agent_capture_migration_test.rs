@@ -28,7 +28,7 @@ async fn connect(url: &str) -> DatabaseConnection {
 
 async fn table_exists(conn: &DatabaseConnection, name: &str) -> bool {
     let backend = conn.get_database_backend();
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         backend,
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
@@ -40,7 +40,7 @@ async fn table_exists(conn: &DatabaseConnection, name: &str) -> bool {
 
 async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
     let backend = conn.get_database_backend();
-    conn.query_one(Statement::from_sql_and_values(
+    conn.query_one_raw(Statement::from_sql_and_values(
         backend,
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1",
         [name.into()],
@@ -79,7 +79,7 @@ async fn run_legacy_bootstrap(conn: &DatabaseConnection) {
             continue;
         }
         let _: ExecResult = conn
-            .execute(Statement::from_string(backend, trimmed.to_string()))
+            .execute_raw(Statement::from_string(backend, trimmed.to_string()))
             .await
             .unwrap_or_else(|e| panic!("legacy bootstrap stmt failed: {trimmed}\n{e}"));
     }
@@ -180,6 +180,140 @@ async fn agent_capture_up_down_up_round_trip() {
     assert!(table_exists(&conn, "agent_checkpoint").await);
 }
 
+/// W4 ownership migration must never guess that historical capture rows came
+/// from main. They receive the explicit `legacy_unknown` marker, and rollback
+/// is blocked after any operator/runtime has attached a real scope.
+#[tokio::test]
+async fn capture_workspace_scope_migration_preserves_legacy_unknown_and_fences_down() {
+    let (_dir, url) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = registered_runner();
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("run pending migrations");
+
+    // Recreate the exact historical schema, then write the row before W4's
+    // additive migration runs. Inserting after the latest migration would
+    // only prove the column default, not that a real upgrade preserves an
+    // existing capture row without inventing a main-worktree owner.
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026073101)
+            .await
+            .expect("roll back W4 scope migration on an empty capture catalog"),
+        vec![2026080401]
+    );
+
+    // This focused migration fixture intentionally does not install the
+    // unrelated `ai_thread` parent table that the historical agent-session
+    // schema references. The legacy row has no thread id; disable FK checks
+    // only while seeding that pre-W4 shape, as the export-job fixture does.
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "PRAGMA foreign_keys = OFF".to_string(),
+    ))
+    .await
+    .expect("disable unrelated thread foreign key for legacy seed");
+
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at
+         ) VALUES ('legacy-scope', 'claude_code', 'legacy-provider', 'stopped', '/tmp',
+                   '{}', '{}', 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed pre-W4-shaped session");
+    assert_eq!(
+        runner
+            .run_pending(&conn)
+            .await
+            .expect("upgrade legacy capture row to W4 scope schema"),
+        vec![2026080401]
+    );
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT repo_id, worktree_id, workspace_id, workspace_fence, scope_state
+             FROM agent_session WHERE session_id = 'legacy-scope'"
+                .to_string(),
+        ))
+        .await
+        .expect("read legacy scope")
+        .expect("legacy row");
+    assert_eq!(
+        row.try_get_by::<Option<String>, _>("repo_id").unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get_by::<Option<String>, _>("worktree_id").unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get_by::<Option<String>, _>("workspace_id").unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get_by::<Option<i64>, _>("workspace_fence").unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("scope_state").unwrap(),
+        "legacy_unknown"
+    );
+    for index in [
+        "idx_agent_session_capture_provider",
+        "idx_agent_export_job_capture_provider",
+        "idx_agent_import_identity_capture_provider",
+    ] {
+        assert!(
+            index_exists(&conn, index).await,
+            "W4 provider-claim validation must stay indexed: {index}"
+        );
+    }
+
+    let dangling_fence = conn
+        .execute_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE agent_session
+             SET repo_id = 'repo-1', worktree_id = '', workspace_fence = 7,
+                 scope_state = 'scoped'
+             WHERE session_id = 'legacy-scope'"
+                .to_string(),
+        ))
+        .await;
+    assert!(
+        dangling_fence.is_err(),
+        "a scoped capture row must reject a workspace fence without its workspace id"
+    );
+
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "UPDATE agent_session
+         SET repo_id = 'repo-1', worktree_id = '', scope_state = 'scoped'
+         WHERE session_id = 'legacy-scope'"
+            .to_string(),
+    ))
+    .await
+    .expect("explicit scoped adoption shape");
+    let error = runner
+        .rollback_to(&conn, 2026073101)
+        .await
+        .expect_err("scoped capture rows must prevent dropping ownership columns");
+    assert!(
+        error.to_string().contains("CHECK constraint failed"),
+        "down guard must fail closed: {error:#}"
+    );
+    assert_eq!(
+        runner.current_version(&conn).await.unwrap(),
+        Some(2026080401),
+        "a refused down migration must leave the W4 schema active"
+    );
+}
+
 /// AG-20 (plan.md Task A5): the `2026070802_agent_checkpoint_paging`
 /// migration survives an up → down → up round-trip. Forward creates the
 /// (deliberately non-unique) `traces_commit` probe index plus the two
@@ -209,7 +343,7 @@ async fn agent_checkpoint_paging_up_down_up_round_trip() {
     // legacy DB must not fail the automatic upgrade.
     let backend = conn.get_database_backend();
     let unique_row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' \
              AND name = 'idx_agent_checkpoint_traces_commit' \
@@ -279,7 +413,7 @@ async fn agent_capture_parent_commit_is_nullable_after_migration() {
 
     let backend = conn.get_database_backend();
     // Seed an agent_session that the FK'd checkpoint can hang off of.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -293,7 +427,7 @@ async fn agent_capture_parent_commit_is_nullable_after_migration() {
     // Insert a checkpoint with NULL parent_commit. Pre-migration this would
     // have failed the NOT NULL constraint; post-migration it must succeed.
     let res = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -308,7 +442,7 @@ async fn agent_capture_parent_commit_is_nullable_after_migration() {
     );
 
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT parent_commit FROM agent_checkpoint WHERE checkpoint_id = 'c1'".to_string(),
         ))
@@ -352,7 +486,7 @@ async fn agent_capture_session_state_check_constraint_rejects_invalid() {
 
     let backend = conn.get_database_backend();
     let res = conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             backend,
             "INSERT INTO agent_session ( \
                 session_id, agent_kind, provider_session_id, state, working_dir, \

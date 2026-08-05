@@ -390,7 +390,10 @@ async fn test_worktree_repair_json_reports_changed_state() {
         .expect("failed to serialize duplicated worktree state");
     fs::write(&state_path, data).expect("failed to overwrite worktrees.json with duplicates");
 
-    let output = run_libra_command(&["--json", "worktree", "repair"], repo_dir.path());
+    let output = run_libra_command(
+        &["--json", "worktree", "repair", "--confirm"],
+        repo_dir.path(),
+    );
     assert_cli_success(&output, "json worktree repair");
     assert!(
         output.stderr.is_empty(),
@@ -458,7 +461,7 @@ async fn test_worktree_lock_json_no_such_worktree_reports_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
@@ -489,7 +492,7 @@ async fn test_worktree_remove_machine_rejects_main_with_stable_error() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
@@ -599,7 +602,7 @@ async fn test_worktree_add_json_rejects_storage_path_as_invalid_target() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize state");
     let before_paths = worktree_paths();
@@ -636,7 +639,7 @@ async fn test_worktree_list_json_corrupt_state_reports_repo_corrupt() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize state");
     let state_path = util::storage_path().join("worktrees.json");
@@ -1105,7 +1108,7 @@ async fn test_worktree_add_rolls_back_populated_files_when_state_save_fails() {
     let wt_path = repo_dir.path().join("wt_state_save_fail");
     fs::create_dir_all(&wt_path).expect("failed to create existing empty target");
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize worktree state");
     assert!(
@@ -1216,7 +1219,7 @@ async fn test_worktree_corrupted_state_file_is_handled_without_side_effects() {
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize state first");
 
@@ -1485,7 +1488,7 @@ async fn test_worktree_move_main_is_rejected_without_side_effects() {
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should initialize worktree state");
 
@@ -1791,7 +1794,7 @@ async fn test_worktree_repair_deduplicates_entries() {
         .expect("failed to serialize duplicated worktree state");
     fs::write(&state_path, data).expect("failed to overwrite worktrees.json with duplicates");
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should succeed");
 
@@ -1830,7 +1833,7 @@ async fn test_worktree_repair_persists_main_flag_fix_without_duplicates() {
         .expect("failed to serialize worktree state with broken main flags");
     fs::write(&state_path, data).expect("failed to overwrite worktrees.json");
 
-    exec_worktree(&["repair"])
+    exec_worktree(&["repair", "--confirm"])
         .await
         .expect("worktree repair should succeed");
 

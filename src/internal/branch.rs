@@ -669,7 +669,7 @@ impl Branch {
         if let Some(provenance_key) = provenance_key {
             use sea_orm::{ConnectionTrait, Statement};
             let recorded = txn
-                .execute(Statement::from_sql_and_values(
+                .execute_raw(Statement::from_sql_and_values(
                     sea_orm::DatabaseBackend::Sqlite,
                     "INSERT INTO metadata_kv \
                      (scope, target, key, value, value_type, created_at, updated_at) \
@@ -707,7 +707,7 @@ impl Branch {
             .await
             .map_err(|error| BranchStoreError::Query(error.to_string()))?;
         let row = txn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "SELECT value FROM metadata_kv WHERE scope = 'stash_branch_journal' \
                  AND target = ? AND key = 'reference_id'",
@@ -724,7 +724,7 @@ impl Branch {
             .try_get_by_index(0)
             .map_err(|error| BranchStoreError::Query(error.to_string()))?;
         let deleted = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "DELETE FROM reference WHERE id = ? AND kind = 'Branch' AND `commit` = ?",
                 [reference_id.clone().into(), base_tip.into()],
@@ -739,7 +739,7 @@ impl Branch {
             JournaledBranchFate::KeptOrGone
         };
         let cleared = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
                 [provenance_key.into()],
@@ -755,6 +755,27 @@ impl Branch {
         Ok(fate)
     }
 
+    /// Whether a journaled creation's provenance row EXISTS — the read-only
+    /// probe recovery runs before touching anything (W2 r8 #1): no row means
+    /// the create never committed, and recovery must then leave HEAD alone
+    /// too (the branch the user might be standing on is not ours).
+    pub async fn journaled_provenance_exists(
+        provenance_key: &str,
+    ) -> Result<bool, BranchStoreError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let db_conn = get_db_conn_instance().await;
+        let row = db_conn
+            .query_one_raw(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT 1 FROM metadata_kv WHERE scope = 'stash_branch_journal' \
+                 AND target = ? AND key = 'reference_id'",
+                [provenance_key.into()],
+            ))
+            .await
+            .map_err(|error| BranchStoreError::Query(error.to_string()))?;
+        Ok(row.is_some())
+    }
+
     /// Remove a journaled creation's provenance row WITHOUT touching the
     /// branch — the success path's conclusion (the branch is the user's).
     pub async fn clear_journaled_branch_provenance(
@@ -763,7 +784,7 @@ impl Branch {
         use sea_orm::{ConnectionTrait, Statement};
         let db_conn = get_db_conn_instance().await;
         db_conn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Sqlite,
                 "DELETE FROM metadata_kv WHERE scope = 'stash_branch_journal' AND target = ?",
                 [provenance_key.into()],

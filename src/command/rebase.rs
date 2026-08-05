@@ -397,7 +397,7 @@ impl RebaseState {
             [Self::scope_key().into()],
         );
         let row = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to query rebase_state: {e}"))?;
         Ok(row.is_some())
@@ -433,7 +433,7 @@ impl RebaseState {
             [scope_key.into()],
         );
         let row = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to load rebase_state: {e}"))?;
         let Some(row) = row else {
@@ -515,7 +515,7 @@ impl RebaseState {
             "DELETE FROM rebase_state WHERE worktree_id = ?;",
             [Self::scope_key().into()],
         );
-        db.execute(delete_stmt)
+        db.execute_raw(delete_stmt)
             .await
             .map_err(|e| format!("failed to clear existing rebase_state: {e}"))?;
         Self::insert_with_conn(db, state).await
@@ -569,7 +569,7 @@ impl RebaseState {
             ],
         );
 
-        db.execute(insert_stmt)
+        db.execute_raw(insert_stmt)
             .await
             .map_err(|e| format!("failed to save rebase_state: {e}"))?;
         Ok(())
@@ -582,7 +582,7 @@ impl RebaseState {
             "DELETE FROM rebase_state WHERE worktree_id = ?;",
             [Self::scope_key().into()],
         );
-        db.execute(stmt)
+        db.execute_raw(stmt)
             .await
             .map_err(|e| format!("failed to clear rebase_state: {e}"))?;
         Ok(())

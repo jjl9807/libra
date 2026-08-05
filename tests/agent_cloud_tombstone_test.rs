@@ -72,7 +72,7 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
 /// Pin the local repo id so the local repo and the D1 mirror row share it — a
 /// future erase keyed by `repo_id` would then target this exact D1 row.
 async fn set_repo_id(conn: &DatabaseConnection, repo_id: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', ?, 0)",
         vec![Value::from(repo_id)],
@@ -82,7 +82,7 @@ async fn set_repo_id(conn: &DatabaseConnection, repo_id: &str) {
 }
 
 async fn seed_local_session(conn: &DatabaseConnection, session_id: &str) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
@@ -103,7 +103,7 @@ async fn seed_local_checkpoint(
     session: &str,
     created_at: i64,
 ) {
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_checkpoint (
             checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -125,7 +125,7 @@ async fn seed_local_checkpoint(
 
 async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))
@@ -305,7 +305,7 @@ async fn cloud_tombstone_propagates_for_agent_capture() {
     // PD-03: publish the local session tombstone exactly as `cloud sync`
     // does — fenced UPSERT + cascade delete of the erased session's rows.
     let tombstone_row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT agent_kind, provider_session_id, erased_session_id,
                     source_fingerprint, erased_at

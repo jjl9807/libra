@@ -2964,7 +2964,7 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         ),
     ];
     for (table, sql, columns, mode) in sources {
-        match db.query_all(stmt_of(sql)).await {
+        match db.query_all_raw(stmt_of(sql)).await {
             Ok(rows) => {
                 for row in rows {
                     for (idx, column) in columns.iter().enumerate() {
@@ -3038,7 +3038,7 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         walk_json_value_oids(value, storage, boundaries, reachable)?;
     }
     match db
-        .query_all(stmt_of(
+        .query_all_raw(stmt_of(
             "SELECT scope, value FROM metadata_kv WHERE scope <> 'agent_traces_inflight'",
         ))
         .await
@@ -3439,7 +3439,7 @@ async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
     // ── sequence_state: head_orig / current_oid / todo (newline list) /
     //    payload (lenient JSON scan) ─────────────────────────────────────────
     match db
-        .query_all(stmt_of(
+        .query_all_raw(stmt_of(
             "SELECT worktree_id, head_orig, current_oid, todo, payload FROM sequence_state",
         ))
         .await
@@ -3487,7 +3487,7 @@ async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
     // ── rebase_state: onto / orig_head / current_head / stopped_sha +
     //    todo / done (newline lists) ─────────────────────────────────────────
     match db
-        .query_all(stmt_of(
+        .query_all_raw(stmt_of(
             "SELECT worktree_id, onto, orig_head, current_head, todo, done, stopped_sha \
              FROM rebase_state",
         ))
@@ -3536,7 +3536,7 @@ async fn collect_sequencer_state_roots<C: sea_orm::ConnectionTrait>(
 
     // ── bisect_state: orig_head / bad / current + good / skipped (JSON) ─────
     match db
-        .query_all(stmt_of(
+        .query_all_raw(stmt_of(
             "SELECT orig_head, bad, good, current, skipped FROM bisect_state",
         ))
         .await

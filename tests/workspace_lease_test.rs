@@ -50,7 +50,7 @@ async fn open_db_with_repo_id(repo_id: &str) -> TestDb {
     let path = dir.path().join("libra.db");
     std::fs::File::create(&path).expect("touch sqlite file");
     let conn = connect(&path).await;
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', ?, 0)",
         [repo_id.into()],
@@ -101,7 +101,7 @@ impl Drop for FailpointGuard {
 
 async fn live_row_count(conn: &DatabaseConnection) -> i64 {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM workspace_record WHERE state IN ('provisioning', 'active', \
              'releasing')"
@@ -386,7 +386,7 @@ async fn write_and_read_paths_resolve_the_same_repository_identity() {
 
     // A rewritten identity: the newest row wins for reads AND writes.
     db.conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', \
              'repo-rewritten', 0)"
@@ -415,7 +415,7 @@ async fn write_and_read_paths_resolve_the_same_repository_identity() {
     // A blank newest value means "no identity" on BOTH paths — the write must
     // not silently fall back to the older, superseded row.
     db.conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', '   ', 0)"
                 .to_string(),
@@ -502,7 +502,7 @@ async fn identity_rewrite_with_live_workspaces_fails_closed() {
     .expect("acquire under the original identity");
 
     db.conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', 'repo-new', 0)"
                 .to_string(),
@@ -626,7 +626,7 @@ async fn reclaim_refuses_after_the_identity_changes_underneath_it() {
         .expect("identity resolved by the doctor before the rewrite");
 
     db.conn
-        .execute(Statement::from_string(
+        .execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', 'repo-new', 0)"
                 .to_string(),
@@ -1846,7 +1846,7 @@ async fn workspace_listing_hits_repo_paging_index() {
 
     let rows = db
         .conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "EXPLAIN QUERY PLAN \
              SELECT workspace_id, repo_id, kind, worktree_id, path, owner_kind, owner_id, \
@@ -1888,7 +1888,7 @@ async fn workspace_record_stores_only_association_ids() {
     let db = open_db().await;
     let rows = db
         .conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT name FROM pragma_table_info('workspace_record') ORDER BY cid".to_string(),
         ))

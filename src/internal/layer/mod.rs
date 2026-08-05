@@ -72,7 +72,7 @@ impl LayerStore {
             [scope.storage_key().into()],
         );
         let rows = db
-            .query_all(stmt)
+            .query_all_raw(stmt)
             .await
             .map_err(|e| format!("failed to list layers: {e}"))?;
         let mut layers = Vec::with_capacity(rows.len());
@@ -97,7 +97,7 @@ impl LayerStore {
         enabled: bool,
     ) -> Result<(), String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO layer (worktree_id, name, source, priority, enabled) \
              VALUES (?, ?, ?, ?, ?)",
@@ -136,7 +136,7 @@ impl LayerStore {
     ) -> Result<bool, String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
         let result = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE layer SET enabled = ?, updated_at = CURRENT_TIMESTAMP \
                  WHERE worktree_id = ? AND name = ?",
@@ -156,7 +156,7 @@ impl LayerStore {
     pub async fn remove(scope: &WorktreeScope, name: &str) -> Result<bool, String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM layer_path WHERE worktree_id = ? AND layer_name = ?",
             [scope.storage_key().into(), name.into()],
@@ -164,7 +164,7 @@ impl LayerStore {
         .await
         .map_err(|e| format!("failed to clear layer paths: {e}"))?;
         let result = txn
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "DELETE FROM layer WHERE worktree_id = ? AND name = ?",
                 [scope.storage_key().into(), name.into()],
@@ -188,7 +188,7 @@ impl LayerStore {
             "SELECT layer_name, path, content_hash FROM layer_path WHERE worktree_id = ?",
             [scope.storage_key().into()],
         );
-        let rows = match db.query_all(stmt).await {
+        let rows = match db.query_all_raw(stmt).await {
             Ok(rows) => rows,
             // Absence-tolerant: before the migration created the table (or on
             // an old binary), there are simply no materialized paths.
@@ -236,7 +236,7 @@ impl LayerStore {
         // protected", so every error — including the missing table — is
         // propagated and `clean` refuses.
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "SELECT path FROM layer_path WHERE worktree_id = ?",
                 [scope.storage_key().into()],
@@ -470,7 +470,7 @@ impl LayerStore {
     ) -> Result<(), String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM layer_path WHERE worktree_id = ?",
             [scope.storage_key().into()],
@@ -478,7 +478,7 @@ impl LayerStore {
         .await
         .map_err(|e| format!("failed to clear layer paths: {e}"))?;
         for record in records {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO layer_path (worktree_id, layer_name, path, content_hash) \
                  VALUES (?, ?, ?, ?)",

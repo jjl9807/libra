@@ -851,7 +851,7 @@ impl<R: BufRead> Importer<R> {
 
                     let mut note_refs = pending_note_replacements.clone();
                     for notes_ref in &pending_note_replacements {
-                        txn.execute(Statement::from_sql_and_values(
+                        txn.execute_raw(Statement::from_sql_and_values(
                             sea_orm::DatabaseBackend::Sqlite,
                             "DELETE FROM notes WHERE notes_ref = ?",
                             [notes_ref.clone().into()],
@@ -862,7 +862,7 @@ impl<R: BufRead> Importer<R> {
                         note_refs.insert(notes_ref.clone());
                         match blob {
                             Some(blob) => {
-                                txn.execute(Statement::from_sql_and_values(
+                                txn.execute_raw(Statement::from_sql_and_values(
                                     sea_orm::DatabaseBackend::Sqlite,
                                     "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?) \
                                      ON CONFLICT(notes_ref, object) DO UPDATE SET blob = excluded.blob",
@@ -875,7 +875,7 @@ impl<R: BufRead> Importer<R> {
                                 .await?;
                             }
                             None => {
-                                txn.execute(Statement::from_sql_and_values(
+                                txn.execute_raw(Statement::from_sql_and_values(
                                     sea_orm::DatabaseBackend::Sqlite,
                                     "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
                                     [notes_ref.clone().into(), object.clone().into()],

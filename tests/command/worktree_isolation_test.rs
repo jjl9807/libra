@@ -618,8 +618,13 @@ fn merge_mode_pull_is_refused_while_a_merge_is_in_progress() {
         "a merge-mode pull must be refused mid-merge: {text}"
     );
     assert!(
-        text.contains("merge"),
-        "the refusal names the in-progress operation, not a network error: {text}"
+        text.contains("in progress"),
+        "the refusal names the in-progress merge: {text}"
+    );
+    assert!(
+        !text.contains("tracking"),
+        "the merge preflight fires BEFORE target resolution — a tracking-info \
+         error here means the pull got past it: {text}"
     );
     assert!(
         !text.contains("network"),
@@ -4145,7 +4150,7 @@ fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
         let db = libra::internal::db::get_db_conn_instance().await;
         for table in ["working_dirty", "working_dirty_meta"] {
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
                 ))
@@ -4179,7 +4184,7 @@ fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
         let db = libra::internal::db::get_db_conn_instance().await;
         for table in ["working_dirty", "working_dirty_meta"] {
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
                 ))
@@ -4494,7 +4499,7 @@ fn worktree_add_sweeps_stale_scope_rows() {
                      VALUES ('{stale_id}', 'stale-ov', 'stale.txt', 'h0');"
                 ),
             ] {
-                db.execute(Statement::from_string(db.get_database_backend(), sql))
+                db.execute_raw(Statement::from_string(db.get_database_backend(), sql))
                     .await
                     .expect("plant stale row");
             }
@@ -4562,7 +4567,7 @@ fn worktree_remove_purges_layer_scope_rows() {
             use sea_orm::{ConnectionTrait, Statement};
             let db = libra::internal::db::get_db_conn_instance().await;
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
                 ))
@@ -4734,7 +4739,7 @@ fn registry_v1_file_upgrades_to_v2_with_backfilled_ids() {
     // The first MUTATING command (here: no-arg repair, which loads under the
     // registry lock) performs the durable upgrade.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair drives the durable upgrade",
     );
 
@@ -4844,7 +4849,10 @@ fn corrupt_linked_identity_refuses_mutations_and_points_at_repair() {
     // own remedy leaves the worktree permanently stuck, so `worktree` stays
     // classified as repository scope (it manages the registry, not this
     // worktree's HEAD/index).
-    let repair = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    let repair = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         repair.status.success(),
         "the repair route named in the error must run: {}",
@@ -4887,7 +4895,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
     std::fs::remove_file(gitdir.join("commondir")).expect("drop commondir");
 
     let repaired = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&repaired, "worktree repair <path>");
@@ -4927,7 +4941,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
 
     // Idempotent second run: nothing left to restore.
     let second = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&second, "second repair run");
@@ -4939,7 +4959,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
     // fails closed on — is restored too, not just a missing file.
     std::fs::write(gitdir.join("commondir"), "").expect("corrupt commondir");
     let third = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&third, "repair of a corrupt commondir");
@@ -4953,7 +4979,13 @@ fn worktree_repair_path_restores_identity_from_registry() {
     // foreign against the caller's cwd.
     std::fs::write(gitdir.join("commondir"), "../../.libra\n").expect("relative commondir");
     let relative = run_libra_command(
-        &["worktree", "repair", wt.to_str().unwrap(), "--json"],
+        &[
+            "worktree",
+            "repair",
+            wt.to_str().unwrap(),
+            "--json",
+            "--confirm",
+        ],
         main,
     );
     assert_cli_success(&relative, "repair with a valid relative commondir");
@@ -4970,7 +5002,10 @@ fn worktree_repair_path_restores_identity_from_registry() {
     let foreign_pointer = format!("{}\n", other.path().display());
     std::fs::write(gitdir.join("commondir"), &foreign_pointer).expect("foreign commondir");
     std::fs::write(gitdir.join("worktree_id"), "stale-or-corrupt\n").expect("stale id");
-    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    let refused = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         !refused.status.success(),
         "repair must refuse to re-home a worktree pointing at another storage"
@@ -4994,7 +5029,10 @@ fn worktree_repair_path_refuses_main_and_unregistered() {
     let dir = repo_with_feature();
     let main = dir.path();
 
-    let main_refused = run_libra_command(&["worktree", "repair", main.to_str().unwrap()], main);
+    let main_refused = run_libra_command(
+        &["worktree", "repair", main.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         !main_refused.status.success(),
         "repair <main> must be refused"
@@ -5002,7 +5040,15 @@ fn worktree_repair_path_refuses_main_and_unregistered() {
 
     let stranger = main.join("never-registered");
     std::fs::create_dir_all(&stranger).expect("mkdir");
-    let unregistered = run_libra_command(&["worktree", "repair", stranger.to_str().unwrap()], main);
+    let unregistered = run_libra_command(
+        &[
+            "worktree",
+            "repair",
+            stranger.to_str().unwrap(),
+            "--confirm",
+        ],
+        main,
+    );
     assert!(
         !unregistered.status.success(),
         "repair on an unregistered path must be refused"
@@ -5041,8 +5087,8 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         assert_eq!(
             rolled,
             vec![
-                2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-                2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+                2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+                2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
             ]
         );
         conn.close().await.expect("close");
@@ -5056,7 +5102,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
     let conn = Database::connect(&db_url).await.expect("reconnect repo db");
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
              AND name = 'worktree_registry_capability'"
@@ -5127,7 +5173,7 @@ fn v2_identity_invariant_violations_refuse_until_explicit_repair() {
     );
 
     // The explicit no-arg repair heals deterministically (gitdir backfill).
-    let repaired = run_libra_command(&["--json", "worktree", "repair"], main);
+    let repaired = run_libra_command(&["--json", "worktree", "repair", "--confirm"], main);
     assert_cli_success(&repaired, "no-arg repair heals the invariants");
     let payload = parse_json_stdout(&repaired);
     assert_eq!(
@@ -5178,8 +5224,8 @@ fn zero_byte_registry_fails_closed_everywhere() {
     for argv in [
         vec!["worktree", "list"],
         vec!["worktree", "lock", wt.to_str().unwrap(), "--reason", "x"],
-        vec!["worktree", "repair"],
-        vec!["worktree", "repair", wt.to_str().unwrap()],
+        vec!["worktree", "repair", "--confirm"],
+        vec!["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
     ] {
         let out = run_libra_command(&argv, main);
         assert!(
@@ -5234,7 +5280,10 @@ fn worktree_repair_path_refuses_v1_registry_until_upgrade() {
     )
     .expect("write v1 registry");
 
-    let refused = run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main);
+    let refused = run_libra_command(
+        &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+        main,
+    );
     assert!(
         !refused.status.success(),
         "path repair must refuse a v1 registry"
@@ -5247,11 +5296,14 @@ fn worktree_repair_path_refuses_v1_registry_until_upgrade() {
 
     // The explicit upgrade, then the path form works.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "no-arg repair upgrades the registry",
     );
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main),
+        &run_libra_command(
+            &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+            main,
+        ),
         "path repair works on the upgraded registry",
     );
 }
@@ -5296,7 +5348,7 @@ fn v1_upgrade_never_crowns_a_linked_entry_as_main() {
         )
         .expect("write malformed v1");
         assert_cli_success(
-            &run_libra_command(&["worktree", "repair"], main),
+            &run_libra_command(&["worktree", "repair", "--confirm"], main),
             "upgrade via no-arg repair",
         );
         let upgraded: serde_json::Value =
@@ -5564,7 +5616,7 @@ async fn worktree_remove_delete_crash_repair() {
     );
     let conn = Database::connect(&db_url).await.expect("connect repo db");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
@@ -5578,7 +5630,7 @@ async fn worktree_remove_delete_crash_repair() {
     std::fs::remove_dir_all(&wt).expect("simulate deleted dir");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair completes the interrupted remove",
     );
 
@@ -5601,7 +5653,7 @@ async fn worktree_remove_delete_crash_repair() {
         ),
     ] {
         let row = conn
-            .query_one(Statement::from_string(backend, query))
+            .query_one_raw(Statement::from_string(backend, query))
             .await
             .expect("query")
             .expect("row");
@@ -5714,7 +5766,7 @@ async fn remove_delete_dir_dot_from_inside_worktree() {
         ),
     ] {
         let row = conn
-            .query_one(Statement::from_string(backend, query.to_string()))
+            .query_one_raw(Statement::from_string(backend, query.to_string()))
             .await
             .expect("query")
             .expect("row");
@@ -5755,7 +5807,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
         async move {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!(
                     "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
@@ -5773,7 +5825,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     backend,
                     "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
                 ))
@@ -5795,7 +5847,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
     );
     plant(payload.clone()).await;
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with ambiguous move (present/present)",
     );
     assert_eq!(
@@ -5808,7 +5860,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
     std::fs::remove_dir_all(&dest).expect("drop dest");
     std::fs::remove_dir_all(&wt).expect("drop src");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with ambiguous move (missing/missing)",
     );
     assert_eq!(
@@ -5831,7 +5883,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
     )
     .expect("restore commondir");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair settles the never-started move",
     );
     assert_eq!(
@@ -5894,7 +5946,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     );
     let conn = Database::connect(&db_url).await.expect("connect");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, \
@@ -5905,7 +5957,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     .await
     .expect("mirror row");
     // Stale move journal for X targeting Y's (now-tombstoned) path.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
@@ -5919,7 +5971,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     conn.close().await.expect("close");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a foreign-destination move journal",
     );
 
@@ -5928,7 +5980,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     assert!(!y.exists(), "nothing was renamed onto the tombstoned path");
     let conn = Database::connect(&db_url).await.expect("reconnect");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
         ))
@@ -5975,7 +6027,7 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     );
     let conn = Database::connect(&db_url).await.expect("connect");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
@@ -5988,7 +6040,7 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     conn.close().await.expect("close");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a stale reattach journal",
     );
 
@@ -6019,7 +6071,7 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     // The stale row itself resolved as rolled back.
     let conn = Database::connect(&db_url).await.expect("reconnect");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
         ))
@@ -6073,7 +6125,7 @@ fn worktree_add_branch_collision_has_zero_side_effects() {
     // Materialize the registry (a locked no-op mutator) so the byte
     // comparison below has a baseline.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "initialize registry",
     );
     let registry_before = std::fs::read(&registry).expect("registry before");
@@ -6383,7 +6435,7 @@ async fn interrupted_add_new_branch_crash_repair() {
         async move {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!(
                     "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
@@ -6407,7 +6459,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     let lock_path = main.join(".libra").join("branch-attach.lock");
     std::fs::create_dir_all(&lock_path).expect("block the lock path");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with an unacquirable attach lock",
     );
     let kept = run_libra_command(&["rev-parse", "crash-topic"], main);
@@ -6419,7 +6471,7 @@ async fn interrupted_add_new_branch_crash_repair() {
         let conn = Database::connect(&db_url).await.expect("connect");
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 backend,
                 "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
             ))
@@ -6436,7 +6488,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     // closed — branch and journal both survive.
     let libra = env!("CARGO_BIN_EXE_libra");
     let faulted = std::process::Command::new(libra)
-        .args(["worktree", "repair"])
+        .args(["worktree", "repair", "--confirm"])
         .env("LIBRA_TEST_FAULT", "branch-attach-probe")
         .current_dir(main)
         .output()
@@ -6451,7 +6503,7 @@ async fn interrupted_add_new_branch_crash_repair() {
         let conn = Database::connect(&db_url).await.expect("connect");
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 backend,
                 "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
             ))
@@ -6464,7 +6516,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     }
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair rolls the orphan branch back",
     );
     let gone = run_libra_command(&["rev-parse", "crash-topic"], main);
@@ -6488,7 +6540,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     ))
     .await;
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a moved tip",
     );
     let kept = run_libra_command(&["rev-parse", "crash-topic-2"], main);
@@ -6499,7 +6551,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     let conn = Database::connect(&db_url).await.expect("reconnect");
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
         ))
@@ -6567,7 +6619,7 @@ fn create_legacy_symlink_worktree(main: &std::path::Path, name: &str) -> std::pa
     // Register it (v2 entry with a persisted id, as the v1→v2 upgrade
     // would have backfilled by canonical-path synthesis).
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "materialize registry",
     );
     let registry = main.join(".libra").join("worktrees.json");
@@ -6668,7 +6720,7 @@ fn legacy_symlink_mutation_fails_closed() {
     let registry_before = std::fs::read(&registry).expect("registry bytes");
     for argv in [
         vec!["worktree", "remove", wt.to_str().unwrap()],
-        vec!["worktree", "repair", wt.to_str().unwrap()],
+        vec!["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
     ] {
         let out = run_libra_command(&argv, main);
         assert!(
@@ -6728,7 +6780,10 @@ fn migrate_layout_refuses_active_shared_sidecar_state() {
     )
     .unwrap();
 
-    let out = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    let out = run_libra_command(
+        &["worktree", "repair", "--migrate-layout", "--confirm"],
+        main,
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -6753,7 +6808,10 @@ fn migrate_layout_refuses_active_shared_sidecar_state() {
     // Clearing the state lifts the refusal.
     fs::remove_file(main.join(".libra").join("merge-state.json")).unwrap();
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        &run_libra_command(
+            &["worktree", "repair", "--migrate-layout", "--confirm"],
+            main,
+        ),
         "migration succeeds once the state is gone",
     );
 }
@@ -6827,7 +6885,10 @@ fn legacy_layout_migration_preserves_dirty_and_untracked() {
 
     // Real migration.
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", "--migrate-layout"], main),
+        &run_libra_command(
+            &["worktree", "repair", "--migrate-layout", "--confirm"],
+            main,
+        ),
         "migrate",
     );
     assert!(
@@ -6915,7 +6976,10 @@ fn legacy_layout_unmerged_index_refused_before_rename() {
     let merge = run_libra_command(&["merge", "main"], main);
     assert!(!merge.status.success(), "merge conflicts");
 
-    let refused = run_libra_command(&["worktree", "repair", "--migrate-layout"], main);
+    let refused = run_libra_command(
+        &["worktree", "repair", "--migrate-layout", "--confirm"],
+        main,
+    );
     assert!(
         !refused.status.success(),
         "unmerged shared index refuses migration"
@@ -6952,7 +7016,7 @@ async fn layout_migration_crash_matrix() {
         async move {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!(
                     "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
@@ -6962,7 +7026,7 @@ async fn layout_migration_crash_matrix() {
             .await
             .expect("plant journal");
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     backend,
                     "SELECT MAX(id) FROM worktree_intent_journal".to_string(),
                 ))
@@ -6980,7 +7044,7 @@ async fn layout_migration_crash_matrix() {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     backend,
                     "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
                 ))
@@ -7041,7 +7105,7 @@ async fn layout_migration_crash_matrix() {
     std::fs::create_dir_all(&prepared1).unwrap();
     std::fs::write(prepared1.join("migrate-marker"), format!("journal {id1}\n")).unwrap();
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair window 1",
     );
     assert!(
@@ -7085,7 +7149,7 @@ async fn layout_migration_crash_matrix() {
     )
     .unwrap();
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair window 2",
     );
     let head2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt2).stdout)
@@ -7128,7 +7192,7 @@ async fn layout_migration_crash_matrix() {
     )
     .await;
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair with a stale migrate journal",
     );
     let head3 = String::from_utf8_lossy(
@@ -7150,6 +7214,7 @@ async fn layout_migration_crash_matrix() {
             "worktree",
             "repair",
             "--migrate-layout",
+            "--confirm",
             wt3.to_str().unwrap(),
         ],
         main,
@@ -7180,7 +7245,7 @@ async fn layout_migration_crash_matrix() {
     let frozen = run_libra_command(&["status"], &wt4);
     assert!(!frozen.status.success(), "marker freezes the worktree");
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair"], main),
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
         "repair clears the resolved marker",
     );
     assert!(
@@ -7334,37 +7399,24 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
     std::fs::write(&id_file, "deadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
     let damaged_before = std::fs::read(&id_file).unwrap();
 
-    let out = run_libra_command(&["--json", "worktree", "doctor"], main);
-    assert_cli_success(&out, "worktree doctor --json");
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("doctor emits one JSON envelope");
-    assert_eq!(json["command"], "worktree.doctor");
-    let data = &json["data"];
-    assert_eq!(data["schema_version"], 1);
-    assert!(data["next_cursor"].is_null(), "W0 emits a single page");
-    // The bare invocation carries BOTH halves of the diagnosis: `worktrees[]`
-    // is the worktree-scope half (§C.11 W0, this test), `diagnostics[]` the
-    // Agent-workspace half (W4).
-    let diagnostics = data["worktrees"]
-        .as_array()
-        .expect("the worktree-scope section is an array");
-    assert_eq!(diagnostics.len(), 2, "main + the linked worktree");
-
-    let damaged = diagnostics
-        .iter()
-        .find(|d| d["is_main"] == false)
-        .expect("the linked worktree is reported");
-    assert_eq!(
-        damaged["identity_registered"], false,
-        "the unknown identity is reported: {damaged}"
+    // W4 freezes the JSON response to workspace diagnostics only; adding the
+    // legacy W0 worktree report there would both change that public schema and
+    // make a capped page scan every worktree. The human doctor retains the
+    // W0 layout/identity diagnosis.
+    let out = run_libra_command(&["worktree", "doctor"], main);
+    assert_cli_success(&out, "worktree doctor");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(wt.to_str().expect("worktree path")),
+        "the linked worktree is reported: {text}"
     );
     assert!(
-        damaged["findings"]
-            .as_array()
-            .expect("findings")
-            .iter()
-            .any(|f| f.as_str().is_some_and(|s| s.contains("worktree repair"))),
-        "and the report names the repair route: {damaged}"
+        text.contains("identity is not one the registry knows"),
+        "the unknown identity is reported: {text}"
+    );
+    assert!(
+        text.contains("worktree repair --confirm"),
+        "the report names the executable repair route: {text}"
     );
 
     // Reporting is not repairing.
@@ -7394,26 +7446,35 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
 /// test would compare an untouched database against itself. The assertion
 /// below pins that, so adding a migration fails here loudly instead of
 /// quietly hollowing the test out.
-#[test]
-fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
+#[tokio::test]
+async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
+    use libra::internal::db::migration::builtin_runner;
+    use sea_orm::Database;
+
     let dir = repo_with_feature();
     let main = dir.path();
     let db = main.join(".libra").join("libra.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db.display());
 
-    assert!(
-        sqlite_exec(
-            &db,
-            &[
-                "DELETE FROM metadata_kv WHERE scope = 'repository' AND target = '' \
-                 AND key = 'stash.reflog.generation'",
-                "DELETE FROM schema_versions WHERE version = 2026073101",
-            ],
-        ),
-        "put the repository one migration behind"
+    // Use the real down migration rather than deleting its ledger row. W4's
+    // schema adds physical columns/triggers, so merely removing the version
+    // would turn the next ordinary migration run into a duplicate-column
+    // failure instead of representing a repository that is genuinely behind.
+    let conn = Database::connect(&db_url)
+        .await
+        .expect("open repository db");
+    assert_eq!(
+        builtin_runner()
+            .expect("builtin runner")
+            .rollback_to(&conn, 2026073101)
+            .await
+            .expect("roll back newest migration"),
+        vec![2026080401]
     );
+    conn.close().await.expect("close repository db");
     assert!(
-        sqlite_max_schema_version(&db) < 2026073101,
-        "2026073101 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026080401,
+        "2026080401 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

@@ -153,7 +153,7 @@ async fn load_stored_with_conn<C: ConnectionTrait>(
          FROM sequence_state WHERE worktree_id = ?",
         [scope_key.into()],
     );
-    let row = match db.query_one(stmt).await {
+    let row = match db.query_one_raw(stmt).await {
         Ok(row) => row,
         // Absence-tolerant (the facade must resolve, not error, before the
         // migration has created the table or on an old binary); real DB
@@ -296,7 +296,7 @@ async fn claim_fields(
     let scope_key = current_scope_key();
     let todo = todo.join("\n");
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO sequence_state \
              (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
@@ -457,7 +457,7 @@ async fn scoped_bisect_position() -> Option<String> {
     };
     let scope_key = current_scope_key();
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT current FROM bisect_state WHERE worktree_id = ? LIMIT 1",
             [scope_key.into()],
@@ -490,7 +490,7 @@ async fn control_repo_id() -> Result<String, String> {
 
     let db = request_db_checked().await?;
     let row = db
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "SELECT `value` FROM `config_kv` WHERE `key` = 'libra.repoid' \
              ORDER BY `id` DESC LIMIT 1",
@@ -629,14 +629,14 @@ where
     // `DELETE FROM sequence_state` would wipe every other worktree's
     // in-progress sequence.
     let scope_key = current_scope_key();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE worktree_id = ?",
         [scope_key.clone().into()],
     ))
     .await?;
     let todo = todo.join("\n");
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO sequence_state \
          (worktree_id, kind, head_name, head_orig, current_oid, todo, payload) \
@@ -713,7 +713,7 @@ where
 {
     // Part C W1 (§C.4.2): scoped by worktree AND kind — a mis-routed abort can
     // erase neither a different consumer's row nor another worktree's sequence.
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
         [kind.as_str().into(), current_scope_key().into()],
@@ -735,7 +735,7 @@ where
 {
     // Part C W1 (§C.4.2): scoped like `clear_with_conn` — clearing this
     // worktree's `am` sequence must not touch another worktree's.
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE kind = ? AND worktree_id = ?",
         ["am".into(), current_scope_key().into()],
@@ -877,7 +877,7 @@ async fn unified_active_in_scope<C: ConnectionTrait>(
 /// any other DB error propagates (fail-closed). Never mutates.
 async fn legacy_table_active<C: ConnectionTrait>(db: &C, table: &str) -> Result<bool, String> {
     let stmt = Statement::from_string(DbBackend::Sqlite, format!("SELECT 1 FROM {table} LIMIT 1"));
-    match db.query_one(stmt).await {
+    match db.query_one_raw(stmt).await {
         Ok(Some(_)) => Ok(true),
         Ok(None) => Ok(false),
         Err(err) if is_missing_table(&err) => Ok(false),
@@ -1060,7 +1060,7 @@ async fn scoped_bisect_state_active<C: ConnectionTrait>(
         "SELECT 1 FROM bisect_state WHERE worktree_id = ? LIMIT 1",
         [scope_key.into()],
     );
-    match db.query_one(stmt).await {
+    match db.query_one_raw(stmt).await {
         Ok(row) => Ok(row.is_some()),
         Err(err) if is_missing_table(&err) => Ok(false),
         Err(err) => Err(format!("failed to probe bisect_state: {err}")),
@@ -1123,7 +1123,7 @@ async fn scoped_rebase_state_active<C: ConnectionTrait>(
         "SELECT 1 FROM rebase_state WHERE worktree_id = ? LIMIT 1",
         [scope_key.into()],
     );
-    match db.query_one(stmt).await {
+    match db.query_one_raw(stmt).await {
         Ok(row) => Ok(row.is_some()),
         Err(err) if is_missing_table(&err) => Ok(false),
         Err(err) => Err(format!("failed to probe rebase_state: {err}")),

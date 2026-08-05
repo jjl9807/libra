@@ -64,7 +64,7 @@ async fn create_operation_schema(db: &DatabaseConnection) {
         "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
     ];
     for sql in ddl {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .unwrap();
     }
@@ -83,7 +83,7 @@ async fn create_operation_schema_missing_view(db: &DatabaseConnection) {
         "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
     ];
     for sql in ddl {
-        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .unwrap();
     }
@@ -91,20 +91,20 @@ async fn create_operation_schema_missing_view(db: &DatabaseConnection) {
 
 /// Create the reference table with both HEAD and main branch rows.
 async fn create_reference_table_with_head(db: &DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Head', NULL, NULL)"
             .to_string(),
     ))
     .await
     .unwrap();
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "INSERT INTO reference(name, kind, \"commit\", remote) VALUES('main', 'Branch', '1111111111111111111111111111111111111111', NULL)".to_string(),
     ))
@@ -114,7 +114,7 @@ async fn create_reference_table_with_head(db: &DatabaseConnection) {
 
 /// Create the reference table without a HEAD row to force snapshot failure.
 async fn create_reference_table_without_head(db: &DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)".to_string(),
     ))
@@ -124,7 +124,7 @@ async fn create_reference_table_without_head(db: &DatabaseConnection) {
 
 /// Create a probe table used to assert rollback behavior.
 async fn create_tx_probe_table(db: &DatabaseConnection) {
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         "CREATE TABLE tx_probe (id INTEGER PRIMARY KEY)".to_string(),
     ))
@@ -308,7 +308,7 @@ async fn business_failure_rolls_back_all_writes() {
 
     let error = with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |txn| {
         Box::pin(async move {
-            txn.execute(Statement::from_string(
+            txn.execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "INSERT INTO tx_probe(id) VALUES(1)".to_string(),
             ))
@@ -322,7 +322,7 @@ async fn business_failure_rolls_back_all_writes() {
     assert!(matches!(error, OperationError::Business(_)));
 
     let tx_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM tx_probe".to_string(),
         ))
@@ -332,7 +332,7 @@ async fn business_failure_rolls_back_all_writes() {
         .try_get_by_index::<i64>(0)
         .unwrap_or_default();
     let op_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM operation".to_string(),
         ))
@@ -355,7 +355,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
 
     let error = with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |txn| {
         Box::pin(async move {
-            txn.execute(Statement::from_string(
+            txn.execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "INSERT INTO tx_probe(id) VALUES(3)".to_string(),
             ))
@@ -369,7 +369,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
     assert!(matches!(error, OperationError::Snapshot(_)));
 
     let tx_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM tx_probe WHERE id = 3".to_string(),
         ))
@@ -379,7 +379,7 @@ async fn snapshot_failure_rolls_back_and_persists_nothing() {
         .try_get_by_index::<i64>(0)
         .unwrap_or_default();
     let op_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM operation".to_string(),
         ))
@@ -402,7 +402,7 @@ async fn persist_failure_rolls_back_business_writes() {
 
     let error = with_operation_log_with_conn(&db, valid_meta(), OperationScope::default(), |txn| {
         Box::pin(async move {
-            txn.execute(Statement::from_string(
+            txn.execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "INSERT INTO tx_probe(id) VALUES(2)".to_string(),
             ))
@@ -419,7 +419,7 @@ async fn persist_failure_rolls_back_business_writes() {
     ));
 
     let tx_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM tx_probe WHERE id = 2".to_string(),
         ))
@@ -429,7 +429,7 @@ async fn persist_failure_rolls_back_business_writes() {
         .try_get_by_index::<i64>(0)
         .unwrap_or_default();
     let op_count = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT COUNT(*) FROM operation".to_string(),
         ))
@@ -623,7 +623,7 @@ async fn cross_scope_interference_cannot_hide_a_duplicate() {
     // Fifty NEWER operations in other worktrees — more than the old page.
     let now = chrono::Utc::now().timestamp();
     for i in 0..50 {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
              args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
@@ -664,7 +664,7 @@ async fn the_same_action_in_another_worktree_is_not_a_duplicate() {
 
     // A success recorded by ANOTHER worktree, one second ago.
     let now = chrono::Utc::now().timestamp();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
@@ -717,7 +717,7 @@ async fn op_restore_dedup_key_is_scope_aware() {
 
     // Another worktree restored this very operation one second ago.
     let now = chrono::Utc::now().timestamp();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
@@ -769,7 +769,7 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
 
     // A pre-canonicalization row: same scope, same command, PADDED digest.
     let now = chrono::Utc::now().timestamp();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         db.get_database_backend(),
         "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
          args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
@@ -783,7 +783,7 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
     // Rows padded with a TAB and a NEWLINE, and one that is whitespace only —
     // SQLite's one-argument TRIM would leave all three untouched.
     for (op_id, digest) in [("op-tab", "\tsha256:legacy-tab\n"), ("op-ws", "   ")] {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             "INSERT INTO operation (op_id, repo_id, view_id, command_name, description, actor, \
              args_digest, start_ts, end_ts, status, worktree_id, scope_provenance) \
@@ -803,7 +803,7 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
 
     // Run the SHIPPED migration SQL, not a hand-written approximation: the
     // point is that THAT predicate and THAT trim set canonicalize these rows.
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         db.get_database_backend(),
         include_str!("../sql/migrations/2026073001_operation_args_digest_canonical.sql")
             .to_string(),
@@ -814,7 +814,7 @@ async fn a_legacy_padded_digest_row_still_blocks_a_duplicate() {
     // Whitespace-only becomes NULL (no digest), and the tab/newline row is
     // trimmed to its token.
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             db.get_database_backend(),
             "SELECT op_id, args_digest FROM operation WHERE op_id IN ('op-tab', 'op-ws') \
              ORDER BY op_id"

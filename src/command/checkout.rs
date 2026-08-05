@@ -87,9 +87,11 @@ pub struct CheckoutArgs {
     track: bool,
 
     /// Check out a branch even if it is already checked out in another worktree.
-    /// Accepted for Git parity and is a no-op: Libra worktrees share a single
-    /// `HEAD`/refs store, so a branch is never locked to one worktree and there
-    /// is no other-worktree restriction to override.
+    /// Accepted for Git parity, but NOT honored against a real collision: each
+    /// worktree owns its HEAD, and one branch may be checked out by at most one
+    /// live worktree (ADR-0714-09), so checking out a branch held by another
+    /// worktree is refused with or without this flag. It is a silent no-op in a
+    /// single-worktree repository.
     #[clap(long = "ignore-other-worktrees")]
     ignore_other_worktrees: bool,
 

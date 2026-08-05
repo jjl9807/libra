@@ -11,6 +11,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use sea_orm::{ConnectionTrait, Statement};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -52,13 +53,14 @@ EXAMPLES:
     libra worktree remove ../feature-x --delete-dir
                                                    Unregister and delete the directory
                                                    (refused on a dirty worktree)
-    libra worktree repair                          Fix stale or duplicate registry rows
-    libra worktree repair ../feature-x             Restore that worktree's gitdir identity
+    libra worktree repair --confirm                Fix stale or duplicate registry rows
+    libra worktree repair --confirm ../feature-x   Restore that worktree's gitdir identity
                                                    from the registry (registry v2)
-    libra worktree repair --migrate-layout         Migrate every legacy shared-.libra
+    libra worktree repair --migrate-layout --confirm
+                                                   Migrate every legacy shared-.libra
                                                    symlink worktree to the isolated layout
     libra worktree repair --migrate-layout --dry-run
-                                                   Report what would be migrated
+                                                   Report what would be migrated (read-only)
     libra worktree doctor                          Read-only diagnosis of every Agent
                                                    workspace scope (paginated)
     libra --json worktree doctor --limit 20        One machine-readable page
@@ -111,15 +113,6 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         porcelain: bool,
     },
-    /// Report per-worktree scope diagnostics. STRICTLY READ-ONLY.
-    ///
-    /// plan-20260714 Part C W0 (§C.11): this is the read-only diagnostic
-    /// skeleton. It never writes: no registry rewrite, no DB row, no lease
-    /// change, no filesystem mutation. Repair actions (legacy adopt/clear,
-    /// lease reclaim, provenance repair) arrive as EXPLICIT subcommands in
-    /// later waves, each requiring confirmation and emitting an audit event
-    /// — which is why no hint anywhere may promise that a bare `doctor` will
-    /// fix something (Codex R19/R20).
     /// Mark a worktree as locked to prevent it from being pruned or removed.
     Lock {
         /// Filesystem path of the worktree to lock.
@@ -163,12 +156,15 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         cleanup: bool,
     },
-    /// Diagnose Agent workspace scopes (READ-ONLY: reports, never repairs).
+    /// Diagnose Agent workspace scopes.
     ///
     /// Without an id this is a keyset-paginated view over every workspace
     /// record that still has something to say — including records left behind
     /// by a previous repository identity, which the identity-scoped listings
     /// hide. With an id it is the single-scope view of that one workspace.
+    /// The default invocation is strictly read-only; the only repair action
+    /// currently available is explicit legacy capture adoption, which also
+    /// requires `--confirm` and writes an audit event.
     Doctor {
         /// Diagnose exactly one workspace (ids come from `worktree doctor`
         /// or `libra agent workspace list`). Cannot be combined with
@@ -181,6 +177,19 @@ pub enum WorktreeSubcommand {
         /// Keyset cursor: the `next_cursor` of the previous page, verbatim.
         #[clap(long, value_name = "CURSOR")]
         cursor: Option<String>,
+        /// Explicitly attribute one legacy unscoped capture session to this
+        /// workspace. Requires a workspace id and --confirm; the default
+        /// doctor command remains strictly read-only.
+        #[clap(
+            long,
+            value_name = "SESSION_ID",
+            requires = "workspace_id",
+            conflicts_with_all = ["limit", "cursor"]
+        )]
+        adopt_capture_session: Option<String>,
+        /// Confirm a legacy capture-scope adoption.
+        #[clap(long, requires = "adopt_capture_session")]
+        confirm: bool,
     },
     /// Repair worktree metadata, attempting to recover from inconsistencies.
     /// With a path, restores that linked worktree's gitdir identity
@@ -199,6 +208,15 @@ pub enum WorktreeSubcommand {
         /// nothing.
         #[clap(long, requires = "migrate_layout")]
         dry_run: bool,
+        /// Confirm a MUTATING repair action (W0 §C.11, Codex R16/R17).
+        /// Required for the no-arg registry repair, `repair <path>`, and a
+        /// non-dry-run `--migrate-layout`: without it the command refuses
+        /// before any registry lock, database write, or filesystem touch
+        /// (zero side effects), and with it the action records exactly one
+        /// operation-log audit event (see `libra op log`). The read-only
+        /// `--migrate-layout --dry-run` never needs it.
+        #[clap(long)]
+        confirm: bool,
         /// Resolve an AMBIGUOUS registry by unregistering the entry at
         /// `<path>` (W1 §C.7).
         ///
@@ -1013,7 +1031,13 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     // read-only diagnostic, and applying migrations is a write — the one
     // command you want available on a repository you have not yet decided to
     // upgrade must not upgrade it as a side effect.
-    let applies_migrations = !matches!(&command, WorktreeSubcommand::Doctor { .. });
+    let applies_migrations = !matches!(
+        &command,
+        WorktreeSubcommand::Doctor {
+            adopt_capture_session: None,
+            ..
+        }
+    );
 
     if needs_repo {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
@@ -1090,11 +1114,25 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             workspace_id,
             limit,
             cursor,
-        } => run_worktree_doctor(workspace_id, limit, cursor, output).await,
+            adopt_capture_session,
+            confirm,
+        } => {
+            if let Some(session_id) = adopt_capture_session {
+                let workspace_id = workspace_id.ok_or_else(|| {
+                    CliError::command_usage(
+                        "--adopt-capture-session requires the target WORKSPACE_ID",
+                    )
+                })?;
+                adopt_legacy_capture_scope(&workspace_id, &session_id, confirm, output).await
+            } else {
+                run_worktree_doctor(workspace_id, limit, cursor, output).await
+            }
+        }
         WorktreeSubcommand::Repair {
             path,
             migrate_layout,
             dry_run,
+            confirm,
             resolve_identity,
             yes,
         } => {
@@ -1122,23 +1160,146 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 }
                 return Ok(());
             }
+            // W0 (§C.11, Codex R16/R17): each mutating repair action is gated
+            // on `--confirm` (the refusal precedes EVERY side effect) and,
+            // once confirmed, runs inside one operation-log audit boundary —
+            // exactly one row per executed action, closed with the action's
+            // outcome. `--dry-run` writes nothing and stays confirmation-free.
             if migrate_layout {
+                if dry_run {
+                    let result = migrate_layout_run(path, dry_run)
+                        .await
+                        .map_err(WorktreeError::into_cli_error)?;
+                    return render_migrate_layout(&result, output);
+                }
+                require_repair_confirmation(confirm, "worktree repair --migrate-layout")?;
+                let boundary =
+                    begin_repair_operation("worktree repair --migrate-layout", path.as_deref())
+                        .await?;
                 let result = migrate_layout_run(path, dry_run)
                     .await
-                    .map_err(WorktreeError::into_cli_error)?;
+                    .map_err(WorktreeError::into_cli_error);
+                let result = finish_repair_operation(boundary, result).await?;
                 return render_migrate_layout(&result, output);
             }
             if let Some(path) = path {
-                let result =
-                    repair_worktree_identity(path).map_err(WorktreeError::into_cli_error)?;
+                require_repair_confirmation(confirm, &format!("worktree repair {path}"))?;
+                let boundary =
+                    begin_repair_operation("worktree repair <path>", Some(&path)).await?;
+                let result = repair_worktree_identity(path).map_err(WorktreeError::into_cli_error);
+                let result = finish_repair_operation(boundary, result).await?;
                 return render_repair_identity(&result, output);
             }
+            require_repair_confirmation(confirm, "worktree repair")?;
+            let boundary = begin_repair_operation("worktree repair", None).await?;
             let result = repair_worktrees()
                 .await
-                .map_err(WorktreeError::into_cli_error)?;
+                .map_err(WorktreeError::into_cli_error);
+            let result = finish_repair_operation(boundary, result).await?;
             render_repair_worktrees(&result, output)
         }
     }
+}
+
+/// W0 (§C.11, Codex R16/R17): a MUTATING repair action runs only behind an
+/// explicit `--confirm`. The refusal precedes every registry lock, database
+/// write and filesystem touch, so an unconfirmed invocation is byte-for-byte
+/// side-effect free — the property the table-driven regression
+/// `worktree_doctor_mutations_require_confirmation_and_emit_audit` asserts.
+fn require_repair_confirmation(confirm: bool, action: &str) -> CliResult<()> {
+    if confirm {
+        return Ok(());
+    }
+    Err(WorktreeError::OperationBlocked(format!(
+        "refusing to run {action} without confirmation; re-run with --confirm"
+    ))
+    .into_cli_error())
+}
+
+/// Open the operation-log audit boundary for one confirmed repair action (W0
+/// §C.11): exactly one row per EXECUTED action, closed with the action's
+/// outcome by [`finish_repair_operation`]. The boundary claim also takes this
+/// worktree's control slot for the duration, serializing the repair against
+/// any concurrent sequencer control action here.
+async fn begin_repair_operation(
+    command_name: &str,
+    target: Option<&str>,
+) -> CliResult<crate::internal::operation_wrapper::OperationBoundary> {
+    use crate::internal::operation_wrapper::{OperationMeta, OperationScope, begin_operation};
+
+    let db = crate::internal::db::get_db_conn_instance().await;
+    // Fail CLOSED on a missing/unreadable identity, like a sequencer control:
+    // without it the audit row cannot be attributed, and a repair that ran
+    // without its audit event is exactly what the W0 contract forbids.
+    let repo_id = RepoIdentity::resolve(&db)
+        .await
+        .map(|identity| identity.as_str().to_string())
+        .map_err(|error| {
+            CliError::fatal(format!("cannot record the repair operation: {error}"))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+    let meta = OperationMeta {
+        command_name: command_name.to_string(),
+        description: match target {
+            Some(target) => format!("{command_name}: target {target}"),
+            None => format!("{command_name}: every registered worktree"),
+        },
+        actor: crate::internal::config::ConfigKv::get("user.name")
+            .await
+            .ok()
+            .flatten()
+            .map(|entry| entry.value)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "libra-user".to_string()),
+        repo_id,
+        // No dedup identity: re-running a confirmed repair to convergence is
+        // the documented flow, and each execution is its own audit row —
+        // never an accidental double submission to suppress.
+        args_digest: None,
+    };
+    // A repair's audit row is never restorable, so snapshotting every branch
+    // and workspace pointer would write rows nothing can ever read; record
+    // the head pointer, which is what `op log`/`op show` display (§C.14).
+    let scope = OperationScope {
+        include_refs: false,
+        include_workspace: false,
+        // Re-running a repair is ordinary (heal one invariant, then the next);
+        // overlap is excluded by the worktree-wide control slot, a real mutex
+        // rather than the five-second heuristic.
+        duplicate_window: false,
+        ..OperationScope::default()
+    };
+    begin_operation(meta, scope).await.map_err(|err| {
+        CliError::fatal(format!("cannot record the repair operation: {err}"))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint(
+                "another control action is running or just completed in this worktree; wait for \
+                 it to finish, or inspect it with `libra op log`",
+            )
+    })
+}
+
+/// Close a repair action's audit boundary with its outcome, success OR
+/// failure — a repair that failed mid-way is still an executed action and
+/// its row says so. A failure to close is a warning rather than a command
+/// failure: the repair already happened, and turning a bookkeeping error
+/// into a command failure would misreport it (the same contract the
+/// sequencer control boundary in `cli.rs` follows).
+async fn finish_repair_operation<T>(
+    boundary: crate::internal::operation_wrapper::OperationBoundary,
+    result: CliResult<T>,
+) -> CliResult<T> {
+    let outcome = if result.is_ok() {
+        crate::internal::operation_wrapper::BoundaryOutcome::Succeeded
+    } else {
+        crate::internal::operation_wrapper::BoundaryOutcome::Failed
+    };
+    if let Err(err) = boundary.finish(outcome).await {
+        crate::utils::error::emit_warning(format!(
+            "the repair finished, but its operation-log record could not be closed: {err}"
+        ));
+    }
+    result
 }
 
 /// What main-scope layer/sparse state exists, for the doctor finding above.
@@ -1152,7 +1313,7 @@ async fn adopted_scope_settings_present() -> Result<Option<String>, String> {
 
     let db = crate::internal::db::get_db_conn_instance().await;
     let count = async |sql: &str| -> Result<i64, String> {
-        db.query_one(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        db.query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .map_err(|error| format!("{error}"))?
             .ok_or_else(|| "a COUNT query returned no row".to_string())?
@@ -1409,7 +1570,7 @@ fn load_state_impl(heal_identity_invariants: bool) -> WorktreeResult<WorktreeSta
             Ok(()) => Ok(state),
             Err(source) => Err(WorktreeError::StateCorrupt {
                 path: path.clone(),
-                source: format!("{source}; run `libra worktree repair` to heal it"),
+                source: format!("{source}; run `libra worktree repair --confirm` to heal it"),
             }),
         };
     }
@@ -1529,7 +1690,7 @@ fn load_state_readonly() -> WorktreeResult<WorktreeState> {
             if let Err(source) = state.validate_v2() {
                 return Err(WorktreeError::StateCorrupt {
                     path: path.clone(),
-                    source: format!("{source}; run `libra worktree repair` to heal it"),
+                    source: format!("{source}; run `libra worktree repair --confirm` to heal it"),
                 });
             }
         }
@@ -2306,7 +2467,7 @@ async fn reattach_worktree(
     let Some(expected_id) = state.entries[index].worktree_id.clone() else {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': the registry entry has no persisted worktree id; run \
-             `libra worktree repair` first",
+             `libra worktree repair --confirm` first",
             target.display()
         )));
     };
@@ -2318,7 +2479,7 @@ async fn reattach_worktree(
     if current_id.as_deref() != Some(expected_id.as_str()) {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': its gitdir identity ({}) does not match the registry's \
-             persisted id ({expected_id}); run `libra worktree repair {}` first",
+             persisted id ({expected_id}); run `libra worktree repair --confirm {}` first",
             target.display(),
             current_id.as_deref().unwrap_or("missing"),
             target.display()
@@ -2352,7 +2513,7 @@ async fn reattach_worktree(
     if !commondir_ok {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot re-attach '{}': its commondir pointer is missing, corrupt, or targets a \
-             different repository's storage; run `libra worktree repair {}` first",
+             different repository's storage; run `libra worktree repair --confirm {}` first",
             target.display(),
             target.display()
         )));
@@ -2406,7 +2567,7 @@ async fn reattach_worktree(
         Err(error) => {
             // Journal kept: repair finishes lifting the marker.
             return Err(WorktreeError::IoWrite(format!(
-                "cannot remove the detached marker '{}' (run `libra worktree repair` to \
+                "cannot remove the detached marker '{}' (run `libra worktree repair --confirm` to \
                  finish the re-attach): {error}",
                 marker.display()
             )));
@@ -2490,7 +2651,7 @@ async fn lifecycle_upsert(
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let now = chrono::Utc::now().timestamp_millis();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?) \
@@ -2516,7 +2677,7 @@ async fn lifecycle_delete(
     worktree_id: &str,
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM worktree_lifecycle WHERE worktree_id = ?",
         [worktree_id.into()],
@@ -2532,7 +2693,7 @@ async fn lifecycle_delete(
 async fn lifecycle_rows(db: &sea_orm::DatabaseConnection) -> Result<Vec<(String, String)>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT worktree_id, state FROM worktree_lifecycle".to_string(),
         ))
@@ -2592,7 +2753,7 @@ async fn journal_append(
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let now = chrono::Utc::now().timestamp_millis();
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
              VALUES (?, ?, ?, ?)",
@@ -2615,7 +2776,7 @@ async fn journal_set_stage(
     stage: &str,
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "UPDATE worktree_intent_journal SET stage = ? WHERE id = ?",
         [stage.into(), id.into()],
@@ -2628,7 +2789,7 @@ async fn journal_set_stage(
 /// Resolve (delete) a journal row after the mutation is fully published.
 async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM worktree_intent_journal WHERE id = ?",
         [id.into()],
@@ -2642,7 +2803,7 @@ async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<()
 async fn journal_pending(db: &sea_orm::DatabaseConnection) -> Result<Vec<PendingIntent>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT id, op, worktree_id, payload FROM worktree_intent_journal ORDER BY id"
                 .to_string(),
@@ -2684,7 +2845,7 @@ async fn scoped_state_active(db: &sea_orm::DatabaseConnection, worktree_id: &str
     for table in ["sequence_state", "rebase_state", "bisect_state"] {
         let query = format!("SELECT COUNT(*) FROM {table} WHERE worktree_id = ?");
         match db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 &query,
                 [worktree_id.into()],
@@ -2738,7 +2899,7 @@ async fn gc_worktree_scoped_rows_strict(
     // pre-migration test databases may still lack it — only purge when the
     // table exists (a DELETE on a missing table would log a spurious warn).
     let has_bisect_table = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bisect_state'",
         ))
@@ -2750,7 +2911,7 @@ async fn gc_worktree_scoped_rows_strict(
         stmts.push("DELETE FROM bisect_state WHERE worktree_id = ?");
     }
     for sql in stmts {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             sql,
             [worktree_id.into()],
@@ -3000,7 +3161,7 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
             "legacy-symlink" => findings.push(
                 "uses the pre-isolation shared-`.libra` symlink layout; mutations here are \
                  refused because they would move the MAIN worktree's HEAD/index. Migrate with \
-                 `libra worktree repair --migrate-layout <path>` from the main worktree."
+                 `libra worktree repair --migrate-layout --confirm <path>` from the main worktree."
                     .to_string(),
             ),
             "missing" => findings.push(
@@ -3010,7 +3171,7 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
             ),
             "corrupt" => findings.push(
                 "the worktree's `.libra` metadata could not be read; `libra worktree repair \
-                 <path>` restores its identity from the registry."
+                 --confirm <path>` restores its identity from the registry."
                     .to_string(),
             ),
             _ => {}
@@ -3018,7 +3179,7 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
         if !identity_registered && entry.layout != "missing" {
             findings.push(
                 "this worktree's identity is not one the registry knows, so mutations here are \
-                 refused; `libra worktree repair <path>` restores it from the registry's \
+                 refused; `libra worktree repair --confirm <path>` restores it from the registry's \
                  persisted id."
                     .to_string(),
             );
@@ -3032,7 +3193,7 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
         }
         if entry.state == "tombstone" {
             findings.push(
-                "a removal did not finish cleaning up; `libra worktree repair` retries it."
+                "a removal did not finish cleaning up; `libra worktree repair --confirm` retries it."
                     .to_string(),
             );
         }
@@ -3178,6 +3339,7 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
 // Grammar is FROZEN (§C.8, Codex R18/R19):
 //
 //     libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]
+//     libra worktree doctor <workspace-id> --adopt-capture-session <session-id> --confirm
 //
 // * no id  -> paginated view: `data.diagnostics[]` + `data.next_cursor`
 // * an id  -> single-scope view: `data.diagnostic` (singular, NO pagination)
@@ -3185,9 +3347,9 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
 //
 // The default invocation is STRICTLY READ-ONLY: it opens no write path, takes
 // no lease, never adopts a legacy row, and never rewrites the registry (it uses
-// the lockless `load_state_readonly` reader). Mutating recovery actions
-// (reclaim/adopt/clear/repair) are a separate, explicitly-confirmed grammar
-// that this slice deliberately does NOT ship — so no hint here may promise one.
+// the lockless `load_state_readonly` reader). Legacy capture adoption is a
+// separate, explicitly-confirmed grammar; reclaim/clear/repair are not part
+// of this slice, so no hint may promise those actions.
 
 /// `data.schema_version` of both doctor payloads. Additive evolution only.
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -3296,6 +3458,7 @@ struct WorktreeDoctorPage {
     /// different questions (is this working tree's layout/identity sound vs
     /// is this Agent workspace's lease sound) and a caller that parses one
     /// must not lose the other.
+    #[serde(skip_serializing)]
     worktrees: Vec<WorktreeDiagnostic>,
 }
 
@@ -3421,7 +3584,7 @@ fn diagnose_workspace(
                         findings.push(ScopeDiagnostic::warning(
                             "registry_entry_tombstoned",
                             "the worktree directory was deleted but its scoped rows are still \
-                             pending cleanup; `libra worktree repair` retries it",
+                             pending cleanup; `libra worktree repair --confirm` retries it",
                         ));
                     }
                 }
@@ -3434,7 +3597,7 @@ fn diagnose_workspace(
                         "scope_layout_legacy_symlink",
                         format!(
                             "'{}' still uses the pre-isolation shared-`.libra` symlink layout; \
-                             migrate it with `libra worktree repair --migrate-layout`",
+                             migrate it with `libra worktree repair --migrate-layout --confirm`",
                             entry.path
                         ),
                     )),
@@ -3456,6 +3619,309 @@ fn diagnose_workspace(
         lease_fence: record.lease_fence,
         lease_expires_at: record.lease_expires_at,
         scope_diagnostics: findings,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureScopeAdoptionOutput {
+    schema_version: u32,
+    session_id: String,
+    workspace_id: String,
+    repo_id: String,
+    worktree_id: String,
+    workspace_fence: i64,
+}
+
+/// Explicit mutation for the W4 legacy boundary. Migration 2026080401 marks
+/// historical capture rows `legacy_unknown` because their original scope was
+/// not recorded. This command is the only supported way to assign one: it
+/// requires a live workspace lease/fence, confirmation, and an audit row.
+async fn adopt_legacy_capture_scope(
+    workspace_id: &str,
+    session_id: &str,
+    confirm: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if !confirm {
+        return Err(CliError::command_usage(
+            "legacy capture adoption changes persistent ownership; re-run with --confirm after \
+             verifying the workspace and session",
+        ));
+    }
+    let db_path = crate::utils::path::database();
+    let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "cannot open the repository database for capture-scope adoption: {error}"
+            ))
+        })?;
+    let record = WorkspaceStore::get_with_conn(&conn, workspace_id)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("cannot read workspace '{workspace_id}': {error}"))
+        })?
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "no workspace matches id '{workspace_id}'; list them with `libra worktree doctor`"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+    if !record.state.holds_identity() || record.lease_owner.is_none() || record.lease_fence <= 0 {
+        return Err(CliError::fatal(format!(
+            "workspace '{workspace_id}' has no live lease fence; refuse to attribute capture \
+             state to a released, orphaned, or unleased scope"
+        )));
+    }
+    if record
+        .lease_expires_at
+        .is_none_or(|deadline| deadline <= workspace::now_ms())
+    {
+        return Err(CliError::fatal(format!(
+            "workspace '{workspace_id}' lease has expired; refuse to attribute capture state \
+             until its owner renews or an explicit reclaim issues a new fence"
+        )));
+    }
+    let identity = RepoIdentity::resolve(&conn).await.map_err(|error| {
+        CliError::fatal(format!(
+            "cannot resolve this repository's identity for capture-scope adoption: {error}"
+        ))
+    })?;
+    let target_worktree_id = record.worktree_id.clone().unwrap_or_default();
+    let txn = crate::internal::db::begin_write_transaction(&conn)
+        .await
+        .map_err(|error| CliError::fatal(format!("begin capture-scope adoption: {error}")))?;
+    let legacy = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT agent_kind, provider_session_id FROM (
+                 SELECT 0 AS match_priority, agent_kind, provider_session_id FROM agent_session
+                  WHERE scope_state = 'legacy_unknown' AND session_id = ?
+                 UNION ALL
+                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_session
+                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+                 UNION ALL
+                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_export_job
+                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+                 UNION ALL
+                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_import_identity
+                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+             ) ORDER BY match_priority LIMIT 1",
+            [
+                session_id.into(),
+                session_id.into(),
+                session_id.into(),
+                session_id.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("read legacy capture session: {error}")))?
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "capture session identifier '{session_id}' has no legacy unscoped capture row; \
+                 doctor adoption accepts an agent session id or an orphan provider session id"
+            ))
+        })?;
+    let agent_kind: String = legacy
+        .try_get_by("agent_kind")
+        .map_err(|error| CliError::fatal(format!("decode legacy capture agent kind: {error}")))?;
+    let provider_session_id: String =
+        legacy.try_get_by("provider_session_id").map_err(|error| {
+            CliError::fatal(format!("decode legacy provider session identity: {error}"))
+        })?;
+    let foreign_scoped = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT 1 FROM (
+                 SELECT provider_session_id FROM agent_session
+                  WHERE provider_session_id = ? AND scope_state = 'scoped'
+                 UNION ALL
+                 SELECT provider_session_id FROM agent_export_job
+                  WHERE provider_session_id = ? AND scope_state = 'scoped'
+                 UNION ALL
+                 SELECT provider_session_id FROM agent_import_identity
+                  WHERE provider_session_id = ? AND scope_state = 'scoped'
+             ) LIMIT 1",
+            [
+                provider_session_id.clone().into(),
+                provider_session_id.clone().into(),
+                provider_session_id.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("check existing scoped capture ownership: {error}"))
+        })?;
+    if foreign_scoped.is_some() {
+        txn.rollback().await.ok();
+        return Err(CliError::fatal(format!(
+            "provider session '{provider_session_id}' already has a scoped capture claim; \
+             refusing to merge a legacy row into it"
+        )));
+    }
+    let target_repo_id = identity.as_str().to_string();
+    let target_workspace_id = record.workspace_id.clone();
+    let target_workspace_fence = record.lease_fence;
+    let mut adopted_rows = txn
+        .execute_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE agent_session
+             SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
+                 scope_state = 'scoped'
+             WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
+               AND EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               )",
+            [
+                target_repo_id.clone().into(),
+                target_worktree_id.clone().into(),
+                target_workspace_id.clone().into(),
+                target_workspace_fence.into(),
+                provider_session_id.clone().into(),
+                target_workspace_id.clone().into(),
+                target_repo_id.clone().into(),
+                target_workspace_fence.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("adopt legacy capture session: {error}")))?
+        .rows_affected();
+    for table in ["agent_export_job", "agent_import_identity"] {
+        let sql = format!(
+            "UPDATE {table}
+             SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
+                 scope_state = 'scoped'
+             WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
+               AND EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               )"
+        );
+        adopted_rows += txn
+            .execute_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                sql,
+                [
+                    target_repo_id.clone().into(),
+                    target_worktree_id.clone().into(),
+                    target_workspace_id.clone().into(),
+                    target_workspace_fence.into(),
+                    provider_session_id.clone().into(),
+                    target_workspace_id.clone().into(),
+                    target_repo_id.clone().into(),
+                    target_workspace_fence.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| CliError::fatal(format!("adopt legacy {table} scope: {error}")))?
+            .rows_affected();
+    }
+    if adopted_rows == 0 {
+        txn.rollback().await.ok();
+        return Err(CliError::fatal(
+            "capture-scope adoption was fenced out because the target workspace changed; rerun \
+             doctor and choose the current live workspace",
+        ));
+    }
+    let actor = env::var("LIBRA_ACTOR")
+        .ok()
+        .or_else(|| env::var("USER").ok());
+    txn.execute_raw(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        "INSERT INTO agent_workspace_scope_audit (
+            audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id,
+            workspace_id, workspace_fence, actor, created_at
+         ) VALUES (?, 'adopt_legacy_capture_scope', ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            uuid::Uuid::new_v4().to_string().into(),
+            agent_kind.into(),
+            provider_session_id.into(),
+            target_repo_id.into(),
+            target_worktree_id.clone().into(),
+            target_workspace_id.into(),
+            target_workspace_fence.into(),
+            actor.into(),
+            workspace::now_ms().into(),
+        ],
+    ))
+    .await
+    .map_err(|error| CliError::fatal(format!("audit capture-scope adoption: {error}")))?;
+    txn.commit()
+        .await
+        .map_err(|error| CliError::fatal(format!("commit capture-scope adoption: {error}")))?;
+
+    let payload = CaptureScopeAdoptionOutput {
+        schema_version: DOCTOR_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        workspace_id: record.workspace_id,
+        repo_id: identity.as_str().to_string(),
+        worktree_id: target_worktree_id,
+        workspace_fence: record.lease_fence,
+    };
+    if output.is_json() {
+        return emit_json_data("worktree.doctor.adopt_capture", &payload, output);
+    }
+    if !output.quiet {
+        println!(
+            "adopted legacy capture session {} into workspace {} at lease fence {}",
+            payload.session_id, payload.workspace_id, payload.workspace_fence
+        );
+    }
+    Ok(())
+}
+
+/// Probe, rather than count, legacy capture rows so a diagnostic page stays
+/// bounded even in repositories with a long capture history. Before the W4
+/// migration these columns do not exist; doctor must remain usable on that
+/// older schema and simply has no legacy-scope classification to report.
+async fn legacy_capture_scope_exists(conn: &sea_orm::DatabaseConnection) -> CliResult<bool> {
+    let result = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT 1 FROM (
+                 SELECT 1 FROM agent_session WHERE scope_state = 'legacy_unknown'
+                 UNION ALL
+                 SELECT 1 FROM agent_export_job WHERE scope_state = 'legacy_unknown'
+                 UNION ALL
+                 SELECT 1 FROM agent_import_identity WHERE scope_state = 'legacy_unknown'
+             ) LIMIT 1"
+                .to_string(),
+        ))
+        .await;
+    match result {
+        Ok(row) => Ok(row.is_some()),
+        Err(error)
+            if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("no such column")
+                || error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no such table") =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(doctor_scope_corrupt(format!(
+            "cannot inspect legacy capture scope state: {error}"
+        ))),
+    }
+}
+
+fn print_legacy_capture_scope_guidance(output: &OutputConfig, legacy_exists: bool) {
+    if legacy_exists && !output.is_json() && !output.quiet {
+        println!(
+            "legacy capture scope: unscoped capture rows exist and are intentionally excluded \
+             from new writes; inspect the session and adopt only its verified owner with \
+             `libra worktree doctor <workspace-id> --adopt-capture-session <session-id> --confirm`"
+        );
     }
 }
 
@@ -3498,6 +3964,7 @@ pub(crate) async fn run_worktree_doctor(
             ))
         })?;
     let now = workspace::now_ms();
+    let legacy_capture_exists = legacy_capture_scope_exists(&conn).await?;
 
     if let Some(workspace_id) = workspace_id {
         let record = WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id)
@@ -3516,7 +3983,9 @@ pub(crate) async fn run_worktree_doctor(
             })?;
         let repo_id = doctor_repo_identity(&conn).await?;
         let diagnostic = diagnose_workspace(&record, &repo_id, &registry, now);
-        return render_doctor_single(diagnostic, output);
+        let result = render_doctor_single(diagnostic, output);
+        print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+        return result;
     }
 
     let after = cursor.as_deref().map(decode_doctor_cursor).transpose()?;
@@ -3535,20 +4004,29 @@ pub(crate) async fn run_worktree_doctor(
             )));
         }
     };
-    // The worktree-scope half of the same bare invocation (§C.11 W0).
-    let worktree_report = collect_worktree_scope_report().await?;
+    // The human doctor also renders the W0 worktree-scope report. Do not
+    // build it for JSON/machine pagination: it scans every registry entry,
+    // would make a capped workspace page unbounded, and is not part of the
+    // frozen W4 JSON payload.
+    let worktrees = if output.is_json() {
+        Vec::new()
+    } else {
+        collect_worktree_scope_report().await?.diagnostics
+    };
     if page.items.is_empty() {
         // Nothing to classify, so a missing/unreadable repository identity is
         // not worth failing on: an empty diagnosis IS the whole truth here.
-        return render_doctor_page(
+        let result = render_doctor_page(
             WorktreeDoctorPage {
                 schema_version: DOCTOR_SCHEMA_VERSION,
                 diagnostics: Vec::new(),
                 next_cursor: None,
-                worktrees: worktree_report.diagnostics,
+                worktrees,
             },
             output,
         );
+        print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+        return result;
     }
     let repo_id = doctor_repo_identity(&conn).await?;
     let diagnostics = page
@@ -3556,15 +4034,17 @@ pub(crate) async fn run_worktree_doctor(
         .iter()
         .map(|record| diagnose_workspace(record, &repo_id, &registry, now))
         .collect();
-    render_doctor_page(
+    let result = render_doctor_page(
         WorktreeDoctorPage {
             schema_version: DOCTOR_SCHEMA_VERSION,
             diagnostics,
             next_cursor: page.next_cursor.as_deref().map(encode_doctor_cursor),
-            worktrees: worktree_report.diagnostics,
+            worktrees,
         },
         output,
-    )
+    );
+    print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+    result
 }
 
 /// Whether a workspace read failed only because the table does not exist yet.
@@ -3809,7 +4289,7 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
                     || intent.payload["path"].as_str() == Some(src_path.to_string_lossy().as_ref()))
         }) {
             return Err(WorktreeError::OperationBlocked(format!(
-                "'{}' has an unfinished layout migration; run `libra worktree repair` \
+                "'{}' has an unfinished layout migration; run `libra worktree repair --confirm` \
                  first",
                 src_path.display()
             )));
@@ -4074,7 +4554,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     if entry_state == WorktreeEntryState::Tombstone {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' is a tombstone (directory already deleted, scoped cleanup pending); run \
-             `libra worktree repair` to retry the cleanup",
+             `libra worktree repair --confirm` to retry the cleanup",
             target.display()
         )));
     }
@@ -4399,7 +4879,7 @@ async fn migrate_layout_run(
 ) -> WorktreeResult<MigrateLayoutOutput> {
     if util::current_worktree_id().is_some() || util::is_legacy_symlink_worktree() {
         return Err(WorktreeError::OperationBlocked(
-            "run `worktree repair --migrate-layout` from the MAIN worktree".to_string(),
+            "run `worktree repair --migrate-layout --confirm` from the MAIN worktree".to_string(),
         ));
     }
     // Dry run is READ-ONLY end to end: no lock file creation, no registry
@@ -4538,7 +5018,7 @@ async fn migrate_one_worktree(
 
     let worktree_id = state.entries[index].worktree_id.clone().ok_or_else(|| {
         WorktreeError::OperationBlocked(format!(
-            "registry entry '{}' has no persisted worktree id; run `worktree repair` \
+            "registry entry '{}' has no persisted worktree id; run `worktree repair --confirm` \
                  first",
             target.display()
         ))
@@ -4664,7 +5144,7 @@ async fn migrate_one_worktree(
         |error| {
             WorktreeError::OperationBlocked(format!(
                 "installed gitdir failed identity validation ({error}); materials kept — \
-                 investigate, then rerun `worktree repair`"
+                 investigate, then rerun `worktree repair --confirm`"
             ))
         },
     )?;
@@ -4694,7 +5174,7 @@ async fn migrate_one_worktree(
             fs::remove_file(&backup).map_err(|error| {
                 WorktreeError::IoWrite(format!(
                     "migrated, but the legacy backup '{}' could not be removed: {error}; \
-                     remove it and rerun `worktree repair`",
+                     remove it and rerun `worktree repair --confirm`",
                     backup.display()
                 ))
             })?;
@@ -4703,7 +5183,7 @@ async fn migrate_one_worktree(
         _ => {
             return Err(WorktreeError::OperationBlocked(format!(
                 "'{}' is no longer the expected legacy symlink; not deleting it — \
-                 investigate, then rerun `worktree repair`",
+                 investigate, then rerun `worktree repair --confirm`",
                 backup.display()
             )));
         }
@@ -4777,7 +5257,7 @@ async fn verify_migrated_worktree(
     if seen != Some(head_commit) {
         return Err(WorktreeError::OperationBlocked(format!(
             "verification failed: '{}' resolves HEAD to {:?}, expected {head_commit}; \
-             materials kept — rerun `worktree repair`",
+             materials kept — rerun `worktree repair --confirm`",
             target.display(),
             seen
         )));
@@ -4785,7 +5265,7 @@ async fn verify_migrated_worktree(
     if !target.join(util::ROOT_DIR).join("index").exists() {
         return Err(WorktreeError::OperationBlocked(format!(
             "verification failed: '{}' has no private index; materials kept — rerun \
-             `worktree repair`",
+             `worktree repair --confirm`",
             target.display()
         )));
     }
@@ -5022,7 +5502,7 @@ fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &OutputConfig) 
     if result.tombstone {
         println!(
             "Deleted worktree directory '{}', but the scoped-state cleanup failed — a \
-             tombstone entry remains; run `libra worktree repair` to retry.",
+             tombstone entry remains; run `libra worktree repair --confirm` to retry.",
             result.path
         );
     } else if result.disk_directory_deleted {
@@ -5133,7 +5613,7 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
     {
         return Err(WorktreeError::OperationBlocked(
             "the worktree registry still uses the legacy v1 format with no persisted \
-             identities; run `libra worktree repair` (no argument) once to upgrade it, \
+             identities; run `libra worktree repair --confirm` (no argument) once to upgrade it, \
              then retry"
                 .to_string(),
         ));
@@ -5151,7 +5631,7 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
     let Some(stable_id) = entry.worktree_id.clone() else {
         return Err(WorktreeError::OperationBlocked(format!(
             "the registry entry for '{}' predates registry v2 and carries no persisted \
-             worktree id; run the no-arg `libra worktree repair` once to upgrade the \
+             worktree id; run the no-arg `libra worktree repair --confirm` once to upgrade the \
              registry, then retry",
             target.display()
         )));
@@ -6338,7 +6818,7 @@ fn render_repair_worktrees(result: &WorktreeRepairOutput, output: &OutputConfig)
         }
         if result.tombstones_pending > 0 {
             println!(
-                "{} tombstone(s) still pending; rerun `libra worktree repair` after \
+                "{} tombstone(s) still pending; rerun `libra worktree repair --confirm` after \
                  addressing the notes above",
                 result.tombstones_pending
             );

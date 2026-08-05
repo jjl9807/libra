@@ -440,7 +440,10 @@ fn repair_path_restores_identity_in_fuse_build() {
     fs::remove_file(&id_file).expect("drop id file");
 
     assert_cli_success(
-        &run_libra_command(&["worktree", "repair", wt.to_str().unwrap()], main),
+        &run_libra_command(
+            &["worktree", "repair", wt.to_str().unwrap(), "--confirm"],
+            main,
+        ),
         "worktree repair <path> in fuse build",
     );
     let restored = fs::read_to_string(&id_file)

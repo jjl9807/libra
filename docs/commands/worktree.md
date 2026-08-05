@@ -16,8 +16,8 @@ libra worktree move <src> <dest>
 libra worktree prune
 libra worktree remove <path>
 libra worktree umount <path> [--cleanup]
-libra worktree repair [<path>]
-libra worktree repair --migrate-layout [--dry-run] [<path>]
+libra worktree repair --confirm [<path>]
+libra worktree repair --migrate-layout [--dry-run] [--confirm] [<path>]
 libra worktree repair <path> --resolve-identity --yes
 libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 ```
@@ -26,7 +26,7 @@ libra worktree doctor [<workspace-id>] [--limit <n>] [--cursor <cursor>]
 
 `libra worktree` manages multiple working trees that share a single repository database and object store. This allows you to have several checkouts of the same repository simultaneously, which is useful for working on multiple branches at once, running builds while editing code, or testing changes in isolation.
 
-Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.) The registry file `worktrees.json` is versioned (`schema_version: 3`; v2 since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the file. v3 adds a durable registration GENERATION — `epoch_counter` on the registry and `epoch` on each entry, reported by `worktree list`. Instance ids are path-derived, so a worktree removed and re-added in the same place has the same id and path as its predecessor; the generation is what tells the two registrations apart, and the `libra service` dirty-mark endpoint requires it as a fence. A v2-era binary would parse a v3 file and drop the generations on rewrite, so the v3 capability marker refuses those binaries at connect time; for the same reason this migration does not roll back while any generation is live.
+Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; `libra worktree doctor` reports it, and `libra worktree repair --migrate-layout --dry-run` previews the migration read-only.) The registry file `worktrees.json` is versioned (`schema_version: 3`; v2 since v0.19.57): each linked entry persists its stable `worktree_id`, a legacy v1 file is upgraded in place by the first mutating worktree command (ids backfilled from each worktree's gitdir; lockless readers like `worktree list` read a v1 file without rewriting it), and older binaries are refused at the database layer before they can misread or rewrite the file. v3 adds a durable registration GENERATION — `epoch_counter` on the registry and `epoch` on each entry, reported by `worktree list`. Instance ids are path-derived, so a worktree removed and re-added in the same place has the same id and path as its predecessor; the generation is what tells the two registrations apart, and the `libra service` dirty-mark endpoint requires it as a fence. A v2-era binary would parse a v3 file and drop the generations on rewrite, so the v3 capability marker refuses those binaries at connect time; for the same reason this migration does not roll back while any generation is live.
 
 **Resolving an ambiguous registry.** A registry written by an older binary can end up with two entries claiming one path-derived identity (`add A` → `move A B` → `add A`). Every worktree MUTATION is refused while that holds — including the `remove` that would fix it, because it goes through the same loader. `libra worktree doctor` names the colliding entries, and `libra worktree repair <path> --resolve-identity --yes` is the one action that runs against the ambiguous registry: it DETACHES the named entry (files and scoped state kept, every command inside that directory fails closed) so the remaining claimant owns the identity again. Finish with `worktree remove --delete-dir <path>`, or `worktree add <path>` to re-attach it.
 
@@ -87,34 +87,73 @@ libra --machine worktree list
 Structured output uses the `worktree.list` command envelope. Each entry reports
 `kind`, `path`, `is_main`, `locked`, `lock_reason`, whether the path currently
 exists on disk, the persisted `worktree_id`, and the lifecycle `state`
-(`active`, `detached_from_registry`, or `tombstone` — see `remove`), and the on-disk `layout` (`main`, `linked-v2`, `legacy-symlink`, `missing`, `corrupt`; porcelain adds a matching `layout` line per entry). In a `legacy-symlink` worktree (pre-isolation shared `.libra`), read-only commands keep working but state-mutating commands refuse with `LBR-REPO-003` — run `libra worktree repair --migrate-layout <path>` from the main worktree. Target-oriented lifecycle commands (`worktree remove <path>` in both modes and `worktree repair <path>`) also refuse a legacy-symlink target — the shared symlink would route their writes into MAIN storage — until the migration completes.
+(`active`, `detached_from_registry`, or `tombstone` — see `remove`), and the on-disk `layout` (`main`, `linked-v2`, `legacy-symlink`, `missing`, `corrupt`; porcelain adds a matching `layout` line per entry). In a `legacy-symlink` worktree (pre-isolation shared `.libra`), read-only commands keep working but state-mutating commands refuse with `LBR-REPO-003` — run `libra worktree repair --migrate-layout --confirm <path>` from the main worktree. Target-oriented lifecycle commands (`worktree remove <path>` in both modes and `worktree repair <path>`) also refuse a legacy-symlink target — the shared symlink would route their writes into MAIN storage — until the migration completes.
+
+### Subcommand: `repair`
+
+Repair stale registry rows, restore a worktree's gitdir identity, or migrate a
+legacy layout. **Every mutating repair action requires `--confirm`**
+(plan-20260714 Part C W0 §C.11, Codex R16/R17): without it the command is
+refused with `LBR-CONFLICT-002` before any registry lock, database write or
+filesystem touch (zero side effects); with it the action runs inside one
+operation-log audit boundary, recording exactly one row per executed action
+(inspect with `libra op log`). The read-only `--migrate-layout --dry-run`
+preview never needs confirmation, and `repair <path> --resolve-identity` keeps
+its own dedicated `--yes` confirmation.
+
+```bash
+libra worktree repair --confirm
+libra worktree repair --confirm <path>
+libra worktree repair --migrate-layout --dry-run   # preview, no --confirm needed
+libra worktree repair --migrate-layout --confirm
+```
 
 ### Subcommand: `doctor`
 
-Report per-worktree scope diagnostics. **Strictly read-only** (plan-20260714
-Part C W0 §C.11): the registry, the database, lease state and the filesystem
-are byte-identical before and after the call. A diagnostic has to be safe to
-run on a repository you do not yet understand, which is precisely when you
-reach for it — so it never adopts, reclaims or repairs on its own. Repair
-actions are separate, explicit subcommands, and no error hint anywhere
-promises that a bare `doctor` will fix something.
+Report Agent workspace-scope diagnostics. The ordinary forms are **strictly
+read-only**: the registry, database, lease state, and filesystem are
+byte-identical before and after the call. A diagnostic must be safe to run on a
+repository you do not yet understand, so a bare `doctor` never adopts,
+reclaims, or repairs anything.
 
 ```bash
 libra worktree doctor
 libra --json worktree doctor
+libra --json worktree doctor --limit 20
+libra --json worktree doctor --cursor "$cursor"
+libra worktree doctor <workspace-id>
 ```
 
-For each worktree it reports the on-disk `layout` and lifecycle `state` (the
-same vocabulary as `worktree list`), whether the worktree's own identity is one
-the registry still knows (`identity_registered`), and a `findings` list naming
-what to do about each problem — for example that a legacy-symlink worktree
-needs `worktree repair --migrate-layout`, or that a worktree whose
-`.libra/worktree_id` no longer matches the registry needs `worktree repair`
-before it will accept mutations.
+Without an id, the machine response pages `data.diagnostics[]` by opaque
+`next_cursor` (`workspace_id` ascending; default limit 50, maximum 500). With
+`<workspace-id>`, it returns the singular `data.diagnostic`; combining that id
+with `--limit` or `--cursor` is `LBR-CLI-002`. Each diagnostic identifies the
+workspace and repository, reports the lease state (`none`, `held`, or
+`expired`), and lists scope findings such as a foreign repository identity,
+expired lease, missing path, or missing/detached/tombstoned registry entry. An
+invalid cursor fails closed with `LBR-WORKTREE-001`; an unreadable scope fails
+closed with `LBR-WORKTREE-002` rather than returning a partial page.
 
-Structured output uses the `worktree.doctor` command envelope with
-`schema_version`, `diagnostics[]`, and `next_cursor` (always `null` today;
-pagination arrives with the W4 machine interface).
+Migration `2026080401` classifies capture rows written before workspace scope
+existed as `legacy_unknown`. They remain unavailable to hooks and historical
+imports rather than being guessed into main. Their only attribution path is a
+separate, confirmed mutation:
+
+```bash
+libra worktree doctor <workspace-id> \
+  --adopt-capture-session <session-id> --confirm
+```
+
+The target workspace must have a current live lease fence. The command assigns
+all legacy capture rows for that provider session (session, export job, and
+import identity) to that exact repository/worktree/workspace fence, refuses if
+any scoped row already exists for the provider session, and appends one
+immutable audit record. It cannot be undone; inspect the target workspace and
+session before confirming. Supply the catalog session id; if an export/import
+row outlived its catalog session, its provider-session id is accepted instead
+so the orphan can be recovered. The adoption response uses the distinct
+`worktree.doctor.adopt_capture` JSON command envelope, leaving the read-only
+`worktree.doctor` page schema unchanged.
 
 ### Subcommand: `lock`
 
@@ -169,7 +208,7 @@ error or an unmounted volume never classifies a worktree as missing. The main
 worktree, locked worktrees, tombstone entries (repair's job), and scopes with
 an in-progress rebase/cherry-pick/bisect are never pruned. If a pruned
 entry's scoped-state cleanup fails, the entry is kept as a `tombstone` for
-`libra worktree repair` to retry (reported in the `tombstoned` field).
+`libra worktree repair --confirm` to retry (reported in the `tombstoned` field).
 
 ```bash
 libra worktree prune
@@ -191,7 +230,7 @@ against the registry's persisted id) or finish the removal with
 Pass `--delete-dir` for Git-style behavior — the directory is removed only
 after a dirty-state check passes, the parent directory entry is fsynced,
 and only then the scoped database state is cleaned. If that cleanup fails,
-a `tombstone` entry remains and `libra worktree repair` retries it. Cannot
+a `tombstone` entry remains and `libra worktree repair --confirm` retries it. Cannot
 remove the main worktree, a locked worktree, or one with an in-progress
 rebase/cherry-pick/bisect.
 
@@ -260,22 +299,25 @@ JSON / machine output envelope:
 
 ### Subcommand: `repair`
 
-Repair worktree metadata. Without an argument, removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed.
+Repair worktree metadata. Every mutating repair requires `--confirm`; without it the command is refused before it takes the registry lock or writes the database/filesystem. Without an argument, the confirmed action removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed. `--migrate-layout --dry-run` is the only read-only repair preview and needs no confirmation.
 
-With `--migrate-layout`, migrates legacy shared-`.libra` symlink worktrees to the isolated layout (run from the MAIN worktree; `--dry-run` reports without writing; without a path every legacy entry is migrated). The migration installs a fresh journaled gitdir by atomic renames (the legacy link is kept as a backup until verification passes), seeds a DETACHED HEAD at the shared snapshot, and rebuilds the private index from that commit: working files are never touched (they show as dirty/untracked afterwards) and shared STAGED state is never copied — commit or stash it in the main worktree first. An unmerged shared index or an in-progress main rebase/cherry-pick/bisect refuses before any rename; an interrupted migration is recovered by the next plain `worktree repair`.
+With `--migrate-layout`, migrates legacy shared-`.libra` symlink worktrees to the isolated layout (run from the MAIN worktree; `--dry-run` reports without writing; without a path every legacy entry is migrated). The migration installs a fresh journaled gitdir by atomic renames (the legacy link is kept as a backup until verification passes), seeds a DETACHED HEAD at the shared snapshot, and rebuilds the private index from that commit: working files are never touched (they show as dirty/untracked afterwards) and shared STAGED state is never copied — commit or stash it in the main worktree first. An unmerged shared index or an in-progress main rebase/cherry-pick/bisect refuses before any rename; an interrupted migration is recovered by the next `worktree repair --confirm`.
 
-With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair` once to upgrade it, then retry.
+With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair --confirm` once to upgrade it, then retry.
 
 ```bash
-libra worktree repair
-libra --json worktree repair
-libra worktree repair ../experiment
-libra --json worktree repair ../experiment
+libra worktree repair --confirm
+libra --json worktree repair --confirm
+libra worktree repair --confirm ../experiment
+libra --json worktree repair --confirm ../experiment
 ```
 
 ### Subcommand: `doctor`
 
-Diagnose Agent **workspace** scopes. This subcommand is **read-only**: it reports and never repairs — no row, registry entry, lease, or file is written by any invocation. (Libra-only; Git has no equivalent.)
+Diagnose Agent **workspace** scopes. Ordinary invocations are **read-only**:
+they report and never repair, so no row, registry entry, lease, or file is
+written. The separately named `--adopt-capture-session … --confirm` form is
+the only exception. (Libra-only; Git has no equivalent.)
 
 A *workspace* is the association record an Agent runtime takes over a worktree (see `libra agent workspace list`). Human use of a linked worktree never needs one, so a repository with no Agent activity reports nothing.
 
@@ -284,6 +326,8 @@ A *workspace* is the association record an Agent runtime takes over a worktree (
 | `<workspace-id>` | Diagnose exactly one workspace instead of paging over all of them. Cannot be combined with `--limit`/`--cursor` (a single scope is not a page) — the combination is a usage error, `LBR-CLI-002`. |
 | `--limit <n>` | Maximum diagnostics per page. Default 50, capped at 500. |
 | `--cursor <cursor>` | Resume after a previous page: pass the `next_cursor` value back verbatim. The cursor is opaque; one this command did not issue is refused with `LBR-WORKTREE-001` rather than silently restarting at page one. |
+| `--adopt-capture-session <session-id>` | Explicitly attributes `legacy_unknown` capture rows to the named workspace. Requires `<workspace-id>` and `--confirm`; it cannot be combined with `--limit`/`--cursor`. All other doctor forms remain read-only. |
+| `--confirm` | Confirms the irreversible capture-scope adoption. It is accepted only with `--adopt-capture-session`. |
 
 Each diagnostic reports the workspace's identity (`workspace_id`, `repo_id`, `path`, `worktree_id`), its `lease_state` (`none`, `held`, or `expired`), and a `scope_diagnostics` array of findings. Findings carry a stable `code` and a `severity` of `warning` or `error`:
 
@@ -297,8 +341,8 @@ Each diagnostic reports the workspace's identity (`workspace_id`, `repo_id`, `pa
 | `workspace_path_missing` | warning | No directory exists at the claimed path. |
 | `registry_entry_missing` | warning | No worktree registry entry owns this scope. |
 | `registry_entry_detached` | warning | The worktree was unregistered with `worktree remove` (keep-dir). |
-| `registry_entry_tombstoned` | warning | The directory was deleted but its scoped rows are still pending cleanup; `libra worktree repair` retries it. |
-| `scope_layout_legacy_symlink` | warning | The worktree still uses the pre-isolation shared-`.libra` symlink layout; migrate it with `libra worktree repair --migrate-layout`. |
+| `registry_entry_tombstoned` | warning | The directory was deleted but its scoped rows are still pending cleanup; `libra worktree repair --confirm` retries it. |
+| `scope_layout_legacy_symlink` | warning | The worktree still uses the pre-isolation shared-`.libra` symlink layout; migrate it with `libra worktree repair --migrate-layout --confirm`. |
 
 A scope that cannot be read at all — an unparseable registry, an unreadable record, or a repository whose identity is missing — fails closed with `LBR-WORKTREE-002` instead of answering with a partial diagnosis.
 
@@ -308,6 +352,25 @@ libra --json worktree doctor --limit 20
 libra --json worktree doctor --cursor "$cursor"
 libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
 ```
+
+Migration `2026080401` marks old capture rows without an ownership scope as
+`legacy_unknown` rather than guessing they belong to main. Hooks and historical
+imports fail closed for those rows. After inspecting the source session and the
+target workspace, the only attribution path is:
+
+```bash
+libra worktree doctor <workspace-id> \
+  --adopt-capture-session <session-id> --confirm
+```
+
+The target must have a current live lease fence. Adoption assigns every legacy
+row for that provider session (session, export job, and import identity) to
+that repository/worktree/workspace fence, refuses if any scoped claim already
+exists, and records an immutable audit event. The action is irreversible. Its
+JSON response uses `worktree.doctor.adopt_capture`; the read-only
+`worktree.doctor` page schema remains unchanged. Use the catalog session id,
+or the provider-session id when an orphaned export/import row outlived its
+catalog session.
 
 ## Common Commands
 
@@ -621,7 +684,7 @@ When creating a linked worktree, Libra restores content from the HEAD commit rat
 | Move | `worktree move <src> <dest>` | `worktree move <worktree> <new-path>` | N/A |
 | Prune | `worktree prune` | `worktree prune [--dry-run]` | N/A (automatic) |
 | Remove | `worktree remove <path>` (detaches — directory + state kept, frozen) | `worktree remove [--force] <worktree>` (deletes dir) | `workspace forget <name>` |
-| Repair | `worktree repair [<path>]` | `worktree repair [<path>...]` | N/A |
+| Repair | `worktree repair --confirm [<path>]` | `worktree repair [<path>...]` | N/A |
 | Alias | `wt` | N/A | N/A |
 | Branch per worktree | `-b <new> [<start>]` explicit (full rollback; no basename default) | Automatic (new branch or existing) | Automatic (new working copy commit) |
 | Storage | JSON file (`worktrees.json`) | Filesystem structure (`.git/worktrees/`) | Operation log |

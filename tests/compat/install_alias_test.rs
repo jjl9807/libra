@@ -62,6 +62,10 @@ fn windows_installer_declares_the_safe_optional_lba_alias() {
         script.contains("$env:LIBRA_NO_ALIAS"),
         "install.ps1 must honour LIBRA_NO_ALIAS like the POSIX installer"
     );
+    assert!(
+        script.contains("$env:LIBRA_NO_ALIAS -eq \"1\""),
+        "install.ps1 must disable the alias only for LIBRA_NO_ALIAS=1, matching install.sh"
+    );
 
     // A marker is what makes a reinstall idempotent AND makes a foreign file
     // recognisable; without it the installer cannot tell its own shim from

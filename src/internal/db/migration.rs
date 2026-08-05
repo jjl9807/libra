@@ -470,7 +470,7 @@ impl MigrationRunner {
 /// version column.
 async fn ensure_schema_versions_table(conn: &DatabaseConnection) -> Result<(), MigrationError> {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(backend, SCHEMA_VERSIONS_DDL))
+    conn.execute_raw(Statement::from_string(backend, SCHEMA_VERSIONS_DDL))
         .await?;
     Ok(())
 }
@@ -478,7 +478,7 @@ async fn ensure_schema_versions_table(conn: &DatabaseConnection) -> Result<(), M
 async fn schema_versions_table_exists(conn: &DatabaseConnection) -> Result<bool, MigrationError> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
             ["table".into(), "schema_versions".into()],
@@ -490,7 +490,7 @@ async fn schema_versions_table_exists(conn: &DatabaseConnection) -> Result<bool,
 async fn max_schema_version(conn: &DatabaseConnection) -> Result<Option<i64>, MigrationError> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT MAX(version) FROM schema_versions",
         ))
@@ -590,14 +590,14 @@ async fn apply_one_migration_guarded(
                 // If the DDL below fails, the whole transaction (including
                 // this claim) rolls back, so a failed apply never leaves a
                 // phantom version row.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "INSERT OR IGNORE INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
                     [version.into(), name.into(), applied_at.into()],
                 ))
                 .await?;
                 let row = txn
-                    .query_one(Statement::from_string(backend, "SELECT changes()"))
+                    .query_one_raw(Statement::from_string(backend, "SELECT changes()"))
                     .await?
                     .ok_or_else(|| {
                         DbErr::Custom("SELECT changes() returned no row".to_string())
@@ -640,7 +640,7 @@ async fn apply_one_migration_guarded(
                     )));
                 }
                 apply_migration_compatibility(txn, version, name).await?;
-                txn.execute(Statement::from_string(backend, up)).await?;
+                txn.execute_raw(Statement::from_string(backend, up)).await?;
                 if version == 2026072902 && history != RegistryLinkedHistory::Never {
                     // The registry witness the migration's SQL cannot see
                     // (§C.9): a linked worktree removed before this upgrade
@@ -648,7 +648,7 @@ async fn apply_one_migration_guarded(
                     // backfilled as trusted `main`. Mark every unscoped row
                     // `unknown` instead — inside this transaction, so the
                     // version row and the marking commit together.
-                    txn.execute(Statement::from_string(
+                    txn.execute_raw(Statement::from_string(
                         backend,
                         "UPDATE `operation` SET `scope_provenance` = 'unknown' \
                          WHERE (`worktree_id` IS NULL OR `worktree_id` = '')"
@@ -709,7 +709,7 @@ async fn apply_migration_compatibility<C: ConnectionTrait>(
     // default-zero value before 1407 existed. Backfill independently from
     // column creation so every evolved 1406 shape preserves the allocated
     // revision high-water mark.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE `agent_subagent_content_claim`
          SET `revision_cursor` = `current_revision`
@@ -745,7 +745,7 @@ async fn add_column_if_missing<C: ConnectionTrait>(
     let backend = conn.get_database_backend();
     let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ? LIMIT 1");
     if conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             probe,
             [column.into()],
@@ -755,10 +755,10 @@ async fn add_column_if_missing<C: ConnectionTrait>(
     {
         return Ok(());
     }
-    conn.execute(Statement::from_string(backend, alter_sql))
+    conn.execute_raw(Statement::from_string(backend, alter_sql))
         .await?;
     if let Some(initialize_sql) = initialize_sql {
-        conn.execute(Statement::from_string(backend, initialize_sql))
+        conn.execute_raw(Statement::from_string(backend, initialize_sql))
             .await?;
     }
     Ok(())
@@ -785,14 +785,14 @@ async fn apply_down_migration(
                 // the rows affected by the LAST INSERT/UPDATE/DELETE on
                 // this connection, so we read it immediately after the
                 // delete, still inside the transaction.
-                txn.execute(Statement::from_sql_and_values(
+                txn.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM schema_versions WHERE version = ?",
                     [version.into()],
                 ))
                 .await?;
                 let row = txn
-                    .query_one(Statement::from_string(backend, "SELECT changes()"))
+                    .query_one_raw(Statement::from_string(backend, "SELECT changes()"))
                     .await?
                     .ok_or_else(|| DbErr::Custom("SELECT changes() returned no row".to_string()))?;
                 let changed: i64 = row
@@ -807,7 +807,8 @@ async fn apply_down_migration(
                 // We own the rollback for this version. Execute the down
                 // DDL inside the same transaction so a SQL failure rolls
                 // both the DELETE and the partial DDL back.
-                txn.execute(Statement::from_string(backend, down)).await?;
+                txn.execute_raw(Statement::from_string(backend, down))
+                    .await?;
                 Ok::<bool, DbErr>(true)
             })
         })
@@ -1338,6 +1339,18 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026073101_stash_generation_fence.sql"),
             include_str!("../../../sql/migrations/2026073101_stash_generation_fence_down.sql"),
         ),
+        // plan-20260714 Part C W4: bind new external-agent capture, export,
+        // and import state to canonical repo/worktree/workspace ownership.
+        // Legacy rows stay explicitly unknown and require doctor adoption;
+        // the migration must never guess that they belonged to main.
+        sql_migration(
+            2026080401,
+            "agent_capture_workspace_scope",
+            include_str!("../../../sql/migrations/2026080401_agent_capture_workspace_scope.sql"),
+            include_str!(
+                "../../../sql/migrations/2026080401_agent_capture_workspace_scope_down.sql"
+            ),
+        ),
     ]
 }
 
@@ -1384,7 +1397,7 @@ async fn historic_state_would_be_misattributed(
     }
     if version == 2026072304 {
         match txn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 txn.get_database_backend(),
                 "SELECT TRIM(COALESCE((SELECT `value` FROM `config_kv` \
                  WHERE `key` = 'sparse.enabled' ORDER BY `id` DESC LIMIT 1), ''))"
@@ -1426,7 +1439,7 @@ async fn count_rows(
         None => format!("SELECT COUNT(*) FROM `{table}`"),
     };
     match txn
-        .query_one(Statement::from_string(txn.get_database_backend(), sql))
+        .query_one_raw(Statement::from_string(txn.get_database_backend(), sql))
         .await
     {
         Ok(Some(row)) => row
@@ -1449,7 +1462,7 @@ fn is_missing_table_error(error: &DbErr) -> bool {
 /// `PRAGMA database_list`. `None` for `:memory:` and anything path-less.
 async fn sqlite_database_dir(conn: &DatabaseConnection) -> Option<std::path::PathBuf> {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "PRAGMA database_list".to_string(),
         ))
@@ -1583,7 +1596,7 @@ const BISECT_STATE_SCOPE_MIGRATION: i64 = 2026072301;
 /// table.
 async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         r#"
             CREATE TABLE IF NOT EXISTS `rebase_state` (
@@ -1610,7 +1623,7 @@ async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
         "ALTER TABLE `rebase_state` ADD COLUMN `empty_mode` TEXT NOT NULL DEFAULT 'keep'",
     ] {
         if let Err(error) = conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 add_column.to_string(),
             ))
@@ -1638,7 +1651,7 @@ async fn normalize_rebase_state_shape(conn: &DatabaseConnection) -> Result<()> {
 /// every `ADD COLUMN` hits "duplicate column name").
 async fn normalize_bisect_state_shape(conn: &DatabaseConnection) -> Result<()> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         DbBackend::Sqlite,
         r#"
             CREATE TABLE IF NOT EXISTS `bisect_state` (
@@ -1665,7 +1678,7 @@ async fn normalize_bisect_state_shape(conn: &DatabaseConnection) -> Result<()> {
         "ALTER TABLE `bisect_state` ADD COLUMN `worktree_id` TEXT NOT NULL DEFAULT ''",
     ] {
         if let Err(error) = conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 add_column.to_string(),
             ))
@@ -1783,9 +1796,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 51);
+        assert_eq!(runner.len(), 52);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026073101));
+        assert_eq!(runner.max_registered_version(), Some(2026080401));
     }
 
     #[test]

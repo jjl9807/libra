@@ -163,6 +163,11 @@ pub enum WorktreeSubcommand {
         /// nothing.
         #[clap(long, requires = "migrate_layout")]
         dry_run: bool,
+        /// Confirm a MUTATING repair action (W0 §C.11): required for every
+        /// repair that writes; the read-only `--migrate-layout --dry-run`
+        /// never needs it.
+        #[clap(long)]
+        confirm: bool,
     },
 }
 
@@ -428,6 +433,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             path,
             migrate_layout,
             dry_run,
+            confirm,
         } => {
             // Core registry first: a corrupt/zero-byte core registry must
             // fail the command BEFORE any fuse metadata is mutated.
@@ -438,6 +444,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                         path,
                         migrate_layout,
                         dry_run,
+                        confirm,
                         // Not exposed on the FUSE surface; the identity-repair
                         // flow needs the canonical layout.
                         resolve_identity: false,

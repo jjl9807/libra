@@ -190,7 +190,7 @@ impl DoctorRepo {
     async fn exec_sql(&self, sql: &str, values: Vec<sea_orm::Value>) {
         let conn = self.db().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(backend, sql, values))
+        conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
             .await
             .expect("execute test SQL");
     }
@@ -200,7 +200,7 @@ impl DoctorRepo {
         let conn = self.db().await;
         let backend = conn.get_database_backend();
         let rows = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                         metadata_blob_oid, traces_commit, created_at \
@@ -235,7 +235,7 @@ impl DoctorRepo {
         );
         let values: Vec<sea_orm::Value> = oids.iter().map(|oid| (*oid).into()).collect();
         let rows = conn
-            .query_all(Statement::from_sql_and_values(backend, sql, values))
+            .query_all_raw(Statement::from_sql_and_values(backend, sql, values))
             .await
             .expect("query object_index");
         rows.into_iter()
@@ -696,7 +696,7 @@ async fn class1_stale_row_repaired_from_ref() {
     );
     let conn = repo.db().await;
     let generation = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT sync_revision FROM agent_checkpoint WHERE checkpoint_id = ?",
             [repaired.checkpoint_id.clone().into()],
@@ -1579,7 +1579,7 @@ async fn class3_drifted_object_index_row_updated_in_place() {
     let synced: i64 = repo
         .db()
         .await
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
             "SELECT is_synced FROM object_index WHERE o_id = ?",
             [transcript_oid.clone().into()],
@@ -1605,7 +1605,7 @@ async fn subagent_parent_link(repo: &DoctorRepo, checkpoint_id: &str) -> Option<
     let conn = repo.db().await;
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT parent_checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ?",
             vec![checkpoint_id.into()],
@@ -2298,7 +2298,7 @@ async fn findings_object_index_tolerates_agent_transcript_tag() {
     let repo_id = {
         let conn = repo.db().await;
         let backend = conn.get_database_backend();
-        conn.query_one(Statement::from_string(
+        conn.query_one_raw(Statement::from_string(
             backend,
             "SELECT value FROM config_kv WHERE key='libra.repoid'",
         ))
