@@ -2447,6 +2447,38 @@ mod tests {
         );
     }
 
+    /// Negative twin of the bounded pins above: the delay seams are inert
+    /// without the harness gate. Arming the env vars WITHOUT `LIBRA_TEST`
+    /// must not slow any operation, so a short batch still succeeds.
+    #[test]
+    #[serial_test::serial]
+    fn slow_op_seams_are_ignored_without_the_harness_gate() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fast.txt");
+        std::fs::write(&path, b"content").expect("write fixture");
+
+        // SAFETY: serialized via `serial`; deliberately NO LIBRA_TEST.
+        unsafe {
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            std::env::set_var("LIBRA_TEST_SLOW_WORKTREE_STAT_MS", "5000");
+            std::env::set_var("LIBRA_TEST_SLOW_WORKTREE_READ_MS", "5000");
+            std::env::set_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS", "5000");
+        }
+        let mut budget = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(1500));
+        let outcome = budget.read_worktree_blob(&path);
+        unsafe {
+            std::env::remove_var("LIBRA_TEST_SLOW_WORKTREE_STAT_MS");
+            std::env::remove_var("LIBRA_TEST_SLOW_WORKTREE_READ_MS");
+            std::env::remove_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS");
+        }
+        assert!(
+            matches!(outcome, ContentOutcome::Content(_)),
+            "with 5s delays armed but ungated, a 1.5s batch must still succeed"
+        );
+    }
+
     /// §B.4.1 designated test: the object-read budget and the worktree-read
     /// budget hold fully independent counters — exhausting one never blocks
     /// the other, and each cap (per-item, total, slot/task) reports through

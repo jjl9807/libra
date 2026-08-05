@@ -5802,6 +5802,12 @@ fn worktree_candidate_not_found_between_scan_and_hash() {
         "a worktree-family warning fires instead of silence: {doc}"
     );
     assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|u| u.iter().any(|p| p == "dest.txt")),
+        "the destination keeps its untracked row through the NotFound degradation: {doc}"
+    );
+    assert!(
         doc["data"]["unstaged"]["deleted"]
             .as_array()
             .is_some_and(|d| d.iter().any(|p| p == "moved-src.txt")),

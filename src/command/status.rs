@@ -2051,7 +2051,9 @@ fn status_comparison_budget() -> u64 {
         && let Ok(parsed) = value.parse::<u64>()
         && parsed > 0
     {
-        return parsed;
+        // Tighten-only, like the probe-limit seams: a test may shrink the
+        // budget to force exhaustion, never raise it past production's cap.
+        return parsed.min(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS);
     }
     rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS
 }
@@ -3359,9 +3361,11 @@ async fn run_status_cache_mode(
         }
     }
     let checked = rows.len();
-    // Test-only fault-injection seam (runtime-gated on LIBRA_TEST): widen the
-    // read→re-verify window so the mid-read concurrent-invalidate branch can
-    // be triggered deterministically. Inert in production (env absent).
+    // Test-only fault-injection seam (debug builds only, runtime-gated on
+    // LIBRA_TEST like the rest of the seam family): widen the read→re-verify
+    // window so the mid-read concurrent-invalidate branch can be triggered
+    // deterministically. Compiled out of release binaries.
+    #[cfg(debug_assertions)]
     if std::env::var_os("LIBRA_TEST").is_some_and(|v| v == "1")
         && let Some(ms) = std::env::var("LIBRA_TEST_CACHE_READ_PAUSE_MS")
             .ok()
@@ -7242,6 +7246,18 @@ mod seam_gate_test {
                 status_comparison_budget(),
                 1,
                 "with the gate the budget override applies"
+            );
+            // Tighten-only: even under the gate, a value above the
+            // production cap clamps back to it — the seam can shrink the
+            // budget to force exhaustion, never raise it.
+            std::env::set_var(
+                "LIBRA_TEST_STATUS_COMPARISON_BUDGET",
+                (rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS + 1).to_string(),
+            );
+            assert_eq!(
+                status_comparison_budget(),
+                rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS,
+                "a gated override above the production cap is clamped to the cap"
             );
             std::env::remove_var("LIBRA_TEST_STATUS_COMPARISON_BUDGET");
             std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);

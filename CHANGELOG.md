@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-2 cross-review, 2026-08-05)
+
+- **The dirty-cache read-pause test seam is no longer compiled into release
+  binaries.** `LIBRA_TEST_CACHE_READ_PAUSE_MS` was runtime-gated on
+  `LIBRA_TEST` but present in release builds, unlike the rest of the seam
+  family; it is now `#[cfg(debug_assertions)]`.
+- **The comparison-budget test seam is tighten-only.** A gated
+  `LIBRA_TEST_STATUS_COMPARISON_BUDGET` above the production cap now clamps
+  to the cap instead of raising it; pinned by a cap+1 regression. Also
+  pinned: the rename-candidate NotFound degradation keeps the destination's
+  untracked row, and the three R0-1 delay seams are inert without the
+  harness gate.
+
 ### Fixed (plan-20260714 R0-1 cross-review, 2026-08-05)
 
 - **A symlink planted at `refs/stash` or `logs/refs/stash` now fails closed
