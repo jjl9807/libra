@@ -1038,8 +1038,10 @@ fn similarity_budget_warning() {
             .as_array()
             .expect("warnings array")
             .iter()
-            .any(|w| w["code"] == "similarity_budget_exceeded"),
-        "budget exhaustion surfaces end to end: {doc}"
+            .any(|w| w["code"] == "similarity_budget_exceeded"
+                && w["message"].as_str().is_some_and(|message| message
+                    .contains("exact and already-scored unique-basename matches were kept"))),
+        "budget exhaustion surfaces end to end with survivor semantics: {doc}"
     );
 }
 

@@ -2054,18 +2054,55 @@ fn remove_durably(path: &Path) -> Result<(), StashError> {
 fn reconcile_stash_ref(storage: &Path) -> Result<bool, StashError> {
     let log_path = storage.join("logs/refs/stash");
     let ref_path = storage.join("refs/stash");
-    let recorded_tip = match fs::read_to_string(&ref_path) {
-        Ok(contents) => Some(contents.trim().to_string()),
+    // No-follow guards on BOTH paths before any read or repair: this binary
+    // only ever writes regular files here, so a symlink or directory is
+    // corruption (or tampering) — following it would read through
+    // uncontrolled indirection, and "repairing" it away would destroy the
+    // evidence. Fail closed instead; repair is only for states a crash of
+    // OUR writer can produce.
+    let recorded_tip = match fs::symlink_metadata(&ref_path) {
+        Ok(metadata) if metadata.is_file() => match fs::read_to_string(&ref_path) {
+            Ok(contents) => Some(contents.trim().to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(StashError::WriteObject(format!(
+                    "{}: {error}",
+                    ref_path.display()
+                )));
+            }
+        },
+        Ok(_) => {
+            return Err(StashError::ReadObject(format!(
+                "stash ref '{}' is not a regular file",
+                ref_path.display()
+            )));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
-            return Err(StashError::WriteObject(format!(
-                "{}: {error}",
+            return Err(StashError::ReadObject(format!(
+                "failed to inspect stash ref '{}': {error}",
                 ref_path.display()
             )));
         }
     };
 
-    if !log_path.exists() {
+    let log_present = match fs::symlink_metadata(&log_path) {
+        Ok(metadata) if metadata.is_file() => true,
+        Ok(_) => {
+            return Err(StashError::ReadObject(format!(
+                "stash log '{}' is not a regular file",
+                log_path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(StashError::ReadObject(format!(
+                "failed to inspect stash log '{}': {error}",
+                log_path.display()
+            )));
+        }
+    };
+    if !log_present {
         // No stack. A ref that outlived its log names an entry no `pop` can
         // ever find; `stash list` shows nothing while `refs/stash` claims a
         // tip, and a later push would chain onto a line that does not exist.

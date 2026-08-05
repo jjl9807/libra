@@ -919,7 +919,7 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<Status
         match read_value(key).await? {
             None => Ok(None),
             Some(value) => {
-                crate::internal::config::parse_git_config_int(&value.to_ascii_lowercase())
+                crate::internal::config::parse_git_config_int(&value.trim().to_ascii_lowercase())
                     .filter(|number| *number >= 0)
                     .and_then(|number| usize::try_from(number).ok())
                     .map(Some)
@@ -1946,9 +1946,15 @@ fn build_rename_side(
                 #[cfg(not(debug_assertions))]
                 let forced_vanish = false;
                 let stat_target = abs.clone();
-                let stat = crate::command::status_probe::with_io_deadline(move || {
-                    stat_target.symlink_metadata()
-                })
+                // Bounded by the SHARED batch window, not the standalone
+                // per-operation timeout: these preliminary stats are part of
+                // the same §B.3.4 batch as the content reads, and giving
+                // each its own 10s allowance would let snapshot construction
+                // alone outlive the 5s deadline (2026-08-05 R0-1 review).
+                let stat = crate::command::status_probe::with_io_deadline_bounded(
+                    worktree_budget.read_window(),
+                    move || stat_target.symlink_metadata(),
+                )
                 .unwrap_or_else(|()| Err(io::Error::new(io::ErrorKind::TimedOut, "reclaimed")));
                 let stat = if forced_vanish {
                     Err(io::Error::new(
@@ -2178,7 +2184,7 @@ fn warnings_from_rename_stats(
         warnings.push(StatusWarning {
             code: StatusWarningCode::SimilarityBudgetExceeded,
             message:
-                "rename detection discarded the inexact pass: similarity comparison budget exceeded"
+                "rename detection discarded the exhaustive inexact pass: similarity comparison budget exceeded; exact and already-scored unique-basename matches were kept"
                     .to_string(),
             source: StatusWarningCode::SimilarityBudgetExceeded.source(),
         });
@@ -7001,6 +7007,19 @@ mod test {
             warnings[1].code,
             StatusWarningCode::SimilarityBudgetExceeded
         ));
+        // Full-text pins: both degradation messages must name their
+        // SURVIVORS — the engine keeps exact and already-scored
+        // unique-basename pairs and discards only the exhaustive stage, and
+        // a rewording that claims the whole inexact pass was lost would
+        // misreport the output the user is looking at.
+        assert_eq!(
+            warnings[0].message,
+            "rename detection skipped the exhaustive inexact pass: too many candidates on one side (renameLimit); exact and unique-basename matches were kept"
+        );
+        assert_eq!(
+            warnings[1].message,
+            "rename detection discarded the exhaustive inexact pass: similarity comparison budget exceeded; exact and already-scored unique-basename matches were kept"
+        );
         assert!(
             warnings
                 .iter()

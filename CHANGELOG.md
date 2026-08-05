@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-1 cross-review, 2026-08-05)
+
+- **A symlink planted at `refs/stash` or `logs/refs/stash` now fails closed
+  instead of being silently "repaired" away.** `reconcile_stash_ref` read the
+  stash tip through a symlink-following `read_to_string` and, when the log
+  was absent, deleted whatever sat at the ref path — destroying the planted
+  symlink and letting `status`/`commit` report a clean stash where the
+  pinned contract demands `LBR-IO-001` (exit 128). Both paths now get
+  no-follow guards before any read or repair; repair remains only for
+  regular-file states the stash writer can actually produce.
+- **The rename-detection batch deadline now bounds the SEQUENCE of I/O
+  operations, not each operation from a stale entry window.** Both worktree
+  readers recompute the remaining window immediately before every
+  stat/readlink/read — including the LFS `.gitattributes` classification,
+  which previously ran outside any deadline and could hang the command on
+  a blocked attributes file — and the preliminary snapshot stats in
+  `status` run under the same shared batch window instead of their own
+  standalone 10s allowance, so a 5s batch can no longer run to a multiple
+  of itself. Pinned by `sequential_ops_share_the_batch_deadline` and the
+  two `lfs_classification_is_bounded_*` regressions.
+- **`libra status` and `libra diff` parse a padded integer config value
+  identically.** `status` handed the untrimmed value to the
+  pre-trimmed-only integer parser, so a stored `diff.renameLimit` of
+  `" 5 "` worked in `diff` but failed closed as a usage error in `status`.
+  Pinned by `padded_rename_limit_value_parses_in_both_commands`.
+- **The `similarity_budget_exceeded` warning names its survivors.** The
+  message claimed the whole inexact pass was discarded; only the exhaustive
+  stage is — exact and already-scored unique-basename matches are kept.
+  Message, EN/zh docs, and full-text pins updated.
+- **An over-cap symlink read charges the worktree budget.** The refusal
+  path returned `WorktreeTooLarge` without charging the readlink bytes
+  already pulled from the OS. Pinned by
+  `symlink_refusal_charges_the_worktree_budget`.
+
 ### Fixed (plan-20260714 W0 implementation review)
 
 - **An unconfirmed `worktree repair` no longer upgrades the repository schema

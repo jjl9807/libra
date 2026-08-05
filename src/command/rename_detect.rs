@@ -233,7 +233,8 @@ pub struct RenameDetectStats {
 /// Engine output.
 #[derive(Debug, Default)]
 pub struct RenameDetectOutcome {
-    /// Matched pairs, sorted by (old, new) path bytes.
+    /// Matched pairs, sorted by (old, new) path component order
+    /// (§B.4.2.5, 2026-08-05 revision).
     pub matches: Vec<RenameMatch>,
     pub stats: RenameDetectStats,
 }
@@ -257,7 +258,12 @@ pub fn match_pairs(
     let mut stats = RenameDetectStats::default();
     let mut matches: Vec<RenameMatch> = Vec::new();
 
-    // Deterministic path ordering: BTree keys compare as OsStr bytes.
+    // Deterministic path ordering: BTree keys compare with `Path`'s `Ord`,
+    // which is component-wise (each component by bytes) — not the raw path
+    // byte string. The distinction only matters when candidates diverge at
+    // a directory boundary against a byte below `/`; both diff and status
+    // share this one engine, so the realized order is identical across
+    // commands either way.
     let mut remaining_old: BTreeMap<&PathBuf, &BlobRef> = snapshot.old_map.iter().collect();
     let mut remaining_new: BTreeMap<&PathBuf, &BlobRef> = snapshot.new_map.iter().collect();
 
@@ -274,8 +280,9 @@ pub fn match_pairs(
         computed: BTreeSet<PathBuf>,
     }
     impl ExactBucket {
-        /// Smallest path (byte order) the old side may pair with, removed
-        /// from the bucket. A known old evidence pairs with any destination;
+        /// Smallest path (component order, §B.4.2.5 revision) the old side
+        /// may pair with, removed from the bucket. A known old evidence
+        /// pairs with any destination;
         /// a computed one pairs only with a known destination — C/C exact is
         /// forbidden (§B.4.1).
         fn pop_first_allowed(&mut self, old_known: bool) -> Option<PathBuf> {
@@ -358,7 +365,7 @@ pub fn match_pairs(
         }
     }
     // `remaining_old` is a BTreeMap, so both passes walk sources in path
-    // byte order without an extra sort.
+    // component order (§B.4.2.5 revision) without an extra sort.
     let old_keys: Vec<PathBuf> = remaining_old.keys().map(|p| (*p).clone()).collect();
     for same_basename_pass in [true, false] {
         for old_path in &old_keys {
@@ -530,9 +537,10 @@ pub fn match_pairs(
 
     // ---- Stage 5: bounded exhaustive inexact ------------------------------
     if !limit_skips && !budget_exhausted {
-        // Edge ordering (§B.4.2.5): score desc, same-basename first, then
-        // old/new path bytes ascending. `Reverse`-free: encode as a sortable
-        // tuple with inverted score.
+        // Edge ordering (§B.4.2.5, 2026-08-05 revision): score desc,
+        // same-basename first, then old/new paths ascending in `Path`
+        // component order. `Reverse`-free: encode as a sortable tuple with
+        // inverted score.
         #[derive(PartialEq, Eq, PartialOrd, Ord)]
         struct EdgeKey(u32, bool, PathBuf, PathBuf); // (60000-score, !same_basename, old, new)
 
@@ -929,6 +937,26 @@ pub(crate) struct WorktreeReadBudget {
 /// stat — the bounded read then pulls more bytes than the stat claimed,
 /// exactly as a growing file would, without the hook ever mutating the
 /// file. Gated on `LIBRA_TEST`; compiled out of release builds.
+/// Debug-only seam: sleep inside a worktree I/O operation so the §B.3.4
+/// batch-deadline tests can make one operation slow without a hung mount.
+/// Gated on `LIBRA_TEST` like every seam in this family; named per
+/// operation so the stat and the content read can be slowed independently.
+/// Compiled out of release builds.
+#[cfg(debug_assertions)]
+fn test_op_delay(var: &str) {
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+        return;
+    }
+    if let Ok(value) = std::env::var(var)
+        && let Ok(milliseconds) = value.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_op_delay(_var: &str) {}
+
 #[cfg(debug_assertions)]
 fn stale_stat_len_for_test(path: &Path, real_len: u64) -> u64 {
     if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
@@ -1009,7 +1037,12 @@ impl WorktreeReadBudget {
     /// run to 15s while every individual read looked compliant. The tighter
     /// of the two bounds wins, and a batch with nothing left yields zero —
     /// which the I/O helper refuses outright.
-    fn read_window(&self) -> Duration {
+    /// Recomputed IMMEDIATELY BEFORE every individual operation: a window
+    /// captured once per call and reused would hand each later operation the
+    /// time an earlier slow one already spent, so a 5s batch could run to a
+    /// multiple of itself while every individual operation looked compliant
+    /// (2026-08-05 R0-1 review).
+    pub(crate) fn read_window(&self) -> Duration {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         remaining.min(crate::command::status_probe::io_op_timeout())
     }
@@ -1020,31 +1053,48 @@ impl WorktreeReadBudget {
         if !self.take_task() {
             return ContentOutcome::Skipped(SkipReason::WorktreeBudgetExceeded);
         }
-        // Bound EVERY read below by what is left of the batch, not just the
-        // per-operation default — see `read_window`.
-        let window = self.read_window();
         // Deadline-guarded: an optional content read must never wedge the
-        // command on a hung mount.
+        // command on a hung mount. Every operation below re-reads the
+        // remaining batch window — see `read_window`.
         let stat_target = abs_path.to_path_buf();
-        let metadata =
-            match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+        let metadata = match crate::command::status_probe::with_io_deadline_bounded(
+            self.read_window(),
+            move || {
+                test_op_delay("LIBRA_TEST_SLOW_WORKTREE_STAT_MS");
                 stat_target.symlink_metadata()
-            }) {
-                Ok(Ok(metadata)) => metadata,
-                Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
-                Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
-            };
+            },
+        ) {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(_)) => return ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
+            Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
+        };
         if metadata.file_type().is_symlink() {
             let link_target = abs_path.to_path_buf();
-            return match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                super::read_symlink_blob_bytes(&link_target)
-            }) {
+            return match crate::command::status_probe::with_io_deadline_bounded(
+                self.read_window(),
+                move || super::read_symlink_blob_bytes(&link_target),
+            ) {
                 Ok(Ok(bytes)) => self.account(bytes),
                 Ok(Err(_)) => ContentOutcome::Skipped(SkipReason::WorktreeIoFailed),
                 Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
             };
         }
-        if crate::utils::lfs::is_lfs_tracked(abs_path) {
+        // LFS classification reads `.gitattributes` files, so it is I/O
+        // like any other operation here and runs under a freshly computed
+        // batch window — a blocked attributes file must cost the candidate,
+        // not hang the command (2026-08-05 R0-1 review).
+        let attributes_path = abs_path.to_path_buf();
+        let is_lfs = match crate::command::status_probe::with_io_deadline_bounded(
+            self.read_window(),
+            move || {
+                test_op_delay("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS");
+                crate::utils::lfs::is_lfs_tracked(&attributes_path)
+            },
+        ) {
+            Ok(is_lfs) => is_lfs,
+            Err(()) => return ContentOutcome::Skipped(SkipReason::IoTimeout),
+        };
+        if is_lfs {
             // The budget covers hydrated bytes, not pointer length (§B.9
             // lfs_budget_counts_hydrated_bytes): charge the on-disk size.
             if metadata.len() > self.per_file_cap.min(self.remaining_total) {
@@ -1056,9 +1106,10 @@ impl WorktreeReadBudget {
             // grows) and the run is reclaimable on a hung mount.
             let cap = self.per_file_cap.min(self.remaining_total);
             let lfs_path = abs_path.to_path_buf();
-            return match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                crate::utils::lfs::generate_pointer_file_bounded(&lfs_path, cap)
-            }) {
+            return match crate::command::status_probe::with_io_deadline_bounded(
+                self.read_window(),
+                move || crate::utils::lfs::generate_pointer_file_bounded(&lfs_path, cap),
+            ) {
                 Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
                 // Charge the bytes the read ACTUALLY consumed, not the stat
                 // length: a file that grew in between would otherwise get the
@@ -1084,16 +1135,18 @@ impl WorktreeReadBudget {
         // budget, and run it under the shared I/O deadline so a hung mount
         // reclaims the run instead of blocking `status` forever.
         let path = abs_path.to_path_buf();
-        let outcome = crate::command::status_probe::with_io_deadline_bounded(window, move || {
-            use std::io::Read as _;
+        let outcome =
+            crate::command::status_probe::with_io_deadline_bounded(self.read_window(), move || {
+                use std::io::Read as _;
 
-            let mut file = std::fs::File::open(&path)?;
-            let mut bytes = Vec::new();
-            file.by_ref()
-                .take(cap.saturating_add(1))
-                .read_to_end(&mut bytes)?;
-            Ok::<Vec<u8>, std::io::Error>(bytes)
-        });
+                test_op_delay("LIBRA_TEST_SLOW_WORKTREE_READ_MS");
+                let mut file = std::fs::File::open(&path)?;
+                let mut bytes = Vec::new();
+                file.by_ref()
+                    .take(cap.saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                Ok::<Vec<u8>, std::io::Error>(bytes)
+            });
         match outcome {
             Err(()) => ContentOutcome::Skipped(SkipReason::IoTimeout),
             Ok(Ok(bytes)) => self.account(bytes),
@@ -1129,30 +1182,38 @@ impl WorktreeReadBudget {
         if !self.take_task() {
             return Err(SkipReason::WorktreeBudgetExceeded);
         }
-        let window = self.read_window();
         // Deadline-guarded like every other worktree read: a stat that hangs
-        // must reclaim the caller and skip the candidate.
+        // must reclaim the caller and skip the candidate. Every operation
+        // re-reads the remaining batch window — see `read_window`.
         let stat_target = abs_path.to_path_buf();
-        let metadata =
-            match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+        let metadata = match crate::command::status_probe::with_io_deadline_bounded(
+            self.read_window(),
+            move || {
+                test_op_delay("LIBRA_TEST_SLOW_WORKTREE_STAT_MS");
                 stat_target.symlink_metadata()
-            }) {
-                Ok(Ok(metadata)) => metadata,
+            },
+        ) {
+            Ok(Ok(metadata)) => metadata,
+            Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+            Err(()) => return Err(SkipReason::IoTimeout),
+        };
+        if metadata.file_type().is_symlink() {
+            let link_target = abs_path.to_path_buf();
+            let bytes = match crate::command::status_probe::with_io_deadline_bounded(
+                self.read_window(),
+                move || super::read_symlink_blob_bytes(&link_target),
+            ) {
+                Ok(Ok(bytes)) => bytes,
                 Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
                 Err(()) => return Err(SkipReason::IoTimeout),
             };
-        if metadata.file_type().is_symlink() {
-            let link_target = abs_path.to_path_buf();
-            let bytes =
-                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                    super::read_symlink_blob_bytes(&link_target)
-                }) {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-                    Err(()) => return Err(SkipReason::IoTimeout),
-                };
             let len = bytes.len() as u64;
             if len > self.per_file_cap.min(self.remaining_total) {
+                // The target bytes were already pulled from the OS: charge
+                // them even on refusal, like the sibling symlink branch in
+                // `read_worktree_blob`, so an over-cap readlink is never
+                // free I/O.
+                self.remaining_total = self.remaining_total.saturating_sub(len);
                 return Err(SkipReason::WorktreeTooLarge);
             }
             self.remaining_total = self.remaining_total.saturating_sub(len);
@@ -1166,26 +1227,39 @@ impl WorktreeReadBudget {
         // Both regular-content branches below produce the blob from bytes
         // pulled through an open that FOLLOWS symlinks, so the kind is
         // re-stated AFTER the read (see the tail of this function).
-        let (oid, len) = if crate::utils::lfs::is_lfs_tracked(abs_path) {
+        // LFS classification reads `.gitattributes` — bounded like every
+        // other operation (2026-08-05 R0-1 review).
+        let attributes_path = abs_path.to_path_buf();
+        let is_lfs = match crate::command::status_probe::with_io_deadline_bounded(
+            self.read_window(),
+            move || {
+                test_op_delay("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS");
+                crate::utils::lfs::is_lfs_tracked(&attributes_path)
+            },
+        ) {
+            Ok(is_lfs) => is_lfs,
+            Err(()) => return Err(SkipReason::IoTimeout),
+        };
+        let (oid, len) = if is_lfs {
             // The POINTER is tiny, but producing it requires a full-file
             // SHA-256, so this read needs the same deadline as any other:
             // the size cap above already rejected anything over the
             // per-file budget, and the deadline covers a hung mount.
             let pointer_path = abs_path.to_path_buf();
-            let (pointer, read) =
-                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                    crate::utils::lfs::generate_pointer_file_bounded(&pointer_path, cap)
-                }) {
-                    Err(()) => return Err(SkipReason::IoTimeout),
-                    Ok(Ok((Some((pointer, _)), read))) => (pointer, read),
-                    // Over the cap, or the file changed size mid-read. Charge the
-                    // attempt anyway — see the note on the success path below.
-                    Ok(Ok((None, read))) => {
-                        self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                        return Err(SkipReason::WorktreeTooLarge);
-                    }
-                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-                };
+            let (pointer, read) = match crate::command::status_probe::with_io_deadline_bounded(
+                self.read_window(),
+                move || crate::utils::lfs::generate_pointer_file_bounded(&pointer_path, cap),
+            ) {
+                Err(()) => return Err(SkipReason::IoTimeout),
+                Ok(Ok((Some((pointer, _)), read))) => (pointer, read),
+                // Over the cap, or the file changed size mid-read. Charge the
+                // attempt anyway — see the note on the success path below.
+                Ok(Ok((None, read))) => {
+                    self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
+                    return Err(SkipReason::WorktreeTooLarge);
+                }
+                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+            };
             // `read` is the hash's real consumption; `metadata.len()` is a
             // pre-read stat a growing file can make stale.
             self.remaining_total = self.remaining_total.saturating_sub(read);
@@ -1198,22 +1272,25 @@ impl WorktreeReadBudget {
             // an unbounded hash of a now-huge file would blow the read budget
             // it was supposed to respect.
             let hash_path = abs_path.to_path_buf();
-            let (oid, read) =
-                match crate::command::status_probe::with_io_deadline_bounded(window, move || {
+            let (oid, read) = match crate::command::status_probe::with_io_deadline_bounded(
+                self.read_window(),
+                move || {
+                    test_op_delay("LIBRA_TEST_SLOW_WORKTREE_READ_MS");
                     super::stream_file_blob_hash_bounded(&hash_path, cap)
-                }) {
-                    Err(()) => return Err(SkipReason::IoTimeout),
-                    Ok(Ok((Some(oid), read))) => (oid, read),
-                    // Over the cap, or the file changed size mid-read: skip the
-                    // candidate rather than trust a hash of a moving target — but
-                    // still charge the bytes the attempt cost, or a growth race
-                    // would give an attacker unlimited free reads.
-                    Ok(Ok((None, read))) => {
-                        self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
-                        return Err(SkipReason::WorktreeTooLarge);
-                    }
-                    Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-                };
+                },
+            ) {
+                Err(()) => return Err(SkipReason::IoTimeout),
+                Ok(Ok((Some(oid), read))) => (oid, read),
+                // Over the cap, or the file changed size mid-read: skip the
+                // candidate rather than trust a hash of a moving target — but
+                // still charge the bytes the attempt cost, or a growth race
+                // would give an attacker unlimited free reads.
+                Ok(Ok((None, read))) => {
+                    self.remaining_total = self.remaining_total.saturating_sub(read.max(cap));
+                    return Err(SkipReason::WorktreeTooLarge);
+                }
+                Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+            };
             // Charge and report what the read ACTUALLY consumed. `metadata.len()`
             // is a pre-read stat, and a file that grew in between would otherwise
             // have the larger read billed at the smaller stale price.
@@ -1231,15 +1308,15 @@ impl WorktreeReadBudget {
         // path-level TOCTOU accepted for R0; fd-bound resolution is tracked
         // by plan-20260715 WIO-02.
         let restat_path = abs_path.to_path_buf();
-        let observed =
-            match crate::command::status_probe::with_io_deadline_bounded(window, move || {
-                restat_path.symlink_metadata()
-            }) {
-                Ok(Ok(meta)) if meta.file_type().is_symlink() => BlobKind::Symlink,
-                Ok(Ok(meta)) if meta.file_type().is_file() => BlobKind::Regular,
-                Ok(Ok(_)) | Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
-                Err(()) => return Err(SkipReason::IoTimeout),
-            };
+        let observed = match crate::command::status_probe::with_io_deadline_bounded(
+            self.read_window(),
+            move || restat_path.symlink_metadata(),
+        ) {
+            Ok(Ok(meta)) if meta.file_type().is_symlink() => BlobKind::Symlink,
+            Ok(Ok(meta)) if meta.file_type().is_file() => BlobKind::Regular,
+            Ok(Ok(_)) | Ok(Err(_)) => return Err(SkipReason::WorktreeIoFailed),
+            Err(()) => return Err(SkipReason::IoTimeout),
+        };
         Ok((oid, len, observed))
     }
 }
@@ -1392,8 +1469,9 @@ mod tests {
     fn exact_duplicate_hash_order_stable() {
         let data = b"dup\n";
         let blob = || regular(known(data), data.len() as u64);
-        // Two identical sources, two identical destinations — pairing must be
-        // deterministic by path byte order regardless of map iteration.
+        // Two identical sources, two identical destinations — pairing must
+        // be deterministic in path component order (§B.4.2.5 revision)
+        // regardless of map iteration.
         let snap = snapshot(
             &[("b_old", blob()), ("a_old", blob())],
             &[("d_new", blob()), ("c_new", blob())],
@@ -1902,9 +1980,12 @@ mod tests {
     }
 
     #[test]
-    fn tie_break_is_deterministic_by_path_bytes() {
+    fn tie_break_is_deterministic_by_path_component_order() {
         // Two sources with identical content compete for two identical
-        // destinations: ties must resolve old↑ then new↑ by path bytes.
+        // destinations: ties must resolve old↑ then new↑ in `Path`
+        // component order (§B.4.2.5, 2026-08-05 revision; these fixtures
+        // order identically under raw bytes — the component-boundary
+        // distinction is pinned separately below).
         let bytes = b"tie tie tie tie\n".to_vec();
         let snap = snapshot(
             &[
@@ -1929,6 +2010,105 @@ mod tests {
         assert_eq!(outcome.matches[0].new, PathBuf::from("n/c"));
         assert_eq!(outcome.matches[1].old, PathBuf::from("o/b"));
         assert_eq!(outcome.matches[1].new, PathBuf::from("n/d"));
+    }
+
+    /// §B.4.2.5 (2026-08-05 revision) distinguishing pin, EXACT stage: the
+    /// path order is `Path` COMPONENT order, which differs from raw path
+    /// bytes exactly when candidates diverge at a directory boundary
+    /// against a byte below `/`: raw bytes order `a-b/x` before `a/x`
+    /// (`-` = 0x2D < `/` = 0x2F), component order puts `a/x` first
+    /// (`a` < `a-b`). The same-basename exact pass consumes sources in
+    /// path order, so the winner pins which order is normative.
+    #[test]
+    fn exact_selection_uses_component_order_at_directory_boundaries() {
+        let bytes = b"same exact content\n".to_vec();
+        let oid = oid_of(&bytes);
+        let blob = || regular(BlobEvidence::KnownObjectId { oid }, bytes.len() as u64);
+        let snap = snapshot(&[("a-b/x", blob()), ("a/x", blob())], &[("dest/x", blob())]);
+        let mut source = MapSource::new();
+        let outcome = match_pairs(&snap, &config(30000), &mut source);
+        assert_eq!(outcome.matches.len(), 1);
+        assert_eq!(
+            outcome.matches[0].old,
+            PathBuf::from("a/x"),
+            "component order (a < a-b) is normative, not raw bytes (a-b/x < a/x)"
+        );
+    }
+
+    /// §B.4.2.5 (2026-08-05 revision) distinguishing pin, EXACT stage on
+    /// the DESTINATION side: one source, two identical destinations that
+    /// diverge at the component boundary — the bucket's
+    /// `pop_first_allowed` must hand out `a/x`, not the raw-byte-first
+    /// `a-b/x`.
+    #[test]
+    fn exact_destination_uses_component_order_at_directory_boundaries() {
+        let bytes = b"same exact content\n".to_vec();
+        let oid = oid_of(&bytes);
+        let blob = || regular(BlobEvidence::KnownObjectId { oid }, bytes.len() as u64);
+        let snap = snapshot(&[("src/x", blob())], &[("a-b/x", blob()), ("a/x", blob())]);
+        let mut source = MapSource::new();
+        let outcome = match_pairs(&snap, &config(30000), &mut source);
+        assert_eq!(outcome.matches.len(), 1);
+        assert_eq!(
+            outcome.matches[0].new,
+            PathBuf::from("a/x"),
+            "the destination bucket resolves in component order too"
+        );
+    }
+
+    /// §B.4.2.5 (2026-08-05 revision) distinguishing pin, EXHAUSTIVE
+    /// stage: same component-boundary fixture, driven through the inexact
+    /// edge tie-break (both edges tie on score and same-basename, so the
+    /// old-path order alone decides).
+    #[test]
+    fn exhaustive_tie_break_uses_component_order_at_directory_boundaries() {
+        let bytes = b"tie tie tie tie\n".to_vec();
+        let snap = snapshot(
+            &[
+                ("a-b/x", regular(BlobEvidence::Unknown, bytes.len() as u64)),
+                ("a/x", regular(BlobEvidence::Unknown, bytes.len() as u64)),
+            ],
+            &[("n/x", regular(BlobEvidence::Unknown, bytes.len() as u64))],
+        );
+        let mut source = MapSource::new();
+        for p in ["a-b/x", "a/x"] {
+            source.old.insert(PathBuf::from(p), bytes.clone());
+        }
+        source.new.insert(PathBuf::from("n/x"), bytes.clone());
+        let outcome = match_pairs(&snap, &config(30000), &mut source);
+        assert_eq!(outcome.matches.len(), 1);
+        assert_eq!(
+            outcome.matches[0].old,
+            PathBuf::from("a/x"),
+            "the exhaustive tie-break resolves in component order"
+        );
+    }
+
+    /// §B.4.2.5 (2026-08-05 revision) distinguishing pin, EXHAUSTIVE
+    /// stage on the NEW side: one source, two identical destinations tying
+    /// on score and same-basename, so the new-path order alone decides.
+    #[test]
+    fn exhaustive_new_side_tie_break_uses_component_order() {
+        let bytes = b"tie tie tie tie\n".to_vec();
+        let snap = snapshot(
+            &[("src/x", regular(BlobEvidence::Unknown, bytes.len() as u64))],
+            &[
+                ("a-b/x", regular(BlobEvidence::Unknown, bytes.len() as u64)),
+                ("a/x", regular(BlobEvidence::Unknown, bytes.len() as u64)),
+            ],
+        );
+        let mut source = MapSource::new();
+        source.old.insert(PathBuf::from("src/x"), bytes.clone());
+        for p in ["a-b/x", "a/x"] {
+            source.new.insert(PathBuf::from(p), bytes.clone());
+        }
+        let outcome = match_pairs(&snap, &config(30000), &mut source);
+        assert_eq!(outcome.matches.len(), 1);
+        assert_eq!(
+            outcome.matches[0].new,
+            PathBuf::from("a/x"),
+            "the new-side exhaustive tie-break resolves in component order"
+        );
     }
 
     #[test]
@@ -2143,6 +2323,127 @@ mod tests {
             budget.remaining_total,
             total - read,
             "the budget was charged {read} bytes, not the stale 4"
+        );
+    }
+
+    /// 2026-08-05 R0-1 review: a symlink whose target exceeds the remaining
+    /// worktree budget is refused as `WorktreeTooLarge`, but the target
+    /// bytes were already pulled from the OS — the refusal must charge
+    /// them, like the sibling branch in `read_worktree_blob`, so an
+    /// over-cap readlink is never I/O the ledger does not see.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_refusal_charges_the_worktree_budget() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("over.link");
+        std::os::unix::fs::symlink("0123456789", &link).expect("symlink");
+
+        let mut budget = WorktreeReadBudget::new(1024, 4, 8, Duration::from_secs(30));
+        let refused = budget.worktree_blob_oid_and_size(&link);
+        assert!(
+            matches!(refused, Err(SkipReason::WorktreeTooLarge)),
+            "a 10-byte target cannot fit a 4-byte remaining budget"
+        );
+        assert_eq!(
+            budget.remaining_total, 0,
+            "the readlink bytes are charged (saturating) even on refusal"
+        );
+    }
+
+    /// 2026-08-05 R0-1 review: the batch deadline bounds the SEQUENCE of
+    /// operations inside one read, not each operation from the same stale
+    /// entry window. A stat that eats most of the batch leaves the content
+    /// read only the remainder; reusing the entry window would let a 5s
+    /// batch run to a multiple of itself while every individual operation
+    /// looked compliant.
+    #[test]
+    #[serial_test::serial]
+    fn sequential_ops_share_the_batch_deadline() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("slow.txt");
+        std::fs::write(&path, b"content").expect("write fixture");
+
+        // SAFETY: serialized via `serial`; the seam gate mirrors the
+        // stale-stat test above.
+        unsafe {
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            std::env::set_var("LIBRA_TEST_SLOW_WORKTREE_STAT_MS", "400");
+            std::env::set_var("LIBRA_TEST_SLOW_WORKTREE_READ_MS", "400");
+        }
+        let mut budget = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(600));
+        let outcome = budget.read_worktree_blob(&path);
+        unsafe {
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            std::env::remove_var("LIBRA_TEST_SLOW_WORKTREE_STAT_MS");
+            std::env::remove_var("LIBRA_TEST_SLOW_WORKTREE_READ_MS");
+        }
+        assert!(
+            matches!(outcome, ContentOutcome::Skipped(SkipReason::IoTimeout)),
+            "a 400ms stat must leave the 400ms read too little of the 600ms batch"
+        );
+    }
+
+    /// 2026-08-05 R0-1 review: LFS classification reads `.gitattributes`,
+    /// so it is I/O like any other operation — a blocked attributes lookup
+    /// must cost the candidate (`IoTimeout`), not hang the command past
+    /// the batch deadline. The seam stands in for a FIFO/hung-mount
+    /// attributes file.
+    #[test]
+    #[serial_test::serial]
+    fn lfs_classification_is_bounded_by_the_batch_deadline() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("classified.txt");
+        std::fs::write(&path, b"content").expect("write fixture");
+
+        // SAFETY: serialized via `serial`; same gate as the seams above.
+        unsafe {
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            std::env::set_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS", "500");
+        }
+        let mut budget = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(200));
+        let outcome = budget.read_worktree_blob(&path);
+        unsafe {
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            std::env::remove_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS");
+        }
+        assert!(
+            matches!(outcome, ContentOutcome::Skipped(SkipReason::IoTimeout)),
+            "a blocked attributes lookup must be reclaimed by the batch deadline"
+        );
+    }
+
+    /// Mirror of the pin above for the exact-stage reader: the
+    /// `worktree_blob_oid_and_size` path used by status's exact gate must
+    /// bound its LFS classification by the batch deadline too.
+    #[test]
+    #[serial_test::serial]
+    fn lfs_classification_is_bounded_on_the_oid_path_too() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("classified.txt");
+        std::fs::write(&path, b"content").expect("write fixture");
+
+        // SAFETY: serialized via `serial`; same gate as the seams above.
+        unsafe {
+            std::env::set_var(crate::utils::pager::LIBRA_TEST_ENV, "1");
+            std::env::set_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS", "500");
+        }
+        let mut budget = WorktreeReadBudget::new(1024, 1024, 8, Duration::from_millis(200));
+        let outcome = budget.worktree_blob_oid_and_size(&path);
+        unsafe {
+            std::env::remove_var(crate::utils::pager::LIBRA_TEST_ENV);
+            std::env::remove_var("LIBRA_TEST_SLOW_LFS_ATTRIBUTES_MS");
+        }
+        assert!(
+            matches!(outcome, Err(SkipReason::IoTimeout)),
+            "a blocked attributes lookup must be reclaimed on the OID path"
         );
     }
 

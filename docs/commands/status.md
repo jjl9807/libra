@@ -248,7 +248,7 @@ other subsystems are folded into the same list (see below):
 | Code | Source | Meaning |
 |------|--------|---------|
 | `rename_limit_product_skipped` | `rename_detect` | One side exceeded the per-side rename limit; the exhaustive inexact stage was skipped |
-| `similarity_budget_exceeded` | `rename_detect` | The similarity-comparison budget was exhausted; the inexact pass was discarded |
+| `similarity_budget_exceeded` | `rename_detect` | The similarity-comparison budget was exhausted; only the exhaustive inexact pass was discarded — exact and already-scored unique-basename matches were kept |
 | `probe_truncated` | `probe` | The rename-destination probe tripped its enumeration/destination budget; pairing is partial |
 | `rename_path_encoding_unsupported` | `rename_detect` | Candidates with non-UTF-8 names sat out rename scoring (base `??`/`D` rows unaffected) |
 | `metadata_unavailable` | `metadata` | Repository objects missing, corrupt, or unavailable; the dependent inexact candidates were skipped |

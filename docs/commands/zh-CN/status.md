@@ -131,7 +131,7 @@ libra status --find-renames=75
 | Code | Source | 含义 |
 |------|--------|------|
 | `rename_limit_product_skipped` | `rename_detect` | 单侧超过 per-side rename 上限；跳过 exhaustive inexact 阶段 |
-| `similarity_budget_exceeded` | `rename_detect` | 相似度比较预算耗尽；inexact 阶段被丢弃 |
+| `similarity_budget_exceeded` | `rename_detect` | 相似度比较预算耗尽；仅丢弃穷举 inexact 阶段——exact 与已评分的 unique-basename 配对保留 |
 | `probe_truncated` | `probe` | rename destination probe 触顶（枚举/目的地预算）；配对为部分结果 |
 | `rename_path_encoding_unsupported` | `rename_detect` | 非 UTF-8 名字的候选不参与 rename 评分（基础 `??`/`D` 行不受影响） |
 | `metadata_unavailable` | `metadata` | 仓库对象缺失、损坏或不可用；依赖它的 inexact 候选被跳过 |
