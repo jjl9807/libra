@@ -2312,6 +2312,34 @@ fn short_non_utf8_quote_path_false_writes_raw_high_bytes() {
     );
 }
 
+/// §B.4.3: `--null` AFTER the `--` separator is a pathspec, never a format
+/// flag — the normalize window and clap's escape both stop at `--`. (§B.9
+/// spec-named test that was never written; added 2026-08-05 R0-4 review.)
+#[test]
+fn null_after_separator_ignored() {
+    let repo = create_repo_with_committed_file("a.txt", "content\n");
+    fs::write(repo.path().join("a.txt"), "changed\n").unwrap();
+    // A literal FILE named `--null`: the token after `--` must reach the
+    // pathspec filter (matching this file, excluding a.txt), proving it
+    // was propagated as a pathspec rather than dropped or read as a flag.
+    fs::write(repo.path().join("--null"), "pathspec target\n").unwrap();
+    let out = run_libra_command(&["status", "--", "--null"], repo.path());
+    assert_cli_success(&out, "a pathspec spelled --null parses");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.stdout.contains(&0u8),
+        "no NUL separators — the token was a pathspec, not a format flag: {text:?}"
+    );
+    assert!(
+        text.contains("--null"),
+        "the untracked file named --null matches its own pathspec: {text}"
+    );
+    assert!(
+        !text.contains("a.txt"),
+        "the modified a.txt is excluded by the pathspec filter: {text}"
+    );
+}
+
 // ── R0-4 residuals: cluster/value safety pins (§B.4.3) ───────────────────────
 
 /// A global short option's ATTACHED value must never leak letters into

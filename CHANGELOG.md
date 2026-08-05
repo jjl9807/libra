@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-4 cross-review, 2026-08-06)
+
+- **`--find-renames` raw scores parse exactly like Git.** The score parser
+  is now a faithful port of Git's `parse_num`: precision stops at five
+  significant digits — `0.000019` is score 0 and therefore the 50% default,
+  never a near-zero threshold that would pair almost anything — and the
+  digitless zero forms (``, `%`, `.`, `.%`) parse to the default like Git
+  instead of erroring. Pinned by `rename_score_matches_git_parse_num`.
+- **The status API percent field rejects out-of-range values.**
+  `find_renames: Option<u8>` silently clamped 101..=255 to exact-only; the
+  clap parser path (value range 0..=100) and the resolver (struct-literal
+  path, `LBR-CLI-002`) both fail closed now. Pinned by
+  `api_percent_above_100_fails_closed`.
+- **`status -- --null` proves pathspec propagation.** The spec-named
+  `null_after_separator_ignored` regression now exists (it was a phantom
+  name — the file named `--null` must match its own pathspec while the
+  modified sibling is excluded); several stale §B.4.3/§B.9 test names were
+  synced to the real manifest names.
+
 ### Fixed (plan-20260714 R0-3 cross-review, 2026-08-05)
 
 - **A directory listing that breaks part-way no longer claims a complete

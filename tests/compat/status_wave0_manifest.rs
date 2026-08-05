@@ -74,6 +74,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "non_utf8_arguments_do_not_abort_the_process",
     "non_utf8_path_skips_rename_not_status",
     "normalize_ignores_diff_pathspec_status",
+    "null_after_separator_ignored",
     "object_fault_warning_is_deduplicated_across_both_sides",
     "object_read_budget_exceeded_skips_inexact_only",
     "object_read_corrupt_blob_skips_inexact_only",

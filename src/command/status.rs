@@ -184,7 +184,8 @@ pub struct StatusArgs {
         value_name = "PERCENT",
         num_args = 0..=1,
         default_missing_value = "50",
-        overrides_with = "find_renames"
+        overrides_with = "find_renames",
+        value_parser = clap::value_parser!(u8).range(..=100)
     )]
     pub find_renames: Option<u8>,
 
@@ -651,7 +652,18 @@ pub(crate) fn resolve_status_threshold(
     Ok(if args.no_renames {
         None
     } else if let Some(percent) = args.find_renames {
-        Some(u32::from(percent).min(100) * 600)
+        // §B.4.3: the API percent field accepts ONLY 0..=100. clap's range
+        // guard covers the parser path; a struct-literal caller bypasses
+        // clap, so the resolver validates too — silently clamping 101..255
+        // to exact-only would misreport what the caller asked for.
+        if percent > 100 {
+            return Err(CliError::command_usage(format!(
+                "invalid rename threshold percentage '{percent}' (expected 0-100)"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("pass a similarity percentage between 0 and 100"));
+        }
+        Some(u32::from(percent) * 600)
     } else if args.renames {
         Some(30000)
     } else {
@@ -6826,6 +6838,37 @@ mod argv_normalization_test {
             resolution.argv[3],
             std::ffi::OsString::from("--find-renames=505")
         );
+    }
+
+    /// §B.4.3: the API percent field accepts ONLY 0..=100 — a struct-literal
+    /// caller passing 101..=255 fails closed with LBR-CLI-002 instead of a
+    /// silent clamp to exact-only, and the clap parser path refuses the
+    /// value outright (2026-08-05 R0-4 review).
+    #[test]
+    fn api_percent_above_100_fails_closed() {
+        use clap::Parser as _;
+
+        let args = StatusArgs {
+            find_renames: Some(101),
+            ..Default::default()
+        };
+        let err = resolve_status_threshold(&args, None).expect_err("101% is out of range");
+        assert_eq!(err.stable_code(), StableErrorCode::CliInvalidArguments);
+
+        assert!(
+            StatusArgs::try_parse_from(["status", "--find-renames=101"]).is_err(),
+            "clap's range guard refuses 101 on the parser path"
+        );
+
+        let full = resolve_status_threshold(
+            &StatusArgs {
+                find_renames: Some(100),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("100% stays valid");
+        assert_eq!(full, Some(60000), "100% means exact-only, not an error");
     }
 }
 
