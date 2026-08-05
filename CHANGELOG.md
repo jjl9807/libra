@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-6 cross-review, 2026-08-06)
+
+- **Rename-aware short and porcelain v1 rows keep the source's staged
+  state.** An unstaged rename whose source carried a staged change printed
+  a space-staged ` R old -> new`, erasing the `M`/`A` component porcelain
+  v2 derives; the shared `ShortStatusEntry` builder now derives it the same
+  way (`MR`/`AR`). Pinned by `short_rename_keeps_staged_source_component`.
+- The `io_blocked[].rename` JSON object now escapes its `from`/`to` paths
+  losslessly like every other JSON path field (was `display()`-lossy for
+  non-UTF-8 pairs — latent, since staged pairs currently require UTF-8
+  index paths).
+
 ### Fixed (plan-20260714 R0-5 cross-review, 2026-08-06)
 
 - **Porcelain v2 non-rename rows keep their real metadata from a

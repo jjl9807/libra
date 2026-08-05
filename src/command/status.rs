@@ -4692,9 +4692,13 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
                     .get(pair)
                     .map(|(pct, _)| *pct)
                     .unwrap_or(100);
+                // Lossless like every other JSON path in the payload —
+                // `display()` would U+FFFD-corrupt a non-UTF-8 pair
+                // (2026-08-06 R0-6 review; latent, since staged pairs
+                // currently require addable UTF-8 index paths).
                 serde_json::json!({
-                    "from": pair.0.display().to_string(),
-                    "to": pair.1.display().to_string(),
+                    "from": json_path_string(&pair.0, quote),
+                    "to": json_path_string(&pair.1, quote),
                     "score": score,
                 })
             })
@@ -5670,10 +5674,22 @@ pub(crate) fn generate_short_status_entries_with_unmerged(
     for (old, new) in &unstaged.renamed {
         endpoints.insert(old.clone());
         endpoints.insert(new.clone());
+        // The suppressed source row is the only carrier of the SOURCE's
+        // staged state: a staged-modify→worktree-rename is `MR`, a
+        // staged-add→worktree-rename `AR` — hard-coding a space here
+        // erased that component while porcelain v2 derived it correctly
+        // (2026-08-06 R0-6 review, mirroring the v2 derivation).
+        let staged_char = if staged.modified.contains(old) {
+            'M'
+        } else if staged.new.contains(old) {
+            'A'
+        } else {
+            ' '
+        };
         entries.push(ShortStatusEntry::Rename {
             old: old.clone(),
             new: new.clone(),
-            staged: ' ',
+            staged: staged_char,
             unstaged: 'R',
         });
     }

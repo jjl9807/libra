@@ -164,6 +164,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "short_forced_color_keeps_raw_high_bytes_with_quote_path_false",
     "short_non_utf8_quote_path_false_writes_raw_high_bytes",
     "short_quote_path_core_false",
+    "short_rename_keeps_staged_source_component",
     "short_z_rename_record_is_raw_new_then_old",
     "similarity_budget_warning",
     "st_bare_z_emits_porcelain_v1",

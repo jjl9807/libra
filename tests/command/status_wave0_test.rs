@@ -2324,6 +2324,49 @@ fn short_non_utf8_quote_path_false_writes_raw_high_bytes() {
     );
 }
 
+/// §B.6.0.1: an unstaged rename whose SOURCE carries a staged change keeps
+/// that component on the rename-aware short/porcelain-v1 rows — `MR`/`AR`
+/// `old -> new`, never a space-staged ` R` that erases the state porcelain
+/// v2 derives correctly (2026-08-06 R0-6 review; mirrors the v2 MR pin).
+#[test]
+fn short_rename_keeps_staged_source_component() {
+    let repo = create_repo_with_committed_file("a.txt", "one\ntwo\nthree\n");
+    enable_rename_untracked(repo.path());
+    fs::write(repo.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    let add = run_libra_command(&["add", "a.txt"], repo.path());
+    assert_cli_success(&add, "stage the modification");
+    fs::rename(repo.path().join("a.txt"), repo.path().join("b.txt")).unwrap();
+
+    let short = status_stdout(repo.path(), &["status", "--short"]);
+    assert!(
+        short
+            .lines()
+            .any(|line| line.starts_with("MR") && line.contains("a.txt -> b.txt")),
+        "short keeps the staged M on the rename row: {short}"
+    );
+    let v1 = status_stdout(repo.path(), &["status", "--porcelain"]);
+    assert!(
+        v1.lines()
+            .any(|line| line.starts_with("MR") && line.contains("a.txt -> b.txt")),
+        "porcelain v1 keeps the staged M: {v1}"
+    );
+
+    // AR twin: a staged-new source renamed in the worktree.
+    let repo2 = create_repo_with_committed_file("base.txt", "base\n");
+    enable_rename_untracked(repo2.path());
+    fs::write(repo2.path().join("c.txt"), "fresh content\n").unwrap();
+    let add = run_libra_command(&["add", "c.txt"], repo2.path());
+    assert_cli_success(&add, "stage the addition");
+    fs::rename(repo2.path().join("c.txt"), repo2.path().join("d.txt")).unwrap();
+    let short = status_stdout(repo2.path(), &["status", "--short"]);
+    assert!(
+        short
+            .lines()
+            .any(|line| line.starts_with("AR") && line.contains("c.txt -> d.txt")),
+        "short keeps the staged A on the rename row: {short}"
+    );
+}
+
 /// §B.6.4: an unresolved conflict must never pair as a staged-rename
 /// SOURCE, even when a same-content staged addition exists — the
 /// stage-0-less index classifies the conflict as staged-deleted, and
