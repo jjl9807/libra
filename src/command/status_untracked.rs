@@ -328,40 +328,100 @@ fn scan_workdir(
             std::sync::Arc::clone(&progress),
             move || {
                 std::fs::read_dir(&open_dir).map(|reader| {
+                    // Debug-only seam companion: replace ONE yielded entry
+                    // with `Err(NotFound)` so the vanished-entry skip arm
+                    // below is exercisable (a real vanish between readdir
+                    // batches cannot be staged from a test).
+                    #[cfg(debug_assertions)]
+                    let mut injected_notfound = false;
                     for entry in reader {
+                        #[cfg(debug_assertions)]
+                        let entry = if !injected_notfound
+                            && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+                            && std::env::var("LIBRA_TEST_READDIR_ENTRY_NOTFOUND_DIR")
+                                .is_ok_and(|target| open_dir.ends_with(&target))
+                        {
+                            injected_notfound = true;
+                            Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "injected vanished entry",
+                            ))
+                        } else {
+                            entry
+                        };
                         // `file_type()` can be a stat on filesystems without
                         // d_type, so it is resolved BEFORE the lock is taken:
                         // a reclaimed caller must be able to drain what has
                         // been collected, and it cannot if the worker is
                         // parked in a syscall while holding the buffer.
-                        let entry = entry?;
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            // §B.3.3 "entry NotFound → continue": ONE entry
+                            // vanishing mid-iteration is not a failed
+                            // listing — skip it and keep iterating, never
+                            // abandon the directory's remaining entries.
+                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                            Err(error) => return Err(error),
+                        };
                         let record = (entry.path(), entry.file_name(), entry.file_type());
                         sink.lock().unwrap_or_else(|e| e.into_inner()).push(record);
                         ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Debug-only seam: force a mid-iteration
+                        // `ReadDir::next` error — the errno-passthrough
+                        // class (NFS/FUSE readdir failures) that no tempdir
+                        // fixture can produce. The error KIND is
+                        // injectable so the genuine-`TimedOut` mapping is
+                        // testable too. Gated on `LIBRA_TEST` like the
+                        // rest of the seam family.
+                        #[cfg(debug_assertions)]
+                        if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+                            && std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_DIR")
+                                .is_ok_and(|target| open_dir.ends_with(&target))
+                        {
+                            let kind = match std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_KIND")
+                                .as_deref()
+                            {
+                                Ok("timedout") => io::ErrorKind::TimedOut,
+                                _ => io::ErrorKind::Other,
+                            };
+                            return Err(io::Error::new(
+                                kind,
+                                "injected mid-iteration readdir error",
+                            ));
+                        }
                     }
                     Ok::<(), io::Error>(())
                 })
             },
         ) {
             Err(()) => {
-                // Reclaimed: report the directory as blocked, but process the
-                // entries the worker had already published.
+                // Reclaimed by the watchdog: record the block HERE and
+                // resolve to `Ok(())` so no sentinel error value needs a
+                // filtering arm below — a filtering arm keyed on the error
+                // KIND would also swallow a genuine `TimedOut` from the
+                // listing itself (2026-08-05 R0-3 review).
                 scan.io_blocked.push(io_timeout_event(&dir_rel));
-                Err(io::Error::new(io::ErrorKind::TimedOut, "reclaimed"))
+                Ok(())
             }
-            Ok(result) => result.map(|_| ()),
+            // Flatten BOTH layers: the outer error is the `read_dir` open
+            // failure, the inner one a mid-iteration `ReadDir::next`
+            // failure. Discarding the inner error would claim a complete
+            // scan while this directory's remaining entries were silently
+            // dropped — a fail-open hole in the §B.3.3 accumulator
+            // contract (2026-08-05 R0-3 review).
+            Ok(result) => result.and_then(|iteration| iteration),
         };
-        // Any non-`Ok` arm already recorded its `io_blocked` event above,
-        // which is what marks the scan partial downstream; the entries the
-        // worker did publish are still processed below.
         match listing {
             Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::TimedOut => {}
+            // The directory itself vanished before it could be opened:
+            // nothing to report, nothing was collected for it.
             Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
             Err(source) => {
                 // §B.3.3: record and continue with the remaining pending
                 // directories — never drop what earlier siblings collected,
                 // nor what this directory already yielded.
+                // (`io_blocked_event` maps a genuine `TimedOut` to the
+                // `IoTimeout` reason.)
                 scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
             }
         }

@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-3 cross-review, 2026-08-05)
+
+- **A directory listing that breaks part-way no longer claims a complete
+  scan.** The untracked walk collected `ReadDir` entries through a nested
+  result whose INNER error (a mid-iteration `ReadDir::next` failure — the
+  errno-passthrough class seen on NFS/FUSE) was discarded: entries after
+  the failure were silently dropped, no `io_blocked` event was recorded,
+  and `--scan` could replace the dirty cache with the partial snapshot.
+  The listing now flattens both error layers into the io_blocked recorder;
+  a genuine `TimedOut` maps to the `io_timeout` reason (the old sentinel
+  arm swallowed it), and a single entry vanishing mid-iteration is skipped
+  without abandoning the directory. Pinned by
+  `main_scan_mid_iteration_readdir_error_reports_partial` (three legs,
+  seam-injected error kinds).
+- **The spec-mandated `main_scan_ioblocked_keeps_ignored_json` regression
+  now exists** (ignored entries collected before an EACCES-blocked sibling
+  survive the JSON partial) — the plan named it but it was never written;
+  two stale marker-test names in the plan were synced to the real manifest
+  names.
+
 ### Fixed (plan-20260714 R0-2 cross-review, 2026-08-05)
 
 - **The dirty-cache read-pause test seam is no longer compiled into release

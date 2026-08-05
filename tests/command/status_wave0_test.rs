@@ -3493,6 +3493,162 @@ fn main_scan_ioblocked_keeps_prior_sibling_json() {
     );
 }
 
+/// §B.3.3 accumulator: ignored entries collected before an EACCES-blocked
+/// sibling survive into the JSON partial — the scan never drops what the
+/// ignored walk already yielded. (Spec-named test that was never written;
+/// added 2026-08-05 R0-3 review.)
+#[test]
+fn main_scan_ioblocked_keeps_ignored_json() {
+    let repo = create_repo_with_committed_file("plain.txt", "content\n");
+    fs::write(repo.path().join(".libraignore"), "aa-ignored.txt\n").unwrap();
+    fs::write(repo.path().join("aa-ignored.txt"), "ignored\n").unwrap();
+    let locked = repo.path().join("mm-locked");
+    fs::create_dir(&locked).unwrap();
+    lock_dir(&locked);
+    let out = run_libra_command(&["--json", "status", "--ignored"], repo.path());
+    unlock_dir(&locked);
+    assert_cli_success(&out, "json status --ignored with a blocked sibling");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["ignored"]
+            .as_array()
+            .is_some_and(|ignored| ignored.iter().any(|p| p == "aa-ignored.txt")),
+        "ignored entries collected before the block survive: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|blocked| !blocked.is_empty()),
+        "the blocked directory is reported: {doc}"
+    );
+}
+
+/// §B.3.3 accumulator, mid-ITERATION arm: a `ReadDir::next` failure part-way
+/// through a directory (the errno-passthrough class — NFS/FUSE — that no
+/// tempdir fixture can produce, so a debug seam stands in) records the
+/// directory as io_blocked and keeps every already-collected entry. The
+/// discarded-inner-error shape claimed a COMPLETE scan while silently
+/// dropping the directory's remaining entries (2026-08-05 R0-3 review).
+#[test]
+fn main_scan_mid_iteration_readdir_error_reports_partial() {
+    let repo = create_repo_with_committed_file("base.txt", "content\n");
+    fs::create_dir(repo.path().join("half")).unwrap();
+    fs::write(repo.path().join("half/inside.txt"), "maybe seen\n").unwrap();
+    fs::write(repo.path().join("other.txt"), "sibling\n").unwrap();
+
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status", "-uall"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_READDIR_ITER_ERROR_DIR", "half")],
+    );
+    assert_cli_success(
+        &out,
+        "a mid-iteration readdir error degrades, it does not fail",
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["io_blocked"].as_array().is_some_and(|blocked| {
+            blocked.iter().any(|event| {
+                event["path"]["display"]
+                    .as_str()
+                    .is_some_and(|path| path.contains("half"))
+            })
+        }),
+        "the failing directory is reported as io_blocked: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["complete"], false,
+        "a directory whose listing broke mid-way is never a complete scan: {doc}"
+    );
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|untracked| untracked.iter().any(|p| p == "other.txt")),
+        "entries outside the failing directory are kept: {doc}"
+    );
+    assert!(
+        doc["data"]["untracked"]
+            .as_array()
+            .is_some_and(|untracked| untracked.iter().any(|p| p == "half/inside.txt")),
+        "the entry published BEFORE the mid-iteration error survives: {doc}"
+    );
+
+    // Same shape with a genuine `TimedOut` iteration error: the event must
+    // carry the `io_timeout` reason (the taxonomy separates a hung mount
+    // from an ordinary read failure), and nothing may be swallowed by a
+    // sentinel arm keyed on the error kind.
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status", "-uall"],
+        repo.path(),
+        "",
+        &[
+            ("LIBRA_TEST_READDIR_ITER_ERROR_DIR", "half"),
+            ("LIBRA_TEST_READDIR_ITER_ERROR_KIND", "timedout"),
+        ],
+    );
+    assert_cli_success(&out, "a timed-out iteration degrades, it does not fail");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    assert!(
+        doc["data"]["io_blocked"].as_array().is_some_and(|blocked| {
+            blocked.iter().any(|event| {
+                event["reason"] == "io_timeout"
+                    && event["path"]["display"]
+                        .as_str()
+                        .is_some_and(|path| path.contains("half"))
+            })
+        }),
+        "a genuine TimedOut iteration error is recorded with the io_timeout reason: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["complete"], false,
+        "and the timed-out listing is never a complete scan: {doc}"
+    );
+
+    // Entry-level NotFound is the OPPOSITE contract: one entry vanishing
+    // mid-iteration is skipped, the iterator keeps going, nothing is
+    // recorded, and the scan stays complete. The seam replaces exactly one
+    // yielded entry with Err(NotFound), so of the two real files exactly
+    // one survives — reverting the in-loop skip arm to plain `?` would
+    // abandon the directory and fail the survivor count.
+    let repo2 = create_repo_with_committed_file("base.txt", "content\n");
+    fs::create_dir(repo2.path().join("pair")).unwrap();
+    fs::write(repo2.path().join("pair/one.txt"), "1\n").unwrap();
+    fs::write(repo2.path().join("pair/two.txt"), "2\n").unwrap();
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status", "-uall"],
+        repo2.path(),
+        "",
+        &[("LIBRA_TEST_READDIR_ENTRY_NOTFOUND_DIR", "pair")],
+    );
+    assert_cli_success(&out, "a vanished entry is skipped, it is not fatal");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let survivors = doc["data"]["untracked"]
+        .as_array()
+        .expect("untracked")
+        .iter()
+        .filter(|p| p.as_str().is_some_and(|p| p.starts_with("pair/")))
+        .count();
+    assert_eq!(
+        survivors, 1,
+        "exactly the non-vanished entry survives the iteration: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|blocked| blocked.is_empty()),
+        "a vanished entry records nothing: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["complete"], true,
+        "and the scan stays complete: {doc}"
+    );
+}
+
 /// §B.3.3 tracked-scan accumulator: an unreadable tracked file records an
 /// io_blocked entry while other tracked changes stay reported.
 #[test]
