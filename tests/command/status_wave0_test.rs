@@ -94,6 +94,18 @@ fn porcelain_v2_unmerged_u_line() {
     assert_eq!(fields.len(), 11, "unexpected u-line fields: {u_line}");
     assert_eq!(fields[1], "UU");
     assert_eq!(fields[10], "conflict.txt");
+    // An unresolved conflict lives ONLY in its `u` record — the
+    // stage-0-less index must not leak a duplicate `1 D.` row
+    // (2026-08-06 R0-5 review).
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| (line.starts_with("1 ") || line.starts_with("2 "))
+                && line.contains("conflict.txt"))
+            .count(),
+        0,
+        "no ordinary record duplicates the conflict: {output}"
+    );
 }
 
 #[test]
@@ -2310,6 +2322,205 @@ fn short_non_utf8_quote_path_false_writes_raw_high_bytes() {
         "and nothing is octal-escaped: {:?}",
         out.stdout
     );
+}
+
+/// §B.6.4: an unresolved conflict must never pair as a staged-rename
+/// SOURCE, even when a same-content staged addition exists — the
+/// stage-0-less index classifies the conflict as staged-deleted, and
+/// rename detection would otherwise consume it into a `2` record whose
+/// only truthful spelling is the `u` row (2026-08-06 R0-5 review).
+#[test]
+#[serial]
+fn unmerged_path_never_pairs_as_a_staged_rename_source() {
+    let body = "same content on either side of the would-be rename\n";
+    let repo = create_repo_with_committed_file("conflict.txt", body);
+    let _guard = ChangeDirGuard::new(repo.path());
+    let mut index = Index::new();
+    add_index_stage(&mut index, "conflict.txt", body, 1);
+    add_index_stage(&mut index, "conflict.txt", "ours\n", 2);
+    add_index_stage(&mut index, "conflict.txt", "theirs\n", 3);
+    // The bait: a staged addition with EXACTLY the conflict's HEAD
+    // content — an eligible exact rename destination if the conflict
+    // were treated as a staged deletion.
+    add_index_stage(&mut index, "added.txt", body, 0);
+    index
+        .save(path::index())
+        .expect("write unmerged index with the staged add");
+    fs::write(repo.path().join("added.txt"), body).unwrap();
+
+    let output = status_stdout(repo.path(), &["status", "--porcelain=v2"]);
+    assert!(
+        output
+            .lines()
+            .any(|line| line.starts_with("u UU") && line.ends_with("conflict.txt")),
+        "the conflict keeps its u record: {output}"
+    );
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| (line.starts_with("2 ") || line.starts_with("1 "))
+                && line.contains("conflict.txt"))
+            .count(),
+        0,
+        "no rename or ordinary record consumes the conflict: {output}"
+    );
+    assert!(
+        output
+            .lines()
+            .any(|line| line.starts_with("1 A.") && line.ends_with("added.txt")),
+        "the staged addition stays an ordinary A row: {output}"
+    );
+}
+
+/// §B.6.4: a staged deletion's `1 D.` row spells BOTH absent sides as
+/// `000000` plus the zero hash — stage 0 has no entry and the worktree
+/// file is gone; the old fallback fabricated `100644` for a lookup that
+/// cannot succeed (2026-08-06 R0-5 review).
+#[test]
+fn porcelain_v2_staged_deletion_spells_absent_sides_as_zero() {
+    let repo = create_repo_with_committed_file("doomed.txt", "content\n");
+    let head = run_libra_command(&["rev-parse", "HEAD:doomed.txt"], repo.path());
+    assert_cli_success(&head, "resolve the committed blob oid");
+    let head_oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let rm = run_libra_command(&["rm", "doomed.txt"], repo.path());
+    assert_cli_success(&rm, "stage the deletion");
+
+    let out = run_libra_command(&["status", "--porcelain=v2"], repo.path());
+    assert_cli_success(&out, "porcelain v2 with a staged deletion");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("1 D."))
+        .unwrap_or_else(|| panic!("expected the staged-deletion row: {text}"));
+    let fields: Vec<_> = row.split_whitespace().collect();
+    assert_eq!(fields[3], "100644", "real HEAD mode survives: {row}");
+    assert_eq!(
+        fields[4], "000000",
+        "absent index side is 000000, never 100644: {row}"
+    );
+    assert_eq!(
+        fields[5], "000000",
+        "absent worktree side is 000000, never 100644: {row}"
+    );
+    assert_eq!(fields[6], head_oid, "real HEAD hash: {row}");
+    assert_eq!(
+        fields[7],
+        "0".repeat(head_oid.len()),
+        "absent index hash is all-zero: {row}"
+    );
+    assert_eq!(fields[8], "doomed.txt");
+}
+
+/// §B.6.4 single projection, `u` rows: the unmerged payload is
+/// repository-root-relative too, so from a subdirectory the worktree-mode
+/// column must read the REAL on-disk mode — the old double projection
+/// stat'ed a nonexistent doubled path and spelled it `000000`
+/// (2026-08-06 R0-5 review).
+#[cfg(unix)]
+#[test]
+#[serial]
+fn porcelain_v2_unmerged_row_from_subdirectory_keeps_real_worktree_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = create_repo_with_committed_file("base.txt", "base\n");
+    let _guard = ChangeDirGuard::new(repo.path());
+    let mut index = Index::new();
+    add_index_stage(&mut index, "sub/conflict.sh", "base\n", 1);
+    add_index_stage(&mut index, "sub/conflict.sh", "ours\n", 2);
+    add_index_stage(&mut index, "sub/conflict.sh", "theirs\n", 3);
+    index.save(path::index()).expect("write unmerged index");
+    fs::create_dir_all(repo.path().join("sub")).unwrap();
+    fs::write(repo.path().join("sub/conflict.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(
+        repo.path().join("sub/conflict.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    let out = run_libra_command(&["status", "--porcelain=v2"], &repo.path().join("sub"));
+    assert_cli_success(&out, "porcelain v2 from the subdirectory");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("u UU"))
+        .unwrap_or_else(|| panic!("expected the unmerged row: {text}"));
+    let fields: Vec<_> = row.split_whitespace().collect();
+    assert_eq!(fields.len(), 11, "u-line arity: {row}");
+    assert_eq!(
+        fields[6], "100755",
+        "real on-disk worktree mode, not a missed stat's fallback: {row}"
+    );
+    assert_eq!(
+        fields[10], "sub/conflict.sh",
+        "repo-root-relative path: {row}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| (line.starts_with("1 ") || line.starts_with("2 "))
+                && line.contains("conflict.sh"))
+            .count(),
+        0,
+        "no ordinary record duplicates the conflict: {text}"
+    );
+}
+
+/// §B.6.4 single projection, NON-rename rows: the porcelain v2 payload is
+/// already repository-root-relative, so rendering from a subdirectory must
+/// keep the REAL index/HEAD/worktree metadata. The old double projection
+/// made every lookup miss from a subdir and fabricated 100644/zero-hash
+/// columns while the printed path stayed correct (2026-08-06 R0-5 review).
+#[test]
+#[cfg(unix)]
+fn porcelain_v2_non_rename_rows_from_subdirectory_keep_real_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir(repo.path().join("sub")).unwrap();
+    fs::write(repo.path().join("sub/inner.sh"), "#!/bin/sh\necho one\n").unwrap();
+    fs::set_permissions(
+        repo.path().join("sub/inner.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "sub/inner.sh"], repo.path());
+    assert_cli_success(&add, "stage the executable");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit the executable");
+    // Unstaged content edit; truncating write keeps the 0755 bit.
+    fs::write(repo.path().join("sub/inner.sh"), "#!/bin/sh\necho two\n").unwrap();
+
+    let head = run_libra_command(&["rev-parse", "HEAD:sub/inner.sh"], repo.path());
+    assert_cli_success(&head, "resolve the committed blob oid");
+    let head_oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+    let out = run_libra_command(&["status", "--porcelain=v2"], &repo.path().join("sub"));
+    assert_cli_success(&out, "porcelain v2 from the subdirectory");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text
+        .lines()
+        .find(|line| line.starts_with("1 .M"))
+        .unwrap_or_else(|| panic!("expected the modified row: {text}"));
+    let fields: Vec<_> = row.split_whitespace().collect();
+    assert_eq!(
+        fields[3], "100755",
+        "real HEAD mode, not a fabricated fallback: {row}"
+    );
+    assert_eq!(
+        fields[4], "100755",
+        "real index mode, not a missed lookup's 100644: {row}"
+    );
+    assert_eq!(
+        fields[5], "100755",
+        "real worktree mode, not a missed stat's 100644: {row}"
+    );
+    assert_eq!(fields[6], head_oid, "real HEAD hash, not all-zero: {row}");
+    assert_eq!(
+        fields[7], head_oid,
+        "index equals HEAD for an unstaged edit: {row}"
+    );
+    assert_eq!(fields[8], "sub/inner.sh", "repo-root-relative path: {row}");
 }
 
 /// §B.4.3: `--null` AFTER the `--` separator is a pathspec, never a format

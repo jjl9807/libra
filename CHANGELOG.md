@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-5 cross-review, 2026-08-06)
+
+- **Porcelain v2 non-rename rows keep their real metadata from a
+  subdirectory.** The `1` and `u` row writers re-projected the already
+  repository-root-relative payload through the current directory, so from a
+  subdirectory every index/HEAD lookup missed and the mode/hash columns
+  silently fell back to fabricated `100644`/all-zero values (the printed
+  path stayed correct, which hid it). The writer now uses the projected
+  payload directly. Pinned by
+  `porcelain_v2_non_rename_rows_from_subdirectory_keep_real_metadata`.
+- **Porcelain v2 spells an unmodified side as `.` like Git.** `1` rows
+  printed the v1-style space (`1  M`) instead of Git's `1 .M`, breaking
+  fixed-column consumers; the XY columns now emit `.` for the clean side.
+- Documented the `MR`/`AR` refinement (an unstaged rename whose source
+  carries a staged change takes real HEAD-tree columns, not the `.R` copy
+  fixup) in the porcelain v2 docs, EN + zh.
+- **A staged deletion's `1 D.` row spells its absent sides `000000`** (index
+  and worktree) with the zero index hash, like Git — the old fallback
+  fabricated `100644` for lookups that cannot succeed; any OTHER missing
+  stage-0 entry now fails closed instead of forging metadata, and an
+  unreadable worktree mode on `1` rows is a hard error like the rename arm.
+- **An unresolved conflict never leaks out of its `u` record.** The
+  stage-0-less index classifies a conflict as staged-deleted, which let it
+  (a) emit a bogus duplicate `1 D.` row and (b) pair as a staged-rename
+  SOURCE with a same-content staged addition, producing a `2` record for
+  an unresolved path. Conflicts are now excluded from rename pairing (with
+  classification restored after detection) and from the ordinary v2 row
+  loop. Pinned by `unmerged_path_never_pairs_as_a_staged_rename_source`
+  and duplicate-count assertions in both `u`-row tests.
+
 ### Fixed (plan-20260714 R0-4 cross-review, 2026-08-06)
 
 - **`--find-renames` raw scores parse exactly like Git.** The score parser

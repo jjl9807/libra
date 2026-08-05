@@ -407,8 +407,10 @@ Detached HEAD：
 
 `R<score>` 是相似度百分比（exact 对为 `R100`）。`mode_HEAD`/`hash_HEAD` 列描述
 rename 的**来源**（旧路径的 HEAD 条目），`mode_index`/`hash_index` 描述新路径的
-已暂存条目——因此 unstaged rename（`.R`）会把 index 条目同时复制到 HEAD 与 index
-两列，因为 HEAD 并不知道该目标路径。目标随后在工作树被修改或删除时并入第二个 XY
+已暂存条目——因此**纯** unstaged rename（`.R`）会把 index 条目同时复制到 HEAD 与
+index 两列，因为 HEAD 并不知道该目标路径。当来源同时带有已暂存改动时，第一列会
+反映它（`MR`，staged-new 来源为 `AR`），且 HEAD 两列取自真实 HEAD tree 条目而非
+复制——此时 `hash_HEAD` 与 `hash_index` 不同。目标随后在工作树被修改或删除时并入第二个 XY
 列（`RM`/`RD`）；被删除目标的 `mode_worktree` 为 `000000`。`-z` 下该记录尾部字段
 对为 `…R<score> <new> NUL <old> NUL`——**先 new 后 old**，原始未引用路径字节，没有
 tab 分隔符。

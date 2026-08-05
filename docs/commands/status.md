@@ -608,9 +608,12 @@ A detected rename is ONE `2` record instead of two `1` rows:
 `R<score>` is the similarity percentage (`R100` for an exact pair). The
 `mode_HEAD`/`hash_HEAD` columns describe the rename's ORIGIN (the old
 path's HEAD entry), while `mode_index`/`hash_index` describe the new
-path's staged entry — an unstaged rename (`.R`) therefore copies the
+path's staged entry — a PURE unstaged rename (`.R`) therefore copies the
 index entry into both the HEAD and index columns, because HEAD does not
-know the destination. A destination modified or deleted in the worktree
+know the destination. When the source also carries a staged change the
+first column reflects it (`MR`, or `AR` for a staged-new source) and the
+HEAD columns come from the real HEAD tree entry instead of the copy —
+`hash_HEAD` and `hash_index` then differ. A destination modified or deleted in the worktree
 rides in the second XY column (`RM`/`RD`); a deleted destination reports
 `mode_worktree` as `000000`. Under `-z` the record's trailing field pair
 is `…R<score> <new> NUL <old> NUL` — NEW first, then OLD, with raw

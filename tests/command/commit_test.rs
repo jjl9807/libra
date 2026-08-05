@@ -1637,7 +1637,13 @@ fn test_commit_porcelain_non_utf8_dir_marker_is_not_corrupted() {
     // bytes through the legacy collapse helper — escaped with the default
     // quotePath, never a U+FFFD replacement character.
     let dir = p.join(std::ffi::OsStr::from_bytes(b"dir-\xff"));
-    std::fs::create_dir(&dir).unwrap();
+    if let Err(error) = std::fs::create_dir(&dir) {
+        // APFS (macOS) refuses non-UTF-8 names with EILSEQ; the byte-level
+        // fixture cannot exist there — same skip convention as the wave-0
+        // non-UTF-8 tests.
+        eprintln!("skipped (filesystem refuses non-UTF-8 file names: {error})");
+        return;
+    }
     std::fs::write(dir.join("file.txt"), "payload\n").unwrap();
     std::fs::write(p.join("staged.txt"), "s\n").unwrap();
     assert_cli_success(

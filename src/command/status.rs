@@ -1385,6 +1385,23 @@ async fn collect_status_data(
             rename_limit: extras.rename_limit,
             comparison_budget: Some(status_comparison_budget()),
         };
+        // An unresolved conflict is NOT a staged deletion for rename
+        // pairing: the stage-0-less index classifies it as deleted, and a
+        // same-content staged addition could otherwise consume it as a
+        // rename SOURCE — emitting a `2` record for a path whose only
+        // truthful spelling is the unmerged `u` row. Pull conflicts out
+        // for the detection pass only and restore them after, leaving
+        // every format's classification of the conflict itself untouched
+        // (2026-08-06 R0-5 review).
+        let conflicted_staged_deletes: Vec<PathBuf> = staged
+            .deleted
+            .iter()
+            .filter(|path| unmerged_paths.contains(*path))
+            .cloned()
+            .collect();
+        if !conflicted_staged_deletes.is_empty() {
+            staged.deleted.retain(|path| !unmerged_paths.contains(path));
+        }
         detect_renames_in_changes(
             &mut staged,
             &config,
@@ -1394,6 +1411,10 @@ async fn collect_status_data(
             &mut rename_stats,
             &mut rename_budgets,
         );
+        if !conflicted_staged_deletes.is_empty() {
+            staged.deleted.extend(conflicted_staged_deletes);
+            staged.deleted.sort();
+        }
         // §B.3.1 Git default: unstaged "new" entries are untracked paths,
         // which may only be consumed as rename destinations under the
         // `status.renameUntracked` extension. Skipping detection keeps a
@@ -4944,46 +4965,18 @@ fn get_worktree_mode_result_for_workdir(workdir_path: &std::path::Path) -> Workt
     }
 }
 
-#[cfg(unix)]
-fn get_worktree_mode_result(file_path: &std::path::Path) -> WorktreeMode {
-    use std::os::unix::fs::PermissionsExt;
-    let workdir_path = current_to_workdir(file_path);
-    let abs_path = util::workdir_to_absolute(&workdir_path);
-    match std::fs::symlink_metadata(&abs_path) {
-        Ok(metadata) => WorktreeMode::Mode(if metadata.file_type().is_symlink() {
-            0o120000
-        } else if metadata.permissions().mode() & 0o111 != 0 {
-            0o100755
-        } else {
-            0o100644
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => WorktreeMode::Gone,
-        Err(_) => WorktreeMode::Unreadable,
-    }
-}
-
-#[cfg(unix)]
-fn get_worktree_mode(file_path: &std::path::Path) -> u32 {
-    match get_worktree_mode_result(file_path) {
+/// Worktree mode of an already repository-root-relative path, with the
+/// pre-R0 lenient fallback. The porcelain v2 payload is projected once at
+/// the render entry (`to_repo_relative`), so this must NOT re-project via
+/// `current_to_workdir` — from a subdirectory that second projection made
+/// every lookup miss and fabricated `100644` (2026-08-06 R0-5 review).
+/// The fallback (vs the rename arm's hard error) is justified by the
+/// collection phase failing closed on unreadable tracked paths first.
+fn get_worktree_mode(workdir_path: &std::path::Path) -> u32 {
+    match get_worktree_mode_result_for_workdir(workdir_path) {
         WorktreeMode::Mode(mode) => mode,
         _ => 0o100644,
     }
-}
-
-#[cfg(not(unix))]
-fn get_worktree_mode_result(file_path: &std::path::Path) -> WorktreeMode {
-    let workdir_path = current_to_workdir(file_path);
-    let abs_path = util::workdir_to_absolute(&workdir_path);
-    match std::fs::symlink_metadata(&abs_path) {
-        Ok(_) => WorktreeMode::Mode(get_worktree_mode(file_path)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => WorktreeMode::Gone,
-        Err(_) => WorktreeMode::Unreadable,
-    }
-}
-
-#[cfg(not(unix))]
-fn get_worktree_mode(_file_path: &std::path::Path) -> u32 {
-    0o100644
 }
 
 fn is_submodule_mode(mode: u32) -> bool {
@@ -5280,9 +5273,18 @@ fn output_porcelain_v2(
         )?;
     }
 
+    // An unresolved conflict lives ONLY in its `u` record: the
+    // stage-0-less index also classifies the path as a staged deletion,
+    // and without this exclusion the ordinary loop would emit a bogus
+    // duplicate `1 D.` row for it (2026-08-06 R0-5 review).
+    let unmerged_paths: std::collections::HashSet<&std::path::Path> =
+        unmerged.iter().map(|entry| entry.path.as_path()).collect();
     let status_list = generate_short_format_status(staged, unstaged);
     for (file, staged_status, unstaged_status) in status_list {
         if endpoints.contains(&file) {
+            continue;
+        }
+        if unmerged_paths.contains(file.as_path()) {
             continue;
         }
         if staged_status == '?' && unstaged_status == '?' {
@@ -5303,13 +5305,28 @@ fn output_porcelain_v2(
             continue;
         }
 
-        let workdir_path = current_to_workdir(&file);
+        // The porcelain payload is ALREADY repository-root-relative
+        // (`to_repo_relative` at the render entry). Re-projecting through
+        // `current_to_workdir` here made every index/HEAD lookup miss from
+        // a subdirectory and fall back to fabricated `100644`/zero-hash
+        // metadata (2026-08-06 R0-5 review).
+        let workdir_path = file.clone();
         let file_str = workdir_path.to_str().unwrap_or_default();
 
         let (mode_index, hash_index) = if let Some(entry) = metadata.index.get(file_str, 0) {
             (entry.mode, entry.hash.to_string())
+        } else if staged_status == 'D' {
+            // Semantically absent: the deletion is staged, so stage 0 has
+            // no entry — Git v2 spells that `000000` plus the zero hash.
+            (0, zero_hash.clone())
         } else {
-            (0o100644, zero_hash.clone())
+            // Every other `1` row REQUIRES a stage-0 entry; fabricating
+            // `100644` here would forge metadata for a lookup that must
+            // not miss (2026-08-06 R0-5 review).
+            return Err(CliError::fatal(format!(
+                "missing index entry for '{file_str}' while rendering porcelain v2"
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid));
         };
 
         let (mode_head, hash_head) = if staged_status == 'A' {
@@ -5323,7 +5340,22 @@ fn output_porcelain_v2(
         let mode_worktree = if unstaged_status == 'D' {
             0
         } else {
-            get_worktree_mode(&file)
+            match get_worktree_mode_result_for_workdir(&workdir_path) {
+                WorktreeMode::Mode(mode) => mode,
+                // A path absent from the worktree (e.g. a staged deletion's
+                // `D.` row) is semantically gone: `000000`, like Git.
+                WorktreeMode::Gone => 0,
+                // Unreadable is a different answer from gone and must never
+                // be spelled `100644` (2026-08-06 R0-5 review, mirroring
+                // the rename-record arm).
+                WorktreeMode::Unreadable => {
+                    return Err(CliError::fatal(format!(
+                        "cannot read the worktree mode of '{file_str}' while rendering \
+                         porcelain v2"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed));
+                }
+            }
         };
 
         let sub = if is_submodule_mode(mode_index) || is_submodule_mode(mode_head) {
@@ -5332,11 +5364,15 @@ fn output_porcelain_v2(
             "N...".to_string()
         };
 
+        // Git porcelain v2 spells an unmodified side as `.`, never the
+        // v1-style space — `1  M` instead of `1 .M` breaks fixed-column
+        // consumers (2026-08-06 R0-5 review).
+        let dot = |status: char| if status == ' ' { '.' } else { status };
         write!(
             writer,
             "1 {}{} {} {} {} {} {} {} ",
-            staged_status,
-            unstaged_status,
+            dot(staged_status),
+            dot(unstaged_status),
             sub,
             format_mode(mode_head),
             format_mode(mode_index),
@@ -5433,11 +5469,13 @@ fn write_unmerged_porcelain_v2(
     Ok(())
 }
 
-fn get_unmerged_worktree_mode(file_path: &std::path::Path) -> u32 {
-    let workdir_path = current_to_workdir(file_path);
-    let abs_path = util::workdir_to_absolute(&workdir_path);
+/// `u`-row worktree mode; the unmerged payload is repository-root-relative
+/// like the rest of the projected porcelain data (2026-08-06 R0-5 review:
+/// same double-projection fix as `get_worktree_mode`).
+fn get_unmerged_worktree_mode(workdir_path: &std::path::Path) -> u32 {
+    let abs_path = util::workdir_to_absolute(workdir_path);
     if std::fs::symlink_metadata(&abs_path).is_ok() {
-        get_worktree_mode(file_path)
+        get_worktree_mode(workdir_path)
     } else {
         0
     }
