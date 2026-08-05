@@ -736,7 +736,9 @@ async fn switch_branch_with_output(
     if let Some(other) = checked_out {
         let hint = if ignore_other_worktrees {
             "Libra does not honor --ignore-other-worktrees (it never allows the same branch \
-             checked out in two worktrees): check out a different branch, or use --detach"
+             checked out in two worktrees): check out a different branch, or use --detach; \
+             if the recorded owner looks stale, inspect it with `libra worktree doctor` and \
+             settle the registry with `libra worktree repair --confirm`"
         } else {
             "check out a different branch, or use --detach"
         };

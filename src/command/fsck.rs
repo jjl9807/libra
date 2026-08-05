@@ -500,8 +500,10 @@ async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
             )
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint(
-                "run `libra maintenance run` for the inventory-complete reachability walk, \
-                 or retry `--heal` after removing linked worktrees",
+                "run `libra maintenance run` for the inventory-complete reachability walk; \
+                 removing the linked worktrees does NOT re-enable `--heal` (the repository's \
+                 worktree history is retained), so it stays unsupported until the heal \
+                 inventory is worktree-complete",
             ));
         }
         // A well-formed `--heal <OBJECT>` seeds that OID so it is healed even if

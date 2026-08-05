@@ -1596,6 +1596,30 @@ fn ignore_other_worktrees_flag_cannot_bypass_in_multi_worktree() {
         co_err.contains("already checked out") && co_err.contains("ignore-other-worktrees"),
         "error explains the flag is not honored: {co_err}"
     );
+    // §C.13: the explicit-flag refusal must offer the doctor/repair route for
+    // a recorded owner that looks stale — never a dead end.
+    assert!(
+        co_err.contains("libra worktree doctor")
+            && co_err.contains("libra worktree repair --confirm"),
+        "the refusal offers the doctor/repair route: {co_err}"
+    );
+
+    // `switch --ignore-other-worktrees feature` is refused the same way, with
+    // the same recovery route (§C.13).
+    let sw_flag = run_libra_command(&["switch", "--ignore-other-worktrees", "feature"], main);
+    assert_ne!(
+        sw_flag.status.code(),
+        Some(0),
+        "switch flag cannot bypass either"
+    );
+    let sw_flag_err = String::from_utf8_lossy(&sw_flag.stderr);
+    assert!(
+        sw_flag_err.contains("already checked out")
+            && sw_flag_err.contains("ignore-other-worktrees")
+            && sw_flag_err.contains("libra worktree doctor")
+            && sw_flag_err.contains("libra worktree repair --confirm"),
+        "switch refusal carries the intentionally-different note and the doctor/repair route: {sw_flag_err}"
+    );
 
     // Plain `switch feature` is also refused (the same-branch guard).
     let sw = run_libra_command(&["switch", "feature"], main);

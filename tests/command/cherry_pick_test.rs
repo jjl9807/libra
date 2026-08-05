@@ -88,6 +88,7 @@ async fn test_basic_cherry_pick() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -182,6 +183,7 @@ async fn test_basic_cherry_pick() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -332,6 +334,7 @@ async fn test_cherry_pick_with_commit() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -385,6 +388,7 @@ async fn test_cherry_pick_with_commit() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -487,6 +491,7 @@ async fn test_cherry_pick_multiple_commits() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -574,6 +579,7 @@ async fn test_cherry_pick_multiple_commits() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -839,6 +845,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -889,6 +896,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })

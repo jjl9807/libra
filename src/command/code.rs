@@ -2934,7 +2934,7 @@ async fn load_code_ui_projection_bundle(
     let storage_root = resolve_storage_root(working_dir).ok_or_else(|| {
         anyhow::anyhow!(
             "cannot resolve the repository storage root for '{}' — if this is a linked \
-             worktree, run `libra worktree repair <worktree-path>`",
+             worktree, run `libra worktree repair --confirm <worktree-path>`",
             working_dir.display()
         )
     })?;
@@ -3873,7 +3873,7 @@ async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
         eprintln!(
             "Warning: cannot resolve the repository storage root for {}. Running in read-only \
              mode (history/context disabled). If this is a linked worktree, run `libra worktree \
-             repair <worktree-path>`.",
+             repair <worktree-path> --confirm`.",
             working_dir.display()
         );
         return Arc::new(LibraMcpServer::new_with_working_dir(
@@ -3973,8 +3973,8 @@ pub(crate) fn require_storage_root(working_dir: &std::path::Path) -> CliResult<s
         ))
         .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
         .with_hint(
-            "if this is a linked worktree, run `libra worktree repair <worktree-path>` from \
-             the main worktree",
+            "if this is a linked worktree, run `libra worktree repair --confirm \
+             <worktree-path>` from the main worktree",
         )
     })
 }
@@ -3988,7 +3988,7 @@ pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> Option<std:
                 %error,
                 "storage-root resolution failed; continuing WITHOUT a storage root rather than \
                  minting a phantom one — if this is a linked worktree, run `libra worktree \
-                 repair <worktree-path>`"
+                 repair <worktree-path> --confirm`"
             );
             None
         }

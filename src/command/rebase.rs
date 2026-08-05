@@ -1566,6 +1566,9 @@ async fn switch_to_rebase_branch(branch: &str, output: &OutputConfig) -> CliResu
             detach: false,
             track: false,
             force: false,
+            // Rebase's internal branch switch never requests the bypass flag;
+            // the same-branch guard applies unchanged.
+            ignore_other_worktrees: false,
             guess: false,
             no_guess: false,
         },

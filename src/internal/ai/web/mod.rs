@@ -534,7 +534,7 @@ async fn code_threads_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "STORAGE_ROOT_UNRESOLVED".to_string(),
             message: "cannot resolve the repository storage root; if this is a linked worktree, \
-                      run `libra worktree repair <worktree-path>`"
+                      run `libra worktree repair --confirm <worktree-path>`"
                 .to_string(),
         })?;
     let db_path = storage_root.join("libra.db");

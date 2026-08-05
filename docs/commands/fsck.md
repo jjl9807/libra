@@ -184,8 +184,10 @@ Safety guarantees:
   walks only the shared refs/reflogs/index roots — it does not cover every
   worktree's private index, sequencer rows or sidecars, so on a repository that
   has (or had) linked worktrees it refuses up front with `LBR-REPO-003`. Run
-  `libra maintenance run` for the inventory-complete reachability walk, or
-  remove the linked worktrees first.
+  `libra maintenance run` for the inventory-complete reachability walk. The
+  refusal is NOT lifted by removing the linked worktrees — the repository's
+  worktree history is retained on purpose — so `--heal` stays unsupported on
+  such repositories until its discovery is worktree-complete.
 
 Heal runs *before* the integrity checks, so the exit code reflects the
 post-repair state: if every problem object was healed, `fsck` exits `0`; objects

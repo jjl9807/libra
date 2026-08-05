@@ -1288,6 +1288,7 @@ async fn test_basic_rebase() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1372,6 +1373,7 @@ async fn test_basic_rebase() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1421,6 +1423,7 @@ async fn test_basic_rebase() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1542,6 +1545,7 @@ async fn test_rebase_preserves_untracked_files() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1591,6 +1595,7 @@ async fn test_rebase_preserves_untracked_files() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1640,6 +1645,7 @@ async fn test_rebase_preserves_untracked_files() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1770,6 +1776,7 @@ async fn test_rebase_already_up_to_date() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1856,6 +1863,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1905,6 +1913,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -1954,6 +1963,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2090,6 +2100,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2139,6 +2150,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2188,6 +2200,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2488,6 +2501,7 @@ async fn test_rebase_with_conflict_and_abort() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2541,6 +2555,7 @@ async fn test_rebase_with_conflict_and_abort() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2590,6 +2605,7 @@ async fn test_rebase_with_conflict_and_abort() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2745,6 +2761,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2793,6 +2810,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2841,6 +2859,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -2972,6 +2991,7 @@ async fn test_rebase_with_conflict_and_skip() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3065,6 +3085,7 @@ async fn test_rebase_with_conflict_and_skip() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3114,6 +3135,7 @@ async fn test_rebase_with_conflict_and_skip() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3240,6 +3262,7 @@ async fn test_rebase_with_conflict_and_continue() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3293,6 +3316,7 @@ async fn test_rebase_with_conflict_and_continue() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3342,6 +3366,7 @@ async fn test_rebase_with_conflict_and_continue() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3510,6 +3535,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3634,6 +3660,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3683,6 +3710,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3826,6 +3854,7 @@ async fn test_rebase_state_persistence() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3875,6 +3904,7 @@ async fn test_rebase_state_persistence() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -3924,6 +3954,7 @@ async fn test_rebase_state_persistence() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4068,6 +4099,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4083,6 +4115,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4134,6 +4167,7 @@ async fn test_rebase_fast_forward_branch_behind() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4231,6 +4265,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4246,6 +4281,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4295,6 +4331,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4395,6 +4432,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4410,6 +4448,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4459,6 +4498,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4559,6 +4599,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4608,6 +4649,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4657,6 +4699,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4764,6 +4807,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4814,6 +4858,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4863,6 +4908,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -4983,6 +5029,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5051,6 +5098,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5100,6 +5148,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5219,6 +5268,7 @@ async fn test_rebase_continue_requires_resolution() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5268,6 +5318,7 @@ async fn test_rebase_continue_requires_resolution() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })
@@ -5317,6 +5368,7 @@ async fn test_rebase_continue_requires_resolution() {
         detach: false,
         track: false,
         force: false,
+        ignore_other_worktrees: false,
         guess: false,
         no_guess: false,
     })

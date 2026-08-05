@@ -809,7 +809,7 @@ struct WorktreeRemoveOutput {
 }
 
 #[derive(Debug, Serialize)]
-struct WorktreeRepairOutput {
+pub(crate) struct WorktreeRepairOutput {
     changed: bool,
     /// Stale intent-journal rows rolled forward/back and resolved.
     journal_recovered: usize,
@@ -987,11 +987,45 @@ pub async fn execute(args: WorktreeArgs) {
 /// fallback for repositories predating the config key.
 pub(crate) async fn reject_bare_repository() -> CliResult<()> {
     let storage = util::storage_path();
+    reject_bare_repository_impl(
+        &storage,
+        crate::internal::config::ConfigKv::get("core.bare").await,
+    )
+}
+
+/// No-migration counterpart of [`reject_bare_repository`] for the refused
+/// repair path. An unconfirmed repair is documented as zero-side-effect, so
+/// it cannot take the migration-applying open above — yet the bare boundary
+/// must still precede the confirmation refusal (a bare repository has no
+/// working trees at all, the more fundamental error). Classify through a
+/// connection that does not apply pending migrations.
+pub(crate) async fn reject_bare_repository_without_migrations() -> CliResult<()> {
+    let storage = util::storage_path();
+    let db_path = crate::utils::path::database();
+    let conn = crate::internal::db::open_database_without_migrations(&db_path)
+        .await
+        .map_err(|source| {
+            CliError::fatal(format!(
+                "cannot open the repository database without applying migrations to classify \
+                 this repository: {source}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    reject_bare_repository_impl(
+        &storage,
+        crate::internal::config::ConfigKv::get_with_conn(&conn, "core.bare").await,
+    )
+}
+
+fn reject_bare_repository_impl(
+    storage: &std::path::Path,
+    entry: anyhow::Result<Option<crate::internal::config::ConfigKvEntry>>,
+) -> CliResult<()> {
     use crate::internal::config::parse_git_bool;
     // FAIL CLOSED on read failures and unparseable values — a bare boundary
     // that cannot be determined must refuse, not fall through to the
     // basename heuristic (which a `.libra`-named bare directory defeats).
-    let is_bare = match crate::internal::config::ConfigKv::get("core.bare").await {
+    let is_bare = match entry {
         Ok(Some(entry)) => parse_git_bool(&entry.value).ok_or_else(|| {
             CliError::fatal(format!(
                 "invalid core.bare value '{}': expected true/false/yes/no/on/off/1/0",
@@ -1030,14 +1064,17 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     // W0 §C.11: `doctor` skips the migration-applying open below. It is a
     // read-only diagnostic, and applying migrations is a write — the one
     // command you want available on a repository you have not yet decided to
-    // upgrade must not upgrade it as a side effect.
-    let applies_migrations = !matches!(
-        &command,
-        WorktreeSubcommand::Doctor {
-            adopt_capture_session: None,
-            ..
-        }
-    );
+    // upgrade must not upgrade it as a side effect. An UNCONFIRMED mutating
+    // repair skips it too (Codex R19 follow-up): the refusal is documented
+    // as zero-side-effect, so it must reach `require_repair_confirmation`
+    // without any migration-applying open on the way. The `--migrate-layout
+    // --dry-run` preview skips it as well (Codex R20 follow-up): it is
+    // documented as read-only end to end, so it enumerates layouts without
+    // ever resolving a database connection.
+    let readonly_layout_preview = repair_readonly_layout_preview(&command);
+    let applies_migrations = !matches!(&command, WorktreeSubcommand::Doctor { .. })
+        && !repair_invocation_refused_without_confirmation(&command)
+        && !readonly_layout_preview;
 
     if needs_repo {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
@@ -1064,6 +1101,15 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
         // Bare boundary: refused before ANY registry IO (the config read
         // needs the database opened just above).
         reject_bare_repository().await?;
+    } else if needs_repo
+        && (repair_invocation_refused_without_confirmation(&command) || readonly_layout_preview)
+    {
+        // The bare boundary precedes even the confirmation refusal — a bare
+        // repository has no working trees at all, which is the more
+        // fundamental error — but the refused repair and the read-only
+        // layout preview must stay zero-side-effect, so classify through the
+        // no-migration open.
+        reject_bare_repository_without_migrations().await?;
     }
 
     match command {
@@ -1152,9 +1198,19 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                     ))
                     .into_cli_error());
                 }
+                // W0 (§C.11, Codex R18): `--yes` is this action's dedicated
+                // confirmation; once given, the detach runs inside the same
+                // one-row operation-log audit boundary as every other
+                // mutating repair, closed with the action's outcome.
+                let boundary = begin_repair_operation(
+                    &format!("worktree repair {path} --resolve-identity"),
+                    Some(&path),
+                )
+                .await?;
                 let result = resolve_identity_collision(&path)
                     .await
-                    .map_err(WorktreeError::into_cli_error)?;
+                    .map_err(WorktreeError::into_cli_error);
+                let result = finish_repair_operation(boundary, result).await?;
                 if !output.is_json() {
                     println!("{result}");
                 }
@@ -1201,12 +1257,63 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
     }
 }
 
+/// W0 (§C.11, Codex R19 follow-up): an UNCONFIRMED mutating repair is
+/// documented as byte-for-byte side-effect free — and applying pending
+/// schema migrations is a WRITE. An invocation this predicate marks must
+/// therefore skip every migration-applying database open (the CLI preflight
+/// AND the dispatch-time open in this file and in `worktree-fuse.rs`) so it
+/// reaches only `require_repair_confirmation`'s pure refusal. Confirmed
+/// actions keep the standard schema preflight: their audit boundary writes.
+pub(crate) fn repair_invocation_refused_without_confirmation(command: &WorktreeSubcommand) -> bool {
+    match command {
+        WorktreeSubcommand::Repair {
+            migrate_layout,
+            dry_run,
+            confirm,
+            resolve_identity,
+            yes,
+            ..
+        } => {
+            if *resolve_identity {
+                // `--yes` is this action's dedicated confirmation.
+                !*yes
+            } else if *migrate_layout && *dry_run {
+                // The read-only preview is confirmation-free by design.
+                false
+            } else {
+                !*confirm
+            }
+        }
+        _ => false,
+    }
+}
+
+/// W0 (§C.11, Codex R20 follow-up): the `--migrate-layout --dry-run` preview
+/// is documented as read-only end to end — and applying pending schema
+/// migrations is a WRITE. An invocation this predicate marks must therefore
+/// skip every migration-applying database open (the CLI preflight AND the
+/// dispatch-time opens in this file and in `worktree-fuse.rs`) and never
+/// resolve the global connection: the preview needs only the lockless
+/// registry read and on-disk layout detection. The preview stays
+/// confirmation-free by design, so it is NOT part of
+/// [`repair_invocation_refused_without_confirmation`].
+pub(crate) fn repair_readonly_layout_preview(command: &WorktreeSubcommand) -> bool {
+    matches!(
+        command,
+        WorktreeSubcommand::Repair {
+            migrate_layout: true,
+            dry_run: true,
+            ..
+        }
+    )
+}
+
 /// W0 (§C.11, Codex R16/R17): a MUTATING repair action runs only behind an
 /// explicit `--confirm`. The refusal precedes every registry lock, database
 /// write and filesystem touch, so an unconfirmed invocation is byte-for-byte
 /// side-effect free — the property the table-driven regression
 /// `worktree_doctor_mutations_require_confirmation_and_emit_audit` asserts.
-fn require_repair_confirmation(confirm: bool, action: &str) -> CliResult<()> {
+pub(crate) fn require_repair_confirmation(confirm: bool, action: &str) -> CliResult<()> {
     if confirm {
         return Ok(());
     }
@@ -1221,7 +1328,7 @@ fn require_repair_confirmation(confirm: bool, action: &str) -> CliResult<()> {
 /// outcome by [`finish_repair_operation`]. The boundary claim also takes this
 /// worktree's control slot for the duration, serializing the repair against
 /// any concurrent sequencer control action here.
-async fn begin_repair_operation(
+pub(crate) async fn begin_repair_operation(
     command_name: &str,
     target: Option<&str>,
 ) -> CliResult<crate::internal::operation_wrapper::OperationBoundary> {
@@ -1281,11 +1388,13 @@ async fn begin_repair_operation(
 
 /// Close a repair action's audit boundary with its outcome, success OR
 /// failure — a repair that failed mid-way is still an executed action and
-/// its row says so. A failure to close is a warning rather than a command
-/// failure: the repair already happened, and turning a bookkeeping error
-/// into a command failure would misreport it (the same contract the
-/// sequencer control boundary in `cli.rs` follows).
-async fn finish_repair_operation<T>(
+/// its row says so. A failure to CLOSE is a command failure (W0 §C.11): the
+/// contract is exactly one row per executed action, closed with the outcome,
+/// and warning-and-continuing would leave a `running` row while reporting a
+/// successful repair — the audit gap the boundary exists to exclude. The
+/// error states plainly that the repair itself already happened, so the
+/// failure is never misread as the repair not running.
+pub(crate) async fn finish_repair_operation<T>(
     boundary: crate::internal::operation_wrapper::OperationBoundary,
     result: CliResult<T>,
 ) -> CliResult<T> {
@@ -1295,8 +1404,13 @@ async fn finish_repair_operation<T>(
         crate::internal::operation_wrapper::BoundaryOutcome::Failed
     };
     if let Err(err) = boundary.finish(outcome).await {
-        crate::utils::error::emit_warning(format!(
-            "the repair finished, but its operation-log record could not be closed: {err}"
+        return Err(CliError::fatal(format!(
+            "the repair completed, but its operation-log record could not be closed: {err}"
+        ))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+        .with_hint(
+            "the repair's effects stand; inspect the unclosed record with `libra op log`, \
+             and re-run the repair once the operation log is writable again",
         ));
     }
     result
@@ -1308,12 +1422,18 @@ async fn finish_repair_operation<T>(
 /// missing table included — is an `Err`, and the caller reports it: §C.13
 /// requires doctor to be fail-closed, and a diagnostic that silently reports
 /// "nothing to see" because it could not look is worse than one that says so.
-async fn adopted_scope_settings_present() -> Result<Option<String>, String> {
+///
+/// The connection comes from the caller — under `worktree doctor` that is the
+/// no-migration open (§C.11 W0): a diagnostic must never upgrade the database
+/// it is observing, so this helper must NOT resolve `get_db_conn_instance()`
+/// (which applies pending migrations) on its own.
+async fn adopted_scope_settings_present(
+    conn: &sea_orm::DatabaseConnection,
+) -> Result<Option<String>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
-    let db = crate::internal::db::get_db_conn_instance().await;
     let count = async |sql: &str| -> Result<i64, String> {
-        db.query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        conn.query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .map_err(|error| format!("{error}"))?
             .ok_or_else(|| "a COUNT query returned no row".to_string())?
@@ -1985,7 +2105,7 @@ async fn add_worktree(
             WorktreeEntryState::Tombstone => {
                 return Err(WorktreeError::OperationBlocked(format!(
                     "'{}' is a tombstone (scoped cleanup pending); run `libra worktree \
-                     repair` first, then add",
+                     repair --confirm` first, then add",
                     canonical_target.display()
                 )));
             }
@@ -2567,8 +2687,8 @@ async fn reattach_worktree(
         Err(error) => {
             // Journal kept: repair finishes lifting the marker.
             return Err(WorktreeError::IoWrite(format!(
-                "cannot remove the detached marker '{}' (run `libra worktree repair --confirm` to \
-                 finish the re-attach): {error}",
+                "cannot remove the detached marker '{}' (run `libra worktree repair \
+                 --confirm` to finish the re-attach): {error}",
                 marker.display()
             )));
         }
@@ -3125,7 +3245,9 @@ pub(crate) async fn format_worktree_porcelain(
 /// The workspace-scope half lives in [`run_worktree_doctor`]. Both are
 /// reported by one bare invocation, in one envelope, because the W0 document
 /// promised that W4 would ADD to this report rather than reshape it.
-pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorOutput> {
+pub(crate) async fn collect_worktree_scope_report(
+    conn: &sea_orm::DatabaseConnection,
+) -> CliResult<WorktreeDoctorOutput> {
     let listed = run_list_worktrees().map_err(WorktreeError::into_cli_error)?;
     // Which identities are claimed by more than one entry, and by which paths.
     let mut duplicate_identity_paths: std::collections::HashMap<String, Vec<String>> =
@@ -3161,7 +3283,8 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
             "legacy-symlink" => findings.push(
                 "uses the pre-isolation shared-`.libra` symlink layout; mutations here are \
                  refused because they would move the MAIN worktree's HEAD/index. Migrate with \
-                 `libra worktree repair --migrate-layout --confirm <path>` from the main worktree."
+                 `libra worktree repair --migrate-layout --confirm <path>` from the main \
+                 worktree."
                     .to_string(),
             ),
             "missing" => findings.push(
@@ -3179,8 +3302,8 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
         if !identity_registered && entry.layout != "missing" {
             findings.push(
                 "this worktree's identity is not one the registry knows, so mutations here are \
-                 refused; `libra worktree repair --confirm <path>` restores it from the registry's \
-                 persisted id."
+                 refused; `libra worktree repair --confirm <path>` restores it from the \
+                 registry's persisted id."
                     .to_string(),
             );
         }
@@ -3193,7 +3316,8 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
         }
         if entry.state == "tombstone" {
             findings.push(
-                "a removal did not finish cleaning up; `libra worktree repair --confirm` retries it."
+                "a removal did not finish cleaning up; `libra worktree repair --confirm` \
+                 retries it."
                     .to_string(),
             );
         }
@@ -3208,7 +3332,7 @@ pub(crate) async fn collect_worktree_scope_report() -> CliResult<WorktreeDoctorO
         // user is the only one who knows whether these settings are theirs, and
         // `layer remove` / `sparse-view clear` are the ordinary way to drop them.
         if entry.is_main && crate::command::maintenance::repository_had_linked_worktrees() {
-            match adopted_scope_settings_present().await {
+            match adopted_scope_settings_present(conn).await {
                 Ok(Some(kinds)) => findings.push(format!(
                     "this worktree holds {kinds} that may have been adopted from a linked \
                      worktree removed before the scope migration — their provenance cannot be \
@@ -4004,14 +4128,14 @@ pub(crate) async fn run_worktree_doctor(
             )));
         }
     };
-    // The human doctor also renders the W0 worktree-scope report. Do not
-    // build it for JSON/machine pagination: it scans every registry entry,
-    // would make a capped workspace page unbounded, and is not part of the
-    // frozen W4 JSON payload.
+    // The human doctor also renders the W0 worktree-scope report on the same
+    // no-migration connection. Do not build it for JSON/machine pagination:
+    // it scans every registry entry, would make a capped workspace page
+    // unbounded, and is not part of the frozen W4 JSON payload.
     let worktrees = if output.is_json() {
         Vec::new()
     } else {
-        collect_worktree_scope_report().await?.diagnostics
+        collect_worktree_scope_report(&conn).await?.diagnostics
     };
     if page.items.is_empty() {
         // Nothing to classify, so a missing/unreadable repository identity is
@@ -4289,8 +4413,8 @@ async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMove
                     || intent.payload["path"].as_str() == Some(src_path.to_string_lossy().as_ref()))
         }) {
             return Err(WorktreeError::OperationBlocked(format!(
-                "'{}' has an unfinished layout migration; run `libra worktree repair --confirm` \
-                 first",
+                "'{}' has an unfinished layout migration; run `libra worktree repair \
+                 --confirm` first",
                 src_path.display()
             )));
         }
@@ -4545,7 +4669,7 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     if detect_entry_layout(&target, false) == "legacy-symlink" {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' uses the legacy shared-.libra symlink layout; run `libra worktree \
-             repair --migrate-layout {}` first",
+             repair --migrate-layout --confirm {}` first",
             target.display(),
             target.display()
         )));
@@ -4623,7 +4747,7 @@ async fn remove_worktree_detach(
     let Some(worktree_id) = worktree_id else {
         return Err(WorktreeError::OperationBlocked(format!(
             "cannot detach '{}': its stable worktree id is unknown; run `libra worktree \
-             repair` first",
+             repair --confirm` first",
             target.display()
         )));
     };
@@ -4883,7 +5007,9 @@ async fn migrate_layout_run(
         ));
     }
     // Dry run is READ-ONLY end to end: no lock file creation, no registry
-    // upgrade — the lockless reader is enough to enumerate layouts.
+    // upgrade, and NO database open at all — the lockless reader is enough to
+    // enumerate layouts, and even a migration-applying connection would be a
+    // write on the repository being previewed (§C.11, Codex R20).
     let (_registry_lock, state) = if dry_run {
         (None, load_state_readonly()?)
     } else {
@@ -4891,7 +5017,6 @@ async fn migrate_layout_run(
         let state = load_state()?;
         (Some(guard), state)
     };
-    let db = crate::internal::db::get_db_conn_instance().await;
     let filter_path = match &filter {
         Some(raw) => Some(resolve_path(raw, "worktree path")?),
         None => None,
@@ -4940,6 +5065,12 @@ async fn migrate_layout_run(
             skipped,
         });
     }
+
+    // Confirmed execution only: the dry-run preview returned above without
+    // any database access, so this connection never resolves on the read-only
+    // path. (Migrations were already applied by the CLI preflight and the
+    // dispatch-time open — the §C.7 contract for confirmed repair actions.)
+    let db = crate::internal::db::get_db_conn_instance().await;
 
     // Preconditions shared by every target (§C.6.2 step 4): the SHARED
     // index must be conflict-free, no repository-global (main-scope)
@@ -5018,8 +5149,8 @@ async fn migrate_one_worktree(
 
     let worktree_id = state.entries[index].worktree_id.clone().ok_or_else(|| {
         WorktreeError::OperationBlocked(format!(
-            "registry entry '{}' has no persisted worktree id; run `worktree repair --confirm` \
-                 first",
+            "registry entry '{}' has no persisted worktree id; run `libra worktree repair \
+                 --confirm` first",
             target.display()
         ))
     })?;
@@ -5036,7 +5167,7 @@ async fn migrate_one_worktree(
     }) {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' has an unresolved earlier migration journal; run `libra worktree \
-             repair` to settle it, then retry",
+             repair --confirm` to settle it, then retry",
             target.display()
         )));
     }
@@ -5613,8 +5744,8 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
     {
         return Err(WorktreeError::OperationBlocked(
             "the worktree registry still uses the legacy v1 format with no persisted \
-             identities; run `libra worktree repair --confirm` (no argument) once to upgrade it, \
-             then retry"
+             identities; run `libra worktree repair --confirm` (no argument) once to upgrade \
+             it, then retry"
                 .to_string(),
         ));
     }
@@ -5631,8 +5762,8 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
     let Some(stable_id) = entry.worktree_id.clone() else {
         return Err(WorktreeError::OperationBlocked(format!(
             "the registry entry for '{}' predates registry v2 and carries no persisted \
-             worktree id; run the no-arg `libra worktree repair --confirm` once to upgrade the \
-             registry, then retry",
+             worktree id; run the no-arg `libra worktree repair --confirm` once to upgrade \
+             the registry, then retry",
             target.display()
         )));
     };
@@ -5643,7 +5774,7 @@ fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdenti
     if detect_entry_layout(&target, false) == "legacy-symlink" {
         return Err(WorktreeError::OperationBlocked(format!(
             "'{}' uses the legacy shared-.libra symlink layout; run `libra worktree \
-             repair --migrate-layout {}` first",
+             repair --migrate-layout --confirm {}` first",
             target.display(),
             target.display()
         )));
@@ -5771,7 +5902,7 @@ fn render_repair_identity(
     Ok(())
 }
 
-async fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
+pub(crate) async fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
     let _registry_lock = acquire_registry_lock()?;
     // The healing loader may itself rewrite the file (v1 upgrade, identity
     // invariants); report that as a change too.
@@ -6808,7 +6939,10 @@ async fn reconcile_lifecycle(
     }
 }
 
-fn render_repair_worktrees(result: &WorktreeRepairOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_repair_worktrees(
+    result: &WorktreeRepairOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.repair", result, output);
     }
@@ -6818,8 +6952,8 @@ fn render_repair_worktrees(result: &WorktreeRepairOutput, output: &OutputConfig)
         }
         if result.tombstones_pending > 0 {
             println!(
-                "{} tombstone(s) still pending; rerun `libra worktree repair --confirm` after \
-                 addressing the notes above",
+                "{} tombstone(s) still pending; rerun `libra worktree repair --confirm` \
+                 after addressing the notes above",
                 result.tombstones_pending
             );
         }
@@ -7052,5 +7186,63 @@ mod tests {
         );
         assert!(output.cleanup_root_removed);
         assert!(!cleanup_root.exists());
+    }
+
+    /// W0 §C.11: a failure to CLOSE the audit boundary is a command failure —
+    /// warn-and-continue would leave a `running` row while reporting a
+    /// successful repair, the audit gap the boundary exists to exclude. Fault
+    /// injection: the operation table is dropped between begin and finish, so
+    /// the close cannot write its outcome.
+    #[tokio::test]
+    async fn finish_repair_operation_surfaces_close_failure() {
+        use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+        use crate::internal::operation_wrapper::{
+            OperationMeta, OperationScope, begin_operation_with_conn,
+        };
+
+        let db = Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        for sql in [
+            "CREATE TABLE operation(op_id TEXT PRIMARY KEY,repo_id TEXT NOT NULL,view_id TEXT NOT NULL,command_name TEXT NOT NULL,description TEXT NOT NULL,actor TEXT NOT NULL,args_digest TEXT,start_ts INTEGER NOT NULL,end_ts INTEGER,status TEXT NOT NULL,worktree_id TEXT NOT NULL DEFAULT '',scope_provenance TEXT NOT NULL DEFAULT 'declared',restorable INTEGER NOT NULL DEFAULT 1,control_slot TEXT,claim_owner TEXT,scope_kind TEXT NOT NULL DEFAULT 'main');",
+            "CREATE TABLE operation_parent(op_id TEXT NOT NULL,parent_op_id TEXT NOT NULL,PRIMARY KEY (op_id,parent_op_id));",
+            "CREATE TABLE config_kv(id INTEGER PRIMARY KEY AUTOINCREMENT,key TEXT NOT NULL,value TEXT NOT NULL,encrypted INTEGER NOT NULL DEFAULT 0);",
+            "CREATE TABLE operation_view_ref(view_id TEXT NOT NULL,ref_kind TEXT NOT NULL,ref_name TEXT NOT NULL,ref_remote TEXT NOT NULL,target_oid TEXT NOT NULL,PRIMARY KEY (view_id,ref_kind,ref_name,ref_remote));",
+            "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
+            "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)",
+        ] {
+            db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+                .await
+                .expect("create schema");
+        }
+
+        let meta = OperationMeta {
+            command_name: "worktree repair".to_string(),
+            description: "repair the worktree registry".to_string(),
+            actor: "test".to_string(),
+            repo_id: "repo_1".to_string(),
+            args_digest: None,
+        };
+        let boundary = begin_operation_with_conn(&db, meta, OperationScope::default())
+            .await
+            .expect("open the boundary");
+
+        // Fault injection: the close cannot write its outcome row.
+        db.execute_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "DROP TABLE operation".to_string(),
+        ))
+        .await
+        .expect("drop the operation table");
+
+        let err = finish_repair_operation(boundary, Ok::<_, CliError>(()))
+            .await
+            .expect_err("a close failure must surface as a command error");
+        let text = format!("{err:?}");
+        assert!(
+            text.contains("could not be closed"),
+            "the error names the unclosed audit record: {text}"
+        );
     }
 }
