@@ -116,7 +116,7 @@ async fn preview_import_identity_prune_count(
         .map_err(|error| CliError::fatal(format!("begin import identity GC preview: {error}")))?;
     let backend = txn.get_database_backend();
     for checkpoint_id in checkpoint_ids {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM agent_coverage_conflict
              WHERE incumbent_checkpoint_id = ?
@@ -135,7 +135,7 @@ async fn preview_import_identity_prune_count(
                 "simulate coverage conflict pruning for import identity preview: {error}"
             ))
         })?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM agent_coverage_revision WHERE checkpoint_id = ?",
             [checkpoint_id.clone().into()],
@@ -152,7 +152,7 @@ async fn preview_import_identity_prune_count(
     // equivalent to the real per-checkpoint repoint/delete loop for the final
     // existence of each claim.
     for checkpoint_id in checkpoint_ids {
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM agent_coverage_claim
              WHERE checkpoint_id = ?
@@ -175,7 +175,7 @@ async fn preview_import_identity_prune_count(
         "SELECT COUNT(*) AS n FROM agent_import_identity WHERE {OWNERLESS_IMPORT_IDENTITY_PREDICATE}"
     );
     let count = txn
-        .query_one(Statement::from_string(backend, sql))
+        .query_one_raw(Statement::from_string(backend, sql))
         .await
         .map_err(|error| {
             CliError::fatal(format!(
@@ -251,7 +251,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
     let session_scope = session_scope_sql(args.all || args.gc);
     let session_filter = format!("SELECT COUNT(*) AS n FROM ({session_scope}) AS scoped_sessions");
     let row = conn
-        .query_one(Statement::from_string(backend, session_filter))
+        .query_one_raw(Statement::from_string(backend, session_filter))
         .await
         .map_err(|e| CliError::fatal(format!("failed to count agent_session: {e}")))?
         .ok_or_else(|| CliError::fatal("agent_session count returned no rows".to_string()))?;
@@ -349,7 +349,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
         let now_ms = chrono::Utc::now().timestamp_millis();
         if args.dry_run {
             let row = conn
-                .query_one(sea_orm::Statement::from_sql_and_values(
+                .query_one_raw(sea_orm::Statement::from_sql_and_values(
                     backend,
                     "SELECT COUNT(*) AS n FROM agent_export_job WHERE ttl_expires_at <= ?",
                     [now_ms.into()],
@@ -379,7 +379,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
                 let sql = format!(
                     "DELETE FROM agent_import_identity WHERE {OWNERLESS_IMPORT_IDENTITY_PREDICATE}"
                 );
-                conn.execute(Statement::from_string(backend, sql))
+                conn.execute_raw(Statement::from_string(backend, sql))
                     .await
                     .map_err(|error| {
                         CliError::fatal(format!("failed to prune stale import identities: {error}"))
@@ -513,7 +513,7 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
     );
-    conn.query_one(stmt)
+    conn.query_one_raw(stmt)
         .await
         .map(|row| row.is_some())
         .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
@@ -537,7 +537,7 @@ async fn gc_expired_checkpoint_ids(
          ORDER BY created_at ASC, checkpoint_id ASC"
     );
     let rows = conn
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             backend,
             &query,
             [cutoff_unix.into()],
@@ -991,7 +991,7 @@ async fn temporary_checkpoint_ids(
          ORDER BY created_at ASC, checkpoint_id ASC"
     );
     let rows = conn
-        .query_all(Statement::from_string(backend, query))
+        .query_all_raw(Statement::from_string(backend, query))
         .await
         .map_err(|e| CliError::fatal(format!("failed to list temporary checkpoints: {e}")))?;
     rows.into_iter()

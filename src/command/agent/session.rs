@@ -363,7 +363,7 @@ async fn list(args: SessionListArgs, output: &OutputConfig) -> CliResult<()> {
 
     let stmt = Statement::from_sql_and_values(backend, &sql, values);
     let rows = conn
-        .query_all(stmt)
+        .query_all_raw(stmt)
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
 
@@ -422,7 +422,7 @@ async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
         [args.session_id.clone().into()],
     );
     let row = conn
-        .query_one(stmt)
+        .query_one_raw(stmt)
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_session: {e}")))?;
     match row {
@@ -506,7 +506,7 @@ async fn mutate_session_state(
     }
 
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT state, stopped_at, last_event_at \
              FROM agent_session WHERE session_id = ? LIMIT 1",
@@ -577,7 +577,7 @@ async fn mutate_session_state(
         SessionMutationKind::Stop => ("stopped", Some(now)),
         SessionMutationKind::Resume => ("active", None),
     };
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         backend,
         "UPDATE agent_session \
          SET state = ?, last_event_at = ?, stopped_at = ?, \
@@ -743,7 +743,7 @@ async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> Cli
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
     );
-    conn.query_one(stmt)
+    conn.query_one_raw(stmt)
         .await
         .map(|row| row.is_some())
         .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
@@ -771,7 +771,7 @@ async fn load_agent_session_snapshot(
 ) -> CliResult<AgentSessionSnapshot> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT session_id, agent_kind, provider_session_id, state, working_dir, \
                     COALESCE(metadata_json, '{}') AS metadata_json, \
@@ -1133,7 +1133,7 @@ mod tests {
                 continue;
             }
             let _: ExecResult = conn
-                .execute(Statement::from_string(backend, trimmed.to_string()))
+                .execute_raw(Statement::from_string(backend, trimmed.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("legacy bootstrap stmt failed: {trimmed}\n{e}"));
         }
@@ -1159,7 +1159,7 @@ mod tests {
         metadata_json: &str,
     ) {
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1184,7 +1184,7 @@ mod tests {
     ) -> (String, Option<i64>, i64) {
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT state, stopped_at, last_event_at \
                  FROM agent_session WHERE session_id = ? LIMIT 1",
@@ -1304,7 +1304,7 @@ mod tests {
         let (_dir, conn, repo_path) = fresh_repo().await;
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1436,7 +1436,7 @@ mod tests {
         let (_dir, conn, repo_path) = fresh_repo().await;
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1502,7 +1502,7 @@ mod tests {
     async fn promote_honors_explicit_prompt_override() {
         let (_dir, conn, repo_path) = fresh_repo().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,

@@ -40,10 +40,12 @@ the same as the POSIX one:
 - An existing `lba.cmd` WITHOUT the marker, or any existing `lba.exe`,
   `lba.bat`, or `lba.ps1`, is left untouched — `lba` is short enough to belong
   to another tool, and Windows would resolve those extensions ahead of ours.
-- `-NoAlias` (or `LIBRA_NO_ALIAS`) skips the shorthand:
+- `-NoAlias` (or `LIBRA_NO_ALIAS=1`) skips the shorthand. To pass the
+  switch, save and invoke the installer rather than piping it to `iex`:
 
   ```powershell
-  irm https://download.libra.tools/install.ps1 | iex -NoAlias
+  irm https://download.libra.tools/install.ps1 -OutFile install.ps1
+  .\install.ps1 -NoAlias
   ```
 
 - Failing to write the shim warns; it does not fail the installation.

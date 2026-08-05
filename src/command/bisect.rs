@@ -127,7 +127,7 @@ impl BisectState {
             .storage_key()
             .to_string();
         let result = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, \
                  skipped, steps, completed, first_parent, worktree_id) \
@@ -201,7 +201,7 @@ impl BisectState {
         );
 
         if let Some(result) = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to query bisect_state: {e}"))?
         {
@@ -223,7 +223,7 @@ impl BisectState {
         );
 
         if let Some(result) = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to query bisect_state: {e}"))?
         {
@@ -286,7 +286,7 @@ impl BisectState {
             ],
         );
 
-        db.execute(stmt)
+        db.execute_raw(stmt)
             .await
             .map_err(|e| format!("failed to save bisect state: {e}"))?;
 
@@ -320,7 +320,7 @@ impl BisectState {
         );
 
         if let Some(result) = db
-            .query_one(stmt)
+            .query_one_raw(stmt)
             .await
             .map_err(|e| format!("failed to load bisect state: {e}"))?
         {
@@ -378,7 +378,7 @@ impl BisectState {
             [Self::scope_key().into()],
         );
 
-        db.execute(stmt)
+        db.execute_raw(stmt)
             .await
             .map_err(|e| format!("failed to clear bisect state: {e}"))?;
 

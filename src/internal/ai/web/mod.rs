@@ -4,9 +4,10 @@
 //! `/api/code/*` protocol used by the browser UI.
 
 pub mod code_ui;
+pub mod code_ui_projection;
 pub mod headless;
 
-use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -22,7 +23,7 @@ use axum::{
 };
 use futures_util::stream::{self, StreamExt};
 use serde::Serialize;
-use tokio::sync::oneshot;
+use tokio::{sync::oneshot, time::timeout};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 use uuid::Uuid;
 
@@ -45,6 +46,7 @@ use crate::{
 
 const CODE_CONTROL_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const CODE_CONTROL_BODY_REJECT_DRAIN_BYTES: usize = 1024 * 1024;
+const WEB_SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct WebAppState {
@@ -70,10 +72,41 @@ pub struct WebServerHandle {
     join: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
+/// Bounded shutdown outcome for the embedded Code web listener.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WebServerShutdownError {
+    #[error("web_server did not stop before the shutdown deadline")]
+    TimedOut,
+    #[error("web_server task exited unexpectedly during shutdown: {reason}")]
+    TaskFailed { reason: String },
+}
+
 impl WebServerHandle {
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self) -> Result<(), WebServerShutdownError> {
+        self.shutdown_with_timeout(WEB_SERVER_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn shutdown_with_timeout(
+        self,
+        shutdown_timeout: Duration,
+    ) -> Result<(), WebServerShutdownError> {
         let _ = self.shutdown_tx.send(());
-        let _ = self.join.await;
+        let mut join = self.join;
+        match timeout(shutdown_timeout, &mut join).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(WebServerShutdownError::TaskFailed {
+                reason: error.to_string(),
+            }),
+            Ok(Err(error)) => Err(WebServerShutdownError::TaskFailed {
+                reason: error.to_string(),
+            }),
+            Err(_) => {
+                join.abort();
+                let _ = join.await;
+                Err(WebServerShutdownError::TimedOut)
+            }
+        }
     }
 }
 
@@ -601,7 +634,7 @@ async fn code_controller_detach_handler(
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
         runtime
-            .detach_controller(lease.kind, &body.client_id, &token, false)
+            .detach_controller(lease.kind, &body.client_id, &token)
             .await
             .map_err(WebApiError::from)
     }
@@ -1172,7 +1205,11 @@ impl IntoResponse for WebApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::{
+        future,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+        time::Duration,
+    };
 
     use axum::{
         body::{Body, to_bytes},
@@ -1210,6 +1247,22 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn web_server_shutdown_reports_a_bounded_timeout_and_aborts_the_task() {
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        let handle = WebServerHandle {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            shutdown_tx,
+            join: tokio::spawn(async { future::pending::<anyhow::Result<()>>().await }),
+        };
+
+        let result = handle
+            .shutdown_with_timeout(Duration::from_millis(10))
+            .await;
+
+        assert_eq!(result, Err(WebServerShutdownError::TimedOut));
     }
 
     #[test]

@@ -220,19 +220,23 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
                 let mut connections = TEST_DB_CONNECTIONS.lock().await;
                 let evicted = connections.remove(&db_path);
                 drop(connections);
-                let closing_path = db_path.clone();
-                tokio::spawn(async move {
-                    if let Some(stale) = evicted
-                        && let Err(error) = stale.close().await
-                    {
-                        tracing::warn!(
-                            db_path = %closing_path.display(),
-                            error = %error,
-                            "failed to close a schema-incompatible cached connection"
-                        );
-                    }
-                    let _ = conn.close().await;
-                });
+                // The pool must be MARKED closed before this function
+                // returns, or a concurrent holder of an evicted clone can
+                // still execute SQL in the window before a spawned task runs
+                // (W2 r8 #3). `Pool::close` marks the pool on its FIRST poll
+                // and only then waits for outstanding connections — so a
+                // zero-duration timeout polls it exactly once: the marking is
+                // synchronous with this call, every clone's next statement is
+                // refused from here on, and the drain (which can only end
+                // when open transactions conclude — awaiting it inline
+                // deadlocks) is abandoned to the connections' own drops.
+                if let Some(stale) = evicted {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(0), stale.close())
+                            .await;
+                }
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_millis(0), conn.close()).await;
                 // Fall through: re-establish, which re-checks and either
                 // upgrades or reports the future schema with its hint.
             }
@@ -289,7 +293,9 @@ const ACQUIRE_WRITE_LOCK_SQL: &str = "UPDATE `config_kv` SET `id` = `id` WHERE 0
 ///
 /// Use this for any transaction that reads before it writes. A transaction
 /// whose first statement is already a write needs nothing.
-pub async fn begin_write_transaction<C: TransactionTrait>(
+pub async fn begin_write_transaction<
+    C: TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
+>(
     db: &C,
 ) -> Result<sea_orm::DatabaseTransaction, DbErr> {
     let txn = db.begin().await?;
@@ -317,7 +323,7 @@ pub async fn begin_write_transaction<C: TransactionTrait>(
 /// instead of waiting.
 pub async fn write_transaction<C, F, T, E>(db: &C, callback: F) -> Result<T, TransactionError<E>>
 where
-    C: TransactionTrait,
+    C: TransactionTrait<Transaction = sea_orm::DatabaseTransaction>,
     F: for<'c> FnOnce(
             &'c sea_orm::DatabaseTransaction,
         ) -> std::pin::Pin<
@@ -578,7 +584,7 @@ async fn setup_database_sql(conn: &DatabaseConnection) -> Result<(), Transaction
             let backend = txn.get_database_backend();
 
             // `include_str!` will expand the file while compiling, so `.sql` is not needed after that
-            txn.execute(Statement::from_string(backend, BOOTSTRAP_SQL))
+            txn.execute_raw(Statement::from_string(backend, BOOTSTRAP_SQL))
                 .await?;
             Ok(())
         })
@@ -634,7 +640,7 @@ async fn sqlite_schema_contains(
         "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
         [entry_type.into(), name.into()],
     );
-    let row = conn.query_one(stmt).await?;
+    let row = conn.query_one_raw(stmt).await?;
     Ok(row.is_some())
 }
 
@@ -659,7 +665,7 @@ CREATE TABLE IF NOT EXISTS `config_kv` (
 );
 CREATE INDEX IF NOT EXISTS idx_config_kv_key ON config_kv(`key`);
 "#;
-    conn.execute(Statement::from_string(backend, ddl))
+    conn.execute_raw(Statement::from_string(backend, ddl))
         .await
         .map_err(|err| IOError::other(format!("Failed to create config_kv table: {err}")))?;
     Ok(())
@@ -671,7 +677,7 @@ async fn ensure_ai_projection_schema(conn: &DatabaseConnection) -> Result<(), IO
         .map_err(|err| IOError::other(format!("Failed to inspect core schema: {err}")))?
     {
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_string(backend, BOOTSTRAP_SQL))
+        conn.execute_raw(Statement::from_string(backend, BOOTSTRAP_SQL))
             .await
             .map_err(|err| IOError::other(format!("Failed to bootstrap SQLite schema: {err}")))?;
         return Ok(());
@@ -689,7 +695,7 @@ async fn ensure_ai_projection_schema(conn: &DatabaseConnection) -> Result<(), IO
     }
 
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(backend, ai_projection_sql()?))
+    conn.execute_raw(Statement::from_string(backend, ai_projection_sql()?))
         .await
         .map_err(|err| IOError::other(format!("Failed to apply AI projection schema: {err}")))?;
     Ok(())
@@ -702,7 +708,7 @@ async fn ensure_ai_projection_schema(conn: &DatabaseConnection) -> Result<(), IO
 /// here on first connection.
 pub async fn ensure_ai_runtime_contract_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         AI_RUNTIME_CONTRACT_MIGRATION_SQL,
     ))
@@ -713,7 +719,7 @@ pub async fn ensure_ai_runtime_contract_schema(conn: &DatabaseConnection) -> Res
 
 async fn ensure_operation_schema(conn: &DatabaseConnection) -> Result<(), IOError> {
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(backend, OPERATION_SCHEMA_SQL))
+    conn.execute_raw(Statement::from_string(backend, OPERATION_SCHEMA_SQL))
         .await
         .map_err(|err| IOError::other(format!("Failed to apply operation schema: {err}")))?;
     Ok(())
@@ -884,7 +890,7 @@ mod tests {
         // busy handler for a read→write upgrade.
         let upgrading = waiter.begin().await.unwrap();
         upgrading
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Sqlite,
                 "SELECT `id` FROM `config_kv`",
             ))
@@ -917,7 +923,7 @@ mod tests {
         // queues behind the holder and succeeds.
         let started = std::time::Instant::now();
         let txn = begin_write_transaction(&waiter).await.unwrap();
-        txn.query_all(Statement::from_string(
+        txn.query_all_raw(Statement::from_string(
             sea_orm::DatabaseBackend::Sqlite,
             "SELECT `id` FROM `config_kv`",
         ))
@@ -934,7 +940,7 @@ mod tests {
         release.await.unwrap();
 
         let rows = waiter
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 sea_orm::DatabaseBackend::Sqlite,
                 "SELECT `key` FROM `config_kv` WHERE `key` IN ('a', 'b') ORDER BY `key`",
             ))
@@ -1311,7 +1317,7 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
             ["ai_thread".into()],
         );
-        let row = conn.query_one(stmt).await.unwrap();
+        let row = conn.query_one_raw(stmt).await.unwrap();
 
         assert!(row.is_some(), "expected ai_thread table to exist");
 
@@ -1346,7 +1352,7 @@ mod tests {
         let core_sql_end = BOOTSTRAP_SQL.find(AI_PROJECTION_SCHEMA_START).unwrap();
         let core_sql = BOOTSTRAP_SQL[..core_sql_end].trim();
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_string(backend, core_sql))
+        conn.execute_raw(Statement::from_string(backend, core_sql))
             .await
             .unwrap();
         conn.close().await.unwrap();
@@ -1362,7 +1368,7 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
             ["ai_thread".into()],
         );
-        let ai_row = conn.query_one(ai_stmt).await.unwrap();
+        let ai_row = conn.query_one_raw(ai_stmt).await.unwrap();
         assert!(ai_row.is_some(), "expected ai_thread table to exist");
 
         let core_stmt = Statement::from_sql_and_values(
@@ -1370,7 +1376,7 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
             ["object_index".into()],
         );
-        let core_row = conn.query_one(core_stmt).await.unwrap();
+        let core_row = conn.query_one_raw(core_stmt).await.unwrap();
         assert!(
             core_row.is_some(),
             "expected object_index table to remain present"
@@ -1403,7 +1409,7 @@ mod tests {
             let conn = task.await.unwrap().unwrap();
             let backend = conn.get_database_backend();
             let stmt = Statement::from_sql_and_values(backend, "SELECT 1", []);
-            let row = conn.query_one(stmt).await.unwrap();
+            let row = conn.query_one_raw(stmt).await.unwrap();
             assert!(row.is_some());
         }
 

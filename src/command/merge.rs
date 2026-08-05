@@ -2239,6 +2239,17 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
     Ok(())
 }
 
+/// Whether THIS worktree has a merge in progress — the request-scoped sidecar
+/// probe `pull` runs BEFORE fetching (W2 r8 #2): the operation-log slot only
+/// excludes CONCURRENT control actions, while a persisted conflicted merge is
+/// state, and a pull that fetched first would mutate FETCH_HEAD and remote
+/// refs before discovering it has nowhere to integrate.
+pub(crate) fn merge_in_progress() -> Result<bool, String> {
+    let gitdir = util::request_worktree_gitdir()
+        .map_err(|error| format!("cannot resolve this worktree's gitdir: {error}"))?;
+    Ok(gitdir.join("merge-state.json").exists())
+}
+
 /// Preflight for the merge control actions (W2 r5 #1, r6 #4): the
 /// held-autostash sidecar must be READABLE before HEAD/index/worktree are
 /// restored — an unreadable one would otherwise surface after `abort` had

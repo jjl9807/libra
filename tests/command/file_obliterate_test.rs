@@ -61,7 +61,7 @@ fn mark_obliteration_as_interrupted(repo: &Path) {
     runtime.block_on(async {
         let conn = connect_raw_repo_db(repo).await;
         let result = conn
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "UPDATE object_obliteration SET state='obliterating', payload_deleted_at=NULL",
             ))

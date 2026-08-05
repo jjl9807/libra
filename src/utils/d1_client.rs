@@ -4537,13 +4537,13 @@ mod tests {
         let conn = Database::connect("sqlite::memory:")
             .await
             .expect("open SQLite JSON fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE batch_values (value INTEGER NOT NULL)".to_string(),
         ))
         .await
         .expect("create batch target");
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             batch.sql,
             ["repo".into(), payload.into(), "writer-token".into()],
@@ -4551,7 +4551,7 @@ mod tests {
         .await
         .expect("execute JSON-text batch through SQLite json_each");
         let values = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT value FROM batch_values ORDER BY value".to_string(),
             ))
@@ -4570,7 +4570,7 @@ mod tests {
         let conn = Database::connect("sqlite::memory:")
             .await
             .expect("open claim high-water fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE agent_subagent_content_claim (
                 source_key TEXT PRIMARY KEY, revision_cursor INTEGER NOT NULL,
@@ -4581,7 +4581,7 @@ mod tests {
         ))
         .await
         .expect("create claim high-water fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_subagent_content_claim VALUES
              ('source', 9, 3, 9, 'checkpoint-9', 'digest-9')"
@@ -4601,12 +4601,12 @@ mod tests {
              WHERE {AGENT_SUBAGENT_CLAIM_UPDATE_GUARD}"
         );
         let result = conn
-            .execute(Statement::from_string(conn.get_database_backend(), sql))
+            .execute_raw(Statement::from_string(conn.get_database_backend(), sql))
             .await
             .expect("apply guarded claim update");
         assert_eq!(result.rows_affected(), 0);
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT revision_cursor, sync_revision FROM agent_subagent_content_claim"
                     .to_string(),
@@ -4642,7 +4642,7 @@ mod tests {
             "INSERT INTO object_index_catalog_generation VALUES ('existing', 7)",
             OBJECT_INDEX_CATALOG_SEED_SQL,
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
@@ -4650,7 +4650,7 @@ mod tests {
             .expect("apply object-index generation seed SQL");
         }
         let generations = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT repo_id, generation FROM object_index_catalog_generation ORDER BY repo_id"
                     .to_string(),
@@ -4694,7 +4694,7 @@ mod tests {
             OBJECT_INDEX_CATALOG_SEED_SQL,
             "INSERT INTO object_index VALUES (1, 'before', 'blob', 1, 'repo', 1, 1)",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
@@ -4702,7 +4702,7 @@ mod tests {
             .expect("prepare object-index readiness fixture");
         }
         let ready_before = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT EXISTS(
                     SELECT 1 FROM object_index_catalog_generation_ready WHERE singleton = 1
@@ -4720,21 +4720,21 @@ mod tests {
             .into_iter()
             .chain(std::iter::once(OBJECT_INDEX_CATALOG_PUBLISH_READY_SQL))
         {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
             .await
             .expect("publish object-index readiness");
         }
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO object_index VALUES (2, 'after', 'blob', 1, 'repo', 1, 1)".to_string(),
         ))
         .await
         .expect("mutate catalog after readiness");
         let generation = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT generation FROM object_index_catalog_generation WHERE repo_id = 'repo'"
                     .to_string(),
@@ -4764,7 +4764,7 @@ mod tests {
                 repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4772,7 +4772,7 @@ mod tests {
             .expect("create object-index generation fixture");
         }
         for trigger in OBJECT_INDEX_CATALOG_TRIGGERS {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 trigger.to_string(),
             ))
@@ -4785,7 +4785,7 @@ mod tests {
             "INSERT INTO object_index VALUES (2, 'a', 'blob', 1, 'repo', 1, 1)",
             "DELETE FROM object_index WHERE repo_id = 'repo' AND o_id = 'b'",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 mutation.to_string(),
             ))
@@ -4793,7 +4793,7 @@ mod tests {
             .expect("mutate object-index generation fixture");
         }
         let generation = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT generation FROM object_index_catalog_generation WHERE repo_id = 'repo'"
                     .to_string(),
@@ -4813,7 +4813,7 @@ mod tests {
         let conn = Database::connect("sqlite::memory:")
             .await
             .expect("open generation lease fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "CREATE TABLE agent_capture_generation (
                 repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
@@ -4826,7 +4826,7 @@ mod tests {
         ))
         .await
         .expect("create generation lease fixture");
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "INSERT INTO agent_capture_generation VALUES (
                 'repo', 7, 'publishing', 'active', 'old', 1,
@@ -4851,7 +4851,7 @@ mod tests {
             ]
         };
         let active = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL,
                 params(),
@@ -4863,14 +4863,14 @@ mod tests {
             "an active publisher must retain its fence"
         );
 
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "UPDATE agent_capture_generation SET started_at = 0 WHERE repo_id = 'repo'".to_string(),
         ))
         .await
         .expect("expire generation lease");
         let recovered = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL,
                 params(),
@@ -4916,7 +4916,7 @@ mod tests {
                 'checkpoint_projection', 1, NULL, 1, NULL
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4925,7 +4925,7 @@ mod tests {
         }
 
         let stale = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
                 ["repo".into(), "writer".into(), 1_i64.into()],
@@ -4937,7 +4937,7 @@ mod tests {
             "an object-index mutation after manifest read must fence completion"
         );
 
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             "UPDATE object_index_catalog_generation SET generation = 1 WHERE repo_id = 'repo'"
                 .to_string(),
@@ -4945,7 +4945,7 @@ mod tests {
         .await
         .expect("restore matching object generation");
         let complete = conn
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
                 AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
                 ["repo".into(), "writer".into(), 1_i64.into()],
@@ -4966,7 +4966,7 @@ mod tests {
             "CREATE TABLE agent_session (session_id TEXT PRIMARY KEY)",
             "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4974,7 +4974,7 @@ mod tests {
             .expect("create legacy capture table");
         }
         for ddl in AGENT_CAPTURE_LEGACY_WRITE_BARRIERS {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -4987,7 +4987,7 @@ mod tests {
             "INSERT INTO agent_checkpoint (checkpoint_id) VALUES ('legacy-checkpoint')",
         ] {
             let error = conn
-                .execute(Statement::from_string(
+                .execute_raw(Statement::from_string(
                     conn.get_database_backend(),
                     sql.to_string(),
                 ))
@@ -5107,21 +5107,21 @@ mod tests {
                 NULL, NULL, NULL, '{}', '{}', 1, 2, NULL, 1, 3
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
             .await
             .expect("seed adoption fixture");
         }
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL.to_string(),
         ))
         .await
         .expect("adopt legacy session");
         let adopted = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT sync_revision FROM agent_capture_session_v2 WHERE session_id = 'legacy-1'"
                     .to_string(),
@@ -5144,21 +5144,21 @@ mod tests {
                 NULL, NULL, NULL, '{}', '{}', 1, 2, NULL, 1, 3
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
             .await
             .expect("finish one-time adoption fixture");
         }
-        conn.execute(Statement::from_string(
+        conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),
             AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL.to_string(),
         ))
         .await
         .expect("re-run adoption after completion");
         let count = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT COUNT(*) AS n FROM agent_capture_session_v2".to_string(),
             ))
@@ -5210,7 +5210,7 @@ mod tests {
                 PRIMARY KEY (repo_id, checkpoint_id)
              )",
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 ddl.to_string(),
             ))
@@ -5221,7 +5221,7 @@ mod tests {
             AGENT_CAPTURE_LEGACY_CHECKPOINT_ADOPTION_SQL,
             AGENT_CAPTURE_LEGACY_ORPHAN_CLEANUP_SQL,
         ] {
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 conn.get_database_backend(),
                 sql.to_string(),
             ))
@@ -5229,7 +5229,7 @@ mod tests {
             .expect("adopt and reconcile legacy checkpoints");
         }
         let rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 conn.get_database_backend(),
                 "SELECT checkpoint_id, sync_revision FROM agent_capture_checkpoint_v2".to_string(),
             ))

@@ -1326,7 +1326,25 @@ async fn recover_stash_branch_journal() -> Result<(), StashError> {
         }
     }
 
-    // HEAD first: if it still points at the journaled branch, restore the
+    // PROVENANCE first, read-only (W2 r8 #1): no row means the create never
+    // committed — and then NOTHING may be touched, HEAD included. A user may
+    // have created and switched to a branch of the journaled name themselves
+    // after the interrupted command; moving their HEAD on the strength of a
+    // `prepared` journal alone would hijack it.
+    let created_by_us = InternalBranch::journaled_provenance_exists(&journal.nonce)
+        .await
+        .map_err(|error| {
+            StashError::Other(format!(
+                "rollback cannot read the creation provenance ({error}); the journal is \
+                 kept and the next stash command will retry"
+            ))
+        })?;
+    if !created_by_us {
+        StashBranchJournal::clear()?;
+        return Ok(());
+    }
+
+    // HEAD next: if it still points at the journaled branch, restore the
     // prior head; if the user already moved on, leave HEAD alone.
     if let Head::Branch(current) = Head::current().await
         && current == journal.branch

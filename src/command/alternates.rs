@@ -136,7 +136,7 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
         .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
     // objectformat (config table; default sha1).
     let fmt_row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT value FROM config WHERE name = 'objectformat' AND configuration = 'core' \
              LIMIT 1"
@@ -159,7 +159,7 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
     };
     // tiered? (config_kv LIBRA_STORAGE_TYPE = s3/r2).
     let tier_row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT value FROM config_kv WHERE key = 'LIBRA_STORAGE_TYPE' LIMIT 1".to_string(),
         ))

@@ -536,7 +536,7 @@ mod tests {
         let path = {
             use sea_orm::{ConnectionTrait, Statement};
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     "PRAGMA database_list".to_string(),
                 ))
@@ -610,7 +610,7 @@ mod tests {
     async fn open_database_path(db: &sea_orm::DatabaseConnection) -> std::path::PathBuf {
         use sea_orm::{ConnectionTrait, Statement};
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 db.get_database_backend(),
                 "PRAGMA database_list".to_string(),
             ))

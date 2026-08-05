@@ -583,7 +583,7 @@ async fn resolve_expire_refs<C: ConnectionTrait>(
 ) -> CliResult<Vec<String>> {
     if options.all {
         let rows = conn
-            .query_all(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT DISTINCT ref_name FROM reflog;".to_string(),
             ))
@@ -795,7 +795,7 @@ async fn delete_single_group(group: &[(String, usize)]) -> CliResult<usize> {
             for (_, index) in &group {
                 if let Some(entry) = logs.get(*index) {
                     let id = entry.id;
-                    txn.execute(Statement::from_sql_and_values(
+                    txn.execute_raw(Statement::from_sql_and_values(
                         DbBackend::Sqlite,
                         "DELETE FROM reflog WHERE id = ?;",
                         [id.into()],

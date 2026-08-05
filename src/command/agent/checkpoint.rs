@@ -194,7 +194,7 @@ async fn list(args: CheckpointListArgs, output: &OutputConfig) -> CliResult<()> 
     values.push((limit as i64 + 1).into());
 
     let rows = conn
-        .query_all(Statement::from_sql_and_values(backend, &sql, values))
+        .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
         .await
         .map_err(|e| CliError::fatal(format!("failed to query agent_checkpoint: {e}")))?;
     let mut out = Vec::with_capacity(rows.len());
@@ -237,7 +237,7 @@ async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> 
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                     metadata_blob_oid, traces_commit, created_at \
@@ -295,7 +295,7 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT parent_commit, traces_commit FROM agent_checkpoint \
              WHERE checkpoint_id = ? LIMIT 1",
@@ -580,7 +580,7 @@ async fn lookup_truncation_support(
 ) -> Result<bool, sea_orm::DbErr> {
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT s.agent_kind AS agent_kind, \
                     COALESCE(s.metadata_json, '{}') AS metadata_json \
@@ -639,7 +639,7 @@ async fn truncate_agent_transcript_for_checkpoint_with_conn(
     //    (Codex round-1 P4 follow-up),
     //  - created_at on the checkpoint (the boundary).
     let row = match conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT s.agent_kind AS agent_kind, \
                     COALESCE(s.metadata_json, '{}') AS metadata_json, \
@@ -1293,7 +1293,7 @@ pub(super) async fn resolve_checkpoint_input_spec(
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                     metadata_blob_oid, traces_commit, created_at \
@@ -1529,7 +1529,7 @@ async fn load_checkpoint_row(
     }
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT checkpoint_id, session_id, scope, parent_commit, tree_oid, \
                     metadata_blob_oid, traces_commit, created_at \
@@ -1836,7 +1836,7 @@ pub(super) async fn table_exists(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
         [name.into()],
     );
-    conn.query_one(stmt)
+    conn.query_one_raw(stmt)
         .await
         .map(|row| row.is_some())
         .map_err(|e| CliError::fatal(format!("failed to query sqlite_master: {e}")))
@@ -1875,7 +1875,7 @@ mod tests {
                 continue;
             }
             let _: ExecResult = conn
-                .execute(Statement::from_string(backend, trimmed.to_string()))
+                .execute_raw(Statement::from_string(backend, trimmed.to_string()))
                 .await
                 .unwrap_or_else(|e| panic!("legacy bootstrap stmt failed: {trimmed}\n{e}"));
         }
@@ -1912,7 +1912,7 @@ mod tests {
             .timestamp();
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1922,7 +1922,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -1953,7 +1953,7 @@ mod tests {
     async fn rewind_truncate_skips_when_no_transcript_path_in_metadata() {
         let (_dir, conn) = fresh_db().await;
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -1963,7 +1963,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -2011,7 +2011,7 @@ mod tests {
             let session_id = format!("s-{idx}");
             let provider_session_id = format!("p-{idx}");
             let checkpoint_id = format!("cp-{idx}");
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_session (
                     session_id, agent_kind, provider_session_id, state, working_dir,
@@ -2026,7 +2026,7 @@ mod tests {
             ))
             .await
             .unwrap();
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_checkpoint (
                     checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -2063,7 +2063,7 @@ mod tests {
         .to_string();
 
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_session (
                 session_id, agent_kind, provider_session_id, state, working_dir,
@@ -2073,7 +2073,7 @@ mod tests {
         ))
         .await
         .unwrap();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO agent_checkpoint (
                 checkpoint_id, session_id, scope, parent_commit, tree_oid,
@@ -2186,7 +2186,7 @@ mod tests {
         ];
         for (sql, values, index_name, table) in cases {
             let rows = conn
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     backend,
                     format!("EXPLAIN QUERY PLAN {sql}"),
                     values,

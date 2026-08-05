@@ -11,6 +11,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
+use sea_orm::{ConnectionTrait, Statement};
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -112,15 +113,6 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         porcelain: bool,
     },
-    /// Report per-worktree scope diagnostics. STRICTLY READ-ONLY.
-    ///
-    /// plan-20260714 Part C W0 (§C.11): this is the read-only diagnostic
-    /// skeleton. It never writes: no registry rewrite, no DB row, no lease
-    /// change, no filesystem mutation. Repair actions (legacy adopt/clear,
-    /// lease reclaim, provenance repair) arrive as EXPLICIT subcommands in
-    /// later waves, each requiring confirmation and emitting an audit event
-    /// — which is why no hint anywhere may promise that a bare `doctor` will
-    /// fix something (Codex R19/R20).
     /// Mark a worktree as locked to prevent it from being pruned or removed.
     Lock {
         /// Filesystem path of the worktree to lock.
@@ -164,12 +156,15 @@ pub enum WorktreeSubcommand {
         #[clap(long)]
         cleanup: bool,
     },
-    /// Diagnose Agent workspace scopes (READ-ONLY: reports, never repairs).
+    /// Diagnose Agent workspace scopes.
     ///
     /// Without an id this is a keyset-paginated view over every workspace
     /// record that still has something to say — including records left behind
     /// by a previous repository identity, which the identity-scoped listings
     /// hide. With an id it is the single-scope view of that one workspace.
+    /// The default invocation is strictly read-only; the only repair action
+    /// currently available is explicit legacy capture adoption, which also
+    /// requires `--confirm` and writes an audit event.
     Doctor {
         /// Diagnose exactly one workspace (ids come from `worktree doctor`
         /// or `libra agent workspace list`). Cannot be combined with
@@ -182,6 +177,19 @@ pub enum WorktreeSubcommand {
         /// Keyset cursor: the `next_cursor` of the previous page, verbatim.
         #[clap(long, value_name = "CURSOR")]
         cursor: Option<String>,
+        /// Explicitly attribute one legacy unscoped capture session to this
+        /// workspace. Requires a workspace id and --confirm; the default
+        /// doctor command remains strictly read-only.
+        #[clap(
+            long,
+            value_name = "SESSION_ID",
+            requires = "workspace_id",
+            conflicts_with_all = ["limit", "cursor"]
+        )]
+        adopt_capture_session: Option<String>,
+        /// Confirm a legacy capture-scope adoption.
+        #[clap(long, requires = "adopt_capture_session")]
+        confirm: bool,
     },
     /// Repair worktree metadata, attempting to recover from inconsistencies.
     /// With a path, restores that linked worktree's gitdir identity
@@ -1152,7 +1160,20 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             workspace_id,
             limit,
             cursor,
-        } => run_worktree_doctor(workspace_id, limit, cursor, output).await,
+            adopt_capture_session,
+            confirm,
+        } => {
+            if let Some(session_id) = adopt_capture_session {
+                let workspace_id = workspace_id.ok_or_else(|| {
+                    CliError::command_usage(
+                        "--adopt-capture-session requires the target WORKSPACE_ID",
+                    )
+                })?;
+                adopt_legacy_capture_scope(&workspace_id, &session_id, confirm, output).await
+            } else {
+                run_worktree_doctor(workspace_id, limit, cursor, output).await
+            }
+        }
         WorktreeSubcommand::Repair {
             path,
             migrate_layout,
@@ -1412,7 +1433,7 @@ async fn adopted_scope_settings_present(
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
     let count = async |sql: &str| -> Result<i64, String> {
-        conn.query_one(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+        conn.query_one_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
             .await
             .map_err(|error| format!("{error}"))?
             .ok_or_else(|| "a COUNT query returned no row".to_string())?
@@ -2750,7 +2771,7 @@ async fn lifecycle_upsert(
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let now = chrono::Utc::now().timestamp_millis();
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?) \
@@ -2776,7 +2797,7 @@ async fn lifecycle_delete(
     worktree_id: &str,
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM worktree_lifecycle WHERE worktree_id = ?",
         [worktree_id.into()],
@@ -2792,7 +2813,7 @@ async fn lifecycle_delete(
 async fn lifecycle_rows(db: &sea_orm::DatabaseConnection) -> Result<Vec<(String, String)>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT worktree_id, state FROM worktree_lifecycle".to_string(),
         ))
@@ -2852,7 +2873,7 @@ async fn journal_append(
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let now = chrono::Utc::now().timestamp_millis();
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
              VALUES (?, ?, ?, ?)",
@@ -2875,7 +2896,7 @@ async fn journal_set_stage(
     stage: &str,
 ) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "UPDATE worktree_intent_journal SET stage = ? WHERE id = ?",
         [stage.into(), id.into()],
@@ -2888,7 +2909,7 @@ async fn journal_set_stage(
 /// Resolve (delete) a journal row after the mutation is fully published.
 async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM worktree_intent_journal WHERE id = ?",
         [id.into()],
@@ -2902,7 +2923,7 @@ async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<()
 async fn journal_pending(db: &sea_orm::DatabaseConnection) -> Result<Vec<PendingIntent>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let rows = db
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT id, op, worktree_id, payload FROM worktree_intent_journal ORDER BY id"
                 .to_string(),
@@ -2944,7 +2965,7 @@ async fn scoped_state_active(db: &sea_orm::DatabaseConnection, worktree_id: &str
     for table in ["sequence_state", "rebase_state", "bisect_state"] {
         let query = format!("SELECT COUNT(*) FROM {table} WHERE worktree_id = ?");
         match db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 &query,
                 [worktree_id.into()],
@@ -2998,7 +3019,7 @@ async fn gc_worktree_scoped_rows_strict(
     // pre-migration test databases may still lack it — only purge when the
     // table exists (a DELETE on a missing table would log a spurious warn).
     let has_bisect_table = db
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bisect_state'",
         ))
@@ -3010,7 +3031,7 @@ async fn gc_worktree_scoped_rows_strict(
         stmts.push("DELETE FROM bisect_state WHERE worktree_id = ?");
     }
     for sql in stmts {
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             sql,
             [worktree_id.into()],
@@ -3442,6 +3463,7 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
 // Grammar is FROZEN (§C.8, Codex R18/R19):
 //
 //     libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]
+//     libra worktree doctor <workspace-id> --adopt-capture-session <session-id> --confirm
 //
 // * no id  -> paginated view: `data.diagnostics[]` + `data.next_cursor`
 // * an id  -> single-scope view: `data.diagnostic` (singular, NO pagination)
@@ -3449,9 +3471,9 @@ async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()>
 //
 // The default invocation is STRICTLY READ-ONLY: it opens no write path, takes
 // no lease, never adopts a legacy row, and never rewrites the registry (it uses
-// the lockless `load_state_readonly` reader). Mutating recovery actions
-// (reclaim/adopt/clear/repair) are a separate, explicitly-confirmed grammar
-// that this slice deliberately does NOT ship — so no hint here may promise one.
+// the lockless `load_state_readonly` reader). Legacy capture adoption is a
+// separate, explicitly-confirmed grammar; reclaim/clear/repair are not part
+// of this slice, so no hint may promise those actions.
 
 /// `data.schema_version` of both doctor payloads. Additive evolution only.
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -3560,6 +3582,7 @@ struct WorktreeDoctorPage {
     /// different questions (is this working tree's layout/identity sound vs
     /// is this Agent workspace's lease sound) and a caller that parses one
     /// must not lose the other.
+    #[serde(skip_serializing)]
     worktrees: Vec<WorktreeDiagnostic>,
 }
 
@@ -3723,6 +3746,309 @@ fn diagnose_workspace(
     }
 }
 
+#[derive(Debug, Serialize)]
+struct CaptureScopeAdoptionOutput {
+    schema_version: u32,
+    session_id: String,
+    workspace_id: String,
+    repo_id: String,
+    worktree_id: String,
+    workspace_fence: i64,
+}
+
+/// Explicit mutation for the W4 legacy boundary. Migration 2026080401 marks
+/// historical capture rows `legacy_unknown` because their original scope was
+/// not recorded. This command is the only supported way to assign one: it
+/// requires a live workspace lease/fence, confirmation, and an audit row.
+async fn adopt_legacy_capture_scope(
+    workspace_id: &str,
+    session_id: &str,
+    confirm: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if !confirm {
+        return Err(CliError::command_usage(
+            "legacy capture adoption changes persistent ownership; re-run with --confirm after \
+             verifying the workspace and session",
+        ));
+    }
+    let db_path = crate::utils::path::database();
+    let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "cannot open the repository database for capture-scope adoption: {error}"
+            ))
+        })?;
+    let record = WorkspaceStore::get_with_conn(&conn, workspace_id)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("cannot read workspace '{workspace_id}': {error}"))
+        })?
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "no workspace matches id '{workspace_id}'; list them with `libra worktree doctor`"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+    if !record.state.holds_identity() || record.lease_owner.is_none() || record.lease_fence <= 0 {
+        return Err(CliError::fatal(format!(
+            "workspace '{workspace_id}' has no live lease fence; refuse to attribute capture \
+             state to a released, orphaned, or unleased scope"
+        )));
+    }
+    if record
+        .lease_expires_at
+        .is_none_or(|deadline| deadline <= workspace::now_ms())
+    {
+        return Err(CliError::fatal(format!(
+            "workspace '{workspace_id}' lease has expired; refuse to attribute capture state \
+             until its owner renews or an explicit reclaim issues a new fence"
+        )));
+    }
+    let identity = RepoIdentity::resolve(&conn).await.map_err(|error| {
+        CliError::fatal(format!(
+            "cannot resolve this repository's identity for capture-scope adoption: {error}"
+        ))
+    })?;
+    let target_worktree_id = record.worktree_id.clone().unwrap_or_default();
+    let txn = crate::internal::db::begin_write_transaction(&conn)
+        .await
+        .map_err(|error| CliError::fatal(format!("begin capture-scope adoption: {error}")))?;
+    let legacy = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT agent_kind, provider_session_id FROM (
+                 SELECT 0 AS match_priority, agent_kind, provider_session_id FROM agent_session
+                  WHERE scope_state = 'legacy_unknown' AND session_id = ?
+                 UNION ALL
+                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_session
+                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+                 UNION ALL
+                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_export_job
+                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+                 UNION ALL
+                 SELECT 1 AS match_priority, agent_kind, provider_session_id FROM agent_import_identity
+                  WHERE scope_state = 'legacy_unknown' AND provider_session_id = ?
+             ) ORDER BY match_priority LIMIT 1",
+            [
+                session_id.into(),
+                session_id.into(),
+                session_id.into(),
+                session_id.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("read legacy capture session: {error}")))?
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "capture session identifier '{session_id}' has no legacy unscoped capture row; \
+                 doctor adoption accepts an agent session id or an orphan provider session id"
+            ))
+        })?;
+    let agent_kind: String = legacy
+        .try_get_by("agent_kind")
+        .map_err(|error| CliError::fatal(format!("decode legacy capture agent kind: {error}")))?;
+    let provider_session_id: String =
+        legacy.try_get_by("provider_session_id").map_err(|error| {
+            CliError::fatal(format!("decode legacy provider session identity: {error}"))
+        })?;
+    let foreign_scoped = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT 1 FROM (
+                 SELECT provider_session_id FROM agent_session
+                  WHERE provider_session_id = ? AND scope_state = 'scoped'
+                 UNION ALL
+                 SELECT provider_session_id FROM agent_export_job
+                  WHERE provider_session_id = ? AND scope_state = 'scoped'
+                 UNION ALL
+                 SELECT provider_session_id FROM agent_import_identity
+                  WHERE provider_session_id = ? AND scope_state = 'scoped'
+             ) LIMIT 1",
+            [
+                provider_session_id.clone().into(),
+                provider_session_id.clone().into(),
+                provider_session_id.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("check existing scoped capture ownership: {error}"))
+        })?;
+    if foreign_scoped.is_some() {
+        txn.rollback().await.ok();
+        return Err(CliError::fatal(format!(
+            "provider session '{provider_session_id}' already has a scoped capture claim; \
+             refusing to merge a legacy row into it"
+        )));
+    }
+    let target_repo_id = identity.as_str().to_string();
+    let target_workspace_id = record.workspace_id.clone();
+    let target_workspace_fence = record.lease_fence;
+    let mut adopted_rows = txn
+        .execute_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE agent_session
+             SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
+                 scope_state = 'scoped'
+             WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
+               AND EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               )",
+            [
+                target_repo_id.clone().into(),
+                target_worktree_id.clone().into(),
+                target_workspace_id.clone().into(),
+                target_workspace_fence.into(),
+                provider_session_id.clone().into(),
+                target_workspace_id.clone().into(),
+                target_repo_id.clone().into(),
+                target_workspace_fence.into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("adopt legacy capture session: {error}")))?
+        .rows_affected();
+    for table in ["agent_export_job", "agent_import_identity"] {
+        let sql = format!(
+            "UPDATE {table}
+             SET repo_id = ?, worktree_id = ?, workspace_id = ?, workspace_fence = ?,
+                 scope_state = 'scoped'
+             WHERE provider_session_id = ? AND scope_state = 'legacy_unknown'
+               AND EXISTS (
+                   SELECT 1 FROM workspace_record
+                   WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                     AND state IN ('provisioning', 'active', 'releasing')
+                     AND lease_owner IS NOT NULL
+                     AND lease_expires_at > (unixepoch('now') * 1000)
+               )"
+        );
+        adopted_rows += txn
+            .execute_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                sql,
+                [
+                    target_repo_id.clone().into(),
+                    target_worktree_id.clone().into(),
+                    target_workspace_id.clone().into(),
+                    target_workspace_fence.into(),
+                    provider_session_id.clone().into(),
+                    target_workspace_id.clone().into(),
+                    target_repo_id.clone().into(),
+                    target_workspace_fence.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| CliError::fatal(format!("adopt legacy {table} scope: {error}")))?
+            .rows_affected();
+    }
+    if adopted_rows == 0 {
+        txn.rollback().await.ok();
+        return Err(CliError::fatal(
+            "capture-scope adoption was fenced out because the target workspace changed; rerun \
+             doctor and choose the current live workspace",
+        ));
+    }
+    let actor = env::var("LIBRA_ACTOR")
+        .ok()
+        .or_else(|| env::var("USER").ok());
+    txn.execute_raw(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        "INSERT INTO agent_workspace_scope_audit (
+            audit_id, action, agent_kind, provider_session_id, repo_id, worktree_id,
+            workspace_id, workspace_fence, actor, created_at
+         ) VALUES (?, 'adopt_legacy_capture_scope', ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            uuid::Uuid::new_v4().to_string().into(),
+            agent_kind.into(),
+            provider_session_id.into(),
+            target_repo_id.into(),
+            target_worktree_id.clone().into(),
+            target_workspace_id.into(),
+            target_workspace_fence.into(),
+            actor.into(),
+            workspace::now_ms().into(),
+        ],
+    ))
+    .await
+    .map_err(|error| CliError::fatal(format!("audit capture-scope adoption: {error}")))?;
+    txn.commit()
+        .await
+        .map_err(|error| CliError::fatal(format!("commit capture-scope adoption: {error}")))?;
+
+    let payload = CaptureScopeAdoptionOutput {
+        schema_version: DOCTOR_SCHEMA_VERSION,
+        session_id: session_id.to_string(),
+        workspace_id: record.workspace_id,
+        repo_id: identity.as_str().to_string(),
+        worktree_id: target_worktree_id,
+        workspace_fence: record.lease_fence,
+    };
+    if output.is_json() {
+        return emit_json_data("worktree.doctor.adopt_capture", &payload, output);
+    }
+    if !output.quiet {
+        println!(
+            "adopted legacy capture session {} into workspace {} at lease fence {}",
+            payload.session_id, payload.workspace_id, payload.workspace_fence
+        );
+    }
+    Ok(())
+}
+
+/// Probe, rather than count, legacy capture rows so a diagnostic page stays
+/// bounded even in repositories with a long capture history. Before the W4
+/// migration these columns do not exist; doctor must remain usable on that
+/// older schema and simply has no legacy-scope classification to report.
+async fn legacy_capture_scope_exists(conn: &sea_orm::DatabaseConnection) -> CliResult<bool> {
+    let result = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT 1 FROM (
+                 SELECT 1 FROM agent_session WHERE scope_state = 'legacy_unknown'
+                 UNION ALL
+                 SELECT 1 FROM agent_export_job WHERE scope_state = 'legacy_unknown'
+                 UNION ALL
+                 SELECT 1 FROM agent_import_identity WHERE scope_state = 'legacy_unknown'
+             ) LIMIT 1"
+                .to_string(),
+        ))
+        .await;
+    match result {
+        Ok(row) => Ok(row.is_some()),
+        Err(error)
+            if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("no such column")
+                || error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no such table") =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(doctor_scope_corrupt(format!(
+            "cannot inspect legacy capture scope state: {error}"
+        ))),
+    }
+}
+
+fn print_legacy_capture_scope_guidance(output: &OutputConfig, legacy_exists: bool) {
+    if legacy_exists && !output.is_json() && !output.quiet {
+        println!(
+            "legacy capture scope: unscoped capture rows exist and are intentionally excluded \
+             from new writes; inspect the session and adopt only its verified owner with \
+             `libra worktree doctor <workspace-id> --adopt-capture-session <session-id> --confirm`"
+        );
+    }
+}
+
 /// `libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]`.
 pub(crate) async fn run_worktree_doctor(
     workspace_id: Option<String>,
@@ -3762,6 +4088,7 @@ pub(crate) async fn run_worktree_doctor(
             ))
         })?;
     let now = workspace::now_ms();
+    let legacy_capture_exists = legacy_capture_scope_exists(&conn).await?;
 
     if let Some(workspace_id) = workspace_id {
         let record = WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id)
@@ -3780,7 +4107,9 @@ pub(crate) async fn run_worktree_doctor(
             })?;
         let repo_id = doctor_repo_identity(&conn).await?;
         let diagnostic = diagnose_workspace(&record, &repo_id, &registry, now);
-        return render_doctor_single(diagnostic, output);
+        let result = render_doctor_single(diagnostic, output);
+        print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+        return result;
     }
 
     let after = cursor.as_deref().map(decode_doctor_cursor).transpose()?;
@@ -3799,22 +4128,29 @@ pub(crate) async fn run_worktree_doctor(
             )));
         }
     };
-    // The worktree-scope half of the same bare invocation (§C.11 W0) — on the
-    // SAME no-migration connection, so a behind-schema repository is diagnosed,
-    // never upgraded, as a side effect.
-    let worktree_report = collect_worktree_scope_report(&conn).await?;
+    // The human doctor also renders the W0 worktree-scope report on the same
+    // no-migration connection. Do not build it for JSON/machine pagination:
+    // it scans every registry entry, would make a capped workspace page
+    // unbounded, and is not part of the frozen W4 JSON payload.
+    let worktrees = if output.is_json() {
+        Vec::new()
+    } else {
+        collect_worktree_scope_report(&conn).await?.diagnostics
+    };
     if page.items.is_empty() {
         // Nothing to classify, so a missing/unreadable repository identity is
         // not worth failing on: an empty diagnosis IS the whole truth here.
-        return render_doctor_page(
+        let result = render_doctor_page(
             WorktreeDoctorPage {
                 schema_version: DOCTOR_SCHEMA_VERSION,
                 diagnostics: Vec::new(),
                 next_cursor: None,
-                worktrees: worktree_report.diagnostics,
+                worktrees,
             },
             output,
         );
+        print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+        return result;
     }
     let repo_id = doctor_repo_identity(&conn).await?;
     let diagnostics = page
@@ -3822,15 +4158,17 @@ pub(crate) async fn run_worktree_doctor(
         .iter()
         .map(|record| diagnose_workspace(record, &repo_id, &registry, now))
         .collect();
-    render_doctor_page(
+    let result = render_doctor_page(
         WorktreeDoctorPage {
             schema_version: DOCTOR_SCHEMA_VERSION,
             diagnostics,
             next_cursor: page.next_cursor.as_deref().map(encode_doctor_cursor),
-            worktrees: worktree_report.diagnostics,
+            worktrees,
         },
         output,
-    )
+    );
+    print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+    result
 }
 
 /// Whether a workspace read failed only because the table does not exist yet.
@@ -4665,7 +5003,7 @@ async fn migrate_layout_run(
 ) -> WorktreeResult<MigrateLayoutOutput> {
     if util::current_worktree_id().is_some() || util::is_legacy_symlink_worktree() {
         return Err(WorktreeError::OperationBlocked(
-            "run `worktree repair --migrate-layout` from the MAIN worktree".to_string(),
+            "run `worktree repair --migrate-layout --confirm` from the MAIN worktree".to_string(),
         ));
     }
     // Dry run is READ-ONLY end to end: no lock file creation, no registry
@@ -4937,7 +5275,7 @@ async fn migrate_one_worktree(
         |error| {
             WorktreeError::OperationBlocked(format!(
                 "installed gitdir failed identity validation ({error}); materials kept — \
-                 investigate, then rerun `worktree repair`"
+                 investigate, then rerun `worktree repair --confirm`"
             ))
         },
     )?;
@@ -4967,7 +5305,7 @@ async fn migrate_one_worktree(
             fs::remove_file(&backup).map_err(|error| {
                 WorktreeError::IoWrite(format!(
                     "migrated, but the legacy backup '{}' could not be removed: {error}; \
-                     remove it and rerun `worktree repair`",
+                     remove it and rerun `worktree repair --confirm`",
                     backup.display()
                 ))
             })?;
@@ -4976,7 +5314,7 @@ async fn migrate_one_worktree(
         _ => {
             return Err(WorktreeError::OperationBlocked(format!(
                 "'{}' is no longer the expected legacy symlink; not deleting it — \
-                 investigate, then rerun `worktree repair`",
+                 investigate, then rerun `worktree repair --confirm`",
                 backup.display()
             )));
         }
@@ -5050,7 +5388,7 @@ async fn verify_migrated_worktree(
     if seen != Some(head_commit) {
         return Err(WorktreeError::OperationBlocked(format!(
             "verification failed: '{}' resolves HEAD to {:?}, expected {head_commit}; \
-             materials kept — rerun `worktree repair`",
+             materials kept — rerun `worktree repair --confirm`",
             target.display(),
             seen
         )));
@@ -5058,7 +5396,7 @@ async fn verify_migrated_worktree(
     if !target.join(util::ROOT_DIR).join("index").exists() {
         return Err(WorktreeError::OperationBlocked(format!(
             "verification failed: '{}' has no private index; materials kept — rerun \
-             `worktree repair`",
+             `worktree repair --confirm`",
             target.display()
         )));
     }
@@ -6874,7 +7212,7 @@ mod tests {
             "CREATE TABLE operation_view_workspace(view_id TEXT NOT NULL,pointer_kind TEXT NOT NULL,pointer_value TEXT NOT NULL,PRIMARY KEY (view_id,pointer_kind));",
             "CREATE TABLE reference (id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,kind TEXT NOT NULL,\"commit\" TEXT,remote TEXT,worktree_id TEXT)",
         ] {
-            db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
+            db.execute_raw(Statement::from_string(DbBackend::Sqlite, sql.to_string()))
                 .await
                 .expect("create schema");
         }
@@ -6891,7 +7229,7 @@ mod tests {
             .expect("open the boundary");
 
         // Fault injection: the close cannot write its outcome row.
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "DROP TABLE operation".to_string(),
         ))

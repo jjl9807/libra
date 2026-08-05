@@ -169,7 +169,7 @@ async fn read_schema_free_object_format(
     db_path: &Path,
 ) -> CliResult<String> {
     let has_config_kv = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             db_conn.get_database_backend(),
             "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
             ["table".into(), "config_kv".into()],
@@ -189,7 +189,7 @@ async fn read_schema_free_object_format(
     }
 
     let row = db_conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             db_conn.get_database_backend(),
             "SELECT value FROM config_kv WHERE key = ? ORDER BY id DESC LIMIT 1",
             ["core.objectformat".into()],
@@ -2187,12 +2187,16 @@ async fn sequencer_control_for(
             // A MERGE-mode pull claims the slot too (W2 r7 #3): it fetches
             // and then drives the internal merge, and starting that while a
             // same-worktree merge/rebase control is active races its
-            // state/index/worktree exactly as a bare `merge` would.
-            return Some(if command::pull::will_rebase(args).await {
-                SequencerControl::Start(SequenceKind::Rebase)
-            } else {
-                SequencerControl::Start(SequenceKind::Merge)
-            });
+            // state/index/worktree exactly as a bare `merge` would. A pull
+            // that cannot RESOLVE a mode (detached HEAD, unreadable config)
+            // claims nothing — the handler is about to refuse it, and a
+            // claimed slot would persist a failed control operation for a
+            // command that never touched the sequencer (r8 #4).
+            return match command::pull::resolved_pull_mode(args).await {
+                Some(true) => Some(SequencerControl::Start(SequenceKind::Rebase)),
+                Some(false) => Some(SequencerControl::Start(SequenceKind::Merge)),
+                None => None,
+            };
         }
         // §C.9: merge's control actions enter the boundary too — `--continue`
         // and `--restart` reset this worktree and rewrite its sequencer state,

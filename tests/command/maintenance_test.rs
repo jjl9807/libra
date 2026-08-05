@@ -860,7 +860,7 @@ fn gc_runs_multi_worktree_and_keeps_private_and_registered_roots() {
 async fn object_index_repo_id(conn: &sea_orm::DatabaseConnection) -> String {
     use sea_orm::{ConnectionTrait, Statement};
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
             "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
                 .to_string(),
@@ -882,7 +882,7 @@ async fn object_index_repo_id(conn: &sea_orm::DatabaseConnection) -> String {
 
 async fn insert_object_index_row(conn: &sea_orm::DatabaseConnection, repo_id: &str, oid: &str) {
     use sea_orm::{ConnectionTrait, Statement};
-    conn.execute(Statement::from_sql_and_values(
+    conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT OR IGNORE INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
          VALUES (?, 'agent_findings', 1, ?, 0, 0)",
@@ -899,7 +899,7 @@ async fn object_index_row_count(
 ) -> i64 {
     use sea_orm::{ConnectionTrait, Statement};
     let row = conn
-        .query_one(Statement::from_sql_and_values(
+        .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT COUNT(*) AS n FROM object_index WHERE repo_id = ? AND o_id = ?",
             [repo_id.into(), oid.into()],

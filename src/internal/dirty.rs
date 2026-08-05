@@ -573,7 +573,7 @@ impl DirtyCache {
                     .do_nothing()
                     .to_owned(),
             )
-            .do_nothing()
+            .try_insert()
             .exec(db)
             .await
             .context("failed to seed working_dirty_meta")?;

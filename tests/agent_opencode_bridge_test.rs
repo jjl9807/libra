@@ -120,7 +120,7 @@ impl BridgeRepo {
             ("agent.external_agents.trusted_dirs", dirs.as_str()),
             ("agent.trust.opencode", record.as_str()),
         ] {
-            conn.execute(Statement::from_sql_and_values(
+            conn.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, 0)",
                 [key.into(), value.into()],
@@ -214,7 +214,7 @@ impl BridgeRepo {
             self.repo.join(".libra").join("libra.db").display()
         );
         let conn: DatabaseConnection = Database::connect(url).await.expect("open db");
-        conn.query_all(Statement::from_string(
+        conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
         ))

@@ -462,7 +462,7 @@ async fn repair_audit_rows(repo: &Path) -> Vec<(String, String)> {
     let mut opts = ConnectOptions::new(url);
     opts.sqlx_logging(false);
     let conn = Database::connect(opts).await.expect("open repo db");
-    conn.query_all(Statement::from_string(
+    conn.query_all_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
         "SELECT command_name, status FROM operation WHERE command_name = 'worktree repair' \
          ORDER BY op_id",

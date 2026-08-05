@@ -2475,14 +2475,14 @@ mod tests {
             .await
             .expect("create config db");
         let backend = conn.get_database_backend();
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM schema_versions",
             [],
         ))
         .await
         .expect("clear schema versions");
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             backend,
             "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
             [

@@ -1,4 +1,4 @@
-//! plan-20260714 PD-00 follow-up guard: the FOUR release version surfaces
+//! plan-20260714 PD-00 follow-up guard: the FIVE release version surfaces
 //! must stay in lockstep.
 //!
 //! PD-00 closed a drift where `Cargo.toml`, `web/package.json` and
@@ -8,6 +8,8 @@
 //! `LIBRA_ALLOW_FALLBACK=1` is set. The card's explicit follow-up
 //! condition ("if it drifts again, add a guard that reads all four files
 //! and asserts they agree") is what this target implements.
+//! PD-10 later added the Windows installer as a fifth surface, so the guard
+//! now includes its `$DefaultVersion` too.
 
 use std::{fs, path::Path};
 

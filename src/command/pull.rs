@@ -183,6 +183,15 @@ pub(crate) enum PullError {
     #[error("you are not currently on a branch")]
     NotOnBranch,
 
+    #[error(
+        "a merge is in progress in this worktree; conclude it first with \
+         `libra merge --continue` or `libra merge --abort`"
+    )]
+    MergeInProgress,
+
+    #[error("cannot inspect this worktree's merge state: {0}")]
+    LocalStateProbe(String),
+
     #[error("there is no tracking information for the current branch")]
     NoTrackingInfo {
         branch: String,
@@ -230,6 +239,16 @@ impl From<PullError> for CliError {
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("checkout a branch before pulling")
                 .with_hint("use 'libra switch <branch>' to switch"),
+            PullError::MergeInProgress => {
+                CliError::failure("a merge is in progress in this worktree; conclude it first")
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .with_hint("finish it with 'libra merge --continue'")
+                    .with_hint("or discard it with 'libra merge --abort'")
+            }
+            PullError::LocalStateProbe(detail) => CliError::fatal(format!(
+                "cannot inspect this worktree's merge state: {detail}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed),
             PullError::NoTrackingInfo {
                 branch,
                 advice_remote,
@@ -355,6 +374,13 @@ pub(crate) async fn run_pull(
 ) -> Result<PullOutput, PullError> {
     let branch = current_branch_for_pull().await?;
     let effective = resolve_effective_pull_options(&args, &branch).await?;
+    // W2 r8 #2: a persisted merge must refuse the pull BEFORE the fetch — the
+    // control slot only excludes concurrent control actions, and a fetch
+    // would move FETCH_HEAD and the remote refs for a pull that has nowhere
+    // to integrate.
+    if !effective.rebase && merge::merge_in_progress().map_err(PullError::LocalStateProbe)? {
+        return Err(PullError::MergeInProgress);
+    }
     // Part C W2 (§C.4.3): the `--rebase --autostash` combination is allowed
     // in linked worktrees now — its wrap pushes/pops the shared stash stack
     // through the W2 stack-lock + by-id CAS protocol, and the snapshot/apply
@@ -529,20 +555,24 @@ async fn current_branch_for_pull() -> Result<String, PullError> {
 /// Errors are answered `false`: a pull that cannot resolve its own branch or
 /// config is about to fail in the handler with a better message, and taking a
 /// control slot for it would only change which error the user sees.
-pub(crate) async fn will_rebase(args: &PullArgs) -> bool {
+/// The pull's RESOLVED integration mode, for dispatch (W2 r8 #4):
+/// `Some(true)` = rebase, `Some(false)` = merge, `None` = the pull cannot
+/// resolve a mode at all — a detached HEAD or unreadable config is about to
+/// be refused by the handler, and claiming a sequencer control slot for it
+/// would persist a failed control operation for a command that never touched
+/// the sequencer.
+pub(crate) async fn resolved_pull_mode(args: &PullArgs) -> Option<bool> {
     // The branch is resolved FIRST, even for an explicit `--rebase`: on a
-    // detached HEAD the handler refuses the pull outright, and claiming a
-    // sequencer control slot for it would record a failed control operation
-    // for a command that never touched the sequencer.
+    // detached HEAD the handler refuses the pull outright.
     let Ok(branch) = current_branch_for_pull().await else {
-        return false;
+        return None;
     };
     if args.rebase {
-        return true;
+        return Some(true);
     }
     match resolve_effective_pull_options(args, &branch).await {
-        Ok(options) => options.rebase,
-        Err(_) => false,
+        Ok(options) => Some(options.rebase),
+        Err(_) => None,
     }
 }
 

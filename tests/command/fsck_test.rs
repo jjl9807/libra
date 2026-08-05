@@ -63,6 +63,29 @@ fn test_fsck_heal_refused_with_linked_worktrees() {
         stderr.contains("per-worktree object inventory"),
         "the refusal names the reason: {stderr}"
     );
+
+    // Removing the directory does not make the historical per-worktree
+    // inventory disappear. `--heal` must remain fail-closed until its object
+    // discovery is actually worktree-complete.
+    let remove = run_libra_command(
+        &[
+            "worktree",
+            "remove",
+            "--delete-dir",
+            linked.path().to_str().unwrap(),
+        ],
+        main.path(),
+    );
+    assert_cli_success(&remove, "remove the linked worktree directory");
+    let out = run_libra_command(&["fsck", "--heal"], main.path());
+    assert!(
+        !out.status.success(),
+        "fsck --heal must remain refused after linked-worktree removal"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("worktree history is retained"),
+        "the retained-history refusal must stay actionable"
+    );
 }
 
 #[test]

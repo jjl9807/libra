@@ -17,7 +17,7 @@
 
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
-| `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths | `src/command/`, `src/cli.rs` |
+| `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema and confirmed legacy-capture adoption contracts | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |
 | `compat_bisect_subcommand_surface` | 1 | Guards `libra bisect` subcommand surface | `src/command/bisect.rs` |
 | `compat_worktree_delete_dir` | 1 | Guards worktree delete semantics on dir removal | `src/command/worktree.rs` |
@@ -36,7 +36,7 @@
 | `compat_agent_run_non_exhaustive_guard` | 1 | Enforces `#[non_exhaustive]` on every `pub enum` under `agent_run/` for additive evolution | `src/internal/ai/agent_run/` |
 | `compat_agent_docs_contract` | 1 | Guards active Agent plan claims against stale removed-provider status, public schema/retention/raw-export wording, and stale internal-plan links | `docs/development/tracing/agent.md`, `src/command/code.rs` |
 | `compat_agent_capability_matrix_pin` | 1 | Pins the E1 8-bool `DeclaredAgentCaps` wire keys and the first-batch supported roster (`claude-code`/`codex`/`opencode`) against drift (AG-16) | `src/internal/ai/observed_agents/{capability,registry}.rs`, `docs/development/tracing/agent.md` |
-| `compat_agent_architecture_guard` | 1 | Observed-agents capture layer stays decoupled from AgentRuntime/checkpoint layers; every `AgentKind` resolves an adapter; external agents need the AG-18 info/trust flow; SQL CHECK / doc roster / enum stay in sync (AG-16) | `src/internal/ai/observed_agents/`, `sql/migrations/2026050303_agent_capture.sql`, `docs/development/tracing/agent.md` |
+| `compat_agent_architecture_guard` | 1 | Observed-agents capture layer stays decoupled from AgentRuntime/checkpoint layers; every `AgentKind` resolves an adapter; external agents need the AG-18 info/trust flow; SQL CHECK / doc roster / enum stay in sync (AG-16); W0-01’s C1–C10/A0 runtime-anchor audit and W0-03 Web-only completion gate prevent a premature TUI removal | `src/internal/ai/observed_agents/`, `src/internal/ai/runtime/`, `sql/migrations/2026050303_agent_capture.sql`, `docs/development/tracing/{agent,code}.md` |
 | `compat_subface_labels` | 1 | Guards the CG-01 sub-face grading matrix: fixed five-label enumeration, graded command set pinned to `src/cli.rs::Commands`, no dual-tier sub-face, and unsupported sub-faces carrying governance IDs synced bidirectionally with `_compatibility.md` | `COMPATIBILITY.md`, `docs/development/commands/_compatibility.md`, `src/cli.rs` |
 | `compat_conflict_status_diff` | 1 | Guards unmerged conflict reporting across merge/rebase/cherry-pick: status v1/v2, ls-files stages/tags, and conflict-aware diff headers | `src/command/status.rs`, `src/command/diff.rs`, `src/command/ls_files.rs`, `src/command/merge.rs` |
 | `compat_diff_check_safety` | 1 | Guards `diff --check` safety classes: trailing whitespace, space-before-tab in indent, leftover conflict markers, and new blank lines at EOF with exit code 2 | `src/command/diff.rs` |
@@ -99,7 +99,7 @@
 | `compat_error_codes_doc_sync` | 1 | Every `LBR-*-NNN` literal in `src/utils/error.rs` is documented in `docs/error-codes.md` | `src/utils/error.rs`, `docs/error-codes.md` |
 | `compat_command_docs_examples_section` | 1 | Every `docs/commands/<name>.md` page carries an `## Examples` / `## Common Commands` heading | `docs/commands/**` |
 | `compat_r0_9_doc_closeout` | 1 | plan-20260714 R0-9 docs close-out: the warning code/source table, the `io_blocked` JSON schema (with the `reason` enum parsed out of `io_blocked_reason_and_code` so a new variant cannot ship undocumented), the `{from, to}` typing of nested `staged.renamed` / `unstaged.renamed`, the three rename config keys across the status docs + `COMPATIBILITY.md`, and the `diff.renameLimit` degradation semantics (exact **and** unique-basename survive) across the diff docs + CHANGELOG — EN and zh asserted in parallel | `docs/commands/status.md`, `docs/commands/diff.md`, `COMPATIBILITY.md`, `CHANGELOG.md` |
-| `compat_version_surface_sync` | 1 | plan-20260714 PD-00 release-surface guard: `Cargo.toml`, `web/package.json`, `worker/package.json`, and `install.sh` `DEFAULT_VERSION` all carry the same version, and `DEFAULT_VERSION` keeps its `v` prefix | `Cargo.toml`, `web/package.json`, `worker/package.json`, `install.sh` |
+| `compat_version_surface_sync` | 1 | plan-20260714 PD-00/PD-10 release-surface guard: `Cargo.toml`, `web/package.json`, `worker/package.json`, `install.sh` `DEFAULT_VERSION`, and `install.ps1` `$DefaultVersion` all carry the same version; both installer values keep their `v` prefix | `Cargo.toml`, `web/package.json`, `worker/package.json`, `install.sh`, `install.ps1` |
 | `compat_help_flag_descriptions` | 1 | Every visible flag and positional under `Options:` / `Arguments:` carries a non-empty description; covers 42 root commands + 53 sub/sub-sub-commands (110 surfaces) | `src/cli.rs`, `src/command/**` |
 | `compat_help_no_impl_meta_leak` | 1 | No `libra <cmd> --help` body leaks contributor-facing rustdoc into clap's long_about; forbids 6 phrase classes (e.g. `Codex pass-`, raw markdown headings, code fences) | `src/cli.rs`, `src/command/**` |
 | `verify_pack_multi_test` | 1 | Guards `verify-pack <idx>...` multi-index verification, JSON wrapping, and `--pack` argument rejection | `src/command/verify_pack*.rs` |
@@ -119,8 +119,8 @@
 | `code_ui_remote_generation_matrix` | 2 | Generation control across surfaces (no live LLM) | `src/internal/tui/app.rs` |
 | `code_ui_remote_approval_matrix` | 2 | Approval flow across TUI/Web/automation | `src/internal/ai/agent/` approvals |
 | `code_cli_dispatch_test` | 2 | `libra code …` argv parsing & dispatch | `src/command/code.rs` |
-| `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code` | `src/internal/ai/providers/`, `src/internal/ai/agent/` |
-| `code_tool_acl_test` | 2 | Tool registry ACL & safety classification | `src/internal/ai/tools/` |
+| `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code`, including the shared env-file → process → Vault factory used by TUI and headless launch | `src/command/code.rs`, `src/internal/ai/providers/`, `src/internal/ai/runtime/services.rs` |
+| `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |
 | `code_resume_test` | 2 | Session resume across restarts | `src/internal/ai/session/`, `src/command/code.rs` |
 | `code_codex_default_tui_test` | 2 | `--provider codex` routes through the default managed-runtime TUI (legacy stdin loop unreachable) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
@@ -134,7 +134,7 @@
 | `ai_automation_test` | 2 | `.libra/automations.toml` rule execution | `src/internal/ai/automation/`, `src/command/automation.rs` |
 | `ai_dag_tool_loop_test` | 2 | DAG-based tool loop regression | `src/internal/ai/agent/` |
 | `ai_mock_provider_test` | 2 | Mock provider used by `test-provider` feature | `src/internal/ai/providers/` (test-only) |
-| `agent_capture_migration_test` | 2 | `agent_capture` / checkpoint-paging migration up→down→up and legacy-bootstrap compatibility via `MigrationRunner` | `src/internal/db.rs`, `sql/migrations/2026050303_agent_capture.sql` |
+| `agent_capture_migration_test` | 2 | `agent_capture` / checkpoint-paging and W4 capture-workspace-scope migrations, including legacy bootstrap and guarded down→up compatibility via `MigrationRunner` | `src/internal/db.rs`, `sql/migrations/2026050303_agent_capture.sql`, `sql/migrations/2026080401_agent_capture_workspace_scope.sql` |
 | `ai_agent_baseline_test` | 2 | Step 1.0 / CEX-00 single-agent baseline tests | `src/command/code.rs`, `src/internal/ai/agent/` |
 | `ai_approval_ttl_test` | 2 | CEX-11 approval TTL and canonical key contract tests | `src/internal/ai/agent/` |
 | `ai_classifier_test` | 2 | CEX-08 TaskIntent classifier contract tests | `src/internal/ai/completion/` |
@@ -165,13 +165,13 @@
 | `ai_provider_error_taxonomy_test` | 2 | Integration fixtures for OC-Phase 4 provider error taxonomy | `src/internal/ai/providers/` |
 | `ai_provider_retry_policy_test` | 2 | OC-Phase 4 retry-policy integration test | `src/internal/ai/providers/` |
 | `ai_provider_transform_test` | 2 | Integration tests for OC-Phase 4 P4.1 provider transform pipeline | `src/internal/ai/providers/` |
-| `ai_runtime_contract_test` | 2 | Wave 1A runtime contract tests pinning TaskExecutor | `src/internal/ai/runtime/` |
+| `ai_runtime_contract_test` | 2 | Wave 1A runtime contracts: TaskExecutor, W1-01 UI-neutral serialized AgentRuntime worker/state machine, and W1-05 durable intent-before-dispatch crash windows | `src/internal/ai/runtime/` |
 | `ai_scheduler_plan_set_test` | 2 | Phase 0 selected plan set and task dependency tests | `src/internal/ai/orchestrator/` |
 | `ai_schema_migration_test` | 2 | Phase 0 schema migration tests for AI runtime contract tables | `src/internal/db.rs`, `sql/` |
 | `ai_security_runtime_test` | 2 | Phase 5 security runtime (authz, redaction, shell, audit) | `src/internal/ai/sandbox/` |
 | `ai_semantic_rust_test` | 2 | Semantic Rust code indexing and structure extraction | `src/internal/ai/skills/` |
 | `ai_semantic_tools_test` | 2 | Semantic tools registration and classification | `src/internal/ai/tools/` |
-| `ai_session_jsonl_test` | 2 | Session JSONL persistence format and event streaming | `src/internal/ai/session/` |
+| `ai_session_jsonl_test` | 2 | Session JSONL persistence plus W1-03 additive Code workflow sequence/dedup/gap/torn-tail recovery and W1-05 command idempotency/recovery | `src/internal/ai/session/` |
 | `ai_skill_test` | 2 | System skills load, parse, and execution validation | `src/internal/ai/skills/` |
 | `ai_source_pool_test` | 2 | CEX-14 source-pool isolation and MCP integration tests | `src/internal/ai/session/` |
 | `ai_storage_flow_test` | 2 | Integration tests for AI object storage on local and R2 backends | `src/utils/storage/` |

@@ -618,8 +618,13 @@ fn merge_mode_pull_is_refused_while_a_merge_is_in_progress() {
         "a merge-mode pull must be refused mid-merge: {text}"
     );
     assert!(
-        text.contains("merge"),
-        "the refusal names the in-progress operation, not a network error: {text}"
+        text.contains("in progress"),
+        "the refusal names the in-progress merge: {text}"
+    );
+    assert!(
+        !text.contains("tracking"),
+        "the merge preflight fires BEFORE target resolution — a tracking-info \
+         error here means the pull got past it: {text}"
     );
     assert!(
         !text.contains("network"),
@@ -4169,7 +4174,7 @@ fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
         let db = libra::internal::db::get_db_conn_instance().await;
         for table in ["working_dirty", "working_dirty_meta"] {
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
                 ))
@@ -4203,7 +4208,7 @@ fn worktree_remove_keep_dir_preserves_or_tombstones_scope() {
         let db = libra::internal::db::get_db_conn_instance().await;
         for table in ["working_dirty", "working_dirty_meta"] {
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
                 ))
@@ -4518,7 +4523,7 @@ fn worktree_add_sweeps_stale_scope_rows() {
                      VALUES ('{stale_id}', 'stale-ov', 'stale.txt', 'h0');"
                 ),
             ] {
-                db.execute(Statement::from_string(db.get_database_backend(), sql))
+                db.execute_raw(Statement::from_string(db.get_database_backend(), sql))
                     .await
                     .expect("plant stale row");
             }
@@ -4586,7 +4591,7 @@ fn worktree_remove_purges_layer_scope_rows() {
             use sea_orm::{ConnectionTrait, Statement};
             let db = libra::internal::db::get_db_conn_instance().await;
             let row = db
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     db.get_database_backend(),
                     format!("SELECT COUNT(*) FROM {table} WHERE worktree_id <> '';"),
                 ))
@@ -5106,8 +5111,8 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
         assert_eq!(
             rolled,
             vec![
-                2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001, 2026072902,
-                2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+                2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
+                2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
             ]
         );
         conn.close().await.expect("close");
@@ -5121,7 +5126,7 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
     let conn = Database::connect(&db_url).await.expect("reconnect repo db");
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' \
              AND name = 'worktree_registry_capability'"
@@ -5635,7 +5640,7 @@ async fn worktree_remove_delete_crash_repair() {
     );
     let conn = Database::connect(&db_url).await.expect("connect repo db");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
@@ -5672,7 +5677,7 @@ async fn worktree_remove_delete_crash_repair() {
         ),
     ] {
         let row = conn
-            .query_one(Statement::from_string(backend, query))
+            .query_one_raw(Statement::from_string(backend, query))
             .await
             .expect("query")
             .expect("row");
@@ -5785,7 +5790,7 @@ async fn remove_delete_dir_dot_from_inside_worktree() {
         ),
     ] {
         let row = conn
-            .query_one(Statement::from_string(backend, query.to_string()))
+            .query_one_raw(Statement::from_string(backend, query.to_string()))
             .await
             .expect("query")
             .expect("row");
@@ -5826,7 +5831,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
         async move {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!(
                     "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
@@ -5844,7 +5849,7 @@ async fn move_crash_ambiguous_states_keep_journal() {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     backend,
                     "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
                 ))
@@ -5965,7 +5970,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     );
     let conn = Database::connect(&db_url).await.expect("connect");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_lifecycle (worktree_id, state, path, created_at, \
@@ -5976,7 +5981,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     .await
     .expect("mirror row");
     // Stale move journal for X targeting Y's (now-tombstoned) path.
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
@@ -5999,7 +6004,7 @@ async fn move_crash_recovery_never_adopts_foreign_destination_entry() {
     assert!(!y.exists(), "nothing was renamed onto the tombstoned path");
     let conn = Database::connect(&db_url).await.expect("reconnect");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
         ))
@@ -6046,7 +6051,7 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     );
     let conn = Database::connect(&db_url).await.expect("connect");
     let backend = conn.get_database_backend();
-    conn.execute(Statement::from_string(
+    conn.execute_raw(Statement::from_string(
         backend,
         format!(
             "INSERT INTO worktree_intent_journal (op, worktree_id, payload, created_at) \
@@ -6090,7 +6095,7 @@ async fn stale_reattach_journal_does_not_unfreeze_later_detach() {
     // The stale row itself resolved as rolled back.
     let conn = Database::connect(&db_url).await.expect("reconnect");
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
         ))
@@ -6454,7 +6459,7 @@ async fn interrupted_add_new_branch_crash_repair() {
         async move {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!(
                     "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
@@ -6490,7 +6495,7 @@ async fn interrupted_add_new_branch_crash_repair() {
         let conn = Database::connect(&db_url).await.expect("connect");
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 backend,
                 "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
             ))
@@ -6522,7 +6527,7 @@ async fn interrupted_add_new_branch_crash_repair() {
         let conn = Database::connect(&db_url).await.expect("connect");
         let backend = conn.get_database_backend();
         let row = conn
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 backend,
                 "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
             ))
@@ -6570,7 +6575,7 @@ async fn interrupted_add_new_branch_crash_repair() {
     let conn = Database::connect(&db_url).await.expect("reconnect");
     let backend = conn.get_database_backend();
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             backend,
             "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
         ))
@@ -7035,7 +7040,7 @@ async fn layout_migration_crash_matrix() {
         async move {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
-            conn.execute(Statement::from_string(
+            conn.execute_raw(Statement::from_string(
                 backend,
                 format!(
                     "INSERT INTO worktree_intent_journal (op, worktree_id, payload, \
@@ -7045,7 +7050,7 @@ async fn layout_migration_crash_matrix() {
             .await
             .expect("plant journal");
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     backend,
                     "SELECT MAX(id) FROM worktree_intent_journal".to_string(),
                 ))
@@ -7063,7 +7068,7 @@ async fn layout_migration_crash_matrix() {
             let conn = Database::connect(&db_url).await.expect("connect");
             let backend = conn.get_database_backend();
             let row = conn
-                .query_one(Statement::from_string(
+                .query_one_raw(Statement::from_string(
                     backend,
                     "SELECT COUNT(*) FROM worktree_intent_journal".to_string(),
                 ))
@@ -7418,37 +7423,24 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
     std::fs::write(&id_file, "deadbeefdeadbeefdeadbeefdeadbeef\n").unwrap();
     let damaged_before = std::fs::read(&id_file).unwrap();
 
-    let out = run_libra_command(&["--json", "worktree", "doctor"], main);
-    assert_cli_success(&out, "worktree doctor --json");
-    let json: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("doctor emits one JSON envelope");
-    assert_eq!(json["command"], "worktree.doctor");
-    let data = &json["data"];
-    assert_eq!(data["schema_version"], 1);
-    assert!(data["next_cursor"].is_null(), "W0 emits a single page");
-    // The bare invocation carries BOTH halves of the diagnosis: `worktrees[]`
-    // is the worktree-scope half (§C.11 W0, this test), `diagnostics[]` the
-    // Agent-workspace half (W4).
-    let diagnostics = data["worktrees"]
-        .as_array()
-        .expect("the worktree-scope section is an array");
-    assert_eq!(diagnostics.len(), 2, "main + the linked worktree");
-
-    let damaged = diagnostics
-        .iter()
-        .find(|d| d["is_main"] == false)
-        .expect("the linked worktree is reported");
-    assert_eq!(
-        damaged["identity_registered"], false,
-        "the unknown identity is reported: {damaged}"
+    // W4 freezes the JSON response to workspace diagnostics only; adding the
+    // legacy W0 worktree report there would both change that public schema and
+    // make a capped page scan every worktree. The human doctor retains the
+    // W0 layout/identity diagnosis.
+    let out = run_libra_command(&["worktree", "doctor"], main);
+    assert_cli_success(&out, "worktree doctor");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(wt.to_str().expect("worktree path")),
+        "the linked worktree is reported: {text}"
     );
     assert!(
-        damaged["findings"]
-            .as_array()
-            .expect("findings")
-            .iter()
-            .any(|f| f.as_str().is_some_and(|s| s.contains("worktree repair"))),
-        "and the report names the repair route: {damaged}"
+        text.contains("identity is not one the registry knows"),
+        "the unknown identity is reported: {text}"
+    );
+    assert!(
+        text.contains("worktree repair --confirm"),
+        "the report names the executable repair route: {text}"
     );
 
     // Reporting is not repairing.
@@ -7478,26 +7470,35 @@ fn worktree_doctor_reports_scope_diagnostics_without_repairing() {
 /// test would compare an untouched database against itself. The assertion
 /// below pins that, so adding a migration fails here loudly instead of
 /// quietly hollowing the test out.
-#[test]
-fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
+#[tokio::test]
+async fn worktree_doctor_does_not_upgrade_a_behind_schema_repository() {
+    use libra::internal::db::migration::builtin_runner;
+    use sea_orm::Database;
+
     let dir = repo_with_feature();
     let main = dir.path();
     let db = main.join(".libra").join("libra.db");
+    let db_url = format!("sqlite://{}?mode=rwc", db.display());
 
-    assert!(
-        sqlite_exec(
-            &db,
-            &[
-                "DELETE FROM metadata_kv WHERE scope = 'repository' AND target = '' \
-                 AND key = 'stash.reflog.generation'",
-                "DELETE FROM schema_versions WHERE version = 2026073101",
-            ],
-        ),
-        "put the repository one migration behind"
+    // Use the real down migration rather than deleting its ledger row. W4's
+    // schema adds physical columns/triggers, so merely removing the version
+    // would turn the next ordinary migration run into a duplicate-column
+    // failure instead of representing a repository that is genuinely behind.
+    let conn = Database::connect(&db_url)
+        .await
+        .expect("open repository db");
+    assert_eq!(
+        builtin_runner()
+            .expect("builtin runner")
+            .rollback_to(&conn, 2026073101)
+            .await
+            .expect("roll back newest migration"),
+        vec![2026080401]
     );
+    conn.close().await.expect("close repository db");
     assert!(
-        sqlite_max_schema_version(&db) < 2026073101,
-        "2026073101 must be the NEWEST migration for this test to leave one \
+        sqlite_max_schema_version(&db) < 2026080401,
+        "2026080401 must be the NEWEST migration for this test to leave one \
          pending — retarget it at the new newest migration"
     );
     let before = std::fs::read(&db).expect("db before");

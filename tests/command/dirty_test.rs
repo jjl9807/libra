@@ -324,7 +324,7 @@ fn scan_lock_stolen_warning() {
     rt.block_on(async {
         use sea_orm::{ConnectionTrait, Statement};
         let db = libra::internal::db::get_db_conn_instance().await;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "UPDATE working_dirty_meta SET scan_lock_pid = 999999999,              scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
                 .to_string(),
@@ -350,7 +350,7 @@ fn scan_lock_stolen_warning() {
     rt.block_on(async {
         use sea_orm::{ConnectionTrait, Statement};
         let db = libra::internal::db::get_db_conn_instance().await;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "UPDATE working_dirty_meta SET scan_lock_pid = 999999999,              scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
                 .to_string(),
@@ -378,7 +378,7 @@ fn scan_lock_stolen_warning() {
     rt.block_on(async {
         use sea_orm::{ConnectionTrait, Statement};
         let db = libra::internal::db::get_db_conn_instance().await;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "UPDATE working_dirty_meta SET scan_lock_pid = 999999999, \
              scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"
@@ -413,7 +413,7 @@ fn scan_stale_lock_broken_pipe_stays_silent() {
     rt.block_on(async {
         use sea_orm::{ConnectionTrait, Statement};
         let db = libra::internal::db::get_db_conn_instance().await;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             db.get_database_backend(),
             "UPDATE working_dirty_meta SET scan_lock_pid = 999999999, \
              scan_lock_at = '2000-01-01T00:00:00Z' WHERE worktree_id = '';"

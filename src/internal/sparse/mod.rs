@@ -49,7 +49,7 @@ impl SparseViewStore {
             [scope.storage_key().into()],
         );
         let rows = db
-            .query_all(stmt)
+            .query_all_raw(stmt)
             .await
             .map_err(|e| format!("failed to list the sparse view: {e}"))?;
         let mut out = Vec::with_capacity(rows.len());
@@ -71,7 +71,7 @@ impl SparseViewStore {
             "SELECT enabled FROM sparse_view_meta WHERE worktree_id = ?",
             [scope.storage_key().into()],
         );
-        match db.query_one(stmt).await {
+        match db.query_one_raw(stmt).await {
             Ok(Some(row)) => Ok(row.try_get_by_index::<i32>(0).map_err(|e| e.to_string())? != 0),
             Ok(None) => Ok(false),
             Err(e) => Err(format!("failed to read the sparse view toggle: {e}")),
@@ -87,7 +87,7 @@ impl SparseViewStore {
 
     async fn set_enabled(scope: &WorktreeScope, enabled: bool) -> Result<(), String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
-        db.execute(Statement::from_sql_and_values(
+        db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO sparse_view_meta (worktree_id, enabled) VALUES (?, ?) \
              ON CONFLICT(worktree_id) DO UPDATE SET enabled = excluded.enabled",
@@ -132,7 +132,7 @@ impl SparseViewStore {
     async fn rewrite(scope: &WorktreeScope, patterns: &[String]) -> Result<(), String> {
         let db = crate::internal::sequencer::request_db_checked().await?;
         let txn = db.begin().await.map_err(|e| e.to_string())?;
-        txn.execute(Statement::from_sql_and_values(
+        txn.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM sparse_view WHERE worktree_id = ?",
             [scope.storage_key().into()],
@@ -140,7 +140,7 @@ impl SparseViewStore {
         .await
         .map_err(|e| format!("failed to clear the sparse view: {e}"))?;
         for (ordinal, pattern) in patterns.iter().enumerate() {
-            txn.execute(Statement::from_sql_and_values(
+            txn.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "INSERT INTO sparse_view (worktree_id, pattern, ordinal) VALUES (?, ?, ?)",
                 [
@@ -420,7 +420,7 @@ mod tests {
 
         // Enabled view + missing PATTERN table → strict load refuses.
         let db = crate::internal::db::get_db_conn_instance().await;
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "ALTER TABLE sparse_view RENAME TO sparse_view__hidden".to_string(),
         ))
@@ -433,7 +433,7 @@ mod tests {
         assert!(err.contains("no such table"), "{err}");
         // The tolerant display path degrades to a no-op view instead.
         assert!(!SparseView::load(&scope).await.is_active());
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "ALTER TABLE sparse_view__hidden RENAME TO sparse_view".to_string(),
         ))
@@ -442,7 +442,7 @@ mod tests {
 
         // Missing META table → strict load refuses too (the toggle store
         // is unreadable, not "disabled").
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "ALTER TABLE sparse_view_meta RENAME TO sparse_view_meta__hidden".to_string(),
         ))
@@ -453,7 +453,7 @@ mod tests {
             .err()
             .expect("missing meta table must fail closed");
         assert!(err.contains("no such table"), "{err}");
-        db.execute(Statement::from_string(
+        db.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "ALTER TABLE sparse_view_meta__hidden RENAME TO sparse_view_meta".to_string(),
         ))

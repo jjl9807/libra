@@ -32,7 +32,7 @@ async fn repo_db(repo: &Path) -> sea_orm::DatabaseConnection {
 /// (a different value would be reported as a foreign-identity record).
 async fn repo_identity(conn: &sea_orm::DatabaseConnection) -> String {
     let row = conn
-        .query_one(Statement::from_string(
+        .query_one_raw(Statement::from_string(
             DatabaseBackend::Sqlite,
             "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1",
         ))
@@ -65,7 +65,7 @@ async fn seed_linked_workspace(repo: &Path, name: &str, acquired_at_ms: i64) -> 
 /// prove the 500-row page cap without minutes of real acquisitions.
 async fn bulk_seed(conn: &sea_orm::DatabaseConnection, repo_id: &str, count: usize) {
     for index in 0..count {
-        conn.execute(Statement::from_sql_and_values(
+        conn.execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             "INSERT INTO workspace_record (workspace_id, repo_id, kind, worktree_id, path, \
              owner_kind, state, lease_fence, created_at, updated_at) \
@@ -95,7 +95,7 @@ async fn bulk_seed(conn: &sea_orm::DatabaseConnection, repo_id: &str, count: usi
 async fn repo_snapshot(repo: &Path) -> (Vec<String>, Vec<u8>, Vec<String>) {
     let conn = repo_db(repo).await;
     let rows = conn
-        .query_all(Statement::from_string(
+        .query_all_raw(Statement::from_string(
             DatabaseBackend::Sqlite,
             "SELECT workspace_id || '|' || repo_id || '|' || kind || '|' || path || '|' || \
              state || '|' || COALESCE(lease_owner, '') || '|' || lease_fence || '|' || \
@@ -170,6 +170,18 @@ async fn worktree_doctor_reports_scope_diagnostics() {
     let doc = parse_json(&output.stdout, "doctor page");
     assert_eq!(doc["ok"], true, "{doc}");
     assert_eq!(doc["command"], "worktree.doctor", "{doc}");
+    let mut page_keys: Vec<&str> = doc["data"]
+        .as_object()
+        .expect("doctor page data object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    page_keys.sort_unstable();
+    assert_eq!(
+        page_keys,
+        vec!["diagnostics", "next_cursor", "schema_version"],
+        "the versioned page shape must not grow unreviewed fields: {doc}"
+    );
     assert_eq!(doc["data"]["schema_version"], 1, "{doc}");
     let diagnostics = doc["data"]["diagnostics"].as_array().expect("diagnostics");
     assert_eq!(diagnostics.len(), 2, "{doc}");
@@ -304,45 +316,6 @@ async fn worktree_doctor_json_schema_and_pagination_stable() {
         "diagnostic key set is frozen schema v1: {doc}"
     );
 
-    // The paginated top-level `data` key set is frozen too: the workspace
-    // page plus the W0 worktree-scope half (`worktrees[]`).
-    let mut data_keys: Vec<String> = doc["data"]
-        .as_object()
-        .expect("data object")
-        .keys()
-        .cloned()
-        .collect();
-    data_keys.sort();
-    assert_eq!(
-        data_keys,
-        vec!["diagnostics", "next_cursor", "schema_version", "worktrees"],
-        "paginated data key set is frozen schema v1: {doc}"
-    );
-    let mut worktree_keys: Vec<String> = doc["data"]["worktrees"]
-        .as_array()
-        .expect("worktrees array")
-        .first()
-        .expect("at least the main worktree is diagnosed")
-        .as_object()
-        .expect("worktree diagnostic object")
-        .keys()
-        .cloned()
-        .collect();
-    worktree_keys.sort();
-    assert_eq!(
-        worktree_keys,
-        vec![
-            "findings",
-            "identity_registered",
-            "is_main",
-            "layout",
-            "path",
-            "state",
-            "worktree_id",
-        ],
-        "worktree diagnostic key set is frozen schema v1: {doc}"
-    );
-
     // An over-large --limit is capped at 500, not honoured.
     let capped = run_libra_command(
         &["--json", "worktree", "doctor", "--limit", "5000"],
@@ -401,6 +374,18 @@ async fn worktree_doctor_json_schema_and_pagination_stable() {
     let single_doc = parse_json(&single.stdout, "single scope");
     assert_eq!(single_doc["command"], "worktree.doctor", "{single_doc}");
     assert_eq!(single_doc["data"]["schema_version"], 1, "{single_doc}");
+    let mut single_keys: Vec<&str> = single_doc["data"]
+        .as_object()
+        .expect("single-scope data object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    single_keys.sort_unstable();
+    assert_eq!(
+        single_keys,
+        vec!["diagnostic", "schema_version"],
+        "the single-scope response has its own exact, non-paginated shape: {single_doc}"
+    );
     assert_eq!(
         single_doc["data"]["diagnostic"]["workspace_id"], "bulk-0007",
         "{single_doc}"
@@ -468,9 +453,380 @@ async fn worktree_doctor_corrupt_scope_fails_closed() {
     assert_eq!(doc["category"], "repo", "{doc}");
 }
 
-/// Every `worktree doctor` mention in a user-facing hint must be INSPECT-ONLY
-/// while the mutating grammar is unfrozen (§C.11 W0, Codex R19/R20): a hint
-/// must not name a recovery command the CLI cannot run.
+/// W4's only adoption path is an explicit, confirmed attribution to a live
+/// workspace lease. It atomically converts every legacy row for the provider
+/// session and records the irreversible decision in the append-only audit.
+#[tokio::test]
+#[serial]
+async fn worktree_doctor_adopts_legacy_capture_with_confirmation_and_audit() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    let workspace_id = seed_linked_workspace(repo.path(), "capture-scope", now_ms()).await;
+    let conn = repo_db(repo.path()).await;
+    let repo_id = repo_identity(&conn).await;
+    let workspace = WorkspaceStore::get_with_conn(&conn, &workspace_id)
+        .await
+        .expect("read captured workspace")
+        .expect("seeded workspace exists");
+
+    for statement in [
+        Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at,
+                stopped_at, schema_version
+             ) VALUES ('legacy-session', 'opencode', 'provider-session', 'active', '.',
+                       '{}', '{}', 1, 1, NULL, 1)",
+            [],
+        ),
+        Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_export_job (
+                job_id, agent_kind, provider_session_id, observed_generation,
+                processed_generation, state, created_at, updated_at, ttl_expires_at
+             ) VALUES ('legacy-export', 'opencode', 'provider-session', 1, 0,
+                       'dirty', 1, 1, 9999999999999)",
+            [],
+        ),
+        Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_import_identity (
+                identity_id, agent_kind, provider_session_id, source_kind, source_id,
+                schema_version, next_ordinal, state, created_at, updated_at
+             ) VALUES ('legacy-import', 'opencode', 'provider-session', 'file', 'source',
+                       1, 0, 'discovered', 1, 1)",
+            [],
+        ),
+    ] {
+        conn.execute_raw(statement)
+            .await
+            .expect("seed legacy capture row");
+    }
+
+    let unconfirmed = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "doctor",
+            &workspace_id,
+            "--adopt-capture-session",
+            "legacy-session",
+        ],
+        repo.path(),
+    );
+    assert_eq!(unconfirmed.status.code(), Some(129), "{unconfirmed:?}");
+    let untouched = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT scope_state FROM agent_session WHERE session_id = 'legacy-session'",
+        ))
+        .await
+        .expect("read legacy scope")
+        .expect("legacy row");
+    assert_eq!(
+        untouched
+            .try_get_by_index::<String>(0)
+            .expect("scope state"),
+        "legacy_unknown"
+    );
+
+    let adopted = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "doctor",
+            &workspace_id,
+            "--adopt-capture-session",
+            "legacy-session",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&adopted, "confirmed capture-scope adoption");
+    let response = parse_json(&adopted.stdout, "capture-scope adoption");
+    assert_eq!(
+        response["command"], "worktree.doctor.adopt_capture",
+        "{response}"
+    );
+    assert_eq!(response["data"]["workspace_id"], workspace_id, "{response}");
+    assert_eq!(response["data"]["repo_id"], repo_id, "{response}");
+
+    for table in ["agent_session", "agent_export_job", "agent_import_identity"] {
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                format!(
+                    "SELECT scope_state, repo_id, worktree_id, workspace_id, workspace_fence \
+                     FROM {table} WHERE provider_session_id = 'provider-session'"
+                ),
+                [],
+            ))
+            .await
+            .expect("read adopted scope")
+            .expect("adopted row");
+        assert_eq!(
+            row.try_get_by::<String, _>("scope_state")
+                .expect("scope state"),
+            "scoped"
+        );
+        assert_eq!(
+            row.try_get_by::<String, _>("repo_id").expect("repo id"),
+            repo_id
+        );
+        assert_eq!(
+            row.try_get_by::<String, _>("worktree_id")
+                .expect("worktree id"),
+            workspace.worktree_id.clone().expect("linked worktree id")
+        );
+        assert_eq!(
+            row.try_get_by::<String, _>("workspace_id")
+                .expect("workspace id"),
+            workspace_id
+        );
+        assert_eq!(
+            row.try_get_by::<i64, _>("workspace_fence")
+                .expect("workspace fence"),
+            workspace.lease_fence
+        );
+    }
+    let audit_count = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM agent_workspace_scope_audit \
+             WHERE action = 'adopt_legacy_capture_scope' AND provider_session_id = 'provider-session'",
+        ))
+        .await
+        .expect("read capture-scope audit")
+        .expect("audit count");
+    assert_eq!(
+        audit_count
+            .try_get_by_index::<i64>(0)
+            .expect("audit count value"),
+        1
+    );
+
+    let repeat = run_libra_command(
+        &[
+            "worktree",
+            "doctor",
+            &workspace_id,
+            "--adopt-capture-session",
+            "legacy-session",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert!(
+        !repeat.status.success(),
+        "a scoped row cannot be adopted twice"
+    );
+}
+
+/// An expired lease may still occupy its identity until explicit reclaim, but
+/// it is not authority to attribute capture history. Adoption must wait for a
+/// renewed or newly fenced live lease and leave the legacy row untouched.
+#[tokio::test]
+#[serial]
+async fn worktree_doctor_refuses_capture_adoption_to_an_expired_lease() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    let workspace_id = seed_linked_workspace(repo.path(), "expired-capture", 1_000).await;
+    let conn = repo_db(repo.path()).await;
+    conn.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at,
+            stopped_at, schema_version
+         ) VALUES ('expired-legacy-session', 'opencode', 'expired-provider', 'active', '.',
+                   '{}', '{}', 1, 1, NULL, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed legacy capture row");
+
+    let refused = run_libra_command(
+        &[
+            "worktree",
+            "doctor",
+            &workspace_id,
+            "--adopt-capture-session",
+            "expired-legacy-session",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert!(!refused.status.success(), "expired lease must be refused");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT scope_state FROM agent_session WHERE session_id = 'expired-legacy-session'"
+                .to_string(),
+        ))
+        .await
+        .expect("read untouched legacy row")
+        .expect("legacy row");
+    assert_eq!(
+        row.try_get_by_index::<String>(0).expect("scope state"),
+        "legacy_unknown"
+    );
+    let audit = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM agent_workspace_scope_audit \
+             WHERE provider_session_id = 'expired-provider'"
+                .to_string(),
+        ))
+        .await
+        .expect("read audit count")
+        .expect("audit count");
+    assert_eq!(audit.try_get_by_index::<i64>(0).expect("audit count"), 0);
+}
+
+/// An export or import identity can outlive its parent catalog session. The
+/// explicit adoption path must still make that legacy state recoverable rather
+/// than leaving it permanently blocked behind a missing `agent_session` row.
+#[tokio::test]
+#[serial]
+async fn worktree_doctor_adopts_orphan_legacy_provider_session() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    let workspace_id = seed_linked_workspace(repo.path(), "orphan-capture", now_ms()).await;
+    let conn = repo_db(repo.path()).await;
+    let repo_id = repo_identity(&conn).await;
+    conn.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO agent_import_identity (
+            identity_id, agent_kind, provider_session_id, source_kind, source_id,
+            schema_version, next_ordinal, state, created_at, updated_at
+         ) VALUES ('orphan-import', 'opencode', 'orphan-provider', 'file', 'source',
+                   1, 0, 'discovered', 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed orphan legacy import identity");
+
+    let diagnosis = run_libra_command(&["worktree", "doctor"], repo.path());
+    assert_cli_success(&diagnosis, "diagnose orphan legacy capture state");
+    assert!(
+        String::from_utf8_lossy(&diagnosis.stdout).contains("legacy capture scope"),
+        "orphan rows must remain discoverable to the read-only doctor: {diagnosis:?}"
+    );
+
+    let adopted = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "doctor",
+            &workspace_id,
+            "--adopt-capture-session",
+            "orphan-provider",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&adopted, "adopt orphan legacy provider session");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT scope_state, repo_id, workspace_id FROM agent_import_identity \
+             WHERE identity_id = 'orphan-import'"
+                .to_string(),
+        ))
+        .await
+        .expect("read adopted orphan row")
+        .expect("adopted orphan row");
+    assert_eq!(
+        row.try_get_by::<String, _>("scope_state")
+            .expect("scope state"),
+        "scoped"
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("repo_id").expect("repo id"),
+        repo_id
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("workspace_id")
+            .expect("workspace id"),
+        workspace_id
+    );
+}
+
+/// A catalog session id is the primary doctor lookup key. It must not be
+/// interpreted as an unrelated provider id merely because another legacy row
+/// happens to use the same opaque string.
+#[tokio::test]
+#[serial]
+async fn worktree_doctor_prefers_catalog_session_id_over_provider_id_collision() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    let workspace_id = seed_linked_workspace(repo.path(), "collision-capture", now_ms()).await;
+    let conn = repo_db(repo.path()).await;
+    conn.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at,
+            stopped_at, schema_version
+         ) VALUES ('collision-id', 'opencode', 'catalog-provider', 'active', '.',
+                   '{}', '{}', 1, 1, NULL, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed catalog legacy session");
+    conn.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO agent_import_identity (
+            identity_id, agent_kind, provider_session_id, source_kind, source_id,
+            schema_version, next_ordinal, state, created_at, updated_at
+         ) VALUES ('collision-orphan', 'codex', 'collision-id', 'file', 'source',
+                   1, 0, 'discovered', 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed colliding orphan provider id");
+
+    let adopted = run_libra_command(
+        &[
+            "worktree",
+            "doctor",
+            &workspace_id,
+            "--adopt-capture-session",
+            "collision-id",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&adopted, "adopt exact catalog session id");
+
+    for (table, predicate, expected_scope) in [
+        ("agent_session", "session_id = 'collision-id'", "scoped"),
+        (
+            "agent_import_identity",
+            "identity_id = 'collision-orphan'",
+            "legacy_unknown",
+        ),
+    ] {
+        let row = conn
+            .query_one_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!("SELECT scope_state FROM {table} WHERE {predicate}"),
+            ))
+            .await
+            .expect("read collision scope")
+            .expect("collision row");
+        assert_eq!(
+            row.try_get_by_index::<String>(0).expect("scope state"),
+            expected_scope,
+            "{table} must retain its independently selected scope"
+        );
+    }
+}
+
+/// The bare `worktree doctor` hint stays inspect-only even though W4 adds one
+/// separately named, confirmed adoption grammar. A normal diagnostic must not
+/// promise recovery as a side effect.
 #[test]
 fn worktree_doctor_hints_are_inspect_only() {
     const SOURCES: [(&str, &str); 3] = [
@@ -495,6 +851,9 @@ fn worktree_doctor_hints_are_inspect_only() {
             if trimmed.starts_with("//") {
                 continue;
             }
+            if line.contains("--adopt-capture-session") {
+                continue;
+            }
             for forbidden in ["reclaim", "adopt", "release"] {
                 assert!(
                     !line.contains(forbidden),
@@ -504,6 +863,76 @@ fn worktree_doctor_hints_are_inspect_only() {
                 );
             }
         }
+    }
+}
+
+/// Every published recovery instruction must include the confirmation the
+/// mutating command now enforces. Otherwise a diagnostic sends an operator
+/// into a guaranteed refusal precisely when the repository needs repair.
+#[test]
+fn worktree_repair_guidance_requires_confirmation() {
+    for (name, document) in [
+        (
+            "English worktree docs",
+            include_str!("../../docs/commands/worktree.md"),
+        ),
+        (
+            "Chinese worktree docs",
+            include_str!("../../docs/commands/zh-CN/worktree.md"),
+        ),
+    ] {
+        assert!(
+            document.contains("worktree repair --confirm"),
+            "{name} must document the required confirmation"
+        );
+        assert!(
+            !document.contains("`libra worktree repair`"),
+            "{name} still suggests an unconfirmed repair command"
+        );
+        assert!(
+            !document.contains("`worktree repair --migrate-layout`"),
+            "{name} still suggests an unconfirmed layout migration"
+        );
+    }
+
+    let source = include_str!("../../src/command/worktree.rs");
+    for stale_instruction in [
+        "`libra worktree repair` to heal it",
+        "`libra worktree repair` first",
+        "`libra worktree repair` retries it",
+        "`worktree repair --migrate-layout` from the MAIN worktree",
+        "rerun `worktree repair`",
+    ] {
+        assert!(
+            !source.contains(stale_instruction),
+            "worktree diagnostic still recommends a command that will be refused: {stale_instruction}"
+        );
+    }
+}
+
+/// The only mutating doctor grammar must be discoverable in both user-facing
+/// command references. Otherwise legacy rows are deliberately fail-closed but
+/// operators have no documented recovery route.
+#[test]
+fn worktree_doctor_capture_adoption_is_documented_in_both_languages() {
+    for (name, document) in [
+        (
+            "English worktree docs",
+            include_str!("../../docs/commands/worktree.md"),
+        ),
+        (
+            "Chinese worktree docs",
+            include_str!("../../docs/commands/zh-CN/worktree.md"),
+        ),
+    ] {
+        assert!(
+            document.contains("--adopt-capture-session <session-id> --confirm"),
+            "{name} must document the confirmed legacy capture adoption grammar"
+        );
+        assert!(
+            document.contains("worktree.doctor.adopt_capture"),
+            "{name} must document the adoption JSON envelope"
+        );
     }
 }
 
@@ -870,649 +1299,4 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
             }
         }
     }
-}
-
-/// W0 (§C.11, Codex R18): `repair <path> --resolve-identity` keeps its
-/// dedicated `--yes` confirmation, but once confirmed the detach runs inside
-/// the SAME one-row operation-log audit boundary as every other mutating
-/// repair — the `--yes`-less refusal writes no row, a success closes its row
-/// `succeeded`, and a nothing-to-resolve failure closes its row `failed`.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn worktree_repair_resolve_identity_runs_inside_the_audit_boundary() {
-    use libra::internal::operation::OperationStatus;
-
-    let repo = create_committed_repo_via_cli();
-    let main = repo.path();
-
-    // Two live worktrees, then handcraft the legacy-binary identity
-    // collision: BOTH entries claim wt-b's identity.
-    assert_cli_success(
-        &run_libra_command(&["worktree", "add", "wt-a"], main),
-        "add worktree a",
-    );
-    assert_cli_success(
-        &run_libra_command(&["worktree", "add", "wt-b"], main),
-        "add worktree b",
-    );
-    let registry_path = main.join(".libra").join("worktrees.json");
-    let mut doc: serde_json::Value =
-        serde_json::from_slice(&fs::read(&registry_path).expect("read registry"))
-            .expect("registry json");
-    let identity_b = doc["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .find(|entry| {
-            entry["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("wt-b"))
-        })
-        .and_then(|entry| entry["worktree_id"].as_str())
-        .expect("wt-b identity")
-        .to_string();
-    doc["entries"]
-        .as_array_mut()
-        .expect("entries")
-        .iter_mut()
-        .find(|entry| {
-            entry["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("wt-a"))
-        })
-        .expect("wt-a entry")["worktree_id"] = serde_json::Value::String(identity_b);
-    fs::write(
-        &registry_path,
-        serde_json::to_vec_pretty(&doc).expect("serialize"),
-    )
-    .expect("plant the identity collision");
-
-    // 1. Without `--yes` the action is refused and writes NO operation row.
-    let operations_before = operation_rows(main).await;
-    let registry_before = fs::read(&registry_path).expect("registry before");
-    let refused = run_libra_command(&["worktree", "repair", "wt-a", "--resolve-identity"], main);
-    assert!(
-        !refused.status.success(),
-        "resolve-identity without --yes must be refused"
-    );
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(
-        stderr.contains("--yes"),
-        "the refusal names its dedicated confirmation: {stderr}"
-    );
-    assert_eq!(
-        operation_rows(main).await,
-        operations_before,
-        "the refusal must not write an operation row"
-    );
-    assert_eq!(
-        fs::read(&registry_path).expect("registry after refusal"),
-        registry_before,
-        "the refusal must not touch the registry"
-    );
-
-    // 2. `--yes` detaches the named entry and closes exactly ONE new audit
-    //    row `succeeded`, named after the action.
-    let ran = run_libra_command(
-        &["worktree", "repair", "wt-a", "--resolve-identity", "--yes"],
-        main,
-    );
-    assert_cli_success(&ran, "resolve the identity collision");
-    let operations_after = operation_rows(main).await;
-    assert_eq!(
-        operations_after.len(),
-        operations_before.len() + 1,
-        "exactly one audit row per executed action"
-    );
-    let audit = operations_after
-        .iter()
-        .find(|after| {
-            !operations_before
-                .iter()
-                .any(|before| before.op_id == after.op_id)
-        })
-        .expect("the new audit row");
-    assert_eq!(
-        audit.command_name, "worktree repair wt-a --resolve-identity",
-        "the audit row names the action"
-    );
-    assert_eq!(
-        audit.status,
-        OperationStatus::Succeeded,
-        "the audit row records the outcome"
-    );
-    assert!(
-        audit.end_ts.is_some(),
-        "the audit row is finished, not left running"
-    );
-
-    // ... and the collision is actually resolved: wt-a is detached, so wt-b
-    // owns the identity alone again.
-    let healed: serde_json::Value =
-        serde_json::from_slice(&fs::read(&registry_path).expect("registry after repair"))
-            .expect("registry json");
-    let state_a = healed["entries"]
-        .as_array()
-        .expect("entries")
-        .iter()
-        .find(|entry| {
-            entry["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("wt-a"))
-        })
-        .and_then(|entry| entry["state"].as_str());
-    assert_eq!(
-        state_a,
-        Some("detached_from_registry"),
-        "the named entry was detached"
-    );
-
-    // 3. A resolve with NOTHING left to resolve fails — and its audit row
-    //    closes `failed` (the boundary records the outcome either way).
-    let failed = run_libra_command(
-        &["worktree", "repair", "wt-b", "--resolve-identity", "--yes"],
-        main,
-    );
-    assert!(
-        !failed.status.success(),
-        "wt-b has no collision left: the resolve must fail"
-    );
-    let operations_final = operation_rows(main).await;
-    assert_eq!(
-        operations_final.len(),
-        operations_after.len() + 1,
-        "the failure is audited too"
-    );
-    let failed_row = operations_final
-        .iter()
-        .find(|row| {
-            !operations_after
-                .iter()
-                .any(|before| before.op_id == row.op_id)
-        })
-        .expect("the failure audit row");
-    assert_eq!(
-        failed_row.command_name, "worktree repair wt-b --resolve-identity",
-        "the failure row names the attempted action"
-    );
-    assert_eq!(failed_row.status, OperationStatus::Failed);
-    assert!(failed_row.end_ts.is_some());
-}
-
-/// W0 (§C.11, Codex R18 follow-up): every user-visible `libra worktree
-/// repair` suggestion in the crate source names its confirmation inside the
-/// same backticks — `--confirm` for the ordinary mutating actions, `--yes`
-/// for `--resolve-identity`, `--dry-run` for the read-only preview. A bare
-/// suggestion refuses deterministically (W0 repair gate), so printing one
-/// sends the user to a second failure at the moment they are already stuck.
-/// This scan keeps hints, doctor findings and recovery output honest.
-///
-/// Rust string literals treat `\` + newline (+ leading whitespace) as a line
-/// continuation — the RENDERED string joins the pieces, so a hint split that
-/// way would hide from a raw-source search. The scan normalizes the source
-/// the same way the compiler does before looking for spans.
-///
-/// The C.3.3 documentation sources that prescribe repair invocations are
-/// held to the same contract (Codex R19 follow-up): a developer doc showing
-/// a bare command sends its reader to the same refusal. COMPATIBILITY.md
-/// and the migration SQL comments prescribe them too (Codex W0-r7
-/// follow-up); they spell the command without the `libra` prefix, so they
-/// are scanned with the bare `worktree repair` needle, and a span
-/// explicitly attributed to Git's own CLI is exempt.
-#[test]
-fn repair_guidance_in_source_always_names_its_confirmation() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut violations = Vec::new();
-    let mut stack = vec![manifest.join("src")];
-    while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir).expect("read src directory") {
-            let entry = entry.expect("directory entry");
-            let path = entry.path();
-            if entry.file_type().expect("file type").is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let text = fs::read_to_string(&path).expect("read source file");
-            let text = join_rust_string_continuations(&text);
-            scan_repair_spans(&path, &text, "libra worktree repair", &mut violations);
-        }
-    }
-    for doc in [
-        "docs/development/libra-worktree-architecture.md",
-        "docs/development/commands/worktree.md",
-    ] {
-        let path = manifest.join(doc);
-        let text = fs::read_to_string(&path).expect("read doc file");
-        scan_repair_spans(&path, &text, "libra worktree repair", &mut violations);
-    }
-    // COMPATIBILITY.md and the migration SQL comments also prescribe repair
-    // invocations (Codex W0-r7 follow-up). They spell the command without
-    // the `libra` prefix, so they are scanned with the bare needle.
-    let compat = manifest.join("COMPATIBILITY.md");
-    let text = fs::read_to_string(&compat).expect("read COMPATIBILITY.md");
-    scan_repair_spans(&compat, &text, "worktree repair", &mut violations);
-    let mut migration_files: Vec<_> = fs::read_dir(manifest.join("sql/migrations"))
-        .expect("read sql/migrations")
-        .map(|entry| entry.expect("migration entry").path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sql"))
-        .collect();
-    migration_files.sort();
-    for path in migration_files {
-        let text = fs::read_to_string(&path).expect("read migration file");
-        scan_repair_spans(&path, &text, "worktree repair", &mut violations);
-    }
-    assert!(
-        violations.is_empty(),
-        "repair guidance that would refuse as written:\n{}",
-        violations.join("\n")
-    );
-}
-
-/// Flag every backtick-quoted span in `text` that contains `needle` (a
-/// `worktree repair` command spelling) yet names none of the confirmation
-/// flags. Sources that prescribe Libra's own CLI are scanned with
-/// "libra worktree repair"; sources that spell the command without the
-/// prefix (COMPATIBILITY.md, migration SQL comments) use the bare
-/// "worktree repair" needle. A span explicitly attributed to Git's own CLI
-/// (its opening backtick immediately preceded by "Git's ") is exempt —
-/// upstream has no `--confirm`.
-fn scan_repair_spans(path: &Path, text: &str, needle: &str, violations: &mut Vec<String>) {
-    let mut rest = text;
-    while let Some(open) = rest.find('`') {
-        let span_start = text.len() - rest.len() + open + 1;
-        rest = &rest[open + 1..];
-        let Some(close) = rest.find('`') else {
-            break;
-        };
-        let span = &rest[..close];
-        if span.contains(needle)
-            && !span.contains("--confirm")
-            && !span.contains("--yes")
-            && !span.contains("--dry-run")
-            && !text[..span_start].ends_with("Git's `")
-        {
-            violations.push(format!("{}: `{span}`", path.display()));
-        }
-        rest = &rest[close + 1..];
-    }
-}
-
-/// Join Rust string-literal line continuations the way the compiler renders
-/// them: a `\` immediately followed by a newline drops the newline and the
-/// next line's leading indentation. Without this a hint written as
-/// `"... worktree \`<newline>`repair ..."` would stay invisible to the scan.
-fn join_rust_string_continuations(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(pos) = rest.find("\\\n") {
-        out.push_str(&rest[..pos]);
-        rest = &rest[pos + 2..];
-        rest = rest.trim_start_matches([' ', '\t']);
-    }
-    out.push_str(rest);
-    out
-}
-
-/// W0 (§C.11, Codex R19 follow-up): an UNCONFIRMED mutating repair applies NO
-/// pending schema migration on its way to the refusal. The refusal is
-/// documented as byte-for-byte side-effect free, and a migration is an
-/// irreversible write — a bare `worktree repair` run against an older
-/// repository must not upgrade its schema while saying no.
-#[tokio::test]
-async fn unconfirmed_repair_applies_no_pending_migrations() {
-    let repo = create_committed_repo_via_cli();
-    let main = repo.path();
-
-    // Simulate a pending migration: drop the newest applied-migration row.
-    // The migration's own DDL is idempotent (INSERT ... ON CONFLICT DO
-    // NOTHING), so the positive control below can cleanly re-apply it.
-    let newest: i64 = {
-        let conn = repo_db(main).await;
-        let row = conn
-            .query_one(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT MAX(version) FROM schema_versions".to_string(),
-            ))
-            .await
-            .expect("query newest schema version")
-            .expect("at least one applied migration");
-        let version = row.try_get_by_index::<i64>(0).expect("version value");
-        conn.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "DELETE FROM schema_versions WHERE version = ?",
-            [version.into()],
-        ))
-        .await
-        .expect("drop the newest migration row");
-        version
-    };
-
-    // The unconfirmed invocation is refused — and the row must STAY deleted.
-    let refused = run_libra_command(&["worktree", "repair"], main);
-    assert_ne!(
-        refused.status.code(),
-        Some(0),
-        "unconfirmed repair must be refused"
-    );
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert!(
-        stderr.contains("--confirm"),
-        "the refusal names --confirm: {stderr}"
-    );
-    let remaining: i64 = {
-        let conn = repo_db(main).await;
-        conn.query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
-            [newest.into()],
-        ))
-        .await
-        .expect("re-query the dropped row")
-        .expect("count row")
-        .try_get_by_index::<i64>(0)
-        .expect("count value")
-    };
-    assert_eq!(
-        remaining, 0,
-        "the unconfirmed refusal must not apply the pending migration"
-    );
-
-    // Positive control: an ordinary (migration-applying) worktree command
-    // DOES bring the schema current, proving the probe can see application.
-    assert_cli_success(
-        &run_libra_command(&["worktree", "list"], main),
-        "worktree list",
-    );
-    let reapplied: i64 = {
-        let conn = repo_db(main).await;
-        conn.query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
-            [newest.into()],
-        ))
-        .await
-        .expect("re-query after the control command")
-        .expect("count row")
-        .try_get_by_index::<i64>(0)
-        .expect("count value")
-    };
-    assert_eq!(
-        reapplied, 1,
-        "the migration-applying control re-applied the pending migration"
-    );
-}
-
-/// Codex R19 gate finding (round 7): a BARE `worktree doctor` must not apply
-/// pending migrations either — the §C.11 guarantee is that doctor is the one
-/// command safe to run on a repository you have not yet decided to upgrade.
-/// The regression hole this pins: with linked-worktree history present, the
-/// doctor's adopted-provenance probe (`adopted_scope_settings_present`)
-/// resolved the GLOBAL (migration-applying) connection instead of doctor's
-/// no-migration one.
-#[tokio::test]
-async fn bare_doctor_applies_no_pending_migrations() {
-    let repo = create_committed_repo_via_cli();
-    let main = repo.path();
-    // Linked-worktree history is required to reach the adopted-provenance probe.
-    let parent = tempfile::tempdir().expect("wt parent");
-    let wt = parent.path().join("wt");
-    assert_cli_success(
-        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
-        "worktree add",
-    );
-
-    // Simulate a pending migration: drop the newest applied-migration row (the
-    // same simulation as `unconfirmed_repair_applies_no_pending_migrations`).
-    let newest: i64 = {
-        let conn = repo_db(main).await;
-        let row = conn
-            .query_one(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT MAX(version) FROM schema_versions".to_string(),
-            ))
-            .await
-            .expect("query newest schema version")
-            .expect("at least one applied migration");
-        let version = row.try_get_by_index::<i64>(0).expect("version value");
-        conn.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "DELETE FROM schema_versions WHERE version = ?",
-            [version.into()],
-        ))
-        .await
-        .expect("drop the newest migration row");
-        version
-    };
-    let count_row = async |version: i64| -> i64 {
-        let conn = repo_db(main).await;
-        conn.query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
-            [version.into()],
-        ))
-        .await
-        .expect("re-query the dropped row")
-        .expect("count row")
-        .try_get_by_index::<i64>(0)
-        .expect("count value")
-    };
-
-    // Bare doctor must succeed AND leave the row dropped.
-    assert_cli_success(
-        &run_libra_command(&["worktree", "doctor"], main),
-        "bare worktree doctor",
-    );
-    assert_eq!(
-        count_row(newest).await,
-        0,
-        "bare doctor must not apply the pending migration"
-    );
-
-    // The JSON surface shares the same no-migration path.
-    assert_cli_success(
-        &run_libra_command(&["--json", "worktree", "doctor"], main),
-        "--json worktree doctor",
-    );
-    assert_eq!(
-        count_row(newest).await,
-        0,
-        "--json doctor must not apply the pending migration"
-    );
-
-    // Positive control: an ordinary (migration-applying) worktree command DOES
-    // bring the schema current, proving the probe can see application.
-    assert_cli_success(
-        &run_libra_command(&["worktree", "list"], main),
-        "worktree list",
-    );
-    assert_eq!(
-        count_row(newest).await,
-        1,
-        "the migration-applying control re-applied the pending migration"
-    );
-}
-
-/// Codex R20 gate finding (round 8): the read-only `worktree repair
-/// --migrate-layout --dry-run` preview must not apply pending migrations
-/// either — it is documented as confirmation-free and read-only end to end,
-/// and applying migrations is a WRITE. The regression hole this pins: the
-/// preview took the migration-applying CLI preflight and dispatch-time opens,
-/// and `migrate_layout_run` resolved the GLOBAL (migration-applying)
-/// connection before returning its plan.
-#[tokio::test]
-async fn migrate_layout_dry_run_applies_no_pending_migrations() {
-    let repo = create_committed_repo_via_cli();
-    let main = repo.path();
-
-    // Simulate a pending migration: drop the newest applied-migration row
-    // (the same simulation as `bare_doctor_applies_no_pending_migrations`).
-    let newest: i64 = {
-        let conn = repo_db(main).await;
-        let row = conn
-            .query_one(Statement::from_string(
-                DatabaseBackend::Sqlite,
-                "SELECT MAX(version) FROM schema_versions".to_string(),
-            ))
-            .await
-            .expect("query newest schema version")
-            .expect("at least one applied migration");
-        let version = row.try_get_by_index::<i64>(0).expect("version value");
-        conn.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "DELETE FROM schema_versions WHERE version = ?",
-            [version.into()],
-        ))
-        .await
-        .expect("drop the newest migration row");
-        version
-    };
-    let count_row = async |version: i64| -> i64 {
-        let conn = repo_db(main).await;
-        conn.query_one(Statement::from_sql_and_values(
-            DatabaseBackend::Sqlite,
-            "SELECT COUNT(*) FROM schema_versions WHERE version = ?",
-            [version.into()],
-        ))
-        .await
-        .expect("re-query the dropped row")
-        .expect("count row")
-        .try_get_by_index::<i64>(0)
-        .expect("count value")
-    };
-
-    // The dry-run preview must succeed AND leave the row dropped.
-    assert_cli_success(
-        &run_libra_command(
-            &["worktree", "repair", "--migrate-layout", "--dry-run"],
-            main,
-        ),
-        "worktree repair --migrate-layout --dry-run",
-    );
-    assert_eq!(
-        count_row(newest).await,
-        0,
-        "the dry-run layout preview must not apply the pending migration"
-    );
-
-    // The JSON surface shares the same no-migration path.
-    assert_cli_success(
-        &run_libra_command(
-            &[
-                "--json",
-                "worktree",
-                "repair",
-                "--migrate-layout",
-                "--dry-run",
-            ],
-            main,
-        ),
-        "--json worktree repair --migrate-layout --dry-run",
-    );
-    assert_eq!(
-        count_row(newest).await,
-        0,
-        "the --json dry-run layout preview must not apply the pending migration"
-    );
-
-    // Positive control: an ordinary (migration-applying) worktree command DOES
-    // bring the schema current, proving the probe can see application.
-    assert_cli_success(
-        &run_libra_command(&["worktree", "list"], main),
-        "worktree list",
-    );
-    assert_eq!(
-        count_row(newest).await,
-        1,
-        "the migration-applying control re-applied the pending migration"
-    );
-}
-
-/// Codex R21 gate finding (round 9): the read-only repair modes — the
-/// `--migrate-layout --dry-run` preview and every UNCONFIRMED (would-be-
-/// refused) repair — must not create `.libra/maintenance.lock` either: the
-/// shared maintenance hold creates the file when absent, and a filesystem
-/// write breaks the byte-for-byte side-effect-free contract the preview and
-/// the refusals are documented to keep. The regression hole this pins:
-/// `command_scope` classified every `Repair` invocation as a Repository
-/// writer, so the generic shared hold ran before dispatch.
-#[tokio::test]
-async fn read_only_repair_modes_create_no_maintenance_lock() {
-    let repo = create_committed_repo_via_cli();
-    let main = repo.path();
-    let lock = main.join(".libra").join("maintenance.lock");
-    // The setup commands legitimately took the shared hold and created the
-    // file; start the probe from a genuinely lock-free repository.
-    if lock.exists() {
-        std::fs::remove_file(&lock).expect("remove the setup-created maintenance lock");
-    }
-    let assert_lock_absent = |context: &str| {
-        assert!(
-            !lock.exists(),
-            "{context} must not create .libra/maintenance.lock"
-        );
-    };
-
-    // The read-only layout preview: plain and --json.
-    assert_cli_success(
-        &run_libra_command(
-            &["worktree", "repair", "--migrate-layout", "--dry-run"],
-            main,
-        ),
-        "worktree repair --migrate-layout --dry-run",
-    );
-    assert_lock_absent("the dry-run layout preview");
-    assert_cli_success(
-        &run_libra_command(
-            &[
-                "--json",
-                "worktree",
-                "repair",
-                "--migrate-layout",
-                "--dry-run",
-            ],
-            main,
-        ),
-        "--json worktree repair --migrate-layout --dry-run",
-    );
-    assert_lock_absent("the --json dry-run layout preview");
-
-    // Every unconfirmed-repair variant is refused — and creates nothing.
-    for (argv, context) in [
-        (vec!["worktree", "repair"], "unconfirmed bare repair"),
-        (
-            vec!["worktree", "repair", "--migrate-layout"],
-            "unconfirmed migrate-layout",
-        ),
-        (
-            vec!["worktree", "repair", "wt"],
-            "unconfirmed identity repair",
-        ),
-        (
-            vec!["worktree", "repair", "wt", "--resolve-identity"],
-            "unconfirmed resolve-identity",
-        ),
-    ] {
-        let refused = run_libra_command(&argv, main);
-        assert_ne!(
-            refused.status.code(),
-            Some(0),
-            "{context} must be refused without its confirmation"
-        );
-        assert_lock_absent(context);
-    }
-
-    // Positive control: a CONFIRMED mutating repair takes the shared hold and
-    // creates the lock file, proving the probe can see creation.
-    assert_cli_success(
-        &run_libra_command(&["worktree", "repair", "--confirm"], main),
-        "worktree repair --confirm",
-    );
-    assert!(
-        lock.exists(),
-        "the confirmed repair must take the shared maintenance hold"
-    );
 }

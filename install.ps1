@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 # One of the release version surfaces. `compat_version_surface_sync` pins it
 # to Cargo.toml: this value is substituted verbatim into the download URL, so
 # a stale value silently installs an old binary when -Version is not given.
-$DefaultVersion = "v0.19.81"
+$DefaultVersion = "v0.19.90"
 $ExeName = "libra.exe"
 $ReleaseAsset = "libra-windows-amd64.exe"
 
@@ -132,7 +132,7 @@ function Install-LbaAlias {
         [string]$ShimDir
     )
 
-    if ($NoAlias -or -not [string]::IsNullOrWhiteSpace($env:LIBRA_NO_ALIAS)) {
+    if ($NoAlias -or $env:LIBRA_NO_ALIAS -eq "1") {
         Write-Info "lba alias: disabled"
         return
     }
