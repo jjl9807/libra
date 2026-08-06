@@ -45,7 +45,7 @@
 
 - **行为轴**：一个可独立恢复、对外语义自洽的变化方向（例如「SSE 协议版本协商」是一个轴，「SSE 背压阈值」是另一个轴）。
 - **落点**：一个可枚举的代码或文档归属域，粒度为**一个具体目录**（如 `src/internal/ai/runtime/`）或**一组同名文档**（如 `docs/commands/<cmd>.md` EN+zh）。仓库根、`src/`、`tests/`、`docs/` 这类顶层目录**不算**一个落点。
-- **写集**：会被修改的文件/目录集合，分三类（G-10）——**实现写集 I**（每卡字段，决定能否并发）、**发布写集 R**（每卡字段，版本面四处 + `Cargo.lock` + artifact；不用于实现阶段的并发分组，但进入发布窗口后按 I–R / R–R 规则串行化）、**协调写集 C**（计划级，发布顺序与窗口记录，不进任务卡字段、不参与并发判定；「禁止多 Agent 并发发布」是 ER-12 的仓库级规则，不是 C 的状态）。
+- **写集**：会被修改的文件/目录集合，分三类（G-10）——**实现写集 I**（每卡字段，决定能否并发）、**发布写集 R**（每卡字段，版本面五处 + `Cargo.lock` + artifact；不用于实现阶段的并发分组，但进入发布窗口后按 I–R / R–R 规则串行化）、**协调写集 C**（计划级，发布顺序与窗口记录，不进任务卡字段、不参与并发判定；「禁止多 Agent 并发发布」是 ER-12 的仓库级规则，不是 C 的状态）。
 - **发布切片**：一次独立的 review + 验收 + 版本 + 提交 + 推送。
 - **家族卡**：共用唯一发布点的一组子卡（G-08）。
 - **恢复模式（字段名 `Rollback mode`）**：`revert` / `forward-only` / `compensating` / `immutable-release` 四种之一（G-01）。不可逆变更用后三种表达，不要求「一次 revert 撤销」。
@@ -239,7 +239,7 @@
    | `spike` | 产物门：结论文档或 ADR 已落盘、go/no-go 已判定、承接卡已登记；**allowlist diff 门**——`libra status --short --branch` 的全部变更必须落在本卡 `Deliverables` 声明的产物内，且生产表面零改动（至少覆盖 `src/**`、`web/src/**`、`worker/src/**`、`sql/**`、`build.rs`、`install.sh`、`Cargo.toml`/`Cargo.lock`、CI 与仓库配置），用「Verification 判定口径」的退出码模板逐条守卫 |
    | `release` | 聚合守卫（本组引入的全部新守卫用例）+ release note / 兼容证据 |
 
-   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面四处 parity 预检（ER-08）→ ② 按 `Version increment` bump 四处 + 让工具链刷新 `Cargo.lock`（不手改）→ ③ 在**已 bump 的状态**上跑 `CLAUDE.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build --release` → ⑤ 安装 → ⑥ `libra add <相关路径>` + `libra commit -s -m`（ER-07 的签名预检与提交后校验）→ ⑦ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑧ **条件步（仅当本计划要产出用户可获取的 release artifact；否则整步 `N/A`）**：创建并推送版本 tag `libra tag v<version>` + `libra push origin v<version>`，**并确认 tag 推送成功**（当前 `release.yml` 只由 `push` 的 `v*` tag 触发，**不**由 main branch push 触发——不推 tag 则 release 流水线根本不会运行）。
+   **C 发布收口门（由会推送的卡执行，顺序强制）:** ① 版本面五处 parity 预检（ER-08）→ ② 按 `Version increment` bump 五处 + 让工具链刷新 `Cargo.lock`（不手改）→ ③ 在**已 bump 的状态**上跑 `CLAUDE.md` 三门（fmt、clippy、`source .env.test && cargo test --all`）→ ④ `cargo build --release` → ⑤ 安装 → ⑥ `libra add <相关路径>` + `libra commit -s -m`（ER-07 的签名预检与提交后校验）→ ⑦ 推送并确认 branch ref：`libra push origin main` 成功且远端 ref 已更新 → ⑧ **条件步（仅当本计划要产出用户可获取的 release artifact；否则整步 `N/A`）**：创建并推送版本 tag `libra tag v<version>` + `libra push origin v<version>`，**并确认 tag 推送成功**（当前 `release.yml` 只由 `push` 的 `v*` tag 触发，**不**由 main branch push 触发——不推 tag 则 release 流水线根本不会运行）。
 
    三门必须覆盖 bump 后的最终状态——bump 与 `Cargo.lock` 刷新本身可能引入格式、lint 或编译回归，`cargo build --release` 不能替代 clippy 与全量测试。
 
@@ -259,7 +259,7 @@
    - 每次提交后强制校验：`libra cat-file -p HEAD | rg -q '^gpgsig'`（注意 `libra log` 不支持 `--show-signature`，没有 `verify-commit` 子命令）。校验失败不得推送。
    - 只有在「字段全局默认与例外」的 waiver 表中存在 `豁免项 = ER-07 签名要求` 的 `EX-*`（含 Approver、Review round、证据、有效期）时，才允许以 sign-off-only 方式提交；「事实基线」最多链接该 `EX-*`，不构成独立授权路径。
    - **与 `AGENTS.md` 的已知漂移及优先级（必须按此执行）:** `AGENTS.md`「Commit & Pull Request Guidelines」示例写的是 `git commit -S -s`，「Workspace Notes」示例写的是 `libra commit -a -s`。两者在本仓库都不可照抄——本仓库没有 `.git`（必须用 `libra`），`libra commit` 没有 `-S`，而 `-a` 会把并发节点改动和带外删除一起提交（违反 GC-12 的精确暂存）。计划执行时**以 ER-07 + GC-12 为准**：`libra add <相关路径>` → `libra commit -s -m` →（按上两条做签名预检与提交后 `gpgsig` 校验）。该漂移应作为独立的文档修复项承接（更新 `AGENTS.md` 这两行），不得在计划执行中两套并行。
-8. **ER-08 版本与发布:** 版本权威源是 `Cargo.toml` 的 `version`。发布前先做版本面 parity 预检：`Cargo.toml`、`web/package.json`、`worker/package.json`、`install.sh` 的 `DEFAULT_VERSION`（允许 `v` 前缀差异）必须一致；**不一致时先建立修复卡对齐，禁止直接 bump**。对齐后按任务卡的 `Version increment` 递增并同步全部四处，其余步骤与顺序按 ER-04 的「发布收口门」执行（bump 后必须重跑三门），并记录安装/发布证据。开工时须重新核对版本面文件数量是否仍为四处。
+8. **ER-08 版本与发布:** 版本权威源是 `Cargo.toml` 的 `version`。发布前先做版本面 parity 预检：`Cargo.toml`、`web/package.json`、`worker/package.json`、`install.sh` 的 `DEFAULT_VERSION`、`install.ps1` 的 `$DefaultVersion`（后两者允许 `v` 前缀差异）必须一致；**不一致时先建立修复卡对齐，禁止直接 bump**。对齐后按任务卡的 `Version increment` 递增并同步全部五处，其余步骤与顺序按 ER-04 的「发布收口门」执行（bump 后必须重跑三门），并记录安装/发布证据。开工时须重新核对版本面文件数量是否仍为五处（2026-08-05 起为五处——`install.ps1` 由 `tests/compat/version_surface_sync.rs`（target `compat_version_surface_sync`）纳入强制相等；该守卫是版本面集合的权威）。
    - `Version increment` 取值：`patch`（默认）| `minor` | `major` | `N/A`。
    - 删除公开 surface、破坏兼容的 schema/协议变更必须用 `minor` 或 `major`，且递增级别由 ADR + 兼容窗口证据决定，不得用 patch 夹带；家族卡（G-08）的递增级别写在唯一发布点卡上，子卡为 `N/A`。
    - `docs` / `audit` / `spike` / `handoff` 卡为 `N/A`，但必须说明产物随哪次发布进入用户渠道。
@@ -359,7 +359,7 @@
   - 文档 / 审计 / 索引-only 卡的条目是清单项、不构成独立行为轴，故适用 20 条上限；这类卡仍受 G-01 约束，且必须在任务卡 `Deliverables` 字段登记产物范围（具体文件清单）——这是常规登记，不是例外，无需进 waiver 表。需要突破本表上限时，只能在 waiver 白名单登记 `EX-*`（具名审批），不得私自改写分母。
 - **G-04 规模上限（可计数）:** `Estimated scope` 的开工态只允许 `S` 或 `M`。`L`/`XL` 只能作为「必须再拆」的中间标注，计划成稿后不得存在 L/XL 卡。计数**只统计行为实现落点与生产文件**，不统计「随附同步集」：
   - **计入**：承载本卡行为变更的生产代码落点与文件（`src/**`、`sql/migrations/**`、`web/src/**`、`worker/src/**` 等）。
-  - **不计入（随附同步集）**：本卡自己的测试文件、按 GC-05/ER-06 强制同步的文档集（`docs/commands/<cmd>.md` EN+zh、`docs/development/**`、`COMPATIBILITY.md`、`docs/error-codes.md`）、测试索引（`tests/INDEX.md`、`tests/compat/README.md`、`Cargo.toml` 的 `[[test]]`）、以及 ER-08 的版本面四处。这些是每张卡的固定成本，不构成粒度信号；但仍要在写集字段中如实列出（文档/测试进 `Implementation write set`，版本面四处进 `Release write set`）。
+  - **不计入（随附同步集）**：本卡自己的测试文件、按 GC-05/ER-06 强制同步的文档集（`docs/commands/<cmd>.md` EN+zh、`docs/development/**`、`COMPATIBILITY.md`、`docs/error-codes.md`）、测试索引（`tests/INDEX.md`、`tests/compat/README.md`、`Cargo.toml` 的 `[[test]]`）、以及 ER-08 的版本面五处。这些是每张卡的固定成本，不构成粒度信号；但仍要在写集字段中如实列出（文档/测试进 `Implementation write set`，版本面五处进 `Release write set`）。
   - **仓库根文件**（`Cargo.toml`、`install.sh`、`COMPATIBILITY.md` 等）按「单个文件」计，不各占一个落点；若某张卡的行为变更**就发生在**根文件本身（例如改 `build.rs` 逻辑），则该文件计为一个落点。
   - `S`：≤ 2 个行为落点、≤ 3 个生产文件，无 schema / 协议 / 公开接口变更。
   - `M`：≤ 4 个行为落点、≤ 12 个生产文件，最多一处公开行为或接口变化，仍是单一行为轴。
@@ -373,7 +373,7 @@
 - **G-09 拆分协议:** 拆分已被引用的卡时，原编号保留给主轴，新子卡在所属 Phase 末尾追加新编号，不重排既有编号。原卡必须写明「拆出 `<ID>`、`<ID>`」，新卡写明「自 `<ID>` 拆出」，并同步实施顺序、依赖登记表、「发布分组与并发窗口」、追溯表、测试矩阵、里程碑、风险表，以及「修订历史」中的一行（日期、原因、原卡、新卡、受影响引用）。
 - **G-10 写集与并发:** 写集分三类，每张卡必须声明前两类（第三类由 ER-12 统一定义，卡内不重复）：
   - **`Implementation write set`（I）**：承载本卡行为的代码、测试、文档文件。
-  - **`Release write set`（R）**：ER-08 的版本面四处、`Cargo.lock`、release artifact。对所有发布卡相同；`family child` 与 `no-release` 卡写 `N/A`（它们不 bump、不构建、不推送）；`batch-release child` 同样写 `N/A`（它推送，但不 bump、不构建、不产 artifact——版本面归其批量发布组的唯一发布点）。
+  - **`Release write set`（R）**：ER-08 的版本面五处、`Cargo.lock`、release artifact。对所有发布卡相同；`family child` 与 `no-release` 卡写 `N/A`（它们不 bump、不构建、不推送）；`batch-release child` 同样写 `N/A`（它推送，但不 bump、不构建、不产 artifact——版本面归其批量发布组的唯一发布点）。
   - **协调写集（C）**：计划级的发布顺序与窗口记录（「发布分组与并发窗口」的发布者、发布顺序、`REL-*` 登记）。由 ER-12 的单一发布者串行维护，**不计入**任何卡的 I 或 R，也不参与并发判定。
 
   冲突规则：
@@ -512,7 +512,7 @@
 
 **Implementation write set:** `<承载本卡行为的代码/测试/文档文件或目录。并发判定只看这一项：与并发在跑的卡不得相交，相交时只能补顺序边或合并到唯一集成卡>`（G-10）
 
-**Release write set:** `<Inherited（= ER-08 版本面四处 + `Cargo.lock` + release artifact）/ N/A（family child / no-release 卡）>`（不用于实现阶段并发分组；进入发布窗口后按 G-10 的 I–R / R–R 规则串行化）
+**Release write set:** `<Inherited（= ER-08 版本面五处 + `Cargo.lock` + release artifact）/ N/A（family child / no-release 卡）>`（不用于实现阶段并发分组；进入发布窗口后按 G-10 的 I–R / R–R 规则串行化）
 
 **Files likely touched:** `<src/...>, <tests/...>, <docs/...>`（估计值；并发判定以 `Implementation write set` 为准）
 
@@ -617,6 +617,6 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [ ] 必要的 docs/compat/error-code/test-index 更新已完成。
 - [ ] 必要的 migration、rollback、failure-recovery 验证已完成；每张卡的 `Rollback mode` 都已被实际验证或记录为不可验证的原因。
 - [ ] Codex review 最终结论为 `PASS`，P0/P1 全部关闭；仅 P2 residual risk 允许保留，且有具名接受人。
-- [ ] 如有发布要求，版本面四处一致、构建、安装、提交、推送和发布证据已完成（ER-08）。
+- [ ] 如有发布要求，版本面五处一致、构建、安装、提交、推送和发布证据已完成（ER-08）。
 - [ ] 「修订历史」已记录成稿后的全部规范性变更（G-09）。
 - [ ] `plan-long.md` 相关状态或日期计划索引已同步，或明确 `N/A`。
