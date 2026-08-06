@@ -135,6 +135,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "quote_path_always_escapes_control_bytes",
     "quote_path_always_escapes_tab",
     "quote_path_escape_matrix_and_cascade",
+    "racily_clean_entry_is_content_compared_not_trusted",
     "raw_base64_encodes_platform_native_units",
     "ref_with_mismatched_hash_kind_fails_closed",
     "rename_config_cli_find_renames_overrides_false",

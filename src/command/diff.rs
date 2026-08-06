@@ -2897,11 +2897,19 @@ fn get_files_blobs(
     index: &Index,
     policy: IgnorePolicy,
 ) -> Result<Vec<(PathBuf, ObjectHash)>, DiffError> {
+    // ONE index snapshot timestamp for the whole batch: per-candidate
+    // re-stats were O(files) syscalls and could evaluate one loaded Index
+    // against different mtimes during a concurrent rewrite (2026-08-06
+    // R0-8 review).
+    let index_file_mtime = crate::utils::path::try_index()
+        .ok()
+        .and_then(|index_path| std::fs::metadata(index_path).ok())
+        .and_then(|meta| meta.modified().ok());
     files
         .iter()
         .filter(|path| !ignore::should_ignore(path, policy, index))
         .map(|p| {
-            if let Some(hash) = index_hash_if_worktree_stat_matches(p, index) {
+            if let Some(hash) = index_hash_if_worktree_stat_matches(p, index, index_file_mtime) {
                 return Ok((p.to_owned(), hash));
             }
             let path = util::workdir_to_absolute(p);
@@ -2914,14 +2922,22 @@ fn get_files_blobs(
         .collect()
 }
 
-fn index_hash_if_worktree_stat_matches(path: &Path, index: &Index) -> Option<ObjectHash> {
+fn index_hash_if_worktree_stat_matches(
+    path: &Path,
+    index: &Index,
+    index_file_mtime: Option<std::time::SystemTime>,
+) -> Option<ObjectHash> {
     let entry = index.get(path.to_str()?, 0)?;
     let absolute = util::workdir_to_absolute(path);
     let metadata = std::fs::symlink_metadata(&absolute).ok()?;
-    index_entry_matches_worktree_stat(entry, &metadata).then_some(entry.hash)
+    index_entry_matches_worktree_stat(entry, &metadata, index_file_mtime).then_some(entry.hash)
 }
 
-fn index_entry_matches_worktree_stat(entry: &IndexEntry, metadata: &std::fs::Metadata) -> bool {
+fn index_entry_matches_worktree_stat(
+    entry: &IndexEntry,
+    metadata: &std::fs::Metadata,
+    index_file_mtime: Option<std::time::SystemTime>,
+) -> bool {
     let Ok(size) = u32::try_from(metadata.len()) else {
         return false;
     };
@@ -2936,6 +2952,12 @@ fn index_entry_matches_worktree_stat(entry: &IndexEntry, metadata: &std::fs::Met
         && entry.uid == index_uid_from_metadata(metadata)
         && entry.gid == index_gid_from_metadata(metadata)
         && entry.mode == index_mode_from_metadata(metadata)
+        // Racily-clean guard (Git parity): the shortcut is only earned by
+        // files strictly OLDER than the index snapshot — an entry written
+        // in the same instant the file changed can pair a post-edit stat
+        // with a pre-edit hash (2026-08-06 R0-8 review; same guard as
+        // status's index_stat_differs).
+        && index_file_mtime.is_some_and(|snapshot| index_mtime(metadata) < snapshot)
 }
 
 #[cfg(unix)]
@@ -7492,11 +7514,26 @@ mod test {
         let worktree_hash = calculate_object_hash(ObjectType::Blob, &worktree_content);
         assert_ne!(indexed_hash, worktree_hash);
 
+        // The racily-clean guard only trusts the shortcut for files
+        // strictly OLDER than the on-disk index snapshot (2026-08-06
+        // R0-8 review): rewind the file's mtime, build the entry from
+        // the rewound stat, THEN persist the index so its snapshot
+        // timestamp is later than the file.
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("tracked.txt")
+            .unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(earlier))
+            .unwrap();
+        drop(file);
+
         let mut index = Index::new();
         index.add(
             IndexEntry::new_from_file(Path::new("tracked.txt"), indexed_hash, temp_path.path())
                 .unwrap(),
         );
+        index.save(crate::utils::path::index()).unwrap();
 
         let blobs = get_files_blobs(
             &[PathBuf::from("tracked.txt")],

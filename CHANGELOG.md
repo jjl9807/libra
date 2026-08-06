@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 R0-8 cross-review, 2026-08-06)
+
+- **The racy-index window can no longer make `status` fabricate "clean" for
+  a modified file.** Every index writer used to stat the file only AFTER
+  reading and hashing it, so an edit landing in that window paired a
+  post-edit stat with a pre-edit hash — plain `status` then trusted the
+  stat shortcut and hid the modification (observed in this repository with
+  a concurrently-edited CHANGELOG.md; `commit` would also have built a
+  stale tree from the poisoned entry). Three layers now close it:
+  1. writers stat BEFORE reading and a shared `verified_index_entry`
+     helper smudges the entry (zeroed volatile stats → always
+     content-compared) whenever the pre/post stats disagree — applied to
+     `add` (new/modified/renormalize), `commit` auto-stage,
+     `update-index`, and `mv`;
+  2. `am`'s mode restage, `add --chmod`, and `stash` restore, which pair
+     an inherited hash with a fresh stat without reading content, now
+     always smudge;
+  3. `status` and `diff` additionally trust a matching stat only for
+     files strictly OLDER than the index snapshot itself (Git's
+     racily-clean rule), and `status` uses the same guarded size
+     comparison as `diff` (a >4GiB stat can no longer collide with a
+     truncated 32-bit size).
+  Pinned by `racy_edit_between_read_and_stat_smudges_the_entry` and
+  `racily_clean_entry_is_content_compared_not_trusted`; `diff` also stats
+  the index snapshot once per batch instead of once per candidate.
+
 ### Changed (plan-20260714 R0-7 cross-review, 2026-08-06)
 
 - **The status warning enums are now self-registering.** `StatusWarningCode`

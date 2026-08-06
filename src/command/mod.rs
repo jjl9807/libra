@@ -309,6 +309,91 @@ pub(crate) fn read_symlink_blob_bytes(path: &Path) -> io::Result<Vec<u8>> {
     Ok(symlink_target_blob_bytes(&fs::read_link(path)?))
 }
 
+/// Build an index entry whose recorded stat PROVABLY describes the hashed
+/// content. The caller stats the file BEFORE reading/hashing it; this
+/// helper re-stats after (via `new_from_file`) and, when the two disagree
+/// — the racy window where an edit landed between the content read and
+/// the stat — zeroes the volatile stat fields so every later `status`
+/// content-compares the entry instead of trusting a post-edit stat paired
+/// with a pre-edit hash. The index writers previously statted only AFTER
+/// hashing, which produced exactly that poisoned pairing (2026-08-06
+/// R0-8 review: plain status hid a concurrently-edited file, and a
+/// non-`-a` commit would have built a stale tree from it).
+pub(crate) fn verified_index_entry(
+    name: &Path,
+    hash: ObjectHash,
+    workdir: &Path,
+    pre_read: Option<&fs::Metadata>,
+) -> io::Result<git_internal::internal::index::IndexEntry> {
+    use git_internal::internal::index::Time;
+
+    let mut entry = git_internal::internal::index::IndexEntry::new_from_file(name, hash, workdir)?;
+    // No pre-read stat means no proof — smudge.
+    if !pre_read.is_some_and(|pre_read| entry_stat_matches_metadata(&entry, pre_read)) {
+        entry.ctime = Time::from_system_time(std::time::UNIX_EPOCH);
+        entry.mtime = Time::from_system_time(std::time::UNIX_EPOCH);
+        entry.dev = 0;
+        entry.ino = 0;
+        entry.uid = 0;
+        entry.gid = 0;
+    }
+    Ok(entry)
+}
+
+/// Whether an entry's volatile stat triple equals `metadata`'s. Mirrors
+/// the comparison `status` performs (`index_stat_differs`), so a pairing
+/// this returns `true` for is exactly one status would trust.
+fn entry_stat_matches_metadata(
+    entry: &git_internal::internal::index::IndexEntry,
+    metadata: &fs::Metadata,
+) -> bool {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use git_internal::internal::index::Time;
+
+    #[cfg(unix)]
+    fn stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
+        use std::os::unix::fs::MetadataExt;
+
+        fn at(seconds: i64, nanos: i64) -> SystemTime {
+            if seconds < 0 {
+                return UNIX_EPOCH;
+            }
+            let nanos = u32::try_from(nanos)
+                .ok()
+                .filter(|nanos| *nanos < 1_000_000_000)
+                .unwrap_or(0);
+            UNIX_EPOCH + Duration::new(seconds as u64, nanos)
+        }
+        (
+            at(metadata.ctime(), metadata.ctime_nsec()),
+            at(metadata.mtime(), metadata.mtime_nsec()),
+        )
+    }
+    #[cfg(not(unix))]
+    fn stat_times(metadata: &fs::Metadata) -> (SystemTime, SystemTime) {
+        let _ = Duration::from_secs(0);
+        (
+            metadata
+                .created()
+                .or_else(|_| metadata.modified())
+                .unwrap_or(UNIX_EPOCH),
+            metadata
+                .modified()
+                .or_else(|_| metadata.created())
+                .unwrap_or(UNIX_EPOCH),
+        )
+    }
+
+    let Ok(size) = u32::try_from(metadata.len()) else {
+        return false;
+    };
+    let (ctime, mtime) = stat_times(metadata);
+    entry.size == size
+        && entry.ctime == Time::from_system_time(ctime)
+        && entry.mtime == Time::from_system_time(mtime)
+}
+
 #[cfg(unix)]
 pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -494,5 +579,50 @@ mod tests {
             let (msg_, _) = parse_commit_msg(&msg_gpg);
             assert_eq!(msg, msg_);
         }
+    }
+}
+
+#[cfg(test)]
+mod verified_entry_tests {
+    use std::path::Path;
+
+    use git_internal::internal::index::Time;
+
+    use super::verified_index_entry;
+
+    /// 2026-08-06 R0-8 review: an edit landing between the pre-read stat
+    /// and the post-hash stat smudges the entry (zeroed volatile stats →
+    /// every later status content-compares it); an un-raced entry keeps
+    /// its verified stat; no pre-read stat never earns trust.
+    #[test]
+    fn racy_edit_between_read_and_stat_smudges_the_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zero = Time::from_system_time(std::time::UNIX_EPOCH);
+
+        let file = dir.path().join("racy.txt");
+        std::fs::write(&file, "original").unwrap();
+        let pre = std::fs::symlink_metadata(&file).unwrap();
+        // (the content would be hashed here) — then the racy edit lands:
+        std::fs::write(&file, "edited, longer than before").unwrap();
+        let hash = git_internal::internal::object::blob::Blob::from_content("original").id;
+        let entry = verified_index_entry(Path::new("racy.txt"), hash, dir.path(), Some(&pre))
+            .expect("entry");
+        assert_eq!(
+            entry.mtime, zero,
+            "smudged: the stat must not describe content the hash is not"
+        );
+        assert_eq!(entry.ctime, zero);
+
+        let calm = dir.path().join("calm.txt");
+        std::fs::write(&calm, "steady").unwrap();
+        let pre = std::fs::symlink_metadata(&calm).unwrap();
+        let hash = git_internal::internal::object::blob::Blob::from_content("steady").id;
+        let entry = verified_index_entry(Path::new("calm.txt"), hash, dir.path(), Some(&pre))
+            .expect("entry");
+        assert_ne!(entry.mtime, zero, "an un-raced entry keeps its real stat");
+
+        let entry =
+            verified_index_entry(Path::new("calm.txt"), hash, dir.path(), None).expect("entry");
+        assert_eq!(entry.mtime, zero, "no pre-read stat never earns trust");
     }
 }

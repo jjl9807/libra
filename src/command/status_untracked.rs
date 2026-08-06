@@ -76,8 +76,18 @@ pub(crate) fn collect_status_worktree_changes(
     })?;
     let tracked = TrackedPaths::from_index(&index, ignore_case);
     let mut io_blocked: Vec<crate::command::status_probe::IoBlockedEvent> = Vec::new();
-    let mut unstaged =
-        collect_tracked_worktree_changes(&workdir, &index, tracked.files(), &mut io_blocked)?;
+    // The index file's own mtime anchors the racily-clean guard: a stat
+    // triple is only trusted for files strictly older than this snapshot.
+    let index_file_mtime = std::fs::metadata(&index_path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let mut unstaged = collect_tracked_worktree_changes(
+        &workdir,
+        &index,
+        tracked.files(),
+        &mut io_blocked,
+        index_file_mtime,
+    )?;
     let mut ignored_files = Vec::new();
 
     if !matches!(untracked_mode, UntrackedFiles::No) {
@@ -142,7 +152,12 @@ fn path_to_current_preserving_directory_marker(path: PathBuf) -> PathBuf {
 /// (the `ctime`/`mtime`/`size` triple `Index::is_modified` compares). A path
 /// missing from the index counts as differing so the caller falls through to
 /// the content hash rather than assuming "clean".
-fn index_stat_differs(index: &Index, file: &str, metadata: &std::fs::Metadata) -> bool {
+fn index_stat_differs(
+    index: &Index,
+    file: &str,
+    metadata: &std::fs::Metadata,
+    index_file_mtime: Option<std::time::SystemTime>,
+) -> bool {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use git_internal::internal::index::Time;
@@ -187,11 +202,33 @@ fn index_stat_differs(index: &Index, file: &str, metadata: &std::fs::Metadata) -
     let Some(entry) = index.get(file, 0) else {
         return true;
     };
+    let Ok(stat_size) = u32::try_from(metadata.len()) else {
+        // A >4GiB stat size cannot be represented in the entry; the old
+        // truncating cast could collide with a smaller recorded size —
+        // always content-compare instead (2026-08-06 R0-8 review, the
+        // guarded comparison diff already used).
+        return true;
+    };
     let (ctime, mtime) = stat_times(metadata);
     let same = entry.ctime == Time::from_system_time(ctime)
         && entry.mtime == Time::from_system_time(mtime)
-        && entry.size == metadata.len() as u32;
-    !same
+        && entry.size == stat_size;
+    if same {
+        // Racily-clean guard (Git parity, §B.6.0.1): a matching stat
+        // triple is trustworthy only when the file is strictly OLDER than
+        // the index snapshot itself. An entry written in the same instant
+        // the file changed can pair a post-edit stat with a pre-edit hash
+        // — the 2026-08-06 incident where plain status hid a modified
+        // CHANGELOG.md that diff's stricter shortcut still caught (the
+        // index writers stat AFTER hashing, and a concurrent node shares
+        // this worktree). In the match branch entry.mtime equals the
+        // worktree mtime, so the ordering runs on the worktree SystemTime
+        // (finer precision, conservative direction). An unknown index
+        // mtime never earns trust.
+        let trustworthy = index_file_mtime.is_some_and(|snapshot| mtime < snapshot);
+        return !trustworthy;
+    }
+    true
 }
 
 fn collect_tracked_worktree_changes(
@@ -199,6 +236,7 @@ fn collect_tracked_worktree_changes(
     index: &Index,
     tracked_files: &[PathBuf],
     io_blocked: &mut Vec<crate::command::status_probe::IoBlockedEvent>,
+    index_file_mtime: Option<std::time::SystemTime>,
 ) -> Result<Changes, StatusError> {
     let mut changes = Changes::default();
     for file in tracked_files {
@@ -257,7 +295,7 @@ fn collect_tracked_worktree_changes(
         // result: a path deleted or made unreadable between the two stats
         // would panic the whole command instead of degrading to an
         // `io_blocked[]` partial. Same fields, one stat, no panic.
-        if index_stat_differs(index, file_str, &metadata) {
+        if index_stat_differs(index, file_str, &metadata, index_file_mtime) {
             let hash_path = file_abs.clone();
             let hashed = match crate::command::status_probe::with_io_deadline(move || {
                 calc_file_blob_hash(&hash_path)

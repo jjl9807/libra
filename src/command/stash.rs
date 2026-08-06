@@ -15,7 +15,7 @@ use git_internal::{
     errors::GitError,
     hash::ObjectHash,
     internal::{
-        index::{Index, IndexEntry, Time},
+        index::{Index, Time},
         object::{
             ObjectTrait,
             blob::Blob,
@@ -918,12 +918,17 @@ fn reset_pathspec_to_head(
                     let perm = std::fs::Permissions::from_mode(tree_mode_to_unix_perm(entry.mode));
                     let _ = fs::set_permissions(&full, perm);
                 }
-                // Pass the repo-relative path: `new_from_file` records its first
-                // argument verbatim as the index entry name (and joins it onto
-                // `workdir` for the stat), so an absolute path would corrupt the
-                // index. It reads metadata from `workdir.join(rel)`.
-                let mut new_entry = IndexEntry::new_from_file(&rel, entry.hash, workdir)
-                    .map_err(|e| StashError::IndexSave(e.to_string()))?;
+                // Pass the repo-relative path: the entry name is recorded
+                // verbatim (an absolute path would corrupt the index). The
+                // entry is smudged unconditionally (`pre_read = None`): the
+                // blob was JUST written from the object store, but a
+                // concurrent edit between that write and the stat would
+                // pair the old hash with a post-edit stat — zeroed stats
+                // make the next status content-compare instead (2026-08-06
+                // R0-8 review).
+                let mut new_entry =
+                    crate::command::verified_index_entry(&rel, entry.hash, workdir, None)
+                        .map_err(|e| StashError::IndexSave(e.to_string()))?;
                 // Preserve HEAD's recorded file mode (e.g. the executable bit),
                 // which a plain `new_from_file` would re-derive from disk.
                 new_entry.mode = match entry.mode {

@@ -2430,6 +2430,58 @@ fn short_rename_keeps_staged_source_component() {
     );
 }
 
+/// §B.6.0.1 racily-clean guard (Git parity; 2026-08-06 R0-8 review): an
+/// index entry whose stat triple MATCHES the worktree but whose file is
+/// not strictly older than the index snapshot must be content-compared.
+/// The index writers stat AFTER hashing, so an edit landing in that
+/// window pairs a post-edit stat with a pre-edit hash — plain status then
+/// fabricated "clean" for a modified file (the observed CHANGELOG.md
+/// incident) while diff's stricter shortcut still caught it.
+#[test]
+#[serial]
+fn racily_clean_entry_is_content_compared_not_trusted() {
+    let repo = create_repo_with_committed_file("base.txt", "base\n");
+    let _guard = ChangeDirGuard::new(repo.path());
+
+    // The worktree file holds the EDITED content...
+    fs::write(repo.path().join("racy.txt"), "edited content\n").unwrap();
+    // ...but the entry records the PRE-edit blob paired with the CURRENT
+    // (post-edit) stat — exactly the poisoned pairing the race produces
+    // (`new_from_file` is the vulnerable stat-after-hash constructor).
+    let (stale_hash, _) = write_blob_to_repo("original content\n");
+    let mut index = Index::new();
+    let entry = IndexEntry::new_from_file(Path::new("racy.txt"), stale_hash, repo.path())
+        .expect("build the poisoned entry");
+    index.add(entry);
+    index.save(path::index()).expect("write the index");
+
+    // Deterministically place the file INSIDE the racy window: rewind the
+    // INDEX FILE's mtime to the worktree file's own mtime, so the file is
+    // not strictly older than the snapshot (equal counts as racy).
+    let file_mtime = fs::metadata(repo.path().join("racy.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let index_file = fs::OpenOptions::new()
+        .write(true)
+        .open(path::index())
+        .expect("open index for time rewind");
+    index_file
+        .set_times(fs::FileTimes::new().set_modified(file_mtime))
+        .expect("rewind index mtime");
+    drop(index_file);
+
+    let out = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&out, "status with a racily-clean entry");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("racy.txt") && line.contains('M')),
+        "the poisoned stat triple is not trusted — content comparison \
+         reports the modification: {text}"
+    );
+}
+
 /// §B.6.4: an unresolved conflict must never pair as a staged-rename
 /// SOURCE, even when a same-content staged addition exists — the
 /// stage-0-less index classifies the conflict as staged-deleted, and

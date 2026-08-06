@@ -10,10 +10,7 @@ use std::{collections::HashSet, fs, str::FromStr};
 use clap::Parser;
 use git_internal::{
     hash::ObjectHash,
-    internal::{
-        index::{Index, IndexEntry},
-        object::commit::Commit,
-    },
+    internal::{index::Index, object::commit::Commit},
 };
 use serde::{Deserialize, Serialize};
 
@@ -922,8 +919,17 @@ fn stage_mode_overrides(overrides: &[(String, u32)]) -> CliResult<()> {
         if current_mode == wanted {
             continue;
         }
-        let mut updated = IndexEntry::new_from_file(std::path::Path::new(target), hash, &workdir)
-            .map_err(|error| {
+        // No content read happens here (the hash is inherited), so the
+        // fresh stat cannot be verified against it — pass no pre-read
+        // stat and let the entry smudge to a content-compare-next-status
+        // shape (2026-08-06 R0-8 review).
+        let mut updated = crate::command::verified_index_entry(
+            std::path::Path::new(target),
+            hash,
+            &workdir,
+            None,
+        )
+        .map_err(|error| {
             am_state_error(format!(
                 "failed to restage mode for am target '{target}': {error}"
             ))

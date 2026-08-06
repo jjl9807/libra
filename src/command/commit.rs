@@ -12,7 +12,7 @@ use clap::Parser;
 use git_internal::{
     hash::{ObjectHash, get_hash_kind},
     internal::{
-        index::{Index, IndexEntry},
+        index::Index,
         object::{
             ObjectTrait,
             blob::Blob,
@@ -2622,7 +2622,10 @@ fn auto_stage_tracked_changes(
                 });
             }
         }
-        // Refresh blob IDs for modified tracked files before updating the index
+        // Refresh blob IDs for modified tracked files before updating the index.
+        // Stat BEFORE reading: the entry's stat must describe the hashed
+        // content, or it is smudged (2026-08-06 R0-8 review).
+        let pre_read = std::fs::symlink_metadata(&abs).ok();
         let blob = if cache_preview_objects {
             read_and_cache_preview_blob(&abs)?
         } else {
@@ -2638,9 +2641,10 @@ fn auto_stage_tracked_changes(
             })?;
         }
         index.update(
-            IndexEntry::new_from_file(&file, blob.id, &workdir).map_err(|e| {
-                CommitError::AutoStage(format!("failed to create index entry: {}", e))
-            })?,
+            crate::command::verified_index_entry(&file, blob.id, &workdir, pre_read.as_ref())
+                .map_err(|e| {
+                    CommitError::AutoStage(format!("failed to create index entry: {}", e))
+                })?,
         );
         touched = true;
     }
