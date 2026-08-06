@@ -384,16 +384,41 @@ fn diff_docs_and_changelog_carry_the_degradation_semantics() {
         "zh budgets section must distinguish the limit from the budget on \
          unique-basename survival: {zh_budgets}"
     );
-    for needle in ["diff.renameLimit", "diff.renameComparisonBudget"] {
+    // Scope the CHANGELOG assertions to the R0-9 release note itself — the
+    // file mentions renameLimit/unique-basename in unrelated releases, so a
+    // whole-file `contains` would stay green even if THIS note regressed.
+    let note_start = changelog
+        .find("Rename-degradation semantics are now spelled out")
+        .expect("CHANGELOG must keep the R0-9 rename-degradation release note");
+    let note_tail = &changelog[note_start..];
+    let note_end = ["\n- **", "\n### ", "\n## "]
+        .iter()
+        .filter_map(|stop| note_tail.find(stop))
+        .min()
+        .unwrap_or(note_tail.len());
+    // Flatten hard line wraps so phrase pins are independent of reflow.
+    let note = note_tail[..note_end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "diff.renameLimit",
+        "diff.renameComparisonBudget",
+        "rename_limit_product_skipped",
+        "similarity_budget_exceeded",
+        // limit degradation: exact + unique-basename survive, exhaustive skipped
+        "exact renames AND unique-basename renames are still reported",
+        "only the exhaustive inexact stage is skipped",
+        // budget degradation: wholesale discard, only already-scored pairs kept
+        "discarded wholesale",
+        "only pairs already scored",
+        "exact plus the unique-basename pairs",
+    ] {
         assert!(
-            changelog.contains(needle),
-            "CHANGELOG must release-note {needle}"
+            note.contains(needle),
+            "the R0-9 CHANGELOG release note must keep the claim {needle:?}: {note}"
         );
     }
-    assert!(
-        changelog.contains("unique-basename"),
-        "CHANGELOG must state WHAT survives a degraded rename pass"
-    );
 
     // The degradation semantics must match the engine: the unique-basename
     // stage runs BEFORE the renameLimit gate, so exceeding the limit keeps
@@ -431,6 +456,74 @@ fn diff_docs_and_changelog_carry_the_degradation_semantics() {
         "the two claims must live in DIFFERENT rows; if they resolve to the \
          same line this guard is not actually checking both surfaces"
     );
+}
+
+/// The Meaning cell (third column) of the warning-table row for `code`.
+/// Asserting on the whole row would be vacuous for some needles — e.g.
+/// "skipped" occurs inside the code `rename_limit_product_skipped` itself —
+/// so the semantic pins below must see ONLY the Meaning cell.
+fn warning_meaning(doc: &str, code: &str) -> String {
+    let marker = format!("| `{code}` |");
+    let row = doc
+        .lines()
+        .find(|line| line.starts_with(marker.as_str()))
+        .unwrap_or_else(|| panic!("status doc must keep a warning-table row for {code}"));
+    let cells: Vec<&str> = row.trim_matches('|').split('|').collect();
+    assert_eq!(
+        cells.len(),
+        3,
+        "warning-table row for {code} must have exactly code/source/meaning cells: {row}"
+    );
+    cells[2].trim().to_string()
+}
+
+/// The Meaning cells of the two degradation warnings carry the survivor
+/// semantics (what a degraded pass KEEPS vs discards). The code→source
+/// coverage test above cannot see those cells, so pin them per row here —
+/// in both languages, since either translation could regress alone.
+#[test]
+fn status_docs_pin_survivor_semantics_in_warning_meaning_cells() {
+    let en = read("docs/commands/status.md");
+    let zh = read("docs/commands/zh-CN/status.md");
+
+    // Budget exhaustion discards ONLY the exhaustive pass; exact and
+    // already-scored unique-basename pairs survive.
+    let en_cell = warning_meaning(&en, "similarity_budget_exceeded");
+    for needle in [
+        "exhaustive",
+        "discarded",
+        "exact",
+        "already-scored unique-basename",
+        "kept",
+    ] {
+        assert!(
+            en_cell.contains(needle),
+            "EN similarity_budget_exceeded Meaning cell must keep {needle:?}: {en_cell}"
+        );
+    }
+    let zh_cell = warning_meaning(&zh, "similarity_budget_exceeded");
+    for needle in ["穷举", "丢弃", "exact", "已评分的 unique-basename", "保留"] {
+        assert!(
+            zh_cell.contains(needle),
+            "zh similarity_budget_exceeded Meaning cell must keep {needle:?}: {zh_cell}"
+        );
+    }
+
+    // Limit excess merely SKIPS the exhaustive stage (nothing scored is lost).
+    let en_cell = warning_meaning(&en, "rename_limit_product_skipped");
+    for needle in ["exhaustive", "skipped"] {
+        assert!(
+            en_cell.contains(needle),
+            "EN rename_limit_product_skipped Meaning cell must keep {needle:?}: {en_cell}"
+        );
+    }
+    let zh_cell = warning_meaning(&zh, "rename_limit_product_skipped");
+    for needle in ["exhaustive", "跳过"] {
+        assert!(
+            zh_cell.contains(needle),
+            "zh rename_limit_product_skipped Meaning cell must keep {needle:?}: {zh_cell}"
+        );
+    }
 }
 
 /// The single `COMPATIBILITY.md` table row containing `needle`. Rows are one
