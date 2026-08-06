@@ -1738,13 +1738,25 @@ fn command_scope(command: &Commands) -> CommandScope {
         // identity, so it must never be gated behind a healthy one.
         Commands::Worktree(args) => match &args.command {
             command::worktree::WorktreeSubcommand::List { .. } => ReadOnly,
-            // `doctor` is STRICTLY read-only (§C.11 W0, Codex R15/R16):
-            // the repository — database, registry, lease state and
-            // FILESYSTEM — must be unchanged across a default invocation.
-            // Classifying it as a writer made the generic shared hold create
-            // `.libra/maintenance.lock`, which is a filesystem change, in the
-            // one command whose contract forbids any.
-            command::worktree::WorktreeSubcommand::Doctor { .. } => ReadOnly,
+            // `doctor` without a mutating flag is STRICTLY read-only (§C.11
+            // W0, Codex R15/R16): the repository — database, registry, lease
+            // state and FILESYSTEM — must be unchanged across a default
+            // invocation. Classifying it as a writer made the generic shared
+            // hold create `.libra/maintenance.lock`, which is a filesystem
+            // change, in the one command whose contract forbids any.
+            command::worktree::WorktreeSubcommand::Doctor {
+                adopt_capture_session: None,
+                adopt_info_to: None,
+                clear_common_info: false,
+                ..
+            } => ReadOnly,
+            // An UNCONFIRMED mutating doctor action is refused before any
+            // side effect (same contract as unconfirmed repair below).
+            command::worktree::WorktreeSubcommand::Doctor { confirm: false, .. } => ReadOnly,
+            // A CONFIRMED doctor mutation (capture-scope adoption, info-file
+            // adoption/clearing) writes — it takes the writer path like any
+            // other mutating repair action.
+            command::worktree::WorktreeSubcommand::Doctor { .. } => Repository,
             // The `--migrate-layout --dry-run` preview publishes nothing
             // (§C.11 W0, Codex R21): it is documented as read-only end to
             // end, so it must not take the shared maintenance hold either —

@@ -971,7 +971,8 @@ fn build_plan_text(explanation: Option<&String>, plan_steps: &[TurnPlanStep]) ->
 /// 为 Codex 代理初始化 MCP（Model Context Protocol）服务器实例。
 ///
 /// 初始化流程：
-/// 1. 通过 `try_get_storage_path` 定位 `.libra/` 目录（若失败则退回到 `{cwd}/.libra/`）；
+/// 1. 通过 `try_get_storage_path` 定位 `.libra/` 目录（失败时**不**退回
+///    `{cwd}/.libra/`——那会铸造第二个幻影仓库，见 Part C §C.4.1——而是以只读模式运行）；
 /// 2. 创建 `.libra/objects/` 目录（若创建失败则以只读模式运行）；
 /// 3. 建立 SQLite 数据库连接（`libra.db`）（若失败则以只读模式运行）；
 /// 4. 初始化 `LocalStorage`（content-addressable 对象存储）；
@@ -981,7 +982,9 @@ fn build_plan_text(explanation: Option<&String>, plan_steps: &[TurnPlanStep]) ->
 /// Initialises the `LibraMcpServer` used by the Codex agent for data persistence.
 ///
 /// The function:
-/// 1. Resolves the `.libra/` storage directory via `try_get_storage_path`.
+/// 1. Resolves the `.libra/` storage directory via `try_get_storage_path`
+///    (on failure it degrades to the read-only server — never to
+///    `{cwd}/.libra`, which would mint a phantom repository; Part C §C.4.1).
 /// 2. Creates the `objects/` sub-directory (falls back to read-only on failure).
 /// 3. Establishes a SQLite connection to `libra.db` (falls back to read-only).
 /// 4. Sets up `LocalStorage` (content-addressable object store).

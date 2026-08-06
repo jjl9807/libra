@@ -236,7 +236,9 @@ libra --json worktree repair --confirm ../experiment
 | `--limit <n>` | 每页最多返回的诊断条数。默认 50，上限 500。 |
 | `--cursor <cursor>` | 从上一页继续：原样回传 `next_cursor` 的值。cursor 是 opaque 的；非本命令签发的 cursor 会以 `LBR-WORKTREE-001` 拒绝，而不是悄悄从第一页重来。 |
 | `--adopt-capture-session <session-id>` | 明确归属一个 `legacy_unknown` 的历史 capture session。必须同时给出 `<workspace-id>` 和 `--confirm`，不能和 `--limit`/`--cursor` 组合。它是单独的变更操作；不带该选项的 doctor 始终只读。 |
-| `--confirm` | 确认 capture scope 归属变更；只允许与 `--adopt-capture-session` 一起使用。 |
+| `--adopt-info-to <worktree-path>` | W0 §C.4.1.1：把仓库共享存储（main 的 `.libra/info/*`）中的 `info/exclude`/`info/attributes` 显式复制进**一个** linked worktree 自己的 gitdir——绝不自动、绝不覆盖已存在的目标文件。需要 `--confirm`。 |
+| `--clear-common-info` | 删除共享存储中的 `.libra/info/exclude` 与 `info/attributes`（这些规则自 W0 起只作用于 main worktree；显式清除表示它们不应再作用于任何地方）。需要 `--confirm`。 |
+| `--confirm` | 确认一项 doctor 变更操作（capture 归属、info 文件 adopt/clear）。 |
 
 每条诊断报告该 workspace 的身份（`workspace_id`、`repo_id`、`path`、`worktree_id`）、`lease_state`（`none`/`held`/`expired`），以及 `scope_diagnostics` 发现列表。每项发现带稳定的 `code` 与 `severity`（`warning` 或 `error`）：
 
@@ -278,6 +280,28 @@ session 的全部 legacy capture 行（session、export job、import identity）
 `worktree.doctor.adopt_capture` envelope；只读 `worktree.doctor` 的分页 schema
 不变。通常传入 catalog session id；若 export/import 行在 catalog session 已
 清理后仍保留，则传入 provider session id 以恢复该 orphan 行。
+
+**Legacy 共享 info 文件**（W0 §C.4.1.1）：`info/exclude` 与 `info/attributes`
+改为 worktree 本地后，共享存储（main 的 `.libra/info/*`）中的文件只作用于
+main worktree。存在 linked worktree 时，只读报告会在 main 条目上说明这一点，
+并给出两个显式、需确认的操作（绝不自动复制）：
+
+```bash
+# 把 main 的 info/exclude + info/attributes 复制进一个 linked worktree
+# 自己的 gitdir（已存在的目标文件保留、绝不覆盖）：
+libra worktree doctor --adopt-info-to <worktree-path> --confirm
+
+# 从共享存储删除它们（这些规则不再作用于任何地方）：
+libra worktree doctor --clear-common-info --confirm
+```
+
+两者在任何副作用之前都要求 `--confirm`，并与其它 mutating repair 操作一样
+运行在同一条 operation-log audit 边界内。`--json`/`--machine` 模式下各自使用
+独立 envelope——`worktree.doctor.adopt_info`（`data.target` + `data.report`）
+与 `worktree.doctor.clear_common_info`（`data.report`）——只读
+`worktree.doctor` 分页 schema 保持不变。只读报告的文本条目还会列出每个
+worktree 实际生效的本地 info 来源（如 `.libra/info/exclude`，双布局树还包括
+`.git/info/exclude`）。
 
 ## 常用命令
 

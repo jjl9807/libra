@@ -187,8 +187,30 @@ pub enum WorktreeSubcommand {
             conflicts_with_all = ["limit", "cursor"]
         )]
         adopt_capture_session: Option<String>,
-        /// Confirm a legacy capture-scope adoption.
-        #[clap(long, requires = "adopt_capture_session")]
+        /// Copy the repository's common `info/exclude`/`info/attributes`
+        /// (main's `.libra/info/*`) into ONE linked worktree's local gitdir
+        /// (W0 §C.4.1.1: since info files became worktree-local they apply
+        /// only to main; adoption is explicit and per-worktree, never
+        /// automatic). Requires --confirm.
+        #[clap(
+            long,
+            value_name = "WORKTREE_PATH",
+            conflicts_with_all = ["workspace_id", "limit", "cursor", "adopt_capture_session"]
+        )]
+        adopt_info_to: Option<String>,
+        /// Delete the repository's common `.libra/info/exclude` and
+        /// `info/attributes` (explicit clear for rules that should no longer
+        /// apply anywhere). Requires --confirm.
+        #[clap(
+            long,
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to"
+            ]
+        )]
+        clear_common_info: bool,
+        /// Confirm a mutating doctor action (capture-scope adoption,
+        /// info-file adoption, or common-info clearing).
+        #[clap(long)]
         confirm: bool,
     },
     /// Repair worktree metadata, attempting to recover from inconsistencies.
@@ -720,6 +742,14 @@ pub(crate) struct WorktreeDiagnostic {
     /// still carries. `false` means mutations there are refused until
     /// `worktree repair` restores it.
     pub(crate) identity_registered: bool,
+    /// W0 §C.4.1.1 origin inventory: which worktree-local `info/*` sources
+    /// THIS worktree's ignore/attributes engines read (`info/exclude`,
+    /// `info/attributes` under its own gitdir). Surfaced in the TEXT report
+    /// today; the machine surface joins the W4 pagination extension of the
+    /// frozen `worktree.doctor` envelope (which deliberately carries only
+    /// the workspace half pre-W4). Per-match origin for excludes is
+    /// `check-ignore -v`.
+    pub(crate) info_sources: Vec<String>,
     /// Human-readable findings; empty means nothing to report.
     pub(crate) findings: Vec<String>,
 }
@@ -1161,6 +1191,8 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             limit,
             cursor,
             adopt_capture_session,
+            adopt_info_to,
+            clear_common_info,
             confirm,
         } => {
             if let Some(session_id) = adopt_capture_session {
@@ -1170,6 +1202,42 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                     )
                 })?;
                 adopt_legacy_capture_scope(&workspace_id, &session_id, confirm, output).await
+            } else if let Some(target) = adopt_info_to {
+                // W0 §C.4.1.1: explicit, confirmed, audited — like every
+                // other mutating doctor/repair action.
+                require_repair_confirmation(confirm, "worktree doctor --adopt-info-to")?;
+                let boundary =
+                    begin_repair_operation("worktree doctor --adopt-info-to", Some(&target))
+                        .await?;
+                let result = adopt_common_info_files(&target);
+                let result = finish_repair_operation(boundary, result).await?;
+                if output.is_json() {
+                    // Distinct envelope, like `worktree.doctor.adopt_capture`
+                    // — the read-only `worktree.doctor` page schema stays
+                    // untouched.
+                    return emit_json_data(
+                        "worktree.doctor.adopt_info",
+                        &serde_json::json!({ "target": target, "report": result }),
+                        output,
+                    );
+                }
+                println!("{result}");
+                Ok(())
+            } else if clear_common_info {
+                require_repair_confirmation(confirm, "worktree doctor --clear-common-info")?;
+                let boundary =
+                    begin_repair_operation("worktree doctor --clear-common-info", None).await?;
+                let result = clear_common_info_files();
+                let result = finish_repair_operation(boundary, result).await?;
+                if output.is_json() {
+                    return emit_json_data(
+                        "worktree.doctor.clear_common_info",
+                        &serde_json::json!({ "report": result }),
+                        output,
+                    );
+                }
+                println!("{result}");
+                Ok(())
             } else {
                 run_worktree_doctor(workspace_id, limit, cursor, output).await
             }
@@ -2567,11 +2635,50 @@ async fn add_worktree(
         );
     }
 
+    // W0 §C.4.1.1 (plan line 2258, 2026-08-06 revision): probe the TARGET
+    // filesystem's case behavior and WARN when it disagrees with the
+    // repository's persisted `core.ignorecase` — persisted at init from
+    // MAIN's filesystem, which this worktree may not share. The per-worktree
+    // config overlay that will store this probe rides the W4 unified
+    // resolver; until then the mismatch must at least be visible, not
+    // silent (materialization guards fall back to a live per-use probe only
+    // when the config key is UNSET).
+    warn_on_case_probe_mismatch(&canonical_target).await;
+
     Ok(WorktreeAddOutput {
         path: canonical_target.to_string_lossy().to_string(),
         already_exists: false,
         reattached: false,
     })
+}
+
+/// The `worktree add` target-filesystem probe (W0 §C.4.1.1): compare the
+/// repository's persisted `core.ignorecase` with what the target volume
+/// actually does, and warn on a mismatch. Best-effort — a probe or config
+/// read failure must never fail the add.
+async fn warn_on_case_probe_mismatch(target: &std::path::Path) {
+    let Ok(Some(entry)) =
+        crate::internal::config::ConfigKv::get_var_case_insensitive("core.", "ignorecase").await
+    else {
+        // No persisted value: materialization guards probe per use, which
+        // already answers from this worktree's own filesystem.
+        return;
+    };
+    let persisted = matches!(
+        entry.value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    );
+    let probed = crate::utils::path_case::probe_dir_ignore_case(target);
+    if probed != persisted {
+        eprintln!(
+            "warning: this worktree's filesystem is case-{} but the repository's persisted \
+             core.ignorecase is {persisted} (probed from the main worktree at init); \
+             case-collision guards here may misjudge until the per-worktree config overlay \
+             lands (plan-20260714 W4). Set core.ignorecase explicitly if this repository \
+             spans differing filesystems.",
+            if probed { "insensitive" } else { "sensitive" }
+        );
+    }
 }
 
 /// Re-attach a detached worktree (W3-s1b, §C.7): verify the directory still
@@ -3352,6 +3459,38 @@ pub(crate) async fn collect_worktree_scope_report(
                 )),
             }
         }
+        // W0 §C.4.1.1 (plan line 2262) origin diagnostics: info files are
+        // worktree-local since W0, so common `.libra/info/*` applies ONLY to
+        // main. When linked worktrees exist, say so on the main entry and
+        // name the explicit adopt/clear actions — never auto-copy.
+        if entry.is_main && !duplicate_identity_paths.is_empty() {
+            let common_info: Vec<&str> = WORKTREE_INFO_FILE_NAMES
+                .iter()
+                .copied()
+                .filter(|name| {
+                    let worktree_root = std::path::Path::new(&entry.path);
+                    let path = worktree_root
+                        .join(crate::utils::util::ROOT_DIR)
+                        .join("info")
+                        .join(name);
+                    path.is_file() && info_file_has_effective_content(&path, name, worktree_root)
+                })
+                .collect();
+            if !common_info.is_empty() {
+                findings.push(format!(
+                    "common info file(s) {} apply ONLY to this main worktree since W0 \
+                     (info files are worktree-local; linked worktrees read their own \
+                     `.libra/info/*`). Copy them into one linked worktree with \
+                     `libra worktree doctor --adopt-info-to <path> --confirm`, or delete \
+                     them with `libra worktree doctor --clear-common-info --confirm`.",
+                    common_info
+                        .iter()
+                        .map(|name| format!("info/{name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
         // A registry an older binary could produce: `add A` → `move A B` →
         // `add A` keeps A's path-derived id on the moved entry, so two entries
         // claim one identity. Every MUTATION is refused while that holds, so
@@ -3371,6 +3510,30 @@ pub(crate) async fn collect_worktree_scope_report(
                 other.join(", ")
             ));
         }
+        // W0 §C.4.1.1 origin inventory: which local info sources THIS
+        // worktree's ignore/attributes engines actually read — via the SAME
+        // resolver the engines use (`worktree_info_file_paths`), so a
+        // dual-layout tree's `.git/info/*` candidates are reported too. For
+        // a legacy-symlink layout the resolution follows the symlink to
+        // main's gitdir — truthfully that worktree's view until migrated.
+        let info_sources: Vec<String> = {
+            let worktree_root = std::path::Path::new(&entry.path);
+            let mut sources = Vec::new();
+            for name in WORKTREE_INFO_FILE_NAMES {
+                for candidate in crate::utils::util::worktree_info_file_paths(worktree_root, name) {
+                    if candidate.is_file()
+                        && info_file_has_effective_content(&candidate, name, worktree_root)
+                    {
+                        let label = candidate
+                            .strip_prefix(worktree_root)
+                            .map(|relative| relative.display().to_string())
+                            .unwrap_or_else(|_| candidate.display().to_string());
+                        sources.push(label);
+                    }
+                }
+            }
+            sources
+        };
         diagnostics.push(WorktreeDiagnostic {
             worktree_id: entry.worktree_id,
             path: entry.path,
@@ -3378,6 +3541,7 @@ pub(crate) async fn collect_worktree_scope_report(
             layout: entry.layout,
             state: entry.state,
             identity_registered,
+            info_sources,
             findings,
         });
     }
@@ -3389,6 +3553,183 @@ pub(crate) async fn collect_worktree_scope_report(
         diagnostics,
         next_cursor: None,
     })
+}
+
+/// The two W0 §C.4.1.1 info-file names the doctor actions operate on.
+const WORKTREE_INFO_FILE_NAMES: [&str; 2] = ["exclude", "attributes"];
+
+/// True when the info file at `path` carries at least one rule the ENGINE
+/// would actually apply — asked of the ENGINES' OWN parsers, never a
+/// line-shape heuristic (a heuristic disagrees in both directions: an
+/// indented `#…` IS a gitignore pattern, and an attributes line with no
+/// assignment is NOT a rule). The comments-only template `libra init`
+/// writes matches nothing, so it is neither a reportable source nor
+/// grounds for adoption advice — without this filter every freshly
+/// initialized multi-worktree repository would carry a doctor finding
+/// about a file that does nothing.
+///
+/// `base` is the worktree root the rules would be resolved against.
+fn info_file_has_effective_content(path: &std::path::Path, name: &str, base: &Path) -> bool {
+    match name {
+        "exclude" => crate::utils::util::ignore_file_defines_any_pattern(path, base),
+        "attributes" => crate::utils::attributes::file_defines_any_rule(path, base),
+        // Unreachable for WORKTREE_INFO_FILE_NAMES; fail closed (report it)
+        // rather than silently hiding an unknown info source.
+        _ => path.is_file(),
+    }
+}
+
+/// `worktree doctor --adopt-info-to <path>` (W0 §C.4.1.1, plan line 2262):
+/// copy the repository's common `info/exclude`/`info/attributes` — main's
+/// `.libra/info/*`, which since W0 applies only to the MAIN worktree — into
+/// ONE linked worktree's local gitdir. Explicit and per-worktree, never
+/// automatic, never all worktrees at once. A destination file that already
+/// exists is kept (the worktree's own view wins) and reported as skipped.
+fn adopt_common_info_files(target: &str) -> CliResult<String> {
+    let common = crate::utils::util::try_get_storage_path(None).map_err(|error| {
+        CliError::fatal(format!(
+            "cannot resolve the repository common storage: {error}"
+        ))
+    })?;
+    let target_path = std::path::PathBuf::from(target);
+    let target_gitdir = target_path.join(crate::utils::util::ROOT_DIR);
+    // No-follow, and only a definitive NotFound means "not linked": a
+    // dangling or uninspectable commondir marker must reach the resolver
+    // below, whose corruption message names the real problem rather than
+    // claiming the path is not a worktree at all.
+    if matches!(
+        std::fs::symlink_metadata(target_gitdir.join("commondir")),
+        Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Err(CliError::command_usage(format!(
+            "'{target}' is not a linked worktree of this repository (no `.libra/commondir`); \
+             --adopt-info-to copies INTO a linked worktree's own gitdir"
+        )));
+    }
+    let target_common = crate::utils::util::try_get_storage_path(Some(target_path.clone()))
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "cannot resolve '{target}' as a worktree of this repository: {error}"
+            ))
+        })?;
+    if target_common != common {
+        return Err(CliError::command_usage(format!(
+            "'{target}' belongs to a DIFFERENT repository (its common storage is '{}'); \
+             refusing to copy this repository's info files there",
+            target_common.display()
+        )));
+    }
+    let mut copied = Vec::new();
+    let mut skipped = Vec::new();
+    for name in WORKTREE_INFO_FILE_NAMES {
+        let source = common.join("info").join(name);
+        let mut reader = match std::fs::File::open(&source) {
+            Ok(reader) => reader,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CliError::fatal(format!(
+                    "cannot read '{}': {error}",
+                    source.display()
+                )));
+            }
+        };
+        let destination_dir = target_gitdir.join("info");
+        std::fs::create_dir_all(&destination_dir).map_err(|error| {
+            CliError::fatal(format!(
+                "cannot create '{}': {error}",
+                destination_dir.display()
+            ))
+        })?;
+        let destination = destination_dir.join(name);
+        // FAILURE-ATOMIC, NO-OVERWRITE publish: STREAM the source into a
+        // same-directory temp file (bounded memory; no partial file can
+        // ever sit at the final name), then `hard_link` it into place —
+        // link(2) fails with AlreadyExists atomically and never follows a
+        // symlink at the destination, so a concurrent creator's
+        // worktree-local policy can neither be truncated nor redirected,
+        // and a crash mid-copy leaves only a temp file the next run
+        // removes.
+        let temp_path = destination_dir.join(format!(".{name}.adopt-tmp-{}", std::process::id()));
+        let publish = (|| -> std::io::Result<bool> {
+            let mut temp = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)?;
+            std::io::copy(&mut reader, &mut temp)?;
+            temp.sync_all()?;
+            drop(temp);
+            match std::fs::hard_link(&temp_path, &destination) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error),
+            }
+        })();
+        // The temp file never survives, success or failure.
+        let _ = std::fs::remove_file(&temp_path);
+        match publish {
+            Ok(true) => copied.push(format!("info/{name}")),
+            Ok(false) => skipped.push(format!("info/{name} (destination already exists)")),
+            Err(error) => {
+                return Err(CliError::fatal(format!(
+                    "cannot adopt '{}' into '{}': {error}",
+                    source.display(),
+                    destination.display()
+                )));
+            }
+        }
+    }
+    if copied.is_empty() && skipped.is_empty() {
+        return Ok(
+            "nothing to adopt: the common storage has no info/exclude or \
+                   info/attributes"
+                .to_string(),
+        );
+    }
+    let mut lines = Vec::new();
+    if !copied.is_empty() {
+        lines.push(format!("adopted into '{target}': {}", copied.join(", ")));
+    }
+    if !skipped.is_empty() {
+        lines.push(format!("skipped: {}", skipped.join(", ")));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `worktree doctor --clear-common-info` (W0 §C.4.1.1): delete the
+/// repository's common `.libra/info/exclude` and `info/attributes` — the
+/// explicit "these rules should no longer apply anywhere" action. Absent
+/// files are fine; the report says exactly what was removed.
+fn clear_common_info_files() -> CliResult<String> {
+    let common = crate::utils::util::try_get_storage_path(None).map_err(|error| {
+        CliError::fatal(format!(
+            "cannot resolve the repository common storage: {error}"
+        ))
+    })?;
+    let mut removed = Vec::new();
+    for name in WORKTREE_INFO_FILE_NAMES {
+        let path = common.join("info").join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(format!("info/{name}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::fatal(format!(
+                    "cannot remove '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if removed.is_empty() {
+        Ok(
+            "nothing to clear: the common storage has no info/exclude or info/attributes"
+                .to_string(),
+        )
+    } else {
+        Ok(format!(
+            "cleared from common storage: {}",
+            removed.join(", ")
+        ))
+    }
 }
 
 /// Text rendering of the worktree-scope half.
@@ -3404,6 +3745,12 @@ fn print_worktree_scope_report(report: &WorktreeDoctorOutput) {
             diagnostic.layout,
             diagnostic.state
         );
+        if !diagnostic.info_sources.is_empty() {
+            println!(
+                "  info sources (this worktree's own gitdir): {}",
+                diagnostic.info_sources.join(", ")
+            );
+        }
         for finding in &diagnostic.findings {
             healthy = false;
             println!("  ! {finding}");

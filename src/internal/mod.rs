@@ -26,6 +26,7 @@ pub mod alternates;
 pub mod auth;
 pub mod branch;
 pub mod config;
+pub mod config_ownership;
 pub mod db;
 pub mod deps;
 pub mod dirty;

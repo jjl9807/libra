@@ -112,6 +112,36 @@ pub enum WorktreeSubcommand {
         /// Keyset cursor: the `next_cursor` of the previous page, verbatim.
         #[clap(long, value_name = "CURSOR")]
         cursor: Option<String>,
+        /// Explicitly attribute one legacy unscoped capture session (same
+        /// contract as the non-FUSE build; delegated to the shared
+        /// implementation).
+        #[clap(
+            long,
+            value_name = "SESSION_ID",
+            requires = "workspace_id",
+            conflicts_with_all = ["limit", "cursor"]
+        )]
+        adopt_capture_session: Option<String>,
+        /// Copy the common `info/exclude`/`info/attributes` into ONE linked
+        /// worktree's local gitdir (W0 §C.4.1.1; requires --confirm).
+        #[clap(
+            long,
+            value_name = "WORKTREE_PATH",
+            conflicts_with_all = ["workspace_id", "limit", "cursor", "adopt_capture_session"]
+        )]
+        adopt_info_to: Option<String>,
+        /// Delete the common `.libra/info/exclude` and `info/attributes`
+        /// (requires --confirm).
+        #[clap(
+            long,
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to"
+            ]
+        )]
+        clear_common_info: bool,
+        /// Confirm a mutating doctor action.
+        #[clap(long)]
+        confirm: bool,
     },
     Lock {
         /// Filesystem path of the worktree to lock.
@@ -402,7 +432,30 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             workspace_id,
             limit,
             cursor,
-        } => legacy::run_worktree_doctor(workspace_id, limit, cursor, output).await,
+            adopt_capture_session,
+            adopt_info_to,
+            clear_common_info,
+            confirm,
+        } => {
+            // Delegate the WHOLE doctor surface (read-only pages and the
+            // confirmed mutations alike) to the shared implementation, so
+            // the FUSE build cannot drift from the non-FUSE contract.
+            legacy::execute_safe(
+                legacy::WorktreeArgs {
+                    command: legacy::WorktreeSubcommand::Doctor {
+                        workspace_id,
+                        limit,
+                        cursor,
+                        adopt_capture_session,
+                        adopt_info_to,
+                        clear_common_info,
+                        confirm,
+                    },
+                },
+                output,
+            )
+            .await
+        }
         WorktreeSubcommand::Lock { path, reason } => {
             if lock_fuse_worktree(&path, reason.clone())
                 .map_err(|e| CliError::fatal(e.to_string()))?

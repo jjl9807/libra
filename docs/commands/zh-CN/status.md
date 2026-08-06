@@ -178,7 +178,7 @@ libra config status.renames false   # 禁用 rename 检测（对该配置作用�
 
 ### `--ignored`
 
-在输出中包含被忽略文件。忽略/未跟踪分类遵循共享 ignore 来源——`.gitignore`、`.git/info/exclude`、`core.excludesFile` 与 `.libraignore`（就近目录优先；同目录 `.libraignore` 高于 `.gitignore`）——完整优先级见 [check-ignore.md](check-ignore.md)。
+在输出中包含被忽略文件。忽略/未跟踪分类遵循共享 ignore 来源——`.gitignore`、worktree 本地 `info/exclude`（`.libra/info/exclude`，Git 或双布局树还包括 `.git/info/exclude`）、`core.excludesFile` 与 `.libraignore`（就近目录优先；同目录 `.libraignore` 高于 `.gitignore`）——完整优先级见 [check-ignore.md](check-ignore.md)。
 
 ```bash
 libra status --ignored

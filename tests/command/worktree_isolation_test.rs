@@ -2480,9 +2480,15 @@ fn linked_cherry_pick_edit_message_isolated() {
 
     let edited = fs::read_to_string(&record_to).unwrap_or_default();
     let edited = edited.trim();
+    // Canonicalize the expectation: the resolver hands out canonical paths,
+    // and macOS tempdirs live behind the /var -> /private/var alias.
+    let expected_gitdir = wt
+        .join(".libra")
+        .canonicalize()
+        .unwrap_or_else(|_| wt.join(".libra"));
     assert_eq!(
         edited,
-        wt.join(".libra")
+        expected_gitdir
             .join("CHERRY_PICK_MSG")
             .to_string_lossy()
             .as_ref(),

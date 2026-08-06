@@ -2,6 +2,90 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W0 cross-review, 2026-08-06)
+
+- **`.libra/info/exclude` and `.libra/info/attributes` now actually work —
+  and are per-worktree.** The info-file resolver only recognized a literal
+  `.git` marker, so in a pure `.libra` repository the `info/exclude` that
+  `libra init` itself creates was never consulted by the ignore engine
+  (`status`, `add`, `clean`, `check-ignore`, `ls-files`) and
+  `info/attributes` was never consulted by the attributes engine
+  (`check-attr`, LFS classification, diff textconv). Resolution now targets
+  the CURRENT worktree's own gitdir — `.libra` plus, in a dual-layout tree
+  converted from Git, the local `.git` (both consulted, so existing
+  `.git/info/*` rules keep working) — and no longer follows `commondir`:
+  each isolated linked worktree reads its own `info/*` view (plan-20260714
+  §C.4.1.1; intentionally different from Git's repository-wide sharing —
+  share rules with a root `.libraignore`/`.gitignore` instead). Docs and
+  COMPATIBILITY rows updated in both languages.
+- **The publish worker-template manifest is one per repository again.**
+  `publish init`/`status`/`deploy`/`unpublish` derived
+  `.libra/publish/worker-template-manifest.json` from the invoking
+  worktree's root, so a linked worktree read and wrote its OWN manifest
+  under its local gitdir — forking the deploy drift gate per worktree. The
+  path now resolves through the fail-closed common-storage resolver
+  (corrupt `commondir` refuses rather than minting a per-worktree
+  manifest). The reported `manifest_path` stays worktree-relative for
+  main-worktree invocations (byte-identical to the previous output) and is
+  an absolute path from a linked worktree — the old relative string would
+  have named a file that does not exist there.
+- **Two cross-worktree process caches are gone.** The `core.ignorecase`
+  workdir probe no longer latches a single process-global verdict (a
+  multi-worktree host process handed worktree A's filesystem answer to
+  worktree B): it re-probes this invocation's worktree, honoring a request
+  pin. The `refs/replace` map is no longer cached at all — resolution
+  follows the chain by reading `refs/replace/<oid>` by name, so the common
+  no-replacement case costs one failed open and EVERY mutation (this
+  process's `replace` create/delete, or another process's, including a
+  same-name `-f` retarget) is visible to the next resolve; a long-lived
+  host can no longer serve stale replacements or another repository's map.
+  The revision-ordinal builder pins one snapshot across its signature stamp
+  and chain walk, so the stamped digest always describes the map the walk
+  used (plan-20260714 §C.4.1.1 process-cache rules).
+- **Corrupt worktree metadata fails closed instead of masquerading as
+  absent.** A `commondir` pointer whose target is missing, is not the
+  repository's terminal common storage (a self-pointer, a pointer chain, a
+  pointer at another worktree's gitdir), or cannot be inspected now
+  refuses with the `worktree repair` remedy — previously the resolver
+  returned the unresolvable path as-is, so every downstream lookup
+  (database, objects, sandbox policy) saw "not found" where "corrupt
+  worktree" was the truth, and sandbox policy in particular degraded to
+  permissive defaults. Lifecycle markers (`commondir`,
+  `detached_from_registry`, `migrate-marker`) are judged without following
+  symlinks and only a definitive "no such file" clears them, so a dangling
+  or unreadable marker can no longer unfreeze a frozen worktree or let
+  repository discovery climb into the main worktree's scope. A
+  sandbox-policy resolution failure inside a repository is likewise an
+  error rather than a silent fall-back to defaults (outside any repository
+  the default config is still legitimate).
+
+### Added (plan-20260714 W0 cross-review, 2026-08-06)
+
+- **Linked-worktree guards for the Code/Agent runtime surfaces.** Until the
+  unified Code/Agent config resolver lands (plan-20260715 W4-06..W4-08),
+  Code/Agent configuration reads are split-brained in a linked worktree
+  (most read the local gitdir, sandbox reads common storage). `libra code`
+  (all modes) and every `libra automation` subcommand now fail closed
+  there with a hint to run from the main worktree — gating the SESSION's
+  working directory, so `libra code --cwd <linked-wt>` from main is refused
+  too — and automation dispatch (VCS events and hook-lifecycle ingestion
+  alike) is disabled with exactly one warning per command instead of
+  silently no-opping against an empty rule set. The §C.4.1.1 ownership
+  inventory (`internal::config_ownership::CODE_AGENT_CONFIG_OWNERSHIP`)
+  registers every Code/Agent config/approval surface with source-scan and
+  structural guards that fail on unregistered or rotten rows.
+- **`worktree doctor` handles the legacy common info files, and
+  `worktree add` probes the target filesystem.** With linked worktrees
+  present, the read-only doctor report states that common `.libra/info/*`
+  applies only to the main worktree and names the two new explicit,
+  confirmed, audited actions: `--adopt-info-to <worktree-path>` (copy into
+  ONE linked worktree's own gitdir, never overwriting its files) and
+  `--clear-common-info` (delete from common storage). `worktree add` now
+  probes the target volume's case behavior and warns when it disagrees
+  with the repository's persisted `core.ignorecase` (probed from main at
+  init) — the persisted per-worktree config overlay rides the W4 unified
+  resolver per the dated plan revision.
+
 ### Fixed (plan-20260714 R0-8 cross-review, 2026-08-06)
 
 - **The racy-index window can no longer make `status` fabricate "clean" for

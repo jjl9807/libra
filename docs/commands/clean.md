@@ -18,9 +18,10 @@ error. This prevents accidental data loss by forcing the user to state
 intent explicitly.
 
 By default, only files are removed and the shared Git/Libra ignore sources
-are honored (ignored files are skipped): `.gitignore`, `.git/info/exclude`,
-`core.excludesFile`, and `.libraignore` — nearest directory wins, and a
-`.libraignore` beats a sibling `.gitignore`; see
+are honored (ignored files are skipped): `.gitignore`, the worktree-local
+`info/exclude` (`.libra/info/exclude`, plus `.git/info/exclude` in a
+Git- or dual-layout tree), `core.excludesFile`, and `.libraignore` — nearest directory
+wins, and a `.libraignore` beats a sibling `.gitignore`; see
 [check-ignore.md](check-ignore.md) for the full precedence. The `-d` flag opts into removing untracked
 directories as well; `-x` opts into removing files the ignore rules would
 otherwise protect; `-X` flips the rules so that *only* ignored files are

@@ -174,6 +174,39 @@ use crate::{
 // stash stack protocol) is worktree-aware now, and no command refuses to run
 // in a linked worktree on those grounds.
 
+/// W0 §C.4.1.1 (plan-20260714): the one transition guard that REMAINS — a
+/// different hazard from the retired store guards above.
+///
+/// Until the unified Code/Agent config resolver lands (transferred to
+/// plan-20260715 W4-06..W4-08, not yet delivered), Code/Agent configuration
+/// reads are split-brained in a linked worktree: agents/approval/MCP/profile/
+/// hooks read the LOCAL gitdir while sandbox reads COMMON storage, so a
+/// linked session could run under main's sandbox policy WITHOUT main's
+/// `PreToolUse` Block hooks. Launching the runtime surfaces there fails
+/// closed instead of running silently permissive. Diagnosis surfaces
+/// (`agent`, `review`, `investigate`, `code-control`) stay usable in a
+/// damaged or linked worktree — see the CommandScope note in `cli.rs`.
+/// `base`: the directory the guarded surface will actually OPERATE ON —
+/// `None` means the process cwd. `libra code` accepts `--cwd`/`--repo`, so
+/// gating on the ambient cwd alone would let `libra code --cwd <linked-wt>`
+/// start the exact split-brained session the guard exists to prevent.
+pub(crate) fn require_main_worktree_for_code_agent(
+    surface: &str,
+    base: Option<&std::path::Path>,
+) -> Result<(), crate::utils::error::CliError> {
+    if util::worktree_id_for_base(base.map(std::path::Path::to_path_buf)).is_some() {
+        return Err(crate::utils::error::CliError::fatal(format!(
+            "{surface} cannot run in a linked worktree yet: Code/Agent \
+             configuration (agents/hooks/sandbox/approvals) is not \
+             worktree-aware until the unified config resolver lands \
+             (plan-20260714 W0 preflight)"
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
+        .with_hint("run this command from the MAIN worktree"));
+    }
+    Ok(())
+}
+
 pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>
 where
     T: ObjectTrait,

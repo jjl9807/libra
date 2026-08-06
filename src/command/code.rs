@@ -692,6 +692,12 @@ pub(crate) fn effective_plan_mode(args: &CodeArgs) -> bool {
 /// terminal/session initialization failures. Error classification follows
 /// `docs/development/cli-error-contract-design.md`.
 pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
+    // W0 §C.4.1.1 preflight: gate on the SESSION's working directory — which
+    // `--cwd`/`--repo` may point at a different worktree than the process cwd
+    // — and BEFORE mode validation, so nothing starts a split-brained session
+    // from a linked worktree.
+    let session_workdir = resolve_code_preflight_working_dir(&args)?;
+    crate::command::require_main_worktree_for_code_agent("libra code", Some(&session_workdir))?;
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
         execute_stdio(&args).await
@@ -3942,25 +3948,6 @@ async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
     ))
 }
 
-/// Resolves the `.libra/` storage root for the given working directory.
-///
-/// Supports linked worktrees by delegating to `try_get_storage_path`, which
-/// follows `.libra` symlinks to the main repository's storage. Falls back to
-/// `<working_dir>/.libra` if resolution fails.
-/// The repository storage root for `working_dir`, or `None` when it cannot be
-/// resolved.
-///
-/// Part C §C.4.1 forbids the caller-side fallback this used to perform. On a
-/// linked worktree with a corrupt or empty `commondir`, minting
-/// `<working_dir>/.libra` does not degrade the session — it CREATES a second,
-/// phantom repository: a fresh `libra.db` and `objects/` beside the real ones,
-/// which then accumulate history, approvals and captured sessions that the
-/// actual repository never sees. A warning does not make that safe, because
-/// the damage is silent and the writes are real.
-///
-/// Callers degrade instead: no storage root means no history and no object
-/// store, which is the same read-only mode they already fall back to when the
-/// directory or database cannot be opened.
 /// [`resolve_storage_root`], but for the paths that genuinely cannot proceed
 /// without a storage root. `libra code`'s own CLI preflight already resolved
 /// one, so a failure here means the repository changed underneath the process
@@ -3979,6 +3966,20 @@ pub(crate) fn require_storage_root(working_dir: &std::path::Path) -> CliResult<s
     })
 }
 
+/// The repository storage root for `working_dir`, or `None` when it cannot be
+/// resolved.
+///
+/// Part C §C.4.1 forbids the caller-side fallback this used to perform. On a
+/// linked worktree with a corrupt or empty `commondir`, minting
+/// `<working_dir>/.libra` does not degrade the session — it CREATES a second,
+/// phantom repository: a fresh `libra.db` and `objects/` beside the real ones,
+/// which then accumulate history, approvals and captured sessions that the
+/// actual repository never sees. A warning does not make that safe, because
+/// the damage is silent and the writes are real.
+///
+/// Callers degrade instead: no storage root means no history and no object
+/// store, which is the same read-only mode they already fall back to when the
+/// directory or database cannot be opened.
 pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     match try_get_storage_path(Some(working_dir.to_path_buf())) {
         Ok(root) => Some(root),

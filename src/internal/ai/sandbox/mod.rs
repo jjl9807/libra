@@ -2112,7 +2112,7 @@ fn resolve_deny_read_paths_from(
 }
 
 fn load_sandbox_config_file(cwd: &Path) -> Result<SandboxConfigFile, String> {
-    let path = sandbox_config_path(cwd);
+    let path = sandbox_config_path(cwd)?;
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -2134,10 +2134,27 @@ fn load_sandbox_config_file(cwd: &Path) -> Result<SandboxConfigFile, String> {
     })
 }
 
-fn sandbox_config_path(cwd: &Path) -> PathBuf {
-    crate::utils::util::try_get_storage_path(Some(cwd.to_path_buf()))
-        .unwrap_or_else(|_| cwd.join(crate::utils::util::ROOT_DIR))
-        .join(SANDBOX_CONFIG_FILE)
+fn sandbox_config_path(cwd: &Path) -> Result<PathBuf, String> {
+    match crate::utils::util::try_get_storage_path(Some(cwd.to_path_buf())) {
+        Ok(root) => Ok(root.join(SANDBOX_CONFIG_FILE)),
+        // Outside any repository there is no repository policy to lose:
+        // resolve the conventional local path (it will not exist, yielding
+        // the default config), preserving non-repo sandbox use.
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(cwd
+            .join(crate::utils::util::ROOT_DIR)
+            .join(SANDBOX_CONFIG_FILE)),
+        // A resolver failure INSIDE a repository (corrupt commondir, frozen
+        // migration, detached worktree) must NOT silently swap the
+        // repository's sandbox policy for defaults — that is the
+        // `<cwd>/.libra` minting pattern §C.4.1 bans, and sandbox policy is
+        // a security config that fails closed (§C.4.1.1).
+        Err(error) => Err(format!(
+            "cannot resolve the repository storage root for the sandbox policy of '{}': \
+             {error}; refusing to run with the default sandbox config — run `libra \
+             worktree repair --confirm <worktree-path>` from the main worktree and retry",
+            cwd.display()
+        )),
+    }
 }
 
 fn resolve_deny_read_path(cwd: &Path, path: PathBuf) -> PathBuf {

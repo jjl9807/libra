@@ -851,7 +851,14 @@ fn worktree_doctor_hints_are_inspect_only() {
             if trimmed.starts_with("//") {
                 continue;
             }
-            if line.contains("--adopt-capture-session") {
+            // Separately named, `--confirm`-gated action grammars are the
+            // sanctioned exception: naming one is not the bare diagnostic
+            // promising recovery, it is pointing at the explicit command
+            // that performs it.
+            if ["--adopt-capture-session", "--adopt-info-to"]
+                .iter()
+                .any(|action| line.contains(action))
+            {
                 continue;
             }
             for forbidden in ["reclaim", "adopt", "release"] {
@@ -1020,6 +1027,8 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
         IdentityPath,
         RegistryAll,
         MigrateLayout,
+        DoctorAdoptInfo,
+        DoctorClearInfo,
     }
 
     let table = [
@@ -1028,6 +1037,14 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
         (
             RepairAction::MigrateLayout,
             "worktree repair --migrate-layout",
+        ),
+        (
+            RepairAction::DoctorAdoptInfo,
+            "worktree doctor --adopt-info-to",
+        ),
+        (
+            RepairAction::DoctorClearInfo,
+            "worktree doctor --clear-common-info",
         ),
     ];
 
@@ -1126,9 +1143,50 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
                     "--migrate-layout".into(),
                 ]
             }
+            // W0 §C.4.1.1: the two info-file doctor actions join the same
+            // confirmation + single-audit-row contract as the repairs.
+            RepairAction::DoctorAdoptInfo => {
+                assert_cli_success(
+                    &run_libra_command(&["worktree", "add", "wt-target"], main),
+                    "add target worktree",
+                );
+                let info_dir = main.join(".libra").join("info");
+                fs::create_dir_all(&info_dir).expect("info dir");
+                fs::write(info_dir.join("exclude"), b"legacy.tmp\n").expect("common exclude");
+                vec![
+                    "worktree".into(),
+                    "doctor".into(),
+                    "--adopt-info-to".into(),
+                    "wt-target".into(),
+                ]
+            }
+            RepairAction::DoctorClearInfo => {
+                assert_cli_success(
+                    &run_libra_command(&["worktree", "add", "wt-target"], main),
+                    "add target worktree",
+                );
+                let info_dir = main.join(".libra").join("info");
+                fs::create_dir_all(&info_dir).expect("info dir");
+                fs::write(info_dir.join("exclude"), b"legacy.tmp\n").expect("common exclude");
+                fs::write(info_dir.join("attributes"), b"*.dat filter=lfs\n")
+                    .expect("common attributes");
+                vec![
+                    "worktree".into(),
+                    "doctor".into(),
+                    "--clear-common-info".into(),
+                ]
+            }
         };
 
         // ---- Phase 1: no `--confirm` -> refused, ZERO side effects. ----
+        // Clear any maintenance lock left by the setup writers so the
+        // refusal phase can assert the action did not CREATE one.
+        let maintenance_lock = main.join(".libra").join("maintenance.lock");
+        match fs::remove_file(&maintenance_lock) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("cannot clear the maintenance lock: {error}"),
+        }
         let registry_path = main.join(".libra").join("worktrees.json");
         let registry_before = fs::read(&registry_path).expect("registry before");
         let operations_before = operation_rows(main).await;
@@ -1165,6 +1223,16 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
             worktree_dir_tree(&bystander),
             bystander_tree_before,
             "{command_name}: the refusal must not touch the bystander worktree"
+        );
+        // The refusal path must stay classified read-only end to end: a
+        // writer classification would take the shared maintenance hold,
+        // whose first side effect is CREATING `.libra/maintenance.lock`
+        // (cleared above after setup, so presence here means the refusal
+        // created it).
+        assert!(
+            !maintenance_lock.exists(),
+            "{command_name}: an unconfirmed action must not create the \
+             maintenance lock (its CommandScope must remain read-only)"
         );
 
         // ---- Phase 2: `--confirm` -> runs, exactly one audit row, only the
@@ -1295,6 +1363,49 @@ async fn worktree_doctor_mutations_require_confirmation_and_emit_audit() {
                 assert_eq!(
                     after, before,
                     "migration touches the target gitdir only (registry semantics)"
+                );
+            }
+            RepairAction::DoctorAdoptInfo => {
+                // The common file was copied into the TARGET's local gitdir;
+                // the common original and the registry are untouched.
+                assert_eq!(
+                    fs::read(target.join(".libra").join("info").join("exclude"))
+                        .expect("adopted exclude"),
+                    b"legacy.tmp\n",
+                    "the common info/exclude was adopted into the target"
+                );
+                assert_eq!(
+                    fs::read(main.join(".libra").join("info").join("exclude"))
+                        .expect("common exclude kept"),
+                    b"legacy.tmp\n",
+                    "adoption copies; it never moves or clears the common file"
+                );
+                assert_eq!(
+                    fs::read(&registry_path).expect("registry after adopt"),
+                    registry_before,
+                    "info adoption does not touch the registry"
+                );
+            }
+            RepairAction::DoctorClearInfo => {
+                // The common files are gone; the target worktree and the
+                // registry are untouched.
+                assert!(
+                    !main.join(".libra").join("info").join("exclude").exists(),
+                    "the common info/exclude was cleared"
+                );
+                assert!(
+                    !main.join(".libra").join("info").join("attributes").exists(),
+                    "the common info/attributes was cleared"
+                );
+                assert_eq!(
+                    worktree_dir_tree(&target),
+                    target_tree_before,
+                    "clearing the common files touches no worktree directory"
+                );
+                assert_eq!(
+                    fs::read(&registry_path).expect("registry after clear"),
+                    registry_before,
+                    "info clearing does not touch the registry"
                 );
             }
         }

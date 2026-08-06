@@ -444,9 +444,12 @@ mod tests {
 
         let resolved =
             crate::utils::util::request_worktree_gitdir().expect("the pinned workdir resolves");
+        // Canonicalize the expectation: the resolver answers canonical paths,
+        // and macOS tempdirs live behind the /var -> /private/var alias.
+        let repo_root = std::fs::canonicalize(repo.path()).unwrap_or_else(|_| repo.path().into());
         assert_eq!(
             resolved,
-            repo.path().join(crate::utils::util::ROOT_DIR),
+            repo_root.join(crate::utils::util::ROOT_DIR),
             "the sidecar gitdir is the WORKTREE's, not one derived from the \
              invocation directory"
         );

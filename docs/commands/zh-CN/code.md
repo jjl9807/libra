@@ -23,6 +23,8 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 当 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令，以便在独立 TUI 中检查该线程的 Intent/Plan/Task/Run/PatchSet 版本图。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
 
+**Linked worktree**：在统一的 Code/Agent 配置 resolver 落地前，`libra code`（所有模式）在 linked worktree 中一律拒绝启动——会话配置（agents、hooks、sandbox、审批）在该场景尚未按 worktree 解析，linked 会话可能在仓库 sandbox 策略下运行却缺失其安全 hooks。请改在 main worktree 运行；拒绝信息会给出该提示。同理，linked worktree 中 automation 的 VCS dispatch 被禁用（带 warning），`libra automation` 亦 fail-closed——见 [automation.md](automation.md)。
+
 ## 选项
 
 | 标志 | 短参数 | 长参数 | 默认值 | 说明 |

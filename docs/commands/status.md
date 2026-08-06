@@ -354,7 +354,7 @@ cache and its JSON gains no keys. See [dirty.md](dirty.md).
 ### `--ignored`
 
 Include ignored files in the output. Ignored/untracked classification follows
-the shared ignore sources — `.gitignore`, `.git/info/exclude`,
+the shared ignore sources — `.gitignore`, the worktree-local `info/exclude` (`.libra/info/exclude`, plus `.git/info/exclude` in Git- or dual-layout trees),
 `core.excludesFile`, and `.libraignore` (nearest directory wins; a
 `.libraignore` beats a sibling `.gitignore`) — see
 [check-ignore.md](check-ignore.md) for the full precedence.

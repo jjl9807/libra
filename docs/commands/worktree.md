@@ -155,6 +155,30 @@ so the orphan can be recovered. The adoption response uses the distinct
 `worktree.doctor.adopt_capture` JSON command envelope, leaving the read-only
 `worktree.doctor` page schema unchanged.
 
+**Legacy common info files** (W0 §C.4.1.1): since `info/exclude` and
+`info/attributes` became worktree-local, the files in COMMON storage (main's
+`.libra/info/*`) apply only to the main worktree. When linked worktrees
+exist, the read-only report says so on the main entry, and two explicit,
+confirmed actions handle the legacy files — never an automatic copy:
+
+```bash
+# Copy main's info/exclude + info/attributes into ONE linked worktree's
+# own gitdir (existing destination files are kept, never overwritten):
+libra worktree doctor --adopt-info-to <worktree-path> --confirm
+
+# Delete them from common storage (the rules stop applying anywhere):
+libra worktree doctor --clear-common-info --confirm
+```
+
+Both refuse without `--confirm` before any side effect and run inside the
+same one-row operation-log audit boundary as the other mutating repair
+actions. In `--json`/`--machine` mode each uses its own envelope —
+`worktree.doctor.adopt_info` (`data.target` + `data.report`) and
+`worktree.doctor.clear_common_info` (`data.report`) — leaving the read-only
+`worktree.doctor` page schema untouched. The read-only report also lists
+each worktree's live local info sources (e.g. `.libra/info/exclude`, plus
+`.git/info/exclude` in a dual-layout tree) on its text entry.
+
 ### Subcommand: `lock`
 
 Mark a worktree as locked to prevent it from being pruned or removed.

@@ -23,6 +23,8 @@ A sandboxed tool-execution layer enforces approval policies that control when th
 
 When the TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
+**Linked worktrees**: `libra code` (every mode) refuses to launch from a linked worktree until the unified Code/Agent configuration resolver lands — the session's configuration (agents, hooks, sandbox, approvals) is not yet worktree-aware there, and a linked session could run under the repository's sandbox policy without its security hooks. Run from the main worktree instead; the refusal names this remedy. For the same reason, automation VCS dispatch is disabled (with a warning) in linked worktrees and `libra automation` fails closed there — see [automation.md](automation.md).
+
 ## Options
 
 | Flag | Short | Long | Default | Description |
