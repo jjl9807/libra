@@ -859,32 +859,95 @@ fn json_warnings_schema_snapshot() {
         "a warning code was added or removed; pin its wire name in this snapshot"
     );
 
+    // The numeric discriminants are public surface too (a fieldless public
+    // enum can be cast by embedders): frozen to the original pre-macro
+    // declaration mapping — a swapped or mistyped explicit value compiles
+    // but fails here (2026-08-06 R0-7 review).
+    let discriminants: Vec<(String, u32)> = libra::command::status::StatusWarningCode::ALL
+        .iter()
+        .map(|code| {
+            (
+                serde_json::to_value(code)
+                    .expect("code")
+                    .as_str()
+                    .expect("name")
+                    .to_string(),
+                *code as u32,
+            )
+        })
+        .collect();
+    for (name, expected) in [
+        ("similarity_budget_exceeded", 0u32),
+        ("rename_limit_product_skipped", 1),
+        ("probe_truncated", 2),
+        ("metadata_unavailable", 3),
+        ("metadata_budget_exceeded", 4),
+        ("worktree_budget_exceeded", 5),
+        ("worktree_read_failed", 6),
+        ("worktree_permission_denied", 7),
+        ("worktree_io_timeout", 8),
+        ("rename_path_encoding_unsupported", 9),
+        ("dirty_cache_lock_stolen", 10),
+        ("dirty_cache_stale_fallback", 11),
+        ("dirty_cache_concurrent_invalidate", 12),
+        ("dirty_cache_path_unencodable", 13),
+        ("repository_preflight", 14),
+    ] {
+        assert!(
+            discriminants
+                .iter()
+                .any(|(wire, value)| wire == name && *value == expected),
+            "frozen discriminant for {name} must be {expected}: {discriminants:?}"
+        );
+    }
+    for (source, expected) in [
+        (libra::command::status::StatusWarningSource::Config, 0u32),
+        (libra::command::status::StatusWarningSource::Probe, 1),
+        (libra::command::status::StatusWarningSource::RenameDetect, 2),
+        (libra::command::status::StatusWarningSource::Cache, 3),
+        (libra::command::status::StatusWarningSource::Metadata, 4),
+        (libra::command::status::StatusWarningSource::Worktree, 5),
+    ] {
+        assert_eq!(
+            source as u32, expected,
+            "frozen source discriminant for {source:?}"
+        );
+    }
+
     // The full §B.5 source enum is frozen public schema — consumers switch
     // on it to tell "we may not have seen every candidate" (probe) apart
     // from "we saw them but could not score them" (rename_detect), and a
-    // worktree block apart from an object-store block.
-    for (source, name) in [
-        (
-            libra::command::status::StatusWarningSource::Config,
-            "config",
-        ),
-        (libra::command::status::StatusWarningSource::Probe, "probe"),
-        (
-            libra::command::status::StatusWarningSource::RenameDetect,
-            "rename_detect",
-        ),
-        (libra::command::status::StatusWarningSource::Cache, "cache"),
-        (
-            libra::command::status::StatusWarningSource::Metadata,
-            "metadata",
-        ),
-        (
-            libra::command::status::StatusWarningSource::Worktree,
-            "worktree",
-        ),
-    ] {
-        assert_eq!(serde_json::to_value(source).expect("src"), name);
-    }
+    // worktree block apart from an object-store block. `Source::ALL` is
+    // generated from the enum declaration itself (a variant cannot exist
+    // outside it), so EXACT set equality here freezes the wire names with
+    // structural completeness (2026-08-06 R0-7 review).
+    let serialized: std::collections::BTreeSet<String> =
+        libra::command::status::StatusWarningSource::ALL
+            .iter()
+            .map(|source| {
+                serde_json::to_value(source)
+                    .expect("src")
+                    .as_str()
+                    .expect("string wire name")
+                    .to_string()
+            })
+            .collect();
+    let expected: std::collections::BTreeSet<String> = [
+        "config",
+        "probe",
+        "rename_detect",
+        "cache",
+        "metadata",
+        "worktree",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    assert_eq!(
+        serialized, expected,
+        "the §B.5 source wire-name set is frozen; a new variant needs a \
+         deliberate snapshot update"
+    );
 }
 
 /// Exceeding the per-side rename limit (1000) degrades the inexact pass with
@@ -5331,16 +5394,16 @@ fn json_io_blocked_rename_branch_schema() {
         .find(|e| e["path"]["display"] == "moved.txt")
         .unwrap_or_else(|| panic!("the blocked destination is reported: {doc}"));
 
-    if entry["rename"].is_null() {
-        // The pairing may legitimately be dropped when the destination
-        // cannot be hashed; then the STAGED component still has to be
-        // reported, and the base rows survive.
-        assert!(
-            entry["staged"].is_string() || entry["staged"].is_null(),
-            "staged is a string or null, never another type: {entry}"
-        );
-        return;
-    }
+    // This STAGED pairing reads both blobs from the OBJECT STORE
+    // (HEAD + index, both KnownObjectId) — the chmod blocks only the
+    // worktree stat, so the association can never legitimately drop here.
+    // The old null-escape let a regression that loses every blocked-path
+    // rename association pass vacuously (2026-08-06 R0-7 review).
+    assert!(
+        !entry["rename"].is_null(),
+        "the object-store-backed staged pairing must survive a blocked \
+         worktree destination: {entry}"
+    );
     let rename = entry["rename"].as_object().expect("rename object");
     let keys: Vec<&str> = rename.keys().map(String::as_str).collect();
     assert_eq!(

@@ -704,77 +704,99 @@ pub struct StatusWarning {
     pub source: StatusWarningSource,
 }
 
-/// Stable warning codes (§B.5). Serialization names are pinned by
-/// `json_warnings_schema_snapshot`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum StatusWarningCode {
-    SimilarityBudgetExceeded,
-    RenameLimitProductSkipped,
-    /// §B.3.2: the rename-destination probe tripped a budget; partial
-    /// destinations still pair, but detection may be incomplete.
-    ProbeTruncated,
-    /// §B.3.4: repository-object reads for inexact scoring were skipped
-    /// (missing/corrupt/unavailable objects); affected candidates dropped.
-    MetadataUnavailable,
-    /// §B.3.4: an OBJECT read budget (per-object size cap, byte total, slot
-    /// count, or deadline) was hit; affected candidates dropped, detection
-    /// may be incomplete. The worktree-side equivalent is
-    /// [`StatusWarningCode::WorktreeBudgetExceeded`] — the two are separate
-    /// because `source` distinguishes `metadata` from `worktree`.
-    MetadataBudgetExceeded,
-    /// §B.3.4: a WORKTREE read budget (per-file size cap, byte total, or
-    /// task count) was hit during optional rename content reads; affected
-    /// candidates dropped, detection may be incomplete.
-    WorktreeBudgetExceeded,
-    /// §B.3.3: a worktree read failed (I/O) during optional rename content
-    /// reads; the affected candidate was dropped.
-    WorktreeReadFailed,
-    /// §B.6.0.1 reason taxonomy (R0-8 io_blocked contract).
-    WorktreePermissionDenied,
-    /// §B.6.0.1 reason taxonomy (R0-8 io_blocked contract).
-    WorktreeIoTimeout,
-    /// §B.6.1: a non-UTF-8 path was skipped as a rename candidate (its base
-    /// D/A/`??` rows are unaffected).
-    RenamePathEncodingUnsupported,
-    DirtyCacheLockStolen,
-    DirtyCacheStaleFallback,
-    DirtyCacheConcurrentInvalidate,
-    /// A path could not be encoded for the dirty cache (a non-UTF-8 name),
-    /// so its row was omitted from the snapshot. The base status is
-    /// unaffected; `--cached` simply will not list that path.
-    DirtyCachePathUnencodable,
-    /// A repository-level PREFLIGHT advisory raised before the command ran
-    /// (e.g. a pending durable object-index repair). Carried in
-    /// `warnings[]` so `--exit-code-on-warning` can never return 9 with an
-    /// empty structured list — §B.5 forbids a stderr-only channel.
-    RepositoryPreflight,
+/// Declare a warning enum together with its `ALL` registry from ONE
+/// variant list: a variant cannot exist without appearing in `ALL`, so
+/// the schema-snapshot and doc-closeout guards cannot be left green by a
+/// forgotten registry entry (2026-08-06 R0-7 review; the old hand-written
+/// `ALL` was a silently-driftable duplicate).
+macro_rules! declare_status_warning_enum {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident $(= $discriminant:literal)?
+            ),+ $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant $(= $discriminant)?
+            ),+
+        }
+
+        impl $name {
+            /// Every variant, generated from the single declaration —
+            /// exhaustive by construction.
+            $vis const ALL: &'static [$name] = &[$($name::$variant),+];
+        }
+    };
+}
+
+declare_status_warning_enum! {
+    /// Stable warning codes (§B.5), declared in the order the user-facing
+    /// warning table lists them (`compat_r0_9_doc_closeout` walks `ALL` to
+    /// assert the docs stay in sync, so a code added here without a doc
+    /// row fails the build rather than shipping undocumented).
+    /// Serialization names are pinned by `json_warnings_schema_snapshot`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    #[non_exhaustive]
+    // Explicit discriminants preserve the ORIGINAL pre-macro declaration's
+    // numeric values: this is a public fieldless enum embedders may cast,
+    // and the table-ordered redeclaration must not silently renumber it
+    // (2026-08-06 R0-7 review).
+    pub enum StatusWarningCode {
+        RenameLimitProductSkipped = 1,
+        SimilarityBudgetExceeded = 0,
+        /// §B.3.2: the rename-destination probe tripped a budget; partial
+        /// destinations still pair, but detection may be incomplete.
+        ProbeTruncated = 2,
+        /// §B.6.1: a non-UTF-8 path was skipped as a rename candidate (its
+        /// base D/A/`??` rows are unaffected).
+        RenamePathEncodingUnsupported = 9,
+        /// §B.3.4: repository-object reads for inexact scoring were skipped
+        /// (missing/corrupt/unavailable objects); affected candidates
+        /// dropped.
+        MetadataUnavailable = 3,
+        /// §B.3.4: an OBJECT read budget (per-object size cap, byte total,
+        /// slot count, or deadline) was hit; affected candidates dropped,
+        /// detection may be incomplete. The worktree-side equivalent is
+        /// [`StatusWarningCode::WorktreeBudgetExceeded`] — the two are
+        /// separate because `source` distinguishes `metadata` from
+        /// `worktree`.
+        MetadataBudgetExceeded = 4,
+        /// §B.3.4: a WORKTREE read budget (per-file size cap, byte total,
+        /// or task count) was hit during optional rename content reads;
+        /// affected candidates dropped, detection may be incomplete.
+        WorktreeBudgetExceeded = 5,
+        /// §B.3.3: a worktree read failed (I/O) during optional rename
+        /// content reads; the affected candidate was dropped.
+        WorktreeReadFailed = 6,
+        /// §B.6.0.1 reason taxonomy (R0-8 io_blocked contract).
+        WorktreePermissionDenied = 7,
+        /// §B.6.0.1 reason taxonomy (R0-8 io_blocked contract).
+        WorktreeIoTimeout = 8,
+        DirtyCacheLockStolen = 10,
+        DirtyCacheStaleFallback = 11,
+        DirtyCacheConcurrentInvalidate = 12,
+        /// A path could not be encoded for the dirty cache (a non-UTF-8
+        /// name), so its row was omitted from the snapshot. The base
+        /// status is unaffected; `--cached` simply will not list that
+        /// path.
+        DirtyCachePathUnencodable = 13,
+        /// A repository-level PREFLIGHT advisory raised before the command
+        /// ran (e.g. a pending durable object-index repair). Carried in
+        /// `warnings[]` so `--exit-code-on-warning` can never return 9
+        /// with an empty structured list — §B.5 forbids a stderr-only
+        /// channel.
+        RepositoryPreflight = 14,
+    }
 }
 
 impl StatusWarningCode {
-    /// The complete frozen code set, in the order the user-facing warning
-    /// table lists it. `compat_r0_9_doc_closeout` walks this to assert the
-    /// docs stay in sync, so a code added here without a doc row fails the
-    /// build rather than shipping undocumented.
-    pub const ALL: &'static [StatusWarningCode] = &[
-        StatusWarningCode::RenameLimitProductSkipped,
-        StatusWarningCode::SimilarityBudgetExceeded,
-        StatusWarningCode::ProbeTruncated,
-        StatusWarningCode::RenamePathEncodingUnsupported,
-        StatusWarningCode::MetadataUnavailable,
-        StatusWarningCode::MetadataBudgetExceeded,
-        StatusWarningCode::WorktreeBudgetExceeded,
-        StatusWarningCode::WorktreeReadFailed,
-        StatusWarningCode::WorktreePermissionDenied,
-        StatusWarningCode::WorktreeIoTimeout,
-        StatusWarningCode::DirtyCacheLockStolen,
-        StatusWarningCode::DirtyCacheStaleFallback,
-        StatusWarningCode::DirtyCacheConcurrentInvalidate,
-        StatusWarningCode::DirtyCachePathUnencodable,
-        StatusWarningCode::RepositoryPreflight,
-    ];
-
     /// The subsystem a code is ALWAYS emitted under (§B.5 table). Every
     /// emit site derives its `source` from here instead of repeating the
     /// pairing, so the code→source mapping has exactly one definition and
@@ -801,27 +823,29 @@ impl StatusWarningCode {
     }
 }
 
-/// Which subsystem produced a warning (§B.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum StatusWarningSource {
-    /// Repository-level advisories not tied to a scan — currently
-    /// `repository_preflight`. Config RESOLUTION itself never warns: an
-    /// invalid value fails closed instead of degrading.
-    Config,
-    /// The bounded rename-destination worktree probe (§B.3.2). Distinct
-    /// from `RenameDetect` on purpose: a truncated probe means "we may not
-    /// have SEEN every candidate", while a `RenameDetect` warning means
-    /// "we saw them but could not score them". Consumers act differently
-    /// on the two (re-run narrower vs. accept the pairing).
-    Probe,
-    RenameDetect,
-    Cache,
-    /// Repository-object reads (§B.3.4 metadata side).
-    Metadata,
-    /// Worktree reads (§B.3.3/§B.3.4 worktree side).
-    Worktree,
+declare_status_warning_enum! {
+    /// Which subsystem produced a warning (§B.5).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    #[non_exhaustive]
+    pub enum StatusWarningSource {
+        /// Repository-level advisories not tied to a scan — currently
+        /// `repository_preflight`. Config RESOLUTION itself never warns: an
+        /// invalid value fails closed instead of degrading.
+        Config,
+        /// The bounded rename-destination worktree probe (§B.3.2). Distinct
+        /// from `RenameDetect` on purpose: a truncated probe means "we may
+        /// not have SEEN every candidate", while a `RenameDetect` warning
+        /// means "we saw them but could not score them". Consumers act
+        /// differently on the two (re-run narrower vs. accept the pairing).
+        Probe,
+        RenameDetect,
+        Cache,
+        /// Repository-object reads (§B.3.4 metadata side).
+        Metadata,
+        /// Worktree reads (§B.3.3/§B.3.4 worktree side).
+        Worktree,
+    }
 }
 
 /// Resolve the Git-compatible `status.*` config defaults (plan-20260708

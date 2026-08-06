@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260714 R0-7 cross-review, 2026-08-06)
+
+- **The status warning enums are now self-registering.** `StatusWarningCode`
+  and `StatusWarningSource` are declared through a macro that generates
+  their `ALL` registries from the single variant list, so a new variant can
+  no longer ship while absent from the registry the schema snapshot and doc
+  guards walk. `StatusWarningSource::ALL` is new public API; numeric
+  discriminants of both enums are explicitly pinned to their original
+  values (and now regression-tested variant by variant), and serialized
+  wire names are unchanged.
+- The `json_io_blocked_rename_branch_schema` regression no longer accepts a
+  `null` rename association for its object-store-backed fixture, closing a
+  vacuous pass.
+
 ### Fixed (plan-20260714 R0-6 cross-review, 2026-08-06)
 
 - **Rename-aware short and porcelain v1 rows keep the source's staged
