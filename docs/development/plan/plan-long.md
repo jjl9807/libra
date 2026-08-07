@@ -161,7 +161,7 @@ flowchart LR
 
 | ID | 任务 | 优先级 | 状态 | 一句话缺口 |
 |---|---|---:|---|---|
-| **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 已验证（**下一个执行任务**） | 兼容仍是自证；需 clean-room 覆盖面 + 离线发现器，见 [`plan-20260729.md`](plan-20260729.md) / [`../gap/grit-gap.md`](../gap/grit-gap.md) |
+| **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 已验证（**下一个执行任务**） | 兼容仍是自证；首批可执行范围见 [`plan-20260729.md`](plan-20260729.md)（S0 + S1 前两项 + S3 + S4 首个 wave）；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A |
 | **UP-01** | 官方签名自动升级链 | P0 | 实施中（CT-01 之后） | 客户端 inert；缺 release-key ceremony、签名 job、`install.sh` 验签 |
 | **LR-01** | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | W1–W2/lease/list|show 已合入；缺 capture/export ownership、doctor、崩溃矩阵、parallel lanes |
 | **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 已验证 | mutation 覆盖与 index/worktree/sequencer snapshot 不完整 |
@@ -183,11 +183,25 @@ flowchart LR
 - **LR-08**：至少一个 Forge 的 PR/CI/stack 状态可从 Libra 机器接口读写。
 - **LR-09**：materializing sparse + partial clone 在大仓基准下正确；失败可诊断。
 
+### CT-01 分阶段契约（摘要）
+
+CT-01 的可执行切片与任务卡在 [`plan-20260729.md`](plan-20260729.md)；机制与净室边界在 [`../gap/grit-gap.md`](../gap/grit-gap.md) 的 `GGT-00A`。本文只固定阶段名与准入关系，避免与日期计划漂移。
+
+| 阶段 | 含义 | 本日期计划是否承接 |
+|---|---|---|
+| **S0** | 范围裁定与合规边界（无生产行为变更） | 是（CT0-*） |
+| **S1** | **预先计划的** test-oracle / 兼容前提修复（不是「唯一」可改 Libra 行为的阶段） | 是（前两项：`config` 裸读、`update-ref` 值操作数；`.libraignore` 抑制随 S2 延后） |
+| **S2** | 离线 gap 发现器（代码入库、上游语料不入库）；五分列统计随本阶段 | 否（DEFER；前置 DEP-01 许可 + **SB-04**） |
+| **S3** | 兼容证据账本 schema 与守卫 | 是（CT2-*） |
+| **S4** | 逐族 clean-room wave；**可经评审的 `CTF-0n` 修复迁移暴露的实现缺陷**，wave 在全绿前不得准出 | 是（t4 首个 wave：CT3-*） |
+| **S5** | CI 落点与证据面（非默认阻断门） | 否（后续日期计划） |
+
+S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际触及的 S1 项为行为前置。不得把 Grit/上游通过率当作完成判据；排除项必须带 `reason` / `category` / `owner` / `review_date`（实施面见 S3）。
+
 ### A 类详细规格入口
 
-既有专节与日期计划仍有效，本文不再全文复制：
-
-- CT-01 / UP-01 / LR-01..LR-05 / LR-08 / LR-09 的开发者问题、目标、非目标、完成判据全文：保留在本文件历史版本与各日期计划中；实施时以「总览状态 + 日期计划切片 + 当前代码复核」为准。
+- CT-01 阶段契约见上表；任务卡、ADR、净室门与发布模型以 [`plan-20260729.md`](plan-20260729.md) 为准。
+- UP-01 / LR-01..LR-05 / LR-08 / LR-09 的细规格以对应日期计划与当前代码复核为准；本文总览只保留状态与一句话缺口。
 - 日期计划：[`plan-20260708.md`](plan-20260708.md)、[`plan-20260714.md`](plan-20260714.md)、[`plan-20260729.md`](plan-20260729.md)。
 
 ---
@@ -448,7 +462,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需。
 | [`plan-20260713.md`](plan-20260713.md) | B（LR-06/07/10 捕获前置） | 已完成 | 不覆盖 seal/preflight/capsule |
 | [`plan-20260714.md`](plan-20260714.md) | A（UP-01、LR-01）+ 横切 | Part A→UP-01；Part C/D 残留 | LR-01 仍实施中 |
 | [`plan-20260715.md`](plan-20260715.md) | B（RT-01） | 已排期 | runtime/UI；非 intent publication |
-| [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 已排期 | 首批兼容证据 wave |
+| [`plan-20260729.md`](plan-20260729.md) | A（CT-01） | 已排期 | **S0 + S1 前两项 + S3 + S4 首个 wave（t4）**；不覆盖 S2 离线发现器、S5 CI 落点与其余族 wave |
 | （待建）Memory 首个日期计划 | C（MEM-01/02） | 未建 | 须先 RFC：对象模型、隐私、与 session 真源关系 |
 
 ---
