@@ -45,7 +45,30 @@ impl Drop for ServiceGuard {
 /// Spawn `libra service run --port 0` and wait for service.json + a live
 /// health endpoint. Returns (guard, base_url, token).
 fn spawn_service(p: &Path) -> (ServiceGuard, String, String) {
-    let child = base_libra_command(&["service", "run", "--port", "0"], p)
+    spawn_service_with_fault(p, None)
+}
+
+/// [`spawn_service`] with an optional `LIBRA_TEST_FAULT` site, so the
+/// handler's error branches can be reached from a test (every fixture
+/// otherwise has a healthy database, which is how a swallowed error
+/// survived unnoticed).
+fn spawn_service_with_fault(p: &Path, fault: Option<&str>) -> (ServiceGuard, String, String) {
+    spawn_service_with_env(p, fault, &[])
+}
+
+fn spawn_service_with_env(
+    p: &Path,
+    fault: Option<&str>,
+    env: &[(&str, String)],
+) -> (ServiceGuard, String, String) {
+    let mut command = base_libra_command(&["service", "run", "--port", "0"], p);
+    if let Some(site) = fault {
+        command.env("LIBRA_TEST_FAULT", site);
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1282,5 +1305,304 @@ fn linked_hydrate_sparse_gate_uses_current_scope() {
     assert!(
         linked.status.success() || !linked_body.contains("sparse"),
         "and it is not refused for a sparse reason: {linked_body}"
+    );
+}
+
+/// plan-20260714 W1: a request PARKED on the worktree registry lock must not
+/// starve unrelated database work in the service process.
+///
+/// This pins the invariant behind a real defect. sqlx returns a pooled
+/// connection by SPAWNING a task, and a spawn from inside a poll lands in
+/// that worker's non-stealable LIFO slot; sea-orm pins SQLite pools to ONE
+/// connection. Taking the blocking `flock` inline on a worker therefore
+/// stranded the connection-return task, and the OTHER request burned the
+/// full sqlx acquire timeout waiting for a connection that could never come
+/// back — surfacing as a CONFIDENTLY WRONG `409 this service serves
+/// repository ''` (a swallowed database error), or as a client timeout.
+///
+/// Unlike a thread race, this drives the parking DETERMINISTICALLY: an
+/// external holder owns the lock for a fixed window, so both requests must
+/// wait for it and then succeed.
+#[test]
+fn service_marks_survive_an_externally_held_registry_lock() {
+    let repo = service_repo();
+    let main = repo.path();
+    let repo_id = repository_id(main);
+    std::fs::write(main.join("held-a.txt"), "a\n").expect("write");
+    std::fs::write(main.join("held-b.txt"), "b\n").expect("write");
+
+    // The service signals HERE — immediately before it takes the registry
+    // lock — so the hold window below starts when the handlers have really
+    // arrived, not merely when the requests were sent.
+    let rendezvous = main.join(".libra").join("test-rendezvous.log");
+    let (_guard, base_url, token) = spawn_service_with_env(
+        main,
+        None,
+        &[(
+            "LIBRA_TEST_RENDEZVOUS",
+            format!("service-registry-lock={}", rendezvous.display()),
+        )],
+    );
+
+    // An EXTERNAL holder owns the registry lock for a bounded window.
+    let lock_path = main.join(".libra").join("worktrees.lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open the registry lock");
+    holder.lock().expect("hold the registry lock");
+
+    // Two scoped marks issued WHILE the lock is held: each must wait for the
+    // lock and then succeed — never answer from a starved database read.
+    let mut handles = Vec::new();
+    for path in ["held-a.txt", "held-b.txt"] {
+        let base_url = base_url.clone();
+        let token = token.clone();
+        let repo_id = repo_id.clone();
+        handles.push(std::thread::spawn(move || {
+            let response = reqwest::blocking::Client::new()
+                .post(format!("{base_url}/api/service/dirty/mark"))
+                .header("x-libra-service-token", token)
+                .json(&serde_json::json!({
+                    "paths": [path],
+                    "scope": { "kind": "main", "repo_id": repo_id },
+                }))
+                .send()
+                .expect("request completes rather than timing out");
+            (
+                response.status().as_u16(),
+                response.text().unwrap_or_default(),
+                std::time::Instant::now(),
+            )
+        }));
+    }
+
+    // Wait for BOTH handlers to reach the acquisition point.
+    let waited_from = std::time::Instant::now();
+    loop {
+        let arrivals = std::fs::read_to_string(&rendezvous)
+            .map(|text| text.lines().count())
+            .unwrap_or(0);
+        if arrivals >= 2 {
+            break;
+        }
+        assert!(
+            waited_from.elapsed() < std::time::Duration::from_secs(60),
+            "only {arrivals}/2 handlers reached the registry-lock acquisition \
+             point — the rendezvous seam is not wired, so this test cannot \
+             prove contention"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // Both handlers are now blocked on the lock. Hold it a while longer, and
+    // remember exactly WHEN it was released.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let released_at = std::time::Instant::now();
+    drop(holder);
+
+    for handle in handles {
+        let (status, body, finished_at) = handle.join().expect("thread");
+        assert_eq!(
+            status, 200,
+            "a mark that merely WAITED for the registry lock must succeed; a \
+             starved identity read used to answer 409 with an empty repo id: {body}"
+        );
+        // Self-check against a VACUOUS pass: a response that completed BEFORE
+        // the lock was released never waited on it, so the run proved nothing
+        // about contention. Unlike a wall-clock threshold, this cannot be
+        // satisfied by a handler that was simply slow to start.
+        assert!(
+            finished_at >= released_at,
+            "the mark completed before the external lock was released — it \
+             never contended for the registry lock, so this test did not \
+             exercise the deadlock it guards"
+        );
+    }
+}
+
+/// plan-20260714 W1: a FAILED repository-identity read is a server error,
+/// never a repository mismatch.
+///
+/// The handler used to collapse the failure into an empty string with
+/// `.ok().flatten()…unwrap_or_default()` and answer `409 this service serves
+/// repository ''` — a confident WRONG verdict that made a real deadlock
+/// unreadable for weeks. The fault seam exists precisely because every
+/// fixture has a healthy database, so this branch is otherwise untestable.
+#[test]
+fn service_reports_identity_read_failure_as_server_error() {
+    let repo = service_repo();
+    let main = repo.path();
+    let repo_id = repository_id(main);
+    std::fs::write(main.join("faulted.txt"), "x\n").expect("write");
+
+    let (_guard, base_url, token) = spawn_service_with_fault(main, Some("service-repo-identity"));
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{base_url}/api/service/dirty/mark"))
+        .header("x-libra-service-token", token)
+        .json(&serde_json::json!({
+            "paths": ["faulted.txt"],
+            "scope": { "kind": "main", "repo_id": repo_id },
+        }))
+        .send()
+        .expect("request");
+
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    assert_eq!(
+        status, 500,
+        "an identity-read failure is a SERVER error, not a scope mismatch: {body}"
+    );
+    assert!(
+        !body.contains("serves repository ''"),
+        "the old swallowed-error wording must not come back: {body}"
+    );
+    assert!(
+        body.contains("cannot read this repository's identity"),
+        "the failure keeps its diagnostic: {body}"
+    );
+}
+
+/// plan-20260714 W1 UPGRADE path: a repository that has linked worktrees must
+/// still be able to restart its OWN service over a legacy (version-1) record.
+///
+/// Version-1 records carry no `repoId`, and with linked-worktree evidence an
+/// unattributable record is refused. Taken literally that bricks the upgrade:
+/// a service killed by the very install that shipped the stamping leaves a v1
+/// `service.json` behind, and every later `libra service run` would refuse to
+/// start until a human deleted the file. A v1 record does name its writer's
+/// `workingDir`, though, and `service` is a REPOSITORY-level surface — so a
+/// working dir that still resolves to this repository's storage proves
+/// ownership without proving which worktree wrote it, which is all the
+/// repository policy needs. A working dir belonging elsewhere proves nothing
+/// and must still be refused.
+#[test]
+fn service_restarts_over_its_own_legacy_record_in_a_linked_repository() {
+    let repo = service_repo();
+    let main = repo.path();
+
+    // Linked-worktree evidence: without it the legacy record would be
+    // adoptable under the OLD rule too, and this test would prove nothing.
+    let linked = main.join("linked-wt");
+    let added = run_libra_command(
+        &["worktree", "add", linked.to_str().expect("utf-8 path")],
+        main,
+    );
+    assert!(
+        added.status.success(),
+        "worktree add must succeed: {}{}",
+        String::from_utf8_lossy(&added.stdout),
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let service_dir = main.join(".libra").join("service");
+    std::fs::create_dir_all(&service_dir).expect("service dir");
+    let info_path = service_dir.join("service.json");
+    let legacy = |working_dir: &str| {
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "mode": "service",
+            "pid": u32::MAX,
+            "baseUrl": "http://127.0.0.1:1",
+            "workingDir": working_dir,
+            "startedAt": "2026-01-01T00:00:00Z",
+        }))
+        .expect("serialize")
+    };
+
+    // A legacy record whose working dir is NOT this repository stays
+    // ambiguous — the adoption is keyed on proof, not on the version alone.
+    let elsewhere = legacy("/somewhere/else");
+    std::fs::write(&info_path, &elsewhere).expect("plant a foreign legacy record");
+    let refused = run_libra_command(&["service", "run", "--port", "0"], main);
+    assert!(
+        !refused.status.success(),
+        "a legacy record from an unresolvable working dir must still be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(
+        std::fs::read(&info_path).expect("still there"),
+        elsewhere,
+        "the refusal must leave the unattributable record byte-identical"
+    );
+
+    // This repository's OWN legacy record — written from the LINKED worktree,
+    // the case the repository policy exists for — is adopted and restamped.
+    std::fs::write(&info_path, legacy(linked.to_str().expect("utf-8 path")))
+        .expect("plant our own legacy record");
+    let (_guard, _base_url, _token) = spawn_service(main);
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&info_path).expect("service.json")).expect("json");
+    assert_eq!(
+        written["repoId"].as_str(),
+        Some(repository_id(main).as_str()),
+        "the restart adopts the legacy record and stamps this repository: {written}"
+    );
+    assert!(
+        written["version"].as_u64().unwrap_or(0) >= 2,
+        "the adopted record is rewritten at the current version: {written}"
+    );
+}
+
+/// §C.12 named regression, END-TO-END half: `libra service run` must consult
+/// the repository-policy takeover gate before it touches the token or the
+/// info file, and must STAMP its own record with the repository identity.
+///
+/// Before this, the service wrote an unstamped version-1 `service.json` and
+/// never called the gate, so an unlocked control record left by ANOTHER
+/// repository's service was silently overwritten — the advisory lock
+/// arbitrates liveness, not ownership.
+#[test]
+fn service_startup_refuses_a_foreign_stale_control_file() {
+    let repo = service_repo();
+    let main = repo.path();
+
+    // A stale record from a DIFFERENT repository, with a dead pid.
+    let service_dir = main.join(".libra").join("service");
+    std::fs::create_dir_all(&service_dir).expect("service dir");
+    let info_path = service_dir.join("service.json");
+    let foreign = serde_json::json!({
+        "version": 2,
+        "mode": "service",
+        "pid": u32::MAX,
+        "baseUrl": "http://127.0.0.1:1",
+        "workingDir": "/somewhere/else",
+        "startedAt": "2026-01-01T00:00:00Z",
+        "repoId": "00000000-0000-4000-8000-00000000dead",
+    });
+    let foreign_bytes = serde_json::to_vec_pretty(&foreign).expect("serialize");
+    std::fs::write(&info_path, &foreign_bytes).expect("plant foreign control file");
+
+    // The service must REFUSE to start rather than reclaim it.
+    let refused = run_libra_command(&["service", "run", "--port", "0"], main);
+    assert!(
+        !refused.status.success(),
+        "startup must refuse a foreign control record: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(
+        std::fs::read(&info_path).expect("still there"),
+        foreign_bytes,
+        "the refusal must leave the foreign record byte-identical"
+    );
+
+    // With the foreign record gone, startup succeeds AND stamps its own
+    // repository identity (an unstamped record is indistinguishable from a
+    // legacy file, which is what let a foreign one be overwritten).
+    std::fs::remove_file(&info_path).expect("remove foreign record");
+    let (_guard, _base_url, _token) = spawn_service(main);
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&info_path).expect("service.json")).expect("json");
+    assert_eq!(
+        written["repoId"].as_str(),
+        Some(repository_id(main).as_str()),
+        "the service stamps its own repository identity: {written}"
+    );
+    assert!(
+        written["version"].as_u64().unwrap_or(0) >= 2,
+        "a stamped record is version 2 or newer: {written}"
     );
 }

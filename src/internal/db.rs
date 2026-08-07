@@ -128,6 +128,24 @@ pub async fn establish_connection_with_busy_timeout(
     // reach disk — pin `synchronous = FULL` explicitly rather than relying on
     // SQLite's journal-mode-dependent default (a future WAL adoption would
     // silently drop it to NORMAL). The `--sync-data` switch never weakens it.
+    // POOL SIZE — an invariant callers must know about. sea-orm pins SQLite
+    // pools to `max_connections(1)` whenever the caller leaves it unset, and
+    // this code leaves it unset deliberately: one connection is what makes
+    // read-then-write sequences safe without a second serialization layer
+    // (see `begin_write_transaction`). The consequence is that the single
+    // connection is a process-wide resource, so:
+    //
+    //   NEVER make a BLOCKING call on a runtime worker thread while a pooled
+    //   connection may be checked out or in the middle of being returned.
+    //
+    // sqlx returns a connection by SPAWNING a task; a spawn from inside a
+    // poll lands in that worker's non-stealable LIFO slot, so blocking the
+    // worker strands the return and every other DB user in the process waits
+    // out the acquire timeout. `libra service`'s dirty-mark handler wedged
+    // exactly this way (it took a blocking `flock` right after a query) and
+    // now takes that lock via `spawn_blocking`. Raising the pool size would
+    // change SQLite read-then-write contention semantics product-wide and is
+    // deliberately NOT done as a side effect of that fix.
     option.map_sqlx_sqlite_opts(move |sqlx_opts| {
         sqlx_opts
             .busy_timeout(busy_timeout)

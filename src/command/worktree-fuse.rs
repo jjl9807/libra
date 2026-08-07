@@ -28,7 +28,7 @@ mod legacy;
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
 pub(crate) use legacy::{
-    WorktreeError, WorktreeState, acquire_registry_lock, local_gitdir_for_scope,
+    WorktreeError, WorktreeState, acquire_registry_lock_async, local_gitdir_for_scope,
     registry_knows_linked_worktree, reject_bare_repository, run_list_worktrees,
 };
 

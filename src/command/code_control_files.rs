@@ -30,7 +30,11 @@
 //! - a legacy (pre-v2) file with no scope fields is adoptable only while the
 //!   repository has no linked-worktree evidence; with such evidence it is
 //!   AMBIGUOUS and never auto-adopted (remove it manually after confirming the
-//!   owning process is gone).
+//!   owning process is gone). ONE exception keeps upgrades survivable: a
+//!   [`ControlScopePolicy::Repository`] surface adopts a legacy record whose
+//!   `working_dir` still resolves to this repository's storage — that proves
+//!   the repository, which is the only thing the repository policy asks
+//!   (see `legacy_record_names_this_repository`).
 
 #[cfg(unix)]
 use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, io::AsRawFd};
@@ -348,11 +352,41 @@ impl std::error::Error for ControlScopeError {
 /// may be replaced (the advisory lock arbitrates liveness), anything else is
 /// refused — INCLUDING dead-PID files from a foreign scope, whose cleanup
 /// belongs to their own scope's owner or an explicit human action.
+/// Repository-policy adoption of a LEGACY (pre-scope-stamping) record.
+///
+/// A version-1 file cannot name its writer's repository — but it does name
+/// the writer's `working_dir`. Under [`ControlScopePolicy::Repository`] the
+/// only question is whether the record belongs to THIS repository (which
+/// worktree wrote it is irrelevant by policy), so a `working_dir` that
+/// still resolves to this repository's common storage settles ownership
+/// even when linked worktrees exist.
+///
+/// This is what keeps an UPGRADE survivable: a service killed before the
+/// scope stamping shipped leaves a v1 record, and in any repository that
+/// has ever had a linked worktree that record would otherwise be
+/// permanently un-takeoverable — the next `libra service run` would refuse
+/// to start and demand a manual file deletion.
+///
+/// Absent proof — a moved or deleted working directory, a path in another
+/// repository, an unresolvable resolve — the record stays ambiguous and the
+/// gate fails closed.
+fn legacy_record_names_this_repository(info: &ControlInfo, common_storage: &Path) -> bool {
+    let Ok(record_storage) = util::try_get_storage_path(Some(info.working_dir.clone())) else {
+        return false;
+    };
+    // Both sides go through the same canonicalization: a record written via
+    // `/var/...` must still match a common storage discovered as
+    // `/private/var/...` (macOS), and vice versa.
+    let canonical = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical(&record_storage) == canonical(common_storage)
+}
+
 pub fn ensure_scope_takeover_allowed(
     info_path: &Path,
     expected: &ControlScope,
     policy: ControlScopePolicy,
     linked_evidence: bool,
+    common_storage: &Path,
 ) -> std::result::Result<(), ControlScopeError> {
     let content = match fs::read_to_string(info_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -385,6 +419,19 @@ pub fn ensure_scope_takeover_allowed(
     };
     match classify_control_scope(&info, expected, policy, linked_evidence) {
         ControlScopeCheck::Match | ControlScopeCheck::LegacyAdoptable => Ok(()),
+        // A repository-level surface may still adopt a legacy record that
+        // PROVES it belongs here (see the helper: this is the upgrade path).
+        ControlScopeCheck::LegacyAmbiguous
+            if policy == ControlScopePolicy::Repository
+                && legacy_record_names_this_repository(&info, common_storage) =>
+        {
+            tracing::debug!(
+                path = %info_path.display(),
+                working_dir = %info.working_dir.display(),
+                "adopting a legacy control record whose working dir resolves to this repository"
+            );
+            Ok(())
+        }
         ControlScopeCheck::LegacyAmbiguous => Err(ControlScopeError::LegacyAmbiguous {
             path: info_path.to_path_buf(),
         }),
@@ -1040,6 +1087,69 @@ mod tests {
         assert!(!pid_is_live(u32::MAX));
     }
 
+    /// §C.12 named regression (plan-20260714 line 2759), UNIT half. `libra
+    /// service` is a REPOSITORY-level sidecar, so its stale-file reclamation
+    /// must be fenced by repository identity: a dead-PID control file
+    /// belonging to ANOTHER repository is not this service's garbage to
+    /// collect — its cleanup belongs to its own scope's owner. The
+    /// same-repository / other-worktree case is deliberately NOT foreign for
+    /// this policy (one service serves the whole repository), and that half
+    /// is asserted too so the fence cannot be "tightened" into refusing
+    /// legitimate reuse. The END-TO-END half — that `libra service run`
+    /// actually consults this gate and stamps its own record — is
+    /// `service_startup_refuses_a_foreign_stale_control_file` in
+    /// tests/command/service_test.rs.
+    #[test]
+    fn service_stale_cleanup_does_not_touch_other_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info_path = dir.path().join("service.json");
+
+        // A DEAD-pid file written by a different repository's service.
+        let foreign = scope("repo-other", None);
+        let stale_foreign = scoped_control_info(u32::MAX, &foreign);
+        std::fs::write(
+            &info_path,
+            serde_json::to_string(&stale_foreign).expect("serialize"),
+        )
+        .expect("write foreign control info");
+        assert!(!pid_is_live(stale_foreign.pid), "the fixture pid is dead");
+
+        let me = scope("repo-a", None);
+        let error = ensure_scope_takeover_allowed(
+            &info_path,
+            &me,
+            ControlScopePolicy::Repository,
+            true,
+            Path::new("/nonexistent-storage-for-this-unit-test"),
+        )
+        .expect_err("a foreign repository's stale control file is not ours to reclaim");
+        assert!(
+            matches!(error, ControlScopeError::Foreign { .. }),
+            "the refusal names the scope mismatch: {error:?}"
+        );
+        assert!(
+            info_path.exists(),
+            "the refusal must leave the foreign file in place"
+        );
+
+        // ...while a stale file from ANOTHER WORKTREE of the SAME repository
+        // is reclaimable: the service is repository-level by design.
+        let sibling = scope("repo-a", Some("wt-sibling"));
+        std::fs::write(
+            &info_path,
+            serde_json::to_string(&scoped_control_info(u32::MAX, &sibling)).expect("serialize"),
+        )
+        .expect("write sibling control info");
+        ensure_scope_takeover_allowed(
+            &info_path,
+            &me,
+            ControlScopePolicy::Repository,
+            true,
+            Path::new("/nonexistent-storage-for-this-unit-test"),
+        )
+        .expect("same repository, different worktree is the service's own scope");
+    }
+
     #[test]
     fn scope_classification_v2_same_scope_matches() {
         let me = scope("repo-a", Some("wt-1"));
@@ -1164,24 +1274,41 @@ mod tests {
 
         // Missing file: allowed.
         assert!(
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, true)
-                .is_ok()
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
         );
 
         // Foreign worktree, dead pid: refused, and the file must survive.
         let owner = scope("repo-a", Some("wt-1"));
         write_control_info(&info_path, &scoped_control_info(u32::MAX, &owner)).unwrap();
-        let error =
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, true)
-                .unwrap_err();
+        let error = ensure_scope_takeover_allowed(
+            &info_path,
+            &me,
+            ControlScopePolicy::Worktree,
+            true,
+            Path::new("/nonexistent-storage-for-this-unit-test"),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("CONTROL_SCOPE_CONFLICT"));
         assert!(info_path.exists());
 
         // Same scope: allowed.
         write_control_info(&info_path, &scoped_control_info(u32::MAX, &me)).unwrap();
         assert!(
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, true)
-                .is_ok()
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
         );
 
         // Legacy + linked evidence: refused; without evidence: allowed.
@@ -1191,23 +1318,47 @@ mod tests {
         )
         .unwrap();
         assert!(
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, true)
-                .is_err()
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_err()
         );
         assert!(
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, false)
-                .is_ok()
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                false,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
         );
 
         // Malformed + linked evidence: refused; without evidence: replaceable.
         fs::write(&info_path, "{not json").unwrap();
         assert!(
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, true)
-                .is_err()
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                true,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_err()
         );
         assert!(
-            ensure_scope_takeover_allowed(&info_path, &me, ControlScopePolicy::Worktree, false)
-                .is_ok()
+            ensure_scope_takeover_allowed(
+                &info_path,
+                &me,
+                ControlScopePolicy::Worktree,
+                false,
+                Path::new("/nonexistent-storage-for-this-unit-test"),
+            )
+            .is_ok()
         );
     }
 

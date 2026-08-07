@@ -1156,11 +1156,15 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
         }
         WorktreeSubcommand::List { porcelain } => list_worktrees(output, porcelain).await,
         WorktreeSubcommand::Lock { path, reason } => {
-            let result = lock_worktree(path, reason).map_err(WorktreeError::into_cli_error)?;
+            let result = lock_worktree(path, reason)
+                .await
+                .map_err(WorktreeError::into_cli_error)?;
             render_lock_worktree(&result, output)
         }
         WorktreeSubcommand::Unlock { path } => {
-            let result = unlock_worktree(path).map_err(WorktreeError::into_cli_error)?;
+            let result = unlock_worktree(path)
+                .await
+                .map_err(WorktreeError::into_cli_error)?;
             render_unlock_worktree(&result, output)
         }
         WorktreeSubcommand::Move { src, dest } => {
@@ -1310,7 +1314,9 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 require_repair_confirmation(confirm, &format!("worktree repair {path}"))?;
                 let boundary =
                     begin_repair_operation("worktree repair <path>", Some(&path)).await?;
-                let result = repair_worktree_identity(path).map_err(WorktreeError::into_cli_error);
+                let result = repair_worktree_identity(path)
+                    .await
+                    .map_err(WorktreeError::into_cli_error);
                 let result = finish_repair_operation(boundary, result).await?;
                 return render_repair_identity(&result, output);
             }
@@ -1549,7 +1555,7 @@ async fn adopted_scope_settings_present(
 /// touched — only the registry entry and that scope's rows go, so the user can
 /// re-add it afterwards and get a fresh identity and generation.
 async fn resolve_identity_collision(path: &str) -> WorktreeResult<String> {
-    let _lock = acquire_registry_lock()?;
+    let _lock = acquire_registry_lock_async().await?;
     let mut state = load_state_for_repair()?;
     let target = resolve_path(path, "worktree path")?;
     let target_key = target.to_string_lossy().to_string();
@@ -1659,7 +1665,14 @@ impl Drop for RegistryLockGuard {
     }
 }
 
-pub(crate) fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
+///
+/// PRIVATE ON PURPOSE (plan-20260714 W1): the blocking variant has
+/// exactly ONE caller — the `spawn_blocking` in
+/// [`acquire_registry_lock_async`]. Every other acquisition in the
+/// crate, sync or async, goes through that helper, so the
+/// blocking-on-a-runtime-worker deadlock cannot be reintroduced from
+/// another module by accident.
+fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
     let lock_path = util::storage_path().join("worktrees.lock");
     let file = fs::OpenOptions::new()
         .create(true)
@@ -1682,6 +1695,31 @@ pub(crate) fn acquire_registry_lock() -> WorktreeResult<RegistryLockGuard> {
         ))
     })?;
     Ok(RegistryLockGuard { file })
+}
+
+/// [`acquire_registry_lock`] for ASYNC callers: takes the blocking `flock`
+/// on the blocking pool instead of on a runtime worker.
+///
+/// Blocking a worker here is not merely impolite, it is a LIVENESS BUG.
+/// sqlx returns a pooled connection by SPAWNING a task; a spawn from inside
+/// a poll lands in that worker's non-stealable LIFO slot; and sea-orm pins
+/// SQLite pools to ONE connection. A worker blocked right after a query
+/// therefore strands the connection return, and every database user in the
+/// process — including whoever holds this very lock — waits out the full
+/// sqlx acquire timeout for a connection that can never come back. The
+/// service's dirty-mark handler deadlocked exactly that way.
+///
+/// The returned guard owns only a `File`, so it is `Send` and may be held
+/// across subsequent awaits: the registry → SQLite lock ORDER is deliberate
+/// (validate and write under one hold). Only the ACQUISITION must leave the
+/// runtime worker.
+pub(crate) async fn acquire_registry_lock_async() -> WorktreeResult<RegistryLockGuard> {
+    match tokio::task::spawn_blocking(acquire_registry_lock).await {
+        Ok(result) => result,
+        Err(error) => Err(WorktreeError::IoWrite(format!(
+            "the worktree registry lock task failed: {error}"
+        ))),
+    }
 }
 
 /// Load the registry for MUTATION. The caller MUST hold the registry lock
@@ -2123,7 +2161,7 @@ async fn add_worktree(
     // Registry mutation lock: the whole precheck → sweep → seed → registry
     // write sequence runs under it (a concurrent add's sweep must not
     // delete this add's freshly seeded rows).
-    let _registry_lock = acquire_registry_lock()?;
+    let _registry_lock = acquire_registry_lock_async().await?;
     let storage = util::storage_path();
     let target = resolve_path(&path, "worktree path")?;
 
@@ -4611,8 +4649,8 @@ fn print_scope_diagnostics(findings: &[ScopeDiagnostic]) {
 /// Marks the specified worktree entry as locked and persists an optional
 /// human-readable reason. Locking is a state-only operation and does not
 /// alter directories on disk.
-fn lock_worktree(path: String, reason: Option<String>) -> WorktreeResult<WorktreeLockOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+async fn lock_worktree(path: String, reason: Option<String>) -> WorktreeResult<WorktreeLockOutput> {
+    let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
     let entry = match find_entry_mut(&mut state, &target) {
@@ -4650,8 +4688,8 @@ fn render_lock_worktree(result: &WorktreeLockOutput, output: &OutputConfig) -> C
 ///
 /// Clears the lock flag and reason for the specified worktree entry if it is
 /// currently locked. Unlocking is idempotent and leaves the filesystem untouched.
-fn unlock_worktree(path: String) -> WorktreeResult<WorktreeUnlockOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+async fn unlock_worktree(path: String) -> WorktreeResult<WorktreeUnlockOutput> {
+    let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
     let entry = match find_entry_mut(&mut state, &target) {
@@ -4692,7 +4730,7 @@ fn render_unlock_worktree(result: &WorktreeUnlockOutput, output: &OutputConfig) 
 /// - renames the directory on disk, attempting to roll back registry changes
 ///   if the rename fails.
 async fn move_worktree(src: String, dest: String) -> WorktreeResult<WorktreeMoveOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+    let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
     let src_path = resolve_path(&src, "source worktree path")?;
     let dest_path = resolve_path(&dest, "destination worktree path")?;
@@ -4830,7 +4868,7 @@ fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> C
 /// to guard); leaked rows would otherwise be re-inherited by a worktree
 /// re-created at the same path (deterministic instance id).
 async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+    let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
 
     // §C.7: prune only handles entries whose path is PROVEN missing
@@ -4987,7 +5025,7 @@ fn render_prune_worktrees(result: &WorktreePruneOutput, output: &OutputConfig) -
 /// Order matters: registry last — a half-completed delete cannot silently
 /// unregister a worktree whose directory is still present.
 async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<WorktreeRemoveOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+    let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
 
@@ -5360,7 +5398,7 @@ async fn migrate_layout_run(
     let (_registry_lock, state) = if dry_run {
         (None, load_state_readonly()?)
     } else {
-        let guard = acquire_registry_lock()?;
+        let guard = acquire_registry_lock_async().await?;
         let state = load_state()?;
         (Some(guard), state)
     };
@@ -6076,8 +6114,8 @@ struct WorktreeRepairIdentityOutput {
 /// unregistered paths, the main worktree, and entries whose registry row
 /// carries no persisted id (pre-v2 rows: run the no-arg `worktree repair`
 /// once to upgrade the registry, or re-add the worktree).
-fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdentityOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+async fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdentityOutput> {
+    let _registry_lock = acquire_registry_lock_async().await?;
     // A legacy v1 registry carries NO persisted identities — refuse before
     // the locked loader would durably upgrade it (backfilling ids from the
     // possibly-damaged gitdirs this command is meant to repair). The no-arg
@@ -6250,7 +6288,7 @@ fn render_repair_identity(
 }
 
 pub(crate) async fn repair_worktrees() -> WorktreeResult<WorktreeRepairOutput> {
-    let _registry_lock = acquire_registry_lock()?;
+    let _registry_lock = acquire_registry_lock_async().await?;
     // The healing loader may itself rewrite the file (v1 upgrade, identity
     // invariants); report that as a change too.
     let bytes_before = fs::read(state_path()).ok();
@@ -7590,6 +7628,47 @@ mod tests {
         assert!(
             text.contains("could not be closed"),
             "the error names the unclosed audit record: {text}"
+        );
+    }
+
+    /// plan-20260714 W1: the BLOCKING registry acquisition keeps exactly one
+    /// caller — the `spawn_blocking` inside `acquire_registry_lock_async`.
+    ///
+    /// Privacy stops other modules; this stops THIS module from quietly
+    /// growing a second inline caller. Taking that `flock` on a runtime
+    /// worker strands sqlx's spawned connection-return in the worker's
+    /// non-stealable LIFO slot, and with sea-orm's 1-connection SQLite pool
+    /// every database user in the process then waits out the acquire
+    /// timeout. That deadlock shipped once; it must not ship twice.
+    #[test]
+    fn blocking_registry_lock_has_a_single_caller() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/command/worktree.rs"),
+        )
+        .expect("this module's source must be readable");
+        // Only the PRODUCTION half: the assertion below names the very
+        // literals it forbids, so scanning this test module would match
+        // itself.
+        let production = source
+            .split("#[cfg(all(test, unix))]")
+            .next()
+            .expect("the module has a production half");
+        let callers: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| {
+                line.contains("acquire_registry_lock")
+                    && !line.contains("acquire_registry_lock_async")
+                    && !line.starts_with("fn acquire_registry_lock")
+            })
+            .collect();
+        assert_eq!(
+            callers,
+            vec!["match tokio::task::spawn_blocking(acquire_registry_lock).await {"],
+            "the blocking registry acquisition grew a caller outside \
+             `acquire_registry_lock_async`: take it on the blocking pool \
+             instead (plan-20260714 W1)"
         );
     }
 }

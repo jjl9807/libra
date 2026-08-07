@@ -101,8 +101,8 @@ pub async fn execute_safe(args: RerereArgs, _output: &OutputConfig) -> CliResult
         None => apply(&scope, &rr_dir, false).await,
         Some(RerereSubcommand::Status) => status(&scope, &rr_dir),
         Some(RerereSubcommand::Diff) => diff(&scope, &rr_dir),
-        Some(RerereSubcommand::Forget { paths }) => forget(&scope, &rr_dir, &paths),
-        Some(RerereSubcommand::Clear) => clear(&scope, &rr_dir),
+        Some(RerereSubcommand::Forget { paths }) => forget(&scope, &rr_dir, &paths).await,
+        Some(RerereSubcommand::Clear) => clear(&scope, &rr_dir).await,
         Some(RerereSubcommand::Gc) => gc(&rr_dir),
     }
 }
@@ -228,7 +228,7 @@ async fn apply(scope: &WorktreeScope, rr_dir: &Path, stage_replayed: bool) -> Cl
     // `rerere.enabled` repo — where `auto_update` runs after every commit — from
     // creating a spurious empty MERGE_RR, so it stays a true no-op.
     if !merge_rr.is_empty() || merge_rr_file(scope)?.exists() || legacy_is_readable(scope, rr_dir) {
-        write_merge_rr(scope, rr_dir, &merge_rr)?;
+        write_merge_rr(scope, rr_dir, &merge_rr).await?;
     }
     Ok(())
 }
@@ -302,7 +302,7 @@ fn diff(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
-fn forget(scope: &WorktreeScope, rr_dir: &Path, paths: &[String]) -> CliResult<()> {
+async fn forget(scope: &WorktreeScope, rr_dir: &Path, paths: &[String]) -> CliResult<()> {
     let mut removed = false;
     let mut kept = Vec::new();
     for (path, id) in read_merge_rr(scope, rr_dir)? {
@@ -313,7 +313,7 @@ fn forget(scope: &WorktreeScope, rr_dir: &Path, paths: &[String]) -> CliResult<(
             kept.push((path, id));
         }
     }
-    write_merge_rr(scope, rr_dir, &kept)?;
+    write_merge_rr(scope, rr_dir, &kept).await?;
     if !removed {
         return Err(CliError::command_usage(format!(
             "no recorded resolution for: {}",
@@ -325,7 +325,7 @@ fn forget(scope: &WorktreeScope, rr_dir: &Path, paths: &[String]) -> CliResult<(
     Ok(())
 }
 
-fn clear(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
+async fn clear(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
     let merge_rr = merge_rr_file(scope)?;
     if merge_rr.exists() {
         fs::remove_file(&merge_rr).map_err(write_err)?;
@@ -339,7 +339,7 @@ fn clear(scope: &WorktreeScope, rr_dir: &Path) -> CliResult<()> {
     if !scope.is_linked()
         && legacy.exists()
         && matches!(
-            remove_legacy_if_unambiguous(rr_dir)?,
+            remove_legacy_if_unambiguous(rr_dir).await?,
             LegacyRemoval::Ambiguous
         )
     {
@@ -475,12 +475,16 @@ enum LegacyRemoval {
 /// registry UNDER the worktree registry lock, so a concurrent `worktree
 /// add` cannot make the file ambiguous between the evidence probe and the
 /// unlink (an ambiguous sidecar must be left for the W3 doctor).
-fn remove_legacy_if_unambiguous(rr_dir: &Path) -> CliResult<LegacyRemoval> {
+async fn remove_legacy_if_unambiguous(rr_dir: &Path) -> CliResult<LegacyRemoval> {
     let legacy = legacy_merge_rr_file(rr_dir);
     if !legacy.exists() {
         return Ok(LegacyRemoval::AlreadyGone);
     }
-    let _registry_lock = crate::command::worktree::acquire_registry_lock()
+    // Off the runtime worker: a blocking `flock` taken inline strands
+    // sqlx's spawned connection-return in that worker's non-stealable LIFO
+    // slot (see `acquire_registry_lock_async`).
+    let _registry_lock = crate::command::worktree::acquire_registry_lock_async()
+        .await
         .map_err(crate::command::worktree::WorktreeError::into_cli_error)?;
     if registry_has_linked_evidence() {
         return Ok(LegacyRemoval::Ambiguous);
@@ -570,7 +574,7 @@ fn read_or_empty(path: &Path) -> CliResult<Vec<u8>> {
     }
 }
 
-fn write_merge_rr(
+async fn write_merge_rr(
     scope: &WorktreeScope,
     rr_dir: &Path,
     entries: &[(String, String)],
@@ -591,7 +595,7 @@ fn write_merge_rr(
     // cannot make it ambiguous between probe and unlink. With linked
     // evidence the legacy file is never touched (rule 3 — doctor territory).
     if legacy_is_readable(scope, rr_dir) {
-        remove_legacy_if_unambiguous(rr_dir)?;
+        remove_legacy_if_unambiguous(rr_dir).await?;
     }
     Ok(())
 }

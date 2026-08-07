@@ -37,6 +37,7 @@ pub mod maintenance_lock;
 pub mod merge_base;
 pub mod metadata;
 pub mod model;
+pub mod mutable_state_ownership;
 pub mod notes;
 pub mod obliteration;
 pub mod operation;

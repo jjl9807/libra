@@ -2619,11 +2619,13 @@ fn linked_pull_rebase_uses_scoped_state() {
 /// Part C W1 (§C.4.4): `pull` in MERGE mode runs in a linked worktree — its
 /// fetch resolves worktree-local paths and its merge integrates on that
 /// worktree's own scoped HEAD/index/tree; the main worktree is untouched.
-/// (The rebase mode stays refused — see
-/// `repository_global_state_commands_refused_in_linked_worktree`. Note:
-/// libra's pull-internal fetch does not write a FETCH_HEAD at all — only the
-/// public `fetch` command does — so the assertion here is only that MAIN's
-/// gitdir gains none.)
+/// (Historical note: the rebase mode was still refused when this test was
+/// written; W1 wired `pull --rebase` through the scoped sequencer and W2
+/// lifted the last mode, `--rebase --autostash` — see
+/// `formerly_guarded_commands_run_in_linked_worktree`. Note: libra's
+/// pull-internal fetch does not write a FETCH_HEAD at all — only the public
+/// `fetch` command does — so the assertion here is only that MAIN's gitdir
+/// gains none.)
 #[test]
 fn pull_merges_in_linked_worktree() {
     // An upstream repo to pull FROM (a plain local path remote).

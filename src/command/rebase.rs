@@ -353,7 +353,8 @@ impl RebaseState {
             // adoption: `repository_has_linked_worktrees` (registered NOW) is
             // not enough — a linked worktree removed earlier leaves no entry,
             // and this directory could have been its rebase (§C.4.3).
-            let _registry = crate::command::worktree::acquire_registry_lock()
+            let _registry = crate::command::worktree::acquire_registry_lock_async()
+                .await
                 .map_err(|error| format!("cannot take the worktree registry lock: {error}"))?;
             let legacy_dir = Self::legacy_rebase_dir();
             if legacy_dir.exists() {
@@ -597,7 +598,8 @@ impl RebaseState {
         // directory ambiguous after we had already decided it was not. Taken
         // before the checks, and every check re-run inside it — the probe above
         // is only a cheap early exit.
-        let _registry = crate::command::worktree::acquire_registry_lock()
+        let _registry = crate::command::worktree::acquire_registry_lock_async()
+            .await
             .map_err(|error| format!("cannot take the worktree registry lock: {error}"))?;
         let Some(legacy_dir) = Self::legacy_rebase_dir_present() else {
             // Another process adopted it while we waited for the lock.

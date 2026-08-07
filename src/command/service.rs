@@ -47,8 +47,9 @@ use tokio::sync::broadcast;
 
 use crate::{
     command::code_control_files::{
-        ControlInfo, ControlPaths, acquire_control_lock, cleanup_control_files,
-        ensure_control_token_file, pid_is_live, validate_token_file_perms, write_control_info,
+        CONTROL_INFO_VERSION, ControlInfo, ControlPaths, ControlScopePolicy, acquire_control_lock,
+        cleanup_control_files, ensure_control_token_file, ensure_scope_takeover_allowed,
+        pid_is_live, resolve_control_scope, validate_token_file_perms, write_control_info,
     },
     internal::dirty::{DirtyCache, MarkError},
     utils::{
@@ -303,12 +304,33 @@ async fn validate_request_repository(scope: &MarkScope) -> Result<(), (StatusCod
             "scope.repo_id must be non-empty".to_string(),
         ));
     }
-    let actual = crate::internal::config::ConfigKv::get("libra.repoid")
-        .await
-        .ok()
-        .flatten()
-        .map(|entry| entry.value)
-        .unwrap_or_default();
+    // A FAILED read is not an answer. Swallowing the error with
+    // `.ok().flatten().unwrap_or_default()` reported a database problem as
+    // "this service serves repository ''" — a confident WRONG verdict
+    // (409 addressed-to-a-different-checkout) for what is really a 500.
+    // Deterministic fault seam (R0-8 style, `LIBRA_TEST_FAULT`): the failure
+    // branch below is otherwise unreachable in a test — every fixture has a
+    // healthy database — and an unexercised error branch is how the
+    // swallowed-error bug survived in the first place.
+    if crate::utils::util::fault_injected("service-repo-identity") {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cannot read this repository's identity: injected fault \
+             (LIBRA_TEST_FAULT=service-repo-identity)"
+                .to_string(),
+        ));
+    }
+    let actual = match crate::internal::config::ConfigKv::get("libra.repoid").await {
+        Ok(Some(entry)) => entry.value,
+        // No identity recorded: genuinely not this repository's client.
+        Ok(None) => String::new(),
+        Err(error) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot read this repository's identity: {error}"),
+            ));
+        }
+    };
     if actual.is_empty() || actual != claimed {
         return Err((
             StatusCode::CONFLICT,
@@ -485,12 +507,27 @@ async fn dirty_mark_handler(
     // because a withdrawal keyed by scope and path cannot tell whose row it is.
     let marked = match request.scope.as_ref() {
         Some(scope) => {
-            let _registry = crate::command::worktree::acquire_registry_lock().map_err(|error| {
-                (
-                    StatusCode::CONFLICT,
-                    format!("cannot take the worktree registry lock: {error}"),
-                )
-            })?;
+            // The registry lock is a BLOCKING `flock`. It must be taken on
+            // the blocking pool, never inline on a runtime worker: sqlx
+            // returns a pooled connection by SPAWNING a task, and a spawn
+            // from inside a poll lands in that worker's LIFO slot, which no
+            // other worker may steal. Blocking the worker right after a
+            // query therefore strands the connection-return task — and
+            // because sea-orm pins SQLite pools to ONE connection, the
+            // request holding this lock then waits out the full sqlx
+            // acquire timeout for a connection that can never come back.
+            // Two concurrent scoped marks deadlocked exactly that way.
+            // Announce arrival BEFORE blocking, so a contention test can
+            // start its hold window when the handler is really here.
+            crate::utils::util::test_rendezvous("service-registry-lock");
+            let _registry = crate::command::worktree::acquire_registry_lock_async()
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::CONFLICT,
+                        format!("cannot take the worktree registry lock: {error}"),
+                    )
+                })?;
             let scope_key = resolve_request_scope(scope).await?;
             DirtyCache::mark_paths_in_scope(&scope_key, &workdir_relative).await
         }
@@ -594,6 +631,30 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_hint("another instance may be running; see `libra service status`")
     })?;
+    // §C.8/§C.4.1.1: the advisory lock arbitrates LIVENESS, not OWNERSHIP.
+    // An unlocked control record left by another REPOSITORY's service is not
+    // this instance's to overwrite — the token and info writes below are
+    // gated on the repository-policy takeover check first (a different
+    // worktree of the SAME repository is fine: `service` is repository-level).
+    let scope = resolve_control_scope(&util::working_dir(), None)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("cannot resolve the service control scope: {e}"))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+    let linked_evidence = crate::command::maintenance::repository_had_linked_worktrees();
+    ensure_scope_takeover_allowed(
+        &paths.info,
+        &scope,
+        ControlScopePolicy::Repository,
+        linked_evidence,
+        &util::storage_path(),
+    )
+    .map_err(|error| {
+        CliError::conflict(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("remove the foreign control file by hand after confirming its owner is gone")
+    })?;
     let token = ensure_control_token_file(&paths.token).await.map_err(|e| {
         CliError::fatal(format!("failed to prepare the service token: {e}"))
             .with_stable_code(StableErrorCode::IoWriteFailed)
@@ -636,7 +697,7 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
         .with_state(state.clone());
 
     let info = ControlInfo {
-        version: 1,
+        version: CONTROL_INFO_VERSION,
         mode: "service".to_string(),
         pid: std::process::id(),
         base_url: base_url.clone(),
@@ -644,11 +705,13 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
         working_dir: util::working_dir(),
         thread_id: None,
         started_at: chrono::Utc::now(),
-        // Repository-level sidecar: scope stamping (§C.8 W4) is a per-worktree
-        // `libra code` concern; `service.json` stays a legacy (version-1) file
-        // whose takeover is arbitrated by the advisory lock alone.
-        repo_id: None,
-        worktree_id: None,
+        // STAMPED with the writer's repository identity: an unstamped record
+        // is indistinguishable from a legacy file, so a foreign one could not
+        // be told apart from this repository's own and was overwritten.
+        // `service` is repository-level, so the worktree id is recorded for
+        // diagnostics but never fences a takeover (see ControlScopePolicy).
+        repo_id: Some(scope.repo_id.clone()),
+        worktree_id: scope.worktree_id.clone(),
         workspace_id: None,
         lease_fence: None,
     };

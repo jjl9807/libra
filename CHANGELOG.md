@@ -2,6 +2,50 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W1 cross-review, 2026-08-07)
+
+- **`libra service` no longer wedges when two dirty-mark requests arrive at
+  once.** The handler took the worktree registry lock — a BLOCKING `flock` —
+  inline on a runtime worker. sqlx returns a pooled connection by *spawning*
+  a task, and a spawn from inside a poll lands in that worker's
+  non-stealable LIFO slot, so blocking the worker stranded the
+  connection-return; because sea-orm pins SQLite pools to a single
+  connection, the request that held the lock then waited out the full sqlx
+  acquire timeout for a connection that could never come back. Both requests
+  stalled ~60s and the client timed out. The lock is now taken via
+  `spawn_blocking`, so concurrent marks complete in milliseconds. Pinned by
+  the previously-failing `linked_service_dirty_mark_is_scoped` and by a new
+  deterministic regression that holds the registry lock from outside the
+  process.
+- **A service database failure is no longer reported as a repository
+  mismatch.** `validate_request_repository` collapsed a failed identity read
+  into an empty string, answering `409 this service serves repository ''` —
+  a confident wrong verdict for what is really a server error. It now
+  returns 500 with the underlying error, which is what made the deadlock
+  above unreadable in the first place.
+
+### Added (plan-20260714 W1 cross-review, 2026-08-07)
+
+- **The §C.4.1.1 mutable-state ownership registry**
+  (`internal::mutable_state_ownership`) declares every mutable table's
+  `Repository | Worktree | Composite` ownership with its rationale, and its
+  guards check those declarations against the real schema from two
+  independent directions. Structurally: a table carrying a `worktree_id`
+  scope column must be declared, and a scoped declaration must be backed by
+  a real column. Exhaustively: every table a freshly created repository
+  database contains (read back from `sqlite_schema`) must be classified,
+  and so must every table created by DDL anywhere in the tree — SQL files,
+  `CREATE TABLE` text in Rust, and sea-orm `create_table_from_entity` calls,
+  found by walking the syn AST with `#[cfg(test)]` items evaluated out. A
+  new per-worktree table can no longer ship unregistered.
+- **`libra service run` refuses to reclaim another repository's control
+  file.** Startup now resolves its own `ControlScope` and passes the
+  repository-policy takeover gate before writing the token or the info file,
+  and stamps its own record with the repository identity. A legacy
+  (pre-stamping) record is still adopted when its `workingDir` resolves to
+  this repository's storage, so upgrading over a killed service keeps
+  working.
+
 ### Fixed (plan-20260714 W0 cross-review, 2026-08-06)
 
 - **`.libra/info/exclude` and `.libra/info/attributes` now actually work —

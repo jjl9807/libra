@@ -2694,6 +2694,103 @@ async fn dirty_migration_clears_advisory_rows_and_rekeys_meta() {
     assert!(rows.is_empty(), "advisory rows are cleared, not adopted");
 }
 
+/// §C.12 named regression. The sibling test above proves the CLEARING rule
+/// on a plain legacy database; this one adds the dimension the plan actually
+/// names: a repository that HAD a linked worktree. §C.4.1.1's migration rule
+/// for rebuildable advisory state is "mark the whole group stale and clear —
+/// never guess the owner", so the legacy rows must NOT be attributed to main
+/// (the tempting default) just because main is the only scope that can be
+/// named. The clearing must also be TARGETED: another worktree-scoped table's
+/// linked row is untouched.
+#[tokio::test]
+async fn legacy_dirty_cache_with_linked_is_invalidated_not_adopted() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let backend = conn.get_database_backend();
+    run_builtin_migrations(&conn).await.expect("migrations");
+
+    // Rewind to just BEFORE the dirty-cache scope migration, so
+    // `working_dirty` is back in its legacy repository-global shape while
+    // `sequence_state` (an earlier migration) is already scoped.
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .rollback_to(&conn, 2026072301)
+        .await
+        .expect("rollback to the pre-dirty-scope schema");
+    assert!(!column_exists(&conn, "working_dirty", "worktree_id").await);
+
+    // Legacy advisory rows + a meta row claiming the cache is authoritative.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty (path, kind, source, marked_at) \
+         VALUES ('legacy.txt', 'modified', 'scan', '2026-07-01T00:00:00Z');"
+            .to_string(),
+    ))
+    .await
+    .expect("legacy dirty row");
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO working_dirty_meta (id, state) VALUES (1, 'fresh');".to_string(),
+    ))
+    .await
+    .expect("legacy meta row");
+    // LINKED EVIDENCE: a linked-scope row in another advisory table proves
+    // this repository had a linked worktree when the legacy cache was
+    // written — so main is NOT the only possible owner.
+    conn.execute_raw(Statement::from_string(
+        backend,
+        "INSERT INTO sequence_state \
+         (worktree_id, kind, head_name, head_orig, current_oid, todo) \
+         VALUES ('wt-linked', 'cherry-pick', 'main', 'aa11', 'bb22', '[]');"
+            .to_string(),
+    ))
+    .await
+    .expect("linked evidence row");
+
+    run_builtin_migrations(&conn)
+        .await
+        .expect("re-apply forward");
+
+    // The whole advisory group is gone — attributed to NO scope, not main.
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, path FROM working_dirty".to_string(),
+        ))
+        .await
+        .expect("query rows");
+    assert!(
+        rows.is_empty(),
+        "legacy rows must be invalidated, never adopted into main scope"
+    );
+    let meta = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id, state FROM working_dirty_meta".to_string(),
+        ))
+        .await
+        .expect("query meta");
+    assert!(
+        meta.is_empty(),
+        "the 'fresh' claim must not survive either — every worktree rescans"
+    );
+
+    // ...and the clearing was TARGETED: the linked row in the sibling
+    // advisory table is untouched.
+    let survivors = conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT worktree_id FROM sequence_state WHERE worktree_id = 'wt-linked'".to_string(),
+        ))
+        .await
+        .expect("query sequence_state");
+    assert_eq!(
+        survivors.len(),
+        1,
+        "clearing the dirty cache must not touch another scoped table's rows"
+    );
+}
+
 /// The 2026072302 down migration FAILS CLOSED while linked-scope dirty rows
 /// or meta exist; after clearing them the rollback restores the legacy
 /// single-row shapes with the main rows intact.
@@ -2868,7 +2965,7 @@ async fn layer_migration_adopts_main_rows_without_linked_evidence() {
 /// worktree evidence (a linked HEAD row): ownership must not be guessed —
 /// the user unapplies/removes from the owning worktree first (§C.4.1.1).
 #[tokio::test]
-async fn layer_migration_fails_closed_with_linked_evidence() {
+async fn legacy_layer_rows_with_linked_fail_migration() {
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
     let backend = conn.get_database_backend();
@@ -3271,7 +3368,7 @@ async fn sparse_migration_projects_last_wins_toggle() {
 /// toggle) coexists with linked worktree evidence — ownership must not be
 /// guessed, and patterns are never copied to every worktree (§C.4.1.1).
 #[tokio::test]
-async fn sparse_migration_fails_closed_with_linked_evidence() {
+async fn legacy_sparse_state_with_linked_requires_adopt_or_clear() {
     let (_dir, url, _path) = fresh_db_url();
     let conn = connect(&url).await;
     let backend = conn.get_database_backend();

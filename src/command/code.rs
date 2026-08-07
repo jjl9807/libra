@@ -1903,6 +1903,8 @@ impl ControlRuntimeConfig {
             &self.scope,
             ControlScopePolicy::Worktree,
             self.linked_evidence,
+            &crate::utils::util::try_get_storage_path(Some(working_dir.to_path_buf()))
+                .unwrap_or_default(),
         )
         .map_err(|error| {
             CliError::conflict(error.to_string())

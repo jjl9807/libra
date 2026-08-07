@@ -847,6 +847,32 @@ pub fn fault_injected(site: &str) -> bool {
     std::env::var("LIBRA_TEST_FAULT").is_ok_and(|value| value == site)
 }
 
+/// Test-only rendezvous seam: when `LIBRA_TEST_RENDEZVOUS` is set to
+/// `<site>=<path>`, append one line to `<path>` on reaching `site`.
+///
+/// It changes NO behaviour — it exists so a test can start a timing window
+/// at the moment the SERVER reaches a point. A client-side barrier can only
+/// observe when a request was SENT; a concurrency test that starts its
+/// window there proves nothing when the handler arrives late, because the
+/// wall-clock assertion is then satisfied by the handler's own slowness
+/// instead of by contention.
+pub fn test_rendezvous(site: &str) {
+    use std::io::Write as _;
+
+    let Ok(value) = std::env::var("LIBRA_TEST_RENDEZVOUS") else {
+        return;
+    };
+    let Some((configured, path)) = value.split_once('=') else {
+        return;
+    };
+    if configured != site {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{site}");
+    }
+}
+
 pub struct BranchAttachLockGuard {
     file: fs::File,
 }
