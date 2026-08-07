@@ -3479,8 +3479,11 @@ impl HistoryManager {
     /// cascade its checkpoint rows away (FK `ON DELETE CASCADE`) and leave
     /// `refs/libra/traces` pointing at orphan commits.
     ///
-    /// D1/R2 cloud-mirror deletion propagation is explicitly out of scope
-    /// (documented deferral): this covers local consistency only.
+    /// Cloud propagation (PD-03): the `agent_import_tombstone` written
+    /// here is published to the D1 mirror by `libra cloud sync`, which
+    /// also drops the erased session's mirror rows, and `libra cloud
+    /// restore` is tombstone-first. Only R2 physical payload deletion
+    /// remains a documented deferral.
     pub async fn erase_session_local(&self, session_id: &str) -> Result<SessionEraseOutcome> {
         use sea_orm::{Statement, Value};
         let backend = self.db_conn.get_database_backend();

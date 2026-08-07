@@ -1,9 +1,19 @@
-//! Apply plain-text `format-patch` mail messages as commits.
+//! Apply `format-patch` mail messages as commits.
 //!
-//! This is the deliberately small P2 mail-flow surface: one or more patch
-//! files plus `--continue`, `--skip`, and `--abort`. The parser accepts the
-//! common 8-bit, quoted-printable, and base64 single-part mail forms. MIME
-//! multipart messages and the wider Git `am` option set remain out of scope.
+//! The PD-09 mail-flow surface: patch files or mbox series (a file — or
+//! stdin `-` — whose first line is an mbox `From ` envelope is split into
+//! its messages), `-3/--3way` fallback, plus `--continue`, `--skip`, and
+//! `--abort`. The shared mail parser accepts 7bit/8bit/binary,
+//! quoted-printable, and base64 transfer encodings and bounded MIME
+//! `multipart/*` nesting with `text/plain` leaf parts; the apply seam
+//! handles binary (literal/delta), rename/copy, and mode-only sections;
+//! and the `applypatch-msg` / `pre-applypatch` / `post-applypatch` hooks
+//! run via `repo_hooks`. Still explicitly refused: non-`text/plain` leaf
+//! parts, charsets other than UTF-8/us-ascii, other transfer encodings,
+//! NUL in decoded bodies, unsafe patch targets (absolute, `..`, `.libra`,
+//! symlink components, non-canonical paths), and the wider Git `am`
+//! option set (e.g. `--keep`, `--scissors`, `--whitespace`,
+//! `--interactive`).
 
 use std::{collections::HashSet, fs, str::FromStr};
 
