@@ -368,7 +368,7 @@
 - **G-05 Agent 可独立执行:** 一张卡必须能在不阅读其它卡正文的前提下被执行：`Current evidence` 给出可核对的 `file:line` 锚点，`Acceptance criteria` 自洽可判定，`Verification` 是可直接复制执行的确切命令，`Dependencies` 只引用「依赖登记表」中的 `DEP-*` / 任务 ID。禁止「见上文」「同上一卡」式跨卡隐式约定；确属跨卡共享的约定要提升为全局工程约束或 ADR。
 - **G-06 依赖闭合且无环:** 依赖必须有向无环。本计划内依赖直接引用任务 ID；跨计划与外部前置必须先在「依赖登记表」登记为 `DEP-*` 再引用，不得在卡内自由描述。互相等待、循环依赖、以及「等某个 Phase 整体完成」都是拆分错误——把依赖收敛到具体前置卡。「实施顺序」的依赖边与各卡 `Dependencies` 必须一致；不一致时以「实施顺序」为准并当场修正卡片。
 - **G-07 发布切片对齐（按任务类型）:** 默认「一张卡 = 一个发布切片」（独立 review + ER-04 门 + 版本 + 提交 + 推送）。适用范围按 `Task type`（G-11）区分：`implementation` / `migration` / `removal` 必须走完整发布切片；`docs` / `audit` / `spike` / `handoff` 卡不 bump 版本、不产出 artifact，`Release boundary` 写 `no-release` 并说明其产物随哪次发布进入用户可见渠道；`release` 卡本身就是发布点（家族卡的唯一发布点必须是 `release` 卡，见 G-08）。任何「多卡合并发布」都是例外，必须在「发布分组与并发窗口」登记 `REL-*`：成员、唯一发布点、窗口期禁止插入的内容、失败时的逆序回滚顺序。例外必须先修订计划并通过 Codex review 才可开工，**不得**在开工时凭笔记临时合并。
-- **G-07a 批量发布组（`batch-release child`）:** 当一组卡各自都是完整、可独立回滚的变更，但**逐卡发版对用户没有独立价值**（例如同一 wave 内的文档/账本/测试产物，或版本号推进会与并发计划频繁抢号）时，可登记为「批量发布组」：成员卡逐张 review、逐张通过全部适用的 A/B 门与三门、逐张提交并**推送**，但不 bump、不构建、不 tag、不产 artifact；全组共用一个唯一发布点卡（`Task type` 必须是 `release`），由它一次性完成版本面与 tag/artifact。与 G-08 家族卡的区别是**成员会推送**且各自可独立回滚（前滚补偿），因此不要求「变更不可分割」；与 G-07 默认的区别是把「发布」从每卡收敛到一次。必须在「发布分组与并发窗口」登记 `REL-*`（成员、唯一发布点、窗口规则、失败回滚顺序、理由），并在每张成员卡的 `Release boundary` 写 `batch-release child of REL-<n>`。**成员卡的 `Acceptance` 在发布点完成前不得标为 `complete`，也不得对外报告完成。**
+- **G-07a 批量发布组（`batch-release child`）:** 当一组卡各自都是完整、可独立回滚的变更，但**逐卡发版对用户没有独立价值**（例如同一 wave 内的文档/账本/测试产物，或版本号推进会与并发计划频繁抢号）时，可登记为「批量发布组」：成员卡逐张 review、逐张通过全部适用的 A/B 门与三门、逐张提交并**推送**，但不 bump、不构建、不 tag、不产 artifact；全组共用一个唯一发布点卡（`Task type` 必须是 `release`），由它一次性完成版本面与 tag/artifact。与 G-08 家族卡的区别是**成员会推送**且各自可独立回滚（前滚补偿），因此不要求「变更不可分割」；与 G-07 默认的区别是把「发布」从每卡收敛到一次。必须在「发布分组与并发窗口」登记 `REL-*`（成员、唯一发布点、窗口规则、失败回滚顺序、理由），并在每张成员卡的 `Release boundary` 写 `batch-release child of REL-<n>`，**唯一发布点卡的 `Release boundary` 写 `batch-release point of REL-<n>`**（2026-08-06 补充：该取值属 G-07a 自身，不要写成 G-08 的 `family release point`——后者的前提是「成员不推送、变更不可分割」，与本形态互斥）。**成员卡的 `Acceptance` 在发布点完成前不得标为 `complete`，也不得对外报告完成。**
 - **G-08 家族卡（不可分割变更的唯一出路）:** 当一次公开 surface 删除、或 schema 与 reader 必须同时上线这类变更确实无法切成可独立发布的切片时，用「家族卡」表达：拆成多张各自 review、各自通过全部适用 ER-04 门、各自本地提交的子卡，共用一个唯一发布点卡；**该发布点卡的 `Task type` 必须是 `release`**（不引入新行为，只做版本、构建、安装、聚合守卫与发布证据），以保证它在 ER-04 的 B 组中唯一命中 `release` 行。家族内子卡仍受除 G-07 外的全部 `G-*` 约束；子卡 `Release boundary` 写 `family child`，发布点卡写 `family release point`，家族边界与「不推送窗口」写进 `REL-*` 登记。
 - **G-09 拆分协议:** 拆分已被引用的卡时，原编号保留给主轴，新子卡在所属 Phase 末尾追加新编号，不重排既有编号。原卡必须写明「拆出 `<ID>`、`<ID>`」，新卡写明「自 `<ID>` 拆出」，并同步实施顺序、依赖登记表、「发布分组与并发窗口」、追溯表、测试矩阵、里程碑、风险表，以及「修订历史」中的一行（日期、原因、原卡、新卡、受影响引用）。
 - **G-10 写集与并发:** 写集分三类，每张卡必须声明前两类（第三类由 ER-12 统一定义，卡内不重复）：
@@ -442,6 +442,7 @@
 | 可豁免项 | 允许的理由范围 |
 |---|---|
 | G-03 条目上限 | 清单型产物（文档 / 审计 / 索引）确实需要超过本类上限，且已写明产物文件清单 |
+| G-03 条目上限（**门族型验收**，2026-08-06 扩充） | `implementation` 卡的验收本质是**同一恢复轴上的机械门族/fixture 清单**（净室、schema、绑定、投影、锁等），逐门计数必然超过本类上限，而按门拆卡会违反 G-01/G-02（同一行为轴的实现/测试/文档不得拆散）与「碎片卡」反模式。准入条件（缺一不可）：① 每个门都是**可复制执行的具名命令**，失败即整卡不达标；② 门族清单在卡内「判据规范（非计数正文）」块逐条枚举；③ 分子如实写作 `n/上限@EX-ID`，不得以合并长句掩盖；④ 门族增减时同批更新 waiver 行与粒度审计表 |
 | G-04 规模上限（`L-exception`） | 不可拆的机械变更：全仓重命名、批量删除、格式化 |
 | ER-07 签名要求 | 仓库策略层面的具名豁免（sign-off-only） |
 
@@ -456,7 +457,7 @@
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `<ID>` | `<Task type>` | `<行为轴>` | `<恢复动作>` | `<yes>` | `<yes>` | `<n/上限[@EX-ID]>` | `<n/上限[@EX-ID]>` | `<n>/<n>` | `<S/M/L-exception:EX-n>` | `<TASK-ID/DEP-ID/none>` | `<no-overlap/序列化于 ID>` | `<independent/REL-n child/REL-n point/no-release>` | `<ID/N/A>` | `<EX-ID/N/A>` |
+| `<ID>` | `<Task type>` | `<行为轴>` | `<恢复动作>` | `<yes>` | `<yes>` | `<n/上限[@EX-ID]>` | `<n/上限[@EX-ID]>` | `<n>/<n>` | `<S/M/L-exception:EX-n>` | `<TASK-ID/DEP-ID/none>` | `<no-overlap/序列化于 ID>` | `<independent/batch-release child/batch-release point/family child/family release point/no-release>` | `<ID/N/A>` | `<EX-ID/N/A>` |
 
 #### Verification 判定口径
 
@@ -530,11 +531,11 @@
 
 **Version increment:** `<patch（默认）| minor | major | N/A>`（ER-08）
 
-**Release boundary:** `<independent（默认）| batch-release child of REL-<n>（G-07a：推送但不发版）| family child of REL-<n>（k/n）| family release point of REL-<n> | no-release（docs/audit/spike/handoff）>`（合并发布须先按 G-07/G-07a 登记 `REL-*`）
+**Release boundary:** `<independent（默认）| batch-release child of REL-<n>（G-07a：推送但不发版）| batch-release point of REL-<n>（G-07a 的唯一发布点，`Task type` 必须为 `release`）| family child of REL-<n>（k/n）| family release point of REL-<n>（G-08 家族卡专用）| no-release（docs/audit/spike/handoff）>`（合并发布须先按 G-07/G-07a 登记 `REL-*`）
 
 **C/D coverage from:** `<self（自行执行 C 组）| <TASK-ID>（继承该发布点/收口点的 C 覆盖与其 D 组）>`（ER-04；`family child` 与 `no-release` 卡必填具体 ID，不得留空）
 
-**Granularity:** `type=<Task type>; axis=<本卡唯一的行为轴>; recovery=<失败/撤回时的单一恢复动作与恢复后的自洽状态>; complete=<yes：实现+测试+文档+索引同步都在本卡内>; self-contained=<yes：不读其它卡正文即可执行>; AC=<n>/<上限>[@EX-ID]; VER=<n>/<上限>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|序列化于 TASK-ID>; release=<independent|REL-n child|REL-n point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,EX-ID…]|N/A>`
+**Granularity:** `type=<Task type>; axis=<本卡唯一的行为轴>; recovery=<失败/撤回时的单一恢复动作与恢复后的自洽状态>; complete=<yes：实现+测试+文档+索引同步都在本卡内>; self-contained=<yes：不读其它卡正文即可执行>; AC=<n>/<上限>[@EX-ID]; VER=<n>/<上限>[@EX-ID]; landing=<n>; prod-files=<n>; scope=<S|M|L-exception:EX-n>; deps=<none|TASK-ID,…|DEP-ID,…>; writeset=<no-overlap|序列化于 TASK-ID>; release=<independent|batch-release child|batch-release point|family child|family release point|no-release>; split-from=<TASK-ID|N/A>; exception=<EX-ID[,EX-ID…]|N/A>`
 
 字段与规则的对应：`type`→G-11，`axis`/`recovery`→G-01，`complete`→G-02，`AC`/`VER`→G-03（分母按 G-03 的 Task type 上限表取值：代码卡与 spike 为 8，`release` 为 12，docs/audit/handoff 为 20；ER-04 的强制门不计入）。**超限只有一种合规写法**：`AC=21/20@EX-01` —— 分子超过分母时必须紧跟豁免该列的 `EX-ID`，否则审计判为不达标；一张卡可同时需要多个豁免，`exception` 用逗号分隔并逐个说明所豁免的列，`landing`/`prod-files`/`scope`→G-04，`self-contained`→G-05，`deps`→G-06，`release`→G-07/G-08，`split-from`→G-09，`writeset`→G-10，`exception`→已登记的 `EX-*`。这一行是 `G-*` 的机器可核对摘要，ER-03 开工前逐字段核对；写不出来就说明卡还没拆干净。计划级汇总见「任务卡粒度审计表」。
 
