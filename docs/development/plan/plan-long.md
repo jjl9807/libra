@@ -4,7 +4,7 @@
 
 本文是 Libra 不绑定具体发布日期和版本号的长期能力组合路线图。它回答「哪些能力值得长期投资、为什么、依赖什么、何时具备进入日期计划的条件」，不是 release 承诺、owner 清单或逐项实施任务表。具体设计、迁移、拆分、发布和回滚只进入按日期计划或后续 RFC/ADR。
 
-**本次改版（2026-08-07，第五次竞品审计）**：按 `/Volumes/Data/competition` 下全部直接仓库的最新事实，把长期能力重组为三类——**版本管理**、**Agent 生成代码**、**Memory**。每类列出最要完成的任务；既有 `CT-*` / `UP-*` / `LR-*` / `SB-*` 编号保留并归入对应类；Memory 类新增 `MEM-*` 编号。详细实施切片仍由日期计划承接。
+**本次改版（2026-08-07，第六次竞品审计）**：按 `/Volumes/Data/competition` 下全部直接仓库的最新事实，把长期能力重组为三类——**版本管理**、**Agent 生成代码**、**Memory**。每类列出最要完成的任务；既有 `CT-*` / `UP-*` / `LR-*` / `SB-*` 编号保留并归入对应类；Memory 类新增 `MEM-*` 编号。详细实施切片仍由日期计划承接。
 
 状态定义：
 
@@ -37,15 +37,15 @@
 
 ## 本次竞品审计快照
 
-审计时间：**2026-08-07（第五次）**。范围严格限定为 `/Volumes/Data/competition/*/*` 直接两层仓库（26 个）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时 `git fetch` + `git pull --ff-only`；Libra 仓库在 `libra status --short` 为空时 `libra pull --ff-only`。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。
+审计时间：**2026-08-07（第六次）**。范围严格限定为 `/Volumes/Data/competition/*/*` 直接两层仓库（30 个）。Git 仓库在 `git status --porcelain` 为空且有 upstream 时 `git fetch` + `git pull --ff-only`；Libra 仓库在 `libra status --short` 为空时 `libra pull --ff-only`。`blocked-*` 只表示本地 revision 可读，**不**表示已更新到远端最新。
 
 | 竞品 | 归类 | 分支 | 审计 revision | 更新结果 | 证据入口 |
 |---|---|---|---|---|---|
-| `facebook/sapling` | 版本管理 | `main` | `5068ec9fe3b` | 已是最新 | EdenFS / worktree / Smartlog |
+| `facebook/sapling` | 版本管理 | `main` | `119e6d1f75d` | **fast-forward** `5068ec9fe3b`→`119e6d1f75d` | EdenFS / worktree / Smartlog、Crewmate 授权钩子 |
 | `jj-vcs/jj` | 版本管理 | `main` | `786e65a1e` | 已是最新 | operation、ChangeId、一等冲突 |
 | `GitButler/gitbutler` | 版本管理 | `master` | `9e3b2a7c2a` | 已是最新 | workspace、change ID、Forge lite panel |
 | `GitButler/grit` | 版本管理 | `main` | `dfb079967` | 已是最新 | 上游 Git 套件驱动的兼容治理 |
-| `epicgames/lore` | 版本管理 | `main` | `6c00af0` | **fast-forward** `63ab3e3`→`6c00af0` | batch revision-tree、storage lifecycle |
+| `epicgames/lore` | 版本管理 | `main` | `afef703` | **fast-forward** `6c00af0`→`afef703` | batch revision-tree、storage lifecycle、layer 未修改不 pin |
 | `git/git` | 版本管理（参考基线） | `master` | `2c78326f81` | 已是最新 | protocol / reftable / `t/` 套件 |
 | `go-git/go-git` | 版本管理（架构参考） | `main` | `d6cbbfaa` | 已是最新 | 兼容缺口矩阵、storage conformance |
 | `go-git/go-billy` | 版本管理（架构参考） | `main` | `6c0a968` | 已是最新 | FS 抽象与 capability |
@@ -67,28 +67,36 @@
 | `graphwisdom/perstate` | Memory | `master` | `95e27e3` | 已是最新 | git-native personality/state |
 | `letta-ai/agent-file` | Memory | `main` | `78212eb` | 已是最新 | `.af` 有状态 Agent 可移植格式 |
 | `letta-ai/skills` | Memory | `main` | `16352df` | 已是最新 | 社区 skill 知识库 |
+| `matrixorigin/Memoria` | Memory | `main` | `54c9114` | 已是最新 | 记忆 snapshot/branch/merge/rollback、MCP |
+| `sachinsharma9780/memweave` | Memory | `main` | `2ff82df` | 已是最新 | Markdown+SQLite 索引、零外部服务 |
+| `sl4m3/ledgermind` | Memory | `main` | `99220d1` | 已是最新 | 自演进记忆管理（反例） |
+| `sqliteai/sqlite-memory` | Memory | `main` | `0f0aede` | 已是最新 | SQLite 混合检索、离线同步 |
 
 | 审计日期 | 仓库数 | 更新摘要 | 路线图结论 |
 |---|---:|---|---|
+| 2026-08-07（第六次） | 30 | 2 个 fast-forward（Lore、Sapling）、27 个已是最新、1 个 `blocked-dirty`（agenta）；新纳入 `matrixorigin/Memoria`、`memweave`、`ledgermind`、`sqlite-memory`（4 个 Memory 参考） | **无优先级变化。** Memory 类证据面加厚：Memoria 直接给出记忆版本化（snapshot/branch/merge/rollback）证据；CT-01 仍是下一个执行任务，MEM-01/MEM-02 维持已验证。 |
 | 2026-08-07（第五次） | 26 | 1 个 fast-forward（Lore）、24 个已是最新、1 个 `blocked-dirty`（agenta）；首次按三类重组；新纳入 `letta-ai/*`（5）与 `rohitg00/agentmemory` | **结构重组。** Memory 升格为第一类长期能力（`MEM-*`）；Agent 生成代码与版本管理分列。CT-01 仍是版本管理类下一个执行任务；MEM-01 为 Memory 类首个验证任务。 |
 | 2026-08-02（第四次） | 20 | 9 个 fast-forward、10 个已是最新、1 个 blocked-dirty | 无优先级变化 |
 | 2026-07-31（第三次） | 20 | 10 个 fast-forward、9 个已是最新、1 个首次纳入 | 无优先级变化 |
 
-**本次结论：** 竞品格局已明显三分。版本管理侧仍由 Jujutsu / GitButler / Sapling / Lore / Grit 定义正确性与规模问题；Agent 生成代码侧由 Entire / Mainline / Grok Build / Letta Code / research-git 定义 session、intent、runtime 与实验谱系；Memory 侧由 agentmemory / fava-trails / Letta MemFS·`.af` / perstate 定义跨会话召回与巩固——Libra 此前只把后者当「相邻参考」，本轮升格为可排期能力类。`agenta-ai/agenta` 因 dirty 不作最新证据。
+**本次结论：** 竞品格局已明显三分。版本管理侧仍由 Jujutsu / GitButler / Sapling / Lore / Grit 定义正确性与规模问题；Agent 生成代码侧由 Entire / Mainline / Grok Build / Letta Code / research-git 定义 session、intent、runtime 与实验谱系；Memory 侧由 agentmemory / fava-trails / Letta MemFS·`.af` / perstate 定义跨会话召回与巩固——Libra 此前只把后者当「相邻参考」，本轮升格为可排期能力类。`agenta-ai/agenta` 因 dirty 不作最新证据。第六次审计新纳入 `Memoria` / `memweave` / `ledgermind` / `sqlite-memory` 四个 Memory 参考，Memory 侧证据面继续加厚，但未改变 CT-01 / MEM-01 的优先顺序。
 
 本轮竞品要点：
 
-- **Lore `6c00af0`**：batch verb 的 batch id / entry id 命名分离；继续支持 LR-09 的批量 materialization 与生命周期证据。
+- **Lore `afef703`**：修复 `stage --scan` 对未修改 layer 误写 staged pin（`NothingStaged` / branch switch 拒绝）并补齐 layer branch latest 指针；继续支持 LR-09 的批量 materialization 与生命周期证据。
 - **GitButler `9e3b2a7c2a`**：Forge lite panel、land reconcile、schema bump 护栏；继续强化 LR-03/LR-08。
+- **Sapling `119e6d1f75d`**：Crewmate 私有目录授权钩子（分片 identity 布局、默认 deny、有界授权扇出、诊断日志）；是 SB-02 fail-closed 授权的补充证据。
 - **Jujutsu `786e65a1e`**：冲突 materialize 尾 CR 修复、merge API 重构、async common ancestors；继续强化 LR-02/LR-05。
 - **Entire `b329335`**：Codex resume 关闭原会话、checkpoint_remote 归属、gitignore status 性能；强化 AG/LR-06 的 checkpoint 可靠性。
 - **Mainline `5704305`**：preflight 限制单条文件证据大小、聚焦本机 worktree 活跃冲突；强化 LR-07。
 - **agentmemory `d60652a`（首次纳入）**：四层巩固（working/episodic/semantic/procedural）、BM25+vector+graph 混合检索、54 MCP tools、跨 Agent hooks、隐私过滤、Git snapshot；是 MEM-* 的主证据源。
 - **Letta Code / agent-file / skills / trajectory（首次纳入）**：有状态 harness、MemFS（git 跟踪 memory blocks）、`.af` 可移植状态、trajectory 归一化、skill 社区库；分别支撑 Agent 生成代码与 Memory 两类。
+- **Memoria / memweave / ledgermind / sqlite-memory（首次纳入，4 个）**：Memoria 直接做「记忆的 snapshot/branch/merge/rollback」并带 MCP；memweave 是 Markdown 文件 + SQLite 索引的零外部服务库；sqlite-memory 提供 SQLite 混合检索与离线同步；ledgermind 的「自演进」作不可审计反例。分别支撑 MEM-01/MEM-02/MEM-05 证据，不改变优先级。
 - **fava-trails `6653f9f`**：Trust Gate 可配置 provider + doctor；是 MEM-03 团队晋升门禁的设计参考，不是 Libra 并发模型。
 
-Libra 自身（`HEAD` `0848edd`，`Cargo.toml` version `0.19.101`）：
+Libra 自身（`HEAD` `1a200a9`，`Cargo.toml` version `0.19.101`）：
 
+- `0848edd`→`1a200a9` 仅 `docs(plan)` 提交（三类重组与 CT-01 对齐），无代码变更；复核时工作区另有未提交 WIP，本文基线只取已提交 HEAD。
 - Part B R0 / Part C W1–W2 / registry v2 / Agent lease / W4 list|show 等已合入事实不变；LR-01 仍实施中。
 - Agent session/checkpoint/skill/review 捕获面已存在；尚无一等 Memory 引擎（混合检索、四层巩固、跨 Agent 共享记忆）。
 - CT-01 / UP-01 / SB-01..SB-04 优先级与完成判据不变。
@@ -163,7 +171,7 @@ flowchart LR
 |---|---|---:|---|---|
 | **CT-01** | 上游 Git 套件驱动的兼容性证据账本 | P0 | 已验证（**下一个执行任务**） | 兼容仍是自证；首批可执行范围见 [`plan-20260729.md`](plan-20260729.md)（S0 + S1 前两项 + S3 + S4 首个 wave）；机制归 [`../gap/grit-gap.md`](../gap/grit-gap.md) GGT-00A |
 | **UP-01** | 官方签名自动升级链 | P0 | 实施中（CT-01 之后） | 客户端 inert；缺 release-key ceremony、签名 job、`install.sh` 验签 |
-| **LR-01** | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | W1–W2/lease/list|show 已合入；缺 capture/export ownership、doctor、崩溃矩阵、parallel lanes |
+| **LR-01** | 完整多工作区隔离与并行 Agent 工作区 | P0 | 实施中 | W1–W2/lease/list\|show 已合入；缺 capture/export ownership、doctor、崩溃矩阵、parallel lanes |
 | **LR-02** | 全命令 Operation Log、完整快照与 Undo/Redo | P0 | 已验证 | mutation 覆盖与 index/worktree/sequencer snapshot 不完整 |
 | **LR-03** | 稳定 Change ID 与历史重写谱系 | P0 | 已验证 | 无稳定 change identity / 持久 lineage |
 | **LR-04** | 非交互 Hunk API、归属与 Stack 编辑 | P0 | 已验证 | 有只读 hunk；无稳定 ID、assignment、mutation |
@@ -261,6 +269,10 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 | **Letta agent-file / MemFS / skills** | 可移植 Agent 状态（`.af`）、git 跟踪的 memory blocks、skill 分层加载 | 把 harness 自改造成产品主线 |
 | **perstate** | branch-as-identity、人格/状态持久化场景 | shell 自动 pull/push 当并发安全模型 |
 | **agentic-flow** | 编排侧对共享记忆/trajectory 的需求信号 | 宣传性 QuantumDAG；不可移植封装 |
+| **Memoria** | 记忆的 snapshot/branch/merge/rollback 与 MCP 面 | 「Git for memory」宣传口径；平行 DB 默认同步 |
+| **memweave** | Markdown 文件 + SQLite 索引、零外部服务、recall 基线 | 单机库形态不替代 Libra VCS-native 边界 |
+| **ledgermind** | 自演进记忆管理（反例：自主变异不可审计） | 无监督自主改写当默认行为 |
+| **sqlite-memory** | Markdown + SQLite 混合检索、离线同步 | 默认上传托管服务 |
 
 ### 为什么现在升格
 
@@ -448,7 +460,7 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需。
 - 以「更接近 100% Git flag parity」为唯一理由的长尾 flag（submodule 全家桶、octopus、reftable 互操作等）——登记在兼容文档与 CT-01 账本 `declined`，不自动提级。
 - 复制 Agenta 的 prompt/workflow 应用版本平台。
 - 复制 Grok/Letta 的完整产品外壳或自修改 harness 哲学。
-- 把 fava-trails 单仓锁或 agentmemory 的平行 DB 当 Libra 并发/存储模型。
+- 把 fava-trails 单仓锁或 agentmemory / Memoria / ledgermind 的平行 DB 当 Libra 并发/存储模型。
 - 逐字迁移 Grit/Git GPLv2 测试资产（CT-01 净室边界）。
 - 未冻结的 agent-trace RFC 直接写进默认 commit 元数据。
 
