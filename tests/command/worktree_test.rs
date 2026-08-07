@@ -127,6 +127,60 @@ fn assert_worktree_error(output: &std::process::Output, error_code: &str) -> Cli
     report
 }
 
+/// §C.8 (W4 review): the `worktree list` JSON data half carries its OWN
+/// `schema_version` (the global `--json` flag never selects a schema), the
+/// v2 fields are present, `--schema-version 2` is the explicit spelling of
+/// the default, and an unsupported version is refused with LBR-CLI-002 —
+/// never answered with a shape lie.
+#[tokio::test]
+#[serial]
+async fn test_worktree_list_schema_version_surface() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", "wt_sv"], repo_dir.path()),
+        "worktree add",
+    );
+
+    for args in [
+        vec!["--json", "worktree", "list"],
+        vec!["--json", "worktree", "list", "--schema-version", "2"],
+    ] {
+        let output = run_libra_command(&args, repo_dir.path());
+        assert_cli_success(&output, "json worktree list");
+        let parsed = parse_json_stdout(&output);
+        assert_eq!(
+            parsed["data"]["schema_version"], 2,
+            "the data half names its schema: {parsed}"
+        );
+        let entry = parsed["data"]["worktrees"]
+            .as_array()
+            .expect("worktrees array")
+            .iter()
+            .find(|entry| entry["is_main"] == false)
+            .expect("linked entry")
+            .clone();
+        assert!(
+            entry["worktree_id"].is_string() && entry["layout"].is_string(),
+            "v2 fields present: {entry}"
+        );
+    }
+
+    let refused = run_libra_command(
+        &["--json", "worktree", "list", "--schema-version", "1"],
+        repo_dir.path(),
+    );
+    assert!(
+        !refused.status.success(),
+        "an unavailable schema version is refused, not faked"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("LBR-CLI-002"),
+        "stable code: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_worktree_list_json_outputs_structured_entries() {

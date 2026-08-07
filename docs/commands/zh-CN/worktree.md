@@ -77,25 +77,89 @@ libra --machine worktree list
 
 ### 子命令：`doctor`
 
-报告每个 worktree 的 scope 诊断。**严格只读**（plan-20260714 Part C W0 §C.11）：
-调用前后 registry、数据库、lease 状态与文件系统逐字节不变。诊断命令必须能安全地
-在一个你尚未理解的仓库上运行——那正是你会用到它的时刻——所以它绝不自行 adopt、
-reclaim 或修复。修复动作是独立的显式子命令；任何错误提示都不会承诺裸 `doctor`
-会修好什么。
+诊断 Agent **workspace** scope。普通调用**严格只读**（plan-20260714 Part C W0
+§C.11）：只报告、绝不修复——不会写入任何行、registry 条目、lease 或文件，
+调用前后 registry、数据库、lease 状态与文件系统逐字节不变。诊断命令必须能
+安全地在一个你尚未理解的仓库上运行——那正是你会用到它的时刻——所以裸
+`doctor` 绝不自行 adopt、reclaim 或修复，任何错误提示都不会承诺裸 `doctor`
+会修好什么；唯一的例外是下表中单独命名、需 `--confirm` 的变更操作。
+（Libra 专有；Git 无对应命令。）
+
+*workspace* 是 Agent runtime 接管某个 worktree 时建立的关联记录（见 `libra agent workspace list`）。人类使用 linked worktree 从不需要它，因此没有 Agent 活动的仓库不会报告任何内容。
+
+| 参数 / 选项 | 说明 |
+|-------------|------|
+| `<workspace-id>` | 只诊断一个 workspace，而不是分页遍历全部。不能与 `--limit`/`--cursor` 同时使用（单 scope 不是一页）——组合使用是用法错误 `LBR-CLI-002`。 |
+| `--limit <n>` | 每页最多返回的诊断条数。默认 50，上限 500。 |
+| `--cursor <cursor>` | 从上一页继续：原样回传 `next_cursor` 的值。cursor 是 opaque 的；非本命令签发的 cursor 会以 `LBR-WORKTREE-001` 拒绝，而不是悄悄从第一页重来。 |
+| `--adopt-capture-session <session-id>` | 明确归属一个 `legacy_unknown` 的历史 capture session。必须同时给出 `<workspace-id>` 和 `--confirm`，不能和 `--limit`/`--cursor` 组合。它是单独的变更操作；不带该选项的 doctor 始终只读。 |
+| `--adopt-info-to <worktree-path>` | W0 §C.4.1.1：把仓库共享存储（main 的 `.libra/info/*`）中的 `info/exclude`/`info/attributes` 显式复制进**一个** linked worktree 自己的 gitdir——绝不自动、绝不覆盖已存在的目标文件。需要 `--confirm`。 |
+| `--clear-common-info` | 删除共享存储中的 `.libra/info/exclude` 与 `info/attributes`（这些规则自 W0 起只作用于 main worktree；显式清除表示它们不应再作用于任何地方）。需要 `--confirm`。 |
+| `--confirm` | 确认一项 doctor 变更操作（capture 归属、info 文件 adopt/clear）。 |
+
+每条诊断报告该 workspace 的身份（`workspace_id`、`repo_id`、`path`、`worktree_id`）、`lease_state`（`none`/`held`/`expired`），以及 `scope_diagnostics` 发现列表。每项发现带稳定的 `code` 与 `severity`（`warning` 或 `error`）：
+
+| Code | Severity | 含义 |
+|------|----------|------|
+| `foreign_repository_identity` | error | 该记录写于此前的仓库身份下：常规列表看不到它，且它会阻塞新 workspace 注册。 |
+| `registry_path_mismatch` | error | worktree registry 与 workspace 记录对 scope 所在路径的说法不一致。 |
+| `scope_layout_corrupt` | error | 该路径的 gitdir 布局无法识别。 |
+| `workspace_orphaned` | warning | 拆除失败或 owner 消失；该 workspace 仍持有恢复状态。 |
+| `lease_expired` | warning | lease 期限已过。在被显式回收之前，lease 仍属于其 owner。 |
+| `workspace_path_missing` | warning | 声称的路径上没有目录。 |
+| `registry_entry_missing` | warning | 没有 worktree registry 条目拥有该 scope。 |
+| `registry_entry_detached` | warning | 该 worktree 已被 `worktree remove`（保留目录）注销。 |
+| `registry_entry_tombstoned` | warning | 目录已删除但其 scoped 行仍待清理；`libra worktree repair --confirm` 会重试。 |
+| `scope_layout_legacy_symlink` | warning | 该 worktree 仍是隔离布局之前的共享 `.libra` 符号链接布局；用 `libra worktree repair --migrate-layout --confirm` 迁移。 |
+
+完全无法读取的 scope——无法解析的 registry、不可读的记录、缺失的仓库身份——一律以 `LBR-WORKTREE-002` fail-closed，而不是给出残缺诊断。
 
 ```bash
 libra worktree doctor
 libra --json worktree doctor
+libra --json worktree doctor --limit 20
+libra --json worktree doctor --cursor "$cursor"
+libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
 ```
 
-对每个 worktree 报告磁盘 `layout` 与生命周期 `state`（与 `worktree list` 同一套
-取值）、该 worktree 自身的身份是否仍为 registry 所知（`identity_registered`），
-以及逐条说明处置方式的 `findings` 列表——例如 legacy-symlink 布局需要
-`worktree repair --migrate-layout --confirm`，或 `.libra/worktree_id` 与 registry 不符的
-worktree 需要先 `worktree repair --confirm` 才会接受 mutation。
+迁移 `2026080401` 会把旧版未保存 scope 的 capture 行标成
+`legacy_unknown`，而不是猜测它们属于主 worktree；因此 hook 和历史导入会
+fail-closed。确认原始 session 与目标 workspace 后，唯一的归属路径是：
 
-结构化输出使用 `worktree.doctor` 命令信封，含 `schema_version`、`diagnostics[]`
-与 `next_cursor`（当前恒为 `null`；分页随 W4 机器接口交付）。
+```bash
+libra worktree doctor <workspace-id> \
+  --adopt-capture-session <session-id> --confirm
+```
+
+目标 workspace 必须持有当前 live lease fence。该命令会把同一 provider
+session 的全部 legacy capture 行（session、export job、import identity）归入
+该仓库/worktree/workspace fence；若该 provider session 已有任何 scoped 行则
+拒绝，随后写入一条不可变 audit 记录。操作不可撤销。其 JSON 使用独立的
+`worktree.doctor.adopt_capture` envelope；只读 `worktree.doctor` 的分页 schema
+不变。通常传入 catalog session id；若 export/import 行在 catalog session 已
+清理后仍保留，则传入 provider session id 以恢复该 orphan 行。
+
+**Legacy 共享 info 文件**（W0 §C.4.1.1）：`info/exclude` 与 `info/attributes`
+改为 worktree 本地后，共享存储（main 的 `.libra/info/*`）中的文件只作用于
+main worktree。存在 linked worktree 时，只读报告会在 main 条目上说明这一点，
+并给出两个显式、需确认的操作（绝不自动复制）：
+
+```bash
+# 把 main 的 info/exclude + info/attributes 复制进一个 linked worktree
+# 自己的 gitdir（已存在的目标文件保留、绝不覆盖）：
+libra worktree doctor --adopt-info-to <worktree-path> --confirm
+
+# 从共享存储删除它们（这些规则不再作用于任何地方）：
+libra worktree doctor --clear-common-info --confirm
+```
+
+两者在任何副作用之前都要求 `--confirm`，并与其它 mutating repair 操作一样
+运行在同一条 operation-log audit 边界内。`--json`/`--machine` 模式下各自使用
+独立 envelope——`worktree.doctor.adopt_info`（`data.target` + `data.report`）
+与 `worktree.doctor.clear_common_info`（`data.report`）——只读
+`worktree.doctor` 分页 schema 保持不变。只读报告的文本条目还会列出每个
+worktree 实际生效的本地 info 来源（如 `.libra/info/exclude`，双布局树还包括
+`.git/info/exclude`）。
 
 ### 子命令：`lock`
 
@@ -223,85 +287,6 @@ libra --json worktree repair --confirm
 libra worktree repair --confirm ../experiment
 libra --json worktree repair --confirm ../experiment
 ```
-
-### 子命令：`doctor`
-
-诊断 Agent **workspace** scope。普通调用**只读**：只报告、绝不修复——不会写入任何行、registry 条目、lease 或文件。（Libra 专有；Git 无对应命令。）
-
-*workspace* 是 Agent runtime 接管某个 worktree 时建立的关联记录（见 `libra agent workspace list`）。人类使用 linked worktree 从不需要它，因此没有 Agent 活动的仓库不会报告任何内容。
-
-| 参数 / 选项 | 说明 |
-|-------------|------|
-| `<workspace-id>` | 只诊断一个 workspace，而不是分页遍历全部。不能与 `--limit`/`--cursor` 同时使用（单 scope 不是一页）——组合使用是用法错误 `LBR-CLI-002`。 |
-| `--limit <n>` | 每页最多返回的诊断条数。默认 50，上限 500。 |
-| `--cursor <cursor>` | 从上一页继续：原样回传 `next_cursor` 的值。cursor 是 opaque 的；非本命令签发的 cursor 会以 `LBR-WORKTREE-001` 拒绝，而不是悄悄从第一页重来。 |
-| `--adopt-capture-session <session-id>` | 明确归属一个 `legacy_unknown` 的历史 capture session。必须同时给出 `<workspace-id>` 和 `--confirm`，不能和 `--limit`/`--cursor` 组合。它是单独的变更操作；不带该选项的 doctor 始终只读。 |
-| `--adopt-info-to <worktree-path>` | W0 §C.4.1.1：把仓库共享存储（main 的 `.libra/info/*`）中的 `info/exclude`/`info/attributes` 显式复制进**一个** linked worktree 自己的 gitdir——绝不自动、绝不覆盖已存在的目标文件。需要 `--confirm`。 |
-| `--clear-common-info` | 删除共享存储中的 `.libra/info/exclude` 与 `info/attributes`（这些规则自 W0 起只作用于 main worktree；显式清除表示它们不应再作用于任何地方）。需要 `--confirm`。 |
-| `--confirm` | 确认一项 doctor 变更操作（capture 归属、info 文件 adopt/clear）。 |
-
-每条诊断报告该 workspace 的身份（`workspace_id`、`repo_id`、`path`、`worktree_id`）、`lease_state`（`none`/`held`/`expired`），以及 `scope_diagnostics` 发现列表。每项发现带稳定的 `code` 与 `severity`（`warning` 或 `error`）：
-
-| Code | Severity | 含义 |
-|------|----------|------|
-| `foreign_repository_identity` | error | 该记录写于此前的仓库身份下：常规列表看不到它，且它会阻塞新 workspace 注册。 |
-| `registry_path_mismatch` | error | worktree registry 与 workspace 记录对 scope 所在路径的说法不一致。 |
-| `scope_layout_corrupt` | error | 该路径的 gitdir 布局无法识别。 |
-| `workspace_orphaned` | warning | 拆除失败或 owner 消失；该 workspace 仍持有恢复状态。 |
-| `lease_expired` | warning | lease 期限已过。在被显式回收之前，lease 仍属于其 owner。 |
-| `workspace_path_missing` | warning | 声称的路径上没有目录。 |
-| `registry_entry_missing` | warning | 没有 worktree registry 条目拥有该 scope。 |
-| `registry_entry_detached` | warning | 该 worktree 已被 `worktree remove`（保留目录）注销。 |
-| `registry_entry_tombstoned` | warning | 目录已删除但其 scoped 行仍待清理；`libra worktree repair --confirm` 会重试。 |
-| `scope_layout_legacy_symlink` | warning | 该 worktree 仍是隔离布局之前的共享 `.libra` 符号链接布局；用 `libra worktree repair --migrate-layout --confirm` 迁移。 |
-
-完全无法读取的 scope——无法解析的 registry、不可读的记录、缺失的仓库身份——一律以 `LBR-WORKTREE-002` fail-closed，而不是给出残缺诊断。
-
-```bash
-libra worktree doctor
-libra --json worktree doctor --limit 20
-libra --json worktree doctor --cursor "$cursor"
-libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
-```
-
-迁移 `2026080401` 会把旧版未保存 scope 的 capture 行标成
-`legacy_unknown`，而不是猜测它们属于主 worktree；因此 hook 和历史导入会
-fail-closed。确认原始 session 与目标 workspace 后，唯一的归属路径是：
-
-```bash
-libra worktree doctor <workspace-id> \
-  --adopt-capture-session <session-id> --confirm
-```
-
-目标 workspace 必须持有当前 live lease fence。该命令会把同一 provider
-session 的全部 legacy capture 行（session、export job、import identity）归入
-该仓库/worktree/workspace fence；若该 provider session 已有任何 scoped 行则
-拒绝，随后写入一条不可变 audit 记录。操作不可撤销。其 JSON 使用独立的
-`worktree.doctor.adopt_capture` envelope；只读 `worktree.doctor` 的分页 schema
-不变。通常传入 catalog session id；若 export/import 行在 catalog session 已
-清理后仍保留，则传入 provider session id 以恢复该 orphan 行。
-
-**Legacy 共享 info 文件**（W0 §C.4.1.1）：`info/exclude` 与 `info/attributes`
-改为 worktree 本地后，共享存储（main 的 `.libra/info/*`）中的文件只作用于
-main worktree。存在 linked worktree 时，只读报告会在 main 条目上说明这一点，
-并给出两个显式、需确认的操作（绝不自动复制）：
-
-```bash
-# 把 main 的 info/exclude + info/attributes 复制进一个 linked worktree
-# 自己的 gitdir（已存在的目标文件保留、绝不覆盖）：
-libra worktree doctor --adopt-info-to <worktree-path> --confirm
-
-# 从共享存储删除它们（这些规则不再作用于任何地方）：
-libra worktree doctor --clear-common-info --confirm
-```
-
-两者在任何副作用之前都要求 `--confirm`，并与其它 mutating repair 操作一样
-运行在同一条 operation-log audit 边界内。`--json`/`--machine` 模式下各自使用
-独立 envelope——`worktree.doctor.adopt_info`（`data.target` + `data.report`）
-与 `worktree.doctor.clear_common_info`（`data.report`）——只读
-`worktree.doctor` 分页 schema 保持不变。只读报告的文本条目还会列出每个
-worktree 实际生效的本地 info 来源（如 `.libra/info/exclude`，双布局树还包括
-`.git/info/exclude`）。
 
 ## 常用命令
 

@@ -6085,6 +6085,83 @@ fn registry_v2_old_binary_refuses_before_rewrite() {
     );
 }
 
+/// W4/W3 lease gates, both directions (§C.7): an UNEXPIRED agent lease on a
+/// linked worktree refuses `worktree remove`; letting it EXPIRE really
+/// unblocks (the refusal hint promises it); and a worktree with NO lease —
+/// the human path — was never affected.
+#[test]
+fn remove_is_lease_gated_and_expiry_unblocks() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-leased");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let wt_canonical = wt.canonicalize().expect("canonical wt");
+    let wt_id = std::fs::read_to_string(wt.join(".libra").join("worktree_id"))
+        .expect("id")
+        .trim()
+        .to_string();
+    let repo_id = String::from_utf8_lossy(
+        &run_libra_command(&["config", "get", "libra.repoid"], main).stdout,
+    )
+    .trim()
+    .to_string();
+
+    // A live agent lease, far from expiring.
+    let far = 4_000_000_000_000i64;
+    assert!(
+        sqlite_exec(
+            &main.join(".libra").join("libra.db"),
+            &[&format!(
+                "INSERT INTO workspace_record (workspace_id, repo_id, kind, worktree_id, path, \
+                 owner_kind, owner_id, state, lease_owner, lease_fence, lease_expires_at, \
+                 created_at, updated_at) VALUES ('ws-gate', '{repo_id}', 'linked', '{wt_id}', \
+                 '{}', 'agent', 'agent-x', 'active', 'agent-x', 3, {far}, 1, 1);",
+                wt_canonical.display()
+            )],
+        ),
+        "plant the live lease"
+    );
+
+    let refused = run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main);
+    assert!(
+        !refused.status.success(),
+        "an unexpired agent lease refuses remove"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("ws-gate"),
+        "and the refusal names the workspace: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // EXPIRE the lease: remove now proceeds — the hint's "let it expire"
+    // must be true even though no scavenger ever ran.
+    assert!(
+        sqlite_exec(
+            &main.join(".libra").join("libra.db"),
+            &["UPDATE workspace_record SET lease_expires_at = 2 WHERE workspace_id = 'ws-gate';"],
+        ),
+        "expire the lease"
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "an expired lease no longer blocks",
+    );
+
+    // The human path: a second worktree with NO lease removes untouched.
+    let wt2 = main.join("wt-unleased");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt2.to_str().unwrap()], main),
+        "worktree add 2",
+    );
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt2.to_str().unwrap()], main),
+        "no lease, no refusal",
+    );
+}
+
 /// v2 identity invariants (§C.7): a v2 registry whose linked entry lost its
 /// persisted id is CORRUPT — readers and mutators refuse it (never silently
 /// falling back to the mutable gitdir) until the explicit no-arg

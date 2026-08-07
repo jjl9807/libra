@@ -1756,6 +1756,114 @@ async fn expired_lease_sweep_is_bounded_and_ordered() {
     assert_eq!(bounded.len(), 2, "the sweep respects its bound");
 }
 
+/// §C.12 named regression `task_worktree_orphan_recovered_without_raw_payload`
+/// (W4): an agent CRASHES holding a task-worktree lease — no release, no
+/// abandon ever runs. The composite recovery contract: the expiry sweep
+/// finds it, the explicit orphan transition recovers the identity, the
+/// doctor surface can still see and explain the record — and NOTHING in the
+/// stored record is raw AI payload: recovery works from association ids
+/// alone (the card's "operation/session/task metadata 关联，不存 raw AI
+/// payload").
+#[tokio::test]
+async fn task_worktree_orphan_recovered_without_raw_payload() {
+    let db = open_db().await;
+    let root = db.path.parent().expect("db parent");
+
+    // The crash victim: a task workspace whose owner never comes back.
+    let lease = WorkspaceStore::acquire(
+        &db.conn,
+        &AcquireRequest::task(
+            WorkspaceKind::TaskCopy,
+            workspace_dir(root, "task-crashed"),
+            "agent-crashed",
+            TTL,
+        ),
+        NOW,
+    )
+    .await
+    .expect("acquire");
+
+    // CRASH: time passes beyond the lease TTL with no renew/release/abandon.
+    let after_expiry = NOW + TTL + 1;
+
+    // 1. The sweep surfaces exactly this record.
+    let expired = WorkspaceStore::expired_leases_with_conn(&db.conn, after_expiry, 10)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        expired
+            .iter()
+            .map(|record| record.workspace_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![lease.workspace_id.as_str()],
+        "the crash victim is the sweep's find"
+    );
+
+    // 2. The explicit orphan transition recovers the identity and the path
+    //    for future claims while keeping the record for diagnosis.
+    WorkspaceStore::orphan_expired_with_conn(&db.conn, &lease.workspace_id, after_expiry)
+        .await
+        .expect("orphan the crashed workspace");
+    let record = WorkspaceStore::doctor_record_with_conn(&db.conn, &lease.workspace_id)
+        .await
+        .expect("doctor read")
+        .expect("the orphaned record is still diagnosable");
+    assert_eq!(record.state, WorkspaceState::Orphaned);
+
+    // A successor can now claim a task workspace at a fresh path — the
+    // orphan no longer blocks provisioning.
+    WorkspaceStore::acquire(
+        &db.conn,
+        &AcquireRequest::task(
+            WorkspaceKind::TaskCopy,
+            workspace_dir(root, "task-successor"),
+            "agent-successor",
+            TTL,
+        ),
+        after_expiry,
+    )
+    .await
+    .expect("a successor claims a fresh task workspace");
+
+    // 3. NO RAW PAYLOAD: the SCHEMA is the proof — every workspace_record
+    //    column is an association id, a path, a state, or a timestamp, and
+    //    no payload-shaped column exists to fill. Asserted against the live
+    //    table rather than the struct so a migration adding one fails here.
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let columns = db
+        .conn
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT name FROM pragma_table_info('workspace_record')",
+        ))
+        .await
+        .expect("table info");
+    let names: Vec<String> = columns
+        .iter()
+        .map(|row| row.try_get_by::<String, _>("name").expect("column name"))
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "task_id") && names.iter().any(|name| name == "session_id"),
+        "the association ids are the recovery anchors: {names:?}"
+    );
+    for forbidden in [
+        "payload",
+        "prompt",
+        "message",
+        "transcript",
+        "conversation",
+        "raw",
+        "content",
+    ] {
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.to_ascii_lowercase().contains(forbidden)),
+            "workspace_record must not carry a `{forbidden}`-like column: {names:?}"
+        );
+    }
+}
+
 /// The machine listing walks every record exactly once through its keyset
 /// cursor, and never returns an unbounded page (§C.14).
 #[tokio::test]

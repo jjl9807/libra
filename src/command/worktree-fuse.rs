@@ -95,6 +95,9 @@ pub enum WorktreeSubcommand {
         /// line, blank line between worktrees).
         #[clap(long)]
         porcelain: bool,
+        /// JSON data schema selector (§C.8) — see the non-FUSE build's doc.
+        #[clap(long = "schema-version", default_value_t = 2)]
+        schema_version: u32,
     },
     /// Diagnose worktree and Agent-workspace scopes. STRICTLY READ-ONLY
     /// (W0 §C.11 / W4).
@@ -428,7 +431,10 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                     .map_err(|e| CliError::fatal(e.to_string()))
             }
         }
-        WorktreeSubcommand::List { porcelain } => list_all_worktrees(output, porcelain).await,
+        WorktreeSubcommand::List {
+            porcelain,
+            schema_version,
+        } => list_all_worktrees(output, porcelain, schema_version).await,
         WorktreeSubcommand::Doctor {
             workspace_id,
             limit,
@@ -839,7 +845,19 @@ async fn add_fuse_worktree(
     Ok(())
 }
 
-async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()> {
+async fn list_all_worktrees(
+    output: &OutputConfig,
+    porcelain: bool,
+    schema_version: u32,
+) -> CliResult<()> {
+    if schema_version != 2 {
+        return Err(CliError::failure(format!(
+            "unsupported worktree list schema version {schema_version}: the shipped shape is \
+             version 2"
+        ))
+        .with_exit_code(129)
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     let mut result = legacy::run_list_worktrees().map_err(legacy::WorktreeError::into_cli_error)?;
     let state = load_fuse_state().map_err(fuse_state_read_error)?;
     if output.is_json() {
@@ -859,7 +877,14 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
                 epoch: 0,
             });
         }
-        return emit_json_data("worktree.list", &result, output);
+        return emit_json_data(
+            "worktree.list",
+            &legacy::VersionedWorktreeList {
+                schema_version: 2,
+                worktrees: &result.worktrees,
+            },
+            output,
+        );
     }
     if output.quiet {
         return Ok(());

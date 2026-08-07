@@ -44,7 +44,6 @@ EXAMPLES:
                                                    check it out
     libra worktree list                            List every registered worktree
     libra worktree list --porcelain                Machine-readable worktree list
-    libra worktree doctor                          Read-only per-worktree scope diagnostics
     libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
     libra worktree unlock ../feature-x             Release the lock
     libra worktree move ../old ../new              Rename a worktree
@@ -61,8 +60,8 @@ EXAMPLES:
                                                    symlink worktree to the isolated layout
     libra worktree repair --migrate-layout --dry-run
                                                    Report what would be migrated (read-only)
-    libra worktree doctor                          Read-only diagnosis of every Agent
-                                                   workspace scope (paginated)
+    libra worktree doctor                          Read-only diagnostics of per-worktree
+                                                   scopes and Agent workspaces (paginated)
     libra --json worktree doctor --limit 20        One machine-readable page
     libra worktree doctor ws-3f0c                  Diagnose a single workspace scope";
 
@@ -112,6 +111,14 @@ pub enum WorktreeSubcommand {
         /// line, blank line between worktrees).
         #[clap(long)]
         porcelain: bool,
+        /// JSON data schema selector (§C.8). `2` — the shipped shape, with
+        /// `worktree_id`/`layout`/`epoch` — is the default and currently the
+        /// only version: the pre-worktree-identity v1 shape gained those
+        /// fields IN PLACE across the W1/W3 releases (each with its compat
+        /// fixtures updated), so there is no frozen v1 left to serve and
+        /// requesting it is refused rather than answered with a lie.
+        #[clap(long = "schema-version", default_value_t = 2)]
+        schema_version: u32,
     },
     /// Mark a worktree as locked to prevent it from being pruned or removed.
     Lock {
@@ -1154,7 +1161,10 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 .map_err(WorktreeError::into_cli_error)?;
             render_add_worktree(&result, output)
         }
-        WorktreeSubcommand::List { porcelain } => list_worktrees(output, porcelain).await,
+        WorktreeSubcommand::List {
+            porcelain,
+            schema_version,
+        } => list_worktrees(output, porcelain, schema_version).await,
         WorktreeSubcommand::Lock { path, reason } => {
             let result = lock_worktree(path, reason)
                 .await
@@ -3885,10 +3895,39 @@ fn print_worktree_scope_report(report: &WorktreeDoctorOutput) {
     }
 }
 
-async fn list_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult<()> {
+/// §C.8: the JSON `data` half of `worktree list` carries its OWN
+/// `schema_version` — the global `--json` flag controls format only, never
+/// the schema.
+#[derive(Serialize)]
+pub(crate) struct VersionedWorktreeList<'a> {
+    pub(crate) schema_version: u32,
+    pub(crate) worktrees: &'a [WorktreeListEntry],
+}
+
+async fn list_worktrees(
+    output: &OutputConfig,
+    porcelain: bool,
+    schema_version: u32,
+) -> CliResult<()> {
+    if schema_version != 2 {
+        return Err(CliError::failure(format!(
+            "unsupported worktree list schema version {schema_version}: the shipped shape is \
+             version 2 (worktree_id/layout/epoch fields); the pre-identity v1 shape gained \
+             those fields in place and no frozen v1 remains to serve"
+        ))
+        .with_exit_code(129)
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     let result = run_list_worktrees().map_err(WorktreeError::into_cli_error)?;
     if output.is_json() {
-        return emit_json_data("worktree.list", &result, output);
+        return emit_json_data(
+            "worktree.list",
+            &VersionedWorktreeList {
+                schema_version: 2,
+                worktrees: &result.worktrees,
+            },
+            output,
+        );
     }
     if output.quiet {
         return Ok(());
@@ -4098,6 +4137,48 @@ fn paths_are_same(left: &str, right: &str) -> bool {
 /// Build one workspace's diagnosis from state that is already in hand — pure
 /// over the record, the registry snapshot and the clock, plus read-only
 /// filesystem probes.
+/// §C.4.1.1 diagnosability: SCOPED capture rows whose recorded fence no
+/// longer matches this workspace's live fence. Every capture/import/export
+/// write for them fails closed (the owner claim is immutable by trigger),
+/// so without this finding a reclaimed workspace's history dead-ends with a
+/// refusal pointing at doctor — and doctor said nothing.
+async fn stale_fence_capture_finding(
+    conn: &sea_orm::DatabaseConnection,
+    record: &WorkspaceRecord,
+) -> Option<ScopeDiagnostic> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let mut stale = 0i64;
+    for table in ["agent_session", "agent_export_job", "agent_import_identity"] {
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT COUNT(*) AS n FROM {table} \
+                     WHERE scope_state = 'scoped' AND workspace_id = ? \
+                       AND workspace_fence <> ?"
+                ),
+                [
+                    record.workspace_id.clone().into(),
+                    record.lease_fence.into(),
+                ],
+            ))
+            .await
+            .ok()??;
+        stale += row.try_get_by::<i64, _>("n").unwrap_or(0);
+    }
+    (stale > 0).then(|| {
+        ScopeDiagnostic::warning(
+            "capture_rows_stale_fence",
+            format!(
+                "{stale} scoped capture row(s) carry an earlier lease fence of this \
+                 workspace; their owner claims are immutable, so capture/import/export \
+                 writes for those provider sessions fail closed under the current fence — \
+                 the rows remain readable provenance"
+            ),
+        )
+    })
+}
+
 fn diagnose_workspace(
     record: &WorkspaceRecord,
     current_repo_id: &str,
@@ -4107,6 +4188,19 @@ fn diagnose_workspace(
     let lease_state = match (&record.lease_owner, record.lease_expires_at) {
         (None, _) => "none",
         (Some(_), Some(deadline)) if now_ms >= deadline => "expired",
+        // `release` deliberately RETAINS lease_owner (provenance) while
+        // nulling the expiry and leaving the live state set — so an owner
+        // with no deadline is "held" only while the record is still live; a
+        // released/adopted record's retained owner is history, not a lease.
+        (Some(_), None)
+            if matches!(
+                record.state,
+                crate::internal::workspace::WorkspaceState::Released
+                    | crate::internal::workspace::WorkspaceState::Orphaned
+            ) =>
+        {
+            "none"
+        }
         (Some(_), _) => "held",
     };
     let mut findings = Vec::new();
@@ -4562,22 +4656,31 @@ pub(crate) async fn run_worktree_doctor(
     let legacy_capture_exists = legacy_capture_scope_exists(&conn).await?;
 
     if let Some(workspace_id) = workspace_id {
-        let record = WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id)
-            .await
-            .map_err(|error| {
-                doctor_scope_corrupt(format!(
+        let record = match WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id).await {
+            Ok(record) => record,
+            // Same special case as the paginated path below: a repository
+            // that never ran the workspace migration has no records — its
+            // TRUE state, not scope corruption, and the actionable answer
+            // is "no such workspace", not LBR-WORKTREE-002.
+            Err(error) if workspace_table_absent(&error) => None,
+            Err(error) => {
+                return Err(doctor_scope_corrupt(format!(
                     "cannot read the workspace record '{workspace_id}': {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                CliError::fatal(format!(
-                    "no workspace matches id '{workspace_id}'; list them with \
+                )));
+            }
+        }
+        .ok_or_else(|| {
+            CliError::fatal(format!(
+                "no workspace matches id '{workspace_id}'; list them with \
                      `libra worktree doctor`"
-                ))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-            })?;
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
         let repo_id = doctor_repo_identity(&conn).await?;
-        let diagnostic = diagnose_workspace(&record, &repo_id, &registry, now);
+        let mut diagnostic = diagnose_workspace(&record, &repo_id, &registry, now);
+        if let Some(finding) = stale_fence_capture_finding(&conn, &record).await {
+            diagnostic.scope_diagnostics.push(finding);
+        }
         let result = render_doctor_single(diagnostic, output);
         print_legacy_capture_scope_guidance(output, legacy_capture_exists);
         return result;
@@ -5005,16 +5108,26 @@ async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
             // ID: the path-keyed lookup canonicalizes its query and cannot
             // match a path that no longer exists — which is every prune
             // candidate.
-            if let Some(id_str) = id.as_deref()
-                && crate::internal::workspace::WorkspaceStore::find_live_linked_with_conn(
+            if let Some(id_str) = id.as_deref() {
+                match crate::internal::workspace::WorkspaceStore::find_live_linked_with_conn(
                     &db, id_str,
                 )
                 .await
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                continue;
+                {
+                    Ok(Some(record)) => {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        if record.lease_expires_at.is_some_and(|expiry| expiry > now) {
+                            // A live, UNEXPIRED lease: never pruned.
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        // FAIL CLOSED: an unreadable workspace store keeps
+                        // the entry rather than pruning blind.
+                        continue;
+                    }
+                }
             }
             eligible.push((path, id));
         }
@@ -5169,21 +5282,36 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
     // owner is mid-work there. Release or let the lease lapse first.
     {
         let db = crate::internal::db::get_db_conn_instance().await;
+        // FAIL CLOSED on a store that cannot be read: swallowing the error
+        // would disable this protection exactly when the leased agent is
+        // busy writing the same database.
+        let lease_error = |error: crate::internal::workspace::WorkspaceError| {
+            WorktreeError::OperationBlocked(format!(
+                "cannot verify agent workspace leases for '{}': {error}; refusing to \
+                 remove until the workspace store is readable",
+                target.display()
+            ))
+        };
         let by_path =
             crate::internal::workspace::WorkspaceStore::find_live_by_path_with_conn(&db, &target)
                 .await
-                .ok()
-                .flatten();
+                .map_err(lease_error)?;
         let by_id = match entry.worktree_id.as_deref() {
             Some(id) => {
                 crate::internal::workspace::WorkspaceStore::find_live_linked_with_conn(&db, id)
                     .await
-                    .ok()
-                    .flatten()
+                    .map_err(lease_error)?
             }
             None => None,
         };
-        if let Some(record) = by_path.or(by_id) {
+        // An EXPIRED lease does not block: nothing may run the scavenger for
+        // a long time, and "let it expire" must actually unblock the human
+        // (§C.7 acceptance: a crashed agent's worktree stays recoverable).
+        let now = chrono::Utc::now().timestamp_millis();
+        let unexpired = |record: &crate::internal::workspace::WorkspaceRecord| {
+            record.lease_expires_at.is_some_and(|expiry| expiry > now)
+        };
+        if let Some(record) = by_path.into_iter().chain(by_id).find(unexpired) {
             return Err(WorktreeError::OperationBlocked(format!(
                 "'{}' is held by live agent workspace '{}' (lease fence {}); release the \
                  lease or let it expire before removing the worktree",

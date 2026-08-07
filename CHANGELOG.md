@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W4 cross-review, 2026-08-08)
+
+- **`cloud restore` no longer overwrites locally scoped agent sessions.**
+  Cloud content carries no workspace ownership, so the restore upsert now
+  skips rows a live workspace owns and reports how many it left untouched.
+- **`agent session stop/resume` respect capture ownership**: rows another
+  worktree scope owns are refused (naming the owner), and `legacy_unknown`
+  rows stay excluded from every new write until explicitly adopted.
+- **The remove/prune agent-lease gates fail closed on store errors and
+  ignore expired leases** — "let it expire" in the refusal hint is now
+  true, and a crashed agent can no longer block a human's `worktree
+  remove` forever. Both directions are pinned by
+  `remove_is_lease_gated_and_expiry_unblocks`.
+- **Doctor accuracy**: a released workspace no longer reports its retained
+  provenance owner as a "held" lease; the by-id form treats a repository
+  that never ran the workspace migration as "no such workspace" instead of
+  scope corruption; and a new `capture_rows_stale_fence` finding makes
+  capture rows bound to a dead workspace generation diagnosable.
+- **`worktree list --schema-version`** exists per §C.8: the data half now
+  names its own `schema_version` (2 — the shipped shape), and requesting
+  the never-shipped v1 is refused with LBR-CLI-002 rather than answered
+  with a fabricated shape. The duplicated/contradictory doctor and repair
+  doc sections (EN/zh/COMPATIBILITY/help EXAMPLES) are merged and
+  corrected.
+- **§C.12**: `task_worktree_orphan_recovered_without_raw_payload` now
+  exists — a crashed owner's task workspace is swept, recovered, and
+  diagnosed with the no-raw-payload guarantee proven against the live
+  schema.
+
 ### Fixed (plan-20260714 W3 cross-review, 2026-08-08)
 
 - **`worktree remove` and `prune` now refuse a worktree an agent holds a

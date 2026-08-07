@@ -101,9 +101,17 @@ operation-log audit boundary, recording exactly one row per executed action
 preview never needs confirmation, and `repair <path> --resolve-identity` keeps
 its own dedicated `--yes` confirmation.
 
+Without an argument, the confirmed action removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed.
+
+With `--migrate-layout`, migrates legacy shared-`.libra` symlink worktrees to the isolated layout (run from the MAIN worktree; `--dry-run` reports without writing; without a path every legacy entry is migrated). The migration installs a fresh journaled gitdir by atomic renames (the legacy link is kept as a backup until verification passes), seeds a DETACHED HEAD at the shared snapshot, and rebuilds the private index from that commit: working files are never touched (they show as dirty/untracked afterwards) and shared STAGED state is never copied — commit or stash it in the main worktree first. An unmerged shared index or an in-progress main rebase/cherry-pick/bisect refuses before any rename; an interrupted migration is recovered by the next `worktree repair --confirm`.
+
+With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair --confirm` once to upgrade it, then retry.
+
 ```bash
 libra worktree repair --confirm
+libra --json worktree repair --confirm
 libra worktree repair --confirm <path>
+libra --json worktree repair --confirm ../experiment
 libra worktree repair --migrate-layout --dry-run   # preview, no --confirm needed
 libra worktree repair --migrate-layout --confirm
 ```
@@ -114,7 +122,19 @@ Report Agent workspace-scope diagnostics. The ordinary forms are **strictly
 read-only**: the registry, database, lease state, and filesystem are
 byte-identical before and after the call. A diagnostic must be safe to run on a
 repository you do not yet understand, so a bare `doctor` never adopts,
-reclaims, or repairs anything.
+reclaims, or repairs anything. (Libra-only; Git has no equivalent.)
+
+A *workspace* is the association record an Agent runtime takes over a worktree (see `libra agent workspace list`). Human use of a linked worktree never needs one, so a repository with no Agent activity reports nothing.
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `<workspace-id>` | Diagnose exactly one workspace instead of paging over all of them. Cannot be combined with `--limit`/`--cursor` (a single scope is not a page) — the combination is a usage error, `LBR-CLI-002`. |
+| `--limit <n>` | Maximum diagnostics per page. Default 50, capped at 500. |
+| `--cursor <cursor>` | Resume after a previous page: pass the `next_cursor` value back verbatim. The cursor is opaque; one this command did not issue is refused with `LBR-WORKTREE-001` rather than silently restarting at page one. |
+| `--adopt-capture-session <session-id>` | Explicitly attributes `legacy_unknown` capture rows to the named workspace. Requires `<workspace-id>` and `--confirm`; it cannot be combined with `--limit`/`--cursor`. All other doctor forms remain read-only. |
+| `--adopt-info-to <worktree-path>` | Copies main's legacy common `info/exclude` + `info/attributes` into that ONE linked worktree's own gitdir (existing destination files are kept, never overwritten). Requires `--confirm`. |
+| `--clear-common-info` | Deletes the legacy `info/exclude` + `info/attributes` from common storage (the rules stop applying anywhere). Requires `--confirm`. |
+| `--confirm` | Confirms the irreversible doctor mutations — the capture-scope adoption and the info-file adopt/clear actions. Every other doctor form is read-only and needs no confirmation. |
 
 ```bash
 libra worktree doctor
@@ -127,12 +147,24 @@ libra worktree doctor <workspace-id>
 Without an id, the machine response pages `data.diagnostics[]` by opaque
 `next_cursor` (`workspace_id` ascending; default limit 50, maximum 500). With
 `<workspace-id>`, it returns the singular `data.diagnostic`; combining that id
-with `--limit` or `--cursor` is `LBR-CLI-002`. Each diagnostic identifies the
-workspace and repository, reports the lease state (`none`, `held`, or
-`expired`), and lists scope findings such as a foreign repository identity,
-expired lease, missing path, or missing/detached/tombstoned registry entry. An
-invalid cursor fails closed with `LBR-WORKTREE-001`; an unreadable scope fails
-closed with `LBR-WORKTREE-002` rather than returning a partial page.
+with `--limit` or `--cursor` is `LBR-CLI-002`. An invalid cursor fails closed
+with `LBR-WORKTREE-001`; an unreadable scope fails closed with
+`LBR-WORKTREE-002` rather than returning a partial page.
+
+Each diagnostic reports the workspace's identity (`workspace_id`, `repo_id`, `path`, `worktree_id`), its `lease_state` (`none`, `held`, or `expired`), and a `scope_diagnostics` array of findings. Findings carry a stable `code` and a `severity` of `warning` or `error`:
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `foreign_repository_identity` | error | The record was written under a previous repository identity: it is invisible to the normal listings and blocks new workspace registrations. |
+| `registry_path_mismatch` | error | The worktree registry and the workspace record disagree about where the scope lives. |
+| `scope_layout_corrupt` | error | The gitdir layout at that path is unrecognizable. |
+| `workspace_orphaned` | warning | Teardown failed or the owner vanished; the workspace still holds recovery state. |
+| `lease_expired` | warning | The lease deadline passed. The lease still belongs to its owner until it is explicitly reclaimed. |
+| `workspace_path_missing` | warning | No directory exists at the claimed path. |
+| `registry_entry_missing` | warning | No worktree registry entry owns this scope. |
+| `registry_entry_detached` | warning | The worktree was unregistered with `worktree remove` (keep-dir). |
+| `registry_entry_tombstoned` | warning | The directory was deleted but its scoped rows are still pending cleanup; `libra worktree repair --confirm` retries it. |
+| `scope_layout_legacy_symlink` | warning | The worktree still uses the pre-isolation shared-`.libra` symlink layout; migrate it with `libra worktree repair --migrate-layout --confirm`. |
 
 Migration `2026080401` classifies capture rows written before workspace scope
 existed as `legacy_unknown`. They remain unavailable to hooks and historical
@@ -320,81 +352,6 @@ JSON / machine output envelope:
   }
 }
 ```
-
-### Subcommand: `repair`
-
-Repair worktree metadata. Every mutating repair requires `--confirm`; without it the command is refused before it takes the registry lock or writes the database/filesystem. Without an argument, the confirmed action removes duplicate registry entries (same canonical path), ensures exactly one main worktree entry exists, and runs the W3 lifecycle recovery engine: stale intent-journal rows (from an interrupted add/move/remove/prune) are rolled forward or back deterministically (recovery never deletes directories), tombstone entries get their scoped cleanup retried, and detached markers plus the SQL lifecycle mirror are reconciled with the registry. The state file is only rewritten when something actually changed. `--migrate-layout --dry-run` is the only read-only repair preview and needs no confirmation.
-
-With `--migrate-layout`, migrates legacy shared-`.libra` symlink worktrees to the isolated layout (run from the MAIN worktree; `--dry-run` reports without writing; without a path every legacy entry is migrated). The migration installs a fresh journaled gitdir by atomic renames (the legacy link is kept as a backup until verification passes), seeds a DETACHED HEAD at the shared snapshot, and rebuilds the private index from that commit: working files are never touched (they show as dirty/untracked afterwards) and shared STAGED state is never copied — commit or stash it in the main worktree first. An unmerged shared index or an in-progress main rebase/cherry-pick/bisect refuses before any rename; an interrupted migration is recovered by the next `worktree repair --confirm`.
-
-With a path, restores that **linked** worktree's gitdir identity from the registry (registry v2): rewrites a missing or corrupt `.libra/worktree_id` from the entry's persisted stable id and restores a missing or corrupt (empty/unreadable) `commondir` pointer to this repository's shared storage. The identity always comes from the registry — never from a guess — so the repaired worktree maps back to its own scoped state (HEAD, index, stash snapshots) instead of a fresh scope or the main worktree's. A `commondir` that validly points at a **different** storage is refused (repair never silently re-homes a worktree onto another repository), and the refusal is side-effect free — neither gitdir file is touched. Unregistered paths and the main worktree are refused, and so is a registry still in the legacy v1 format (it carries no persisted identities) — run the no-argument `libra worktree repair --confirm` once to upgrade it, then retry.
-
-```bash
-libra worktree repair --confirm
-libra --json worktree repair --confirm
-libra worktree repair --confirm ../experiment
-libra --json worktree repair --confirm ../experiment
-```
-
-### Subcommand: `doctor`
-
-Diagnose Agent **workspace** scopes. Ordinary invocations are **read-only**:
-they report and never repair, so no row, registry entry, lease, or file is
-written. The separately named `--adopt-capture-session … --confirm` form is
-the only exception. (Libra-only; Git has no equivalent.)
-
-A *workspace* is the association record an Agent runtime takes over a worktree (see `libra agent workspace list`). Human use of a linked worktree never needs one, so a repository with no Agent activity reports nothing.
-
-| Argument / Flag | Description |
-|-----------------|-------------|
-| `<workspace-id>` | Diagnose exactly one workspace instead of paging over all of them. Cannot be combined with `--limit`/`--cursor` (a single scope is not a page) — the combination is a usage error, `LBR-CLI-002`. |
-| `--limit <n>` | Maximum diagnostics per page. Default 50, capped at 500. |
-| `--cursor <cursor>` | Resume after a previous page: pass the `next_cursor` value back verbatim. The cursor is opaque; one this command did not issue is refused with `LBR-WORKTREE-001` rather than silently restarting at page one. |
-| `--adopt-capture-session <session-id>` | Explicitly attributes `legacy_unknown` capture rows to the named workspace. Requires `<workspace-id>` and `--confirm`; it cannot be combined with `--limit`/`--cursor`. All other doctor forms remain read-only. |
-| `--confirm` | Confirms the irreversible capture-scope adoption. It is accepted only with `--adopt-capture-session`. |
-
-Each diagnostic reports the workspace's identity (`workspace_id`, `repo_id`, `path`, `worktree_id`), its `lease_state` (`none`, `held`, or `expired`), and a `scope_diagnostics` array of findings. Findings carry a stable `code` and a `severity` of `warning` or `error`:
-
-| Code | Severity | Meaning |
-|------|----------|---------|
-| `foreign_repository_identity` | error | The record was written under a previous repository identity: it is invisible to the normal listings and blocks new workspace registrations. |
-| `registry_path_mismatch` | error | The worktree registry and the workspace record disagree about where the scope lives. |
-| `scope_layout_corrupt` | error | The gitdir layout at that path is unrecognizable. |
-| `workspace_orphaned` | warning | Teardown failed or the owner vanished; the workspace still holds recovery state. |
-| `lease_expired` | warning | The lease deadline passed. The lease still belongs to its owner until it is explicitly reclaimed. |
-| `workspace_path_missing` | warning | No directory exists at the claimed path. |
-| `registry_entry_missing` | warning | No worktree registry entry owns this scope. |
-| `registry_entry_detached` | warning | The worktree was unregistered with `worktree remove` (keep-dir). |
-| `registry_entry_tombstoned` | warning | The directory was deleted but its scoped rows are still pending cleanup; `libra worktree repair --confirm` retries it. |
-| `scope_layout_legacy_symlink` | warning | The worktree still uses the pre-isolation shared-`.libra` symlink layout; migrate it with `libra worktree repair --migrate-layout --confirm`. |
-
-A scope that cannot be read at all — an unparseable registry, an unreadable record, or a repository whose identity is missing — fails closed with `LBR-WORKTREE-002` instead of answering with a partial diagnosis.
-
-```bash
-libra worktree doctor
-libra --json worktree doctor --limit 20
-libra --json worktree doctor --cursor "$cursor"
-libra worktree doctor 9f1c2f1e-4a0e-4c0e-9a71-6a2f4a2e0b13
-```
-
-Migration `2026080401` marks old capture rows without an ownership scope as
-`legacy_unknown` rather than guessing they belong to main. Hooks and historical
-imports fail closed for those rows. After inspecting the source session and the
-target workspace, the only attribution path is:
-
-```bash
-libra worktree doctor <workspace-id> \
-  --adopt-capture-session <session-id> --confirm
-```
-
-The target must have a current live lease fence. Adoption assigns every legacy
-row for that provider session (session, export job, and import identity) to
-that repository/worktree/workspace fence, refuses if any scoped claim already
-exists, and records an immutable audit event. The action is irreversible. Its
-JSON response uses `worktree.doctor.adopt_capture`; the read-only
-`worktree.doctor` page schema remains unchanged. Use the catalog session id,
-or the provider-session id when an orphaned export/import row outlived its
-catalog session.
 
 ## Common Commands
 

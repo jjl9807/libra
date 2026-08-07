@@ -5430,10 +5430,36 @@ async fn restore_agent_capture_from_rows_with_subagents(
         }
     }
 
+    let mut skipped_scoped_sessions = 0usize;
     for row in session_rows {
         if newer_local_sessions.contains(&(row.agent_kind.clone(), row.provider_session_id.clone()))
         {
             continue;
+        }
+        // §C.4.1.1: a LOCALLY SCOPED session belongs to a live workspace
+        // owner; cloud content carries no scope columns, so overwriting the
+        // row would graft foreign material under an immutable owner claim.
+        // The UPSERT below skips such rows via its scope predicate — count
+        // them so the user learns the restore was partial.
+        let scoped_conflict = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT 1 AS hit FROM agent_session \
+                 WHERE agent_kind = ? AND provider_session_id = ? \
+                   AND scope_state IS 'scoped' AND sync_revision < ?",
+                [
+                    row.agent_kind.clone().into(),
+                    row.provider_session_id.clone().into(),
+                    row.sync_revision.into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                CloudError::Generic(format!("probe scoped session conflict: {error}"))
+            })?
+            .is_some();
+        if scoped_conflict {
+            skipped_scoped_sessions += 1;
         }
         txn.execute_raw(Statement::from_sql_and_values(
             backend,
@@ -5454,7 +5480,8 @@ async fn restore_agent_capture_from_rows_with_subagents(
                 stopped_at = excluded.stopped_at,
                 schema_version = excluded.schema_version,
                 sync_revision = excluded.sync_revision
-             WHERE excluded.sync_revision > agent_session.sync_revision",
+             WHERE excluded.sync_revision > agent_session.sync_revision
+               AND agent_session.scope_state IS NOT 'scoped'",
             [
                 row.session_id.clone().into(),
                 row.agent_kind.clone().into(),
@@ -5477,6 +5504,13 @@ async fn restore_agent_capture_from_rows_with_subagents(
         .map_err(|error| {
             CloudError::Generic(format!("restore agent session {}: {error}", row.session_id))
         })?;
+    }
+    if skipped_scoped_sessions > 0 {
+        emit_warning(format!(
+            "cloud restore left {skipped_scoped_sessions} locally SCOPED agent session(s) \
+             untouched: their rows are owned by a live workspace and cloud content carries \
+             no ownership; inspect with `libra worktree doctor`"
+        ));
     }
     for row in checkpoint_rows {
         txn.execute_raw(Statement::from_sql_and_values(
