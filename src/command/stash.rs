@@ -1221,6 +1221,29 @@ struct StashBranchJournal {
     nonce: String,
 }
 
+/// The SEMANTIC OID fields of this gitdir's `stash-branch-journal.json`, for
+/// GC root collection (plan-20260714 §C.4.3 / §C.10): `base` always, and
+/// `prior_detached` when the interrupted command left a detached HEAD to
+/// restore. Branch names, the phase, and the 32-hex nonce are text and are
+/// NOT returned.
+pub(crate) fn stash_branch_journal_gc_oids(
+    gitdir: &Path,
+) -> Result<Option<Vec<(&'static str, String)>>, String> {
+    let path = gitdir.join("stash-branch-journal.json");
+    let data = match fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    let journal: StashBranchJournal = serde_json::from_str(&data)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    let mut oids = vec![("base", journal.base)];
+    if let Some(prior) = journal.prior_detached {
+        oids.push(("prior_detached", prior));
+    }
+    Ok(Some(oids))
+}
+
 impl StashBranchJournal {
     fn path() -> PathBuf {
         util::request_worktree_gitdir_strict().join("stash-branch-journal.json")
@@ -2474,10 +2497,11 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
 /// Return every file-backed stash object that repository maintenance must
 /// trace. Older stash entries live only in the stash reflog; tracing just the
 /// refs/stash tip would let GC delete stash@{1} and later entries.
-pub(crate) fn gc_roots() -> Result<Vec<ObjectHash>, StashError> {
-    let storage = util::try_get_storage_path(None).map_err(|error| {
-        StashError::ReadObject(format!("failed to resolve stash GC roots: {error}"))
-    })?;
+/// §C.4.2: takes the caller's BOUND storage root instead of resolving one —
+/// the GC collection binds every file-backed source to a single pinned root,
+/// and an ambient re-resolution here could hand it another repository's
+/// stash stack after an in-process cwd move.
+pub(crate) fn gc_roots(storage: &Path) -> Result<Vec<ObjectHash>, StashError> {
     let mut roots = HashSet::new();
     let stash_ref_path = storage.join("refs/stash");
     match fs::read_to_string(&stash_ref_path) {

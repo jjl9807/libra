@@ -3582,7 +3582,7 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
             }
             let inventoried = GC_OBJECT_SOURCE_INVENTORY
                 .iter()
-                .any(|(t, c, _, _)| *t == table && *c == column);
+                .any(|source| source.location == table && source.column == column);
             if !inventoried {
                 uncovered.push(format!("{table}.{column}"));
             }
@@ -3598,7 +3598,7 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
     ] {
         let inventoried = GC_OBJECT_SOURCE_INVENTORY
             .iter()
-            .any(|(t, c, _, _)| *t == table && *c == column);
+            .any(|source| source.location == table && source.column == column);
         if !inventoried {
             uncovered.push(format!("{table}.{column} (semantic)"));
         }
@@ -4118,7 +4118,7 @@ fn gc_object_source_inventory_is_typed_across_all_four_kinds() {
 
     let db_kinds: Vec<GcSourceStatus> = GC_OBJECT_SOURCE_INVENTORY
         .iter()
-        .map(|(_, _, status, _)| *status)
+        .map(|source| source.status)
         .collect();
     let file_kinds: Vec<GcSourceStatus> = GC_OBJECT_FILE_SOURCE_INVENTORY
         .iter()
@@ -4140,8 +4140,8 @@ fn gc_object_source_inventory_is_typed_across_all_four_kinds() {
     let db_entry = |table: &str, column: &str| {
         GC_OBJECT_SOURCE_INVENTORY
             .iter()
-            .find(|(t, c, _, _)| *t == table && *c == column)
-            .map(|(_, _, status, _)| *status)
+            .find(|source| source.location == table && source.column == column)
+            .map(|source| source.status)
     };
     assert_eq!(
         db_entry("object_obliteration", "oid"),
@@ -4186,6 +4186,43 @@ fn gc_object_source_inventory_is_typed_across_all_four_kinds() {
             source.note.len() > 40,
             "{} has no substantive note",
             source.location
+        );
+    }
+
+    // §C.4.3: every source declares storage kind, schema/version, read
+    // bound and corruption policy — and the policy must be CONSISTENT with
+    // the root type, or the declarations are decoration. A root that keeps
+    // objects alive (TracedRoot/AntiRoot/Boundary) must fail closed (or
+    // defer on undecidable liveness); an IndexOnly source keeps nothing
+    // alive so lenient is the only honest answer; a NonRoot contributes
+    // nothing so no policy applies.
+    use libra::command::maintenance::GcCorruptionPolicy;
+    for source in GC_OBJECT_SOURCE_INVENTORY
+        .iter()
+        .chain(GC_OBJECT_FILE_SOURCE_INVENTORY.iter())
+    {
+        assert!(
+            !source.schema.trim().is_empty() && !source.read_bound.trim().is_empty(),
+            "{}.{} declares no schema/read bound",
+            source.location,
+            source.column
+        );
+        let policy_fits = match source.status {
+            GcSourceStatus::TracedRoot | GcSourceStatus::AntiRoot | GcSourceStatus::Boundary => {
+                matches!(
+                    source.corruption,
+                    GcCorruptionPolicy::FailClosed | GcCorruptionPolicy::DeferLive
+                )
+            }
+            GcSourceStatus::IndexOnly => source.corruption == GcCorruptionPolicy::LenientSkip,
+            GcSourceStatus::NonRoot => source.corruption == GcCorruptionPolicy::NotApplicable,
+        };
+        assert!(
+            policy_fits,
+            "{}.{} declares {:?} with corruption policy {:?} — inconsistent \
+             (a keep-alive root must fail closed or defer; IndexOnly must be \
+             lenient; NonRoot has no policy)",
+            source.location, source.column, source.status, source.corruption
         );
     }
 }

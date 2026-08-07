@@ -50,6 +50,8 @@ pub mod reflog;
 pub mod repo_hooks;
 pub mod revision_ordinal;
 pub mod sequencer;
+#[cfg(test)]
+pub mod source_scan;
 pub mod sparse;
 pub mod tag;
 pub mod tree_plumbing;

@@ -1179,6 +1179,13 @@ fn test_stash_show_invalid_index_errors() {
 /// `stash branch <name>` creates a new branch, applies the stash, and
 /// drops it. `applied` and `dropped` are both `true` in the JSON output
 /// when the operation succeeds end-to-end.
+///
+/// §C.12 roster: this is `stash_branch_apply_success_only_then_cas_drop` —
+/// the drop is reported only because the apply completed, and the CAS is the
+/// only path that removes the entry. The CAS-MISS arm (stack changed between
+/// apply and drop → entry kept, never re-resolved by index) is pinned at the
+/// unit level by `do_drop_cas_misses_leave_the_stack_untouched` in
+/// `src/command/stash.rs`, which `stash branch` shares with pop.
 #[test]
 fn test_stash_branch_creates_branch_and_applies() {
     let repo = create_committed_repo_via_cli();
@@ -1707,6 +1714,11 @@ async fn test_stash_push_pathspec_rejects_options() {
 /// W2 §C.4.3: a failed `stash branch` apply rolls back the half-created
 /// state — the new branch is deleted (tip-conditionally), HEAD returns to
 /// the original branch, and the stash entry is kept.
+///
+/// §C.12 roster: this is `stash_branch_failure_has_zero_side_effects`; the
+/// crash-interrupted half of the same contract is
+/// `an_interrupted_stash_branch_rollback_completes_from_the_journal` in the
+/// worktree-isolation suite.
 #[test]
 fn stash_branch_failed_apply_rolls_back_branch_and_head() {
     let repo = create_committed_repo_via_cli();

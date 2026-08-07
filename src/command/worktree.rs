@@ -1882,7 +1882,15 @@ pub(crate) fn local_gitdir_for_scope(
 }
 
 fn load_state_readonly() -> WorktreeResult<WorktreeState> {
-    let path = state_path();
+    load_state_readonly_at(&state_path())
+}
+
+/// [`load_state_readonly`] against an EXPLICIT registry path — for callers
+/// that resolved their storage root once (§C.4.2) and must not let an
+/// ambient re-resolution answer for a different repository (the GC root
+/// enumeration binds everything to the request pin this way).
+fn load_state_readonly_at(path: &std::path::Path) -> WorktreeResult<WorktreeState> {
+    let path = path.to_path_buf();
     if !path.exists() {
         let mut state = WorktreeState::default();
         let _ = ensure_main_entry(&mut state)
@@ -3222,7 +3230,15 @@ fn remove_worktree_storage_link(link_path: &Path) -> io::Result<()> {
 /// `main <path>` or `worktree <path>`, with optional `[locked: <reason>]`
 /// suffix when the entry is locked.
 pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
-    let state = load_state_readonly()?;
+    run_list_worktrees_at(&state_path())
+}
+
+/// [`run_list_worktrees`] against an EXPLICIT registry path (§C.4.2) — see
+/// `load_state_readonly_at`.
+pub(crate) fn run_list_worktrees_at(
+    registry_path: &std::path::Path,
+) -> WorktreeResult<WorktreeListOutput> {
+    let state = load_state_readonly_at(registry_path)?;
     let worktrees = state
         .entries
         .into_iter()

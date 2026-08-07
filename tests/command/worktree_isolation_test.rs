@@ -317,6 +317,83 @@ fn formerly_guarded_commands_run_in_linked_worktree() {
 /// W2 §C.4.3: the stash STACK is deliberately repository-shared (an entry
 /// pushed in one worktree lists and applies in another), while push/pop
 /// snapshot and mutate only the ACTING worktree's index/workdir; `stash
+/// plan-20260714 W2 §C.4.3 re-verification (self-review finding): gc run
+/// FROM A LINKED WORKTREE must still root the MAIN worktree's private index.
+///
+/// `worktree_index_roots` seeds the invoking worktree's index and then walks
+/// the registry — which SKIPS the main entry, because on a main-invoked run
+/// the seed already covers it. Invoked from a linked worktree, that skip
+/// left main's index out of the root set entirely, so a blob staged only in
+/// main was collected as garbage by any gc a linked worktree happened to
+/// run. Every pre-existing gc test invoked from main, which is exactly why
+/// this survived.
+#[test]
+fn gc_from_linked_worktree_keeps_main_staged_blob() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("gc-from-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // A blob STAGED ONLY in main — no commit, no ref, no reflog: the main
+    // index is its only anchor.
+    fs::write(main.join("staged-only.txt"), "main staged only\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "staged-only.txt"], main),
+        "stage in main",
+    );
+    let oid = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "staged-only.txt"], main).stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(!oid.is_empty(), "hash-object yields the staged blob's oid");
+
+    // Make it prunable-if-unrooted: age the loose objects past the grace
+    // window, run gc FROM THE LINKED WORKTREE once (a first sighting only
+    // QUARANTINES — deletion happens on a later pass), then assert the blob
+    // was never even quarantined, age the ledger, and run again. A
+    // single-run assertion would be vacuous: gc deletes nothing on first
+    // sight.
+    backdate_loose_objects(main);
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], &wt);
+    assert_cli_success(&gc, "gc from the linked worktree");
+    let ledger_path = main.join(".libra").join("gc-prune-candidates.json");
+    if let Ok(raw) = fs::read(&ledger_path) {
+        let ledger: serde_json::Value = serde_json::from_slice(&raw).expect("ledger json");
+        assert!(
+            !ledger
+                .as_object()
+                .is_some_and(|entries| entries.contains_key(&oid)),
+            "the MAIN-staged blob must never even be QUARANTINED by a \
+             linked-worktree gc: {ledger}"
+        );
+        let aged: serde_json::Map<String, serde_json::Value> = ledger
+            .as_object()
+            .expect("ledger object")
+            .keys()
+            .map(|key| (key.clone(), serde_json::json!(0)))
+            .collect();
+        fs::write(&ledger_path, serde_json::to_vec(&aged).expect("serialize")).expect("age");
+    }
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], &wt);
+    assert_cli_success(&gc, "second gc from the linked worktree");
+
+    let survives = run_libra_command(&["cat-file", "-t", &oid], main);
+    assert_cli_success(
+        &survives,
+        "the blob staged only in MAIN must survive a linked-worktree gc",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&survives.stdout).trim(),
+        "blob",
+        "and still reads back as a blob"
+    );
+}
+
 /// §C.11 W2 acceptance: a linked worktree's HELD AUTOSTASH and its UNMERGED
 /// index stages survive gc.
 ///
@@ -325,6 +402,13 @@ fn formerly_guarded_commands_run_in_linked_worktree() {
 /// conflict stages are entries in the worktree's private index. Neither is
 /// reachable from any ref, so if the collector missed either, one maintenance
 /// run would destroy the user's uncommitted work mid-conflict.
+///
+/// §C.12 roster: together with
+/// `test_pull_rebase_autostash_in_linked_worktree_pops_only_its_own_entry`
+/// (pull's autostash wrap pushes a REGULAR entry onto the shared stack,
+/// whose full reflog `stash::gc_roots` traces) this discharges
+/// `linked_pull_autostash_survives_gc`: pull-held state is either a stack
+/// entry (traced via refs/stash + its log) or a held sidecar (traced here).
 #[test]
 fn a_linked_held_autostash_and_unmerged_stages_survive_gc() {
     let repo = repo_with_feature();
@@ -405,6 +489,120 @@ fn a_linked_held_autostash_and_unmerged_stages_survive_gc() {
     assert!(
         text.to_lowercase().contains("unmerged") || text.to_lowercase().contains("both modified"),
         "the unmerged index stages survived gc: {text}"
+    );
+}
+
+/// plan-20260714 W2 §C.4.3 re-verification (self-review finding): the
+/// `stash-branch-journal.json` sidecar is a TRACED GC root.
+///
+/// The journal's `prior_detached` can be the ONLY anchor of the HEAD a
+/// `stash branch` just left: the HEAD switch rewrites the reference row
+/// without a reflog entry, so for a worktree that was detached the old OID
+/// vanishes from every table the walk reads the moment the switch commits.
+/// In the crash window before recovery, gc pruning that commit would leave
+/// recovery re-pointing HEAD at a missing object. This plants exactly that
+/// journal (dead command, otherwise-unanchored commit) and proves two aged
+/// gc passes keep the commit — and that a corrupt journal fails closed.
+#[test]
+fn stash_branch_journal_oids_survive_gc() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let oid = orphan_commit(main, "journal-anchor");
+    assert!(
+        sqlite_exec(
+            &main.join(".libra").join("libra.db"),
+            &["DELETE FROM reflog;"]
+        ),
+        "purge the reflog"
+    );
+
+    // The journal a crashed `stash branch` would leave, in MAIN's gitdir.
+    let journal = main.join(".libra").join("stash-branch-journal.json");
+    fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({
+            "branch": "crashed-stash-branch",
+            "base": oid,
+            "prior_branch": null,
+            "prior_detached": oid,
+            "phase": "prepared",
+            "nonce": "0123456789abcdef0123456789abcdef",
+        }))
+        .expect("serialize"),
+    )
+    .expect("plant the journal");
+
+    backdate_loose_objects(main);
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], main),
+        "first gc quarantines",
+    );
+    let ledger_path = main.join(".libra").join("gc-prune-candidates.json");
+    if let Ok(raw) = fs::read(&ledger_path) {
+        let ledger: serde_json::Value = serde_json::from_slice(&raw).expect("ledger json");
+        assert!(
+            !ledger
+                .as_object()
+                .is_some_and(|entries| entries.contains_key(&oid)),
+            "the journal-anchored commit must not be quarantined: {ledger}"
+        );
+        let aged: serde_json::Map<String, serde_json::Value> = ledger
+            .as_object()
+            .expect("ledger object")
+            .keys()
+            .map(|key| (key.clone(), serde_json::json!(0)))
+            .collect();
+        fs::write(&ledger_path, serde_json::to_vec(&aged).expect("serialize")).expect("age");
+    }
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], main),
+        "second gc prunes the aged candidates",
+    );
+    let survives = run_libra_command(&["cat-file", "-t", &oid], main);
+    assert_cli_success(&survives, "the journal-anchored commit survives");
+
+    // And the sidecar contract's other half: a corrupt journal fails the
+    // prune closed, naming the file.
+    fs::write(&journal, "{ not json").expect("corrupt the journal");
+    let refused = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    assert!(
+        !refused.status.success(),
+        "a corrupt stash-branch journal must refuse the prune"
+    );
+    assert!(
+        (String::from_utf8_lossy(&refused.stdout).to_string()
+            + &String::from_utf8_lossy(&refused.stderr))
+            .contains("stash-branch-journal.json"),
+        "and the refusal names the journal"
+    );
+
+    // A WELL-FORMED journal naming a MISSING object is corruption too
+    // (§C.11 W2: mandatory reachability with a missing object fails the
+    // prune closed) — skipping it would prune the operation's remaining
+    // anchors on top of the one already lost.
+    fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({
+            "branch": "crashed-stash-branch",
+            "base": "ffffffffffffffffffffffffffffffffffffffff",
+            "prior_branch": null,
+            "prior_detached": null,
+            "phase": "prepared",
+            "nonce": "0123456789abcdef0123456789abcdef",
+        }))
+        .expect("serialize"),
+    )
+    .expect("plant a journal naming a missing object");
+    let refused = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    assert!(
+        !refused.status.success(),
+        "a journal naming a missing object must refuse the prune"
+    );
+    assert!(
+        (String::from_utf8_lossy(&refused.stdout).to_string()
+            + &String::from_utf8_lossy(&refused.stderr))
+            .contains("does not exist"),
+        "and the refusal says WHY"
     );
 }
 
@@ -1326,7 +1524,20 @@ fn linked_stash_pop_apply_failure_keeps_shared_entry() {
     );
 }
 
-/// branch` preflights the branch collision before touching anything.
+/// plan-20260714 W2 §C.10: the stash STACK is repository-shared while every
+/// snapshot and every application is scoped to the acting worktree — push
+/// snapshots the calling worktree's index and tree, pop applies into the
+/// calling worktree, and the entry leaves the shared stack only through the
+/// CAS delete. `stash branch` preflights the branch collision before
+/// touching anything.
+///
+/// §C.12 roster: covers `linked_stash_push_uses_local_index_and_worktree`
+/// (the pushed change is STAGED in the linked worktree, the push consumes
+/// that index entry, and main's `status --porcelain` is byte-identical
+/// before and after) and `linked_stash_apply_does_not_touch_main_index`
+/// (apply runs IN the linked worktree while main still holds a staged entry
+/// that must not move); the collision preflight below is the zero-write
+/// half of `stash_branch_failure_has_zero_side_effects`.
 #[test]
 fn stash_stack_is_shared_with_scoped_snapshots() {
     let repo = repo_with_feature();
@@ -1338,20 +1549,83 @@ fn stash_stack_is_shared_with_scoped_snapshots() {
         "worktree add",
     );
 
-    // Dirty a TRACKED file in the linked worktree and stash there.
+    // A STAGED change in MAIN that must sit untouched through everything the
+    // linked worktree does — the "main index" half of both roster names.
+    fs::write(main.join("main-staged.txt"), "main staged\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "main-staged.txt"], main),
+        "stage in main",
+    );
+    let main_status_before =
+        String::from_utf8_lossy(&run_libra_command(&["status", "--porcelain"], main).stdout)
+            .to_string();
+    assert!(
+        main_status_before.contains("main-staged.txt"),
+        "main really has a staged entry: {main_status_before}"
+    );
+
+    // Dirty a TRACKED file in the linked worktree — STAGED there, so the
+    // push must snapshot the LINKED index, not main's.
     let tracked = std::fs::read_dir(&wt)
         .unwrap()
         .filter_map(|e| e.ok())
         .find(|e| e.path().is_file())
         .expect("tracked file in wt")
         .path();
+    let tracked_name = tracked
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("file name")
+        .to_string();
     let original = std::fs::read_to_string(&tracked).unwrap();
     std::fs::write(&tracked, "stashed-from-wt\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", &tracked_name], &wt),
+        "stage the change in the LINKED worktree",
+    );
     assert_cli_success(&run_libra_command(&["stash", "push"], &wt), "wt stash push");
     assert_eq!(
         std::fs::read_to_string(&tracked).unwrap(),
         original,
         "push restores the LINKED worktree's file"
+    );
+    // The push consumed the LINKED index's staged entry…
+    let wt_status =
+        String::from_utf8_lossy(&run_libra_command(&["status", "--porcelain"], &wt).stdout)
+            .to_string();
+    assert!(
+        !wt_status.contains(&tracked_name),
+        "the linked worktree's staged change was snapshotted by ITS push: {wt_status}"
+    );
+    // …and left MAIN's index byte-identical.
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["status", "--porcelain"], main).stdout),
+        main_status_before,
+        "a linked push must not touch MAIN's index"
+    );
+
+    // Apply in the LINKED worktree: the change lands there, MAIN's index is
+    // still untouched (the "apply" half of the roster names).
+    assert_cli_success(&run_libra_command(&["stash", "apply"], &wt), "wt apply");
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        "stashed-from-wt\n",
+        "apply lands in the ACTING worktree"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["status", "--porcelain"], main).stdout),
+        main_status_before,
+        "a linked apply must not touch MAIN's index either"
+    );
+    // Reset the linked worktree so the pop-in-main half below starts clean.
+    assert_cli_success(
+        &run_libra_command(&["restore", "--staged", "--worktree", &tracked_name], &wt),
+        "restore the linked worktree",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).unwrap(),
+        original,
+        "the linked worktree is back to its pre-stash content"
     );
 
     // The shared stack lists the entry from MAIN...
@@ -1403,9 +1677,10 @@ fn stash_stack_is_shared_with_scoped_snapshots() {
     );
 }
 
-/// W1 §C.4.1.1: plain `status` and ALL cache-semantic modes run in a
-/// linked worktree — the dirty cache is scoped per worktree. (Formerly the
-/// `--scan`/`--cached`/`--check-dirty` fail closed until W1 scopes the cache.
+/// W1 §C.4.1.1: plain `status` and ALL cache-semantic modes run in a linked
+/// worktree — the dirty cache is scoped per worktree. (Formerly
+/// `--scan`/`--cached`/`--check-dirty` failed closed there, under the W0
+/// transitional guard, until W1 scoped the cache.)
 #[test]
 fn status_cache_modes_run_in_linked_worktree() {
     let repo = repo_with_feature();
@@ -1832,6 +2107,16 @@ pub(crate) fn backdate_loose_objects(repo: &std::path::Path) {
 /// `tag` is a Repository-scope command allowed in ANY worktree, so a shared
 /// `TAG_EDITMSG` would let two worktrees composing a message concurrently
 /// truncate each other's buffer.
+///
+/// §C.12 roster: this ONE test discharges four named regressions —
+/// `tag_editmsg_isolated_or_repo_locked`,
+/// `notes_editmsg_isolated_or_repo_locked`,
+/// `branch_description_editmsg_isolated_or_repo_locked` and
+/// `linked_revert_edit_message_isolated`. They share a single contract
+/// (each worktree is handed a buffer under its own gitdir) and a single
+/// expensive fixture, and the assertion loop names each buffer, so splitting
+/// them into four tests would quadruple the CLI round-trips without
+/// strengthening anything.
 #[test]
 fn editor_buffers_are_worktree_local_not_shared() {
     let repo = repo_with_feature();
@@ -1979,6 +2264,371 @@ fn editor_buffers_are_worktree_local_not_shared() {
         expected,
         "the linked worktree's buffer lives in its own gitdir: {paths:?}"
     );
+}
+
+/// plan-20260714 W2 §C.4.3 / §C.12: `MERGE_RR` is per-worktree.
+///
+/// rerere's tracking list names the conflicts a worktree is CURRENTLY
+/// resolving. Before W2 it lived in the shared `.libra/rerere/MERGE_RR`, so
+/// two worktrees resolving different conflicts overwrote each other's list —
+/// and a `rerere clear` in one erased the other's tracking. The rr-CACHE
+/// (recorded pre/postimages) stays shared on purpose: a resolution learned
+/// in one worktree should be replayable in the next.
+#[test]
+fn linked_rerere_merge_rr_isolated() {
+    let (main, wt, _repo, _parent) = two_conflicting_worktrees("rerere-mrr");
+
+    // Each worktree tracks its OWN conflict, in its OWN gitdir.
+    let main_rr = main.join(".libra").join("MERGE_RR");
+    let wt_rr = wt.join(".libra").join("MERGE_RR");
+    assert!(
+        main_rr.exists(),
+        "main records its tracked conflict in its own gitdir"
+    );
+    assert!(
+        wt_rr.exists(),
+        "the linked worktree records its tracked conflict in its own gitdir"
+    );
+    assert!(
+        !main.join(".libra").join("rerere").join("MERGE_RR").exists(),
+        "nothing writes the pre-W2 shared MERGE_RR any more"
+    );
+
+    // Same file name, different conflict content → different conflict ids.
+    let main_list = fs::read_to_string(&main_rr).unwrap_or_default();
+    let wt_list = fs::read_to_string(&wt_rr).unwrap_or_default();
+    assert!(
+        !main_list.trim().is_empty() && !wt_list.trim().is_empty(),
+        "both worktrees track a conflict: main={main_list:?} wt={wt_list:?}"
+    );
+    assert_ne!(
+        main_list, wt_list,
+        "each worktree's list describes ITS conflict, not a shared one"
+    );
+
+    // And `rerere status` in one scope reports only that scope's conflict.
+    let status = run_libra_command(&["rerere", "status"], &wt);
+    assert_cli_success(&status, "rerere status in the linked worktree");
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("wt.txt"),
+        "the linked worktree's status names its own conflicted path: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("main.txt"),
+        "and never the other worktree's: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+
+    // `rerere diff` reads the same scoped list: the linked worktree's diff
+    // covers its own conflict and never mentions the other's path.
+    let diff = run_libra_command(&["rerere", "diff"], &wt);
+    assert_cli_success(&diff, "rerere diff in the linked worktree");
+    let diff_text = String::from_utf8_lossy(&diff.stdout).to_string();
+    assert!(
+        diff_text.contains("wt.txt") && !diff_text.contains("main.txt"),
+        "rerere diff is scoped to the calling worktree: {diff_text}"
+    );
+
+    // `rerere forget` retires an entry from the CALLING worktree's list and
+    // leaves the other worktree's list byte-identical.
+    let main_before = fs::read_to_string(&main_rr).unwrap_or_default();
+    assert_cli_success(
+        &run_libra_command(&["rerere", "forget", "wt.txt"], &wt),
+        "rerere forget in the linked worktree",
+    );
+    assert!(
+        !fs::read_to_string(&wt_rr)
+            .unwrap_or_default()
+            .contains("wt.txt"),
+        "forget retired the entry from the calling worktree's list"
+    );
+    assert_eq!(
+        fs::read_to_string(&main_rr).unwrap_or_default(),
+        main_before,
+        "and left the other worktree's list byte-identical"
+    );
+}
+
+/// plan-20260714 §C.12: `rerere clear` is scoped to the calling worktree.
+///
+/// `clear` drops the CURRENT tracking list. Sharing it meant one worktree's
+/// cleanup silently abandoned another's in-progress recording — the
+/// postimage for that conflict could then never be recorded.
+#[test]
+fn linked_rerere_clear_does_not_touch_other_worktree() {
+    let (main, wt, _repo, _parent) = two_conflicting_worktrees("rerere-clear");
+    let main_rr = main.join(".libra").join("MERGE_RR");
+    let wt_rr = wt.join(".libra").join("MERGE_RR");
+    let main_before = fs::read_to_string(&main_rr).unwrap_or_default();
+    assert!(
+        !main_before.trim().is_empty(),
+        "main is tracking a conflict"
+    );
+    assert!(
+        !fs::read_to_string(&wt_rr)
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "the linked worktree is tracking one too — a clear of an empty list \
+         would prove nothing"
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["rerere", "clear"], &wt),
+        "rerere clear in the linked worktree",
+    );
+
+    assert_eq!(
+        fs::read_to_string(&wt_rr).unwrap_or_default().trim(),
+        "",
+        "the clear emptied the CALLING worktree's list"
+    );
+    assert_eq!(
+        fs::read_to_string(&main_rr).unwrap_or_default(),
+        main_before,
+        "and left the other worktree's list byte-identical"
+    );
+}
+
+/// plan-20260714 §C.12: an auto-recorded postimage belongs to the conflict
+/// the RESOLVING worktree had, and replays there.
+///
+/// The postimage is keyed by conflict id in the SHARED cache, so a
+/// mis-scoped recording would file one worktree's resolution under the
+/// other's conflict — and then replay the wrong text into a clean merge.
+#[test]
+fn linked_rerere_auto_update_records_correct_postimage() {
+    let (main, wt, _repo, _parent) = two_conflicting_worktrees("rerere-post");
+
+    // Resolve the LINKED worktree's conflict and let rerere record it.
+    fs::write(
+        wt.join("wt.txt"),
+        "resolved-in-wt
+",
+    )
+    .unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], &wt), "record the postimage");
+    assert_eq!(
+        fs::read_to_string(wt.join(".libra").join("MERGE_RR"))
+            .unwrap_or_default()
+            .trim(),
+        "",
+        "recording the postimage retires the entry from THIS worktree's list"
+    );
+
+    // Main's conflict is untouched: still tracked, still conflicted.
+    assert!(
+        fs::read_to_string(main.join("main.txt"))
+            .unwrap_or_default()
+            .contains("<<<<<<<"),
+        "the other worktree's file is still conflicted"
+    );
+    assert!(
+        !fs::read_to_string(main.join(".libra").join("MERGE_RR"))
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "and still tracked there"
+    );
+
+    // Replaying the SAME conflict in the linked worktree reuses the
+    // recording — proof the postimage was filed under the right id.
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], &wt), "abort");
+    let remerged = run_libra_command(&["merge", "rerere-side"], &wt);
+    assert!(
+        !remerged.status.success(),
+        "the same merge conflicts again: {}",
+        String::from_utf8_lossy(&remerged.stdout)
+    );
+    let replayed = run_libra_command(&["rerere"], &wt);
+    assert_cli_success(&replayed, "replay");
+    assert_eq!(
+        fs::read_to_string(wt.join("wt.txt")).unwrap_or_default(),
+        "resolved-in-wt\n",
+        "the recorded resolution replayed into the worktree that recorded it: {}",
+        String::from_utf8_lossy(&replayed.stdout)
+    );
+}
+
+/// plan-20260714 §C.12: `merge-file` backups are worktree-local.
+///
+/// `libra merge-file` overwrites the file in place and keeps a backup when
+/// the merge conflicts. A shared backup directory meant two worktrees
+/// merging same-named files clobbered — and cleaned up — each other's only
+/// copy of the pre-merge content.
+#[test]
+fn linked_merge_file_backup_isolated() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("mf-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // The SAME relative file name in both worktrees, with conflicting edits
+    // so the backup is kept rather than cleaned up.
+    for (dir, tag) in [(main, "main"), (wt.as_path(), "wt")] {
+        fs::write(dir.join("base.txt"), "base\n").unwrap();
+        fs::write(dir.join("mine.txt"), format!("{tag}-mine\n")).unwrap();
+        fs::write(dir.join("theirs.txt"), format!("{tag}-theirs\n")).unwrap();
+        let out = run_libra_command(&["merge-file", "mine.txt", "base.txt", "theirs.txt"], dir);
+        assert!(
+            !out.status.success(),
+            "merge-file must report the conflict in {dir:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Each backup lives under ITS OWN gitdir and holds ITS OWN original.
+    for (dir, tag) in [(main, "main"), (wt.as_path(), "wt")] {
+        let backup = dir
+            .join(".libra")
+            .join("merge-file-backup")
+            .join("mine.txt");
+        assert!(
+            backup.exists(),
+            "{dir:?} keeps its conflicted merge-file backup at {}",
+            backup.display()
+        );
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            format!("{tag}-mine\n"),
+            "the backup holds THIS worktree's pre-merge content"
+        );
+    }
+
+    // CLEANUP is scoped too: a CLEAN merge-file in main removes only MAIN's
+    // same-named backup; the linked worktree's is untouched.
+    fs::write(main.join("mine.txt"), "base\n").unwrap();
+    fs::write(main.join("theirs.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["merge-file", "mine.txt", "base.txt", "theirs.txt"], main),
+        "clean merge-file in main",
+    );
+    assert!(
+        !main
+            .join(".libra")
+            .join("merge-file-backup")
+            .join("mine.txt")
+            .exists(),
+        "the clean merge removed MAIN's backup"
+    );
+    assert!(
+        wt.join(".libra")
+            .join("merge-file-backup")
+            .join("mine.txt")
+            .exists(),
+        "and left the LINKED worktree's same-named backup in place"
+    );
+}
+
+/// Two worktrees of one repository, each sitting on its OWN unresolved merge
+/// conflict, with `rerere.enabled` on.
+///
+/// Both side branches are built BEFORE the linked worktree exists, so no
+/// branch switch in main ever races the shared-branch guard.
+fn two_conflicting_worktrees(
+    slug: &str,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let repo = tempfile::tempdir().expect("repo");
+    let main = repo.path().to_path_buf();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault=false"], &main),
+        "init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "t"], &main),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t"], &main),
+        "email",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "rerere.enabled", "true"], &main),
+        "enable rerere",
+    );
+
+    // One base commit carrying both files.
+    for file in ["main.txt", "wt.txt"] {
+        fs::write(main.join(file), "base\n").unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], &main), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], &main),
+        "commit base",
+    );
+
+    // A side branch per file, each with its own version of that file.
+    for (branch, file) in [("rerere-main-side", "main.txt"), ("rerere-side", "wt.txt")] {
+        assert_cli_success(
+            &run_libra_command(&["switch", "-c", branch], &main),
+            "create the side branch",
+        );
+        fs::write(main.join(file), format!("side-{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], &main), "add side");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "side", "--no-verify"], &main),
+            "commit side",
+        );
+        assert_cli_success(
+            &run_libra_command(&["switch", "main"], &main),
+            "back to main",
+        );
+    }
+
+    // Trunk's conflicting versions of BOTH files, in one commit.
+    for file in ["main.txt", "wt.txt"] {
+        fs::write(main.join(file), format!("trunk-{file}\n")).unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], &main), "add trunk");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "trunk", "--no-verify"], &main),
+        "commit trunk",
+    );
+
+    // Now the linked worktree, on its own branch off the same tip.
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join(slug);
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], &main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "wt-trunk"], &wt),
+        "give the linked worktree its own branch",
+    );
+
+    // Each worktree merges ITS side branch and stops on the conflict.
+    for (dir, branch, file) in [
+        (main.as_path(), "rerere-main-side", "main.txt"),
+        (wt.as_path(), "rerere-side", "wt.txt"),
+    ] {
+        let out = run_libra_command(&["merge", branch], dir);
+        assert!(
+            !out.status.success(),
+            "the merge in {dir:?} must conflict: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A guard refusal also exits non-zero; only conflict MARKERS prove
+        // the merge really ran and stopped in THIS worktree.
+        assert!(
+            fs::read_to_string(dir.join(file))
+                .unwrap_or_default()
+                .contains("<<<<<<<"),
+            "{dir:?} holds a materialized conflict in {file}"
+        );
+    }
+    (main, wt, repo, parent)
 }
 
 /// Part C W1 (§C.4.2): `fetch` is no longer refused in a linked worktree, and
@@ -2626,6 +3276,10 @@ fn linked_pull_rebase_uses_scoped_state() {
 /// pull-internal fetch does not write a FETCH_HEAD at all — only the public
 /// `fetch` command does — so the assertion here is only that MAIN's gitdir
 /// gains none.)
+///
+/// The CONFLICTING half — a linked pull that stops with real merge state,
+/// which main must neither see nor adopt — is
+/// `linked_conflicting_pull_state_not_adopted_by_main` below.
 #[test]
 fn pull_merges_in_linked_worktree() {
     // An upstream repo to pull FROM (a plain local path remote).
@@ -2687,6 +3341,129 @@ fn pull_merges_in_linked_worktree() {
     assert!(
         !main.join(".libra/FETCH_HEAD").exists(),
         "the linked worktree's pull must not write into main's gitdir"
+    );
+}
+
+/// §C.12 roster `linked_pull_merge_state_not_adopted_by_main`, and the W2
+/// acceptance line "linked conflicting pull 使用 scoped state": a pull that
+/// CONFLICTS in a linked worktree parks its merge state in THAT worktree's
+/// gitdir. Main sees no `merge-state.json`, no MERGE_HEAD, no conflict
+/// entries — and the linked worktree's own abort clears only its own state.
+#[test]
+fn linked_conflicting_pull_state_not_adopted_by_main() {
+    // An upstream repo to pull FROM (a plain local path remote).
+    let upstream = repo_with_feature();
+    let up = upstream.path();
+
+    // A clone hosting the linked worktree.
+    let clone_parent = tempfile::tempdir().expect("clone parent");
+    let clone_dir = clone_parent.path().join("clone");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", up.to_str().unwrap(), clone_dir.to_str().unwrap()],
+            clone_parent.path(),
+        ),
+        "clone upstream",
+    );
+    let main = clone_dir.as_path();
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "t"], main),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "t@t"], main),
+        "email",
+    );
+    // A clone inherits vault signing without an unseal key, which would fail
+    // the fixture commit below rather than exercise the pull.
+    assert_cli_success(
+        &run_libra_command(&["config", "vault.signing", "false"], main),
+        "disable vault signing in the clone",
+    );
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("conflict-pull-wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // DIVERGE: upstream and the linked worktree edit the same lines of the
+    // same file, so the pull's merge must conflict.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], up),
+        "upstream switch feature",
+    );
+    fs::write(up.join("a.txt"), "upstream-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], up), "upstream add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "upstream-line", "--no-verify"], up),
+        "upstream commit",
+    );
+    fs::write(wt.join("a.txt"), "wt-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "wt-line", "--no-verify"], &wt),
+        "wt commit",
+    );
+
+    let main_head_before = abbrev_head(main);
+    let main_status_before =
+        String::from_utf8_lossy(&run_libra_command(&["status", "--porcelain"], main).stdout)
+            .to_string();
+    let pull = run_libra_command(&["pull", "origin", "feature"], &wt);
+    assert!(
+        !pull.status.success(),
+        "the pull must stop on the merge conflict: {}{}",
+        String::from_utf8_lossy(&pull.stdout),
+        String::from_utf8_lossy(&pull.stderr)
+    );
+    assert!(
+        fs::read_to_string(wt.join("a.txt"))
+            .unwrap_or_default()
+            .contains("<<<<<<<"),
+        "the conflict is materialized in the LINKED worktree"
+    );
+
+    // The merge state is the LINKED worktree's, and only its.
+    assert!(
+        wt.join(".libra").join("merge-state.json").exists(),
+        "the linked worktree parks its pull's merge state in its OWN gitdir"
+    );
+    assert!(
+        !main.join(".libra").join("merge-state.json").exists(),
+        "main's gitdir gains no merge state from a linked pull"
+    );
+    let main_status =
+        String::from_utf8_lossy(&run_libra_command(&["status", "--porcelain"], main).stdout)
+            .to_string();
+    assert_eq!(
+        main_status, main_status_before,
+        "main's status is byte-identical across the linked pull"
+    );
+    assert!(
+        !main_status.contains("a.txt") && !main_status.contains("UU"),
+        "and shows no conflict entries: {main_status}"
+    );
+    assert_eq!(abbrev_head(main), main_head_before, "main HEAD untouched");
+
+    // (`rev-parse MERGE_HEAD` stays DEFERRED by §C.5 — the per-worktree
+    // pseudo-ref projection itself is pinned at the service level by
+    // `linked_pseudo_refs_resolve_per_worktree`.)
+
+    // The linked worktree's own abort clears its state; main is still clean.
+    assert_cli_success(&run_libra_command(&["merge", "--abort"], &wt), "wt abort");
+    assert!(
+        !wt.join(".libra").join("merge-state.json").exists(),
+        "the abort cleared the linked worktree's own state"
+    );
+    assert_eq!(
+        abbrev_head(main),
+        main_head_before,
+        "main HEAD still untouched"
     );
 }
 

@@ -1565,7 +1565,9 @@ async fn collect_reachability_context(storage: &ClientStorage) -> CliResult<Reac
     // does not delete, but a false "unreachable" invites a manual delete. All
     // stages (0..=3) count: a blob referenced only by an unmerged conflict
     // stage is not garbage either.
-    for index_path in crate::command::maintenance::worktree_index_roots()? {
+    for index_path in crate::command::maintenance::worktree_index_roots(
+        &crate::utils::util::request_storage_path(),
+    )? {
         if index_path.exists()
             && let Ok(index) = Index::load(&index_path)
         {

@@ -2309,10 +2309,16 @@ where
     C: sea_orm::ConnectionTrait,
 {
     let mut reachable: HashSet<ObjectHash> = HashSet::new();
+    // §C.4.2: ONE storage root for the whole collection, resolved from the
+    // request pin at entry. Every file-backed collector below derives its
+    // paths from this binding, so an in-process cwd move can never mix
+    // repository A's indexes with repository B's registry or sidecars.
+    let storage_root = crate::utils::util::request_storage_path();
+    let storage_root = storage_root.as_path();
     // §C.4.3 Boundary: loaded ONCE for the whole walk. A shallow clone's
     // grafts stop parent traversal instead of demanding parents it was never
     // given; malformed metadata fails closed before anything is pruned.
-    let boundaries = shallow_boundaries()?;
+    let boundaries = shallow_boundaries(storage_root)?;
     let boundaries = &boundaries;
 
     // Collect from refs
@@ -2372,7 +2378,7 @@ where
     // Part C §C.9: the sidecars are worktree-LOCAL, so enumerate EVERY
     // worktree's gitdir — a linked worktree's held autostash is exactly as
     // live as main's.
-    for gitdir in worktree_gitdir_roots()? {
+    for gitdir in worktree_gitdir_roots(storage_root)? {
         let merge_autostash =
             crate::command::merge::MergeAutostash::load_optional_sync_in_gitdir(&gitdir)
                 .map_err(|error| {
@@ -2408,12 +2414,12 @@ where
     // worktree-local merge/revert/rebase-aux sidecars (NOT FETCH_HEAD —
     // §C.4.3 item 13 classifies it as a non-root).
     collect_registered_store_roots(db_conn, storage, boundaries, &mut reachable).await?;
-    collect_worktree_sidecar_roots(storage, boundaries, &mut reachable)?;
+    collect_worktree_sidecar_roots(storage_root, storage, boundaries, &mut reachable)?;
 
     // Ordinary stashes are file-backed rather than SQLite reference rows, and
     // older entries live only in logs/refs/stash. Trace the full reflog, not
     // just refs/stash, so stash@{1} and later remain recoverable.
-    let stash_roots = crate::command::stash::gc_roots().map_err(|error| {
+    let stash_roots = crate::command::stash::gc_roots(storage_root).map_err(|error| {
         CliError::fatal(format!("failed to load stash GC roots: {error}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
@@ -2431,7 +2437,7 @@ where
     // the multi-worktree guard, deleted by `gc`. Every registered worktree's
     // index is a reachability root. A worktree whose index cannot be read fails
     // closed: callers must never prune against a partial root set.
-    for index_path in worktree_index_roots()? {
+    for index_path in worktree_index_roots(storage_root)? {
         let index_exists = index_path.try_exists().map_err(|error| {
             CliError::fatal(format!(
                 "failed to inspect index GC root '{}': {error}",
@@ -2451,6 +2457,38 @@ where
         })?;
         for stage in 0..=3 {
             for entry in index.tracked_entries(stage) {
+                // Gitlinks (`160000`) reference a SUBMODULE's commit, which
+                // legitimately does not exist in this repository's store.
+                if entry.mode == 0o160000 {
+                    continue;
+                }
+                // §C.11 W2: a staged or conflict-stage blob is MANDATORY
+                // reachability — its index entry may be its only anchor, so
+                // an entry naming a missing object fails the prune closed
+                // rather than being carried as an unbacked root.
+                match storage.get_object_type(&entry.hash) {
+                    Ok(_) => {}
+                    Err(git_internal::errors::GitError::ObjectNotFound(_)) => {
+                        return Err(CliError::fatal(format!(
+                            "index GC root '{}' entry '{}' (stage {stage}) names object {}, \
+                             which does not exist — pruning would delete the remaining \
+                             anchors of state that is already damaged",
+                            index_path.display(),
+                            entry.name,
+                            entry.hash
+                        ))
+                        .with_stable_code(StableErrorCode::RepoCorrupt));
+                    }
+                    Err(error) => {
+                        return Err(CliError::fatal(format!(
+                            "failed to probe index GC root '{}' entry '{}' ({}): {error}",
+                            index_path.display(),
+                            entry.name,
+                            entry.hash
+                        ))
+                        .with_stable_code(StableErrorCode::IoReadFailed));
+                    }
+                }
                 reachable.insert(entry.hash);
             }
         }
@@ -2459,25 +2497,47 @@ where
     Ok(reachable)
 }
 
-/// Every worktree's private index path — this worktree's plus each registered
-/// linked worktree's `<path>/.libra/index` (plan-20260714 Part C §C.9).
+/// Every worktree's private index path — MAIN's, this worktree's, and each
+/// registered linked worktree's `<path>/.libra/index` (plan-20260714 Part C
+/// §C.9).
 ///
 /// The current worktree's index always comes first so a single-worktree
 /// repository behaves exactly as before. Registry entries whose directory is
 /// gone are skipped (a pruned worktree holds nothing); the caller's
 /// `try_exists` handles a registered-but-indexless worktree.
-pub(crate) fn worktree_index_roots() -> CliResult<Vec<std::path::PathBuf>> {
+///
+/// MAIN's index is seeded EXPLICITLY (its gitdir is the common storage
+/// root), because the registry loop below skips the main entry and
+/// `path::index()` resolves the INVOKING worktree: a gc run from a linked
+/// worktree would otherwise walk every index except main's, and a blob
+/// staged only in main would be pruned — the exact data-loss class this
+/// root set exists to prevent.
+pub(crate) fn worktree_index_roots(
+    storage_root: &std::path::Path,
+) -> CliResult<Vec<std::path::PathBuf>> {
     let mut roots = vec![path::index()];
+    // §C.4.2: EVERYTHING below binds to `storage_root` — the storage the
+    // caller resolved ONCE from the request pin. A first version compared
+    // the pin against a fresh ambient resolution instead; that check is
+    // TOCTOU-shaped (a cwd that moved away and back between collectors
+    // passes it), so the binding is now by construction: the main index and
+    // the registry are both derived from the given root, never re-resolved.
+    let main_index = storage_root.join("index");
+    if !roots.contains(&main_index) {
+        roots.push(main_index);
+    }
     // W2 §C.4.3: with the multi-worktree prune/repack skips lifted, a partial
     // root set is a DATA-LOSS vector — an unreadable registry or a registered
     // worktree whose directory is missing (unmounted volume, half-removed
     // tree) fails the walk CLOSED instead of silently narrowing the roots.
-    let list = crate::command::worktree::run_list_worktrees().map_err(|error| {
-        CliError::fatal(format!(
+    let list =
+        crate::command::worktree::run_list_worktrees_at(&storage_root.join("worktrees.json"))
+            .map_err(|error| {
+                CliError::fatal(format!(
             "cannot enumerate worktree GC roots: the worktree registry is unreadable: {error}"
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
-    })?;
+            })?;
     for entry in list.worktrees {
         if entry.is_main {
             continue;
@@ -2515,8 +2575,8 @@ pub(crate) fn worktree_index_roots() -> CliResult<Vec<std::path::PathBuf>> {
 /// Every worktree's private gitdir (the parent of its index) — used to
 /// enumerate worktree-local GC-root sidecars (`merge-autostash.json`,
 /// `rebase-aux.json`) across ALL worktrees (Part C §C.9).
-fn worktree_gitdir_roots() -> CliResult<Vec<std::path::PathBuf>> {
-    Ok(worktree_index_roots()?
+fn worktree_gitdir_roots(storage_root: &std::path::Path) -> CliResult<Vec<std::path::PathBuf>> {
+    Ok(worktree_index_roots(storage_root)?
         .into_iter()
         .filter_map(|index| index.parent().map(|dir| dir.to_path_buf()))
         .collect())
@@ -2580,7 +2640,46 @@ pub enum GcSourceOrigin {
     File,
 }
 
-/// One inventoried source: what it is, where it lives, how GC treats it.
+/// §C.4.3: the STORAGE KIND a source lives in — one of the five shapes the
+/// plan names. Declared per row so a reader can tell how to inspect it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcStorageKind {
+    /// A column of a migration-owned SQLite table.
+    SqliteColumn,
+    /// A Libra-owned JSON document (in-progress operation sidecars, ledgers,
+    /// findings manifests).
+    JsonManifest,
+    /// A loose ref-shaped file (`refs/stash`, `refs/replace`, their logs).
+    LooseRef,
+    /// A private worktree index.
+    Index,
+    /// A non-JSON sidecar/text file (shallow grafts, FETCH_HEAD, editor
+    /// buffers, raw backups).
+    Sidecar,
+}
+
+/// §C.4.3: what the collector does when a source cannot be READ or names a
+/// missing object. Declared per row and structurally checked against the
+/// row's root type by `gc_object_source_inventory_is_typed_across_all_four_kinds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcCorruptionPolicy {
+    /// Unreadable/corrupt/missing-object ⇒ the prune STOPS (mandatory
+    /// reachability).
+    FailClosed,
+    /// Entries that cannot be read are skipped; the source keeps nothing
+    /// alive, so losing it costs staleness, never an object.
+    LenientSkip,
+    /// A row whose liveness cannot be judged counts as LIVE and defers the
+    /// destructive phase (traces-inflight markers).
+    DeferLive,
+    /// The source contributes no roots at all, so corruption of it cannot
+    /// change what survives.
+    NotApplicable,
+}
+
+/// One inventoried source: what it is, where it lives, how GC treats it —
+/// carrying every declaration §C.4.3 requires (storage kind, schema/version,
+/// read bound, corruption policy, root type).
 #[derive(Debug, Clone, Copy)]
 pub struct GcObjectSource {
     pub origin: GcSourceOrigin,
@@ -2589,6 +2688,14 @@ pub struct GcObjectSource {
     /// Column name for `Column` origins; `""` for files.
     pub column: &'static str,
     pub status: GcSourceStatus,
+    /// §C.4.3 storage kind.
+    pub kind: GcStorageKind,
+    /// §C.4.3 schema/version: which parser/migration owns this shape.
+    pub schema: &'static str,
+    /// §C.4.3 read bound: how much a collection pass reads from it.
+    pub read_bound: &'static str,
+    /// §C.4.3 corruption policy: what happens when it cannot be trusted.
+    pub corruption: GcCorruptionPolicy,
     pub note: &'static str,
 }
 
@@ -2598,9 +2705,13 @@ pub struct GcObjectSource {
 pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
     GcObjectSource {
         origin: GcSourceOrigin::File,
-        location: "<gitdir>/merge-autostash.json, merge-state.json, revert-state.json,                    rebase-aux.json",
+        location: "<gitdir>/merge-autostash.json, merge-state.json, revert-state.json, rebase-aux.json",
         column: "",
         status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::JsonManifest,
+        schema: "typed owner structs (MergeState/RevertState/RebaseAuxState + MergeAutostash), serde with tolerated defaults",
+        read_bound: "one file per registered worktree, full read",
+        corruption: GcCorruptionPolicy::FailClosed,
         note: "collect_worktree_sidecar_roots — held autostash and in-progress operation state, across every worktree scope; corrupt JSON fails closed",
     },
     GcObjectSource {
@@ -2608,6 +2719,10 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
         location: ".libra/sessions/agent-runs/<id>/manifest.json",
         column: "",
         status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::JsonManifest,
+        schema: "RunManifest (findings_oid + manual_attach[].oid), structurally parsed",
+        read_bound: "bounded manifest list; per-file size and total OID caps",
+        corruption: GcCorruptionPolicy::FailClosed,
         note: "collect_agent_run_manifest_roots — findings_oid and manual_attach[].oid parsed structurally and bounded; a missing manifest on a young run DEFERS the prune, an absent object fails closed",
     },
     GcObjectSource {
@@ -2615,6 +2730,10 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
         location: ".libra/shallow",
         column: "",
         status: GcSourceStatus::Boundary,
+        kind: GcStorageKind::Sidecar,
+        schema: "one OID per line (shallow graft list)",
+        read_bound: "single file, full read",
+        corruption: GcCorruptionPolicy::FailClosed,
         note: "shallow_boundaries — parent traversal STOPS at these commits; the commits themselves are kept and their absent parents are never demanded. Unparseable metadata fails closed",
     },
     GcObjectSource {
@@ -2622,6 +2741,10 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
         location: "<gitdir>/FETCH_HEAD",
         column: "",
         status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::Sidecar,
+        schema: "tab-separated fetch records, one per advertised ref",
+        read_bound: "single file per worktree, never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
         note: "§C.4.3 item 13: explicitly NOT a root. fetch records advertised tips that are already up to date and have no local destination, so rooting them would pin objects nothing references. Safety comes from the writer-vs-deleter grace window (PRUNE_GRACE_SECS), not from root registration",
     },
     GcObjectSource {
@@ -2629,250 +2752,541 @@ pub const GC_OBJECT_FILE_SOURCE_INVENTORY: &[GcObjectSource] = &[
         location: ".libra/gc-prune-candidates.json",
         column: "",
         status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::JsonManifest,
+        schema: "oid -> first-seen-epoch map (quarantine ledger)",
+        read_bound: "single file, full read",
+        corruption: GcCorruptionPolicy::LenientSkip,
         note: "read_prune_candidate_ledger — the writer-vs-deleter quarantine ledger: OIDs seen \
                unreachable, with when. Keeps nothing alive and confers no authority; losing it \
                costs one delayed prune cycle, never an object",
+    },
+    // ── W2 §C.4.3 re-verification: file-backed roots the walk ALREADY
+    // collects, which this inventory did not name. An inventory that
+    // understates the collector cannot be used to review it.
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/index",
+        column: "",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::Index,
+        schema: "git index v2 (git-internal parser), stages 0-3",
+        read_bound: "every registered worktree's index, full read",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "collect_reachable_objects via worktree_index_roots — EVERY registered worktree's private index, at every stage: a blob that exists only as an unmerged stage 1/2/3 in a linked worktree is live. An index that cannot be read fails closed before any prune",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<storage>/refs/stash, <storage>/logs/refs/stash",
+        column: "",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::LooseRef,
+        schema: "ref file + reflog lines (stash stack)",
+        read_bound: "tip + full reflog, bounded by stack depth",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "stash::gc_roots — the shared stack is file-backed, and entries below the tip live ONLY in the reflog, so the whole log is traced rather than just the tip; a stash commit's parents carry the pre-stash tree",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<storage>/refs/replace",
+        column: "",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::LooseRef,
+        schema: "<original-oid> filename -> replacement OID content",
+        read_bound: "directory scan, one read per entry",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "collect_worktree_sidecar_roots — each file NAMES the replaced object and CONTAINS the replacement; both sides are roots and neither is anchored anywhere else, so a malformed entry fails closed rather than silently dropping a root",
+    },
+    // ── W1/W2 sidecars that are deliberately NOT roots. Each states the
+    // reason, because "absent from the inventory" and "known not to hold
+    // object ids" are indistinguishable to a reader otherwise.
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/MERGE_RR",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::Sidecar,
+        schema: "id<TAB>path lines (rerere tracking list)",
+        read_bound: "never read by GC (conflict-content ids, not OIDs)",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "rerere's per-worktree tracking list: its ids are CONFLICT-CONTENT hashes that key the rr-cache, not object-store ids. Rooting them would demand objects that were never written",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<storage>/rerere",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::Sidecar,
+        schema: "pre/postimage file bytes under conflict-id dirs",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "the shared rr-cache stores pre/postimage FILE BYTES under conflict-id directories, outside the object store entirely; `rerere gc` ages them out on its own schedule",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/merge-file-backup",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::Sidecar,
+        schema: "raw pre-merge file bytes",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "merge_file::backup_path — raw pre-merge file bytes for `libra merge-file`, never written to the object store; worktree-local so two worktrees cannot clean up each other's backups",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/stash-branch-journal.json",
+        column: "",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::JsonManifest,
+        schema: "StashBranchJournal (base/prior_detached OIDs + text fields), typed extractor",
+        read_bound: "one file per worktree, full read",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "collect_worktree_sidecar_roots — the §C.10 rollback record for `stash branch`. Its `base` and `prior_detached` OIDs can be the ONLY anchors in a crash window: the HEAD switch rewrites the reference row without a reflog entry, so a worktree that was detached (e.g. created with `worktree add --detach`) loses its old HEAD's last anchor the moment the switch commits — recovery would then re-point HEAD at a pruned commit. Tracing the journal for its short life keeps the rollback target alive; corrupt JSON fails the prune closed like every sidecar",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::File,
+        location: "<gitdir>/COMMIT_EDITMSG, MERGE_MSG, CHERRY_PICK_MSG, REVERT_EDITMSG, TAG_EDITMSG, NOTES_EDITMSG, BRANCH_DESCRIPTION_EDITMSG",
+        column: "",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::Sidecar,
+        schema: "free message text",
+        read_bound: "never read by GC",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "worktree-local editor buffers (W2 §C.4.3). They hold MESSAGE TEXT: any object the message will eventually describe is rooted by the ref the command writes, not by the buffer",
     },
     GcObjectSource {
         origin: GcSourceOrigin::File,
         location: "<objects>/info/alternates, <objects>/info/borrowers",
         column: "",
         status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::Sidecar,
+        schema: "one path per line (object-store borrow declarations)",
+        read_bound: "two files, full read at deletion gates",
+        corruption: GcCorruptionPolicy::NotApplicable,
         note: "alternates::ensure_no_live_borrowers — a live borrower blocks every deletion entry point outright, rather than contributing roots this store cannot see",
     },
 ];
 
 /// `(table, column, status, note)` — inventory version 1 (W2 §C.4.3).
-pub const GC_OBJECT_SOURCE_INVENTORY: &[(&str, &str, GcSourceStatus, &str)] = &[
-    (
-        "reference",
-        "commit",
-        GcSourceStatus::TracedRoot,
-        "shared refs loop",
-    ),
-    (
-        "reflog",
-        "old_oid",
-        GcSourceStatus::TracedRoot,
-        "reflog loop (both sides)",
-    ),
-    (
-        "reflog",
-        "new_oid",
-        GcSourceStatus::TracedRoot,
-        "reflog loop (both sides)",
-    ),
-    (
-        "sequence_state",
-        "head_orig",
-        GcSourceStatus::TracedRoot,
-        "sequencer rows, all scopes",
-    ),
-    (
-        "sequence_state",
-        "current_oid",
-        GcSourceStatus::TracedRoot,
-        "sequencer rows, all scopes",
-    ),
-    (
-        "sequence_state",
-        "todo",
-        GcSourceStatus::TracedRoot,
-        "newline OID list",
-    ),
-    (
-        "sequence_state",
-        "payload",
-        GcSourceStatus::TracedRoot,
-        "lenient JSON OID scan",
-    ),
-    (
-        "rebase_state",
-        "onto",
-        GcSourceStatus::TracedRoot,
-        "rebase rows, all scopes",
-    ),
-    (
-        "rebase_state",
-        "orig_head",
-        GcSourceStatus::TracedRoot,
-        "rebase rows, all scopes",
-    ),
-    (
-        "rebase_state",
-        "current_head",
-        GcSourceStatus::TracedRoot,
-        "rebase rows, all scopes",
-    ),
-    (
-        "rebase_state",
-        "stopped_sha",
-        GcSourceStatus::TracedRoot,
-        "rebase rows, all scopes",
-    ),
-    (
-        "rebase_state",
-        "todo",
-        GcSourceStatus::TracedRoot,
-        "newline OID list",
-    ),
-    (
-        "rebase_state",
-        "done",
-        GcSourceStatus::TracedRoot,
-        "newline OID list",
-    ),
-    (
-        "bisect_state",
-        "orig_head",
-        GcSourceStatus::TracedRoot,
-        "bisect rows, all scopes",
-    ),
-    (
-        "bisect_state",
-        "bad",
-        GcSourceStatus::TracedRoot,
-        "bisect rows, all scopes",
-    ),
-    (
-        "bisect_state",
-        "good",
-        GcSourceStatus::TracedRoot,
-        "list column",
-    ),
-    (
-        "bisect_state",
-        "current",
-        GcSourceStatus::TracedRoot,
-        "bisect rows, all scopes",
-    ),
-    (
-        "bisect_state",
-        "skipped",
-        GcSourceStatus::TracedRoot,
-        "list column",
-    ),
-    (
-        "notes",
-        "blob",
-        GcSourceStatus::TracedRoot,
-        "note content blobs are anchored ONLY here",
-    ),
-    (
-        "operation_view_ref",
-        "target_oid",
-        GcSourceStatus::TracedRoot,
-        "undo/view snapshots must stay restorable",
-    ),
-    (
-        "agent_checkpoint",
-        "parent_commit",
-        GcSourceStatus::TracedRoot,
-        "AI capture chain",
-    ),
-    (
-        "agent_checkpoint",
-        "tree_oid",
-        GcSourceStatus::TracedRoot,
-        "AI capture tree",
-    ),
-    (
-        "agent_checkpoint",
-        "metadata_blob_oid",
-        GcSourceStatus::TracedRoot,
-        "AI capture metadata",
-    ),
-    (
-        "agent_checkpoint",
-        "traces_commit",
-        GcSourceStatus::TracedRoot,
-        "AI traces anchor",
-    ),
-    (
-        "agent_coverage_claim",
-        "traces_commit",
-        GcSourceStatus::TracedRoot,
-        "AI coverage claim traces commit",
-    ),
-    (
-        "agent_session",
-        "parent_commit",
-        GcSourceStatus::TracedRoot,
-        "AI session base commit",
-    ),
-    (
-        "workspace_record",
-        "base_commit",
-        GcSourceStatus::TracedRoot,
-        "workspace sync-back baseline (W4 §C.8)",
-    ),
-    (
-        "operation_view",
-        "head_target",
-        GcSourceStatus::TracedRoot,
-        "undo view HEAD pointer — rooted when it is an OID (a name is ref-anchored)",
-    ),
-    (
-        "operation_view_workspace",
-        "pointer_value",
-        GcSourceStatus::TracedRoot,
-        "undo view workspace pointer — rooted when it is an OID",
-    ),
-    (
-        "metadata_kv",
-        "value",
-        GcSourceStatus::TracedRoot,
-        "traces-inflight scope via the dedicated live-marker contract (malformed rows fail \
-         closed, live markers also DEFER pruning); other scopes lenient-scanned",
-    ),
-    (
-        "object_index",
-        "o_id",
-        GcSourceStatus::IndexOnly,
-        "catalog of what the store holds; derivable, never an anchor",
-    ),
-    (
-        "working_dirty",
-        "head_oid",
-        GcSourceStatus::IndexOnly,
-        "advisory freshness key; the commit is ref/reflog-anchored",
-    ),
-    (
-        "working_dirty_meta",
-        "head_oid",
-        GcSourceStatus::IndexOnly,
-        "advisory freshness key; the commit is ref/reflog-anchored",
-    ),
-    (
-        "revision_ordinal",
-        "oid",
-        GcSourceStatus::IndexOnly,
-        "derivable ordinal cache over ref history; rebuilt on demand",
-    ),
-    (
-        "revision_ordinal_meta",
-        "tip_oid",
-        GcSourceStatus::IndexOnly,
-        "cache validity key (the tip is ref-anchored); rebuilt on demand",
-    ),
-    (
-        "object_obliteration",
-        "hash_kind",
-        GcSourceStatus::NonRoot,
-        "not an OID — the hash-algorithm label of the tombstoned address",
-    ),
-    (
-        "object_obliteration",
-        "oid",
-        GcSourceStatus::AntiRoot,
-        "intentional-absence tombstone — the opposite of a root",
-    ),
-    (
-        "layer_path",
-        "content_hash",
-        GcSourceStatus::NonRoot,
-        "identity of an on-disk overlay file; never enters the object store",
-    ),
+pub const GC_OBJECT_SOURCE_INVENTORY: &[GcObjectSource] = &[
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "reference",
+        column: "commit",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "shared refs loop",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "reflog",
+        column: "old_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "reflog loop (both sides)",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "reflog",
+        column: "new_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "reflog loop (both sides)",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "sequence_state",
+        column: "head_orig",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "sequencer rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "sequence_state",
+        column: "current_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "sequencer rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "sequence_state",
+        column: "todo",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "newline OID list",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "sequence_state",
+        column: "payload",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "lenient JSON OID scan",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "rebase_state",
+        column: "onto",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "rebase rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "rebase_state",
+        column: "orig_head",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "rebase rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "rebase_state",
+        column: "current_head",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "rebase rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "rebase_state",
+        column: "stopped_sha",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "rebase rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "rebase_state",
+        column: "todo",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "newline OID list",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "rebase_state",
+        column: "done",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "newline OID list",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "bisect_state",
+        column: "orig_head",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "bisect rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "bisect_state",
+        column: "bad",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "bisect rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "bisect_state",
+        column: "good",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "list column",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "bisect_state",
+        column: "current",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "bisect rows, all scopes",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "bisect_state",
+        column: "skipped",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "list column",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "notes",
+        column: "blob",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "note content blobs are anchored ONLY here",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_view_ref",
+        column: "target_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "undo/view snapshots must stay restorable",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "agent_checkpoint",
+        column: "parent_commit",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "AI capture chain",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "agent_checkpoint",
+        column: "tree_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "AI capture tree",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "agent_checkpoint",
+        column: "metadata_blob_oid",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "AI capture metadata",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "agent_checkpoint",
+        column: "traces_commit",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "AI traces anchor",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "agent_coverage_claim",
+        column: "traces_commit",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "AI coverage claim traces commit",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "agent_session",
+        column: "parent_commit",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "AI session base commit",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "workspace_record",
+        column: "base_commit",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "workspace sync-back baseline (W4 §C.8)",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_view",
+        column: "head_target",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "undo view HEAD pointer — rooted when it is an OID (a name is ref-anchored)",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "operation_view_workspace",
+        column: "pointer_value",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "undo view workspace pointer — rooted when it is an OID",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "metadata_kv",
+        column: "value",
+        status: GcSourceStatus::TracedRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "versioned TracesInflightMarker JSON in value (scope=agent_traces_inflight); unparseable rows count as LIVE",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::DeferLive,
+        note: "traces-inflight scope via the dedicated live-marker contract (malformed rows fail closed, live markers also DEFER pruning); other scopes lenient-scanned",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "object_index",
+        column: "o_id",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "catalog of what the store holds; derivable, never an anchor",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "working_dirty",
+        column: "head_oid",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "advisory freshness key; the commit is ref/reflog-anchored",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "working_dirty_meta",
+        column: "head_oid",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "advisory freshness key; the commit is ref/reflog-anchored",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "revision_ordinal",
+        column: "oid",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "derivable ordinal cache over ref history; rebuilt on demand",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "revision_ordinal_meta",
+        column: "tip_oid",
+        status: GcSourceStatus::IndexOnly,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::LenientSkip,
+        note: "cache validity key (the tip is ref-anchored); rebuilt on demand",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "object_obliteration",
+        column: "hash_kind",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "not an OID — the hash-algorithm label of the tombstoned address",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "object_obliteration",
+        column: "oid",
+        status: GcSourceStatus::AntiRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::FailClosed,
+        note: "intentional-absence tombstone — the opposite of a root",
+    },
+    GcObjectSource {
+        origin: GcSourceOrigin::Column,
+        location: "layer_path",
+        column: "content_hash",
+        status: GcSourceStatus::NonRoot,
+        kind: GcStorageKind::SqliteColumn,
+        schema: "migration-owned SQLite column",
+        read_bound: "full table scan, one query per collection pass",
+        corruption: GcCorruptionPolicy::NotApplicable,
+        note: "identity of an on-disk overlay file; never enters the object store",
+    },
 ];
 
 /// W2 §C.4.3: roots from REGISTERED STORES that anchor object-store OIDs
@@ -3072,31 +3486,81 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
 /// Every registered worktree's gitdir is enumerated; unreadable sidecars
 /// fail CLOSED.
 fn collect_worktree_sidecar_roots(
+    storage_root: &std::path::Path,
     storage: &ClientStorage,
     boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
-    for gitdir in worktree_gitdir_roots()? {
-        for name in ["merge-state.json", "revert-state.json", "rebase-aux.json"] {
+    // Each owner module exposes a TYPED extractor for its sidecar's
+    // semantic OID fields. A generic "walk every OID-shaped JSON string"
+    // scan is wrong in BOTH directions here: a branch name or conflict path
+    // that happens to be 40 hex characters is not a reference (and failing
+    // closed on its absence would block GC on a coincidence), while the
+    // rewrites map's KEYS — real commit ids — are invisible to a
+    // string-value walk. The schema knowledge stays with the owner.
+    type SidecarExtractor =
+        fn(&std::path::Path) -> Result<Option<Vec<(&'static str, String)>>, String>;
+    const SIDECAR_EXTRACTORS: &[(&str, SidecarExtractor)] = &[
+        (
+            "merge-state.json",
+            crate::command::merge::merge_state_gc_oids,
+        ),
+        (
+            "revert-state.json",
+            crate::command::revert::revert_state_gc_oids,
+        ),
+        (
+            "rebase-aux.json",
+            crate::command::rebase::rebase_aux_gc_oids,
+        ),
+        (
+            "stash-branch-journal.json",
+            crate::command::stash::stash_branch_journal_gc_oids,
+        ),
+    ];
+    for gitdir in worktree_gitdir_roots(storage_root)? {
+        for (name, extract) in SIDECAR_EXTRACTORS {
             let path = gitdir.join(name);
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    // Libra-owned documents: corrupt JSON fails closed.
-                    walk_strict_json_oids(
-                        &format!("sidecar '{}'", path.display()),
-                        &text,
-                        storage,
-                        boundaries,
-                        reachable,
-                    )?
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(CliError::fatal(format!(
-                        "failed to read sidecar GC root '{}': {error}",
+            // Corrupt/unreadable sidecars fail the prune CLOSED.
+            let oids = extract(&gitdir).map_err(|error| {
+                CliError::fatal(format!(
+                    "sidecar GC root '{}' cannot be trusted: {error}",
+                    path.display()
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            let Some(oids) = oids else { continue };
+            for (field, oid) in oids {
+                // §C.11 W2: every semantic OID of an in-progress operation
+                // is MANDATORY reachability — invalid or missing objects
+                // fail the prune closed rather than being skipped.
+                let hash = parse_object_hash(oid.trim()).ok_or_else(|| {
+                    CliError::fatal(format!(
+                        "sidecar GC root '{}' field {field} holds an invalid object id \
+                         '{oid}'",
                         path.display()
                     ))
-                    .with_stable_code(StableErrorCode::IoReadFailed));
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
+                match storage.get_object_type(&hash) {
+                    Ok(_) => walk_reachable(&hash, storage, boundaries, reachable)?,
+                    Err(git_internal::errors::GitError::ObjectNotFound(_)) => {
+                        return Err(CliError::fatal(format!(
+                            "sidecar GC root '{}' field {field} names object {hash}, which \
+                             does not exist — an in-progress operation's anchor is missing, \
+                             so the prune stops rather than deleting its remaining ones",
+                            path.display()
+                        ))
+                        .with_stable_code(StableErrorCode::RepoCorrupt));
+                    }
+                    Err(error) => {
+                        return Err(CliError::fatal(format!(
+                            "failed to probe sidecar GC root '{}' field {field} ({hash}): \
+                             {error}",
+                            path.display()
+                        ))
+                        .with_stable_code(StableErrorCode::IoReadFailed));
+                    }
                 }
             }
         }
@@ -3113,7 +3577,7 @@ fn collect_worktree_sidecar_roots(
     // `refs/replace/<original-oid>` files (repository-shared): the CONTENT
     // names the replacement object — anchored nowhere else. Both sides are
     // strict OIDs; malformed entries fail closed.
-    let replace_dir = crate::utils::util::storage_path().join("refs/replace");
+    let replace_dir = storage_root.join("refs/replace");
     match std::fs::read_dir(&replace_dir) {
         Ok(entries) => {
             for entry in entries {
@@ -3168,7 +3632,7 @@ fn collect_worktree_sidecar_roots(
     // else, so they are MANDATORY reachability roots (§C.4.3): a manifest
     // this walk cannot read completely means roots it cannot enumerate, and
     // pruning past that deletes a run's findings.
-    collect_agent_run_manifest_roots(storage, boundaries, reachable)?;
+    collect_agent_run_manifest_roots(storage_root, storage, boundaries, reachable)?;
 
     Ok(())
 }
@@ -3183,6 +3647,7 @@ fn collect_worktree_sidecar_roots(
 /// unbounded, so a large or adversarial tree could stall the prune with no
 /// deadline.
 fn collect_agent_run_manifest_roots(
+    storage_root: &std::path::Path,
     storage: &ClientStorage,
     boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
@@ -3196,7 +3661,7 @@ fn collect_agent_run_manifest_roots(
     /// Attachment lists are human-scale.
     const MAX_ATTACHMENTS: usize = 10_000;
 
-    let runs_dir = crate::utils::util::storage_path().join("sessions/agent-runs");
+    let runs_dir = storage_root.join("sessions/agent-runs");
     let entries = match std::fs::read_dir(&runs_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -3614,32 +4079,11 @@ fn walk_payload_oids(
         return Ok(());
     }
     // LENIENT: non-JSON is legal for this caller class (arbitrary user
-    // values). Libra-OWNED documents go through `walk_strict_json_oids`.
+    // values). Libra-OWNED sidecars go through their owners' TYPED
+    // extractors in `collect_worktree_sidecar_roots` instead.
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
         return Ok(());
     };
-    walk_json_value_oids(value, storage, boundaries, reachable)
-}
-
-/// STRICT variant for Libra-owned JSON documents (in-progress sidecars,
-/// agent-run manifests, traces-inflight markers): a document that fails to
-/// PARSE is corruption, and destructive GC must stop rather than treat its
-/// unreadable roots as absent (fail closed).
-fn walk_strict_json_oids(
-    context: &str,
-    payload: &str,
-    storage: &ClientStorage,
-    boundaries: &HashSet<ObjectHash>,
-    reachable: &mut HashSet<ObjectHash>,
-) -> CliResult<()> {
-    // An EMPTY owned document is corruption too (a truncated manifest or
-    // sidecar would silently surrender its only roots) — fail closed.
-    let value = serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
-        CliError::fatal(format!(
-            "{context} holds corrupt JSON while computing GC roots: {error}"
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
     walk_json_value_oids(value, storage, boundaries, reachable)
 }
 
@@ -3685,13 +4129,14 @@ fn walk_json_value_oids(
 /// and `prune` all failed outright on every shallow clone. Malformed shallow
 /// metadata fails closed rather than silently degrading to "no boundaries",
 /// because that reading would resume the corruption report.
-fn shallow_boundaries() -> CliResult<HashSet<ObjectHash>> {
-    let raw = crate::command::fetch::read_shallow_boundaries().map_err(|error| {
-        CliError::fatal(format!(
-            "shallow metadata cannot be trusted before pruning: {error}"
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
+fn shallow_boundaries(storage_root: &Path) -> CliResult<HashSet<ObjectHash>> {
+    let raw = crate::command::fetch::read_shallow_boundaries_at(&storage_root.join("shallow"))
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "shallow metadata cannot be trusted before pruning: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
     raw.iter()
         .map(|oid| {
             parse_object_hash(oid).ok_or_else(|| {
@@ -4243,5 +4688,219 @@ mod tests {
         // Trailer is the SHA-256 of the body (32 bytes), not SHA-1.
         let body = &bytes[..bytes.len() - 32];
         assert_eq!(&sha2::Sha256::digest(body)[..], &bytes[bytes.len() - 32..]);
+    }
+
+    /// plan-20260714 W2 §C.4.3: EVERY file production code can create under a
+    /// repository's storage roots is classified — as an object source in
+    /// [`GC_OBJECT_FILE_SOURCE_INVENTORY`], or in the explicit
+    /// `NOT_AN_OBJECT_SOURCE` list below.
+    ///
+    /// The inventory's DB half already has a forward guard
+    /// (`gc_object_source_inventory_covers_every_oid_column`); its FILE half
+    /// had none, and it showed: the walk collected every worktree's private
+    /// index, the shared stash reflog and `refs/replace` while the inventory
+    /// named none of the three, and no W1/W2 sidecar appeared at all. An
+    /// inventory that understates its own collector cannot be used to review
+    /// GC, which is what §C.4.3 asks it to be.
+    ///
+    /// KNOWN COVERAGE LIMITS (documented, not silent): the scan sees single
+    /// string literals joined onto receivers it can RECOGNIZE as a storage
+    /// root (identifiers containing `gitdir`/`git_dir`/`storage`, or an
+    /// explicit `.join(".libra")` that is not home-rooted). It cannot see
+    /// (a) paths built component-wise on a `&Path` parameter — the
+    /// alternates/borrowers files (`objects_dir.join("info").join(…)`) are
+    /// inventoried but guarded by their own borrower-gate tests, not by this
+    /// scan; and (b) rows whose only visible join literal is in the GC
+    /// collector itself (`refs/replace`, `sessions/agent-runs`) — for those
+    /// this guard pins the name's continued existence, not writer coverage.
+    #[test]
+    fn every_storage_rooted_file_is_a_classified_gc_source() {
+        /// Files under a storage root that are NOT object sources, with the
+        /// reason. Listed by name so adding one is a reviewed decision.
+        const NOT_AN_OBJECT_SOURCE: &[(&str, &str)] = &[
+            (
+                "HEAD",
+                "the HEAD pointer file (dual-layout compatibility); ref OIDs are inventoried in the DB half (reference)",
+            ),
+            (
+                "config",
+                "repository configuration file (dual-layout compatibility); no object ids",
+            ),
+            (
+                "packed-refs",
+                "packed ref file (dual-layout compatibility); ref OIDs are inventoried in the DB half (reference)",
+            ),
+            (
+                "objects/info/libra-tmp",
+                "loose-object write STAGING inside the object store: objects are hardlinked out of it on publish, and an orphaned temp file is re-writable content, never the only copy",
+            ),
+            ("stash-stack.lock", "the shared stash stack's advisory lock"),
+            ("contexts", "agent context files (§C.4.1.1 config surface)"),
+            ("rules", "agent rule files (§C.4.1.1 config surface)"),
+            (
+                "skills",
+                "agent skill definitions (§C.4.1.1 config surface)",
+            ),
+            ("hooks.json", "hook configuration (§C.4.1.1 config surface)"),
+            (
+                "dagrs-checkpoints",
+                "agent scheduler checkpoints; task graph state, no object ids",
+            ),
+            (
+                "tmp/commit-preview",
+                "scratch directory for commit previews",
+            ),
+            (
+                "commands",
+                "custom command definitions (§C.4.1.1 config surface)",
+            ),
+            (
+                "automations.toml",
+                "automation rules (§C.4.1.1 config surface)",
+            ),
+            (
+                "agents.toml",
+                "agent registry file (§C.4.1.1 config surface)",
+            ),
+            ("agents", "agent definition files (§C.4.1.1 config surface)"),
+            (
+                "objects",
+                "the object store itself — what GC collects, not a source of roots",
+            ),
+            ("pack", "packfiles inside the object store"),
+            (
+                "lost-found",
+                "where `fsck` WRITES dangling objects it found; never an input",
+            ),
+            (
+                "libra.db",
+                "the database; its OID columns are the inventory's other half",
+            ),
+            (
+                "info",
+                "ignore/attributes sources (§C.4.1.1), no object ids",
+            ),
+            ("hooks", "hook scripts"),
+            ("code", "`libra code` control/session surface (§C.4.1.1)"),
+            ("service", "service control files (§C.4.1.1)"),
+            (
+                "sessions",
+                "agent session surface; its findings manifests are inventoried separately",
+            ),
+            ("tasks", "agent task surface"),
+            ("config.toml", "repository configuration (§C.4.1.1)"),
+            ("commondir", "worktree layout pointer"),
+            ("worktree_id", "worktree identity marker"),
+            ("migrate-marker", "layout-migration lifecycle marker"),
+            ("worktrees", "linked worktree gitdir container"),
+            ("worktrees.json", "the worktree registry"),
+            ("worktrees.lock", "registry advisory lock"),
+            ("worktrees-fuse", "FUSE worktree container"),
+            ("worktrees-fuse.json", "FUSE worktree registry"),
+            ("maintenance.lock", "maintenance advisory lock"),
+            ("branch-attach.lock", "branch-attach advisory lock"),
+            (
+                "merge-autostash.lock",
+                "advisory lock for the inventoried autostash sidecar",
+            ),
+            ("publication-barrier", "publish barrier marker"),
+            (
+                "publication-barrier.attempted",
+                "publish barrier attempt marker",
+            ),
+            (
+                "lfs/objects",
+                "the LFS content store — separate from the object store",
+            ),
+            (
+                "media",
+                "large-media content store — separate from the object store",
+            ),
+            (
+                "chunks",
+                "chunked content store — separate from the object store",
+            ),
+            (
+                "manifests",
+                "chunk manifests — describe the chunk store, not git objects",
+            ),
+            (
+                "obliteration-audit.jsonl",
+                "audit trail; the AntiRoot itself is the `object_obliteration` table",
+            ),
+        ];
+
+        // Names the inventory classifies, normalized to storage-relative
+        // paths: "<gitdir>/index" → "index", ".libra/shallow" → "shallow".
+        let classified: Vec<String> = GC_OBJECT_FILE_SOURCE_INVENTORY
+            .iter()
+            .flat_map(|source| source.location.split(','))
+            .map(|location| {
+                let location = location.trim();
+                // Strip a LEADING placeholder root only: `<id>` appears
+                // mid-path in the agent-run manifest location, and splitting
+                // on the first '>' anywhere would swallow the prefix.
+                let location = match location
+                    .strip_prefix('<')
+                    .and_then(|rest| rest.split_once('>'))
+                {
+                    Some((_, rest)) => rest,
+                    None => location,
+                };
+                let relative = location
+                    .trim_start_matches('/')
+                    .trim_start_matches(".libra/");
+                // Truncate at an in-path placeholder so
+                // `sessions/agent-runs/<id>/manifest.json` names the
+                // directory production code actually joins.
+                match relative.split_once('<') {
+                    Some((head, _)) => head.trim_end_matches('/').to_string(),
+                    None => relative.to_string(),
+                }
+            })
+            .collect();
+
+        let found = crate::internal::source_scan::storage_rooted_join_literals();
+        // Self-check: an empty or broken scan would make the loop vacuous.
+        assert!(
+            found.contains("merge-state.json") && found.len() > 30,
+            "the storage-rooted scan looks broken: {found:?}"
+        );
+
+        for name in &found {
+            let inventoried = classified.iter().any(|entry| entry == name);
+            let excluded = NOT_AN_OBJECT_SOURCE.iter().any(|(entry, _)| entry == name);
+            assert!(
+                inventoried || excluded,
+                "production code creates `<storage>/{name}`, which is in neither \
+                 GC_OBJECT_FILE_SOURCE_INVENTORY nor NOT_AN_OBJECT_SOURCE. Classify it: \
+                 if it can hold object ids give it a row (TracedRoot / AntiRoot / \
+                 Boundary / IndexOnly / NonRoot with the reason), otherwise add it to \
+                 the exclusion list (plan-20260714 §C.4.3)"
+            );
+        }
+
+        // And the exclusion list stays honest: an entry nothing creates is
+        // stale, and an entry that is ALSO inventoried is a contradiction —
+        // one that HIDES deletions, because the exclusion keeps answering
+        // for a row somebody removed. (Found exactly that way: mutating the
+        // `<gitdir>/index` row away left this guard green.)
+        for (name, reason) in NOT_AN_OBJECT_SOURCE {
+            assert!(
+                !classified.iter().any(|entry| entry == name),
+                "`{name}` is BOTH inventoried as a GC source and excluded as a \
+                 non-source — the exclusion would keep this guard green if the \
+                 inventory row were deleted. Keep one"
+            );
+            assert!(
+                found.contains(*name),
+                "`{name}` is excluded as a non-object-source, but no production code \
+                 joins it onto a storage root any more — drop the entry"
+            );
+            assert!(
+                reason.len() > 10,
+                "`{name}` is excluded without a substantive reason"
+            );
+        }
     }
 }

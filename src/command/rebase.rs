@@ -175,6 +175,37 @@ impl RebaseAuxState {
 /// Scope (Part C §C.9): GC enumerates EVERY worktree's gitdir, so this reads
 /// the aux sidecar of the gitdir the caller names — a held autostash is a
 /// first-class reachability root regardless of which worktree holds it.
+/// The SEMANTIC OID fields of this gitdir's `rebase-aux.json`, for GC root
+/// collection (plan-20260714 §C.4.3): the held autostash, every update-refs
+/// plan tip, and BOTH sides of every rewrite (including the map KEYS — the
+/// original commits — which a generic JSON scan would miss entirely).
+/// `exec_commands` and branch names are text and are NOT returned.
+pub(crate) fn rebase_aux_gc_oids(
+    gitdir: &std::path::Path,
+) -> Result<Option<Vec<(&'static str, String)>>, String> {
+    let aux = RebaseAuxState::load_optional_at(&gitdir.join("rebase-aux.json"))
+        .map_err(|error| error.to_string())?;
+    let Some(aux) = aux else {
+        return Ok(None);
+    };
+    let mut oids = Vec::new();
+    if let Some(autostash) = aux.autostash {
+        oids.push(("autostash", autostash));
+    }
+    for update in aux.refs_to_update {
+        oids.push(("refs_to_update.old_oid", update.old_oid));
+    }
+    for (original, rewritten) in aux.rewrites {
+        oids.push(("rewrites (original)", original));
+        oids.push(("rewrites (rewritten)", rewritten));
+    }
+    for (original, parent) in aux.rewrite_aliases {
+        oids.push(("rewrite_aliases (original)", original));
+        oids.push(("rewrite_aliases (parent)", parent));
+    }
+    Ok(Some(oids))
+}
+
 pub(crate) fn held_autostash_oid_in_gitdir(
     gitdir: &std::path::Path,
 ) -> CliResult<Option<ObjectHash>> {

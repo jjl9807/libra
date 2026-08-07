@@ -2,6 +2,72 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W2 cross-review, 2026-08-07)
+
+- **gc run from a linked worktree no longer prunes blobs staged only in
+  main.** The index root collector seeded the INVOKING worktree's index and
+  then skipped the registry's main entry — correct when gc runs from main,
+  and a silent data-loss hole when it runs from a linked worktree: main's
+  private index was simply absent from the root set. Main's index is now
+  seeded explicitly from the common storage root, and a two-phase regression
+  (quarantine pass + aged prune pass, invoked from the linked worktree)
+  pins it.
+- **A crashed `stash branch` can no longer lose the detached commit it must
+  restore.** Its rollback journal named two OIDs but was classified as a
+  GC non-root on the claim that both were anchored elsewhere — untrue for
+  `prior_detached`: the HEAD switch rewrites the reference row without a
+  reflog entry, so a worktree that was detached loses that commit's last
+  anchor the moment the switch commits, and recovery would re-point HEAD at
+  a pruned object. The journal is now a traced sidecar root for its short
+  life (corrupt JSON fails the prune closed, like every sidecar).
+
+### Added (plan-20260714 W2 cross-review, 2026-08-07)
+
+- **The `WorktreePseudoRefs` per-worktree isolation is now pinned by the
+  §C.12 named regression `linked_pseudo_refs_resolve_per_worktree`.** The
+  service projects `ORIG_HEAD`/`MERGE_HEAD`/`CHERRY_PICK_HEAD`/
+  `REVERT_HEAD`/`REBASE_HEAD`/`FETCH_HEAD` from each worktree's own scoped
+  state; exposing them as `rev-parse` names stays DEFERRED by §C.5's
+  explicit contract (`COMPATIBILITY.md` rev-parse row), and the compat
+  guard continues to pin that refusal.
+- **The §C.4.3 GC inventory is now typed, exhaustive and guarded.** Every
+  source — 38 SQLite columns and 14 file surfaces, one struct — declares
+  its storage kind, schema/version, read bound, corruption policy and root
+  type, with a structural guard forbidding inconsistent combinations (a
+  keep-alive root must fail closed or defer; an index-only source must be
+  lenient). The file half gained the rows the walk already collected but
+  never named (every worktree's private index, the shared stash reflog,
+  `refs/replace`) and explicit classifications for every W1/W2 sidecar. A
+  forward guard scans production sources for every file name joined onto a
+  storage root and fails when one is neither inventoried nor excluded with
+  a reason — the exclusion list is checked for staleness and forbidden from
+  shadowing an inventory row.
+- **GC roots now fail closed on missing objects, from typed schemas.** Each
+  in-progress sidecar's OWNER exposes a typed extractor for its semantic
+  OID fields (merge/revert state, rebase-aux — including the rewrite map's
+  keys — and the stash-branch journal): a field naming a missing object
+  refuses the prune naming the file and field, while text fields that
+  merely look like hashes (branch names, conflict paths) are never
+  extracted and can no longer block GC. Private-index entries are probed
+  the same way (gitlinks exempt — a submodule commit is legitimately
+  absent).
+- **The whole GC root collection binds to ONE storage root**, resolved from
+  the request pin at entry and threaded through every file-backed collector
+  (indexes, registry, sidecars, `refs/replace`) — an in-process working-
+  directory move can no longer pair one repository's indexes with
+  another's registry.
+- **`CHERRY_PICK_HEAD` now means what §C.5 says.** The sequencer row is
+  persisted before every pick attempt, so the row alone cannot distinguish
+  a conflict stop from a hard-error stop; a durable conflict-phase flag in
+  the persisted options now discriminates — set on every conflict stop,
+  stripped on resume — and the pseudo-ref projection requires it (rows from
+  older binaries project nothing; `ORIG_HEAD` stays defined for any
+  sequence).
+- **`WorktreePseudoRefs::for_request()` binds its file projections to the
+  request pin**, not the ambient working directory, so an in-process
+  directory move cannot pair one repository's database rows with another's
+  merge/revert/`FETCH_HEAD` files.
+
 ### Fixed (plan-20260714 W1 cross-review, 2026-08-07)
 
 - **`libra service` no longer wedges when two dirty-mark requests arrive at

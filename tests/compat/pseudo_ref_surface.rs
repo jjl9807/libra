@@ -4,7 +4,12 @@
 //! `rev-parse` row states that the pseudo-ref names are not resolvable — so a
 //! Git user who reaches for `rev-parse MERGE_HEAD` mid-conflict finds a
 //! contract instead of a silent failure. This guard fails if the service and
-//! the declaration ever drift apart in either direction.
+//! the declaration ever drift apart in either direction. (A W2-review
+//! attempt to wire the names into `rev-parse` was ROLLED BACK against this
+//! very contract — §C.5 keeps public resolution deferred and says that if it
+//! ever lands, it lands only through the service; the per-worktree isolation
+//! itself is pinned by `linked_pseudo_refs_resolve_per_worktree` at the
+//! service level.)
 
 use std::process::Command;
 

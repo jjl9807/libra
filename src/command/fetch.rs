@@ -2690,7 +2690,16 @@ fn shallow_file_path() -> Result<PathBuf, FetchError> {
 /// with this one about what counts as a boundary, which is precisely the
 /// disagreement that turns a shallow clone's GC into a corruption report.
 pub(crate) fn read_shallow_boundaries() -> Result<BTreeSet<String>, FetchError> {
-    let path = shallow_file_path()?;
+    read_shallow_boundaries_at(&shallow_file_path()?)
+}
+
+/// [`read_shallow_boundaries`] against an EXPLICIT shallow file (§C.4.2) —
+/// the GC collection binds every file-backed source to one pinned storage
+/// root rather than re-resolving ambiently per source.
+pub(crate) fn read_shallow_boundaries_at(
+    path: &std::path::Path,
+) -> Result<BTreeSet<String>, FetchError> {
+    let path = path.to_path_buf();
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),

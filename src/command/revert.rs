@@ -807,6 +807,22 @@ const CONFLICT_MARKER: &str = "<<<<<<<";
 /// This worktree's revert sidecar, for the §C.5 pseudo-ref projection:
 /// `(ORIG_HEAD, REVERT_HEAD)`. Read-only; the tuple keeps `RevertState`
 /// private, since the projection needs exactly these two fields.
+/// The SEMANTIC OID fields of this gitdir's `revert-state.json`, for GC root
+/// collection (plan-20260714 §C.4.3). Same contract as
+/// `merge::merge_state_gc_oids`: typed fields only, never text.
+pub(crate) fn revert_state_gc_oids(
+    gitdir: &std::path::Path,
+) -> Result<Option<Vec<(&'static str, String)>>, String> {
+    Ok(
+        revert_state_for_pseudo_refs(gitdir)?.map(|(orig_head, reverted_commit)| {
+            vec![
+                ("orig_head", orig_head),
+                ("reverted_commit", reverted_commit),
+            ]
+        }),
+    )
+}
+
 pub(crate) fn revert_state_for_pseudo_refs(
     gitdir: &std::path::Path,
 ) -> Result<Option<(String, String)>, String> {

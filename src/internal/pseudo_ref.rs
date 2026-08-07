@@ -18,6 +18,11 @@
 //! | `ORIG_HEAD`        | `sequence_state.head_orig` / `rebase_state.orig_head` / `bisect_state.orig_head` / the merge and revert sidecars |
 //! | `MERGE_HEAD`       | `merge-state.json` `target` (this worktree's gitdir) |
 //! | `CHERRY_PICK_HEAD` | `sequence_state.current_oid` when the sequence is a cherry-pick |
+//! |                    | (projected whenever the sequence row EXISTS — i.e. on any stop, |
+//! |                    | conflict or hard error — matching Git, which keeps            |
+//! |                    | `CHERRY_PICK_HEAD` while a pick is in progress for any reason; |
+//! |                    | §C.5's "当前冲突 commit" is read as "the commit the stopped     |
+//! |                    | pick was applying", which both stop reasons satisfy)           |
 //! | `REVERT_HEAD`      | `revert-state.json` `reverted_commit`, or `sequence_state.current_oid` for a revert sequence |
 //! | `REBASE_HEAD`      | `rebase_state.stopped_sha`                          |
 //! | `FETCH_HEAD`       | `<local gitdir>/FETCH_HEAD` (the one pseudo-ref that IS a file, because it holds many rows) |
@@ -126,8 +131,21 @@ impl WorktreePseudoRefs {
     }
 
     /// Bind to the scope THIS INVOCATION is acting on.
+    ///
+    /// The gitdir comes from the REQUEST PIN, not from
+    /// `local_gitdir_for_scope`: that helper re-resolves the common storage
+    /// and registry from the ambient cwd, so an in-process cwd move could
+    /// pair repository A's database projections with repository B's
+    /// merge/revert/`FETCH_HEAD` files — exactly the split fact §C.4.2
+    /// forbids. The pin resolved all of its paths at request entry, so both
+    /// halves come from one worktree or the request never pinned (in which
+    /// case the ambient fallback is at least self-consistent with the
+    /// scope's own ambient resolution).
     pub fn for_request() -> Self {
-        Self::new(WorktreeScope::for_request())
+        let scope = WorktreeScope::for_request();
+        let gitdir =
+            crate::utils::util::request_worktree_gitdir().map_err(|error| error.to_string());
+        Self { scope, gitdir }
     }
 
     /// The scope this service answers for.
@@ -268,6 +286,23 @@ impl WorktreePseudoRefs {
             SequenceFace::Revert => state.kind == crate::internal::sequencer::SequenceKind::Revert,
         };
         if !matches {
+            return Ok(None);
+        }
+        // §C.5: `CHERRY_PICK_HEAD`/`REVERT_HEAD` name the commit of a
+        // CONFLICT stop. The row alone cannot prove which stop this is —
+        // `resume_picks` persists position before every attempt, so a hard
+        // error mid-resume leaves the same row. The writer stamps a durable
+        // conflict-phase flag into the payload on every conflict stop and
+        // strips it on resume; a row without the flag (including rows from
+        // older binaries) does not define the pseudo-ref. `ORIG_HEAD` stays
+        // defined for ANY sequence — its contract is "where the sequence
+        // started", not "why it stopped".
+        let stopped_on_conflict = serde_json::from_str::<serde_json::Value>(&state.payload)
+            .ok()
+            .and_then(|opts| opts.get("stopped_on_conflict").cloned())
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false);
+        if !stopped_on_conflict {
             return Ok(None);
         }
         Ok(Some(ResolvedPseudoRef {
@@ -462,7 +497,7 @@ mod tests {
             head_orig: "1111111111111111111111111111111111111111".to_string(),
             current_oid: "2222222222222222222222222222222222222222".to_string(),
             todo: Vec::new(),
-            payload: String::new(),
+            payload: r#"{"stopped_on_conflict":true}"#.to_string(),
         })
         .await
         .expect("save main's sequence");
@@ -476,7 +511,7 @@ mod tests {
             head_orig: "3333333333333333333333333333333333333333".to_string(),
             current_oid: "4444444444444444444444444444444444444444".to_string(),
             todo: Vec::new(),
-            payload: String::new(),
+            payload: r#"{"stopped_on_conflict":true}"#.to_string(),
         })
         .await
         .expect("save the linked worktree's sequence");
@@ -528,6 +563,215 @@ mod tests {
                 .expect("the linked worktree's cherry-pick projection")
                 .is_none(),
             "and it does not see main's cherry-pick"
+        );
+    }
+
+    /// §C.5: a sequence row WITHOUT the conflict-phase flag — a hard-error
+    /// stop, or a row written by an older binary — defines NO
+    /// `CHERRY_PICK_HEAD`, while `ORIG_HEAD` (a "where did it start" fact)
+    /// stays defined.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_non_conflict_stop_defines_no_cherry_pick_head() {
+        use crate::internal::sequencer::{SequenceKind, SequenceState};
+
+        let repo = tempfile::tempdir().expect("repo");
+        let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let _pin =
+            WorktreeScope::pin_scope_for_test(WorktreeScope::Main, repo.path().to_path_buf());
+        crate::internal::sequencer::save(&SequenceState {
+            kind: SequenceKind::CherryPick,
+            head_name: "main".to_string(),
+            head_orig: "1111111111111111111111111111111111111111".to_string(),
+            current_oid: "2222222222222222222222222222222222222222".to_string(),
+            todo: Vec::new(),
+            // The pre-attempt save `resume_picks` writes: position known,
+            // conflict NOT proven.
+            payload: r#"{"stopped_on_conflict":false}"#.to_string(),
+        })
+        .await
+        .expect("save the hard-error-stopped sequence");
+
+        let service = WorktreePseudoRefs::new(WorktreeScope::Main);
+        assert!(
+            service
+                .resolve(PseudoRef::CherryPickHead)
+                .await
+                .expect("projection")
+                .is_none(),
+            "a stop that is not a proven conflict defines no CHERRY_PICK_HEAD"
+        );
+        assert_eq!(
+            service
+                .resolve(PseudoRef::OrigHead)
+                .await
+                .expect("ORIG_HEAD projection")
+                .expect("any sequence defines ORIG_HEAD")
+                .oid,
+            "1111111111111111111111111111111111111111",
+            "ORIG_HEAD is about where the sequence STARTED, not why it stopped"
+        );
+    }
+
+    /// §C.4.2: `for_request` binds BOTH halves — scope AND gitdir — to the
+    /// request pin, not the ambient cwd.
+    ///
+    /// Repository A is pinned; the process cwd then moves to repository B.
+    /// The service must keep answering with A's file-backed state (the merge
+    /// sidecar planted in A's gitdir). A constructor that re-resolved the
+    /// gitdir from the cwd would pair A's scope with B's files — the §C.4.2
+    /// split-fact this pins against. Reverting the pinned constructor makes
+    /// this fail.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn for_request_keeps_the_pinned_worktree_after_a_cwd_move() {
+        let repo_a = tempfile::tempdir().expect("repo A");
+        let repo_b = tempfile::tempdir().expect("repo B");
+        {
+            let _cd = crate::utils::test::ChangeDirGuard::new(repo_a.path());
+            crate::utils::test::setup_with_new_libra_in(repo_a.path()).await;
+        }
+        {
+            let _cd = crate::utils::test::ChangeDirGuard::new(repo_b.path());
+            crate::utils::test::setup_with_new_libra_in(repo_b.path()).await;
+        }
+
+        // A's merge sidecar; B gets a DIFFERENT one so a mis-bound gitdir
+        // produces a WRONG answer rather than a missing one.
+        for (repo, target) in [
+            (repo_a.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            (repo_b.path(), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        ] {
+            std::fs::write(
+                repo.join(crate::utils::util::ROOT_DIR)
+                    .join("merge-state.json"),
+                serde_json::json!({
+                    "head_name": "main",
+                    "orig_head": "cccccccccccccccccccccccccccccccccccccccc",
+                    "target": target,
+                    "target_ref": "refs/heads/incoming",
+                    "conflicted_paths": ["clash.txt"],
+                })
+                .to_string(),
+            )
+            .expect("merge sidecar");
+        }
+
+        // Pin repository A, then MOVE the cwd to repository B.
+        let _pin =
+            WorktreeScope::pin_scope_for_test(WorktreeScope::Main, repo_a.path().to_path_buf());
+        let _cd = crate::utils::test::ChangeDirGuard::new(repo_b.path());
+
+        let service = WorktreePseudoRefs::for_request();
+        let merge_head = service
+            .resolve(PseudoRef::MergeHead)
+            .await
+            .expect("the pinned worktree's merge projection")
+            .expect("repository A has a merge in progress");
+        assert_eq!(
+            merge_head.oid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "for_request answers with the PINNED repository's sidecar, not the \
+             ambient cwd's"
+        );
+    }
+
+    /// §C.12 named regression `linked_pseudo_refs_resolve_per_worktree`:
+    /// `resolve_all` across two scopes — the full-surface composition of the
+    /// per-projection tests above.
+    ///
+    /// Main holds a cherry-pick while the linked worktree holds a merge
+    /// sidecar; each scope's `resolve_all` names EXACTLY its own pseudo-refs
+    /// and never the other's. This is the isolation the W2 acceptance line
+    /// demands of `WorktreePseudoRefs` (the public `rev-parse` surface stays
+    /// deferred by §C.5 — `tests/compat/pseudo_ref_surface.rs` pins that).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn linked_pseudo_refs_resolve_per_worktree() {
+        use crate::internal::sequencer::{SequenceKind, SequenceState};
+
+        let repo = tempfile::tempdir().expect("repo");
+        let _cd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+
+        let main = WorktreeScope::Main;
+        let linked = WorktreeScope::Linked("wt-resolve-all".to_string());
+        let linked_path = register_linked_worktree(repo.path(), "wt-resolve-all");
+
+        // Main: a cherry-pick sequence (DB row).
+        let _main_pin = WorktreeScope::pin_scope_for_test(main.clone(), repo.path().to_path_buf());
+        crate::internal::sequencer::save(&SequenceState {
+            kind: SequenceKind::CherryPick,
+            head_name: "main".to_string(),
+            head_orig: "1111111111111111111111111111111111111111".to_string(),
+            current_oid: "2222222222222222222222222222222222222222".to_string(),
+            todo: Vec::new(),
+            payload: r#"{"stopped_on_conflict":true}"#.to_string(),
+        })
+        .await
+        .expect("save main's sequence");
+        drop(_main_pin);
+
+        // Linked worktree: an in-progress merge (sidecar in ITS gitdir).
+        std::fs::write(
+            linked_path
+                .join(crate::utils::util::ROOT_DIR)
+                .join("merge-state.json"),
+            serde_json::json!({
+                "head_name": "topic",
+                "orig_head": "6666666666666666666666666666666666666666",
+                "target": "5555555555555555555555555555555555555555",
+                "target_ref": "refs/heads/incoming",
+                "conflicted_paths": ["clash.txt"],
+            })
+            .to_string(),
+        )
+        .expect("linked merge sidecar");
+
+        let named = |resolved: &[ResolvedPseudoRef]| -> Vec<&'static str> {
+            resolved.iter().map(|entry| entry.name).collect()
+        };
+
+        let main_all = WorktreePseudoRefs::new(main)
+            .resolve_all()
+            .await
+            .expect("main's resolve_all");
+        assert_eq!(
+            named(&main_all),
+            vec!["ORIG_HEAD", "CHERRY_PICK_HEAD"],
+            "main defines exactly its own pseudo-refs: {main_all:?}"
+        );
+        assert!(
+            main_all
+                .iter()
+                .all(|entry| !entry.oid.starts_with('5') && !entry.oid.starts_with('6')),
+            "and none of its answers leak the linked worktree's merge: {main_all:?}"
+        );
+
+        let linked_all = WorktreePseudoRefs::new(linked)
+            .resolve_all()
+            .await
+            .expect("the linked worktree's resolve_all");
+        assert_eq!(
+            named(&linked_all),
+            vec!["ORIG_HEAD", "MERGE_HEAD"],
+            "the linked worktree defines exactly its own pseudo-refs: {linked_all:?}"
+        );
+        assert_eq!(
+            linked_all
+                .iter()
+                .find(|entry| entry.name == "MERGE_HEAD")
+                .expect("its merge target")
+                .oid,
+            "5555555555555555555555555555555555555555",
+            "its MERGE_HEAD is ITS merge's target"
+        );
+        assert!(
+            linked_all
+                .iter()
+                .all(|entry| !entry.oid.starts_with('1') && !entry.oid.starts_with('2')),
+            "and none of its answers leak main's cherry-pick: {linked_all:?}"
         );
     }
 

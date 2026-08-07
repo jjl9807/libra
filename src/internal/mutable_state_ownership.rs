@@ -528,154 +528,6 @@ mod tests {
         entities: BTreeSet<String>,
     }
 
-    /// Three-valued evaluation of a `cfg` predicate with `test = false` and
-    /// every OTHER predicate unknown.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum CfgValue {
-        /// Provably off in a production build.
-        Off,
-        /// Provably on in a production build.
-        On,
-        /// Depends on a predicate this scan does not model (`unix`,
-        /// `feature = "…"`, `debug_assertions`, …).
-        Unknown,
-    }
-
-    /// Evaluate one `cfg` predicate as if `test` were NOT set.
-    ///
-    /// Only a predicate that evaluates to [`CfgValue::Off`] is test-only.
-    /// Merely MENTIONING `test` is not enough — `not(test)` is production
-    /// code (`utils/client_storage.rs`), and `any(test, debug_assertions)`
-    /// is compiled in a debug build (`command/rename_detect.rs`). Treating
-    /// either as test-only would delete real DDL from the corpus, which is
-    /// the failure this whole scan exists to prevent.
-    fn evaluate_cfg(meta: &syn::Meta) -> CfgValue {
-        match meta {
-            syn::Meta::Path(path) if path.is_ident("test") => CfgValue::Off,
-            syn::Meta::Path(_) | syn::Meta::NameValue(_) => CfgValue::Unknown,
-            syn::Meta::List(list) => {
-                let Ok(inner) = list.parse_args_with(
-                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-                ) else {
-                    // Unparseable predicate: unknown, i.e. KEEP the code.
-                    return CfgValue::Unknown;
-                };
-                if list.path.is_ident("not") {
-                    return match inner.first().map(evaluate_cfg) {
-                        Some(CfgValue::Off) => CfgValue::On,
-                        Some(CfgValue::On) => CfgValue::Off,
-                        _ => CfgValue::Unknown,
-                    };
-                }
-                if list.path.is_ident("all") {
-                    let mut result = CfgValue::On;
-                    for predicate in &inner {
-                        match evaluate_cfg(predicate) {
-                            CfgValue::Off => return CfgValue::Off,
-                            CfgValue::Unknown => result = CfgValue::Unknown,
-                            CfgValue::On => {}
-                        }
-                    }
-                    return result;
-                }
-                if list.path.is_ident("any") {
-                    let mut result = CfgValue::Off;
-                    for predicate in &inner {
-                        match evaluate_cfg(predicate) {
-                            CfgValue::On => return CfgValue::On,
-                            CfgValue::Unknown => result = CfgValue::Unknown,
-                            CfgValue::Off => {}
-                        }
-                    }
-                    return result;
-                }
-                CfgValue::Unknown
-            }
-        }
-    }
-
-    /// Whether these attributes make the code they annotate impossible in a
-    /// production build. A parse failure means "not provably off" — KEEP.
-    fn is_test_only(attrs: &[syn::Attribute]) -> bool {
-        attrs.iter().any(|attr| {
-            attr.path().is_ident("cfg")
-                && attr
-                    .parse_args::<syn::Meta>()
-                    .is_ok_and(|meta| evaluate_cfg(&meta) == CfgValue::Off)
-        })
-    }
-
-    /// The attributes of an item, for the variants that can carry code.
-    /// Unknown variants return `None` = "keep it": a false KEEP only risks a
-    /// fixture demanding an ownership row, while a false DROP hides real DDL.
-    fn item_attrs(item: &syn::Item) -> Option<&[syn::Attribute]> {
-        Some(match item {
-            syn::Item::Const(i) => &i.attrs,
-            syn::Item::Enum(i) => &i.attrs,
-            syn::Item::ExternCrate(i) => &i.attrs,
-            syn::Item::Fn(i) => &i.attrs,
-            syn::Item::ForeignMod(i) => &i.attrs,
-            syn::Item::Impl(i) => &i.attrs,
-            syn::Item::Macro(i) => &i.attrs,
-            syn::Item::Mod(i) => &i.attrs,
-            syn::Item::Static(i) => &i.attrs,
-            syn::Item::Struct(i) => &i.attrs,
-            syn::Item::Trait(i) => &i.attrs,
-            syn::Item::TraitAlias(i) => &i.attrs,
-            syn::Item::Type(i) => &i.attrs,
-            syn::Item::Union(i) => &i.attrs,
-            syn::Item::Use(i) => &i.attrs,
-            _ => return None,
-        })
-    }
-
-    /// The attributes of an expression, for every variant that carries them.
-    /// `None` (an unmodelled variant) means KEEP, same rationale as
-    /// [`item_attrs`].
-    fn expr_attrs(expr: &syn::Expr) -> Option<&[syn::Attribute]> {
-        Some(match expr {
-            syn::Expr::Array(e) => &e.attrs,
-            syn::Expr::Assign(e) => &e.attrs,
-            syn::Expr::Async(e) => &e.attrs,
-            syn::Expr::Await(e) => &e.attrs,
-            syn::Expr::Binary(e) => &e.attrs,
-            syn::Expr::Block(e) => &e.attrs,
-            syn::Expr::Break(e) => &e.attrs,
-            syn::Expr::Call(e) => &e.attrs,
-            syn::Expr::Cast(e) => &e.attrs,
-            syn::Expr::Closure(e) => &e.attrs,
-            syn::Expr::Const(e) => &e.attrs,
-            syn::Expr::Continue(e) => &e.attrs,
-            syn::Expr::Field(e) => &e.attrs,
-            syn::Expr::ForLoop(e) => &e.attrs,
-            syn::Expr::Group(e) => &e.attrs,
-            syn::Expr::If(e) => &e.attrs,
-            syn::Expr::Index(e) => &e.attrs,
-            syn::Expr::Infer(e) => &e.attrs,
-            syn::Expr::Let(e) => &e.attrs,
-            syn::Expr::Lit(e) => &e.attrs,
-            syn::Expr::Loop(e) => &e.attrs,
-            syn::Expr::Macro(e) => &e.attrs,
-            syn::Expr::Match(e) => &e.attrs,
-            syn::Expr::MethodCall(e) => &e.attrs,
-            syn::Expr::Paren(e) => &e.attrs,
-            syn::Expr::Path(e) => &e.attrs,
-            syn::Expr::Range(e) => &e.attrs,
-            syn::Expr::Reference(e) => &e.attrs,
-            syn::Expr::Repeat(e) => &e.attrs,
-            syn::Expr::Return(e) => &e.attrs,
-            syn::Expr::Struct(e) => &e.attrs,
-            syn::Expr::Try(e) => &e.attrs,
-            syn::Expr::TryBlock(e) => &e.attrs,
-            syn::Expr::Tuple(e) => &e.attrs,
-            syn::Expr::Unary(e) => &e.attrs,
-            syn::Expr::Unsafe(e) => &e.attrs,
-            syn::Expr::While(e) => &e.attrs,
-            syn::Expr::Yield(e) => &e.attrs,
-            _ => return None,
-        })
-    }
-
     /// `<table>` from a `create_table_from_entity(<table>::Entity)` argument.
     fn entity_table_name(
         args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
@@ -696,76 +548,6 @@ mod tests {
     }
 
     impl<'ast> syn::visit::Visit<'ast> for RustDdl {
-        fn visit_item(&mut self, item: &'ast syn::Item) {
-            if item_attrs(item).is_some_and(is_test_only) {
-                return;
-            }
-            syn::visit::visit_item(self, item);
-        }
-
-        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-            let attrs = match item {
-                syn::ImplItem::Const(i) => Some(&i.attrs),
-                syn::ImplItem::Fn(i) => Some(&i.attrs),
-                syn::ImplItem::Type(i) => Some(&i.attrs),
-                syn::ImplItem::Macro(i) => Some(&i.attrs),
-                _ => None,
-            };
-            if attrs.is_some_and(|attrs| is_test_only(attrs)) {
-                return;
-            }
-            syn::visit::visit_impl_item(self, item);
-        }
-
-        fn visit_field(&mut self, field: &'ast syn::Field) {
-            if is_test_only(&field.attrs) {
-                return;
-            }
-            syn::visit::visit_field(self, field);
-        }
-
-        fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
-            let attrs = match stmt {
-                syn::Stmt::Local(local) => Some(local.attrs.as_slice()),
-                syn::Stmt::Macro(mac) => Some(mac.attrs.as_slice()),
-                syn::Stmt::Expr(expr, _) => expr_attrs(expr),
-                // Item statements are filtered by `visit_item`.
-                syn::Stmt::Item(_) => None,
-            };
-            if attrs.is_some_and(is_test_only) {
-                return;
-            }
-            syn::visit::visit_stmt(self, stmt);
-        }
-
-        fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
-            let attrs = match item {
-                syn::TraitItem::Const(i) => Some(i.attrs.as_slice()),
-                syn::TraitItem::Fn(i) => Some(i.attrs.as_slice()),
-                syn::TraitItem::Type(i) => Some(i.attrs.as_slice()),
-                syn::TraitItem::Macro(i) => Some(i.attrs.as_slice()),
-                _ => None,
-            };
-            if attrs.is_some_and(is_test_only) {
-                return;
-            }
-            syn::visit::visit_trait_item(self, item);
-        }
-
-        fn visit_variant(&mut self, variant: &'ast syn::Variant) {
-            if is_test_only(&variant.attrs) {
-                return;
-            }
-            syn::visit::visit_variant(self, variant);
-        }
-
-        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            if is_test_only(&arm.attrs) {
-                return;
-            }
-            syn::visit::visit_arm(self, arm);
-        }
-
         /// Macro ARGUMENTS are opaque tokens to `syn::visit`, so DDL passed
         /// to `format!`/`assert_eq!`/… would otherwise be invisible. Parse
         /// the body as a comma-separated expression list (the shape almost
@@ -815,11 +597,10 @@ mod tests {
         }
     }
 
-    /// Scan one Rust source. A file that does not parse is a HARD error:
-    /// skipping it silently is how DDL goes missing.
+    /// Scan one Rust source for DDL, with its `#[cfg(test)]` code pruned by
+    /// the shared scanner ([`crate::internal::source_scan`]).
     fn scan_rust_source(label: &str, source: &str) -> RustDdl {
-        let file = syn::parse_file(source)
-            .unwrap_or_else(|error| panic!("`{label}` must parse as Rust: {error}"));
+        let file = crate::internal::source_scan::parse_production_file(label, source);
         let mut scanner = RustDdl::default();
         syn::visit::Visit::visit_file(&mut scanner, &file);
         scanner
@@ -855,37 +636,20 @@ mod tests {
     /// parent declares them `#[cfg(test)] mod tests;`) and are excluded by
     /// path.
     fn rust_ddl() -> RustDdl {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut found = RustDdl::default();
-        fn collect(dir: &Path, root: &Path, into: &mut RustDdl) {
-            for entry in fs::read_dir(dir).expect("source dir must be readable") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    collect(&path, root, into);
-                    continue;
-                }
-                if path.extension().is_none_or(|ext| ext != "rs") {
-                    continue;
-                }
-                let relative = path.strip_prefix(root).unwrap_or(&path);
-                let relative = format!("src/{}", relative.display());
-                let is_test_file = relative.ends_with("/tests.rs")
-                    || relative.contains("/tests/")
-                    || relative.ends_with("_test.rs");
-                if NON_REPOSITORY_DDL_SOURCES.contains(&relative.as_str())
-                    || relative.ends_with("mutable_state_ownership.rs")
-                    || is_test_file
-                {
-                    continue;
-                }
-                let source = fs::read_to_string(&path).expect("readable source");
-                let scanned = scan_rust_source(&relative, &source);
-                into.sql.push_str(&scanned.sql);
-                into.entities.extend(scanned.entities);
-            }
+        // This module's own source is excluded: its registry rows name every
+        // table as a string literal, which would trivially satisfy the scan.
+        let excludes = {
+            let mut excludes = NON_REPOSITORY_DDL_SOURCES.to_vec();
+            excludes.push("src/internal/mutable_state_ownership.rs");
+            excludes
+        };
+        for (_label, file) in crate::internal::source_scan::production_files(&excludes) {
+            let mut scanner = RustDdl::default();
+            syn::visit::Visit::visit_file(&mut scanner, &file);
+            found.sql.push_str(&scanner.sql);
+            found.entities.extend(scanner.entities);
         }
-        let root = manifest_dir.join("src");
-        collect(&root, &root, &mut found);
         found
     }
 

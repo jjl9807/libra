@@ -358,6 +358,25 @@ pub(crate) struct PullMergeOptions {
 /// (`MERGE_HEAD` = `target`, `ORIG_HEAD` = `orig_head`). Read-only, and it
 /// resolves through the same request-bound path as every other consumer, so
 /// the projection can never answer from a different worktree's sidecar.
+/// The SEMANTIC OID fields of this gitdir's `merge-state.json`, for GC root
+/// collection (plan-20260714 §C.4.3): `(field name, oid)` pairs, `None` when
+/// no merge is in progress, `Err` on a file that exists but cannot be
+/// parsed. Text fields (branch names, messages, conflict paths) are NOT
+/// returned — a path or branch name that happens to be 40 hex characters
+/// must never be treated as an object reference.
+pub(crate) fn merge_state_gc_oids(
+    gitdir: &std::path::Path,
+) -> Result<Option<Vec<(&'static str, String)>>, String> {
+    let Some(state) = merge_state_for_pseudo_refs(gitdir)? else {
+        return Ok(None);
+    };
+    let mut oids = vec![("orig_head", state.orig_head), ("target", state.target)];
+    if let Some(base) = state.base {
+        oids.push(("base", base));
+    }
+    Ok(Some(oids))
+}
+
 pub(crate) fn merge_state_for_pseudo_refs(
     gitdir: &std::path::Path,
 ) -> Result<Option<MergeState>, String> {

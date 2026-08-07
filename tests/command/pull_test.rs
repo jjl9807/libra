@@ -1256,6 +1256,14 @@ async fn test_pull_rebase_autostash_in_linked_worktree_pops_only_its_own_entry()
         listing.contains("foreign-entry") && listing.lines().count() == 1,
         "exactly the foreign entry remains: {listing}"
     );
+    // "never touched": the foreign stash restored main's README.md to its
+    // COMMITTED content — if the linked pull had popped the foreign entry,
+    // "main dirty" would be back in main's tree.
+    assert_ne!(
+        fs::read_to_string(local_repo.path().join("README.md")).expect("read main file"),
+        "main dirty\n",
+        "the linked pull must not pop the foreign entry into main's worktree"
+    );
 }
 
 /// W2 §C.4.3 packed-HEAD regression: a HEAD that arrived via `pull` lives in
