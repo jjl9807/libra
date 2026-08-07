@@ -3615,6 +3615,14 @@ async fn gc_object_source_inventory_covers_every_oid_column() {
 /// fail-closed) before they can parse or recreate `worktrees.json`. Its down
 /// drops only the marker — the v2 JSON layout itself still fails a v1 parser
 /// closed — and re-applying is idempotent.
+///
+/// §C.12 roster: together with
+/// `worktree_commands_apply_capability_marker_before_registry_io` (the
+/// marker precedes registry IO on every worktree command path) this
+/// discharges `registry_v2_old_binary_refuses_before_rewrite`: the refusal
+/// happens at schema-preflight time, BEFORE an old binary could parse or
+/// rewrite the registry, and the renamed v2 top-level key is the second
+/// belt for any reader that never connects.
 #[tokio::test]
 async fn worktree_registry_v2_capability_marker_round_trip() {
     let (_dir, url, _path) = fresh_db_url();

@@ -5927,6 +5927,164 @@ async fn worktree_commands_apply_capability_marker_before_registry_io() {
     );
 }
 
+/// §C.7: `worktree repair <path> --resolve-identity --yes` — the ONLY
+/// documented escape from a duplicate-identity registry — detaches the
+/// chosen entry, records the SQL lifecycle mirror (the down-migration
+/// guard's only view), and clears both the mutation refusal and doctor's
+/// collision finding.
+#[test]
+fn resolve_identity_detaches_one_claimant_and_mirrors_the_lifecycle() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt_a = main.join("wt-collide-a");
+    let wt_b = main.join("wt-collide-b");
+    for wt in [&wt_a, &wt_b] {
+        assert_cli_success(
+            &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+            "worktree add",
+        );
+    }
+
+    // Manufacture the older-binary collision: both ACTIVE entries claim
+    // wt-a's identity.
+    let id_a = std::fs::read_to_string(wt_a.join(".libra").join("worktree_id"))
+        .expect("wt-a id")
+        .trim()
+        .to_string();
+    let registry = main.join(".libra").join("worktrees.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).expect("read registry"))
+            .expect("registry json");
+    for entry in doc["entries"].as_array_mut().expect("entries") {
+        if entry["is_main"] == false {
+            entry["worktree_id"] = serde_json::json!(id_a);
+        }
+    }
+    std::fs::write(
+        &registry,
+        serde_json::to_vec_pretty(&doc).expect("serialize"),
+    )
+    .expect("write colliding registry");
+
+    // Mutations refuse while the collision holds.
+    let refused = run_libra_command(
+        &["worktree", "lock", wt_a.to_str().unwrap(), "--reason", "x"],
+        main,
+    );
+    assert!(
+        !refused.status.success(),
+        "mutations refuse a duplicated identity"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("resolve-identity"),
+        "and the refusal names the escape hatch"
+    );
+
+    // Resolve by detaching wt-b.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "worktree",
+                "repair",
+                wt_b.to_str().unwrap(),
+                "--resolve-identity",
+                "--yes",
+            ],
+            main,
+        ),
+        "resolve-identity detaches the chosen claimant",
+    );
+
+    // The survivor mutates again; the detached directory fails closed.
+    assert_cli_success(
+        &run_libra_command(
+            &["worktree", "lock", wt_a.to_str().unwrap(), "--reason", "x"],
+            main,
+        ),
+        "the surviving claimant owns the identity again",
+    );
+    let frozen = run_libra_command(&["status"], &wt_b);
+    assert!(
+        !frozen.status.success(),
+        "the detached directory fails closed"
+    );
+
+    // The SQL lifecycle mirror carries the detach — the 2026072402 down
+    // guard reads ONLY this table, so a registry-file-only detach would let
+    // the rollback run while a detached directory exists on disk.
+    let rows = sqlite_query(
+        &main.join(".libra").join("libra.db"),
+        &format!("SELECT state FROM worktree_lifecycle WHERE worktree_id = '{id_a}'"),
+    );
+    assert_eq!(
+        rows,
+        vec!["detached_from_registry".to_string()],
+        "resolve-identity records the lifecycle mirror row"
+    );
+
+    // Doctor reports NO collision for the legitimate Active+Detached pair —
+    // it must not recommend a command that would then refuse to act.
+    let doctor = run_libra_command(&["worktree", "doctor"], main);
+    assert_cli_success(&doctor, "doctor runs");
+    let text = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        !text.contains("claim"),
+        "no duplicate-identity finding for Active+Detached: {text}"
+    );
+}
+
+/// §C.12 roster `registry_v2_old_binary_refuses_before_rewrite`, the
+/// REWRITE half: a binary confronted with a FUTURE repository schema (what
+/// this binary looks like to an old one) refuses a MUTATING worktree
+/// command at connect time, leaving `worktrees.json` byte-identical — it
+/// never gets far enough to parse or rewrite the registry. The parse half
+/// (capability marker round-trip + marker-before-registry-IO ordering) is
+/// pinned in `db_migration_test.rs` and
+/// `worktree_commands_apply_capability_marker_before_registry_io`.
+#[test]
+fn registry_v2_old_binary_refuses_before_rewrite() {
+    let dir = repo_with_feature();
+    let main = dir.path();
+    let wt = main.join("wt-future");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let registry = main.join(".libra").join("worktrees.json");
+    let before = std::fs::read(&registry).expect("registry bytes");
+
+    // Make the repository look like it was upgraded by a NEWER binary.
+    assert!(
+        sqlite_exec(
+            &main.join(".libra").join("libra.db"),
+            &[
+                "INSERT INTO schema_versions (version, name, applied_at) VALUES \
+               (99999999099, 'from_the_future', '2099-01-01T00:00:00Z');"
+            ],
+        ),
+        "plant the future schema row"
+    );
+
+    let refused = run_libra_command(
+        &["worktree", "add", main.join("wt-refused").to_str().unwrap()],
+        main,
+    );
+    assert!(
+        !refused.status.success(),
+        "a mutating worktree command must refuse a future schema: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(
+        std::fs::read(&registry).expect("registry bytes after"),
+        before,
+        "and the refusal precedes ANY registry rewrite (bytes identical)"
+    );
+    assert!(
+        !main.join("wt-refused").exists(),
+        "no worktree directory was created either"
+    );
+}
+
 /// v2 identity invariants (§C.7): a v2 registry whose linked entry lost its
 /// persisted id is CORRUPT — readers and mutators refuse it (never silently
 /// falling back to the mutable gitdir) until the explicit no-arg
@@ -7978,6 +8136,60 @@ async fn layout_migration_crash_matrix() {
         0,
         "both windows resolved their journals"
     );
+
+    // POST-INSTALL window (self-review leg): the prepared gitdir was RENAMED
+    // into place — journal-stamped marker still inside, legacy backup still
+    // present, journal pending. Recovery must adopt it: re-seed HEAD/index,
+    // remove the marker AND the identity-checked backup, resolve the journal,
+    // and leave a working worktree.
+    let wt4 = create_legacy_symlink_worktree(main, "wt-crash-installed");
+    let id4 = plant(
+        "legacy-wt-crash-installed".to_string(),
+        format!(
+            "{{\"path\":\"{}\",\"head\":\"{shared_head}\"}}",
+            wt4.to_string_lossy()
+        ),
+    )
+    .await;
+    // Manufacture the installed state directly: backup the legacy link, then
+    // a marker-carrying gitdir at the FINAL name.
+    std::fs::rename(
+        wt4.join(".libra"),
+        wt4.join(format!(".libra.legacy-backup-{id4}")),
+    )
+    .unwrap();
+    let gitdir4 = wt4.join(".libra");
+    std::fs::create_dir_all(&gitdir4).unwrap();
+    std::fs::write(
+        gitdir4.join("commondir"),
+        format!(
+            "{}\n",
+            main.join(".libra").canonicalize().unwrap().display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(gitdir4.join("worktree_id"), "legacy-wt-crash-installed\n").unwrap();
+    std::fs::write(gitdir4.join("migrate-marker"), format!("journal {id4}\n")).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["worktree", "repair", "--confirm"], main),
+        "repair post-install window",
+    );
+    let head4 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &wt4).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        head4, shared_head,
+        "post-install window rolled forward to a working worktree"
+    );
+    assert!(
+        !wt4.join(format!(".libra.legacy-backup-{id4}")).exists(),
+        "post-install backup cleaned"
+    );
+    assert!(
+        !gitdir4.join("migrate-marker").exists(),
+        "post-install marker lifted"
+    );
+    assert_eq!(journal_count().await, 0, "post-install journal resolved");
 
     // Stale-journal adoption guard: a worktree freshly re-added at the same
     // path (deterministic id, valid commondir, NO journal-stamped marker)

@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.19.102"
+version = "0.19.103"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -281,6 +281,10 @@ path = "tests/compat/r0_9_doc_closeout.rs"
 [[test]]
 name = "compat_command_docs_examples_section"
 path = "tests/compat/command_docs_examples_section.rs"
+
+[[test]]
+name = "compat_worktree_docs_v2_layout"
+path = "tests/compat/worktree_docs_v2_layout.rs"
 
 [[test]]
 name = "compat_pseudo_ref_surface"

@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260714 W3 cross-review, 2026-08-08)
+
+- **`worktree remove` and `prune` now refuse a worktree an agent holds a
+  live workspace lease on** (§C.7): remove checks by path and by worktree
+  id; prune skips leased entries by worktree id (a missing path can never
+  match a canonicalizing path query).
+- **Crash-journal recovery no longer guesses.** An unknown intent op is
+  kept pending instead of deleted (it is a NEWER binary's crash anchor);
+  interrupted-move recovery advances only when the directory's own gitdir
+  identity matches the journal (a stranger's directory can no longer be
+  renamed or adopted); a crashed re-attach lifts the frozen marker only
+  from a directory that still carries the entry's identity; a crashed
+  keep-dir detach is not rolled forward over sequencer work started after
+  the crash; and `reconcile_lifecycle` restores a detached marker only into
+  an identity-matching directory.
+- **Two migrate-layout crash points are no longer unrecoverable.** The
+  migrate-marker is written FIRST in the prepared gitdir, and recovery
+  rolls back a marker-less prepared dir whose name binds it to the exact
+  pending journal and whose contents are at most the engine's three files.
+  Backup-symlink removal failures now keep the journal instead of leaking
+  the link silently.
+- **`worktree repair <path>` restores a DANGLING commondir pointer**
+  (previously misclassified as "points at a different storage" and refused
+  forever), still refuses an EXISTING different storage, and refuses
+  tombstoned entries outright. `--resolve-identity` now writes the SQL
+  lifecycle mirror row the 2026072402 down-migration guard reads, and
+  doctor no longer reports the legitimate post-resolve Active+Detached pair
+  as a collision. `add`'s handled failures resolve their intent-journal
+  row; `remove --delete-dir` treats a real parent-fsync failure as
+  non-durable (tombstone kept); stale corrupt-identity and v3-rollback
+  hints now name actions that exist.
+
 ### Fixed (plan-20260714 W2 cross-review, 2026-08-07)
 
 - **gc run from a linked worktree no longer prunes blobs staged only in

@@ -2560,8 +2560,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
                 // LBR-REPO-002.
                 .with_stable_code(utils::error::StableErrorCode::RepoCorrupt)
                 .with_hint(
-                    "run `libra worktree repair --confirm` from the main worktree to restore \
-                     this worktree's identity (read-only commands still work)",
+                    "run `libra worktree repair <this-worktree-path> --confirm` from the main \
+                     worktree to restore this worktree's identity from the registry \
+                     (read-only commands still work)",
                 ));
         }
     }

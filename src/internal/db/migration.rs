@@ -1529,8 +1529,10 @@ async fn registry_v3_rollback_preflight(conn: &DatabaseConnection) -> Result<(),
     if counter > 0 || entry_generations {
         return Err(MigrationError::Other(anyhow::anyhow!(
             "cannot roll back registry v3: '{}' carries live registration generations, and an \
-             older binary would silently drop them — remove the linked worktrees first, or \
-             restore a backup taken before the upgrade",
+             older binary would silently drop them. The epoch counter is deliberately \
+             monotonic and SURVIVES worktree removal, so removing worktrees cannot clear \
+             this guard — restore a registry backup taken before the v3 upgrade (or keep \
+             running a v3-aware binary)",
             path.display()
         )));
     }
