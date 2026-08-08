@@ -3,13 +3,13 @@ commit	-m	git-compatible	COMPATIBILITY.md:147
 diff	--check	git-compatible	docs/commands/diff.md#options
 diff	--exit-code	git-compatible	docs/commands/diff.md#options
 diff	--name-only	git-compatible	docs/commands/diff.md#options
-diff	--name-status	git-compatible	docs/commands/diff.md#options
 diff	--no-patch	git-compatible	docs/commands/diff.md#options
 diff	--numstat	git-compatible	docs/commands/diff.md#options
 diff	--quiet	git-compatible	docs/commands/diff.md#options
 diff	--shortstat	git-compatible	docs/commands/diff.md#options
 diff	--stat	git-compatible	docs/commands/diff.md#options
 diff	--summary	git-compatible	docs/commands/diff.md#options
+diff	-C	absent	docs/commands/diff.md#options
 diff	-M	git-compatible	docs/commands/diff.md#options
 diff	diff	git-compatible	docs/commands/diff.md#options
 diff-files	--compact-summary	absent	docs/commands/diff.md#options
@@ -20,19 +20,19 @@ diff-files	--raw	absent	docs/commands/diff.md#options
 diff-files	--shortstat	absent	docs/commands/diff.md#options
 diff-files	--stat	absent	docs/commands/diff.md#options
 diff-files	--summary	absent	docs/commands/diff.md#options
-diff-files	-C	intentionally-different	docs/commands/diff.md#options
-diff-files	-p	absent	docs/commands/diff.md#options
+diff-files	-C	absent	docs/commands/diff.md#options
 diff-files	-s	absent	docs/commands/diff.md#options
+diff-files	porcelain flag surface	intentionally-different	COMPATIBILITY.md:167
 diff-index	--cached	deferred	docs/commands/diff-index.md#comparison-with-git
-diff-index	-C	intentionally-different	docs/commands/diff.md#options
-diff-index	-p	absent	docs/commands/diff.md#options
+diff-index	--exit-code	absent	docs/commands/diff.md#options
+diff-index	-C	absent	docs/commands/diff.md#options
+diff-index	-M	absent	docs/commands/diff.md#options
 diff-index	-z	absent	docs/commands/diff.md#options
 diff-index	raw output	absent	docs/commands/diff-index.md#comparison-with-git
 diff-tree	--exit-code	absent	docs/commands/diff.md#options
 diff-tree	--name-only	absent	docs/commands/diff.md#options
 diff-tree	--stdin	absent	docs/commands/diff-tree.md#comparison-with-git
-diff-tree	-M	intentionally-different	docs/commands/diff.md#options
-diff-tree	-p	absent	docs/commands/diff.md#options
+diff-tree	-M	absent	docs/commands/diff.md#options
 diff-tree	-r	absent	docs/commands/diff-tree.md#comparison-with-git
 format-patch	--attach	git-compatible	COMPATIBILITY.md:161
 format-patch	--base	git-compatible	COMPATIBILITY.md:161

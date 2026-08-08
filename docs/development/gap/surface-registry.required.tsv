@@ -3,13 +3,13 @@ commit	-m
 diff	--check
 diff	--exit-code
 diff	--name-only
-diff	--name-status
 diff	--no-patch
 diff	--numstat
 diff	--quiet
 diff	--shortstat
 diff	--stat
 diff	--summary
+diff	-C
 diff	-M
 diff	diff
 diff-files	--compact-summary
@@ -21,18 +21,18 @@ diff-files	--shortstat
 diff-files	--stat
 diff-files	--summary
 diff-files	-C
-diff-files	-p
 diff-files	-s
+diff-files	porcelain flag surface
 diff-index	--cached
+diff-index	--exit-code
 diff-index	-C
-diff-index	-p
+diff-index	-M
 diff-index	-z
 diff-index	raw output
 diff-tree	--exit-code
 diff-tree	--name-only
 diff-tree	--stdin
 diff-tree	-M
-diff-tree	-p
 diff-tree	-r
 format-patch	--attach
 format-patch	--base
