@@ -3133,6 +3133,18 @@ fn config_bare_read_sensitive_key_never_leaks_value() {
             !stderr.contains(SENTINEL),
             "{shape:?} leaked the stored secret on stderr: {stderr}"
         );
+        // Pin the failure class too: a shape that started SUCCEEDING would
+        // also satisfy the two assertions above while having quietly turned
+        // the protected key into a readable one.
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{shape:?} must stay on the protected-key path: {stderr}"
+        );
+        assert!(
+            stderr.contains("missing value for protected key"),
+            "{shape:?} must report the protected-key error: {stderr}"
+        );
     }
 }
 
