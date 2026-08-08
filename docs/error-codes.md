@@ -83,8 +83,8 @@ structured report is always present.
 | Exit | Stable code | Category | Meaning | Typical examples |
 | --- | --- | --- | --- | --- |
 | `129` | `LBR-CLI-001` | `cli` | Unknown command | `libra wat` |
-| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags |
-| `129` | `LBR-CLI-003` | `cli` | Invalid object, revision, pathspec, or move target | bad ref, invalid pathspec, outside-repo move target |
+| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags ; `update-ref` fatals exit `128` instead — see the note below the table |
+| `129` | `LBR-CLI-003` | `cli` | Invalid object, revision, pathspec, or move target | bad ref, invalid pathspec, outside-repo move target ; `update-ref` fatals exit `128` instead — see the note below the table |
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
@@ -136,6 +136,14 @@ structured report is always present.
 | `128` | `LBR-AGENT-022` | `internal` | Agent workspace lease refused: another live workspace record already claims the linked worktree identity or the canonical directory | two agents requesting a writable lease on the same linked worktree, or on an alias of an already-leased path |
 | `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after the expired lease was reclaimed with a higher fence by its workspace owner |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
+
+> **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
+> `update-ref` fatal with exit code **128** (matching Git's `fatal:` convention), including
+> `LBR-CLI-002` and `LBR-CLI-003`, which the table above lists as `129` for every other command.
+> Reproduce in a repository with one commit: `libra update-ref refs/heads/x HEAD` prints
+> `Error-Code: LBR-CLI-002` and exits `128`; `libra update-ref refs/heads/x 1111111111111111111111111111111111111111`
+> prints `Error-Code: LBR-CLI-003` and exits `128`. Aligning the implementation with the table
+> would change an already-published exit-code contract, so the table records the exception instead.
 
 ## Stable Codes By Category
 
