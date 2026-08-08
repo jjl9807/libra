@@ -685,3 +685,308 @@ fn update_ref_revision_foreign_hash_length_rejected() {
         "the refused update must not have created the ref"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT1-03 (plan-20260729): `<oldvalue>` goes through the SAME revision entry
+// point as `<newvalue>`, but with no commit type check — it states what the
+// ref is expected to point at, so the resolved id is compared verbatim.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run SQL against a repository's database through python3's bundled sqlite3
+/// module; `sqlite3(1)` is not installed on every dev machine.
+fn repo_sqlite(repo: &TempDir, sql: &str) {
+    let db = repo.path().join(".libra/libra.db");
+    let out = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import sqlite3\nc = sqlite3.connect({db:?})\nc.executescript({sql:?})\nc.commit()\n"
+        ))
+        .output()
+        .expect("run python3 sqlite3");
+    assert!(
+        out.status.success(),
+        "sqlite {sql}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The reflog of `refs/heads/<branch>`, for asserting a refused update wrote
+/// nothing.
+fn reflog_of(repo: &TempDir, branch: &str) -> String {
+    let out = run_libra_command(&["reflog", "show", branch], repo.path());
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn update_ref_oldvalue_cas_revision() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    assert_eq!(update_feature(&repo, &c1).status.code(), Some(0));
+
+    // `<oldvalue>` as a revision: HEAD~1 is c1, which is where feature points.
+    let out = run_libra_command(
+        &["update-ref", "refs/heads/feature", &c2, "HEAD~1"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a revision oldvalue that matches must swap: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(feature_tip(&repo), c2);
+
+    // And one that does not match is an ordinary CAS failure.
+    let stale = run_libra_command(
+        &["update-ref", "refs/heads/feature", &c1, "HEAD~1"],
+        repo.path(),
+    );
+    assert_eq!(stale.status.code(), Some(128), "stale oldvalue must fail");
+    assert_eq!(feature_tip(&repo), c2, "the failed CAS left the ref alone");
+}
+
+#[test]
+fn update_ref_oldvalue_annotated_tag_is_cas_mismatch() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    assert_eq!(update_feature(&repo, &c2).status.code(), Some(0));
+    let tag = run_libra_command(&["tag", "-m", "release", "annotated"], repo.path());
+    assert_eq!(tag.status.code(), Some(0), "tag: {}", stderr_of(&tag));
+
+    // The tag object id is not the ref's current value, so this is a CAS
+    // mismatch — NOT a "not a commit" refusal. `<oldvalue>` asserts state; a
+    // wrong assertion is a mismatch, exactly as Git reports it.
+    let out = run_libra_command(
+        &["update-ref", "refs/heads/feature", &c1, "annotated"],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(128), "mismatch exits 128");
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains("not a commit"),
+        "oldvalue must not be type-checked: {stderr}"
+    );
+    assert!(
+        !stderr.contains("LBR-CLI-003"),
+        "a state mismatch is not an invalid target: {stderr}"
+    );
+    assert_eq!(feature_tip(&repo), c2, "the mismatch left the ref alone");
+}
+
+#[test]
+fn update_ref_oldvalue_delete_with_revision_matches() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    assert_eq!(update_feature(&repo, &c2).status.code(), Some(0));
+
+    let out = run_libra_command(
+        &["update-ref", "-d", "refs/heads/feature", "HEAD"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a matching revision oldvalue must allow the delete: {}",
+        stderr_of(&out)
+    );
+    let after = run_libra_command(&["rev-parse", "refs/heads/feature"], repo.path());
+    assert_ne!(after.status.code(), Some(0), "the ref is gone");
+}
+
+#[test]
+fn update_ref_oldvalue_delete_with_revision_mismatch() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    assert_eq!(update_feature(&repo, &c2).status.code(), Some(0));
+
+    // feature is at c2; asserting HEAD~1 (c1) must refuse the delete.
+    let out = run_libra_command(
+        &["update-ref", "-d", "refs/heads/feature", "HEAD~1"],
+        repo.path(),
+    );
+    assert_eq!(out.status.code(), Some(128), "mismatched delete must fail");
+    assert_eq!(feature_tip(&repo), c2, "the ref survived");
+    assert_ne!(c1, c2);
+}
+
+// ── CT1-03 policy invariants ─────────────────────────────────────────────────
+// Widening the operand parsing must not open a bypass: protect/archive
+// metadata is still enforced INSIDE the transaction, and a metadata read that
+// fails still refuses the write (fail-closed) with a repository code.
+
+/// The ref tip (or `None`) plus the reflog, captured so a refusal can be shown
+/// to have changed neither.
+fn ref_state(repo: &TempDir, branch: &str) -> (Option<String>, String) {
+    let full = format!("refs/heads/{branch}");
+    let tip = run_libra_command(&["rev-parse", &full], repo.path());
+    let tip = tip.status.success().then(|| stdout_trimmed(&tip));
+    (tip, reflog_of(repo, branch))
+}
+
+/// Assert a refused operation exited 128 with `code` and changed nothing.
+fn assert_refused_and_unchanged(
+    repo: &TempDir,
+    branch: &str,
+    before: (Option<String>, String),
+    out: &Output,
+    code: &str,
+) {
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "the refusal must exit 128: {}",
+        stderr_of(out)
+    );
+    let stderr = stderr_of(out);
+    assert!(
+        stderr.contains(code),
+        "expected {code} in the refusal: {stderr}"
+    );
+    let after = ref_state(repo, branch);
+    assert_eq!(after.0, before.0, "the refusal moved {branch}");
+    assert_eq!(
+        after.1, before.1,
+        "the refusal wrote a reflog entry for {branch}"
+    );
+}
+
+/// Seed `refs/heads/policy` at HEAD and mark it with `key`.
+fn repo_with_marked_branch(key: &str) -> (TempDir, String) {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    assert_eq!(
+        run_libra_command(&["update-ref", "refs/heads/policy", &c2], repo.path())
+            .status
+            .code(),
+        Some(0)
+    );
+    let set = run_libra_command(
+        &["metadata", "set", "--branch", "policy", key, "true"],
+        repo.path(),
+    );
+    assert_eq!(set.status.code(), Some(0), "metadata: {}", stderr_of(&set));
+    (repo, c2)
+}
+
+/// A branch NAME that carries policy metadata but has no ref: `metadata set`
+/// requires the branch to exist, so mark it and then drop the ref row
+/// directly. That is the only way to reach the "create a branch that is
+/// already protected" path.
+fn repo_with_marked_absent_branch(key: &str) -> (TempDir, String) {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    assert_eq!(
+        run_libra_command(&["update-ref", "refs/heads/fresh", &c2], repo.path())
+            .status
+            .code(),
+        Some(0)
+    );
+    let set = run_libra_command(
+        &["metadata", "set", "--branch", "fresh", key, "true"],
+        repo.path(),
+    );
+    assert_eq!(set.status.code(), Some(0), "metadata: {}", stderr_of(&set));
+    repo_sqlite(
+        &repo,
+        "DELETE FROM reference WHERE name = 'fresh' AND kind = 'Branch';",
+    );
+    let gone = run_libra_command(&["rev-parse", "refs/heads/fresh"], repo.path());
+    assert!(!gone.status.success(), "the ref row should be gone");
+    (repo, c2)
+}
+
+#[test]
+fn update_ref_policy_update_protected() {
+    let (repo, c2) = repo_with_marked_branch("protect");
+    let before = ref_state(&repo, "policy");
+    // A value that really would move the ref, so the refusal cannot be
+    // mistaken for a no-op.
+    let out = run_libra_command(&["update-ref", "refs/heads/policy", "HEAD~1"], repo.path());
+    assert_refused_and_unchanged(&repo, "policy", before, &out, "LBR-POLICY-001");
+    assert_eq!(
+        ref_state(&repo, "policy").0,
+        Some(c2),
+        "the protected branch is still at its original tip"
+    );
+}
+
+#[test]
+fn update_ref_policy_create_protected() {
+    let (repo, c2) = repo_with_marked_absent_branch("protect");
+    let before = ref_state(&repo, "fresh");
+    let out = run_libra_command(&["update-ref", "refs/heads/fresh", &c2], repo.path());
+    assert_refused_and_unchanged(&repo, "fresh", before, &out, "LBR-POLICY-001");
+    let after = run_libra_command(&["rev-parse", "refs/heads/fresh"], repo.path());
+    assert!(!after.status.success(), "the ref was not created");
+}
+
+#[test]
+fn update_ref_policy_delete_protected() {
+    let (repo, _c2) = repo_with_marked_branch("protect");
+    let before = ref_state(&repo, "policy");
+    let out = run_libra_command(&["update-ref", "-d", "refs/heads/policy"], repo.path());
+    assert_refused_and_unchanged(&repo, "policy", before, &out, "LBR-POLICY-001");
+}
+
+#[test]
+fn update_ref_policy_update_archived() {
+    let (repo, c2) = repo_with_marked_branch("archive");
+    let before = ref_state(&repo, "policy");
+    let out = run_libra_command(&["update-ref", "refs/heads/policy", &c2], repo.path());
+    assert_refused_and_unchanged(&repo, "policy", before, &out, "LBR-POLICY-001");
+}
+
+#[test]
+fn update_ref_policy_create_archived() {
+    let (repo, c2) = repo_with_marked_absent_branch("archive");
+    let before = ref_state(&repo, "fresh");
+    let out = run_libra_command(&["update-ref", "refs/heads/fresh", &c2], repo.path());
+    assert_refused_and_unchanged(&repo, "fresh", before, &out, "LBR-POLICY-001");
+    let after = run_libra_command(&["rev-parse", "refs/heads/fresh"], repo.path());
+    assert!(!after.status.success(), "the ref was not created");
+}
+
+#[test]
+fn update_ref_policy_delete_archived() {
+    let (repo, _c2) = repo_with_marked_branch("archive");
+    let before = ref_state(&repo, "policy");
+    let out = run_libra_command(&["update-ref", "-d", "refs/heads/policy"], repo.path());
+    assert_refused_and_unchanged(&repo, "policy", before, &out, "LBR-POLICY-001");
+}
+
+/// A repository whose branch-policy metadata cannot be read at all. The write
+/// must be refused (fail-closed), with a repository code — never silently
+/// treated as "no policy set".
+fn repo_with_unreadable_policy_metadata() -> (TempDir, String) {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    assert_eq!(
+        run_libra_command(&["update-ref", "refs/heads/policy", &c2], repo.path())
+            .status
+            .code(),
+        Some(0)
+    );
+    repo_sqlite(&repo, "DROP TABLE metadata_kv;");
+    (repo, c2)
+}
+
+#[test]
+fn update_ref_policy_update_storage_error() {
+    let (repo, c2) = repo_with_unreadable_policy_metadata();
+    let before = ref_state(&repo, "policy");
+    let out = run_libra_command(&["update-ref", "refs/heads/policy", &c2], repo.path());
+    assert_refused_and_unchanged(&repo, "policy", before, &out, "LBR-REPO-003");
+}
+
+#[test]
+fn update_ref_policy_create_storage_error() {
+    let (repo, c2) = repo_with_unreadable_policy_metadata();
+    let before = ref_state(&repo, "fresh");
+    let out = run_libra_command(&["update-ref", "refs/heads/fresh", &c2], repo.path());
+    assert_refused_and_unchanged(&repo, "fresh", before, &out, "LBR-REPO-003");
+    let after = run_libra_command(&["rev-parse", "refs/heads/fresh"], repo.path());
+    assert!(!after.status.success(), "the ref was not created");
+}
+
+#[test]
+fn update_ref_policy_delete_storage_error() {
+    let (repo, _c2) = repo_with_unreadable_policy_metadata();
+    let before = ref_state(&repo, "policy");
+    let out = run_libra_command(&["update-ref", "-d", "refs/heads/policy"], repo.path());
+    assert_refused_and_unchanged(&repo, "policy", before, &out, "LBR-REPO-003");
+    let after = run_libra_command(&["rev-parse", "refs/heads/policy"], repo.path());
+    assert!(after.status.success(), "the ref survived");
+}

@@ -41,7 +41,7 @@ reflog message; only the actual before/after object ids are.
 | `-d`, `--delete` | Delete the ref instead of updating it. | `libra update-ref -d refs/heads/old` |
 | `-m <reason>` | Reflog reason recorded with the update. | `libra update-ref -m "reset tip" refs/heads/main <oid>` |
 | `<newvalue>` | The new commit, as an object id or any revision expression (omit with `-d`). | `libra update-ref refs/heads/main HEAD~1` |
-| `<oldvalue>` | Expected current id for a compare-and-swap (`0{40}` = must not exist). | |
+| `<oldvalue>` | Expected current value for a compare-and-swap, as an id or revision (`0{40}` = must not exist). | `libra update-ref -d refs/heads/topic HEAD` |
 | `--json` / `--machine` | Structured output: `{ ref, old, new, deleted }`. | `libra --json update-ref refs/heads/main <oid>` |
 
 A symbolic value (`ref:refs/heads/…`) and the null object id as `<newvalue>` are
@@ -68,7 +68,11 @@ syntax-layer refusals above stay `LBR-CLI-002`. Both exit `128`. A failure
 inside the object store (an unreadable or corrupt object) keeps its own
 repository/IO code and is never reported as bad input.
 
-`<oldvalue>` is unchanged: it is still a full object id (or the all-zero id).
+`<oldvalue>` accepts the same expressions, with one deliberate difference: it
+is **not** type-checked. It states what the ref points at *right now*, so the
+resolved id is compared verbatim — naming an annotated tag there is an ordinary
+compare-and-swap mismatch, not a "not a commit" refusal, which is also how Git
+reports it. The all-zero id keeps its "must not exist" meaning.
 
 ## Exit codes
 

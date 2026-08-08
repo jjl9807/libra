@@ -29,7 +29,7 @@ libra update-ref -d [-m <reason>] refs/heads/<branch> [<oldvalue>]
 | `-d`, `--delete` | 删除 ref 而非更新。 | `libra update-ref -d refs/heads/old` |
 | `-m <reason>` | 随更新记录的 reflog 原因。 | `libra update-ref -m "重置 tip" refs/heads/main <oid>` |
 | `<newvalue>` | 新提交，可写对象 id 或任意 revision 表达式（`-d` 时省略）。 | `libra update-ref refs/heads/main HEAD~1` |
-| `<oldvalue>` | 比较并交换的期望当前 id（`0{40}` = 必须不存在）。 | |
+| `<oldvalue>` | 比较并交换的期望当前值，可写 id 或 revision（`0{40}` = 必须不存在）。 | `libra update-ref -d refs/heads/topic HEAD` |
 | `--json` / `--machine` | 结构化输出：`{ ref, old, new, deleted }`。 | `libra --json update-ref refs/heads/main <oid>` |
 
 符号值（`ref:refs/heads/…`）以及把全零对象 id 作为 `<newvalue>` 都会被拒绝 —— 请用 `symbolic-ref`，或用 `-d` 删除。
@@ -46,7 +46,7 @@ libra update-ref refs/heads/release v1.0^{commit}
 
 这与 Git 一致——Git 同样拒绝把 annotated tag 对象写进 `refs/heads/*`。无法解析的 revision 是 `LBR-CLI-003`；上面两条语法层拒绝仍是 `LBR-CLI-002`。两者退出码都是 `128`。对象库自身的失败（对象不可读或损坏）保留其仓库/IO 错误码，绝不降级为输入错误。
 
-`<oldvalue>` 不变：仍然只接受完整对象 id（或全零 id）。
+`<oldvalue>` 接受同样的表达式，但有一处有意差异：**不做类型校验**。它断言的是「ref 现在指向什么」，因此解析结果按原样逐字比较——在这里写 annotated tag 得到的是普通的比较并交换不匹配，而不是「不是 commit」的拒绝，这也正是 Git 的行为。全零 id 的「必须不存在」语义不变。
 
 ## 退出码
 

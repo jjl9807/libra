@@ -9,8 +9,6 @@
 //! (use `symbolic-ref` / `switch` / `tag`), since they are not directly
 //! representable here.
 
-use std::str::FromStr;
-
 use clap::Parser;
 use git_internal::{
     errors::GitError,
@@ -175,7 +173,7 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
 
     // Parse the optional compare-and-swap operand.
     let old_spec = match old_spec {
-        Some(value) => Some(parse_old_value(&value, &zero).map_err(fatal)?),
+        Some(value) => Some(resolve_old_value(&value, &zero, &args.ref_name).await?),
         None => None,
     };
 
@@ -402,26 +400,7 @@ async fn resolve_new_value(value: &str, zero: &str, ref_name: &str) -> CliResult
 
     let object_id = util::resolve_object_spec_typed(value)
         .await
-        .map_err(|error| match error {
-            CommitBaseError::HeadUnborn | CommitBaseError::InvalidReference(_) => {
-                invalid_target_fatal(format!(
-                    "cannot update '{ref_name}': '{value}' is not a valid revision in this repository"
-                ))
-            }
-            // A resolver failure caused by the repository itself must keep its
-            // own class — reporting it as bad user input would send the
-            // operator looking at their command line instead of their objects.
-            CommitBaseError::ReadFailure(detail) => {
-                CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
-                    .with_exit_code(128)
-                    .with_stable_code(StableErrorCode::IoReadFailed)
-            }
-            CommitBaseError::CorruptReference(detail) => {
-                CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
-                    .with_exit_code(128)
-                    .with_stable_code(StableErrorCode::RepoCorrupt)
-            }
-        })?;
+        .map_err(|error| resolver_error(error, value, ref_name))?;
 
     // Git's update-ref refuses to point a ref at an object that is not in the
     // store; do the same so we never create a dangling ref. Reading the type
@@ -462,25 +441,50 @@ fn invalid_target_fatal(message: String) -> CliError {
         .with_stable_code(StableErrorCode::CliInvalidTarget)
 }
 
-/// Parse a compare-and-swap operand (`0{40}` => must-not-exist).
-fn parse_old_value(value: &str, zero: &str) -> Result<OldValue, String> {
+/// Resolve a compare-and-swap operand (`0{40}` => must-not-exist).
+///
+/// Same revision entry point as `<newvalue>`, and deliberately **no commit
+/// type check**: `<oldvalue>` states what the ref is expected to point at
+/// right now, so the resolved id is compared verbatim. Naming an annotated tag
+/// here therefore produces an ordinary CAS mismatch — Git behaves the same
+/// way, because a ref that points at a tag object is a state you are allowed
+/// to assert and be wrong about, not a malformed request.
+async fn resolve_old_value(value: &str, zero: &str, ref_name: &str) -> CliResult<OldValue> {
     if value == zero {
         return Ok(OldValue::MustNotExist);
     }
-    validate_oid(value)?;
-    Ok(OldValue::Exact(value.to_string()))
-}
-
-/// Validate that `value` is a full object id matching the repository hash kind,
-/// returning the parsed hash.
-fn validate_oid(value: &str) -> Result<ObjectHash, String> {
-    let expected_len = get_hash_kind().hex_len();
-    if value.len() != expected_len {
-        return Err(format!(
-            "'{value}' is not a valid object id for this repository (expected {expected_len} hex chars)"
+    if value.starts_with("ref:") {
+        return Err(usage_fatal(
+            "symbolic refs are not supported by update-ref; use `symbolic-ref`".to_string(),
         ));
     }
-    ObjectHash::from_str(value).map_err(|_| {
-        format!("'{value}' is not a valid object id for this repository (expected {expected_len} hex chars)")
-    })
+    let object_id = util::resolve_object_spec_typed(value)
+        .await
+        .map_err(|error| resolver_error(error, value, ref_name))?;
+    Ok(OldValue::Exact(object_id.to_string()))
+}
+
+/// Map a resolver failure onto this command's error classes.
+///
+/// A resolver failure caused by the repository itself must keep its own class
+/// — reporting it as bad user input would send the operator looking at their
+/// command line instead of at their objects.
+fn resolver_error(error: CommitBaseError, value: &str, ref_name: &str) -> CliError {
+    match error {
+        CommitBaseError::HeadUnborn | CommitBaseError::InvalidReference(_) => {
+            invalid_target_fatal(format!(
+                "cannot update '{ref_name}': '{value}' is not a valid revision in this repository"
+            ))
+        }
+        CommitBaseError::ReadFailure(detail) => {
+            CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        }
+        CommitBaseError::CorruptReference(detail) => {
+            CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+        }
+    }
 }

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added (plan-20260729 CT1-03, 2026-08-08)
+
+- **`update-ref`'s `<oldvalue>` accepts revision expressions too**, through the
+  same entry point as `<newvalue>` — so `libra update-ref -d refs/heads/topic
+  HEAD` guards a delete without a manual `rev-parse`. It is deliberately not
+  type-checked: `<oldvalue>` asserts what the ref points at now, so the
+  resolved id is compared verbatim and naming an annotated tag there is an
+  ordinary compare-and-swap mismatch, matching Git. The all-zero "must not
+  exist" spelling is unchanged, and branch protect/archive enforcement stays
+  inside the same transaction and fail-closed on a metadata read error.
+
 ### Added (plan-20260729 CT1-02, 2026-08-08)
 
 - **`libra update-ref refs/heads/<branch> <newvalue>` accepts revision
