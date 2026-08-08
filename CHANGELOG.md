@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260729 CT1-01, 2026-08-08)
+
+- **`libra config <key>` reads an encrypted ordinary key instead of refusing
+  it.** A stored encrypted value used to be read as assignment intent, so a
+  bare read of an ordinary key reported "missing value for protected key"
+  with exit 2. That inference is now drawn only when the caller spells out
+  the assignment (`config set <key>` / `--add`); the bare form renders
+  `<REDACTED>` through the same `reveal=false` path as `config get`.
+  Protected keys keep their interactive secure-assignment path — an
+  intentional divergence from Git, now registered on the `config` row of
+  `COMPATIBILITY.md` and documented in both language editions of
+  `docs/commands/config.md`.
+- **`libra config -z <key>` terminates with NUL like `config get` does.** The
+  bare read hardcoded newline termination, so the two spellings of the same
+  read disagreed byte for byte whenever `-z`/`--null` was in play.
+
 ### Fixed (plan-20260714 W4 cross-review, 2026-08-08)
 
 - **`cloud restore` no longer overwrites locally scoped agent sessions.**

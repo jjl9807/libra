@@ -556,6 +556,8 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             plaintext,
             stdin,
             value_type,
+            explicit_set,
+            null,
         } => {
             handle_set(
                 &key,
@@ -567,6 +569,8 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 value_type,
                 scope,
                 use_cascade,
+                explicit_set,
+                null,
                 output,
             )
             .await
@@ -812,6 +816,11 @@ async fn route_upgrade_namespace(
             plaintext,
             stdin,
             value_type,
+            // The reserved-namespace router is fail-closed for every spelling
+            // of a write, so it never needs to tell the two set forms apart
+            // nor how a read would have been terminated.
+            explicit_set: _,
+            null: _,
         } if is_upgrade_namespace_key(key) => Some(match guard_conflicts() {
             Err(err) => Err(err),
             Ok(()) => {
@@ -1065,6 +1074,14 @@ enum ResolvedCommand {
         /// Validate and canonicalize the value to this type before storing
         /// (`--type`/`--bool`/etc. on a set, matching `git config --type`).
         value_type: Option<ConfigValueType>,
+        /// The caller spelled out assignment intent (`libra config set …` or
+        /// `--add`). The bare `libra config <key>` form does not: for an
+        /// ordinary key it is a READ, so an already-encrypted stored value
+        /// must not drag it onto the protected-input path.
+        explicit_set: bool,
+        /// `-z`/`--null`. Only consulted when the bare form degrades to a
+        /// read, where the output must match `config get` byte for byte.
+        null: bool,
     },
     Get {
         key: String,
@@ -1158,6 +1175,8 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 plaintext: *plaintext,
                 stdin: *stdin,
                 value_type,
+                explicit_set: true,
+                null: args.null,
             },
             ConfigCommand::Get {
                 key,
@@ -1357,12 +1376,14 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             plaintext: false,
             stdin: false,
             value_type,
+            explicit_set: true,
+            null: args.null,
         });
     }
 
-    // Default: set mode (key + optional value).
-    // When value is omitted, handle_set will trigger interactive input for
-    // sensitive keys or report a missing-value error for ordinary keys.
+    // Default: the bare `libra config <key> [value]` form. With a value it is a
+    // set; without one it is a READ for ordinary keys and the interactive
+    // secure-assignment path for protected keys (see `handle_set`).
     Ok(ResolvedCommand::Set {
         key: key.to_string(),
         value: args.valuepattern.clone(),
@@ -1371,6 +1392,8 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         plaintext: false,
         stdin: false,
         value_type,
+        explicit_set: false,
+        null: args.null,
     })
 }
 
@@ -1389,6 +1412,8 @@ async fn handle_set(
     value_type: Option<ConfigValueType>,
     scope: ConfigScope,
     use_cascade: bool,
+    explicit_set: bool,
+    null: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
     // Validate key format
@@ -1490,8 +1515,13 @@ async fn handle_set(
         v.to_string()
     } else {
         // No value provided
+        // `has_encrypted` only expresses assignment intent when the caller
+        // asked to assign (`config set <key>` / `--add`). On the bare
+        // `libra config <key>` form an ordinary key stays a READ even when its
+        // stored value happens to be encrypted — otherwise reading it would
+        // report "missing value for protected key" instead of `<REDACTED>`.
         let needs_protected_input =
-            !plaintext && (encrypt || is_sensitive_key(key) || has_encrypted);
+            !plaintext && (encrypt || is_sensitive_key(key) || (has_encrypted && explicit_set));
 
         if needs_protected_input {
             // Check if interactive mode is available.
@@ -1522,7 +1552,7 @@ async fn handle_set(
                 None,
                 scope,
                 use_cascade,
-                false,
+                null,
                 value_type,
                 output,
             )
