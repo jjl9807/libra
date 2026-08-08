@@ -1,0 +1,850 @@
+//! plan-20260729 CT2-01 — the structural contract of the compatibility
+//! evidence ledger, and the mechanism that enforces it.
+//!
+//! The ledger lives at `tests/compat-ledger/<family>/<stem>.toml`: one TOML
+//! per upstream source file, carrying one `[[scenario]]` table per migrated
+//! upstream test. ADR-CT-03 in
+//! [`docs/development/plan/plan-20260729.md`](../../docs/development/plan/plan-20260729.md)
+//! is the single normative definition of the field set; this guard is its
+//! executable form and must not invent fields of its own.
+//!
+//! Why a guard from day one: the ledger's whole purpose is to be believable
+//! evidence about Git compatibility. A row that self-reports its command's
+//! compatibility tier, or that says `declined` without naming a decision, or
+//! that quietly loses `owner`/`review_date`, is worse than no row at all — it
+//! looks like evidence. So the tier is RECOMPUTED from `COMPATIBILITY.md`
+//! rather than trusted, every field is required to be present and non-blank,
+//! and the field set is closed: an unknown key is an error, not a comment.
+//!
+//! `_example/` holds one valid file (the format's worked example) and
+//! `_invalid/` holds one file per rejection this guard promises to make.
+//! Both are skipped when walking the real ledger — a directory whose name
+//! starts with `_` is fixture space, not evidence.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Path, PathBuf},
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The schema, as ADR-CT-03 defines it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CATEGORIES: &[&str] = &["direct", "adapted", "declined", "blocked"];
+const COMMAND_STATUSES: &[&str] = &["supported", "partial", "intentionally-different", "absent"];
+const SURFACE_STATUSES: &[&str] = &[
+    "git-compatible",
+    "intentionally-different",
+    "absent",
+    "deferred",
+];
+
+/// Every field a `[[scenario]]` must carry. `libra_tests` is filled in later
+/// (CT3-02), `decision_id`/`blocked_by` are category-conditional, so those
+/// three are optional here and checked separately.
+const REQUIRED_FIELDS: &[&str] = &[
+    "id",
+    "category",
+    "command_status",
+    "surface_compatibility",
+    "surface_evidence",
+    "reason",
+    "owner",
+    "review_date",
+    "upstream_revision",
+    "upstream_file",
+    "libra_command",
+    "libra_surface",
+];
+
+const CONDITIONAL_FIELDS: &[&str] = &["decision_id", "blocked_by", "libra_tests"];
+
+/// ADR-CT-03: `reason` is free text of at most 200 Unicode scalar values.
+const REASON_MAX_SCALARS: usize = 200;
+
+/// Absolute paths that would leak a developer's machine into the evidence
+/// (ER-11). A ledger row is published material; it names repository-relative
+/// paths or nothing.
+const PRIVATE_PATH_MARKERS: &[&str] = &["/Users/", "/home/", "/root/", "C:\\Users\\"];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Locations
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn ledger_root() -> PathBuf {
+    repo_root().join("tests/compat-ledger")
+}
+
+fn example_file() -> PathBuf {
+    ledger_root().join("_example/ledger_example.toml")
+}
+
+fn invalid_file(stem: &str) -> PathBuf {
+    ledger_root().join(format!("_invalid/{stem}.toml"))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A validated scenario row
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Scenario {
+    id: String,
+    category: String,
+    surface_evidence: String,
+    libra_tests: Vec<String>,
+}
+
+/// Validate one ledger file's text. `Ok` carries its scenarios in file order;
+/// `Err` carries a message naming what was wrong, so a rejection fixture can
+/// assert it was rejected for its own reason and not by accident.
+fn validate_ledger_text(display_path: &str, text: &str) -> Result<Vec<Scenario>, String> {
+    let doc: toml::Value =
+        toml::from_str(text).map_err(|error| format!("{display_path}: not valid TOML: {error}"))?;
+    let table = doc
+        .as_table()
+        .ok_or_else(|| format!("{display_path}: top level must be a table"))?;
+
+    for key in table.keys() {
+        if key != "scenario" {
+            return Err(format!(
+                "{display_path}: unknown top-level key '{key}'; a ledger file holds only \
+                 [[scenario]] tables"
+            ));
+        }
+    }
+
+    let rows = table
+        .get("scenario")
+        .ok_or_else(|| format!("{display_path}: no [[scenario]] table"))?
+        .as_array()
+        .ok_or_else(|| format!("{display_path}: 'scenario' must be an array of tables"))?;
+    if rows.is_empty() {
+        return Err(format!("{display_path}: [[scenario]] array is empty"));
+    }
+
+    let compat = compatibility_tiers();
+    let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+    let mut scenarios = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        let row = row
+            .as_table()
+            .ok_or_else(|| format!("{display_path}: [[scenario]] #{index} is not a table"))?;
+        let where_ = format!("{display_path} scenario #{index}");
+
+        // Closed field set: an unknown key is a typo or a private extension,
+        // and either way the guard would stop covering it.
+        for key in row.keys() {
+            if !REQUIRED_FIELDS.contains(&key.as_str())
+                && !CONDITIONAL_FIELDS.contains(&key.as_str())
+            {
+                return Err(format!("{where_}: unknown field '{key}'"));
+            }
+        }
+
+        let mut values: BTreeMap<&str, String> = BTreeMap::new();
+        for field in REQUIRED_FIELDS {
+            let value = row
+                .get(*field)
+                .ok_or_else(|| format!("{where_}: missing field '{field}'"))?;
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("{where_}: field '{field}' must be a string"))?;
+            if value.trim().is_empty() {
+                return Err(format!("{where_}: field '{field}' is blank"));
+            }
+            values.insert(field, value.to_string());
+        }
+
+        for (field, value) in &values {
+            for marker in PRIVATE_PATH_MARKERS {
+                if value.contains(marker) {
+                    return Err(format!(
+                        "{where_}: field '{field}' contains the absolute private path \
+                         marker '{marker}'"
+                    ));
+                }
+            }
+        }
+
+        let id = values["id"].clone();
+        let (stem, slug) = id
+            .split_once("::")
+            .ok_or_else(|| format!("{where_}: id '{id}' is not '<stem>::<slug>'"))?;
+        if stem.is_empty() || slug.is_empty() {
+            return Err(format!("{where_}: id '{id}' has an empty half"));
+        }
+        if !seen_ids.insert(id.clone()) {
+            return Err(format!("{where_}: duplicate scenario id '{id}'"));
+        }
+
+        let category = values["category"].clone();
+        if !CATEGORIES.contains(&category.as_str()) {
+            return Err(format!(
+                "{where_}: category '{category}' is not in the closed set"
+            ));
+        }
+        let command_status = values["command_status"].clone();
+        if !COMMAND_STATUSES.contains(&command_status.as_str()) {
+            return Err(format!(
+                "{where_}: command_status '{command_status}' is not in the closed set"
+            ));
+        }
+        let surface_compatibility = values["surface_compatibility"].clone();
+        if !SURFACE_STATUSES.contains(&surface_compatibility.as_str()) {
+            return Err(format!(
+                "{where_}: surface_compatibility '{surface_compatibility}' is not in the \
+                 closed set"
+            ));
+        }
+
+        if !is_iso_date(&values["review_date"]) {
+            return Err(format!(
+                "{where_}: review_date '{}' is not an ISO YYYY-MM-DD date",
+                values["review_date"]
+            ));
+        }
+        if values["reason"].chars().count() > REASON_MAX_SCALARS {
+            return Err(format!(
+                "{where_}: reason is {} scalar values, the limit is {REASON_MAX_SCALARS}",
+                values["reason"].chars().count()
+            ));
+        }
+        let revision = &values["upstream_revision"];
+        if revision.len() != 40 || !revision.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "{where_}: upstream_revision '{revision}' is not a 40-hex pinned grit SHA"
+            ));
+        }
+
+        // The tier is RECOMPUTED, never trusted. `absent` means the command is
+        // not in `COMPATIBILITY.md`'s top-level table at all.
+        let libra_command = values["libra_command"].clone();
+        let derived = compat
+            .get(libra_command.as_str())
+            .cloned()
+            .unwrap_or_else(|| "absent".to_string());
+        if derived != command_status {
+            return Err(format!(
+                "{where_}: command_status '{command_status}' disagrees with the tier \
+                 '{derived}' derived from COMPATIBILITY.md for '{libra_command}'"
+            ));
+        }
+        if matches!(derived.as_str(), "intentionally-different" | "absent")
+            && category != "declined"
+        {
+            return Err(format!(
+                "{where_}: '{libra_command}' is {derived}, so the only admissible category \
+                 is 'declined', not '{category}'"
+            ));
+        }
+
+        // ADR-CT-03's `direct` threshold. The command half is recomputed
+        // above; the surface half is checked here as declared and will be
+        // recomputed from SURFACES.lock by CT2-02.
+        if category == "direct" {
+            if !matches!(command_status.as_str(), "supported" | "partial") {
+                return Err(format!(
+                    "{where_}: category 'direct' requires command_status supported|partial, \
+                     found '{command_status}'"
+                ));
+            }
+            if surface_compatibility != "git-compatible" {
+                return Err(format!(
+                    "{where_}: category 'direct' requires surface_compatibility \
+                     'git-compatible', found '{surface_compatibility}'"
+                ));
+            }
+        }
+
+        match category.as_str() {
+            "declined" => {
+                let decision_id = row
+                    .get("decision_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| format!("{where_}: category 'declined' requires decision_id"))?;
+                if !decision_exists(decision_id) {
+                    return Err(format!(
+                        "{where_}: decision_id '{decision_id}' does not resolve to a \
+                         '### {decision_id}' heading in _compatibility.md"
+                    ));
+                }
+            }
+            "blocked" => {
+                let blocked_by = row
+                    .get("blocked_by")
+                    .ok_or_else(|| format!("{where_}: category 'blocked' requires blocked_by"))?;
+                let items = blocked_by
+                    .as_array()
+                    .ok_or_else(|| format!("{where_}: blocked_by must be an array"))?;
+                if items.is_empty()
+                    || items
+                        .iter()
+                        .any(|v| v.as_str().is_none_or(|s| s.trim().is_empty()))
+                {
+                    return Err(format!(
+                        "{where_}: blocked_by must be a non-empty array of non-blank strings"
+                    ));
+                }
+            }
+            _ => {}
+        }
+
+        let libra_surface = values["libra_surface"].clone();
+        let surface_evidence = values["surface_evidence"].clone();
+        check_surface_evidence(&where_, &surface_evidence, &libra_command, &libra_surface)?;
+
+        let libra_tests = match row.get("libra_tests") {
+            None => Vec::new(),
+            Some(value) => {
+                let items = value
+                    .as_array()
+                    .ok_or_else(|| format!("{where_}: libra_tests must be an array"))?;
+                let mut names = Vec::new();
+                for item in items {
+                    let name = item
+                        .as_str()
+                        .ok_or_else(|| format!("{where_}: libra_tests entries must be strings"))?;
+                    if name.trim().is_empty() {
+                        return Err(format!("{where_}: libra_tests contains a blank entry"));
+                    }
+                    names.push(name.to_string());
+                }
+                names
+            }
+        };
+
+        scenarios.push(Scenario {
+            id,
+            category,
+            surface_evidence,
+            libra_tests,
+        });
+    }
+
+    Ok(scenarios)
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if !value
+        .char_indices()
+        .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let month: u32 = value[5..7].parse().unwrap_or(0);
+    let day: u32 = value[8..10].parse().unwrap_or(0);
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// The `Command -> Tier` map of `COMPATIBILITY.md`'s top-level table, located
+/// by its heading so a second table elsewhere in the file cannot be mistaken
+/// for it.
+fn compatibility_tiers() -> BTreeMap<String, String> {
+    let text = fs::read_to_string(repo_root().join("COMPATIBILITY.md"))
+        .expect("COMPATIBILITY.md must be readable");
+    let mut tiers = BTreeMap::new();
+    let mut inside = false;
+    for line in text.lines() {
+        if line.starts_with("## Top-level commands") {
+            inside = true;
+            continue;
+        }
+        if inside && line.starts_with("## ") {
+            break;
+        }
+        if !inside || !line.starts_with('|') {
+            continue;
+        }
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        if cells.len() < 3 || cells[0] == "Command" || cells[0].starts_with("---") {
+            continue;
+        }
+        tiers.insert(cells[0].to_string(), cells[1].to_string());
+    }
+    assert!(
+        !tiers.is_empty(),
+        "no rows parsed out of COMPATIBILITY.md's top-level command table"
+    );
+    tiers
+}
+
+/// Whether `_compatibility.md` carries a `### <id>` heading for this decision.
+fn decision_exists(decision_id: &str) -> bool {
+    let text = fs::read_to_string(repo_root().join("docs/development/commands/_compatibility.md"))
+        .expect("_compatibility.md must be readable");
+    text.lines().any(|line| {
+        line.strip_prefix("### ")
+            .is_some_and(|rest| rest.starts_with(decision_id))
+    })
+}
+
+/// `surface_evidence` must resolve to real text, and that text must mention
+/// both the command and the surface. Citing a page that does not actually
+/// discuss the flag is the failure mode this closes: it looks like a citation
+/// and proves nothing.
+fn check_surface_evidence(
+    where_: &str,
+    evidence: &str,
+    command: &str,
+    surface: &str,
+) -> Result<(), String> {
+    let body = resolve_evidence(where_, evidence)?;
+    for needle in [command, surface] {
+        if !body.contains(needle) {
+            return Err(format!(
+                "{where_}: surface_evidence '{evidence}' does not mention '{needle}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_evidence(where_: &str, evidence: &str) -> Result<String, String> {
+    // Form 1: COMPATIBILITY.md:<line>
+    if let Some(rest) = evidence.strip_prefix("COMPATIBILITY.md:") {
+        let line_no: usize = rest
+            .parse()
+            .map_err(|_| format!("{where_}: '{evidence}' has a non-numeric line number"))?;
+        let text = read_repo_file(where_, Path::new("COMPATIBILITY.md"))?;
+        return text
+            .lines()
+            .nth(line_no.checked_sub(1).ok_or_else(|| {
+                format!("{where_}: '{evidence}' uses line 0; line numbers are 1-based")
+            })?)
+            .map(str::to_string)
+            .ok_or_else(|| format!("{where_}: '{evidence}' points past the end of the file"));
+    }
+
+    // Form 2: _compatibility.md#D<n>
+    if let Some(anchor) = evidence.strip_prefix("_compatibility.md#") {
+        let text = read_repo_file(
+            where_,
+            Path::new("docs/development/commands/_compatibility.md"),
+        )?;
+        return section_text(&text, anchor)
+            .ok_or_else(|| format!("{where_}: '{evidence}' names no such section"));
+    }
+
+    // Form 3: docs/commands/<cmd>.md#<section>
+    if let Some((path, anchor)) = evidence.split_once('#')
+        && path.starts_with("docs/commands/")
+        && path.ends_with(".md")
+    {
+        let text = read_repo_file(where_, Path::new(path))?;
+        return section_text(&text, anchor)
+            .ok_or_else(|| format!("{where_}: '{evidence}' names no such section"));
+    }
+
+    Err(format!(
+        "{where_}: surface_evidence '{evidence}' is not one of the three admissible forms"
+    ))
+}
+
+fn read_repo_file(where_: &str, relative: &Path) -> Result<String, String> {
+    fs::read_to_string(repo_root().join(relative))
+        .map_err(|error| format!("{where_}: cannot read {}: {error}", relative.display()))
+}
+
+/// The text of the section whose heading slug is `anchor`, up to the next
+/// heading at the same or a shallower level.
+fn section_text(text: &str, anchor: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut body: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        let is_heading = hashes > 0 && line.as_bytes().get(hashes) == Some(&b' ');
+        if is_heading {
+            let title = line[hashes + 1..].trim();
+            if body.is_some() && hashes <= depth {
+                break;
+            }
+            if body.is_none() && (slugify(title) == slugify(anchor) || title.starts_with(anchor)) {
+                depth = hashes;
+                body = Some(vec![line]);
+                continue;
+            }
+        }
+        if let Some(collected) = body.as_mut() {
+            collected.push(line);
+        }
+    }
+    body.map(|lines| lines.join("\n"))
+}
+
+fn slugify(title: &str) -> String {
+    title
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if c == ' ' || c == '-' || c == '_' {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Walking the real ledger
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every real ledger file as `(stem, scenarios)`, sorted by path. Directories
+/// whose name starts with `_` are fixture space and are skipped.
+fn load_real_ledger() -> Vec<(String, Vec<Scenario>)> {
+    let root = ledger_root();
+    let mut files: Vec<PathBuf> = Vec::new();
+    if root.is_dir() {
+        for family in read_dir_sorted(&root) {
+            let name = family
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !family.is_dir() || name.starts_with('_') {
+                continue;
+            }
+            for file in read_dir_sorted(&family) {
+                if file.extension().is_some_and(|ext| ext == "toml") {
+                    files.push(file);
+                }
+            }
+        }
+    }
+
+    let mut loaded = Vec::new();
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    for file in files {
+        let display = file
+            .strip_prefix(repo_root())
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        let text = fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {display}: {e}"));
+        let scenarios = validate_ledger_text(&display, &text)
+            .unwrap_or_else(|error| panic!("ledger row rejected: {error}"));
+        for scenario in &scenarios {
+            if let Some(previous) = seen.insert(scenario.id.clone(), display.clone()) {
+                panic!(
+                    "duplicate scenario id '{}' in {display} and {previous}",
+                    scenario.id
+                );
+            }
+        }
+        let stem = file
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        loaded.push((stem, scenarios));
+    }
+    loaded
+}
+
+fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// The example, loaded through the same validator the real tree uses.
+fn load_example() -> Vec<(String, Vec<Scenario>)> {
+    let path = example_file();
+    let text = fs::read_to_string(&path).expect("the ledger example must exist");
+    let scenarios = validate_ledger_text("_example/ledger_example.toml", &text)
+        .expect("the ledger example must be valid");
+    vec![("ledger_example".to_string(), scenarios)]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dumps consumed by later cards (CT3-02 / CT3-03 / CT3-04)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn dump_scenario_ids(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+    tree.iter()
+        .flat_map(|(stem, rows)| {
+            rows.iter()
+                .map(move |row| format!("SCENARIO_ID {stem}\t{}", row.id))
+        })
+        .collect()
+}
+
+fn dump_direct_ids(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+    tree.iter()
+        .flat_map(|(stem, rows)| {
+            rows.iter()
+                .filter(|row| row.category == "direct")
+                .map(move |row| format!("DIRECT_ID {}\ttests/compat-ledger/{stem}.toml", row.id))
+        })
+        .collect()
+}
+
+fn dump_libra_tests(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+    tree.iter()
+        .flat_map(|(_stem, rows)| rows.iter().flat_map(|row| row.libra_tests.iter()))
+        .map(|name| format!("LIBRA_TEST {name}"))
+        .collect()
+}
+
+fn dump_surface_evidence(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+    tree.iter()
+        .flat_map(|(_stem, rows)| {
+            rows.iter()
+                .map(|row| format!("EVIDENCE {}\t{}", row.id, row.surface_evidence))
+        })
+        .collect()
+}
+
+fn dump_scenario_tests(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+    tree.iter()
+        .flat_map(|(_stem, rows)| {
+            rows.iter().flat_map(|row| {
+                row.libra_tests
+                    .iter()
+                    .map(move |name| format!("SCENARIO_TEST {}\t{name}", row.id))
+            })
+        })
+        .collect()
+}
+
+/// Print a dump for the consumers that run this target with `--nocapture`.
+fn emit(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn ledger_example_is_valid() {
+    let path = example_file();
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let scenarios = validate_ledger_text("_example/ledger_example.toml", &text)
+        .unwrap_or_else(|error| panic!("the worked example must validate: {error}"));
+    assert!(
+        !scenarios.is_empty(),
+        "the worked example must carry at least one scenario"
+    );
+}
+
+/// Every rejection fixture: it must be refused, and the refusal must name the
+/// thing the fixture is about. A fixture that is rejected for an unrelated
+/// reason (a typo elsewhere) would otherwise look like coverage.
+fn assert_rejected(stem: &str, expected_fragment: &str) {
+    let path = invalid_file(stem);
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    match validate_ledger_text(&format!("_invalid/{stem}.toml"), &text) {
+        Ok(_) => panic!("_invalid/{stem}.toml was accepted; it must be rejected"),
+        Err(error) => assert!(
+            error.contains(expected_fragment),
+            "_invalid/{stem}.toml was rejected for the wrong reason.\n  expected to mention: \
+             {expected_fragment}\n  got: {error}"
+        ),
+    }
+}
+
+#[test]
+fn ledger_rejects_missing_field() {
+    assert_rejected("missing_field", "missing field 'owner'");
+}
+
+#[test]
+fn ledger_rejects_blank_field() {
+    assert_rejected("blank_field", "is blank");
+}
+
+#[test]
+fn ledger_rejects_bad_category() {
+    assert_rejected("bad_category", "is not in the closed set");
+}
+
+#[test]
+fn ledger_rejects_bad_review_date() {
+    assert_rejected("bad_review_date", "is not an ISO YYYY-MM-DD date");
+}
+
+#[test]
+fn ledger_rejects_dangling_decision_id() {
+    assert_rejected("dangling_decision_id", "does not resolve to a");
+}
+
+#[test]
+fn ledger_rejects_empty_blocked_by() {
+    assert_rejected("empty_blocked_by", "blocked_by must be a non-empty array");
+}
+
+#[test]
+fn ledger_rejects_duplicate_id() {
+    assert_rejected("duplicate_id", "duplicate scenario id");
+}
+
+#[test]
+fn ledger_rejects_private_path() {
+    assert_rejected("private_path", "absolute private path marker");
+}
+
+#[test]
+fn ledger_rejects_reason_too_long() {
+    assert_rejected("reason_too_long", "the limit is 200");
+}
+
+#[test]
+fn ledger_rejects_bad_upstream_revision() {
+    assert_rejected("bad_upstream_revision", "is not a 40-hex pinned grit SHA");
+}
+
+#[test]
+fn ledger_rejects_empty_upstream_file() {
+    assert_rejected("empty_upstream_file", "field 'upstream_file' is blank");
+}
+
+#[test]
+fn ledger_rejects_empty_libra_command() {
+    assert_rejected("empty_libra_command", "field 'libra_command' is blank");
+}
+
+#[test]
+fn ledger_rejects_empty_libra_surface() {
+    assert_rejected("empty_libra_surface", "field 'libra_surface' is blank");
+}
+
+#[test]
+fn ledger_rejects_bad_surface_status() {
+    assert_rejected("bad_surface_status", "surface_compatibility");
+}
+
+#[test]
+fn ledger_rejects_direct_with_incompatible_surface() {
+    assert_rejected(
+        "bad_direct_surface_status",
+        "category 'direct' requires surface_compatibility",
+    );
+}
+
+#[test]
+fn ledger_rejects_self_reported_tier_mismatch() {
+    assert_rejected("self_reported_tier_mismatch", "disagrees with the tier");
+}
+
+#[test]
+fn ledger_rejects_unknown_field() {
+    assert_rejected("unknown_field", "unknown field");
+}
+
+#[test]
+fn ledger_empty_tree_passes() {
+    // The tree starts empty and must not go red for having no evidence yet.
+    // `load_real_ledger` panics on any invalid row, so reaching the end is
+    // the assertion.
+    let tree = load_real_ledger();
+    for (stem, rows) in &tree {
+        assert!(!rows.is_empty(), "{stem}.toml carries no scenarios");
+    }
+}
+
+#[test]
+fn ledger_dump_scenario_ids() {
+    let example = load_example();
+    let lines = dump_scenario_ids(&example);
+    assert_eq!(lines.len(), example[0].1.len());
+    assert!(
+        lines[0].starts_with("SCENARIO_ID ledger_example\t"),
+        "dump format: {}",
+        lines[0]
+    );
+    emit(&dump_scenario_ids(&load_real_ledger()));
+}
+
+#[test]
+fn ledger_dump_direct_ids() {
+    let example = load_example();
+    let lines = dump_direct_ids(&example);
+    assert!(
+        !lines.is_empty(),
+        "the worked example must contain a direct scenario so this dump is exercised"
+    );
+    for line in &lines {
+        let rest = line
+            .strip_prefix("DIRECT_ID ")
+            .unwrap_or_else(|| panic!("dump format: {line}"));
+        let (_id, path) = rest
+            .split_once('\t')
+            .unwrap_or_else(|| panic!("DIRECT_ID must carry two tab-separated columns: {line}"));
+        assert!(
+            path.ends_with(".toml"),
+            "second column is a ledger path: {line}"
+        );
+    }
+    emit(&dump_direct_ids(&load_real_ledger()));
+}
+
+#[test]
+fn ledger_dump_libra_tests() {
+    let example = load_example();
+    let lines = dump_libra_tests(&example);
+    assert!(
+        !lines.is_empty(),
+        "the worked example must carry libra_tests so this dump is exercised"
+    );
+    for line in &lines {
+        assert!(line.starts_with("LIBRA_TEST "), "dump format: {line}");
+    }
+    emit(&dump_libra_tests(&load_real_ledger()));
+}
+
+#[test]
+fn ledger_dump_surface_evidence() {
+    let example = load_example();
+    let lines = dump_surface_evidence(&example);
+    assert_eq!(lines.len(), example[0].1.len());
+    for line in &lines {
+        let rest = line
+            .strip_prefix("EVIDENCE ")
+            .unwrap_or_else(|| panic!("dump format: {line}"));
+        assert!(
+            rest.contains('\t'),
+            "EVIDENCE must carry two tab-separated columns: {line}"
+        );
+    }
+    emit(&dump_surface_evidence(&load_real_ledger()));
+}
+
+#[test]
+fn ledger_dump_scenario_tests() {
+    let example = load_example();
+    let lines = dump_scenario_tests(&example);
+    assert!(
+        !lines.is_empty(),
+        "the worked example must pair a scenario with a test so this dump is exercised"
+    );
+    for line in &lines {
+        let rest = line
+            .strip_prefix("SCENARIO_TEST ")
+            .unwrap_or_else(|| panic!("dump format: {line}"));
+        assert!(
+            rest.contains('\t'),
+            "SCENARIO_TEST must carry two tab-separated columns: {line}"
+        );
+    }
+    emit(&dump_scenario_tests(&load_real_ledger()));
+}

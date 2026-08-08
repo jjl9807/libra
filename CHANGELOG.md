@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added (plan-20260729 CT2-01, 2026-08-08)
+
+- **The compatibility evidence ledger and its guard.**
+  `tests/compat-ledger/` records one row per migrated upstream Git test
+  scenario, and `compat_ledger_schema` enforces ADR-CT-03's field set on every
+  row. The rules that make it evidence rather than paperwork: the command's
+  compatibility tier is recomputed from `COMPATIBILITY.md` instead of being
+  read from the row, `surface_evidence` must resolve to text that actually
+  mentions both the command and the surface, and the field set is closed. An
+  empty ledger passes, so the tree can land before the evidence does.
+
 ### Added (plan-20260729 CT1-03, 2026-08-08)
 
 - **`update-ref`'s `<oldvalue>` accepts revision expressions too**, through the
