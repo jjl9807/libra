@@ -56,7 +56,10 @@ for n in 0 1 2 3 4 5 6 7 8 9; do
     case "$rc" in
       0) wc -l < "$GD/grep.out" | tr -d ' ' ;;
       1) echo 0 ;;
-      *) echo "FAIL: grep exited $rc while matching '$1'" >&2; exit "$rc" ;;
+      *) echo "FAIL: grep exited $rc while matching '$1'" >&2
+         # 把 grep 自己的诊断转出去：trap 随后会删掉 $GD，不转就永远看不到了。
+         if [ -s "$GD/grep.err" ]; then cat "$GD/grep.err" >&2; fi
+         exit "$rc" ;;
     esac
   }
   # 每列先赋值再打印：`$(c …)` 在子 shell 里跑，`exit` 只结束子 shell；简单赋值把
