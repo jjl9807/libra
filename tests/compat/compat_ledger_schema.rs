@@ -1238,6 +1238,15 @@ fn ledger_longest_prefix_match_resolves_specific_over_generic() {
 
 #[test]
 fn ledger_rejects_dangling_surface_evidence() {
+    // The lock is consulted before the citation is, so this fixture only
+    // exercises anchor resolution while its surface IS locked. Pin that, or a
+    // later edit could quietly turn it into a second copy of
+    // `ledger_rejects_surface_not_in_lock`.
+    assert!(
+        example_lock().resolve("diff", "--numstat").is_some(),
+        "the fixture's surface must be in the lock, or it would be refused before its \
+         dangling anchor is ever resolved"
+    );
     assert_rejected_with_lock("dangling_surface_evidence", "names no such section");
 }
 
@@ -1317,4 +1326,134 @@ fn ledger_committed_locks_match_the_regenerated_lock() {
         let _ = fs::remove_file(&persisted);
         let _ = fs::remove_dir(&dir);
     }
+}
+
+/// CT2-02 review round 1 (P2): evidence-anchor resolution exists twice — in
+/// python inside `SURFACES.gen`, which validates the REGISTRY's anchors, and in
+/// Rust here, which validates each LEDGER row's citation. They read different
+/// inputs for different purposes, so they cannot simply be merged; what they
+/// must never do is disagree about whether a given anchor backs a given
+/// (command, surface). This drives both over the same table and fails if they
+/// ever split.
+#[test]
+fn ledger_anchor_resolution_agrees_with_the_generator() {
+    // (anchor, command, surface, backs_the_row)
+    let cases: &[(&str, &str, &str, bool)] = &[
+        (
+            "docs/commands/diff.md#description",
+            "diff",
+            "--numstat",
+            true,
+        ),
+        (
+            "docs/commands/update-ref.md#comparison-with-git",
+            "update-ref",
+            "--stdin",
+            true,
+        ),
+        // Resolves, but the cited text never mentions the surface.
+        (
+            "docs/commands/update-ref.md#synopsis",
+            "update-ref",
+            "--stdin",
+            false,
+        ),
+        // No such section.
+        (
+            "docs/commands/diff.md#no-such-section",
+            "diff",
+            "--numstat",
+            false,
+        ),
+        // A prefix of a real heading slug must not bind.
+        ("docs/commands/diff.md#descript", "diff", "--numstat", false),
+        // Decision sections, matched by bounded decision id.
+        ("_compatibility.md#D999", "diff", "--numstat", false),
+        // Line references.
+        ("COMPATIBILITY.md:0", "diff", "--numstat", false),
+        ("COMPATIBILITY.md:99999999", "diff", "--numstat", false),
+        ("COMPATIBILITY.md:notanumber", "diff", "--numstat", false),
+        // Not one of the three admissible forms.
+        (
+            "docs/development/gap/grit-gap.md#anything",
+            "diff",
+            "--numstat",
+            false,
+        ),
+        ("just-some-text", "diff", "--numstat", false),
+    ];
+
+    let dir = std::env::temp_dir().join("libra-ct202-anchor-parity");
+    fs::create_dir_all(&dir).expect("temp dir");
+
+    for (anchor, command, surface, expected) in cases {
+        // The Rust side: does the citation resolve AND mention both literals?
+        let rust_ok = check_surface_evidence("parity", anchor, command, surface).is_ok();
+
+        // The generator side: a one-row registry with the same anchor.
+        let registry = dir.join("parity.tsv");
+        fs::write(
+            &registry,
+            format!("{command}\t{surface}\tgit-compatible\t{anchor}\n"),
+        )
+        .expect("write the parity registry");
+        let generator_ok = run_surfaces_gen(&registry).is_ok();
+
+        assert_eq!(
+            rust_ok, *expected,
+            "the ledger validator disagrees with the expectation for {anchor} \
+             ({command} {surface})"
+        );
+        assert_eq!(
+            generator_ok, rust_ok,
+            "SURFACES.gen and the ledger validator disagree about {anchor} \
+             ({command} {surface}): generator={generator_ok}, validator={rust_ok}"
+        );
+    }
+
+    let _ = fs::remove_file(dir.join("parity.tsv"));
+    let _ = fs::remove_dir(&dir);
+}
+
+/// CT2-02 review round 1 (a): the input side of determinism. A registry edited
+/// on Windows, or with padded cells, must produce the same lock as the same
+/// registry written cleanly — and padding must not let a duplicate key slip
+/// through by looking different.
+#[test]
+fn surfaces_gen_normalises_line_endings_and_padding() {
+    let dir = std::env::temp_dir().join("libra-ct202-normalisation");
+    fs::create_dir_all(&dir).expect("temp dir");
+
+    let clean = "diff\t--numstat\tgit-compatible\tdocs/commands/diff.md#description\n";
+    let messy = "diff\t --numstat \tgit-compatible\t docs/commands/diff.md#description \r\n";
+
+    let clean_path = dir.join("clean.tsv");
+    let messy_path = dir.join("messy.tsv");
+    fs::write(&clean_path, clean).expect("write clean");
+    fs::write(&messy_path, messy).expect("write messy");
+    assert_eq!(
+        run_surfaces_gen(&clean_path).expect("clean generates"),
+        run_surfaces_gen(&messy_path).expect("messy generates"),
+        "CRLF and padded cells must normalise to the same lock"
+    );
+
+    // And padding must not disguise a duplicate key.
+    let padded_dup = dir.join("padded_dup.tsv");
+    fs::write(
+        &padded_dup,
+        format!("{clean} diff \t--numstat\tabsent\tdocs/commands/diff.md#description\n"),
+    )
+    .expect("write padded duplicate");
+    match run_surfaces_gen(&padded_dup) {
+        Ok(lock) => panic!("a padded duplicate key generated a lock: {lock:?}"),
+        Err(error) => assert!(
+            error.contains("duplicate key"),
+            "expected a duplicate-key refusal: {error}"
+        ),
+    }
+
+    for path in [clean_path, messy_path, padded_dup] {
+        let _ = fs::remove_file(path);
+    }
+    let _ = fs::remove_dir(&dir);
 }
