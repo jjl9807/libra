@@ -344,9 +344,24 @@ fn is_iso_date(value: &str) -> bool {
     {
         return false;
     }
+    let year: u32 = value[0..4].parse().unwrap_or(0);
     let month: u32 = value[5..7].parse().unwrap_or(0);
     let day: u32 = value[8..10].parse().unwrap_or(0);
-    (1..=12).contains(&month) && (1..=31).contains(&day)
+    // Shape alone would accept 2026-02-30. A review date that never happened
+    // is not a review date.
+    (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// The `Command -> Tier` map of `COMPATIBILITY.md`'s top-level table, located
@@ -385,10 +400,23 @@ fn compatibility_tiers() -> BTreeMap<String, String> {
 fn decision_exists(decision_id: &str) -> bool {
     let text = fs::read_to_string(repo_root().join("docs/development/commands/_compatibility.md"))
         .expect("_compatibility.md must be readable");
-    text.lines().any(|line| {
-        line.strip_prefix("### ")
-            .is_some_and(|rest| rest.starts_with(decision_id))
-    })
+    text.lines()
+        .any(|line| heading_names_decision(line, decision_id))
+}
+
+/// Whether a `### …` heading names exactly this decision. A bare
+/// `starts_with` would let `D1` match `### D10`, which is how a dangling
+/// decision id sneaks past as a valid one.
+fn heading_names_decision(line: &str, decision_id: &str) -> bool {
+    let Some(rest) = line.strip_prefix("### ") else {
+        return false;
+    };
+    let Some(tail) = rest.strip_prefix(decision_id) else {
+        return false;
+    };
+    tail.chars()
+        .next()
+        .is_none_or(|c| !c.is_ascii_alphanumeric())
 }
 
 /// `surface_evidence` must resolve to real text, and that text must mention
@@ -428,14 +456,16 @@ fn resolve_evidence(where_: &str, evidence: &str) -> Result<String, String> {
             .ok_or_else(|| format!("{where_}: '{evidence}' points past the end of the file"));
     }
 
-    // Form 2: _compatibility.md#D<n>
+    // Form 2: _compatibility.md#D<n> — the heading carries the decision id
+    // followed by its title, so it is matched by decision id at a token
+    // boundary rather than by slug.
     if let Some(anchor) = evidence.strip_prefix("_compatibility.md#") {
         let text = read_repo_file(
             where_,
             Path::new("docs/development/commands/_compatibility.md"),
         )?;
-        return section_text(&text, anchor)
-            .ok_or_else(|| format!("{where_}: '{evidence}' names no such section"));
+        return decision_section_text(&text, anchor)
+            .ok_or_else(|| format!("{where_}: '{evidence}' names no such decision section"));
     }
 
     // Form 3: docs/commands/<cmd>.md#<section>
@@ -458,9 +488,23 @@ fn read_repo_file(where_: &str, relative: &Path) -> Result<String, String> {
         .map_err(|error| format!("{where_}: cannot read {}: {error}", relative.display()))
 }
 
-/// The text of the section whose heading slug is `anchor`, up to the next
-/// heading at the same or a shallower level.
+/// The text of the section whose heading slug is EXACTLY `anchor`, up to the
+/// next heading at the same or a shallower level. Prefix matching is
+/// deliberately not offered: `#options` must not silently bind to
+/// `## Option Details`, or a citation could point at a section that never
+/// mentions the flag it claims to document.
 fn section_text(text: &str, anchor: &str) -> Option<String> {
+    collect_section(text, |title| slugify(title) == slugify(anchor))
+}
+
+/// The section of `_compatibility.md` whose heading names decision `anchor`.
+fn decision_section_text(text: &str, anchor: &str) -> Option<String> {
+    collect_section(text, |title| {
+        heading_names_decision(&format!("### {title}"), anchor)
+    })
+}
+
+fn collect_section(text: &str, matches: impl Fn(&str) -> bool) -> Option<String> {
     let mut depth = 0usize;
     let mut body: Option<Vec<&str>> = None;
     for line in text.lines() {
@@ -471,7 +515,7 @@ fn section_text(text: &str, anchor: &str) -> Option<String> {
             if body.is_some() && hashes <= depth {
                 break;
             }
-            if body.is_none() && (slugify(title) == slugify(anchor) || title.starts_with(anchor)) {
+            if body.is_none() && matches(title) {
                 depth = hashes;
                 body = Some(vec![line]);
                 continue;
@@ -503,9 +547,18 @@ fn slugify(title: &str) -> String {
 // Walking the real ledger
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Every real ledger file as `(stem, scenarios)`, sorted by path. Directories
-/// whose name starts with `_` are fixture space and are skipped.
-fn load_real_ledger() -> Vec<(String, Vec<Scenario>)> {
+/// One loaded ledger file: its repository-relative path (what a downstream
+/// consumer must be able to open), its stem, and its scenarios.
+#[derive(Debug, Clone)]
+struct LedgerFile {
+    relative: String,
+    stem: String,
+    scenarios: Vec<Scenario>,
+}
+
+/// Every real ledger file, sorted by path. Directories whose name starts with
+/// `_` are fixture space and are skipped.
+fn load_real_ledger() -> Vec<LedgerFile> {
     let root = ledger_root();
     let mut files: Vec<PathBuf> = Vec::new();
     if root.is_dir() {
@@ -550,7 +603,11 @@ fn load_real_ledger() -> Vec<(String, Vec<Scenario>)> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        loaded.push((stem, scenarios));
+        loaded.push(LedgerFile {
+            relative: display,
+            stem,
+            scenarios,
+        });
     }
     loaded
 }
@@ -565,57 +622,69 @@ fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The example, loaded through the same validator the real tree uses.
-fn load_example() -> Vec<(String, Vec<Scenario>)> {
+fn load_example() -> Vec<LedgerFile> {
     let path = example_file();
     let text = fs::read_to_string(&path).expect("the ledger example must exist");
     let scenarios = validate_ledger_text("_example/ledger_example.toml", &text)
         .expect("the ledger example must be valid");
-    vec![("ledger_example".to_string(), scenarios)]
+    vec![LedgerFile {
+        relative: "tests/compat-ledger/_example/ledger_example.toml".to_string(),
+        stem: "ledger_example".to_string(),
+        scenarios,
+    }]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Dumps consumed by later cards (CT3-02 / CT3-03 / CT3-04)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn dump_scenario_ids(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+fn dump_scenario_ids(tree: &[LedgerFile]) -> Vec<String> {
     tree.iter()
-        .flat_map(|(stem, rows)| {
-            rows.iter()
+        .flat_map(|file| {
+            let stem = file.stem.clone();
+            file.scenarios
+                .iter()
                 .map(move |row| format!("SCENARIO_ID {stem}\t{}", row.id))
         })
         .collect()
 }
 
-fn dump_direct_ids(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+/// `DIRECT_ID <scenario_id>\t<ledger file path>`. The path is the real
+/// repository-relative path of the file the row lives in — a consumer must be
+/// able to open it, and `<family>/` is part of that path.
+fn dump_direct_ids(tree: &[LedgerFile]) -> Vec<String> {
     tree.iter()
-        .flat_map(|(stem, rows)| {
-            rows.iter()
+        .flat_map(|file| {
+            let relative = file.relative.clone();
+            file.scenarios
+                .iter()
                 .filter(|row| row.category == "direct")
-                .map(move |row| format!("DIRECT_ID {}\ttests/compat-ledger/{stem}.toml", row.id))
+                .map(move |row| format!("DIRECT_ID {}\t{relative}", row.id))
         })
         .collect()
 }
 
-fn dump_libra_tests(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+fn dump_libra_tests(tree: &[LedgerFile]) -> Vec<String> {
     tree.iter()
-        .flat_map(|(_stem, rows)| rows.iter().flat_map(|row| row.libra_tests.iter()))
+        .flat_map(|file| file.scenarios.iter().flat_map(|row| row.libra_tests.iter()))
         .map(|name| format!("LIBRA_TEST {name}"))
         .collect()
 }
 
-fn dump_surface_evidence(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+fn dump_surface_evidence(tree: &[LedgerFile]) -> Vec<String> {
     tree.iter()
-        .flat_map(|(_stem, rows)| {
-            rows.iter()
+        .flat_map(|file| {
+            file.scenarios
+                .iter()
                 .map(|row| format!("EVIDENCE {}\t{}", row.id, row.surface_evidence))
         })
         .collect()
 }
 
-fn dump_scenario_tests(tree: &[(String, Vec<Scenario>)]) -> Vec<String> {
+fn dump_scenario_tests(tree: &[LedgerFile]) -> Vec<String> {
     tree.iter()
-        .flat_map(|(_stem, rows)| {
-            rows.iter().flat_map(|row| {
+        .flat_map(|file| {
+            file.scenarios.iter().flat_map(|row| {
                 row.libra_tests
                     .iter()
                     .map(move |name| format!("SCENARIO_TEST {}\t{name}", row.id))
@@ -757,8 +826,12 @@ fn ledger_empty_tree_passes() {
     // `load_real_ledger` panics on any invalid row, so reaching the end is
     // the assertion.
     let tree = load_real_ledger();
-    for (stem, rows) in &tree {
-        assert!(!rows.is_empty(), "{stem}.toml carries no scenarios");
+    for file in &tree {
+        assert!(
+            !file.scenarios.is_empty(),
+            "{} carries no scenarios",
+            file.relative
+        );
     }
 }
 
@@ -766,7 +839,7 @@ fn ledger_empty_tree_passes() {
 fn ledger_dump_scenario_ids() {
     let example = load_example();
     let lines = dump_scenario_ids(&example);
-    assert_eq!(lines.len(), example[0].1.len());
+    assert_eq!(lines.len(), example[0].scenarios.len());
     assert!(
         lines[0].starts_with("SCENARIO_ID ledger_example\t"),
         "dump format: {}",
@@ -791,8 +864,8 @@ fn ledger_dump_direct_ids() {
             .split_once('\t')
             .unwrap_or_else(|| panic!("DIRECT_ID must carry two tab-separated columns: {line}"));
         assert!(
-            path.ends_with(".toml"),
-            "second column is a ledger path: {line}"
+            path.starts_with("tests/compat-ledger/") && path.ends_with(".toml"),
+            "second column is a repository-relative ledger path: {line}"
         );
     }
     emit(&dump_direct_ids(&load_real_ledger()));
@@ -816,7 +889,7 @@ fn ledger_dump_libra_tests() {
 fn ledger_dump_surface_evidence() {
     let example = load_example();
     let lines = dump_surface_evidence(&example);
-    assert_eq!(lines.len(), example[0].1.len());
+    assert_eq!(lines.len(), example[0].scenarios.len());
     for line in &lines {
         let rest = line
             .strip_prefix("EVIDENCE ")
@@ -847,4 +920,51 @@ fn ledger_dump_scenario_tests() {
         );
     }
     emit(&dump_scenario_tests(&load_real_ledger()));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT2-01 review round 1: the three matchers below were prefix-based and would
+// each have produced a false PASS. Pin the boundaries directly, so a future
+// simplification back to `starts_with` fails here instead of in the evidence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn ledger_decision_id_match_is_bounded() {
+    // The real headings are `### D1：…`, `### D10：…`.
+    assert!(heading_names_decision("### D1：`submodule` 子命令族", "D1"));
+    assert!(
+        !heading_names_decision("### D10：sparse-checkout", "D1"),
+        "D1 must not match the D10 heading"
+    );
+    assert!(decision_exists("D1"), "D1 exists in _compatibility.md");
+    assert!(
+        !decision_exists("D999"),
+        "a decision that does not exist must not resolve"
+    );
+}
+
+#[test]
+fn ledger_section_anchor_match_is_exact() {
+    let doc = "# Page\n\n## Options\n\nbody-a\n\n## Option Details\n\nbody-b\n";
+    let options = section_text(doc, "options").expect("the Options section resolves");
+    assert!(options.contains("body-a"), "resolved: {options}");
+    assert!(
+        !options.contains("body-b"),
+        "a section must stop at the next heading of the same level: {options}"
+    );
+    assert!(
+        section_text(doc, "option").is_none(),
+        "a prefix of a heading slug must not resolve"
+    );
+}
+
+#[test]
+fn ledger_review_date_rejects_impossible_calendar_days() {
+    assert!(is_iso_date("2026-08-08"));
+    assert!(is_iso_date("2024-02-29"), "2024 is a leap year");
+    assert!(!is_iso_date("2026-02-29"), "2026 is not a leap year");
+    assert!(!is_iso_date("2026-04-31"), "April has 30 days");
+    assert!(!is_iso_date("2026-13-01"));
+    assert!(!is_iso_date("2026-00-10"));
+    assert!(!is_iso_date("2026-8-8"), "the format is zero-padded");
 }
