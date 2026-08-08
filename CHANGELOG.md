@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added (plan-20260729 CT2-03, 2026-08-08)
+
+- **The clean-room phrase allowlist, frozen.**
+  `tests/compat-ledger/PHRASE_ALLOWLIST.txt` is the single escape valve from
+  the zero-overlap clean-room contract, and it ships empty on purpose: nothing
+  has been migrated yet, so there is no unavoidable overlap to approve. Its
+  sha256 sidecar freezes it, and `phrase_allowlist_sidecar_matches` checks the
+  digest along with the entry format — at most 20 lines, no blank lines, and
+  every entry exactly 8 tokens, because the gate's window is 8 tokens wide and
+  an entry of any other length would sit there looking approved while matching
+  nothing.
+
 ### Added (plan-20260729 CT2-02, 2026-08-08)
 
 - **The surface lock and its generator.**

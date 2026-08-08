@@ -1457,3 +1457,110 @@ fn surfaces_gen_normalises_line_endings_and_padding() {
     }
     let _ = fs::remove_dir(&dir);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT2-03 — the clean-room phrase allowlist, frozen by a sidecar digest.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The clean-room gate's normalisation, mirrored here so the entry-format rule
+/// is checked in the same terms the consumer will use: collapse whitespace,
+/// lowercase, then count tokens. Its window is 8 tokens wide, so an entry of
+/// any other length can never match and would sit in the file looking like an
+/// approved exception while doing nothing.
+fn allowlist_token_count(entry: &str) -> usize {
+    entry.to_lowercase().split_whitespace().count()
+}
+
+#[test]
+fn phrase_allowlist_sidecar_matches() {
+    use sha2::{Digest, Sha256};
+
+    let allowlist = ledger_root().join("PHRASE_ALLOWLIST.txt");
+    let sidecar = ledger_root().join("PHRASE_ALLOWLIST.sha256");
+    assert!(allowlist.is_file(), "{} must exist", allowlist.display());
+    assert!(sidecar.is_file(), "{} must exist", sidecar.display());
+
+    // The sidecar is a `shasum -a 256` line and nothing else. Anything extra
+    // is a place for a second, contradictory claim to hide.
+    let sidecar_text = fs::read_to_string(&sidecar).expect("read the sidecar");
+    let mut lines = sidecar_text.lines();
+    let line = lines.next().unwrap_or_default();
+    assert!(
+        lines.next().is_none(),
+        "the sidecar must hold exactly one line, found:\n{sidecar_text}"
+    );
+    let (digest, name) = line
+        .split_once("  ")
+        .unwrap_or_else(|| panic!("sidecar line is not '<sha256>  <name>': {line:?}"));
+    assert_eq!(
+        name, "PHRASE_ALLOWLIST.txt",
+        "the sidecar must name the allowlist relative to tests/compat-ledger/"
+    );
+    assert!(
+        digest.len() == 64
+            && digest
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+        "the digest must be 64 lowercase hex characters: {digest:?}"
+    );
+
+    let bytes = fs::read(&allowlist).expect("read the allowlist");
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    assert_eq!(
+        actual, digest,
+        "PHRASE_ALLOWLIST.txt has changed since it was frozen; the sidecar no longer \
+         matches it"
+    );
+
+    // Entry format. Comments are free text; entries are not.
+    let text = String::from_utf8(bytes).expect("the allowlist is UTF-8");
+    let all_lines: Vec<&str> = text.lines().collect();
+    assert!(
+        all_lines.len() <= 20,
+        "the allowlist is capped at 20 lines, found {}",
+        all_lines.len()
+    );
+    for (index, line) in all_lines.iter().enumerate() {
+        assert!(
+            !line.trim().is_empty(),
+            "line {} is blank; the allowlist has no blank lines",
+            index + 1
+        );
+        if line.starts_with('#') {
+            continue;
+        }
+        let tokens = allowlist_token_count(line);
+        assert_eq!(
+            tokens,
+            8,
+            "line {} is {tokens} tokens; the clean-room window is 8 tokens wide, so an \
+             entry of any other length would never match and would fail silently: {line:?}",
+            index + 1
+        );
+    }
+}
+
+/// The entry-format rule above is vacuous while the allowlist carries no
+/// entries, which is its intended state. Exercise the rule itself so it cannot
+/// rot before the first exception is ever granted.
+#[test]
+fn phrase_allowlist_token_rule_counts_normalised_tokens() {
+    assert_eq!(
+        allowlist_token_count("one two three four five six seven eight"),
+        8
+    );
+    assert_eq!(
+        allowlist_token_count("  One   Two\tthree four five six seven eight  "),
+        8,
+        "whitespace collapses and case folds, matching the gate's normalisation"
+    );
+    assert_eq!(
+        allowlist_token_count("one two three four five six seven"),
+        7
+    );
+    assert_eq!(
+        allowlist_token_count("one two three four five six seven eight nine"),
+        9
+    );
+    assert_eq!(allowlist_token_count(""), 0);
+}
