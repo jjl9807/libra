@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added (plan-20260729 CT2-02, 2026-08-08)
+
+- **The surface lock and its generator.**
+  `tests/compat-ledger/SURFACES.gen` turns the authoritative surface registry
+  (`docs/development/gap/surface-registry.tsv`, GC-13) into a deterministic,
+  sorted lock, refusing any row whose evidence anchor does not resolve to text
+  that mentions both the command and the surface — command documentation is
+  free text, so a per-flag status can only ever be asserted and anchored, never
+  scraped. `compat_ledger_schema` now adjudicates each ledger row's
+  `surface_compatibility` against that lock using GC-13's longest-exact-prefix
+  rule, and a `direct` row must have the lock, not just the row, saying
+  `git-compatible`.
+
 ### Added (plan-20260729 CT2-01, 2026-08-08)
 
 - **The compatibility evidence ledger and its guard.**

@@ -104,6 +104,23 @@ struct Scenario {
 /// `Err` carries a message naming what was wrong, so a rejection fixture can
 /// assert it was rejected for its own reason and not by accident.
 fn validate_ledger_text(display_path: &str, text: &str) -> Result<Vec<Scenario>, String> {
+    validate_ledger_text_with_lock(display_path, text, None)
+}
+
+/// The same validation, with the surface lock consulted when one exists.
+///
+/// The lock is what turns `surface_compatibility` from a claim into a derived
+/// value: CT2-02's `SURFACES.gen` produces it from the authoritative registry,
+/// and a row may not contradict it. Until a family ships its
+/// `SURFACES.lock` (CT3-03) there is nothing to check against, so `None`
+/// means "surface adjudication not available here" rather than "anything
+/// goes" — a row still cannot claim `direct` over a surface it declares to be
+/// anything but `git-compatible` (CT2-01's declared-value half).
+fn validate_ledger_text_with_lock(
+    display_path: &str,
+    text: &str,
+    lock: Option<&SurfaceLock>,
+) -> Result<Vec<Scenario>, String> {
     let doc: toml::Value =
         toml::from_str(text).map_err(|error| format!("{display_path}: not valid TOML: {error}"))?;
     let table = doc
@@ -263,6 +280,33 @@ fn validate_ledger_text(display_path: &str, text: &str) -> Result<Vec<Scenario>,
             }
         }
 
+        let libra_surface = values["libra_surface"].clone();
+        if let Some(lock) = lock {
+            let (key, locked) = lock
+                .resolve(&libra_command, &libra_surface)
+                .ok_or_else(|| {
+                    format!(
+                        "{where_}: surface '{libra_surface}' of '{libra_command}' is not in \
+                     SURFACES.lock, so nothing adjudicates it"
+                    )
+                })?;
+            // For a `direct` row the lock's verdict is the binding one, and the
+            // refusal should say so rather than blaming the declared value.
+            if category == "direct" && locked != "git-compatible" {
+                return Err(format!(
+                    "{where_}: category 'direct' requires the lock to record \
+                     '{libra_surface}' as git-compatible, but the lock says '{locked}' \
+                     (matched key '{key}')"
+                ));
+            }
+            if locked != surface_compatibility {
+                return Err(format!(
+                    "{where_}: surface_compatibility '{surface_compatibility}' disagrees \
+                     with the lock's '{locked}' for '{libra_surface}' (matched key '{key}')"
+                ));
+            }
+        }
+
         match category.as_str() {
             "declined" => {
                 let decision_id = row
@@ -298,7 +342,6 @@ fn validate_ledger_text(display_path: &str, text: &str) -> Result<Vec<Scenario>,
             _ => {}
         }
 
-        let libra_surface = values["libra_surface"].clone();
         let surface_evidence = values["surface_evidence"].clone();
         check_surface_evidence(&where_, &surface_evidence, &libra_command, &libra_surface)?;
 
@@ -582,13 +625,26 @@ fn load_real_ledger() -> Vec<LedgerFile> {
     let mut loaded = Vec::new();
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for file in files {
+        // A family's committed `SURFACES.lock` adjudicates its rows. None
+        // exists yet (CT3-03 delivers the first one); when it lands it enters
+        // this path with no further wiring.
+        let lock = file
+            .parent()
+            .map(|dir| dir.join("SURFACES.lock"))
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let text = fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                SurfaceLock::parse(&text)
+                    .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            });
         let display = file
             .strip_prefix(repo_root())
             .unwrap_or(&file)
             .display()
             .to_string();
         let text = fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {display}: {e}"));
-        let scenarios = validate_ledger_text(&display, &text)
+        let scenarios = validate_ledger_text_with_lock(&display, &text, lock.as_ref())
             .unwrap_or_else(|error| panic!("ledger row rejected: {error}"));
         for scenario in &scenarios {
             if let Some(previous) = seen.insert(scenario.id.clone(), display.clone()) {
@@ -967,4 +1023,298 @@ fn ledger_review_date_rejects_impossible_calendar_days() {
     assert!(!is_iso_date("2026-13-01"));
     assert!(!is_iso_date("2026-00-10"));
     assert!(!is_iso_date("2026-8-8"), "the format is zero-padded");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT2-02 — the surface lock: generated from the authoritative registry by
+// `tests/compat-ledger/SURFACES.gen`, then treated as the adjudicator of every
+// row's `surface_compatibility`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A parsed `SURFACES.lock`: `(command, surface) -> status`.
+#[derive(Debug, Default, Clone)]
+struct SurfaceLock {
+    rows: Vec<(String, String, String)>,
+}
+
+impl SurfaceLock {
+    fn parse(text: &str) -> Result<Self, String> {
+        let mut rows = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != 4 {
+                return Err(format!(
+                    "SURFACES.lock line {}: expected 4 tab-separated fields, found {}",
+                    number + 1,
+                    fields.len()
+                ));
+            }
+            rows.push((
+                fields[0].to_string(),
+                fields[1].to_string(),
+                fields[2].to_string(),
+            ));
+        }
+        Ok(Self { rows })
+    }
+
+    /// GC-13's conflict resolution: longest exact prefix match. An exact key
+    /// wins; failing that the longest key that is a prefix of the surface
+    /// wins, so `--base=auto` is adjudicated by its own row when one exists
+    /// and falls back to `--base` when it does not.
+    ///
+    /// Returns the key that matched together with its status, so a caller can
+    /// say WHICH row decided — "specific over generic" is only checkable if
+    /// the winner is observable.
+    fn resolve(&self, command: &str, surface: &str) -> Option<(&str, &str)> {
+        self.rows
+            .iter()
+            .filter(|(cmd, key, _)| cmd == command && surface.starts_with(key.as_str()))
+            .max_by_key(|(_, key, _)| key.len())
+            .map(|(_, key, status)| (key.as_str(), status.as_str()))
+    }
+}
+
+/// Run `SURFACES.gen` over a registry and return the lock it prints.
+fn run_surfaces_gen(registry: &Path) -> Result<String, String> {
+    let generator = ledger_root().join("SURFACES.gen");
+    let output = std::process::Command::new(&generator)
+        .env("SURFACE_REGISTRY", registry)
+        .current_dir(repo_root())
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", generator.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "SURFACES.gen exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn example_registry() -> PathBuf {
+    ledger_root().join("_example/registry_example.tsv")
+}
+
+fn invalid_registry(stem: &str) -> PathBuf {
+    ledger_root().join(format!("_invalid_registry/{stem}.tsv"))
+}
+
+/// The lock the example registry generates, used to self-verify the mechanism
+/// while the real per-family locks do not exist yet.
+fn example_lock() -> SurfaceLock {
+    let text = run_surfaces_gen(&example_registry())
+        .unwrap_or_else(|error| panic!("the example registry must generate: {error}"));
+    SurfaceLock::parse(&text).expect("the generated lock must parse")
+}
+
+fn assert_rejected_with_lock(stem: &str, expected_fragment: &str) {
+    let path = invalid_file(stem);
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let lock = example_lock();
+    match validate_ledger_text_with_lock(&format!("_invalid/{stem}.toml"), &text, Some(&lock)) {
+        Ok(_) => panic!("_invalid/{stem}.toml was accepted; it must be rejected"),
+        Err(error) => assert!(
+            error.contains(expected_fragment),
+            "_invalid/{stem}.toml was rejected for the wrong reason.\n  expected to mention: \
+             {expected_fragment}\n  got: {error}"
+        ),
+    }
+}
+
+#[test]
+fn surfaces_gen_is_deterministic() {
+    let first = run_surfaces_gen(&example_registry()).expect("first run");
+    let second = run_surfaces_gen(&example_registry()).expect("second run");
+    assert_eq!(
+        first, second,
+        "two runs over the same registry must be byte-identical, or the lock cannot be \
+         regenerated and diffed"
+    );
+    assert!(
+        !first.is_empty(),
+        "the example registry is not empty, so its lock must not be either"
+    );
+    // Sorted, four columns, LF-terminated.
+    let mut previous: Option<(String, String)> = None;
+    for line in first.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(fields.len(), 4, "lock line is four columns: {line}");
+        let key = (fields[0].to_string(), fields[1].to_string());
+        if let Some(previous) = previous {
+            assert!(
+                previous < key,
+                "lock is sorted by (command, surface): {line}"
+            );
+        }
+        previous = Some(key);
+    }
+    assert!(first.ends_with('\n'), "the lock is LF-terminated");
+}
+
+#[test]
+fn surfaces_gen_empty_registry_yields_empty_lock() {
+    // An empty registry is a legitimate starting state; it must not be an
+    // error, and it must produce an empty lock rather than a stale one.
+    let dir = std::env::temp_dir().join("libra-ct202-empty-registry");
+    fs::create_dir_all(&dir).expect("temp dir");
+    let registry = dir.join("empty.tsv");
+    fs::write(&registry, "# only a comment\n\n").expect("write registry");
+    let lock = run_surfaces_gen(&registry).expect("an empty registry is not an error");
+    assert!(lock.is_empty(), "expected an empty lock, got: {lock:?}");
+    let _ = fs::remove_file(&registry);
+    let _ = fs::remove_dir(&dir);
+}
+
+fn assert_registry_rejected(stem: &str, expected_fragment: &str) {
+    match run_surfaces_gen(&invalid_registry(stem)) {
+        Ok(lock) => panic!("_invalid_registry/{stem}.tsv generated a lock: {lock:?}"),
+        Err(error) => assert!(
+            error.contains(expected_fragment),
+            "_invalid_registry/{stem}.tsv failed for the wrong reason.\n  expected: \
+             {expected_fragment}\n  got: {error}"
+        ),
+    }
+}
+
+#[test]
+fn surfaces_gen_rejects_dangling_anchor() {
+    assert_registry_rejected("dangling_anchor", "does not resolve");
+}
+
+#[test]
+fn surfaces_gen_rejects_text_mismatch() {
+    assert_registry_rejected("text_mismatch", "does not mention");
+}
+
+#[test]
+fn surfaces_gen_rejects_duplicate_key() {
+    assert_registry_rejected("duplicate_key", "duplicate key");
+}
+
+#[test]
+fn surfaces_gen_rejects_missing_registry() {
+    // A missing registry must be an error, never an empty lock: an empty lock
+    // would let a downstream `diff` pass against evidence that documents
+    // nothing.
+    let missing = ledger_root().join("_example/there-is-no-such-registry.tsv");
+    assert!(!missing.exists());
+    match run_surfaces_gen(&missing) {
+        Ok(lock) => panic!("a missing registry produced a lock: {lock:?}"),
+        Err(error) => assert!(
+            error.contains("cannot read the surface registry"),
+            "unexpected failure: {error}"
+        ),
+    }
+}
+
+#[test]
+fn ledger_longest_prefix_match_resolves_specific_over_generic() {
+    let lock = example_lock();
+    // Both `--word-diff` and `--word-diff-regex` are keys. A surface spelled
+    // with a value must be adjudicated by the SPECIFIC key.
+    let (key, _status) = lock
+        .resolve("diff", "--word-diff-regex=[a-z]+")
+        .expect("the specific key adjudicates");
+    assert_eq!(
+        key, "--word-diff-regex",
+        "the longest matching key must win over the generic '--word-diff'"
+    );
+    // The generic key still adjudicates its own spellings.
+    let (key, _status) = lock
+        .resolve("diff", "--word-diff=color")
+        .expect("the generic key adjudicates its own spelling");
+    assert_eq!(key, "--word-diff");
+    // A key of one command must not adjudicate another command's surface.
+    assert!(
+        lock.resolve("update-ref", "--numstat").is_none(),
+        "keys are scoped to their command"
+    );
+}
+
+#[test]
+fn ledger_rejects_dangling_surface_evidence() {
+    assert_rejected_with_lock("dangling_surface_evidence", "names no such section");
+}
+
+#[test]
+fn ledger_rejects_surface_evidence_text_mismatch() {
+    assert_rejected_with_lock(
+        "surface_evidence_text_mismatch",
+        "does not mention '--stdin'",
+    );
+}
+
+#[test]
+fn ledger_rejects_surface_not_in_lock() {
+    assert_rejected_with_lock("surface_not_in_lock", "is not in SURFACES.lock");
+}
+
+#[test]
+fn ledger_rejects_direct_with_non_git_compatible_surface() {
+    assert_rejected_with_lock("non_git_compatible_direct", "requires the lock to record");
+}
+
+/// CT2-02 AC 2: a committed lock must be exactly what the generator produces
+/// from the authoritative registry today — otherwise the lock is a snapshot of
+/// someone's intent rather than of the registry.
+///
+/// No family lock exists yet, so the mechanism self-verifies on the example
+/// registry: generate, persist, regenerate, compare. When CT3-03 commits
+/// `tests/compat-ledger/t4/SURFACES.lock` it enters the loop below with no
+/// further wiring.
+#[test]
+fn ledger_committed_locks_match_the_regenerated_lock() {
+    let registry = repo_root().join("docs/development/gap/surface-registry.tsv");
+    let mut checked = 0usize;
+    let root = ledger_root();
+    if root.is_dir() {
+        for family in read_dir_sorted(&root) {
+            let name = family
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !family.is_dir() || name.starts_with('_') {
+                continue;
+            }
+            let lock_path = family.join("SURFACES.lock");
+            if !lock_path.is_file() {
+                continue;
+            }
+            let committed = fs::read_to_string(&lock_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", lock_path.display()));
+            let regenerated = run_surfaces_gen(&registry).unwrap_or_else(|error| {
+                panic!("regenerating the lock for family {name} failed: {error}")
+            });
+            assert_eq!(
+                committed, regenerated,
+                "{}/SURFACES.lock is not what SURFACES.gen produces from the registry \
+                 today; regenerate it",
+                name
+            );
+            checked += 1;
+        }
+    }
+
+    if checked == 0 {
+        // Self-verify the mechanism itself, so this test is never vacuous.
+        let generated = run_surfaces_gen(&example_registry()).expect("generate the example lock");
+        let dir = std::env::temp_dir().join("libra-ct202-lock-roundtrip");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let persisted = dir.join("SURFACES.lock");
+        fs::write(&persisted, &generated).expect("persist the example lock");
+        let again = run_surfaces_gen(&example_registry()).expect("regenerate");
+        let committed = fs::read_to_string(&persisted).expect("read back");
+        assert_eq!(
+            committed, again,
+            "a persisted lock must equal a regeneration of the same registry"
+        );
+        let _ = fs::remove_file(&persisted);
+        let _ = fs::remove_dir(&dir);
+    }
 }
