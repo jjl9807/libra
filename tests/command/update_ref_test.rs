@@ -231,3 +231,316 @@ fn outside_repository_is_an_error() {
     let out = run_libra_command(&["update-ref", "refs/heads/x", ZERO_SHA1], dir.path());
     assert_eq!(out.status.code(), Some(128));
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CT1-02 (plan-20260729): the `<newvalue>` operand goes through the shared
+// revision engine, with NO implicit peel. Whatever the expression names must
+// itself be a commit — Git's rule, which is why a lightweight tag works, a
+// bare annotated tag does not, and `<tag>^{commit}` does.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// stderr of a run, for asserting on stable error codes and messages.
+fn stderr_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Point `refs/heads/feature` at `value` and return the run.
+fn update_feature(repo: &TempDir, value: &str) -> Output {
+    run_libra_command(&["update-ref", "refs/heads/feature", value], repo.path())
+}
+
+/// The commit `refs/heads/feature` currently points at.
+fn feature_tip(repo: &TempDir) -> String {
+    stdout_trimmed(&rev_parse(repo, "refs/heads/feature"))
+}
+
+#[test]
+fn update_ref_revision_head_accepted() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    let out = update_feature(&repo, "HEAD");
+    assert_eq!(out.status.code(), Some(0), "HEAD: {}", stderr_of(&out));
+    assert_eq!(feature_tip(&repo), c2, "HEAD resolves to the current tip");
+}
+
+#[test]
+fn update_ref_revision_branch_name_accepted() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    let out = update_feature(&repo, "main");
+    assert_eq!(out.status.code(), Some(0), "branch: {}", stderr_of(&out));
+    assert_eq!(feature_tip(&repo), c2);
+}
+
+#[test]
+fn update_ref_revision_lightweight_tag_accepted() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    // `libra tag <name>` tags HEAD and, without `-m`, is lightweight: the tag
+    // ref holds the commit id directly, so no peeling is involved.
+    let tag = run_libra_command(&["tag", "light"], repo.path());
+    assert_eq!(tag.status.code(), Some(0), "tag: {}", stderr_of(&tag));
+
+    let out = update_feature(&repo, "light");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "lightweight tag: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(feature_tip(&repo), c2);
+}
+
+#[test]
+fn update_ref_revision_parent_revision_accepted() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = update_feature(&repo, "HEAD^");
+    assert_eq!(out.status.code(), Some(0), "HEAD^: {}", stderr_of(&out));
+    assert_eq!(feature_tip(&repo), c1, "HEAD^ is the first commit");
+}
+
+#[test]
+fn update_ref_revision_ancestor_revision_accepted() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let out = update_feature(&repo, "HEAD~1");
+    assert_eq!(out.status.code(), Some(0), "HEAD~1: {}", stderr_of(&out));
+    assert_eq!(feature_tip(&repo), c1);
+}
+
+#[test]
+fn update_ref_revision_abbreviated_oid_accepted() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let short = &c1[..8];
+    let out = update_feature(&repo, short);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "abbreviated oid {short}: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(feature_tip(&repo), c1);
+}
+
+#[test]
+fn update_ref_revision_annotated_tag_rejected() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    // `-m` is what makes a Libra tag annotated: the ref then names a tag
+    // OBJECT, not the commit.
+    let tag = run_libra_command(&["tag", "-m", "release", "annotated"], repo.path());
+    assert_eq!(
+        tag.status.code(),
+        Some(0),
+        "annotated tag: {}",
+        stderr_of(&tag)
+    );
+
+    let out = update_feature(&repo, "annotated");
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "a bare annotated tag must be refused, as Git refuses it"
+    );
+    let stderr = stderr_of(&out);
+    // AC: the refusal names the type that was resolved, so the user can see
+    // why it was refused and what to do instead.
+    assert!(
+        stderr.contains("tag"),
+        "the refusal must name the resolved object type: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a commit"),
+        "the refusal must say what was expected: {stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-CLI-003"),
+        "an unusable target is LBR-CLI-003: {stderr}"
+    );
+    // And nothing was written.
+    let after = run_libra_command(&["rev-parse", "refs/heads/feature"], repo.path());
+    assert_ne!(
+        after.status.code(),
+        Some(0),
+        "the refused update must not have created the ref"
+    );
+}
+
+#[test]
+fn update_ref_revision_explicit_peel_accepted() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    let tag = run_libra_command(&["tag", "-m", "release", "annotated"], repo.path());
+    assert_eq!(tag.status.code(), Some(0), "tag: {}", stderr_of(&tag));
+
+    // Explicit peel is how the user says "I mean the commit".
+    let out = update_feature(&repo, "annotated^{commit}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "explicit peel: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(feature_tip(&repo), c2);
+}
+
+#[test]
+fn update_ref_revision_unresolvable_is_cli003_exit128() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    let out = update_feature(&repo, "no-such-revision");
+    assert_eq!(out.status.code(), Some(128), "unresolvable exits 128");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("LBR-CLI-003"),
+        "an unresolvable revision is LBR-CLI-003: {stderr}"
+    );
+}
+
+#[test]
+fn update_ref_revision_malformed_is_cli002_exit128() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    // `ref:` is refused at the syntax layer, before any lookup: it is
+    // `symbolic-ref`'s spelling, not a revision. That keeps the usage class.
+    let out = update_feature(&repo, "ref:refs/heads/main");
+    assert_eq!(out.status.code(), Some(128), "malformed exits 128");
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("LBR-CLI-002"),
+        "a syntax-layer refusal stays LBR-CLI-002: {stderr}"
+    );
+}
+
+#[test]
+fn update_ref_revision_resolver_storage_failure_keeps_repo_code() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    // Corrupt the commit object itself. Resolution now fails inside the
+    // object store, which must NOT be reported as bad user input — the
+    // command line was fine, the repository is not.
+    let loose = repo
+        .path()
+        .join(".libra/objects")
+        .join(&c1[..2])
+        .join(&c1[2..]);
+    assert!(loose.is_file(), "expected a loose object at {loose:?}");
+    fs::write(&loose, b"not a zlib stream").unwrap();
+
+    let out = update_feature(&repo, &c1);
+    assert_ne!(out.status.code(), Some(0), "a corrupt object must not pass");
+    let stderr = stderr_of(&out);
+    assert!(
+        !stderr.contains("LBR-CLI-002") && !stderr.contains("LBR-CLI-003"),
+        "a storage failure must not be downgraded to an input error: {stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-REPO-") || stderr.contains("LBR-IO-"),
+        "a storage failure keeps a repository/IO code: {stderr}"
+    );
+}
+
+#[test]
+fn update_ref_revision_ref_operand_still_narrow() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    // Widening the VALUE operand must not widen the REF operand: the
+    // refs/heads/* narrowing is a registered intentional difference.
+    for target in ["refs/tags/v1", "refs/remotes/origin/main", "HEAD"] {
+        let out = run_libra_command(&["update-ref", target, &c2], repo.path());
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{target} must still be refused: {}",
+            stderr_of(&out)
+        );
+    }
+}
+
+#[test]
+fn update_ref_output_shape_human() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    let ok = update_feature(&repo, &c1);
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "human success: {}",
+        stderr_of(&ok)
+    );
+    assert_eq!(feature_tip(&repo), c1);
+
+    // A revision operand behaves the same as a raw id on the human surface.
+    let ok_rev = update_feature(&repo, "HEAD");
+    assert_eq!(ok_rev.status.code(), Some(0));
+    assert_eq!(feature_tip(&repo), c2);
+
+    let err = update_feature(&repo, "no-such-revision");
+    assert_eq!(err.status.code(), Some(128), "human failure exit code");
+    assert!(
+        String::from_utf8_lossy(&err.stdout).trim().is_empty(),
+        "a failed update must not print to stdout"
+    );
+    assert_eq!(feature_tip(&repo), c2, "the failure left the ref alone");
+}
+
+#[test]
+fn update_ref_output_shape_json() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let seed = update_feature(&repo, &c1);
+    assert_eq!(seed.status.code(), Some(0), "seed: {}", stderr_of(&seed));
+
+    let ok = run_libra_command(
+        &["--json", "update-ref", "refs/heads/feature", "HEAD"],
+        repo.path(),
+    );
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "json success: {}",
+        stderr_of(&ok)
+    );
+    let json = parse_json_stdout(&ok);
+    assert_eq!(json["data"]["ref"].as_str(), Some("refs/heads/feature"));
+    assert_eq!(json["data"]["old"].as_str(), Some(c1.as_str()));
+    assert_eq!(json["data"]["deleted"].as_bool(), Some(false));
+
+    let err = run_libra_command(
+        &["--json", "update-ref", "refs/heads/feature", "no-such-rev"],
+        repo.path(),
+    );
+    assert_eq!(err.status.code(), Some(128), "json failure exit code");
+    let stderr = stderr_of(&err);
+    assert!(
+        stderr.contains("\"ok\": false") && stderr.contains("LBR-CLI-003"),
+        "json failure envelope: {stderr}"
+    );
+}
+
+#[test]
+fn update_ref_output_shape_machine() {
+    let (repo, c1, _c2) = repo_with_two_commits();
+    let seed = update_feature(&repo, &c1);
+    assert_eq!(seed.status.code(), Some(0), "seed: {}", stderr_of(&seed));
+
+    let ok = run_libra_command(
+        &["--machine", "update-ref", "refs/heads/feature", "HEAD"],
+        repo.path(),
+    );
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "machine success: {}",
+        stderr_of(&ok)
+    );
+    let body = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        body.contains("\"ref\":\"refs/heads/feature\""),
+        "machine success payload: {body}"
+    );
+
+    let err = run_libra_command(
+        &[
+            "--machine",
+            "update-ref",
+            "refs/heads/feature",
+            "no-such-rev",
+        ],
+        repo.path(),
+    );
+    assert_eq!(err.status.code(), Some(128), "machine failure exit code");
+    assert!(
+        stderr_of(&err).contains("LBR-CLI-003"),
+        "machine failure carries the stable code: {}",
+        stderr_of(&err)
+    );
+}

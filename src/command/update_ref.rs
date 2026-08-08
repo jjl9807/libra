@@ -12,7 +12,11 @@
 use std::str::FromStr;
 
 use clap::Parser;
-use git_internal::hash::{ObjectHash, get_hash_kind};
+use git_internal::{
+    errors::GitError,
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::types::ObjectType,
+};
 use sea_orm::TransactionError;
 use serde::Serialize;
 
@@ -25,7 +29,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
-        util,
+        util::{self, CommitBaseError},
     },
 };
 
@@ -165,17 +169,7 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
                 args.ref_name
             )));
         };
-        let new_hash = parse_object_id(&new_value, &zero).map_err(fatal)?;
-        // Git's update-ref refuses to point a ref at an object that is not in
-        // the store; do the same so we never create a dangling ref.
-        if util::objects_storage().get(&new_hash).is_err() {
-            return Err(CliError::fatal(format!(
-                "cannot update '{}': object {new_value} does not exist in the repository",
-                args.ref_name
-            ))
-            .with_exit_code(128)
-            .with_stable_code(StableErrorCode::CliInvalidTarget));
-        }
+        let new_hash = resolve_new_value(&new_value, &zero, &args.ref_name).await?;
         (Some(new_hash.to_string()), args.old_value.clone())
     };
 
@@ -380,19 +374,92 @@ fn parse_heads_ref(ref_name: &str) -> Result<&str, String> {
     ))
 }
 
-/// Parse a new-value object id, rejecting symbolic-ref syntax, the null id, and
-/// hash-format mismatches. Returns the parsed [`ObjectHash`] so the caller can
-/// check that the object exists.
-fn parse_object_id(value: &str, zero: &str) -> Result<ObjectHash, String> {
+/// Resolve the `<newvalue>` operand to the commit the ref will point at.
+///
+/// Two syntax-layer spellings are refused before any lookup and keep the
+/// usage class (`LBR-CLI-002`): `ref:` (that is `symbolic-ref`'s job) and the
+/// null id (that is `-d`'s job). Everything else goes through the shared
+/// revision engine, so branch names, tags, `HEAD`, `~`/`^` navigation and
+/// abbreviated ids all work.
+///
+/// There is deliberately **no implicit peel**: whatever the expression names
+/// must itself be a commit. That is Git's rule — a lightweight tag points at
+/// the commit and is accepted, a bare annotated tag names a tag object and is
+/// refused, and `<tag>^{commit}` peels explicitly and is accepted. Peeling
+/// silently would let `update-ref refs/heads/x v1.0` write a branch the user
+/// never named.
+async fn resolve_new_value(value: &str, zero: &str, ref_name: &str) -> CliResult<ObjectHash> {
     if value.starts_with("ref:") {
-        return Err(
+        return Err(usage_fatal(
             "symbolic refs are not supported by update-ref; use `symbolic-ref`".to_string(),
-        );
+        ));
     }
     if value == zero {
-        return Err("refusing to point a ref at the null object id; use -d to delete".to_string());
+        return Err(usage_fatal(
+            "refusing to point a ref at the null object id; use -d to delete".to_string(),
+        ));
     }
-    validate_oid(value)
+
+    let object_id = util::resolve_object_spec_typed(value)
+        .await
+        .map_err(|error| match error {
+            CommitBaseError::HeadUnborn | CommitBaseError::InvalidReference(_) => {
+                invalid_target_fatal(format!(
+                    "cannot update '{ref_name}': '{value}' is not a valid revision in this repository"
+                ))
+            }
+            // A resolver failure caused by the repository itself must keep its
+            // own class — reporting it as bad user input would send the
+            // operator looking at their command line instead of their objects.
+            CommitBaseError::ReadFailure(detail) => {
+                CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            CommitBaseError::CorruptReference(detail) => {
+                CliError::fatal(format!("cannot update '{ref_name}': {detail}"))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+            }
+        })?;
+
+    // Git's update-ref refuses to point a ref at an object that is not in the
+    // store; do the same so we never create a dangling ref. Reading the type
+    // proves existence and answers the commit question in one lookup.
+    let object_type = util::objects_storage()
+        .get_object_type(&object_id)
+        .map_err(|error| match error {
+            GitError::ObjectNotFound(_) => invalid_target_fatal(format!(
+                "cannot update '{ref_name}': object {value} does not exist in the repository"
+            )),
+            other => CliError::fatal(format!(
+                "cannot update '{ref_name}': could not read object {object_id}: {other}"
+            ))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::RepoCorrupt),
+        })?;
+
+    if object_type != ObjectType::Commit {
+        return Err(invalid_target_fatal(format!(
+            "cannot update '{ref_name}': '{value}' resolves to a {object_type}              ({object_id}), not a commit; use '{value}^{{commit}}' to peel it"
+        )));
+    }
+
+    Ok(object_id)
+}
+
+/// A syntax-layer refusal of an operand: the user's command line is wrong.
+fn usage_fatal(message: String) -> CliError {
+    CliError::fatal(message)
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+}
+
+/// The operand parsed, but does not name something this command can use.
+fn invalid_target_fatal(message: String) -> CliError {
+    CliError::fatal(message)
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
 }
 
 /// Parse a compare-and-swap operand (`0{40}` => must-not-exist).

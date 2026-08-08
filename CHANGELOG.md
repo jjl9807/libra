@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added (plan-20260729 CT1-02, 2026-08-08)
+
+- **`libra update-ref refs/heads/<branch> <newvalue>` accepts revision
+  expressions.** The value operand previously took a full object id only, so
+  `update-ref refs/heads/x HEAD` failed. It now goes through the shared
+  resolver — branches, tags, `HEAD`, `HEAD^`/`HEAD~n`, abbreviated ids and
+  `<rev>^{commit}` all work — with no implicit peel: what the expression names
+  must itself be a commit, so a lightweight tag is accepted and a bare
+  annotated tag is refused naming the type that was resolved, exactly as Git
+  does. Unresolvable or non-commit values are `LBR-CLI-003`; the `ref:` and
+  null-id syntax refusals stay `LBR-CLI-002`; a failure inside the object
+  store keeps its repository/IO code instead of being reported as bad input.
+  `<oldvalue>` is unchanged.
+
 ### Fixed (plan-20260729 CT1-01, 2026-08-08)
 
 - **`libra config <key>` reads an encrypted ordinary key instead of refusing

@@ -40,19 +40,42 @@ reflog message; only the actual before/after object ids are.
 |--------|-------------|---------|
 | `-d`, `--delete` | Delete the ref instead of updating it. | `libra update-ref -d refs/heads/old` |
 | `-m <reason>` | Reflog reason recorded with the update. | `libra update-ref -m "reset tip" refs/heads/main <oid>` |
-| `<newvalue>` | The new object id (omit with `-d`). | |
+| `<newvalue>` | The new commit, as an object id or any revision expression (omit with `-d`). | `libra update-ref refs/heads/main HEAD~1` |
 | `<oldvalue>` | Expected current id for a compare-and-swap (`0{40}` = must not exist). | |
 | `--json` / `--machine` | Structured output: `{ ref, old, new, deleted }`. | `libra --json update-ref refs/heads/main <oid>` |
 
 A symbolic value (`ref:refs/heads/…`) and the null object id as `<newvalue>` are
 rejected — use `symbolic-ref`, or `-d` to delete.
 
+### Revision expressions in `<newvalue>`
+
+`<newvalue>` goes through the same revision resolver as the rest of Libra, so
+branch names, tags, `HEAD`, parent/ancestor navigation (`HEAD^`, `HEAD~2`) and
+abbreviated object ids all work.
+
+There is **no implicit peel**: whatever the expression names must itself be a
+commit. A lightweight tag is the commit id, so it is accepted; a bare annotated
+tag names a tag object and is refused with `LBR-CLI-003`, naming the type that
+was resolved. Peel it explicitly to use it:
+
+```bash
+libra update-ref refs/heads/release v1.0^{commit}
+```
+
+This matches Git, which likewise refuses to write an annotated tag object into
+`refs/heads/*`. A revision that does not resolve is `LBR-CLI-003`; the two
+syntax-layer refusals above stay `LBR-CLI-002`. Both exit `128`. A failure
+inside the object store (an unreadable or corrupt object) keeps its own
+repository/IO code and is never reported as bad input.
+
+`<oldvalue>` is unchanged: it is still a full object id (or the all-zero id).
+
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | The ref was updated, created, or deleted. |
-| `128` | Not inside a repository, an unsupported/invalid ref, an invalid object id, a compare-and-swap mismatch, or deleting a ref that does not exist. |
+| `128` | Not inside a repository, an unsupported/invalid ref, an unresolvable `<newvalue>` revision or one that does not name a commit, an invalid object id, a compare-and-swap mismatch, or deleting a ref that does not exist. |
 
 ## Examples
 

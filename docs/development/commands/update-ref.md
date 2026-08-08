@@ -10,6 +10,7 @@
 - 已支持：`update-ref refs/heads/<branch> <new> [<old>]`（`<old>` = 全零 → 仅创建；= 完整 oid → CAS；省略 → 无条件创建/覆盖）、`-d` 删除（含可选 `<old>` CAS）、`-m <reason>` reflog 原因、`--json`/`--machine`。
 - **有意 v1 范围收窄**：仅 `refs/heads/*`（Libra `reference` 表能直接建模的分支 tip）。`HEAD`、`refs/tags/*`、`refs/remotes/*`、任意命名空间均拒绝（128）并给出指引（HEAD→`symbolic-ref`/`switch`，tag→`tag`）。
 - **plan-vs-Git 调和**：grit-gap 早期验收写「省略 `<old>` 等价于要求 ref 存在、否则 exit 1」，与 Git 实际行为**不符**（Git 省略 `<old>` 时无条件创建/更新，不要求存在）。本实现按 **Git 正确语义**：省略 `<old>` = 无条件创建或覆盖。验收文案已据此调和。
+- **`<newvalue>` 的 revision 解析（plan-20260729 CT1-02）**：值操作数经 `util::resolve_object_spec_typed` 解析（`src/command/update_ref.rs` 的 `resolve_new_value`），支持分支/tag/`HEAD`/`~`/`^`/缩写 oid/`<rev>^{commit}`。**不做隐式 peel**——解析结果本身必须是 commit（用 `ClientStorage::get_object_type` 判定，同一次查询顺带证明对象存在），因此 lightweight tag 通过、bare annotated tag 被拒并在错误信息里点名解析到的类型，与 Git 一致。错误分层：`ref:` 前缀与全零 id 是**语法层**拒绝，保持 `LBR-CLI-002`；无法解析、解析结果非 commit、对象不存在为 `LBR-CLI-003`；解析器抛出的 `CommitBaseError::ReadFailure`/`CorruptReference` 分别保持 `LBR-IO-001`/`LBR-REPO-002`，**不降级为输入错误**（否则运维会去查命令行而不是查对象库）。全部 fatal 仍统一 exit 128（`execute_safe` 的既有契约，见 `docs/error-codes.md` 的 update-ref 例外段）。`<oldvalue>` 仍走 `validate_oid` 的定长 hex 校验（其 revision 化归 CT1-03）。回归：`tests/command/update_ref_test.rs` 的 12 个 `update_ref_revision_*` 与 3 个 `update_ref_output_shape_*`。
 - 未公开（延后）：非 `refs/heads/*` 命名空间、`HEAD`、`--stdin` 批量、`--create-reflog`、`--no-deref`。
 
 ## 设计方案
