@@ -17,6 +17,21 @@ G=${GRIT_REPO:-/Volumes/Data/competition/GitButler/grit}
   || { echo "FAIL: grit HEAD != pin" >&2; exit 1; }
 cd "$G/tests"
 
+# 判定纪律（FIX-01）：中间文件落 run-scoped 目录，三个 trap 保证清理。固定 `/tmp`
+# 路径可被预置符号链接劫持，异常退出还会留下文件。
+GD=$(mktemp -d)
+gd_cleanup() {
+  r=$?; [ -n "${1:-}" ] && r=$1
+  trap - EXIT INT TERM
+  set +e
+  if ! rm -rf "$GD"; then
+    echo "FATAL: cannot remove $GD — intermediate files left on disk" >&2
+    if [ "$r" -eq 0 ]; then r=3; fi
+  fi
+  exit "$r"
+}
+trap 'gd_cleanup' EXIT; trap 'gd_cleanup 130' INT; trap 'gd_cleanup 143' TERM
+
 EXT='lib-httpd\.sh|lib-git-daemon\.sh|lib-git-p4\.sh|lib-git-svn\.sh|lib-cvs\.sh|lib-gitweb\.sh|(^|[^-[:alnum:]_])git[[:space:]]+(p4|svn|daemon|cvsimport|cvsexportcommit|cvsserver)([[:space:]]|$)'
 TT='(^|[^-[:alnum:]_])test-tool([[:space:]]|$)'
 GITD='\.git/|\$GIT_DIR/|--git-path'
@@ -31,8 +46,27 @@ for n in 0 1 2 3 4 5 6 7 8 9; do
   done
   [ -n "$files" ] || { printf '%s\t0\t0\t0\t0\t0\t0\n' "t$n"; continue; }
   tot=$(printf '%s\n' $files | wc -l | tr -d ' ')
-  c(){ if command grep -lE "$1" $files > /tmp/gs.$$ 2>/dev/null; then wc -l < /tmp/gs.$$ | tr -d ' '; else echo 0; fi; }
-  printf 't%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$tot" "$(c "$GITD")" "$(c "$TT")" "$(c "$EXT")" "$(c "$GPG")" "$(c "$SUB")"
+  # 三态分流：rc=0 命中、rc=1 零命中、rc>1 是执行错误（不可读文件、正则错误…），
+  # 后者必须以原退出码失败，绝不降级为「零命中」。
+  c(){
+    set +e
+    command grep -lE "$1" $files > "$GD/grep.out" 2>"$GD/grep.err"
+    rc=$?
+    set -e
+    case "$rc" in
+      0) wc -l < "$GD/grep.out" | tr -d ' ' ;;
+      1) echo 0 ;;
+      *) echo "FAIL: grep exited $rc while matching '$1'" >&2; exit "$rc" ;;
+    esac
+  }
+  # 每列先赋值再打印：`$(c …)` 在子 shell 里跑，`exit` 只结束子 shell；简单赋值把
+  # 它的退出码交给 `set -e`，rc>1 才真的中止整个脚本。
+  n_gitdir=$(c "$GITD")
+  n_tt=$(c "$TT")
+  n_ext=$(c "$EXT")
+  n_gpg=$(c "$GPG")
+  n_sub=$(c "$SUB")
+  printf 't%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$tot" "$n_gitdir" "$n_tt" "$n_ext" "$n_gpg" "$n_sub"
 done
 ```
 
