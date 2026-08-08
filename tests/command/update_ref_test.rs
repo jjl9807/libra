@@ -544,3 +544,144 @@ fn update_ref_output_shape_machine() {
         stderr_of(&err)
     );
 }
+
+// ── CT1-02, edge spellings ───────────────────────────────────────────────────
+// The forms below all RESOLVE fine; what makes them interesting is that what
+// they resolve to is not a commit. Each must be refused naming the type, and
+// must leave the ref untouched — a resolver change that started peeling would
+// silently write a branch the user never named.
+
+/// Assert `value` is refused for naming a non-commit of type `type_name`, and
+/// that `refs/heads/feature` was not created.
+fn assert_refused_as_non_commit(repo: &TempDir, value: &str, type_name: &str) {
+    let out = update_feature(repo, value);
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "{value} must be refused: {}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(type_name),
+        "the refusal of {value} must name the resolved type {type_name}: {stderr}"
+    );
+    assert!(
+        stderr.contains("not a commit"),
+        "the refusal of {value} must say what was expected: {stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-CLI-003"),
+        "an unusable target is LBR-CLI-003: {stderr}"
+    );
+    let after = run_libra_command(&["rev-parse", "refs/heads/feature"], repo.path());
+    assert_ne!(
+        after.status.code(),
+        Some(0),
+        "the refused update of {value} must not have created the ref"
+    );
+}
+
+#[test]
+fn update_ref_revision_tree_ish_rejected() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    assert_refused_as_non_commit(&repo, "HEAD^{tree}", "tree");
+}
+
+#[test]
+fn update_ref_revision_tree_path_blob_rejected() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    // `<rev>:<path>` names the blob at that path.
+    assert_refused_as_non_commit(&repo, "HEAD:tracked.txt", "blob");
+}
+
+#[test]
+fn update_ref_revision_tag_object_id_rejected() {
+    let (repo, _c1, _c2) = repo_with_two_commits();
+    let tag = run_libra_command(&["tag", "-m", "release", "annotated"], repo.path());
+    assert_eq!(tag.status.code(), Some(0), "tag: {}", stderr_of(&tag));
+
+    // Naming the tag OBJECT by its full id is the same refusal as naming it by
+    // tag name: the check is on the resolved object, not on the spelling. This
+    // is also what protects against a tag whose target is itself a tag.
+    let tag_oid = stdout_trimmed(&rev_parse(&repo, "annotated"));
+    let cat = run_libra_command(&["cat-file", "-t", &tag_oid], repo.path());
+    assert_eq!(
+        stdout_trimmed(&cat),
+        "tag",
+        "expected rev-parse to name the tag object itself"
+    );
+    assert_refused_as_non_commit(&repo, &tag_oid, "tag");
+}
+
+#[test]
+fn update_ref_revision_recursive_peel_accepted() {
+    let (repo, _c1, c2) = repo_with_two_commits();
+    let tag = run_libra_command(&["tag", "-m", "release", "annotated"], repo.path());
+    assert_eq!(tag.status.code(), Some(0), "tag: {}", stderr_of(&tag));
+
+    // `^{}` peels recursively to a non-tag, which for a tagged commit is the
+    // commit. It must be accepted for the same reason `^{commit}` is.
+    let out = update_feature(&repo, "annotated^{}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "recursive peel: {}",
+        stderr_of(&out)
+    );
+    assert_eq!(feature_tip(&repo), c2);
+}
+
+#[test]
+fn update_ref_revision_foreign_hash_length_rejected() {
+    // In a SHA-256 repository a 40-hex string is not an id of this repository.
+    // Widening the operand must not make it resolve to something.
+    let dir = tempfile::tempdir().unwrap();
+    let init = run_libra_command(&["init", "--object-format", "sha256"], dir.path());
+    assert_eq!(init.status.code(), Some(0), "init: {}", stderr_of(&init));
+    for (key, value) in [("user.name", "T U Ser"), ("user.email", "t@example.com")] {
+        let set = run_libra_command(&["config", "--local", key, value], dir.path());
+        assert_eq!(
+            set.status.code(),
+            Some(0),
+            "seed {key}: {}",
+            stderr_of(&set)
+        );
+    }
+    fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    assert_eq!(
+        run_libra_command(&["add", "a.txt"], dir.path())
+            .status
+            .code(),
+        Some(0)
+    );
+    let commit = run_libra_command(&["commit", "-m", "c1", "--no-verify"], dir.path());
+    assert_eq!(
+        commit.status.code(),
+        Some(0),
+        "commit: {}",
+        stderr_of(&commit)
+    );
+
+    let sha1_shaped = "a".repeat(40);
+    let out = run_libra_command(
+        &["update-ref", "refs/heads/feature", &sha1_shaped],
+        dir.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "a foreign-length id is refused"
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("LBR-CLI-002") || stderr.contains("LBR-CLI-003"),
+        "a bad operand stays an input error: {stderr}"
+    );
+    let after = run_libra_command(&["rev-parse", "refs/heads/feature"], dir.path());
+    assert_ne!(
+        after.status.code(),
+        Some(0),
+        "the refused update must not have created the ref"
+    );
+}

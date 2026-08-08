@@ -16,9 +16,9 @@
 ## 设计方案
 
 - 入口与分发：`src/cli.rs::Commands::UpdateRef` → `command::update_ref::execute_safe`。
-- 源码分层：`src/command/update_ref.rs`：`UpdateRefArgs`（`delete`/`message`/`ref_name`/`value`/`old_value`）、`execute`/`execute_safe`、`UpdateRefOutput`（`--json`：`ref`/`old`/`new`/`deleted`）、`UpdateRefTxError`（事务内错误，映射为 128）、`OldValue`（`MustNotExist`/`Exact`）、`parse_heads_ref`/`parse_object_id`/`parse_old_value`/`validate_oid`/`write_reflog`。
+- 源码分层：`src/command/update_ref.rs`：`UpdateRefArgs`（`delete`/`message`/`ref_name`/`value`/`old_value`）、`execute`/`execute_safe`、`UpdateRefOutput`（`--json`：`ref`/`old`/`new`/`deleted`）、`UpdateRefTxError`（事务内错误，映射为 128）、`OldValue`（`MustNotExist`/`Exact`）、`parse_heads_ref`/`resolve_new_value`/`parse_old_value`/`validate_oid`/`usage_fatal`/`invalid_target_fatal`/`write_reflog`。
 - 位置参数消歧：`-d <ref> [<old>]`（位置 2 = old）vs `<ref> <new> [<old>]`（位置 2 = new、位置 3 = old）。`-d` 时位置 3 必须为空。
-- 校验：`parse_heads_ref`（仅 `refs/heads/`，HEAD/其它命名空间拒绝）+ `util::is_valid_refname`（对齐 `git check-ref-format`）；`<new>` 经 `parse_object_id`（拒绝 `ref:` 符号值、拒绝全零 new、`validate_oid` 长度==`HashKind::hex_len()` + `ObjectHash::from_str`）；`<old>` 经 `parse_old_value`（全零→`MustNotExist`，否则 `Exact`）。
+- 校验：`parse_heads_ref`（仅 `refs/heads/`，HEAD/其它命名空间拒绝）+ `util::is_valid_refname`（对齐 `git check-ref-format`）；`<new>` 经 `resolve_new_value`（CT1-02 起）：先做**语法层**拒绝（`ref:` 符号值、全零 new），再交 `util::resolve_object_spec_typed` 解析任意 revision 表达式，最后用 `ClientStorage::get_object_type` 断言解析结果**本身就是 commit**（不隐式 peel），该次查询同时证明对象存在，故不再单独调 `objects_storage().get()`；定长 hex 校验 `validate_oid` 现在只服务 `<old>`；`<old>` 经 `parse_old_value`（全零→`MustNotExist`，否则 `Exact`）。
 - 事务（`get_db_conn_instance().await.transaction(move |txn| Box::pin(async move {...}))`）：
   1. `Branch::find_branch_result_with_conn(txn, branch, None)` 读当前 tip（`Option<ObjectHash>`→hex）。
   2. CAS 判定：`MustNotExist` 但已存在 → `MustNotExist` 错；`Exact(want)` 但当前 != want → `CasMismatch`。
@@ -26,7 +26,7 @@
   4. update：`update_branch_with_conn(txn, branch, new, None)` + reflog(old_or_zero→new)。
   - `TransactionError` → `CliError` 128（`RepoStateInvalid`）。
 - reflog：新增 `ReflogAction::UpdateRef { message }`（+ `ReflogActionKind::UpdateRef` → action 列 = `"update-ref"`；`ReflogContext` Display = message）。**`<old>` CAS 操作数绝不写入 reflog**——只记录真实前后 oid（`write_reflog` 仅取 current/new）。
-- 错误码：复用既有 `StableErrorCode`（`CliInvalidArguments` 用于用法/refname/oid/CAS-arg；`RepoStateInvalid` 用于事务失败/CAS 不匹配）；**未新增** `StableErrorCode` 变体，故无需改 `docs/error-codes.md`（新增是条件性要求）。全部 128，对齐 Git fatal。
+- 错误码：复用既有 `StableErrorCode`。`CliInvalidArguments` 用于用法/refname/**`<new>` 的语法层拒绝**/CAS-arg；`CliInvalidTarget` 用于 `<new>` 无法解析、解析结果非 commit、对象不存在；`IoReadFailed`/`RepoCorrupt` 分别承接解析器的 `CommitBaseError::ReadFailure`/`CorruptReference` 与 `get_object_type` 的非 `ObjectNotFound` 失败（**不降级为输入错误**）；`RepoStateInvalid` 用于事务失败/CAS 不匹配。**未新增** `StableErrorCode` 变体（`docs/error-codes.md` 只补了 `LBR-CLI-003` 的适用场景描述）。全部 128，对齐 Git fatal——该 128 覆盖与总表 129 的差异由 `docs/error-codes.md` 的 update-ref 例外段登记（plan-20260729 FIX-02）。
 - 底层操作对象：SQLite `reference` + `reflog` 表（事务）。无对象库/网络/工作树写入。
 
 ## 实现历史
