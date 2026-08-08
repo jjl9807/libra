@@ -805,6 +805,34 @@ fn update_ref_oldvalue_delete_with_revision_mismatch() {
     assert_ne!(c1, c2);
 }
 
+#[test]
+fn update_ref_oldvalue_unresolvable_changes_nothing() {
+    let (repo, c1, c2) = repo_with_two_commits();
+    assert_eq!(update_feature(&repo, &c2).status.code(), Some(0));
+    let before = ref_state(&repo, "feature");
+
+    // A short/garbage oldvalue no longer fails a fixed-length hex check; it
+    // fails to resolve. Either way the refusal must leave the ref and its
+    // reflog exactly as they were.
+    for bad in ["deadbeef", "no-such-revision"] {
+        let out = run_libra_command(&["update-ref", "refs/heads/feature", &c1, bad], repo.path());
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{bad} as oldvalue must be refused: {}",
+            stderr_of(&out)
+        );
+        assert!(
+            stderr_of(&out).contains("LBR-CLI-003"),
+            "an unresolvable oldvalue is LBR-CLI-003: {}",
+            stderr_of(&out)
+        );
+        let after = ref_state(&repo, "feature");
+        assert_eq!(after.0, before.0, "{bad} moved the ref");
+        assert_eq!(after.1, before.1, "{bad} wrote a reflog entry");
+    }
+}
+
 // ── CT1-03 policy invariants ─────────────────────────────────────────────────
 // Widening the operand parsing must not open a bypass: protect/archive
 // metadata is still enforced INSIDE the transaction, and a metadata read that
