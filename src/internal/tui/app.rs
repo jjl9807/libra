@@ -11175,11 +11175,10 @@ Use this failure evidence as the source of truth:\n{report}",
 }
 
 fn automatic_plan_repair_threshold_message(report: &str, attempts: u8, max_attempts: u8) -> String {
-    format!(
-        "Automatic plan repair stopped after {attempts} failed repair attempts (automatic threshold: {max_attempts}).\n\
-Developer confirmation is required before more automatic correction.\n\
-{report}\n\
-Reply `continue` or `/plan continue <max-attempts>` to allow more automatic repair attempts, describe specific Plan repair guidance, or use `/plan cancel` to stop."
+    crate::internal::tui::workflow_baseline::plan_repair_threshold_baseline_message(
+        report,
+        attempts,
+        max_attempts,
     )
 }
 

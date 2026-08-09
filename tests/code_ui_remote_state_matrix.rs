@@ -184,6 +184,22 @@ fn state_matrix_requires_test_provider_feature() {
     eprintln!("skipping state matrix; enable --features test-provider");
 }
 
+/// W0-02 repair-loop baseline (cargo filter: `repair`).
+///
+/// Keeps the automatic plan-repair threshold copy and `/plan continue`
+/// affordance discoverable from the state-matrix target listed in the plan.
+#[test]
+fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
+    use libra::internal::tui::plan_repair_threshold_baseline_message;
+
+    let message = plan_repair_threshold_baseline_message("step failed", 2, 2);
+    assert!(message.contains(
+        "Automatic plan repair stopped after 2 failed repair attempts (automatic threshold: 2)."
+    ));
+    assert!(message.contains("Reply `continue` or `/plan continue"));
+    assert!(message.contains("step failed"));
+}
+
 #[cfg(feature = "test-provider")]
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
