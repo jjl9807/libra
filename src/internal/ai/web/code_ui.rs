@@ -26,6 +26,7 @@ use crate::internal::ai::{
         ControllerLease, ControllerService, ControllerServiceError, ControllerServiceOptions,
         ControllerSnapshot, hardening::SecretRedactor,
     },
+    session::CodeWorkflowReplay,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1134,7 +1135,44 @@ impl CodeUiRuntimeHandle {
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.adapter.shutdown().await
+        self.shutdown_for_lifecycle()
+            .await
+            .map_err(|error| match error {
+                crate::internal::ai::runtime::LifecycleStepError::TimedOut { categories } => {
+                    anyhow::anyhow!(
+                        "Code UI runtime shutdown timed out waiting for: {categories:?}"
+                    )
+                }
+                crate::internal::ai::runtime::LifecycleStepError::Failed { categories, detail } => {
+                    anyhow::anyhow!(
+                        "Code UI runtime shutdown failed releasing {categories:?}: {detail}"
+                    )
+                }
+            })
+    }
+
+    /// Process-level adapter shutdown used by [`LifecycleShutdownOwner`].
+    /// Closes provider/runtime admission first; the controller lease is
+    /// released separately after listeners drain so a browser cannot attach
+    /// and submit during teardown.
+    pub async fn shutdown_for_lifecycle(
+        &self,
+    ) -> Result<(), crate::internal::ai::runtime::LifecycleStepError> {
+        use crate::internal::ai::runtime::lifecycle_resource;
+
+        match self.adapter.shutdown().await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(lifecycle_step_error_from_shutdown_message(
+                &error.to_string(),
+                lifecycle_resource::RUNTIME_TURN,
+            )),
+        }
+    }
+
+    /// Drop the process controller lease after listeners/child have stopped.
+    pub async fn release_controller_for_lifecycle(&self) {
+        self.controller_service.release_for_process_shutdown().await;
+        self.sync_controller_snapshot().await;
     }
 
     /// Validate a controller token and return the active lease.
@@ -1213,12 +1251,49 @@ impl CodeUiRuntimeHandle {
     }
 }
 
+fn lifecycle_step_error_from_shutdown_message(
+    message: &str,
+    fallback_category: &str,
+) -> crate::internal::ai::runtime::LifecycleStepError {
+    use crate::internal::ai::runtime::{LifecycleStepError, lifecycle_resource};
+
+    let known = [
+        lifecycle_resource::MUTATING_RUNTIME_TURN_RECONCILIATION,
+        lifecycle_resource::RUNTIME_TURN,
+        lifecycle_resource::PROVIDER_STREAM,
+        lifecycle_resource::CONTROLLER_LEASE,
+    ];
+    let found: Vec<String> = known
+        .iter()
+        .filter(|category| message.contains(*category))
+        .map(|category| (*category).to_string())
+        .collect();
+    let categories = if found.is_empty() {
+        vec![fallback_category.to_string()]
+    } else {
+        found
+    };
+    if message.contains("timed out") {
+        LifecycleStepError::timed_out_with(categories)
+    } else {
+        LifecycleStepError::failed_with(categories, message.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CodeUiApiError {
     pub status: u16,
     pub code: String,
     pub message: String,
 }
+
+impl std::fmt::Display for CodeUiApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for CodeUiApiError {}
 
 impl CodeUiApiError {
     fn from_controller_service(error: ControllerServiceError) -> Self {
@@ -1245,6 +1320,10 @@ impl CodeUiApiError {
         }
     }
 
+    pub fn reconciliation_required(message: impl Into<String>) -> Self {
+        Self::conflict("RECONCILIATION_REQUIRED", message)
+    }
+
     pub fn forbidden(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status: 403,
@@ -1262,6 +1341,9 @@ impl CodeUiApiError {
     }
 
     pub fn unsupported_from_error(error: anyhow::Error) -> Self {
+        if let Some(api_error) = error.downcast_ref::<CodeUiApiError>() {
+            return api_error.clone();
+        }
         if let Some(control_error) =
             error.downcast_ref::<crate::internal::tui::control::TuiControlError>()
         {
@@ -1270,6 +1352,14 @@ impl CodeUiApiError {
                 code: control_error.code().to_string(),
                 message: control_error.message(),
             };
+        }
+        if let Some(crate::internal::ai::runtime::RuntimeWorkerError::ReconciliationRequired {
+            session_id,
+        }) = error.downcast_ref::<crate::internal::ai::runtime::RuntimeWorkerError>()
+        {
+            return Self::reconciliation_required(format!(
+                "session '{session_id}' requires mutation reconciliation before another turn can run"
+            ));
         }
 
         Self {
@@ -1327,6 +1417,7 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("STATUS_UNAVAILABLE", 500),
         ("THREAD_LIST_FAILED", 500),
         ("DB_UNAVAILABLE", 500),
+        ("RECONCILIATION_REQUIRED", 409),
         ("INTERNAL_ERROR", 500),
         ("UNSUPPORTED_OPERATION", 422),
     ]
@@ -1409,6 +1500,21 @@ pub fn snapshot_from_thread_bundle(
     let mut snapshot = initial_snapshot(working_dir, provider, capabilities);
     apply_thread_bundle_to_snapshot(&mut snapshot, bundle);
     snapshot
+}
+
+/// Fold workflow events into Code-UI-equivalent read-model fields for graph/history.
+///
+/// Graph currently sources thread structure from [`ThreadBundle`]; transcript,
+/// interaction, and status overlays must use the same bounded event fold as
+/// Code UI resume ([`super::code_ui_projection::rebuild_code_ui_read_model_from_events`]).
+pub fn graph_code_ui_read_model_from_events(
+    bootstrap: CodeUiSessionSnapshot,
+    replay: &CodeWorkflowReplay,
+) -> Result<
+    super::code_ui_projection::CodeUiProjectionFold,
+    super::code_ui_projection::CodeUiProjectionFoldError,
+> {
+    super::code_ui_projection::fold_graph_compatible_code_ui_snapshot(bootstrap, replay)
 }
 
 pub fn apply_thread_bundle_to_snapshot(
@@ -1725,6 +1831,10 @@ mod tests {
             (
                 CodeUiApiError::conflict("CONTROLLER_CONFLICT", "held"),
                 "CONTROLLER_CONFLICT",
+            ),
+            (
+                CodeUiApiError::reconciliation_required("fence"),
+                "RECONCILIATION_REQUIRED",
             ),
             (
                 CodeUiApiError::forbidden("BROWSER_CONTROL_DISABLED", "off"),

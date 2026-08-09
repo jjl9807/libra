@@ -10,6 +10,7 @@ pub mod durability;
 pub mod environment;
 pub mod event;
 pub mod hardening;
+pub mod lifecycle;
 pub mod phase0;
 pub mod phase1;
 pub mod phase2;
@@ -37,6 +38,10 @@ pub use hardening::{
     SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, ToolOperation, ToolOperationDetails,
     TracingAuditSink,
 };
+pub use lifecycle::{
+    LifecycleShutdownError, LifecycleShutdownOwner, LifecycleShutdownStep, LifecycleStepError,
+    resource as lifecycle_resource,
+};
 pub use phase3::{
     ArtifactLedger, ValidationOutcome, ValidationReport, ValidationReportStore, ValidationStage,
     ValidationStageResult, ValidatorEngine,
@@ -54,10 +59,11 @@ pub use services::{
 pub use snapshot::Snapshot;
 pub use worker::{
     AgentEvent, AgentEventKind, AgentEventStream, AgentRuntimeHandle, AgentRuntimeWorker,
-    AgentRuntimeWorkerConfig, AgentSnapshot, EventCursor, InteractionResponse, InteractionState,
-    RuntimeCommand, RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeObserveError,
-    RuntimeShutdownError, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
-    TurnReceipt, TurnRequest, TurnStateMachine,
+    AgentRuntimeWorkerConfig, AgentSnapshot, EventCursor, ExternalTurnTrackingExecutor,
+    InteractionResponse, InteractionState, RuntimeCommand, RuntimeExecutionContext,
+    RuntimeInteractionDelivery, RuntimeObserveError, RuntimeShutdownError, RuntimeTurnExecution,
+    RuntimeTurnExecutor, RuntimeWorkerError, TurnReceipt, TurnRequest, TurnStateMachine,
+    runtime_worker_adapter_message,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
