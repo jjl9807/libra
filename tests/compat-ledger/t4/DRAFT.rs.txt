@@ -31,7 +31,10 @@ fn t4_repo(tag: &str) -> (TempDir, String) {
     let repo = create_committed_repo_via_cli();
     let name = format!("{tag}.txt");
     std::fs::write(repo.path().join(&name), "one\ntwo\n").expect("seed the tracked file");
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the seed");
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the seed",
+    );
     assert_cli_success(
         &run_libra_command(&["commit", "-m", "seed", "--no-verify"], repo.path()),
         "commit the seed",
@@ -136,7 +139,10 @@ fn t4_port_t4000_update_index_add_two_files_with_and_without_x() {
     assert_cli_success(&out, "update-index --add");
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
-    assert!(t4_stdout(&listed).contains("indexed.txt"), "the path is in the index");
+    assert!(
+        t4_stdout(&listed).contains("indexed.txt"),
+        "the path is in the index"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::favour-same-basenames-even-with-minor-differences`.
@@ -171,12 +177,18 @@ fn t4_port_t4001_favour_same_basenames_over_different_ones() {
 fn t4_port_t4001_rename_pretty_print_common_prefix_and_suffix_overlap() {
     // `-M` turns a delete/create pair back into the rename it was.
     let (repo, name) = t4_repo("t009");
-    assert_cli_success(&run_libra_command(&["mv", &name, "moved.txt"], repo.path()), "rename it");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
     let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
     assert_cli_success(&out, "diff -M --staged --name-status");
     let text = t4_stdout(&out);
     assert!(text.contains("moved.txt"), "the new path appears: {text}");
-    assert!(text.starts_with('R') || text.contains(&name), "rename or pair: {text}");
+    assert!(
+        text.starts_with('R') || text.contains(&name),
+        "rename or pair: {text}"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-common-prefix`.
@@ -185,12 +197,18 @@ fn t4_port_t4001_rename_pretty_print_common_prefix_and_suffix_overlap() {
 fn t4_port_t4001_rename_pretty_print_with_common_prefix() {
     // `-M` turns a delete/create pair back into the rename it was.
     let (repo, name) = t4_repo("t010");
-    assert_cli_success(&run_libra_command(&["mv", &name, "moved.txt"], repo.path()), "rename it");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
     let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
     assert_cli_success(&out, "diff -M --staged --name-status");
     let text = t4_stdout(&out);
     assert!(text.contains("moved.txt"), "the new path appears: {text}");
-    assert!(text.starts_with('R') || text.contains(&name), "rename or pair: {text}");
+    assert!(
+        text.starts_with('R') || text.contains(&name),
+        "rename or pair: {text}"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-common-prefix-and-suffix`.
@@ -199,12 +217,18 @@ fn t4_port_t4001_rename_pretty_print_with_common_prefix() {
 fn t4_port_t4001_rename_pretty_print_with_common_prefix_and_suffix() {
     // `-M` turns a delete/create pair back into the rename it was.
     let (repo, name) = t4_repo("t011");
-    assert_cli_success(&run_libra_command(&["mv", &name, "moved.txt"], repo.path()), "rename it");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
     let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
     assert_cli_success(&out, "diff -M --staged --name-status");
     let text = t4_stdout(&out);
     assert!(text.contains("moved.txt"), "the new path appears: {text}");
-    assert!(text.starts_with('R') || text.contains(&name), "rename or pair: {text}");
+    assert!(
+        text.starts_with('R') || text.contains(&name),
+        "rename or pair: {text}"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-common-suffix`.
@@ -213,12 +237,18 @@ fn t4_port_t4001_rename_pretty_print_with_common_prefix_and_suffix() {
 fn t4_port_t4001_rename_pretty_print_with_common_suffix() {
     // `-M` turns a delete/create pair back into the rename it was.
     let (repo, name) = t4_repo("t012");
-    assert_cli_success(&run_libra_command(&["mv", &name, "moved.txt"], repo.path()), "rename it");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
     let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
     assert_cli_success(&out, "diff -M --staged --name-status");
     let text = t4_stdout(&out);
     assert!(text.contains("moved.txt"), "the new path appears: {text}");
-    assert!(text.starts_with('R') || text.contains(&name), "rename or pair: {text}");
+    assert!(
+        text.starts_with('R') || text.contains(&name),
+        "rename or pair: {text}"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::rename-pretty-print-with-nothing-in-common`.
@@ -227,12 +257,18 @@ fn t4_port_t4001_rename_pretty_print_with_common_suffix() {
 fn t4_port_t4001_rename_pretty_print_with_nothing_in_common() {
     // `-M` turns a delete/create pair back into the rename it was.
     let (repo, name) = t4_repo("t013");
-    assert_cli_success(&run_libra_command(&["mv", &name, "moved.txt"], repo.path()), "rename it");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "moved.txt"], repo.path()),
+        "rename it",
+    );
     let out = run_libra_command(&["diff", "-M", "--staged", "--name-status"], repo.path());
     assert_cli_success(&out, "diff -M --staged --name-status");
     let text = t4_stdout(&out);
     assert!(text.contains("moved.txt"), "the new path appears: {text}");
-    assert!(text.starts_with('R') || text.contains(&name), "rename or pair: {text}");
+    assert!(
+        text.starts_with('R') || text.contains(&name),
+        "rename or pair: {text}"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::renamed-and-edited-the-file`.
@@ -246,7 +282,10 @@ fn t4_port_t4001_renamed_and_edited_the_file() {
     assert_cli_success(&out, "update-index --add");
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
-    assert!(t4_stdout(&listed).contains("indexed.txt"), "the path is in the index");
+    assert!(
+        t4_stdout(&listed).contains("indexed.txt"),
+        "the path is in the index"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::setup`.
@@ -303,7 +342,10 @@ fn t4_port_t4001_update_index_add_a_file() {
     assert_cli_success(&out, "update-index --add");
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
-    assert!(t4_stdout(&listed).contains("indexed.txt"), "the path is in the index");
+    assert!(
+        t4_stdout(&listed).contains("indexed.txt"),
+        "the path is in the index"
+    );
 }
 
 /// Upstream scenario `t4001-diff-rename::write-that-tree`.
@@ -356,7 +398,10 @@ fn t4_port_t4004_prepare_work_tree() {
     assert_cli_success(&out, "update-index --add");
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
-    assert!(t4_stdout(&listed).contains("indexed.txt"), "the path is in the index");
+    assert!(
+        t4_stdout(&listed).contains("indexed.txt"),
+        "the path is in the index"
+    );
 }
 
 /// Upstream scenario `t4005-diff-rename-2::setup-reference-tree`.
@@ -370,7 +415,11 @@ fn t4_port_t4005_setup_reference_tree() {
     assert_cli_success(&first, "hash-object");
     let second = run_libra_command(&["hash-object", "blob.txt"], repo.path());
     assert_cli_success(&second, "hash-object again");
-    assert_eq!(t4_stdout(&first), t4_stdout(&second), "the id is deterministic");
+    assert_eq!(
+        t4_stdout(&first),
+        t4_stdout(&second),
+        "the id is deterministic"
+    );
     assert_eq!(t4_stdout(&first).len(), 40);
 }
 
@@ -381,12 +430,21 @@ fn t4_port_t4006_prepare_binary_file() {
     // `commit -m` records the message it was given.
     let (repo, name) = t4_repo("t024");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
-    let out = run_libra_command(&["commit", "-m", "recorded subject", "--no-verify"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    let out = run_libra_command(
+        &["commit", "-m", "recorded subject", "--no-verify"],
+        repo.path(),
+    );
     assert_cli_success(&out, "commit -m");
     let log = run_libra_command(&["log", "-1"], repo.path());
     assert_cli_success(&log, "log");
-    assert!(t4_stdout(&log).contains("recorded subject"), "the message is recorded");
+    assert!(
+        t4_stdout(&log).contains("recorded subject"),
+        "the message is recorded"
+    );
 }
 
 /// Upstream scenario `t4006-diff-mode::setup`.
@@ -484,7 +542,10 @@ fn t4_port_t4007_prepare_work_tree() {
     assert_cli_success(&out, "update-index --add");
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
-    assert!(t4_stdout(&listed).contains("indexed.txt"), "the path is in the index");
+    assert!(
+        t4_stdout(&listed).contains("indexed.txt"),
+        "the path is in the index"
+    );
 }
 
 /// Upstream scenario `t4007-rename-3::tweak-index`.
@@ -498,7 +559,10 @@ fn t4_port_t4007_tweak_index() {
     assert_cli_success(&out, "update-index --remove");
     let listed = run_libra_command(&["ls-files"], repo.path());
     assert_cli_success(&listed, "ls-files");
-    assert!(!t4_stdout(&listed).contains(&name), "the path left the index");
+    assert!(
+        !t4_stdout(&listed).contains(&name),
+        "the path left the index"
+    );
 }
 
 /// Upstream scenario `t4009-diff-rename-4::prepare-reference-tree`.
@@ -561,7 +625,11 @@ fn t4_port_t4010_setup() {
     assert_cli_success(&first, "hash-object");
     let second = run_libra_command(&["hash-object", "blob.txt"], repo.path());
     assert_cli_success(&second, "hash-object again");
-    assert_eq!(t4_stdout(&first), t4_stdout(&second), "the id is deterministic");
+    assert_eq!(
+        t4_stdout(&first),
+        t4_stdout(&second),
+        "the id is deterministic"
+    );
     assert_eq!(t4_stdout(&first).len(), 40);
 }
 
@@ -572,12 +640,21 @@ fn t4_port_t4010_setup_submodules() {
     // `commit -m` records the message it was given.
     let (repo, name) = t4_repo("t038");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
-    let out = run_libra_command(&["commit", "-m", "recorded subject", "--no-verify"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    let out = run_libra_command(
+        &["commit", "-m", "recorded subject", "--no-verify"],
+        repo.path(),
+    );
     assert_cli_success(&out, "commit -m");
     let log = run_libra_command(&["log", "-1"], repo.path());
     assert_cli_success(&log, "log");
-    assert!(t4_stdout(&log).contains("recorded subject"), "the message is recorded");
+    assert!(
+        t4_stdout(&log).contains("recorded subject"),
+        "the message is recorded"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-attach-produces-mime-attachment`.
@@ -587,9 +664,15 @@ fn t4_port_t4015_format_patch_attach_produces_mime_attachment() {
     // `format-patch --attach` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t039");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
@@ -598,7 +681,10 @@ fn t4_port_t4015_format_patch_attach_produces_mime_attachment() {
     );
     assert_cli_success(&out, "format-patch --attach");
     let text = t4_stdout(&out);
-    assert!(text.contains("Content-Type:"), "the mail carries Content-Type: : {text}");
+    assert!(
+        text.contains("Content-Type:"),
+        "the mail carries Content-Type: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-base-commit-adds-base-commit-info`.
@@ -608,18 +694,33 @@ fn t4_port_t4015_format_patch_base_commit_adds_base_commit_info() {
     // `format-patch --base` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t040");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
-        &["format-patch", "--base", "HEAD~1", "--stdout", "HEAD~1..HEAD"],
+        &[
+            "format-patch",
+            "--base",
+            "HEAD~1",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
         repo.path(),
     );
     assert_cli_success(&out, "format-patch --base");
     let text = t4_stdout(&out);
-    assert!(text.contains("base-commit:"), "the mail carries base-commit: : {text}");
+    assert!(
+        text.contains("base-commit:"),
+        "the mail carries base-commit: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-base-with-multi-patch-puts-base-commit-on-last-patch-only`.
@@ -629,18 +730,33 @@ fn t4_port_t4015_format_patch_base_with_multi_patch_puts_base_commit_on_last_pat
     // `format-patch --base` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t041");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
-        &["format-patch", "--base", "HEAD~1", "--stdout", "HEAD~1..HEAD"],
+        &[
+            "format-patch",
+            "--base",
+            "HEAD~1",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
         repo.path(),
     );
     assert_cli_success(&out, "format-patch --base");
     let text = t4_stdout(&out);
-    assert!(text.contains("base-commit:"), "the mail carries base-commit: : {text}");
+    assert!(
+        text.contains("base-commit:"),
+        "the mail carries base-commit: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-cc-adds-cc-header`.
@@ -650,13 +766,25 @@ fn t4_port_t4015_format_patch_cc_adds_cc_header() {
     // `format-patch --cc` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t042");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
-        &["format-patch", "--cc", "reviewer@example.com", "--stdout", "HEAD~1..HEAD"],
+        &[
+            "format-patch",
+            "--cc",
+            "reviewer@example.com",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
         repo.path(),
     );
     assert_cli_success(&out, "format-patch --cc");
@@ -671,13 +799,25 @@ fn t4_port_t4015_format_patch_cc_and_to_can_be_combined() {
     // `format-patch --cc` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t043");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
-        &["format-patch", "--cc", "reviewer@example.com", "--stdout", "HEAD~1..HEAD"],
+        &[
+            "format-patch",
+            "--cc",
+            "reviewer@example.com",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
         repo.path(),
     );
     assert_cli_success(&out, "format-patch --cc");
@@ -692,18 +832,33 @@ fn t4_port_t4015_format_patch_in_reply_to_adds_in_reply_to_and_references() {
     // `format-patch --in-reply-to` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t044");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
-        &["format-patch", "--in-reply-to", "<thread@example.com>", "--stdout", "HEAD~1..HEAD"],
+        &[
+            "format-patch",
+            "--in-reply-to",
+            "<thread@example.com>",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
         repo.path(),
     );
     assert_cli_success(&out, "format-patch --in-reply-to");
     let text = t4_stdout(&out);
-    assert!(text.contains("In-Reply-To:"), "the mail carries In-Reply-To: : {text}");
+    assert!(
+        text.contains("In-Reply-To:"),
+        "the mail carries In-Reply-To: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-inline-produces-mime-inline`.
@@ -713,9 +868,15 @@ fn t4_port_t4015_format_patch_inline_produces_mime_inline() {
     // `format-patch --inline` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t045");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
@@ -724,7 +885,10 @@ fn t4_port_t4015_format_patch_inline_produces_mime_inline() {
     );
     assert_cli_success(&out, "format-patch --inline");
     let text = t4_stdout(&out);
-    assert!(text.contains("Content-Type:"), "the mail carries Content-Type: : {text}");
+    assert!(
+        text.contains("Content-Type:"),
+        "the mail carries Content-Type: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-s-adds-signed-off-by`.
@@ -734,9 +898,15 @@ fn t4_port_t4015_format_patch_s_adds_signed_off_by() {
     // `format-patch -s` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t046");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
@@ -745,7 +915,10 @@ fn t4_port_t4015_format_patch_s_adds_signed_off_by() {
     );
     assert_cli_success(&out, "format-patch -s");
     let text = t4_stdout(&out);
-    assert!(text.contains("Signed-off-by:"), "the mail carries Signed-off-by: : {text}");
+    assert!(
+        text.contains("Signed-off-by:"),
+        "the mail carries Signed-off-by: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-signoff-adds-signed-off-by`.
@@ -755,9 +928,15 @@ fn t4_port_t4015_format_patch_signoff_adds_signed_off_by() {
     // `format-patch --signoff` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t047");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
@@ -766,7 +945,10 @@ fn t4_port_t4015_format_patch_signoff_adds_signed_off_by() {
     );
     assert_cli_success(&out, "format-patch --signoff");
     let text = t4_stdout(&out);
-    assert!(text.contains("Signed-off-by:"), "the mail carries Signed-off-by: : {text}");
+    assert!(
+        text.contains("Signed-off-by:"),
+        "the mail carries Signed-off-by: : {text}"
+    );
 }
 
 /// Upstream scenario `t4015-format-patch-options::format-patch-to-adds-to-header`.
@@ -776,13 +958,25 @@ fn t4_port_t4015_format_patch_to_adds_to_header() {
     // `format-patch --to` must put its mark in the produced mail.
     let (repo, name) = t4_repo("t048");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
     assert_cli_success(
-        &run_libra_command(&["commit", "-m", "patch subject", "--no-verify"], repo.path()),
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "patch subject", "--no-verify"],
+            repo.path(),
+        ),
         "commit the change",
     );
     let out = run_libra_command(
-        &["format-patch", "--to", "maintainer@example.com", "--stdout", "HEAD~1..HEAD"],
+        &[
+            "format-patch",
+            "--to",
+            "maintainer@example.com",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
         repo.path(),
     );
     assert_cli_success(&out, "format-patch --to");
@@ -797,12 +991,21 @@ fn t4_port_t4015_setup() {
     // `commit -m` records the message it was given.
     let (repo, name) = t4_repo("t049");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
-    let out = run_libra_command(&["commit", "-m", "recorded subject", "--no-verify"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    let out = run_libra_command(
+        &["commit", "-m", "recorded subject", "--no-verify"],
+        repo.path(),
+    );
     assert_cli_success(&out, "commit -m");
     let log = run_libra_command(&["log", "-1"], repo.path());
     assert_cli_success(&log, "log");
-    assert!(t4_stdout(&log).contains("recorded subject"), "the message is recorded");
+    assert!(
+        t4_stdout(&log).contains("recorded subject"),
+        "the message is recorded"
+    );
 }
 
 /// Upstream scenario `t4016-diff-quote::git-diff-numstat-m-head`.
@@ -838,7 +1041,10 @@ fn t4_port_t4016_git_diff_summary_m_head() {
     // `--summary` reports structural changes; a new file is a create entry.
     let (repo, _name) = t4_repo("t052");
     std::fs::write(repo.path().join("added.txt"), "fresh\n").expect("create a file");
-    assert_cli_success(&run_libra_command(&["add", "added.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "added.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--summary", "--staged"], repo.path());
     assert_cli_success(&out, "diff --summary --staged");
     let text = t4_stdout(&out);
@@ -852,8 +1058,14 @@ fn t4_port_t4016_git_diff_summary_m_head() {
 fn t4_port_t4016_setup() {
     // `mv` renames a tracked path and stages both halves of the rename.
     let (repo, name) = t4_repo("t053");
-    assert_cli_success(&run_libra_command(&["mv", &name, "renamed.txt"], repo.path()), "mv");
-    assert!(repo.path().join("renamed.txt").is_file(), "the new path exists");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "renamed.txt"], repo.path()),
+        "mv",
+    );
+    assert!(
+        repo.path().join("renamed.txt").is_file(),
+        "the new path exists"
+    );
     assert!(!repo.path().join(&name).exists(), "the old path is gone");
 }
 
@@ -863,8 +1075,14 @@ fn t4_port_t4016_setup() {
 fn t4_port_t4016_setup_expected_files() {
     // `mv` renames a tracked path and stages both halves of the rename.
     let (repo, name) = t4_repo("t054");
-    assert_cli_success(&run_libra_command(&["mv", &name, "renamed.txt"], repo.path()), "mv");
-    assert!(repo.path().join("renamed.txt").is_file(), "the new path exists");
+    assert_cli_success(
+        &run_libra_command(&["mv", &name, "renamed.txt"], repo.path()),
+        "mv",
+    );
+    assert!(
+        repo.path().join("renamed.txt").is_file(),
+        "the new path exists"
+    );
     assert!(!repo.path().join(&name).exists(), "the old path is gone");
 }
 
@@ -875,10 +1093,16 @@ fn t4_port_t4017_check_detects_leftover_conflict_markers() {
     // `add` moves a working-tree path into the index.
     let (repo, _name) = t4_repo("t055");
     std::fs::write(repo.path().join("staged.txt"), "content\n").expect("write it");
-    assert_cli_success(&run_libra_command(&["add", "staged.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["add", "staged.txt"], repo.path()),
+        "add",
+    );
     let out = run_libra_command(&["status", "--porcelain=v1"], repo.path());
     assert_cli_success(&out, "status");
-    assert!(t4_stdout(&out).contains("staged.txt"), "status reports the staged path");
+    assert!(
+        t4_stdout(&out).contains("staged.txt"),
+        "status reports the staged path"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::check-exit-code-returns-0-for-no-difference`.
@@ -889,7 +1113,10 @@ fn t4_port_t4017_check_exit_code_returns_0_for_no_difference() {
     // any; Git signals that with a dedicated non-zero status.
     let (repo, _name) = t4_repo("t056");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(&run_libra_command(&["add", "ws.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
     assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
@@ -905,7 +1132,10 @@ fn t4_port_t4017_check_exit_code_returns_1_for_a_clean_difference() {
     // any; Git signals that with a dedicated non-zero status.
     let (repo, _name) = t4_repo("t057");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(&run_libra_command(&["add", "ws.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
     assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
@@ -921,7 +1151,10 @@ fn t4_port_t4017_check_exit_code_returns_3_for_a_dirty_difference() {
     // any; Git signals that with a dedicated non-zero status.
     let (repo, _name) = t4_repo("t058");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(&run_libra_command(&["add", "ws.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
     assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
@@ -937,7 +1170,10 @@ fn t4_port_t4017_check_honors_conflict_marker_length() {
     // any; Git signals that with a dedicated non-zero status.
     let (repo, _name) = t4_repo("t059");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(&run_libra_command(&["add", "ws.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
     assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
@@ -953,7 +1189,10 @@ fn t4_port_t4017_check_should_test_not_just_the_last_line() {
     // any; Git signals that with a dedicated non-zero status.
     let (repo, _name) = t4_repo("t060");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(&run_libra_command(&["add", "ws.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
     assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
@@ -969,7 +1208,10 @@ fn t4_port_t4017_check_with_no_pager_returns_2_for_dirty_difference() {
     // any; Git signals that with a dedicated non-zero status.
     let (repo, _name) = t4_repo("t061");
     std::fs::write(repo.path().join("ws.txt"), "trailing \nclean\n").expect("write whitespace");
-    assert_cli_success(&run_libra_command(&["add", "ws.txt"], repo.path()), "stage it");
+    assert_cli_success(
+        &run_libra_command(&["add", "ws.txt"], repo.path()),
+        "stage it",
+    );
     let out = run_libra_command(&["diff", "--check", "--staged"], repo.path());
     assert_eq!(out.status.code(), Some(2), "whitespace damage is exit 2");
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
@@ -984,7 +1226,12 @@ fn t4_port_t4017_git_diff_exit_code_returns_1_for_changed_binary_file() {
     // `--exit-code` carries the difference in the status code, like Git.
     let (repo, name) = t4_repo("t062");
     let clean = run_libra_command(&["diff", "--exit-code"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--exit-code"], repo.path());
     assert_eq!(dirty.status.code(), Some(1), "a difference is exit 1");
@@ -997,7 +1244,12 @@ fn t4_port_t4017_git_diff_exit_code_returns_1_for_renamed_file() {
     // `--exit-code` carries the difference in the status code, like Git.
     let (repo, name) = t4_repo("t063");
     let clean = run_libra_command(&["diff", "--exit-code"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--exit-code"], repo.path());
     assert_eq!(dirty.status.code(), Some(1), "a difference is exit 1");
@@ -1100,10 +1352,19 @@ fn t4_port_t4017_git_diff_quiet_head_head() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
     let (repo, name) = t4_repo("t070");
     let clean = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(dirty.status.code(), Some(1), "a modified path makes it non-zero");
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a modified path makes it non-zero"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::git-diff-quiet-returns-1-for-changed-binary-file`.
@@ -1113,10 +1374,19 @@ fn t4_port_t4017_git_diff_quiet_returns_1_for_changed_binary_file() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
     let (repo, name) = t4_repo("t071");
     let clean = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(dirty.status.code(), Some(1), "a modified path makes it non-zero");
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a modified path makes it non-zero"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::git-diff-quiet-returns-1-for-renamed-file`.
@@ -1126,10 +1396,19 @@ fn t4_port_t4017_git_diff_quiet_returns_1_for_renamed_file() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
     let (repo, name) = t4_repo("t072");
     let clean = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(dirty.status.code(), Some(1), "a modified path makes it non-zero");
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a modified path makes it non-zero"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::git-diff-quiet-w-head-head`.
@@ -1139,10 +1418,19 @@ fn t4_port_t4017_git_diff_quiet_w_head_head() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
     let (repo, name) = t4_repo("t073");
     let clean = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(dirty.status.code(), Some(1), "a modified path makes it non-zero");
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a modified path makes it non-zero"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::git-diff-quiet-w-head-head-2`.
@@ -1152,10 +1440,19 @@ fn t4_port_t4017_git_diff_quiet_w_head_head_2() {
     // `--quiet` is a status-only check: clean is 0, any change is non-zero.
     let (repo, name) = t4_repo("t074");
     let clean = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(clean.status.code(), Some(0), "clean tree: {}", t4_stderr(&clean));
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "clean tree: {}",
+        t4_stderr(&clean)
+    );
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--quiet"], repo.path());
-    assert_eq!(dirty.status.code(), Some(1), "a modified path makes it non-zero");
+    assert_eq!(
+        dirty.status.code(),
+        Some(1),
+        "a modified path makes it non-zero"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::setup`.
@@ -1165,12 +1462,21 @@ fn t4_port_t4017_setup() {
     // `commit -m` records the message it was given.
     let (repo, name) = t4_repo("t075");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
-    let out = run_libra_command(&["commit", "-m", "recorded subject", "--no-verify"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    let out = run_libra_command(
+        &["commit", "-m", "recorded subject", "--no-verify"],
+        repo.path(),
+    );
     assert_cli_success(&out, "commit -m");
     let log = run_libra_command(&["log", "-1"], repo.path());
     assert_cli_success(&log, "log");
-    assert!(t4_stdout(&log).contains("recorded subject"), "the message is recorded");
+    assert!(
+        t4_stdout(&log).contains("recorded subject"),
+        "the message is recorded"
+    );
 }
 
 /// Upstream scenario `t4017-diff-retval::setup-dirty-subrepo`.
@@ -1180,12 +1486,21 @@ fn t4_port_t4017_setup_dirty_subrepo() {
     // `commit -m` records the message it was given.
     let (repo, name) = t4_repo("t076");
     t4_touch(&repo, &name);
-    assert_cli_success(&run_libra_command(&["add", &name], repo.path()), "stage the change");
-    let out = run_libra_command(&["commit", "-m", "recorded subject", "--no-verify"], repo.path());
+    assert_cli_success(
+        &run_libra_command(&["add", &name], repo.path()),
+        "stage the change",
+    );
+    let out = run_libra_command(
+        &["commit", "-m", "recorded subject", "--no-verify"],
+        repo.path(),
+    );
     assert_cli_success(&out, "commit -m");
     let log = run_libra_command(&["log", "-1"], repo.path());
     assert_cli_success(&log, "log");
-    assert!(t4_stdout(&log).contains("recorded subject"), "the message is recorded");
+    assert!(
+        t4_stdout(&log).contains("recorded subject"),
+        "the message is recorded"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1201,7 +1516,10 @@ fn t4_port_t4017_setup_dirty_subrepo() {
 /// is about to freeze.
 fn t4_src() -> (String, String) {
     let path = std::env::var("T4_PORT_SOURCE").unwrap_or_else(|_| {
-        format!("{}/tests/command/t4_port_test.rs", env!("CARGO_MANIFEST_DIR"))
+        format!(
+            "{}/tests/command/t4_port_test.rs",
+            env!("CARGO_MANIFEST_DIR")
+        )
     });
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("cannot read the ported suite at {path}: {error}"));
@@ -1235,6 +1553,22 @@ const T4_PORT_GUARDS: &[&str] = &[
     "t4_port_direct_rows_have_tests",
 ];
 
+/// `assert!(true)` type-checks, runs, and proves nothing; it is the cheapest
+/// way to satisfy a presence check while the real assertion hides elsewhere.
+fn t4_is_trivial_assertion(tokens: &str) -> bool {
+    let t = tokens.trim();
+    t == "true" || t == "false" || t.starts_with("true ,") || t.starts_with("false ,")
+}
+
+fn t4_is_real_assertion(mac: &syn::Macro) -> bool {
+    mac.path.segments.last().is_some_and(|s| {
+        matches!(
+            s.ident.to_string().as_str(),
+            "assert" | "assert_eq" | "assert_ne"
+        )
+    }) && !t4_is_trivial_assertion(&mac.tokens.to_string())
+}
+
 /// The parsed form of this file. Substring hunting cannot survive Rust's
 /// syntax: `include !("x")` with a space, or `use std::process::Command as C`
 /// followed by `C::new(..)`, both evade a literal scan while doing exactly
@@ -1255,8 +1589,15 @@ fn t4_is_infrastructure(name: &str) -> bool {
     T4_PORT_GUARDS.contains(&name)
         || matches!(
             name,
-            "t4_src" | "t4_ast" | "t4_items" | "t4_snap" | "t4_is_infrastructure"
-                | "t4_repo" | "t4_touch" | "t4_stdout" | "t4_stderr"
+            "t4_src"
+                | "t4_ast"
+                | "t4_items"
+                | "t4_snap"
+                | "t4_is_infrastructure"
+                | "t4_repo"
+                | "t4_touch"
+                | "t4_stdout"
+                | "t4_stderr"
         )
 }
 
@@ -1304,7 +1645,11 @@ fn t4_port_integrity() {
     impl<'ast> Visit<'ast> for Scan {
         fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
             if let Some(seg) = node.mac.path.segments.last()
-                && matches!(seg.ident.to_string().as_str(), "assert" | "assert_eq" | "assert_ne")
+                && matches!(
+                    seg.ident.to_string().as_str(),
+                    "assert" | "assert_eq" | "assert_ne"
+                )
+                && !t4_is_trivial_assertion(&node.mac.tokens.to_string())
             {
                 self.asserts += 1;
             }
@@ -1314,7 +1659,11 @@ fn t4_port_integrity() {
             // `assert!(..);` in statement position is a Stmt::Macro, not an
             // Expr::Macro — missing this arm made every scenario look empty.
             if let Some(seg) = node.mac.path.segments.last()
-                && matches!(seg.ident.to_string().as_str(), "assert" | "assert_eq" | "assert_ne")
+                && matches!(
+                    seg.ident.to_string().as_str(),
+                    "assert" | "assert_eq" | "assert_ne"
+                )
+                && !t4_is_trivial_assertion(&node.mac.tokens.to_string())
             {
                 self.asserts += 1;
             }
@@ -1325,14 +1674,25 @@ fn t4_port_integrity() {
             syn::visit::visit_expr_return(self, node);
         }
         fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
-            // `if false { assert!(..) }` type-checks, never runs, and would
-            // otherwise satisfy a presence check.
-            if let syn::Expr::Lit(lit) = &*node.cond
-                && matches!(lit.lit, syn::Lit::Bool(_))
-            {
-                self.dead_branches += 1;
-            }
+            // A migrated scenario is straight-line: set up, run, assert. Any
+            // branch makes "does this assertion actually run" undecidable by
+            // inspection — `if false`, `if cfg!(..)`, `if SKIP_ME` all park an
+            // assertion on a path nobody takes. Banning branches outright is
+            // what makes the unconditional-assertion rule mean something.
+            self.dead_branches += 1;
             syn::visit::visit_expr_if(self, node);
+        }
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            self.dead_branches += 1;
+            syn::visit::visit_expr_match(self, node);
+        }
+        fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+            self.dead_branches += 1;
+            syn::visit::visit_expr_while(self, node);
+        }
+        fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+            self.dead_branches += 1;
+            syn::visit::visit_expr_loop(self, node);
         }
     }
 
@@ -1345,20 +1705,8 @@ fn t4_port_integrity() {
         // any other conditional can sit there forever without running. Require
         // one at the top level of the body, where nothing can skip it.
         let unconditional = block.stmts.iter().any(|stmt| match stmt {
-            syn::Stmt::Macro(m) => m
-                .mac
-                .path
-                .segments
-                .last()
-                .is_some_and(|s| matches!(s.ident.to_string().as_str(),
-                    "assert" | "assert_eq" | "assert_ne")),
-            syn::Stmt::Expr(syn::Expr::Macro(m), _) => m
-                .mac
-                .path
-                .segments
-                .last()
-                .is_some_and(|s| matches!(s.ident.to_string().as_str(),
-                    "assert" | "assert_eq" | "assert_ne")),
+            syn::Stmt::Macro(m) => t4_is_real_assertion(&m.mac),
+            syn::Stmt::Expr(syn::Expr::Macro(m), _) => t4_is_real_assertion(&m.mac),
             _ => false,
         });
         assert!(
@@ -1371,7 +1719,8 @@ fn t4_port_integrity() {
         );
         assert_eq!(
             scan.dead_branches, 0,
-            "{path}: {name} guards code behind a constant condition, which never runs"
+            "{path}: {name} contains a branch or loop; a ported scenario must be \
+             straight-line so every assertion demonstrably runs"
         );
     }
 
@@ -1418,7 +1767,10 @@ fn t4_port_no_foreign_harness() {
             // process launcher gets an alias.
             let rendered = quote_use(&node.tree);
             if rendered.contains("process")
-                && !rendered.split("::").last().is_some_and(|t| t.starts_with("Output"))
+                && !rendered
+                    .split("::")
+                    .last()
+                    .is_some_and(|t| t.starts_with("Output"))
             {
                 self.findings
                     .push(format!("an import reaches into std::process: {rendered}"));
@@ -1462,6 +1814,19 @@ fn t4_port_no_foreign_harness() {
             }
             syn::visit::visit_item_macro(self, node);
         }
+        fn visit_item_foreign_mod(&mut self, node: &'ast syn::ItemForeignMod) {
+            // An `extern "C"` block can declare `system` and call it from an
+            // unsafe block, spawning a process without ever naming the process
+            // builder. Both halves are banned.
+            self.findings
+                .push("a ported case declares a foreign function interface".to_string());
+            syn::visit::visit_item_foreign_mod(self, node);
+        }
+        fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+            self.findings
+                .push("a ported case uses an unsafe block".to_string());
+            syn::visit::visit_expr_unsafe(self, node);
+        }
         fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
             self.check_path(&node.path, "an expression");
             syn::visit::visit_expr_path(self, node);
@@ -1497,12 +1862,7 @@ fn quote_use(tree: &syn::UseTree) -> String {
         syn::UseTree::Name(n) => n.ident.to_string(),
         syn::UseTree::Rename(r) => format!("{} as {}", r.ident, r.rename),
         syn::UseTree::Glob(_) => "*".to_string(),
-        syn::UseTree::Group(g) => g
-            .items
-            .iter()
-            .map(quote_use)
-            .collect::<Vec<_>>()
-            .join(", "),
+        syn::UseTree::Group(g) => g.items.iter().map(quote_use).collect::<Vec<_>>().join(", "),
     }
 }
 
