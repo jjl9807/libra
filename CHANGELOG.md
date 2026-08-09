@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260715 W0-02, 2026-08-09)
+
+- **W0-02 freeze TUI-owned workflow baselines before Web migration.**
+  Add `workflow_baseline` choice/threshold contracts, named
+  `plan_workflow`/`plan_review`/`repair`/`user_input`/`goal_task` filters, and
+  an INDEX inventory of baseline test names + expected outputs so later Web
+  harness work can retarget these behaviors instead of deleting them.
+
 ### Changed (plan-20260715 W0-01, 2026-08-09)
 
 - **W0-01 source-anchor refresh for the Web-only migration plan.**
