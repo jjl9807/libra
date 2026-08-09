@@ -1694,6 +1694,23 @@ fn t4_port_integrity() {
             self.dead_branches += 1;
             syn::visit::visit_expr_loop(self, node);
         }
+        fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+            // A `for` over an empty iterator skips its body exactly the way
+            // `if false` does.
+            self.dead_branches += 1;
+            syn::visit::visit_expr_for_loop(self, node);
+        }
+        fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+            // A closure body runs only if someone calls it.
+            self.dead_branches += 1;
+            syn::visit::visit_expr_closure(self, node);
+        }
+        fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+            // `?` is an early exit wearing a different hat; the early-return
+            // rule below covers `return`, and this covers its sibling.
+            self.dead_branches += 1;
+            syn::visit::visit_expr_try(self, node);
+        }
     }
 
     let scenarios = t4_scenarios(&file);
@@ -1719,7 +1736,7 @@ fn t4_port_integrity() {
         );
         assert_eq!(
             scan.dead_branches, 0,
-            "{path}: {name} contains a branch or loop; a ported scenario must be \
+            "{path}: {name} contains a branch, loop, closure or `?`; a ported scenario must be \
              straight-line so every assertion demonstrably runs"
         );
     }
