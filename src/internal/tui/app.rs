@@ -555,10 +555,10 @@ impl ProcessTerminateGate {
 
     /// Instant the first terminate signal was observed, if any.
     pub fn signaled_at(&self) -> Option<Instant> {
-        self.signaled_at
+        *self
+            .signaled_at
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
     }
 
     pub async fn wait(&self) {
