@@ -237,6 +237,10 @@ W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际
 
 ## Web-only completion gate（W0-03）
 
+**当前 Web-only direct-turn 不是完成态。** headless/`--web-only` 仍可跳过
+IntentSpec/Plan human gates（见 C10）；不得据此删除默认 TUI 或宣称 Web-only
+parity closeout。
+
 `src/internal/tui` 仍在 production 编译图中时，下列清单是迁移契约，不代表已经
 达到 Web-only。任何删除 `internal::tui` 的变更必须在同一发布组把所有行更新为
 `[x]`，并在对应 target 中留下可复跑证据；`code_web_only_completion_gate` 会拒绝

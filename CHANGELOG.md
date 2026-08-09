@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260715 W0-03, 2026-08-09)
+
+- **W0-03 Web-only completion gate is machine-checkable.**
+  Strengthen `code_web_only_completion_gate` to assert AC1–AC6 checklist
+  items (parity gates, direct-turn non-completion, A0 inputs, non-Code TUI
+  consumers, product decisions) and fail with a missing-item list; document
+  that current Web-only direct-turn is not a completion state.
+
 ### Changed (plan-20260715 W0-02, 2026-08-09)
 
 - **W0-02 freeze TUI-owned workflow baselines before Web migration.**
