@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed (plan-20260715 W0-01, 2026-08-09)
+
+- **W0-01 source-anchor refresh for the Web-only migration plan.**
+  Revalidated `docs/development/tracing/code.md` C1–C10 conflict table, A0-02..A0-11
+  bind/consume inventory, runtime namespace decision, and non-Code TUI consumers
+  against `main` @ `25c8f6a` / v0.19.104; synchronized plan fact-baseline anchors and
+  recorded `agent/graph.rs` as a required W5-03/W5-10 consumer. Docs-only; no runtime
+  behavior change.
+
 ### Added (plan-20260729 CT2-03, 2026-08-08)
 
 - **The clean-room phrase allowlist, frozen.**
