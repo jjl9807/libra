@@ -976,6 +976,13 @@ async fn ingest_agent_traces_payload_with_scope(
             );
             return Ok(());
         }
+        // Codex hooks skip the generic command preflight so an auxiliary
+        // callback can be acknowledged when storage is unavailable. Take the
+        // shared hold at the actual object-publication boundary instead.
+        let _maintenance_lock = crate::internal::maintenance_lock::MaintenanceLock::shared(repo)
+            .context(
+                "failed to acquire the repository maintenance lock before writing an agent checkpoint",
+            )?;
         // A0-02: `SubagentStart` / `SubagentEnd` boundaries materialise an
         // independent `scope='subagent'` checkpoint (its own `traces`
         // commit + `agent_checkpoint` row) that carries parent session /

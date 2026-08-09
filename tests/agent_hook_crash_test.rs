@@ -17,6 +17,7 @@
 
 use std::{
     io::Write,
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     time::Duration,
@@ -263,6 +264,57 @@ fn hook_handler_panic_leaves_no_partial_write_and_no_stdin_echo() {
     assert!(
         repo.checkpoints().is_empty(),
         "a panic before the DB write must not create a checkpoint"
+    );
+}
+
+/// Codex runs its Stop hook in the foreground. If checkpoint publication
+/// cannot take the maintenance lock, capture must remain advisory: the host
+/// callback succeeds, leaks no hook payload, and writes no checkpoint.
+#[test]
+fn codex_stop_acknowledges_capture_failure_when_maintenance_lock_is_unwritable() {
+    let repo = HookRepo::init();
+    let session = "sess-codex-lock-failure";
+    let start = repo.run(
+        &["hooks", "codex", "session-start"],
+        Some(&repo.envelope("SessionStart", session, json!({}))),
+        &[],
+    );
+    assert!(
+        start.status.success(),
+        "session-start: {}",
+        describe(&start)
+    );
+
+    let lock_path = repo.repo.join(".libra").join("maintenance.lock");
+    std::fs::write(&lock_path, b"").expect("create maintenance lock");
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o400))
+        .expect("make maintenance lock unwritable");
+
+    let marker = "LIBRA_TEST_CODEX_STOP_MARKER_1d412a";
+    let stop = repo.run(
+        &["hooks", "codex", "stop"],
+        Some(&repo.envelope("Stop", session, json!({ "last_assistant_message": marker }))),
+        &[],
+    );
+
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore maintenance lock permissions");
+
+    assert!(
+        stop.status.success(),
+        "Codex Stop must acknowledge capture failure: {}",
+        describe(&stop)
+    );
+    let stderr = String::from_utf8_lossy(&stop.stderr);
+    let stdout = String::from_utf8_lossy(&stop.stdout);
+    assert!(
+        !stderr.contains(marker) && !stdout.contains(marker),
+        "the hook payload must not be echoed after capture failure: {}",
+        describe(&stop)
+    );
+    assert!(
+        repo.checkpoints().is_empty(),
+        "a failed Codex Stop checkpoint publication must not leave a checkpoint"
     );
 }
 
