@@ -1341,9 +1341,29 @@ fn t4_port_integrity() {
     for (name, block) in &scenarios {
         let mut scan = Scan::default();
         scan.visit_block(block);
+        // Presence is not enough: an assertion parked inside `if cfg!(..)` or
+        // any other conditional can sit there forever without running. Require
+        // one at the top level of the body, where nothing can skip it.
+        let unconditional = block.stmts.iter().any(|stmt| match stmt {
+            syn::Stmt::Macro(m) => m
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| matches!(s.ident.to_string().as_str(),
+                    "assert" | "assert_eq" | "assert_ne")),
+            syn::Stmt::Expr(syn::Expr::Macro(m), _) => m
+                .mac
+                .path
+                .segments
+                .last()
+                .is_some_and(|s| matches!(s.ident.to_string().as_str(),
+                    "assert" | "assert_eq" | "assert_ne")),
+            _ => false,
+        });
         assert!(
-            scan.asserts > 0,
-            "{path}: {name} invokes no assertion macro, so it proves nothing"
+            scan.asserts > 0 && unconditional,
+            "{path}: {name} has no unconditional assertion, so it can prove nothing at run time"
         );
         assert_eq!(
             scan.returns, 0,
@@ -1405,33 +1425,40 @@ fn t4_port_no_foreign_harness() {
             }
             syn::visit::visit_item_use(self, node);
         }
-        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
-            if let Some(seg) = node.mac.path.segments.last() {
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            // Check the macro's NAME and its token stream. Hiding
+            // `include_str!` inside a `macro_rules!` body would otherwise
+            // splice a file while the call site reads as a harmless `spill!()`.
+            // Scanning tokens rather than raw text also settles the spacing
+            // evasion for free: `include !(..)` tokenizes to the same idents.
+            if let Some(seg) = node.path.segments.last() {
                 let m = seg.ident.to_string();
                 if m.starts_with("include") {
                     self.findings
                         .push(format!("a compile-time splice ({m}) is not allowed"));
                 }
             }
-            syn::visit::visit_expr_macro(self, node);
-        }
-        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
-            if let Some(seg) = node.mac.path.segments.last() {
-                let m = seg.ident.to_string();
-                if m.starts_with("include") {
-                    self.findings
-                        .push(format!("a compile-time splice ({m}) is not allowed"));
+            for tok in node.tokens.clone() {
+                let t = tok.to_string();
+                for word in t.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                    if word.starts_with("include") || word == "Command" || word == "process" {
+                        self.findings.push(format!(
+                            "a macro body reaches for a forbidden construct ({word})"
+                        ));
+                    }
                 }
             }
-            syn::visit::visit_stmt_macro(self, node);
+            syn::visit::visit_macro(self, node);
         }
         fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
-            if let Some(seg) = node.mac.path.segments.last() {
-                let m = seg.ident.to_string();
-                if m.starts_with("include") {
-                    self.findings
-                        .push(format!("a compile-time splice ({m}) is not allowed"));
-                }
+            // `macro_rules!` in a ported suite has no legitimate use and is the
+            // simplest place to hide a forbidden construct behind a harmless
+            // call site.
+            if node.ident.is_some() {
+                self.findings.push(
+                    "a ported case defines a macro; scenarios drive Libra's helpers directly"
+                        .to_string(),
+                );
             }
             syn::visit::visit_item_macro(self, node);
         }
