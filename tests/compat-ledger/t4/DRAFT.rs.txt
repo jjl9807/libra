@@ -1208,142 +1208,9 @@ fn t4_src() -> (String, String) {
     (path, text)
 }
 
-/// The `fn` name and body of every `#[test]` item, in source order.
-fn t4_items(text: &str) -> Vec<(String, String)> {
-    let mut items = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        // Only a `#[test]` item is a case. Helper functions live in this file
-        // too, and counting them would make the suite look larger than the
-        // frozen snapshot it must match exactly.
-        let is_case = lines[i].trim_start().starts_with("fn t4_port_")
-            && lines[i].contains('(')
-            && lines[..i]
-                .iter()
-                .rev()
-                .take_while(|l| {
-                    let t = l.trim_start();
-                    t.starts_with('#') || t.starts_with("///") || t.is_empty()
-                })
-                .any(|l| l.trim() == "#[test]");
-        if is_case {
-            let name = lines[i]
-                .trim_start()
-                .trim_start_matches("fn ")
-                .split('(')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            let mut depth = 0usize;
-            let mut opened = false;
-            let start = i;
-            while i < lines.len() {
-                depth += lines[i].matches('{').count();
-                if depth > 0 {
-                    opened = true;
-                }
-                depth = depth.saturating_sub(lines[i].matches('}').count());
-                i += 1;
-                if opened && depth == 0 {
-                    break;
-                }
-            }
-            items.push((name, lines[start..i].join("\n")));
-        } else {
-            i += 1;
-        }
-    }
-    items
-}
-
-/// Whether a test body contains a `return` STATEMENT, as opposed to the word
-/// appearing inside an identifier or a comment. The signature line is skipped
-/// because scenario names legitimately describe what a command returns.
-fn t4_has_return_token(body: &str) -> bool {
-    for line in body.lines().skip(1) {
-        let code = line.split("//").next().unwrap_or("");
-        let bytes = code.as_bytes();
-        let mut from = 0usize;
-        while let Some(at) = code[from..].find("return") {
-            let start = from + at;
-            let end = start + "return".len();
-            let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
-            let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
-            if before_ok && after_ok {
-                return true;
-            }
-            from = end;
-        }
-    }
-    false
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-const T4_PORT_GUARDS: &[&str] = &[
-    "t4_port_integrity",
-    "t4_port_no_foreign_harness",
-    "t4_port_document_scope_and_boundaries",
-    "t4_port_direct_rows_have_tests",
-];
-
-/// Every ported case must actually assert something, must be runnable, and the
-/// executed set must be exactly the ledger's `direct` set. A suite that
-/// silently shrinks — one skipped case, one assertion deleted — would still be
-/// green, which is the failure this guard exists to prevent.
-#[test]
-fn t4_port_integrity() {
-    let (path, text) = t4_src();
-    // Assembled at run time on purpose. This guard reads its own source, so a
-    // needle written as a literal anywhere in this file — even inside the
-    // guard that hunts for it — would match itself and fail on every run.
-    let ignore_attr = format!("{}[{}]", '#', "ignore");
-    assert!(
-        !text.contains(&ignore_attr),
-        "{path}: a ported case is ignored, so the suite reports green without running it"
-    );
-    let items = t4_items(&text);
-    assert!(!items.is_empty(), "{path}: no ported cases found");
-    for (name, body) in &items {
-        if T4_PORT_GUARDS.contains(&name.as_str()) {
-            continue;
-        }
-        // The word "assert" can appear in a comment; require a real assertion
-        // macro invocation. These needles are matched inside a SCENARIO body,
-        // never against this guard's own source, so they are safe as literals.
-        let asserts = ["assert!(", "assert_eq!(", "assert_ne!("]
-            .iter()
-            .any(|m| body.contains(m));
-        assert!(
-            asserts,
-            "{path}: {name} invokes no assertion macro, so it proves nothing"
-        );
-        // Any early return can skip the assertions below it, whatever its
-        // spelling — `return;`, `return ();`, or a bare `return` before a
-        // closing brace. Matched as a token and only below the signature: a
-        // case named `..._returns_0_for_no_difference` is not an early return.
-        assert!(
-            !t4_has_return_token(body),
-            "{path}: {name} can return early, which would skip its assertions"
-        );
-    }
-    let scenarios = items
-        .iter()
-        .filter(|(n, _)| !T4_PORT_GUARDS.contains(&n.as_str()))
-        .count();
-    let snapshot = t4_snap();
-    assert_eq!(
-        scenarios,
-        snapshot.len(),
-        "{path}: {scenarios} ported cases against {} frozen scenarios",
-        snapshot.len()
-    );
-}
-
-/// The rows of the frozen snapshot as `(scenario_id, test_fn)`.
+/// The rows of the frozen snapshot as `(scenario_id, test_fn)`. It is the
+/// contract this suite must match: the ledger decides which scenarios are
+/// `direct`, and the snapshot froze that decision before any precheck ran.
 fn t4_snap() -> Vec<(String, String)> {
     let path = format!(
         "{}/tests/compat-ledger/t4/DIRECT_SNAPSHOT.tsv",
@@ -1361,45 +1228,254 @@ fn t4_snap() -> Vec<(String, String)> {
         })
         .collect()
 }
+const T4_PORT_GUARDS: &[&str] = &[
+    "t4_port_integrity",
+    "t4_port_no_foreign_harness",
+    "t4_port_document_scope_and_boundaries",
+    "t4_port_direct_rows_have_tests",
+];
 
-/// The clean-room boundary, as structure rather than as text. The suite drives
-/// Libra through its own helpers; it never launches a process itself, never
-/// reaches for the upstream binary, and never embeds a file. A single
-/// process-spawn call here would be enough to run the upstream harness and
-/// call the result a port, so the prose below names none of the banned
-/// spellings literally — the guard scans its own source too.
-#[test]
-fn t4_port_no_foreign_harness() {
+/// The parsed form of this file. Substring hunting cannot survive Rust's
+/// syntax: `include !("x")` with a space, or `use std::process::Command as C`
+/// followed by `C::new(..)`, both evade a literal scan while doing exactly
+/// what the clean-room boundary forbids. So the guards below work on the AST.
+///
+/// The four guards and the helpers they share are excluded from the scan. They
+/// are part of the frozen anchor, reviewed as such, and covered by the
+/// assertion lock; including them would only make every guard match its own
+/// banned-construct list.
+fn t4_ast() -> (String, syn::File) {
     let (path, text) = t4_src();
-    // Assembled at run time, for the same reason as the attribute above.
-    let cmd = format!("{}{}", "Comm", "and");
-    let inc = format!("{}{}", "inc", "lude");
-    for banned in [
-        format!("{cmd}::new"),
-        format!("std::process::{cmd}"),
-        // The bare form matters most: it splices arbitrary Rust at compile
-        // time, so anything it pulls in is invisible to a scan of this file.
-        format!("{inc}{}", '!'),
-        format!("{inc}_{}{}", "str", '!'),
-        format!("{inc}_{}{}", "bytes", '!'),
-    ] {
+    let parsed = syn::parse_file(&text)
+        .unwrap_or_else(|error| panic!("{path}: the ported suite does not parse: {error}"));
+    (path, parsed)
+}
+
+fn t4_is_infrastructure(name: &str) -> bool {
+    T4_PORT_GUARDS.contains(&name)
+        || matches!(
+            name,
+            "t4_src" | "t4_ast" | "t4_items" | "t4_snap" | "t4_is_infrastructure"
+                | "t4_repo" | "t4_touch" | "t4_stdout" | "t4_stderr"
+        )
+}
+
+/// Every `#[test]` function that is a migrated scenario, as (name, body).
+fn t4_scenarios(file: &syn::File) -> Vec<(String, syn::Block)> {
+    let mut out = Vec::new();
+    for item in &file.items {
+        if let syn::Item::Fn(f) = item {
+            let name = f.sig.ident.to_string();
+            let is_test = f
+                .attrs
+                .iter()
+                .any(|a| a.path().segments.last().is_some_and(|s| s.ident == "test"));
+            if is_test && !t4_is_infrastructure(&name) {
+                out.push((name, (*f.block).clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Every ported case must actually assert something, must be reachable, and
+/// the executed set must be exactly the ledger's `direct` set. A suite that
+/// silently shrinks — one skipped case, one assertion deleted, one assertion
+/// parked behind a constant-false branch — would still be green, which is the
+/// failure this guard exists to prevent.
+#[test]
+fn t4_port_integrity() {
+    use syn::visit::Visit;
+
+    let (path, file) = t4_ast();
+    let (_, raw) = t4_src();
+    let ignore_attr = format!("{}[{}]", '#', "ignore");
+    assert!(
+        !raw.contains(&ignore_attr),
+        "{path}: a ported case is skipped, so the suite reports green without running it"
+    );
+
+    #[derive(Default)]
+    struct Scan {
+        asserts: usize,
+        returns: usize,
+        dead_branches: usize,
+    }
+    impl<'ast> Visit<'ast> for Scan {
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if let Some(seg) = node.mac.path.segments.last()
+                && matches!(seg.ident.to_string().as_str(), "assert" | "assert_eq" | "assert_ne")
+            {
+                self.asserts += 1;
+            }
+            syn::visit::visit_expr_macro(self, node);
+        }
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            // `assert!(..);` in statement position is a Stmt::Macro, not an
+            // Expr::Macro — missing this arm made every scenario look empty.
+            if let Some(seg) = node.mac.path.segments.last()
+                && matches!(seg.ident.to_string().as_str(), "assert" | "assert_eq" | "assert_ne")
+            {
+                self.asserts += 1;
+            }
+            syn::visit::visit_stmt_macro(self, node);
+        }
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            self.returns += 1;
+            syn::visit::visit_expr_return(self, node);
+        }
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            // `if false { assert!(..) }` type-checks, never runs, and would
+            // otherwise satisfy a presence check.
+            if let syn::Expr::Lit(lit) = &*node.cond
+                && matches!(lit.lit, syn::Lit::Bool(_))
+            {
+                self.dead_branches += 1;
+            }
+            syn::visit::visit_expr_if(self, node);
+        }
+    }
+
+    let scenarios = t4_scenarios(&file);
+    assert!(!scenarios.is_empty(), "{path}: no ported cases found");
+    for (name, block) in &scenarios {
+        let mut scan = Scan::default();
+        scan.visit_block(block);
         assert!(
-            !text.contains(&banned),
-            "{path}: `{banned}` is not allowed in a ported suite"
+            scan.asserts > 0,
+            "{path}: {name} invokes no assertion macro, so it proves nothing"
+        );
+        assert_eq!(
+            scan.returns, 0,
+            "{path}: {name} can return early, which would skip its assertions"
+        );
+        assert_eq!(
+            scan.dead_branches, 0,
+            "{path}: {name} guards code behind a constant condition, which never runs"
         );
     }
-    // Even the argument has to be split: writing the word inside quotes would
-    // put the very needle this loop looks for into this file.
-    let q = '"';
-    for shelled in [
-        format!("{q}{}{}{q}", "gi", "t"),
-        format!("{q}/bin/{}{}{q}", "s", "h"),
-        format!("{q}{}{}{q}", "ba", "sh"),
-    ] {
-        assert!(
-            !text.contains(&shelled),
-            "{path}: the suite must not invoke {shelled}; drive Libra through its helpers"
-        );
+
+    let snapshot = t4_snap();
+    assert_eq!(
+        scenarios.len(),
+        snapshot.len(),
+        "{path}: {} ported cases against {} frozen scenarios",
+        scenarios.len(),
+        snapshot.len()
+    );
+}
+
+/// The clean-room boundary, as structure rather than as text. The suite drives
+/// Libra through its own helpers; it never launches a process itself and never
+/// splices another file in at compile time. Both are checked on the AST, so
+/// spacing (`include !(..)`) and aliasing (`use std::process::Command as C`)
+/// cannot slip past.
+#[test]
+fn t4_port_no_foreign_harness() {
+    use syn::visit::Visit;
+
+    let (path, file) = t4_ast();
+
+    #[derive(Default)]
+    struct Scan {
+        findings: Vec<String>,
+    }
+    impl Scan {
+        fn check_path(&mut self, p: &syn::Path, what: &str) {
+            for seg in &p.segments {
+                let ident = seg.ident.to_string();
+                if ident == "Command" {
+                    self.findings
+                        .push(format!("{what} names a process builder ({ident})"));
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Scan {
+        fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+            // `std::process` may supply the Output type the helpers hand back,
+            // and nothing else: importing anything further from it is how a
+            // process launcher gets an alias.
+            let rendered = quote_use(&node.tree);
+            if rendered.contains("process")
+                && !rendered.split("::").last().is_some_and(|t| t.starts_with("Output"))
+            {
+                self.findings
+                    .push(format!("an import reaches into std::process: {rendered}"));
+            }
+            syn::visit::visit_item_use(self, node);
+        }
+        fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+            if let Some(seg) = node.mac.path.segments.last() {
+                let m = seg.ident.to_string();
+                if m.starts_with("include") {
+                    self.findings
+                        .push(format!("a compile-time splice ({m}) is not allowed"));
+                }
+            }
+            syn::visit::visit_expr_macro(self, node);
+        }
+        fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+            if let Some(seg) = node.mac.path.segments.last() {
+                let m = seg.ident.to_string();
+                if m.starts_with("include") {
+                    self.findings
+                        .push(format!("a compile-time splice ({m}) is not allowed"));
+                }
+            }
+            syn::visit::visit_stmt_macro(self, node);
+        }
+        fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+            if let Some(seg) = node.mac.path.segments.last() {
+                let m = seg.ident.to_string();
+                if m.starts_with("include") {
+                    self.findings
+                        .push(format!("a compile-time splice ({m}) is not allowed"));
+                }
+            }
+            syn::visit::visit_item_macro(self, node);
+        }
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            self.check_path(&node.path, "an expression");
+            syn::visit::visit_expr_path(self, node);
+        }
+        fn visit_type_path(&mut self, node: &'ast syn::TypePath) {
+            self.check_path(&node.path, "a type");
+            syn::visit::visit_type_path(self, node);
+        }
+    }
+
+    let mut scan = Scan::default();
+    for item in &file.items {
+        // Skip the guards and their helpers: they are the frozen anchor, and
+        // scanning them would only find the names they exist to look for.
+        if let syn::Item::Fn(f) = item
+            && t4_is_infrastructure(&f.sig.ident.to_string())
+        {
+            continue;
+        }
+        scan.visit_item(item);
+    }
+    assert!(
+        scan.findings.is_empty(),
+        "{path}: the ported suite breaks the clean-room boundary: {:?}",
+        scan.findings
+    );
+}
+
+/// A `use` tree rendered back to a path string, for the import check above.
+fn quote_use(tree: &syn::UseTree) -> String {
+    match tree {
+        syn::UseTree::Path(p) => format!("{}::{}", p.ident, quote_use(&p.tree)),
+        syn::UseTree::Name(n) => n.ident.to_string(),
+        syn::UseTree::Rename(r) => format!("{} as {}", r.ident, r.rename),
+        syn::UseTree::Glob(_) => "*".to_string(),
+        syn::UseTree::Group(g) => g
+            .items
+            .iter()
+            .map(quote_use)
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
@@ -1430,12 +1506,9 @@ fn t4_port_document_scope_and_boundaries() {
 /// dropped scenario fail rather than pass.
 #[test]
 fn t4_port_direct_rows_have_tests() {
-    let (path, text) = t4_src();
-    let defined: std::collections::BTreeSet<String> = t4_items(&text)
-        .into_iter()
-        .map(|(n, _)| n)
-        .filter(|n| !T4_PORT_GUARDS.contains(&n.as_str()))
-        .collect();
+    let (path, file) = t4_ast();
+    let defined: std::collections::BTreeSet<String> =
+        t4_scenarios(&file).into_iter().map(|(n, _)| n).collect();
     let expected: std::collections::BTreeSet<String> =
         t4_snap().into_iter().map(|(_, f)| f).collect();
     let missing: Vec<&String> = expected.difference(&defined).collect();
