@@ -2193,16 +2193,24 @@ fn build_code_ui_resume_bootstrap_snapshot(
     provider: CodeUiProviderInfo,
     capabilities: CodeUiCapabilities,
     projection_bundle: Option<&ThreadBundle>,
-) -> CodeUiSessionSnapshot {
+) -> Result<CodeUiSessionSnapshot, String> {
     let working_dir = working_dir.into();
     // Prefer a durable Code UI checkpoint over a ThreadBundle skeleton. The
     // bundle has no transcript/interaction overlays, so using it when a
     // checkpoint exists would drop indeterminate fences and live UI state
     // while replay starts after the projection cursor.
-    let checkpoint = session
-        .metadata
-        .get(HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY)
-        .and_then(|value| serde_json::from_value::<CodeUiSessionSnapshot>(value.clone()).ok());
+    let checkpoint = match session.metadata.get(HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY) {
+        Some(value) => match serde_json::from_value::<CodeUiSessionSnapshot>(value.clone()) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                return Err(format!(
+                    "session '{}' has a durable Code UI checkpoint that cannot be deserialized ({error}); refusing to resume with a fresh snapshot that could hide an indeterminate reconciliation fence",
+                    session.id
+                ));
+            }
+        },
+        None => None,
+    };
     let used_checkpoint = checkpoint.is_some();
     let mut snapshot = match (checkpoint, projection_bundle) {
         (Some(checkpoint), _) => checkpoint,
@@ -2230,7 +2238,7 @@ fn build_code_ui_resume_bootstrap_snapshot(
     }
 
     finalize_code_ui_resume_bootstrap_snapshot(&mut snapshot);
-    snapshot
+    Ok(snapshot)
 }
 
 fn build_headless_web_code_ui_snapshot(
@@ -2238,7 +2246,7 @@ fn build_headless_web_code_ui_snapshot(
     provider: CodeUiProviderInfo,
     capabilities: CodeUiCapabilities,
     session: &SessionState,
-) -> CodeUiSessionSnapshot {
+) -> Result<CodeUiSessionSnapshot, String> {
     build_code_ui_resume_bootstrap_snapshot(
         working_dir.to_string_lossy(),
         session,
@@ -2333,7 +2341,8 @@ where
         provider.clone(),
         capabilities.clone(),
         &session_state,
-    );
+    )
+    .map_err(CliError::fatal)?;
     let folded =
         fold_code_ui_resume_from_session(&session_store, &session_state, bootstrap_snapshot)
             .map_err(CliError::fatal)?;
@@ -2966,7 +2975,8 @@ async fn build_tui_code_ui_runtime(
         provider,
         capabilities.clone(),
         projection_bundle,
-    );
+    )
+    .map_err(CliError::fatal)?;
     let folded = fold_code_ui_resume_from_session(session_store, session, bootstrap)
         .map_err(CliError::fatal)?;
     let snapshot = folded.snapshot;
@@ -5039,12 +5049,59 @@ mod tests {
             provider,
             capabilities,
             &session,
-        );
+        )
+        .expect("valid checkpoint must resume");
 
         assert_eq!(
             restored.status,
             CodeUiSessionStatus::IndeterminateSideEffect,
             "resume must retain the reconciliation fence even when projection replay is empty"
+        );
+    }
+
+    #[test]
+    fn code_ui_resume_rejects_malformed_durable_checkpoint() {
+        let working_dir = tempfile::tempdir().expect("create temporary workspace");
+        let provider = CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: Some("web-headless".to_string()),
+            managed: false,
+        };
+        let capabilities = headless_capabilities();
+        let mut session = SessionState::new(&working_dir.path().to_string_lossy());
+        session.metadata.insert(
+            HEADLESS_CODE_UI_SNAPSHOT_METADATA_KEY.to_string(),
+            serde_json::json!({"not": "a CodeUiSessionSnapshot"}),
+        );
+        session.metadata.insert(
+            "code_ui_projection_cursor".to_string(),
+            serde_json::json!(7),
+        );
+
+        let headless_error = build_headless_web_code_ui_snapshot(
+            working_dir.path(),
+            provider.clone(),
+            capabilities.clone(),
+            &session,
+        )
+        .expect_err("malformed checkpoint must fail closed");
+        assert!(
+            headless_error.contains("cannot be deserialized"),
+            "headless resume must reject a corrupt durable checkpoint: {headless_error}"
+        );
+
+        let tui_error = build_code_ui_resume_bootstrap_snapshot(
+            working_dir.path().to_string_lossy(),
+            &session,
+            provider,
+            build_tui_code_ui_capabilities(),
+            None,
+        )
+        .expect_err("malformed checkpoint must fail closed for TUI bootstrap");
+        assert!(
+            tui_error.contains("cannot be deserialized"),
+            "TUI resume must reject a corrupt durable checkpoint: {tui_error}"
         );
     }
 
@@ -5082,7 +5139,8 @@ mod tests {
             provider,
             capabilities,
             None,
-        );
+        )
+        .expect("valid checkpoint must bootstrap");
         let folded = fold_code_ui_resume_from_session(&session_store, &session, bootstrap)
             .expect("fold resume snapshot with empty replay suffix");
 

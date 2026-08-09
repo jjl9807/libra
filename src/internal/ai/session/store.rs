@@ -198,10 +198,37 @@ impl SessionStore {
 
     /// Save a session to disk.
     pub fn save(&self, session: &SessionState) -> io::Result<()> {
+        if !is_safe_session_path_id(&session.id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to save session with unsafe id '{}': session ids must be a single relative path component",
+                    session.id
+                ),
+            ));
+        }
         self.ensure_dir()?;
         SessionJsonlStore::new(self.session_root(&session.id))
             .append(&SessionEvent::snapshot(session.clone()))?;
-        self.record_thread_session_index(session)
+        if let Err(error) = self.record_thread_session_index(session) {
+            // Drop the one-time backfill marker so the next lookup rebuilds
+            // instead of permanently omitting this session after a partial save.
+            // Propagate cleanup failure: a stale marker with an unindexed
+            // snapshot would hide the session from thread lookups forever.
+            if let Err(cleanup_error) = fs::remove_file(self.thread_index_backfill_marker_path())
+                && cleanup_error.kind() != io::ErrorKind::NotFound
+            {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to record thread session index for '{}': {error}; additionally failed to invalidate the thread-index backfill marker so lookups can rebuild ({cleanup_error})",
+                        session.id
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Session ids known to belong to `thread_id` (exact id and/or index).
@@ -823,6 +850,22 @@ fn is_safe_thread_index_id(thread_id: &str) -> bool {
         && !thread_id.contains('\0')
 }
 
+fn is_safe_session_path_id(session_id: &str) -> bool {
+    // Session ids are used as directory/file names under sessions/. Reject
+    // path escape and absolute components.
+    if session_id.is_empty()
+        || session_id == "."
+        || session_id == ".."
+        || session_id.contains('/')
+        || session_id.contains('\\')
+        || session_id.contains('\0')
+    {
+        return false;
+    }
+    let path = Path::new(session_id);
+    !path.is_absolute() && path.components().count() == 1
+}
+
 /// Brief info about a saved session.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -835,6 +878,33 @@ pub struct SessionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_rejects_unsafe_session_ids() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::from_storage_path(tmp.path());
+        for unsafe_id in [
+            "../escape",
+            "/tmp/abs",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            ".",
+            "..",
+            "",
+        ] {
+            let mut session = SessionState::new("/repo");
+            session.id = unsafe_id.to_string();
+            let error = store
+                .save(&session)
+                .expect_err("unsafe id must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(
+                !tmp.path().join("sessions").join(unsafe_id).exists(),
+                "unsafe id must not create a session path: {unsafe_id}"
+            );
+        }
+    }
 
     #[test]
     fn test_save_and_load() {
