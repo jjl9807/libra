@@ -9,7 +9,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -25,6 +25,9 @@ use ratatui::{
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
+
+/// Ranking key for choosing the freshest Code session overlay candidate.
+type GraphOverlaySessionRank = (SystemTime, DateTime<Utc>, String);
 
 use crate::{
     internal::{
@@ -216,11 +219,10 @@ async fn load_thread_graph(storage_root: &Path, requested_thread_id: Uuid) -> Re
     let mut graph = ThreadGraph::from_projection(bundle, rows, object_details);
     // Overlay lookup must use the resolved canonical thread id: callers may
     // pass an intent UUID that projection remaps to its owning thread.
-    match load_code_ui_overlay_for_thread(storage_root, graph.thread_id)? {
-        Some((status, transcript_len, pending_interactions)) => {
-            graph = graph.with_code_ui_overlay(status, transcript_len, pending_interactions);
-        }
-        None => {}
+    if let Some((status, transcript_len, pending_interactions)) =
+        load_code_ui_overlay_for_thread(storage_root, graph.thread_id)?
+    {
+        graph = graph.with_code_ui_overlay(status, transcript_len, pending_interactions);
     }
     Ok(graph)
 }
@@ -245,7 +247,7 @@ fn load_code_ui_overlay_for_thread(
 
     let mut latest: Option<(
         crate::internal::ai::session::SessionState,
-        (std::time::SystemTime, DateTime<Utc>, String),
+        GraphOverlaySessionRank,
     )> = None;
     for session_id in candidate_ids {
         let session = match session_store.load(&session_id) {
@@ -1003,7 +1005,7 @@ impl ThreadGraph {
         transcript_len: usize,
         pending_interactions: usize,
     ) -> Self {
-        self.code_ui_status = serde_json::to_value(&status)
+        self.code_ui_status = serde_json::to_value(status)
             .ok()
             .and_then(|value| value.as_str().map(str::to_owned));
         self.code_ui_transcript_len = transcript_len;
