@@ -96,20 +96,70 @@ impl WebServerHandle {
         shutdown_timeout: Duration,
     ) -> Result<(), WebServerShutdownError> {
         let _ = self.shutdown_tx.send(());
-        let mut join = self.join;
-        match timeout(shutdown_timeout, &mut join).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(error))) => Err(WebServerShutdownError::TaskFailed {
-                reason: error.to_string(),
-            }),
-            Ok(Err(error)) => Err(WebServerShutdownError::TaskFailed {
-                reason: error.to_string(),
-            }),
+        // Abort the listener if this future is cancelled by an outer lifecycle
+        // deadline before the local timeout can call `join.abort()`.
+        let mut join = AbortJoinOnDrop::new(self.join);
+        match timeout(shutdown_timeout, join.as_mut()).await {
+            Ok(Ok(Ok(()))) => {
+                join.disarm();
+                Ok(())
+            }
+            Ok(Ok(Err(error))) => {
+                join.disarm();
+                Err(WebServerShutdownError::TaskFailed {
+                    reason: error.to_string(),
+                })
+            }
+            Ok(Err(error)) => {
+                join.disarm();
+                Err(WebServerShutdownError::TaskFailed {
+                    reason: error.to_string(),
+                })
+            }
             Err(_) => {
-                join.abort();
-                let _ = join.await;
+                join.abort_now().await;
                 Err(WebServerShutdownError::TimedOut)
             }
+        }
+    }
+}
+
+/// Ensures a Tokio task is aborted if its owning shutdown future is dropped
+/// mid-wait (for example when a process lifecycle deadline cancels the step).
+struct AbortJoinOnDrop<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+impl<T> AbortJoinOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn as_mut(&mut self) -> &mut tokio::task::JoinHandle<T> {
+        // INVARIANT: handle is present until `disarm` / `abort_now`.
+        self.handle
+            .as_mut()
+            .expect("AbortJoinOnDrop used after disarm")
+    }
+
+    fn disarm(&mut self) {
+        self.handle.take();
+    }
+
+    async fn abort_now(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl<T> Drop for AbortJoinOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
@@ -677,7 +727,7 @@ async fn code_message_handler(
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
         runtime
-            .submit_message(token.as_deref(), body.text)
+            .submit_message(token.as_deref(), body.text, body.command_id)
             .await
             .map_err(WebApiError::from)
     }
@@ -1533,6 +1583,135 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["error"]["code"], "PAYLOAD_TOO_LARGE");
+    }
+
+    #[tokio::test]
+    async fn code_messages_route_forwards_command_id_and_rejects_invalid_ids() {
+        use std::sync::Mutex;
+
+        use axum::extract::connect_info::MockConnectInfo;
+
+        #[derive(Clone)]
+        struct CommandIdAdapter {
+            session: Arc<CodeUiSession>,
+            submitted: Arc<Mutex<Vec<(String, Option<String>)>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::internal::ai::web::code_ui::CodeUiReadModel for CommandIdAdapter {
+            fn session(&self) -> Arc<CodeUiSession> {
+                self.session.clone()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::internal::ai::web::code_ui::CodeUiCommandAdapter for CommandIdAdapter {
+            fn capabilities(&self) -> CodeUiCapabilities {
+                CodeUiCapabilities {
+                    message_input: true,
+                    command_idempotency: true,
+                    ..CodeUiCapabilities::default()
+                }
+            }
+
+            async fn submit_message(&self, text: String) -> anyhow::Result<()> {
+                self.submitted.lock().unwrap().push((text, None));
+                Ok(())
+            }
+
+            async fn submit_message_with_command_id(
+                &self,
+                text: String,
+                command_id: Option<String>,
+            ) -> anyhow::Result<()> {
+                self.submitted.lock().unwrap().push((text, command_id));
+                Ok(())
+            }
+
+            async fn respond_interaction(
+                &self,
+                _interaction_id: &str,
+                _response: crate::internal::ai::web::code_ui::CodeUiInteractionResponse,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities {
+                message_input: true,
+                command_idempotency: true,
+                ..CodeUiCapabilities::default()
+            },
+        ));
+        let adapter = Arc::new(CommandIdAdapter {
+            session: session.clone(),
+            submitted: Arc::new(Mutex::new(Vec::new())),
+        });
+        let runtime =
+            CodeUiRuntimeHandle::build(adapter.clone(), true, CodeUiInitialController::Unclaimed)
+                .await;
+        let attach = runtime
+            .attach_browser_controller("browser-a")
+            .await
+            .expect("browser controller should attach");
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime.clone()),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let body = r#"{"text":"hello","commandId":"cmd-route-1"}"#;
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Code-Controller-Token", attach.controller_token.clone())
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let submitted = adapter.submitted.lock().unwrap().clone();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].0, "hello");
+        let composed = submitted[0]
+            .1
+            .as_deref()
+            .expect("route must forward a composed commandId");
+        assert!(
+            composed.contains(":cmd-route-1"),
+            "composed commandId should preserve the caller id, got {composed}"
+        );
+        assert_eq!(
+            composed.len(),
+            64 + 1 + "cmd-route-1".len(),
+            "composed commandId should be sha256(client)+':'+caller id, got {composed}"
+        );
+
+        let invalid = Request::builder()
+            .method(Method::POST)
+            .uri("/messages")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Code-Controller-Token", attach.controller_token)
+            .body(Body::from(r#"{"text":"hello","commandId":" padded "}"#))
+            .unwrap();
+        let response = app.oneshot(invalid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "INVALID_COMMAND_ID");
     }
 
     #[tokio::test]

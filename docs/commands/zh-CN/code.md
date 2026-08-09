@@ -91,7 +91,7 @@ Ollama 请求默认流式读取 `/api/chat` 响应，并向 debug logs 添加每
 
 Write control 仅限本地。`--control write` 与 `--stdio` 组合会被拒绝，并要求 `--host` 是 loopback（`127.0.0.1`、`::1` 或 `localhost`）。使用相同默认路径启动第二个 write-control 实例会以 `CONTROL_INSTANCE_CONFLICT` 快速失败；只有调用方有意管理多个本地实例时，才使用不同的 `--control-token-file` 和 `--control-info-file` 路径。
 
-Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 `{ "clientId": "...", "kind": "automation" }`，header `X-Libra-Control-Token`，然后使用返回的 `X-Code-Controller-Token` 写入。Automation-held leases 对 `/api/code/messages`、`/api/code/interactions/{id}`、`/api/code/controller/detach` 和 `/api/code/control/cancel` 同时要求两个 tokens。本地 TUI 可以用 `/control reclaim` 重新取得控制权，这会使 automation lease 失效。Code UI 写请求体上限为 256KiB。
+Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 `{ "clientId": "...", "kind": "automation" }`，header `X-Libra-Control-Token`，然后使用返回的 `X-Code-Controller-Token` 写入。Automation-held leases 对 `/api/code/messages`、`/api/code/interactions/{id}`、`/api/code/controller/detach` 和 `/api/code/control/cancel` 同时要求两个 tokens。本地 TUI 可以用 `/control reclaim` 重新取得控制权，这会使 automation lease 失效。Code UI 写请求体上限为 256KiB。当会话广告 `capabilities.commandIdempotency`（当前仅 headless web-only）时，`POST /api/code/messages` 接受 `{ "text": "...", "commandId": "..." }` 以支持重试去重（相同 id + 相同 text 幂等；相同 id + 不同 text 返回 `COMMAND_PAYLOAD_CONFLICT`）。运行时会用活动 controller `clientId` 的 SHA-256 fence 命名空间化 `commandId`（原始 clientId 不会写入 durable command log）。`commandIdempotency` 仅在配置了 durable SessionStore command admission 时广告。其他 runtime 若收到 `commandId` 会显式拒绝，而不会静默忽略。
 
 `GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 使用 [`libra code-control --stdio`](code-control.md)；`libra code --stdio` 仍是 MCP stdio server，不控制 live TUI。
 
@@ -161,8 +161,11 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | 用非 automation lease 调用了 automation-only 路径。 |
 | `CODE_UI_UNAVAILABLE` | 404 | 没有 active `libra code` session 附加到 Web 服务器。 |
 | `INVALID_QUERY_PARAM` | 400 | 查询解析失败，目前用于 `/threads` 分页。 |
+| `INVALID_COMMAND_ID` | 400 | `commandId` 为空、过长，或包含空白/控制字符。 |
 | `STORAGE_PATH_INVALID` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database 或 fallback internal failure。 |
 | `RECONCILIATION_REQUIRED` | 409 | 变异 turn 需要人工 reconciliation；在检查 durable session 数据前不要自动重放。 |
+| `COMMAND_PAYLOAD_CONFLICT` | 409 | 相同 `commandId` 被复用到不同的消息 payload。 |
+| `COMMAND_ALREADY_TERMINAL` | 409 | 相同 `commandId` 已以 failed/cancelled/indeterminate 终态结束；重试需分配新的 `commandId`。 |
 | `UNSUPPORTED_OPERATION` | 422 | Runtime 拒绝尚不支持的请求操作。 |
 
 ### Web Search
@@ -309,7 +312,7 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 
 对于持久化的非 Codex Web session，初始 session 写入是启动 turn 的前提：写入失败时 Libra 不会启动 turn，浏览器可修复存储后重试。若后续持久化失败，live session 会变为 `indeterminate_side_effect`，并阻止新的 submit 或 interaction reply；重启或 reconciliation 前必须检查 durable session data。
 
-收到 `Ctrl-C` 时，非 Codex headless runtime 会先关闭浏览器命令 admission，再最多等待 30 秒让 active turn 得到可判定结果。read-only/model 工作会 cooperative cancel；已经开始的 mutating tool 被允许完成。若超过期限，`libra code` 会以明确的 shutdown failure 退出，重启前必须检查 session 并完成 reconciliation。
+收到 `Ctrl-C` / `SIGINT` 或 `SIGTERM` 时，非 Codex headless / web-only 进程会关闭浏览器命令 admission，再走统一的进程级 lifecycle shutdown owner（runtime / listeners / managed child / control），并共享同一 deadline。read-only/model 工作会 cooperative cancel；已经开始的 mutating tool 在预算内被允许完成。若超过期限，`libra code` 会以明确的 shutdown failure 退出，重启前必须检查 session 并完成 reconciliation。进程编排应优先发送 `SIGTERM`（或 `Ctrl-C`/`SIGINT`），避免直接 `SIGKILL`，以便端口、lease 与子进程被干净释放。
 
 ## 参数对比：Libra vs Git vs jj
 
