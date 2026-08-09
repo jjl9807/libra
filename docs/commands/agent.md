@@ -66,7 +66,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `disable` | Disable one or more external agents and uninstall hooks |
 | `remove` | Alias of `disable`: `remove <name>` ≡ `disable --agent <name>` |
 | `session list` | List captured sessions |
-| `session show <id>` | Show a captured session |
+| `session show <id>` | Show a captured session, including a non-sensitive retryable checkpoint-capture diagnostic when the last Codex Stop failed |
 | `session stop <id>` | Mark a captured session as stopped |
 | `session resume <id>` | Mark a stopped captured session active again |
 | `session promote <id>` | Promote a captured session into Libra intent metadata |

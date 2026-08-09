@@ -50,9 +50,11 @@ boundaries (`subagent-start` / `subagent-end`).
 
 Codex callbacks are advisory to the host agent. If a callback is invoked
 outside a Libra repository, or capture cannot complete because repository
-storage is unavailable, Libra records a non-sensitive tracing warning and
-exits successfully. The affected callback may be absent from capture output
-or lack its checkpoint, but capture availability never fails the Codex task.
+storage is unavailable, Libra records a non-sensitive retryable diagnostic on
+the captured session and exits successfully. The affected callback may be
+absent from capture output or lack its checkpoint, but capture availability
+never fails the Codex task. A later Codex `Stop` can re-own the abandoned
+coverage claim; inspect the state with `libra agent session show <session>`.
 
 `libra hooks gemini <verb>` no longer ingests: gemini is uninstall-only
 (AG-17), so stale hook configs installed before the demotion get an

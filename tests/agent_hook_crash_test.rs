@@ -17,7 +17,6 @@
 
 use std::{
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     time::Duration,
@@ -110,6 +109,24 @@ impl HookRepo {
             &self.run(&["agent", "checkpoint", "list", "--json"], None, &[]),
             "checkpoints",
         )
+    }
+
+    fn session_show(&self, session: &str) -> Value {
+        let out = self.run(&["agent", "session", "show", session, "--json"], None, &[]);
+        assert!(
+            out.status.success(),
+            "session show failed: {}",
+            describe(&out)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parsed: Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|err| panic!("session show stdout is not JSON ({err}): {stdout}"));
+        assert_eq!(
+            parsed["ok"],
+            json!(true),
+            "session show envelope not ok: {parsed}"
+        );
+        parsed["data"].clone()
     }
 
     fn envelope(&self, hook_event_name: &str, session_id: &str, extra: Value) -> String {
@@ -268,11 +285,41 @@ fn hook_handler_panic_leaves_no_partial_write_and_no_stdin_echo() {
 }
 
 /// Codex runs its Stop hook in the foreground. If checkpoint publication
-/// cannot take the maintenance lock, capture must remain advisory: the host
-/// callback succeeds, leaks no hook payload, and writes no checkpoint.
+/// fails after writer registration, capture must remain advisory: the host
+/// callback succeeds, leaks no hook payload, and exposes a retryable session
+/// diagnostic. The next Stop must re-own the abandoned attempt and publish.
 #[test]
-fn codex_stop_acknowledges_capture_failure_when_maintenance_lock_is_unwritable() {
+fn codex_stop_exposes_and_retries_checkpoint_publication_failure() {
     let repo = HookRepo::init();
+    let user_name = repo.run(&["config", "user.name", "Test"], None, &[]);
+    assert!(
+        user_name.status.success(),
+        "user.name: {}",
+        describe(&user_name)
+    );
+    let user_email = repo.run(&["config", "user.email", "test@example.com"], None, &[]);
+    assert!(
+        user_email.status.success(),
+        "user.email: {}",
+        describe(&user_email)
+    );
+    let initial_commit = repo.run(
+        &[
+            "commit",
+            "--allow-empty",
+            "--author",
+            "Test <test@example.com>",
+            "-m",
+            "agent-hook-test",
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        initial_commit.status.success(),
+        "initial commit: {}",
+        describe(&initial_commit)
+    );
     let session = "sess-codex-lock-failure";
     let start = repo.run(
         &["hooks", "codex", "session-start"],
@@ -285,20 +332,12 @@ fn codex_stop_acknowledges_capture_failure_when_maintenance_lock_is_unwritable()
         describe(&start)
     );
 
-    let lock_path = repo.repo.join(".libra").join("maintenance.lock");
-    std::fs::write(&lock_path, b"").expect("create maintenance lock");
-    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o400))
-        .expect("make maintenance lock unwritable");
-
     let marker = "LIBRA_TEST_CODEX_STOP_MARKER_1d412a";
     let stop = repo.run(
         &["hooks", "codex", "stop"],
         Some(&repo.envelope("Stop", session, json!({ "last_assistant_message": marker }))),
-        &[],
+        &[("LIBRA_TEST_CHECKPOINT_FAIL_AFTER_REGISTRATION", "1")],
     );
-
-    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
-        .expect("restore maintenance lock permissions");
 
     assert!(
         stop.status.success(),
@@ -315,6 +354,42 @@ fn codex_stop_acknowledges_capture_failure_when_maintenance_lock_is_unwritable()
     assert!(
         repo.checkpoints().is_empty(),
         "a failed Codex Stop checkpoint publication must not leave a checkpoint"
+    );
+    let failed = repo.session_show(&format!("codex__{session}"));
+    assert_eq!(failed["capture_status"], json!("retryable"));
+    assert_eq!(
+        failed["capture_error_code"],
+        json!("checkpoint_write_failed")
+    );
+
+    // The abandoned coverage claim is deliberately re-ownable. A later Stop
+    // retries the same full-session capture after the injected failure is
+    // removed, matching Entire's deferred recovery behavior.
+    let retry = repo.run(
+        &["hooks", "codex", "stop"],
+        Some(&repo.envelope("Stop", session, json!({}))),
+        &[],
+    );
+    assert!(
+        retry.status.success(),
+        "Codex Stop retry failed: {}",
+        describe(&retry)
+    );
+    let checkpoint_out = repo.run(&["agent", "checkpoint", "list", "--json"], None, &[]);
+    let checkpoints = json_data_rows(&checkpoint_out, "checkpoints");
+    let after_retry = repo.session_show(&format!("codex__{session}"));
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "retry should publish the checkpoint; retry={} list={} session={}",
+        describe(&retry),
+        describe(&checkpoint_out),
+        after_retry
+    );
+    let recovered = repo.session_show(&format!("codex__{session}"));
+    assert!(
+        recovered.get("capture_status").is_none(),
+        "successful retry should clear the failure diagnostic: {recovered}"
     );
 }
 

@@ -21,7 +21,7 @@ libra hooks gemini   <event>   # 拒绝并给出提示：gemini 已是 uninstall
 
 `libra hooks claude <verb>` 是 `libra agent enable --agent claude-code` 写入项目 `.claude/settings.json` 的稳定调用面；`libra hooks codex <verb>`（AG-19）是 `libra agent enable --agent codex` 写入 `$CODEX_HOME/hooks.json` 的稳定调用面。两者都记录到 AgentTraces 捕获存储（`refs/libra/traces`）；claude 历史上路由到 `refs/libra/intent` 写入器的行为已由 Task A6.5 本地采集 smoke 收敛（该 smoke 要求已安装 hook 的采集出现在 `libra agent session/checkpoint list` 中）。Codex 额外转发原生子代理边界（`subagent-start` / `subagent-end`）。
 
-Codex 回调对宿主 Agent 属于辅助采集：在非 Libra 仓库中触发，或因仓库存储不可用而无法完成捕获时，Libra 只记录不含敏感内容的 tracing 警告并成功退出。受影响的回调可能不会出现在捕获结果中，或缺少对应检查点；捕获不可用本身不会让 Codex 任务失败。
+Codex 回调对宿主 Agent 属于辅助采集：在非 Libra 仓库中触发，或因仓库存储不可用而无法完成捕获时，Libra 会在已捕获的 session 上记录不含敏感内容、可重试的诊断并成功退出。受影响的回调可能不会出现在捕获结果中，或缺少对应检查点；捕获不可用本身不会让 Codex 任务失败。后续 Codex `Stop` 可以重新取得已放弃的 coverage claim；可用 `libra agent session show <session>` 查看状态。
 
 `libra hooks gemini <verb>` 不再摄入：gemini 已是 uninstall-only（AG-17），降级前安装的过时 hook 配置会得到指向 `libra agent remove gemini` 的可操作错误，而不是静默捕获数据。
 
