@@ -110,7 +110,7 @@ Libra 自身（`HEAD` `302844b`，`Cargo.toml` version `0.19.106`）：
 |---|---|---|
 | **A. 版本管理** | CT-01 收尾 → UP-01 → LR-01 收尾 → LR-02 → LR-03 → LR-04/LR-05 → LR-08 → LR-09 | CT-01, UP-01, LR-01..05, LR-08, LR-09 |
 | **B. Agent 生成代码** | 工程安全 SB-02/SB-04 → LR-06 → LR-07 → runtime/UI（plan-20260715）→ LR-10 → 归因/trajectory | LR-06, LR-07, LR-10；横切 SB；日期计划 plan-20260715 |
-| **C. Memory** | MEM-01 存储与隐私 → MEM-02 混合召回 → MEM-03 巩固/晋升 → MEM-04 MCP 面 → MEM-05 可移植导出 | MEM-01..MEM-05（新增） |
+| **C. Memory** | MEM-01 存储与隐私 → MEM-02 混合召回 → MEM-03 巩固/晋升 → MEM-04 MCP 面 → MEM-05 可移植导出 → MEM-06 并行协调 | MEM-01..MEM-06（MEM-06 新增） |
 
 横切工程门禁 **SB-01..SB-04** 适用于三类，不单独占一类名额。
 
@@ -138,6 +138,7 @@ flowchart LR
     MEM03[MEM-03 Lifecycle]
     MEM04[MEM-04 MCP]
     MEM05[MEM-05 Portable]
+    MEM06[MEM-06 Coordinate]
   end
   LR01 --> LR05
   LR02 --> LR04
@@ -148,6 +149,8 @@ flowchart LR
   MEM03 --> LR06
   LR07 --> LR10
   MEM02 --> LR10
+  MEM06 --> LR07
+  MEM03 --> MEM06
 ```
 
 ---
@@ -292,6 +295,7 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 | **MEM-03** | 巩固、衰减、遗忘与团队晋升门禁 | P1 | 已验证 | agentmemory 四层 + decay；fava-trails Trust Gate |
 | **MEM-04** | 经鉴权的 Memory MCP / 机器接口 | P1 | 已验证 | agentmemory 54 tools（规模作反例）；须服从 SB-02 |
 | **MEM-05** | 可移植导出（`.af` / MemFS 子集）与 skill 投影 | P2 | 候选 | Letta agent-file、skills、MemFS |
+| **MEM-06** | 并行多 Agent 协调 Memory（协调通道） | P1 | 候选（新增） | 并行工作区需求；Libra worktree/lease 基础；复用 MEM-01/03 |
 
 ### MEM-01：VCS-native Memory 存储与隐私基线
 
@@ -373,6 +377,29 @@ S4 不要求 S1 全部候选项先发布：每个 wave 只以其候选集实际�
 
 **完成判据：** 至少一条导出→清空→导入→召回仍命中的往返测试；文档明确兼容范围。
 
+### MEM-06：并行多 Agent 协调 Memory（协调通道）
+
+**开发者问题：** 多个 Agent 在同一仓库并行执行开发工作时，缺一个共享、有界、可审计、可过期的通道来协调**所有权（谁改什么）**、**移交（做完交给谁）**、**冲突声明（哪里撞了）**与**同步点**；靠猜测、共享文件或 merge 后撞冲突都会造成重复劳动、覆盖与延迟发现。完整设计见 [`tracing/memory.md`](../tracing/memory.md) §19。
+
+**目标能力：**
+
+- 新增保留 namespace `coordination` 与 `MemoryCoordinator` Module（`claim`/`release`/`handoff`/`progress`/`conflict_declare`/`sync_point`），复用 `MemoryWriter` 单一 seam（§4.2.1）。
+- 所有权声明用 cell CAS 保证**单写者赢**；协调条目带短 TTL 自动过期，不毒化后续工作。
+- `CoordinationView` 在 SessionStart 注入（活跃声明、待处理移交、未解冲突、同步点），TurnEnd 经 Working 缓冲回写。
+- 协调条目默认 ephemeral，仅达到晋升门槛（sync-point 复用、handoff 稳定）才经 consolidation + Trust Gate 巩固为持久 note。
+
+**非目标：** 实时消息总线 / agent IM；分布式锁替代（写入冲突仍由 ref CAS / 冲突检测兜底）；默认进入 `default` 持久团队知识；复制 mainline intent-team publication。
+
+**依赖：** MEM-01（存储/隐私）、MEM-03（Trust Gate / 巩固）；与 LR-01 worktree/lease 与 SB-02 授权边界相容。
+
+**完成判据：**
+
+- 单写者赢：并发 `claim` 同一 cell 恰一成功，释放后可重 claim。
+- 移交闭环：A handoff → B（或 `any`）在 SessionStart 注入，B ack 后 A 释放。
+- 过期不毒化：TTL 过期条目从 `CoordinationView` 排除，历史可审计、不阻塞新 claim。
+- 冲突声明触发 `contradicts` 链接并进入隔离；`SecretLike`/`Confidential` 不进协调通道，actor 不信任自报。
+- 协调条目从 `refs/libra/memory/*` 可重建；`MemoryCoordinator` 不绕过 `MemoryWriter`。
+
 ---
 
 ## 工程安全基线（横切）
@@ -421,7 +448,7 @@ LR-06 → LR-07 + RT-01（plan-20260715）；Memory MEM-01/MEM-02 向 LR-07 供�
 
 ### 阶段四：Memory 巩固与规模
 
-MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需。
+MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需；MEM-06（并行协调）依赖 MEM-01/03，可与 LR-01 worktree/lease 并行推进设计。
 
 ---
 
@@ -496,10 +523,11 @@ MEM-03 → MEM-04；LR-09；LR-10；MEM-05 / AG-ATTR 按需。
 - 不采纳未经限定的竞品宣传指标作为完成判据。
 - 不把 Grok 进程级 git ODB 门控（`git_odb.rs`/`git_gate.rs`）当作 Libra 的并发模型照搬——Libra 的 SQLite 状态与对象库访问路径不同；其「相同 in-flight 工作 join + 短快照复用 + 超时不取消」可作 SB-04 资源生命周期与 LR-01 并行工作区性能的参考。
 - 不把 Letta `EnterWorktree`/`ExitWorktree` 的「跨 Agent 锁释放 + 拒绝未合入改动删除」直接复制为 Libra 的 worktree 语义——Libra 已有 `worktree doctor`/lease 模型；其「离开前释放锁、删除前拒绝未合入改动」是 LR-01 完成判据的补充证据。
+- 不把 MEM-06 协调通道实现为实时消息总线 / agent IM / 分布式锁替代：它只协调工作所有权（CAS 单写者赢），真正写入冲突仍由 ref CAS / 冲突检测兜底；不承诺实时投递，也不替代 mainline intent-team publication。
 
 ### 已实现
 
-- 无 LR-01..LR-10 / MEM-01..MEM-05 满足全部长期完成判据。部分基础（worktree、operation、Agent capture、sparse-view）据实记录在总览，不提前关闭整项。
+- 无 LR-01..LR-10 / MEM-01..MEM-06 满足全部长期完成判据。部分基础（worktree、operation、Agent capture、sparse-view）据实记录在总览，不提前关闭整项。
 - **CT-01 部分落地**：兼容证据账本 schema/守卫、29 个 t4 账本行、surface registry、预检/净室基础设施已合入（`plan-20260729.md` S0/S1/S3/S4 首个 wave）；`t4_port_test.rs` 待入库、CT4-01 发布卡待执行，故 CT-01 仍为「实施中」，不标「已实现」。
 
 ---

@@ -44,6 +44,7 @@ Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / b
 - §16 评测与验收
 - §17 验证计划
 - §18 开放问题
+- §19 并行多 Agent 协调 Memory（MEM-06）
 - 总结规则
 
 ### MEM 追溯表
@@ -55,6 +56,7 @@ Memory 是 Libra 的 VCS-native 长期知识层：让 agent 跨 run / thread / b
 | MEM-03 | 巩固、衰减、遗忘与团队晋升门禁 | §7.5 / §10.5 / §10.6 / §13.1 | 设计定稿，Phase B/D |
 | MEM-04 | 经鉴权的 Memory MCP / 机器接口 | §13（受 C9 门禁） | 设计定稿，Phase C-MCP |
 | MEM-05 | 可移植导出（`.af` / MemFS 子集）与 skill 投影 | §5.5 / §15 Phase D/E | 设计定稿，Phase D/E |
+| MEM-06 | 并行多 Agent 协调 Memory（协调通道） | §19 | 设计提案（新增），依赖 MEM-01/03 |
 
 ## 0. 设计基线
 
@@ -1955,6 +1957,7 @@ Libra 专属场景（官方 benchmark 不覆盖）：branch/commit anchor 切换
 | MEM-02 | 无 embedding 配置召回可用且可测；注入不超预算；citation 可人工核验；与 LR-07 preflight 共享同一检索服务 |
 | MEM-03 | 巩固/遗忘单测 + 集成测；晋升失败不泄漏私有原文；doctor 可报告记忆健康 |
 | MEM-05 | 导出→清空→导入→召回命中；兼容范围文档化 |
+| MEM-06 | 单写者赢（并发 claim 恰一成功）；移交闭环（A→B/`any` 注入 + ack）；TTL 过期不毒化、历史可审计；冲突声明触发隔离；协调条目可从 refs 重建且不绕过 `MemoryWriter` |
 
 ## 17. 验证计划
 
@@ -2037,6 +2040,133 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
    精确看到 agent 究竟「记得」什么。该标志已由开放问题升级为 Phase C 硬性
    退出门槛（与 §8.6 的 `ContextReceipt` / `inspect-injection` 并列，G14）。
 
+## 19. 并行多 Agent 协调 Memory（MEM-06，设计提案）
+
+前文 §1–§18 规范的 `Memory` 是**持久知识层**：agent 跨 run / thread / branch 记住并召回可复用事实。本节新增一个**相邻但正交**的能力——**协调 Memory（Coordination Memory）**：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。
+
+### 19.1 开发者问题
+
+在 `libra code` / `worktree` 并行工作区中，多个 agent 同时编辑同一仓库时反复出现四类协调失效：
+
+- **任务所有权冲突**：两个 agent 同时声称"我来改 `src/command/status.rs`"，导致重复劳动或互相覆盖。
+- **移交（handoff）丢失**：一个 agent 完成阶段工作后，不知道把结果交给谁、下一步该谁做。
+- **变更面冲突延迟发现**：agent 各自并行改到重叠文件，直到 merge 时才撞冲突，而不是尽早协调。
+- **进度与同步点缺失**：没有可查询的"谁在做什么、做到哪一步、哪里是同步点"。
+
+`CLAUDE.md` / 全局文件的方案不可行（与 §2.1 相同：上下文污染、token 租金、无版本化），且共享文件本身就有并发写冲突。协调需要的是**有界、可审计、可过期、单写者赢（CAS）**的通道，而不是另一个扁平大文件。
+
+### 19.2 目标与非目标
+
+**目标：**
+
+- 在仓库内提供一个共享、有界、可审计的协调通道，让并行 agent 发布/订阅：**所有权声明（claim）**、**移交（handoff）**、**进度（progress）**、**冲突声明（conflict-declare）**、**同步点（sync-point）**。
+- 复用现有 Memory 三层模型与 `MemoryWriter` 单一 seam，不新建第二套存储或第二套并发机制。
+- 所有权声明用 CAS 保证**单写者赢**；协调条目带短 TTL 自动过期，防止陈旧声明毒化后续工作。
+- 每个 agent 在 SessionStart 注入当前 `CoordinationView`（活跃声明、待处理移交、未解冲突、同步点），并在 TurnEnd 把协调变更写回。
+- 协调变更默认进入 Working 缓冲（§10.5），仅在达到晋升门槛时巩固为持久 `episodic.*` 或 `procedural.*` note。
+
+**非目标：**
+
+- **不是消息总线 / 实时聊天。** 协调是**异步、有界、可过期**的写读，不承诺实时投递、不提供订阅推送、不是 agent 之间的自由文本 IM。
+- **不是分布式锁替代。** `claim` 只协调工作所有权，不替代 `MemoryWriter` 的 ref CAS 或文件系统锁；真正写入冲突仍由 CAS / 冲突检测兜底。
+- **不是持久团队知识。** 协调条目默认 ephemeral（短 TTL），不自动进入 `default` 持久知识；需要持久化的才经 Trust Gate 巩固（§7.5.1）。
+- **不复制 mainline 的 intent-team publication。** 协调是仓库内共享，不是远端团队发布（§5.4 边界仍适用）。
+
+### 19.3 数据模型：CoordinationNamespace 与协调条目
+
+新增一个保留 namespace `coordination`，与 `default` / `codebase:onboard` / `project:onboard` / `private:*` 并列。其路径使用既有 §6.2 文法，根为 `coordination.*`：
+
+```text
+coordination.<task-id>.claims             # 任务所有权声明（replacement，单写者赢）
+coordination.<task-id>.handoff            # 移交记录（accretive，追加）
+coordination.<task-id>.progress           # 进度标记（replacement，覆盖）
+coordination.<task-id>.sync-point         # 同步点（accretive，追加）
+coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，追加）
+```
+
+协调条目复用 `MemoryNote` 快照 + `MemoryEvent` 生命周期，但字段语义有协调专属约定：
+
+| 字段 | 协调语义 |
+|---|---|
+| `kind` | 沿用 `Episodic`（进度/移交）或 `Semantic`（冲突/同步点）；**不新增 kind** |
+| `lifecycle` | `claims`/`progress` 用 `Replacement`；`handoff`/`sync-point`/`conflicts` 用 `Accretive` |
+| `expires_at` | 协调条目的**默认短 TTL**（如 30 分钟声明、6 小时移交）；过期即从 `CoordinationView` 排除，不进入默认召回 |
+| `actor` | 声明者/写者；所有权以已认证 principal 为准（§4.1 规则） |
+| `body` | 有界正文：声明的文件/路径范围、移交的交付物摘要、进度的一行状态 |
+| `evidence_refs` | 移交/冲突可选引用 commit OID / Run / Evidence |
+
+协调条目**默认**是本地 Working 缓冲中的 ephemeral 状态，只有达到晋升门槛（§19.5）才写为持久 `MemoryNote`。为区分，协调写入走 `MemoryWriter` 的一个专门入口 `MemoryCoordinator`（见 §19.4），它复用 `CompileRecord.origin` 的 `Coordinator` 值。
+
+### 19.4 `MemoryCoordinator` Module 与并发语义
+
+协调写入**必须**经 `MemoryWriter` 内部的 `MemoryCoordinator` Module（不新增公共 seam，仍符合 §4.2.1「写入只有一个 seam」）：
+
+- **claim（所有权声明）**：`MemoryCoordinator::claim(scope, task_id, paths, principal)`。对 `coordination.<task>.claims` 执行 **CAS 单写者赢**——仅当该 cell 当前无活声明（或声明已过期）时才接受；否则返回 `OwnedBy{other_actor, claim_note_id}`。claim 写为 `Replacement` note，带短 TTL。
+- **yield / release**：`release(task_id, claim_id)` 追加 `Revoked` 事件，释放所有权（同 §10.3 撤销，但只作用于协调 cell）。
+- **handoff**：`handoff(task_id, from, to, deliverable_summary, evidence_refs)` 追加 `Accretive` note，写移交记录；`to` 可以是 actor 或 `any`（表示"下一个空闲 agent"）。
+- **progress**：`progress(task_id, status, detail)` 写 `Replacement` note，更新进度标记。
+- **conflict-declare**：`conflict_declare(paths_or_tag, mine, theirs, evidence_refs)` 追加 `Accretive` note 到 `coordination.conflicts.*`，触发 `contradicts` 链接，进入隔离/人工解决（§7.5）。
+- **sync-point**：`sync_point(task_id, revision, description)` 追加 `Accretive` note，登记一个可被其他 agent 查询的同步点。
+
+并发语义与现有 §4.2.1 完全一致：所有协调写入都走 ref CAS + 有界重试；claim 的单写者赢在 `(scope, namespace, path)` cell 上由事件状态机 + CAS 共同保证，**不引入文件系统锁**（§4.2.1 明确 worktree checkout 状态不能充当 writer lock）。
+
+### 19.5 `CoordinationView` 与注入
+
+每个 agent 在 SessionStart（§11.1）额外解析一个 `CoordinationView`——它是 `ResolvedMemoryView` 的一个协调子集，冻结当前仓库作用域下的：
+
+- 活跃 claims（未过期的所有权声明，含持有者与路径范围）；
+- 待处理 handoff（`to = <me>` 或 `any` 且未 ack）；
+- 未解决 conflicts（`coordination.conflicts.*` 中非终态条目）；
+- 最近 sync-points（有界数量）。
+
+`CoordinationView` 作为有预算的 prompt 槽位注入（§11.7），**不进入默认持久 recall**；它回答 agent "现在谁在做什么、哪里撞了、我该接手什么"。协调变更在 TurnEnd 经 Working 缓冲回写；达到以下门槛才巩固为持久 note：
+
+- claim 的持有者释放后，其历史由 `episodic.coordination.<task>.handoff` 承接（经 Trust Gate 确认）；
+- 一个 sync-point 被 ≥2 个 agent 复用且稳定，可经 consolidation（§10.5）提升为 `procedural.repo.coordination` 或 `semantic.repo.*` 持久 note。
+
+### 19.6 授权、隐私与过期
+
+- `coordination` namespace 是仓库共享，但**仍须**在读取前做 principal / sensitivity 过滤（§13.1「投影不可越权」）：`SecretLike` / `Confidential` 正文不进协调通道；协调条目 body 默认 `Internal`。
+- claim / handoff 的 `actor` 以已认证 principal 为准，不接受请求体自报（§4.1.1）。
+- 短 TTL 只从 `CoordinationView` 与默认召回排除过期条目；**历史事件与 note 不物理删除**（§10.7），可 `libra memory log` 审计。
+- 协调条目**不得**进入团队 publication / 远端 durable tier，除非经 §5.4 的团队 publication 流程（前置 C9 + SB-02 + mainline ML-01 manifest）。
+
+### 19.7 与现有 MEM 的关系
+
+| 能力 | MEM-01..05 | MEM-06 协调 |
+|---|---|---|
+| 目的 | 持久知识（记住并召回可复用事实） | 并行工作协调（谁做、交给谁、哪里撞） |
+| 生命周期 | 长期，取代/累加 + 巩固 | 短 TTL ephemeral，默认 Working 缓冲 |
+| 注入 | 默认持久 recall + 有界预算 | 独立 `CoordinationView` 槽位 |
+| 写入 | `MemoryWriter` | `MemoryWriter.MemoryCoordinator`（同一 seam） |
+| 晋升 | Trust Gate → Confirmed 持久 note | 仅 sync-point / handoff 稳定后经 consolidation 巩固 |
+| 并发 | CAS + 事件状态机 | 同左；claim 额外单写者赢（cell CAS） |
+
+MEM-06 **不新增存储层、不新增第二套并发机制**，完全构建在既有 §3/§4/§5 之上；它主要是一个新的保留 namespace + 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲与 Trust Gate。
+
+### 19.8 验收与验证（对应 plan-long MEM-06）
+
+- **单写者赢**：两个 agent 并发 `claim` 同一 `(task, paths)` cell，断言恰好一个成功、另一个收到 `OwnedBy{other}`；释放后可重新 claim。
+- **移交闭环**：A handoff → B（`to=<me>`）在 SessionStart 注入；B ack 后 A 的声明释放；`to=any` 时任一空闲 agent 可接手。
+- **过期不毒化**：claim 的 TTL 过期后从 `CoordinationView` 排除，历史仍在 `log` 可审计；不因过期条目拒绝新 claim。
+- **冲突声明**：两个 agent 并行改重叠路径，`conflict_declare` 触发 `contradicts` 链接并进入隔离；`CoordinationView` 显示未解冲突。
+- **不越权**：`SecretLike` / `Confidential` 不进协调通道；`actor` 不信任自报。
+- **无第二真源**：协调条目仍从 `refs/libra/memory/*` 可重建；Working 缓冲可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
+- **与并行工作区衔接**：跨 worktree（§9.1 / [`libra-worktree-architecture.md`](../libra-worktree-architecture.md)）的 agent 都能读到同一 repo 级协调（Repo scope 共享），worktree 级协调按需隔离。
+
+### 19.9 分阶段与优先级
+
+MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建议排在其后：
+
+| 阶段 | 内容 |
+|---|---|
+| 前置 | MEM-01（Phase A）、MEM-03（Phase B）先落地 |
+| MEM-06-a | `coordination` namespace + `MemoryCoordinator`（claim/release/handoff/progress）+ 单写者赢 CAS |
+| MEM-06-b | `CoordinationView` 注入（SessionStart）+ TurnEnd Working 回写 |
+| MEM-06-c | conflict-declare / sync-point + 经 consolidation 巩固为持久 note |
+
+协调 Memory 的价值在于：它把并行 agent 的隐式协调（靠猜、靠共享文件、靠 merge 后撞冲突）变成显式、可审计、可过期的仓库内通道，与 Libra 的 VCS-native + 事件历史 + 单一 writer 纪律完全同构。
+
 ## 总结规则（Summary Rule）
 
 ```text
@@ -2060,6 +2190,9 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
     scopes, refs, watermarks, and policy.          (perstate UX + Libra)
 11. Markdown and graph views are rebuildable,
     redacted, untrusted projections.               (perstate + Libra)
+12. Coordination Memory gives parallel agents a
+    shared, bounded, expiring, single-writer channel
+    for claims, handoffs, conflicts, and sync points. (MEM-06, §19)
 ```
 
 至此，agent 的 memory 成为仓库的一份带版本、可分支、可审计的产物——与代码

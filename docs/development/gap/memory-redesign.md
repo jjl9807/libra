@@ -7,7 +7,7 @@
 - **代码现状（2026-08-07 复核）**：`src/` 中尚无 `MemoryNote` / `MemoryEvent` / `refs/libra/memory/*` 实现，也无 `libra memory` 命令；已落地的只有 `MemoryAnchor` 体系（`src/internal/ai/context_budget/memory_anchor.rs`）与 `with_memory_anchors()`（`src/internal/ai/prompt/builder.rs`）。memory.md 的 Phase A 尚未开工，设计修订成本最低。
 - **事实来源**：memory.md 全文、`plan-long.md`（MEM-01..05）、本地竞品仓库 README / DESIGN / docs（revision 引脚见 §2）、Libra 相关源码。
 - **权威边界**：本文是提案，不替代 memory.md / `agent.md` / `code.md` / `mainline.md` 的设计权威；与既有文档冲突时以对应权威为准，本文只登记「文档同步债」或「待决策」。
-- **落地状态**：A1 / A2 / A7 已按本文落地到 memory.md（§16 评测与验收、§8.7 混合检索通道、§0.0.4 本地语料复核）；**A3（Working 层 / §10.5）、A4（Trust Gate / §7.5.1）、A5（可移植导出导入 / §5.6）、A6 决策（scope_key 为最小单位 / 团队同步维持 local-only）、B2（TOC + 执行摘要 + MEM 追溯表）、B3（MemoryAnchor wire 映射 / §11.6.1）、C（consolidate 命令 / §12–§13）以及 G12–G15（§10.5/§13.1/§18）已按第七次审计合并到 memory.md（2026-08-09）**；B1（§0.0 细节外移）留待后续按需。
+- **落地状态**：A1 / A2 / A7 已按本文落地到 memory.md（§16 评测与验收、§8.7 混合检索通道、§0.0.4 本地语料复核）；**A3（Working 层 / §10.5）、A4（Trust Gate / §7.5.1）、A5（可移植导出导入 / §5.6）、A6 决策（scope_key 为最小单位 / 团队同步维持 local-only）、B2（TOC + 执行摘要 + MEM 追溯表）、B3（MemoryAnchor wire 映射 / §11.6.1）、C（consolidate 命令 / §12–§13）以及 G12–G15（§10.5/§13.1/§18）已按第七次审计合并到 memory.md（2026-08-09）**；B1（§0.0 细节外移）留待后续按需。**2026-08-09 增补 MEM-06**：memory.md 新增 §19 并行多 Agent 协调 Memory（`coordination` namespace + `MemoryCoordinator` + `CoordinationView`），plan-long.md 登记 MEM-06（P1 候选），见 memory.md §19 与 plan-long.md MEM-06。
 
 ## 1. 结论速览
 
