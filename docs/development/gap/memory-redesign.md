@@ -7,7 +7,7 @@
 - **代码现状（2026-08-07 复核）**：`src/` 中尚无 `MemoryNote` / `MemoryEvent` / `refs/libra/memory/*` 实现，也无 `libra memory` 命令；已落地的只有 `MemoryAnchor` 体系（`src/internal/ai/context_budget/memory_anchor.rs`）与 `with_memory_anchors()`（`src/internal/ai/prompt/builder.rs`）。memory.md 的 Phase A 尚未开工，设计修订成本最低。
 - **事实来源**：memory.md 全文、`plan-long.md`（MEM-01..05）、本地竞品仓库 README / DESIGN / docs（revision 引脚见 §2）、Libra 相关源码。
 - **权威边界**：本文是提案，不替代 memory.md / `agent.md` / `code.md` / `mainline.md` 的设计权威；与既有文档冲突时以对应权威为准，本文只登记「文档同步债」或「待决策」。
-- **落地状态**：A1 / A2 / A7 已按本文落地到 memory.md（§16 评测与验收、§8.7 混合检索通道、§0.0.4 本地语料复核）；A3–A6、B、C 待评审后落地。**第七次审计（2026-08-09）**：Memory 类竞品仓库全部无更新，无新机制需吸收；本次新增 G12–G15 缺口（见 §9）并更新优先级，A3/A4/B2/B3/C 相应提前（Phase A/B 前）。
+- **落地状态**：A1 / A2 / A7 已按本文落地到 memory.md（§16 评测与验收、§8.7 混合检索通道、§0.0.4 本地语料复核）；**A3（Working 层 / §10.5）、A4（Trust Gate / §7.5.1）、A5（可移植导出导入 / §5.6）、A6 决策（scope_key 为最小单位 / 团队同步维持 local-only）、B2（TOC + 执行摘要 + MEM 追溯表）、B3（MemoryAnchor wire 映射 / §11.6.1）、C（consolidate 命令 / §12–§13）以及 G12–G15（§10.5/§13.1/§18）已按第七次审计合并到 memory.md（2026-08-09）**；B1（§0.0 细节外移）留待后续按需。
 
 ## 1. 结论速览
 
@@ -16,18 +16,18 @@
 | A1 评测与验收 | memory.md 新 §16 | MEM-02 验收 | P0 | **已落地** |
 | A2 混合检索通道 | memory.md §8.7、§5.2/§14 表 | MEM-02 | P0 | **已落地** |
 | A7 §0.0 语料刷新 + 反例登记 | memory.md §0.0.4 | 文档治理 | P0 | **已落地** |
-| A3 四层巩固与归并语义 | §3.2 / §10.5 | MEM-03 | P1 | 待落地（第七次提前至 Phase B 前） |
-| A4 Trust Gate 显式化 | §7.5 / §10 | MEM-03 | P1 | 待落地（第七次提前至 Phase B 前） |
-| A5 可移植导出/导入 | §5.5 扩展 | MEM-05 | P2 | 待落地 |
-| A6 数据边界与团队同步 | §5.4 / §17(→18) | 开放问题 | P1 决策 / P3 实现 | 待落地 |
+| A3 四层巩固与归并语义 | §3.2 / §10.5 | MEM-03 | P1 | **已落地（§10.5 Working 层）** |
+| A4 Trust Gate 显式化 | §7.5 / §10 | MEM-03 | P1 | **已落地（§7.5.1）** |
+| A5 可移植导出/导入 | §5.5 扩展 | MEM-05 | P2 | **已落地（§5.6）** |
+| A6 数据边界与团队同步 | §5.4 / §17(→18) | 开放问题 | P1 决策 / P3 实现 | **决策已落地（scope_key 最小单位、团队同步 local-only）；实现待 Phase D** |
 | B1 §0.0 细节外移 | gap/memory-redesign.md 承接 | 结构 | P1 | 待落地 |
-| B2 目录 + 执行摘要 + MEM 追溯表 | memory.md 头部 | 治理 | P1 | 待落地 |
-| B3 MemoryAnchor 规范性 wire 映射 | §11.6 | 一致性 | P1 | 待落地 |
-| C `consolidate` 命令补齐 | §12 / §13 | 一致性 | P1 | 待落地（第七次提前至 Phase A 前） |
-| G12 投毒隔离与再验证闭环 | §10.5 / §13.1 | MEM-03 | P1 | **新增（第七次）** |
-| G13 高信任 note 定期再验证 | §7.5 | MEM-03 | P2 | **新增（第七次）** |
-| G14 `--debug-memory` 升 Phase C 硬交付 | §18 | 可观测性 | P1 | **新增（第七次）** |
-| G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | **新增（第七次）** |
+| B2 目录 + 执行摘要 + MEM 追溯表 | memory.md 头部 | 治理 | P1 | **已落地** |
+| B3 MemoryAnchor 规范性 wire 映射 | §11.6 | 一致性 | P1 | **已落地（§11.6.1）** |
+| C `consolidate` 命令补齐 | §12 / §13 | 一致性 | P1 | **已落地** |
+| G12 投毒隔离与再验证闭环 | §10.5 / §13.1 | MEM-03 | P1 | **已落地（§10.6 / §13.1）** |
+| G13 高信任 note 定期再验证 | §7.5 | MEM-03 | P2 | **已落地（§10.6 / §13.1）** |
+| G14 `--debug-memory` 升 Phase C 硬交付 | §18 | 可观测性 | P1 | **已落地（§18）** |
+| G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | **已落地（§18）** |
 
 ## 2. 本地竞品语料与机制分析（第六次审计，revision 引脚）
 
