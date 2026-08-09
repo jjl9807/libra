@@ -1549,7 +1549,7 @@ fn t4_snap() -> Vec<(String, String)> {
 const T4_PORT_GUARDS: &[&str] = &[
     "t4_port_integrity",
     "t4_port_no_foreign_harness",
-    "t4_port_document_scope_and_boundaries",
+    "t4_port_tests_document_scope_and_boundaries",
     "t4_port_direct_rows_have_tests",
 ];
 
@@ -1886,7 +1886,7 @@ fn quote_use(tree: &syn::UseTree) -> String {
 /// The file must say what it covers and what it deliberately does not. A port
 /// that omits its boundary invites the next reader to widen it by accident.
 #[test]
-fn t4_port_document_scope_and_boundaries() {
+fn t4_port_tests_document_scope_and_boundaries() {
     let (path, text) = t4_src();
     let header: String = text
         .lines()
