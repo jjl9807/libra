@@ -141,6 +141,11 @@ replay_git_probe() {          # $1 = a complete argv
   _st=$(git -C "$GRIT_REPO" status --porcelain -- tests) || die "cannot read grit status"
   [ -z "$_st" ] || die "grit tests/ is dirty; the probe would not be reproducible"
   # A hermetic environment: no user config, no pager, no prompts, no stdin.
+  # Local aliases are not a hole here: git refuses to let an alias shadow a
+  # builtin, and every subcommand in the read-only closed set is one —
+  # verified by setting alias.show in a scratch repository and watching the
+  # builtin run anyway. A non-builtin alias does fire, which is exactly why
+  # the closed set is a whitelist of builtins rather than a blacklist.
   env -i PATH=/usr/bin:/bin HOME=/nonexistent LC_ALL=C GIT_CONFIG_NOSYSTEM=1 \
     GIT_CONFIG_GLOBAL=/dev/null GIT_PAGER=cat GIT_TERMINAL_PROMPT=0 \
     git -C "$GRIT_REPO" "$_sub" "$@" > "$GD/_probe.out" 2>/dev/null < /dev/null \

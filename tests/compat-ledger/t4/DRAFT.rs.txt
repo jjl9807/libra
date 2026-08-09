@@ -1257,6 +1257,32 @@ fn t4_items(text: &str) -> Vec<(String, String)> {
     items
 }
 
+/// Whether a test body contains a `return` STATEMENT, as opposed to the word
+/// appearing inside an identifier or a comment. The signature line is skipped
+/// because scenario names legitimately describe what a command returns.
+fn t4_has_return_token(body: &str) -> bool {
+    for line in body.lines().skip(1) {
+        let code = line.split("//").next().unwrap_or("");
+        let bytes = code.as_bytes();
+        let mut from = 0usize;
+        while let Some(at) = code[from..].find("return") {
+            let start = from + at;
+            let end = start + "return".len();
+            let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+            let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = end;
+        }
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 const T4_PORT_GUARDS: &[&str] = &[
     "t4_port_integrity",
     "t4_port_no_foreign_harness",
@@ -1285,12 +1311,22 @@ fn t4_port_integrity() {
         if T4_PORT_GUARDS.contains(&name.as_str()) {
             continue;
         }
+        // The word "assert" can appear in a comment; require a real assertion
+        // macro invocation. These needles are matched inside a SCENARIO body,
+        // never against this guard's own source, so they are safe as literals.
+        let asserts = ["assert!(", "assert_eq!(", "assert_ne!("]
+            .iter()
+            .any(|m| body.contains(m));
         assert!(
-            body.contains("assert"),
-            "{path}: {name} asserts nothing, so it proves nothing"
+            asserts,
+            "{path}: {name} invokes no assertion macro, so it proves nothing"
         );
+        // Any early return can skip the assertions below it, whatever its
+        // spelling — `return;`, `return ();`, or a bare `return` before a
+        // closing brace. Matched as a token and only below the signature: a
+        // case named `..._returns_0_for_no_difference` is not an early return.
         assert!(
-            !body.contains("return;"),
+            !t4_has_return_token(body),
             "{path}: {name} can return early, which would skip its assertions"
         );
     }
@@ -1337,11 +1373,15 @@ fn t4_port_no_foreign_harness() {
     let (path, text) = t4_src();
     // Assembled at run time, for the same reason as the attribute above.
     let cmd = format!("{}{}", "Comm", "and");
+    let inc = format!("{}{}", "inc", "lude");
     for banned in [
         format!("{cmd}::new"),
         format!("std::process::{cmd}"),
-        format!("include_{}{}", "str", '!'),
-        format!("include_{}{}", "bytes", '!'),
+        // The bare form matters most: it splices arbitrary Rust at compile
+        // time, so anything it pulls in is invisible to a scan of this file.
+        format!("{inc}{}", '!'),
+        format!("{inc}_{}{}", "str", '!'),
+        format!("{inc}_{}{}", "bytes", '!'),
     ] {
         assert!(
             !text.contains(&banned),
