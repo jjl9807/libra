@@ -11,7 +11,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -896,6 +896,8 @@ pub struct App<M: CompletionModel> {
     /// [`Self::interrupt_agent_task`]; never hard-aborts a started
     /// mutation dispatch (ADR-CODE-05).
     current_turn_cancellation: Option<CancellationToken>,
+    /// Active model-request sequence for cancellation usage attribution.
+    current_model_turn: Option<Arc<AtomicUsize>>,
     /// Shared with [`ToolLoopCancellation`] for the active turn. When
     /// set, [`Self::interrupt_agent_task`] must not
     /// [`JoinHandle::abort`] the background agent task.
@@ -1153,6 +1155,7 @@ where
             agent_task: None,
             current_turn_abort_token: None,
             current_turn_cancellation: None,
+            current_model_turn: None,
             current_turn_mutation_started: None,
             scheduled_draw_task: None,
             welcome_message: app_config.welcome_message,
@@ -1445,13 +1448,17 @@ where
     fn attach_turn_cancellation(&mut self, config: &mut ToolLoopConfig) {
         let token = CancellationToken::new();
         let mutation_started = Arc::new(AtomicBool::new(false));
+        let active_model_turn = Arc::new(AtomicUsize::new(0));
         self.current_turn_cancellation = Some(token.clone());
+        self.current_model_turn = Some(active_model_turn.clone());
         self.current_turn_mutation_started = Some(Arc::clone(&mutation_started));
         config.cancellation = Some(ToolLoopCancellation::new(token, mutation_started));
+        config.active_model_turn = Some(active_model_turn);
     }
 
     fn clear_turn_cancellation(&mut self) {
         self.current_turn_cancellation = None;
+        self.current_model_turn = None;
         self.current_turn_mutation_started = None;
     }
 
@@ -4822,25 +4829,37 @@ where
         self.clear_pending_code_ui_dialogs().await;
         // OC-Phase 5 P5.4 usage-row backfill (v0.17.797): when a
         // turn is cancelled, the tool_loop's `record_summary` /
-        // `record_failure` path never fires (the future tree is
+        // `record_failure` path may never fire (the future tree is
         // dropped). Record the cancellation as a failure row so
         // the `agent_usage_stats` audit reflects the abandoned
         // turn — error_kind carries the CancelSource so an
         // operator can distinguish Esc / SlashQuit / Automation /
-        // Budget abandons in the rollup.
+        // Budget abandons in the rollup. Runtime cancellations share the
+        // active model turn's event ID, so the database records either the
+        // in-flight request's terminal outcome or this fallback, never both.
         if !mutation_in_progress
             && let (Some(recorder), Some(context)) = (
                 self.config.usage_recorder.as_ref(),
                 self.config.usage_context.as_ref(),
             )
         {
+            let active_model_turn = self
+                .current_model_turn
+                .as_ref()
+                .map(|turn| turn.load(Ordering::Acquire))
+                .filter(|turn| *turn > 0)
+                .unwrap_or(1);
+            let context = local_runtime_turn_id.as_deref().map_or_else(
+                || context.clone(),
+                |turn_id| context.for_runtime_turn_cancellation(turn_id, active_model_turn),
+            );
             let error_kind = match source {
                 CancelSource::Esc => "cancelled_esc",
                 CancelSource::SlashQuit => "cancelled_quit",
                 CancelSource::Automation => "cancelled_automation",
                 CancelSource::Budget => "cancelled_budget",
             };
-            if let Err(err) = recorder.record_failure(context, error_kind, None).await {
+            if let Err(err) = recorder.record_failure(&context, error_kind, None).await {
                 tracing::warn!(
                     %err,
                     error_kind,
@@ -6334,6 +6353,7 @@ where
                             ),
                         );
                     }
+                    config.active_model_turn = self.current_model_turn.clone();
                     if let Some(abort) = self.current_turn_abort_token.clone()
                         && let Some(rt) = config.subagent_runtime.clone()
                     {
@@ -6399,6 +6419,12 @@ where
                         }
                         self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
                     }
+                }
+                if let Some((active_ui_turn, runtime_turn_id)) =
+                    self.active_local_runtime_turn.as_ref()
+                    && *active_ui_turn == turn_id
+                {
+                    bind_usage_context_to_runtime_turn(&mut config, runtime_turn_id);
                 }
 
                 let browser_user_entry = CodeUiTranscriptEntry {
@@ -10832,6 +10858,7 @@ where
                 self.set_idle_and_draw();
                 return false;
             }
+            bind_usage_context_to_runtime_turn(&mut config, &runtime_turn_id);
             self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
             self.pending_plan_workflow_repair_continuation =
                 repair_continuation_interaction_id.clone();
@@ -11842,6 +11869,7 @@ where
         );
 
         let runtime_turn_id = format!("plan-exec-{}", uuid::Uuid::new_v4());
+        bind_usage_context_to_runtime_turn(&mut tool_loop_config, &runtime_turn_id);
         let session_id = self.session.id.clone();
         let runtime_turn_id_for_wait = runtime_turn_id.clone();
         let runner_turn_id = turn_id;
@@ -12631,6 +12659,7 @@ where
                 self.set_idle_and_draw();
                 return;
             }
+            bind_usage_context_to_runtime_turn(&mut config, &runtime_turn_id);
             self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
         }
 
@@ -18045,6 +18074,20 @@ fn apply_automation_approval_scope(config: &mut ToolLoopConfig, turn_id: TurnId)
         return;
     };
     approval.scope_key_prefix = Some(format!("automation:{turn_id}"));
+}
+
+/// Attribute all model requests in a TUI loop to its durable runtime turn.
+///
+/// `UsageContext::for_runtime_turn` supplies a stable event prefix; the tool
+/// loop appends its model-turn sequence so retries dedupe without coalescing
+/// multiple model requests from the same turn.
+fn bind_usage_context_to_runtime_turn(config: &mut ToolLoopConfig, runtime_turn_id: &str) {
+    if let Some(context) = config.usage_context.as_mut() {
+        *context = context.for_runtime_turn(runtime_turn_id);
+    }
+    if let Some(runtime) = config.subagent_runtime.as_mut() {
+        runtime.parent_turn_id = Some(runtime_turn_id.to_string());
+    }
 }
 
 fn attach_file_history_context(

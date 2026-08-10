@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-12, 2026-08-11)
+
+- **W2-12 delivers UI-neutral runtime usage attribution and query.**
+  `RuntimeUsageService` attributes spend at repo/session/turn/sub-agent,
+  reuses `internal/ai/usage` with session-scoped event idempotency, and
+  exposes Known/Partial/Unknown (plus mixed `$exact + ~$estimate`) on CLI,
+  CSV/JSON, and TUI formatters. Headless and TUI bind durable turn IDs;
+  cancel races prefer completed provider usage over placeholders.
+
 ### Added (plan-20260715 W2-11, 2026-08-11)
 
 - **W2-11 migrates plan-execution failure classification and repair loops into

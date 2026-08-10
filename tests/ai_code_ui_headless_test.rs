@@ -11,31 +11,36 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use libra::internal::ai::{
-    agent::runtime::tool_loop::ToolLoopConfig,
-    completion::Message,
-    providers::fake,
-    runtime::{InteractionState, ToolBoundaryRuntime, TracingAuditSink},
-    sandbox::{ExecApprovalRequest, NetworkAccess},
-    session::{
-        SessionState, SessionStore,
-        jsonl::{CodeWorkflowEventKind, SessionJsonlStore},
-    },
-    tools::{
-        ToolHandler, ToolInvocation, ToolKind, ToolOutput, ToolRegistry, ToolRegistryBuilder,
-        ToolResult, ToolSpec,
-        context::{UserInputQuestion, UserInputRequest, UserInputResponse},
-        handlers::{PlanHandler, ReadFileHandler, SubmitPlanDraftHandler},
-    },
-    web::{
-        code_ui::{
-            CodeUiApplyToFuture, CodeUiCommandAdapter, CodeUiInteractionResponse,
-            CodeUiInteractionStatus, CodeUiProviderInfo, CodeUiReadModel, CodeUiSession,
-            CodeUiSessionStatus, initial_snapshot,
+use libra::internal::{
+    ai::{
+        agent::runtime::{RuntimeUsageService, tool_loop::ToolLoopConfig},
+        completion::Message,
+        providers::fake,
+        runtime::{InteractionState, ToolBoundaryRuntime, TracingAuditSink},
+        sandbox::{ExecApprovalRequest, NetworkAccess},
+        session::{
+            SessionState, SessionStore,
+            jsonl::{CodeWorkflowEventKind, SessionJsonlStore},
         },
-        headless::{HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities},
+        tools::{
+            ToolHandler, ToolInvocation, ToolKind, ToolOutput, ToolRegistry, ToolRegistryBuilder,
+            ToolResult, ToolSpec,
+            context::{UserInputQuestion, UserInputRequest, UserInputResponse},
+            handlers::{PlanHandler, ReadFileHandler, SubmitPlanDraftHandler},
+        },
+        usage::{UsageContext, UsageQueryFilter, UsageRecorder},
+        web::{
+            code_ui::{
+                CodeUiApplyToFuture, CodeUiCommandAdapter, CodeUiInteractionResponse,
+                CodeUiInteractionStatus, CodeUiProviderInfo, CodeUiReadModel, CodeUiSession,
+                CodeUiSessionStatus, initial_snapshot,
+            },
+            headless::{HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities},
+        },
     },
+    db::migration::run_builtin_migrations,
 };
+use sea_orm::{ConnectionTrait, Database, Statement};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -667,6 +672,131 @@ async fn caller_supplied_command_id_is_durable_and_idempotent() {
     assert_eq!(
         intent_count, 1,
         "idempotent retry and payload conflict must not append a second intent"
+    );
+}
+
+/// A completed browser retry must not replay provider usage. This exercises the
+/// HeadlessDirectTurnExecutor path that replaces the config's local identity
+/// with the durable runtime command id, while the tool loop adds the
+/// per-model-turn suffix used as the idempotency key. The deterministic fake
+/// provider fixture supplies non-zero usage; this test runs only with
+/// `--features test-provider`, as does the rest of this target.
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_command_retry_does_not_double_count_executor_usage() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let mut state = SessionState::new(&workdir.path().to_string_lossy());
+    let thread_id = state.id.clone();
+    state
+        .metadata
+        .insert("thread_id".to_string(), serde_json::json!(thread_id));
+    let persistence = HeadlessSessionPersistence::new(store, state);
+
+    let conn = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect usage sqlite");
+    run_builtin_migrations(&conn)
+        .await
+        .expect("run usage migrations");
+    let recorder = UsageRecorder::new(conn.clone());
+    let usage_context = UsageContext {
+        repo_id: Some("headless-usage-repo".to_string()),
+        session_id: Some("headless-usage-session".to_string()),
+        thread_id: Some("headless-usage-thread".to_string()),
+        agent_run_id: None,
+        run_id: Some("config-local-run-id".to_string()),
+        turn_id: Some("config-local-turn-id".to_string()),
+        event_id: Some("config-local-event-id".to_string()),
+        provider: "fake".to_string(),
+        model: "fake".to_string(),
+        request_kind: "completion".to_string(),
+        intent: Some("headless-retry-test".to_string()),
+        agent_name: None,
+    };
+    let config_factory: Arc<dyn Fn() -> ToolLoopConfig + Send + Sync> =
+        Arc::new(move || ToolLoopConfig {
+            usage_recorder: Some(recorder.clone()),
+            usage_context: Some(usage_context.clone()),
+            ..ToolLoopConfig::default()
+        });
+    let registry = Arc::new(
+        ToolRegistryBuilder::with_working_dir(workdir.path().to_path_buf())
+            .hardening(ToolBoundaryRuntime::system(
+                Uuid::new_v4(),
+                Arc::new(TracingAuditSink),
+            ))
+            .build(),
+    );
+    let (runtime, _, _) = build_runtime_with_registry_and_config(
+        "basic_chat",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+        registry,
+        config_factory,
+    )
+    .await;
+    let command_id = "headless-usage-retry-1".to_string();
+
+    runtime
+        .submit_message_with_command_id(
+            "record provider usage".to_string(),
+            Some(command_id.clone()),
+        )
+        .await
+        .expect("first durable command should admit");
+
+    let service = RuntimeUsageService::new(UsageRecorder::new(conn.clone()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let totals = service
+            .current_turn(&command_id, UsageQueryFilter::default())
+            .await
+            .expect("query headless turn usage");
+        if totals.request_count == 1 {
+            assert_eq!(totals.total_tokens, 10);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before_retry = service
+        .current_turn(&command_id, UsageQueryFilter::default())
+        .await
+        .expect("query first command usage");
+    assert_eq!(before_retry.request_count, 1);
+    assert_eq!(before_retry.total_tokens, 10);
+
+    runtime
+        .submit_message_with_command_id(
+            "record provider usage".to_string(),
+            Some(command_id.clone()),
+        )
+        .await
+        .expect("completed retry should acknowledge without re-dispatch");
+
+    let after_retry = service
+        .current_turn(&command_id, UsageQueryFilter::default())
+        .await
+        .expect("query retried command usage");
+    assert_eq!(after_retry.request_count, 1);
+    assert_eq!(after_retry.total_tokens, 10);
+
+    let rows = conn
+        .query_all_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!(
+                "SELECT turn_id, event_id FROM agent_usage_stats \
+                 WHERE event_id = 'runtime-turn:{command_id}:model-turn:1'"
+            ),
+        ))
+        .await
+        .expect("read executor usage row");
+    assert_eq!(rows.len(), 1, "retry must leave one provider usage row");
+    assert_eq!(
+        rows[0].try_get_by::<String, _>("turn_id").ok().as_deref(),
+        Some(command_id.as_str()),
+        "executor must replace config-local turn_id with durable command id"
     );
 }
 

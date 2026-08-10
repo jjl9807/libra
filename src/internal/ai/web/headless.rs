@@ -841,6 +841,19 @@ where
         };
         let prior_history = self.history.lock().await.clone();
         let mut config = (self.config_factory)();
+        if let Some(usage_context) = config.usage_context.as_mut() {
+            // The serialized runtime's request id is durable and replay-stable.
+            // It is the single turn/event identity shared by browser retries,
+            // rather than a UI-local counter.
+            usage_context.run_id = Some(request.turn_id.clone());
+            usage_context.turn_id = Some(request.turn_id.clone());
+            usage_context.event_id = Some(format!("runtime-turn:{}", request.turn_id));
+        }
+        if let Some(subagent_runtime) = config.subagent_runtime.as_mut() {
+            // Child usage stays on the parent's durable turn; the child run is
+            // identified separately by its agent_run_id/run_id.
+            subagent_runtime.parent_turn_id = Some(request.turn_id.clone());
+        }
         config.cancellation = Some(ToolLoopCancellation::new(
             context.cancellation(),
             mutation_started,

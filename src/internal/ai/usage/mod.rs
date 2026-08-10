@@ -5,7 +5,9 @@ pub mod pricing;
 pub mod query;
 pub mod recorder;
 
-pub use format::{UsageDisplaySnapshot, format_usage_badge, format_usage_detail_panel};
+pub use format::{
+    UsageDisplaySnapshot, format_aggregate_cost, format_usage_badge, format_usage_detail_panel,
+};
 pub use pricing::{UsagePrice, UsagePriceTable, UsagePricingConfigError};
 pub use query::{UsageAggregate, UsageGrouping, UsageQuery, UsageQueryFilter};
 pub use recorder::{UsageContext, UsageRecorder};

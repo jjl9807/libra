@@ -3,11 +3,21 @@
     {
       "match": { "contains": "hello" },
       "type": "text",
-      "text": "fake assistant: hello from the PTY harness"
+      "text": "fake assistant: hello from the PTY harness",
+      "usage": {
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "total_tokens": 10
+      }
     }
   ],
   "fallback": {
     "type": "text",
-    "text": "fake assistant: fallback"
+    "text": "fake assistant: fallback",
+    "usage": {
+      "input_tokens": 7,
+      "output_tokens": 3,
+      "total_tokens": 10
+    }
   }
 }

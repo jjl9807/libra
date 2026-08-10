@@ -27,11 +27,13 @@ use crate::internal::ai::{
 
 pub mod builder;
 pub mod tool_loop;
+pub mod usage;
 pub use builder::AgentBuilder;
 pub use tool_loop::{
     ToolLoopCancellation, ToolLoopConfig, ToolLoopObserver, ToolLoopTurn, run_tool_loop,
     run_tool_loop_with_history_and_observer,
 };
+pub use usage::{RuntimeUsageService, RuntimeUsageTotals, UsageStatus, usage_status};
 
 pub mod chat;
 pub use chat::ChatAgent;

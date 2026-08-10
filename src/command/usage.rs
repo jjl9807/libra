@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     info_println,
     internal::{
-        ai::usage::{UsageGrouping, UsageQuery, UsageQueryFilter},
+        ai::{
+            agent::runtime::{UsageStatus, usage_status},
+            usage::{UsageGrouping, UsageQuery, UsageQueryFilter},
+        },
         db::get_db_conn_instance_for_path,
     },
     utils::{
@@ -195,6 +198,7 @@ async fn report_usage(options: UsageReportOptions, output: &OutputConfig) -> Cli
         session_id: filter_output.session.clone(),
         thread_id: filter_output.thread.clone(),
         include_failed: filter_output.include_failed,
+        ..UsageQueryFilter::default()
     };
     let db = open_repo_db().await?;
     let rows = UsageQuery::new(db)
@@ -221,7 +225,7 @@ async fn report_usage(options: UsageReportOptions, output: &OutputConfig) -> Cli
         return Ok(());
     }
     for row in &rows {
-        let total = usage_total_tokens(row);
+        let tokens = usage_human_tokens(row);
         let cost = usage_human_cost(row);
         match options.by {
             UsageReportBy::Model => {
@@ -232,7 +236,7 @@ async fn report_usage(options: UsageReportOptions, output: &OutputConfig) -> Cli
                     row.model,
                     row.request_count,
                     row.failed_count,
-                    total,
+                    tokens,
                     row.cached_tokens,
                     row.reasoning_tokens,
                     row.tool_call_count,
@@ -247,7 +251,7 @@ async fn report_usage(options: UsageReportOptions, output: &OutputConfig) -> Cli
                     usage_agent_name(row),
                     row.request_count,
                     row.failed_count,
-                    total,
+                    tokens,
                     row.cached_tokens,
                     row.reasoning_tokens,
                     row.tool_call_count,
@@ -264,7 +268,7 @@ async fn report_usage(options: UsageReportOptions, output: &OutputConfig) -> Cli
                     row.model,
                     row.request_count,
                     row.failed_count,
-                    total,
+                    tokens,
                     row.cached_tokens,
                     row.reasoning_tokens,
                     row.tool_call_count,
@@ -370,15 +374,15 @@ fn emit_usage_csv(
     match by {
         UsageReportBy::Model => info_println!(
             output,
-            "provider,model,requests,failed,prompt_tokens,completion_tokens,cached_tokens,reasoning_tokens,total_tokens,tool_calls,wall_ms,cost_usd,cost_estimate_micro_dollars"
+            "provider,model,requests,failed,prompt_tokens,completion_tokens,cached_tokens,reasoning_tokens,total_tokens,tool_calls,wall_ms,cost_usd,cost_estimate_micro_dollars,usage_status,unknown_usage_count,cost_status,unknown_cost_count"
         ),
         UsageReportBy::Agent => info_println!(
             output,
-            "agent_name,requests,failed,prompt_tokens,completion_tokens,cached_tokens,reasoning_tokens,total_tokens,tool_calls,wall_ms,cost_usd,cost_estimate_micro_dollars"
+            "agent_name,requests,failed,prompt_tokens,completion_tokens,cached_tokens,reasoning_tokens,total_tokens,tool_calls,wall_ms,cost_usd,cost_estimate_micro_dollars,usage_status,unknown_usage_count,cost_status,unknown_cost_count"
         ),
         UsageReportBy::AgentProviderModel => info_println!(
             output,
-            "agent_name,provider,model,requests,failed,prompt_tokens,completion_tokens,cached_tokens,reasoning_tokens,total_tokens,tool_calls,wall_ms,cost_usd,cost_estimate_micro_dollars"
+            "agent_name,provider,model,requests,failed,prompt_tokens,completion_tokens,cached_tokens,reasoning_tokens,total_tokens,tool_calls,wall_ms,cost_usd,cost_estimate_micro_dollars,usage_status,unknown_usage_count,cost_status,unknown_cost_count"
         ),
     };
     for row in rows {
@@ -391,10 +395,12 @@ fn emit_usage_csv(
             .cost_estimate_micro_dollars
             .map(|cost| cost.to_string())
             .unwrap_or_default();
+        let usage_state = usage_status(row.request_count, row.unknown_usage_count).as_str();
+        let cost_state = usage_status(row.request_count, row.unknown_cost_count).as_str();
         match by {
             UsageReportBy::Model => info_println!(
                 output,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 csv_escape(&row.provider),
                 csv_escape(&row.model),
                 row.request_count,
@@ -407,11 +413,15 @@ fn emit_usage_csv(
                 row.tool_call_count,
                 row.wall_clock_ms,
                 cost,
-                cost_estimate
+                cost_estimate,
+                usage_state,
+                row.unknown_usage_count,
+                cost_state,
+                row.unknown_cost_count
             ),
             UsageReportBy::Agent => info_println!(
                 output,
-                "{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 csv_escape(row.agent_name.as_deref().unwrap_or("")),
                 row.request_count,
                 row.failed_count,
@@ -423,11 +433,15 @@ fn emit_usage_csv(
                 row.tool_call_count,
                 row.wall_clock_ms,
                 cost,
-                cost_estimate
+                cost_estimate,
+                usage_state,
+                row.unknown_usage_count,
+                cost_state,
+                row.unknown_cost_count
             ),
             UsageReportBy::AgentProviderModel => info_println!(
                 output,
-                "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 csv_escape(row.agent_name.as_deref().unwrap_or("")),
                 csv_escape(&row.provider),
                 csv_escape(&row.model),
@@ -441,7 +455,11 @@ fn emit_usage_csv(
                 row.tool_call_count,
                 row.wall_clock_ms,
                 cost,
-                cost_estimate
+                cost_estimate,
+                usage_state,
+                row.unknown_usage_count,
+                cost_state,
+                row.unknown_cost_count
             ),
         }
     }
@@ -518,12 +536,17 @@ fn validate_positive_retention_days(days: u32, source: &str) -> CliResult<u32> {
 }
 
 fn usage_human_cost(row: &crate::internal::ai::usage::UsageAggregate) -> String {
-    if let Some(cost) = row.cost_usd {
-        return format!(" ${cost:.4}");
+    let status = usage_status(row.request_count, row.unknown_cost_count);
+    let cost = crate::internal::ai::usage::format_aggregate_cost(row);
+
+    match status {
+        UsageStatus::Known => format!(" {cost}"),
+        UsageStatus::Partial | UsageStatus::Unknown => format!(
+            " {cost} ({}; unknown_cost={})",
+            status.as_str(),
+            row.unknown_cost_count
+        ),
     }
-    row.cost_estimate_micro_dollars
-        .map(|micro| format!(" ~${:.4}", micro as f64 / 1_000_000.0))
-        .unwrap_or_default()
 }
 
 fn usage_total_tokens(row: &crate::internal::ai::usage::UsageAggregate) -> u64 {
@@ -531,6 +554,19 @@ fn usage_total_tokens(row: &crate::internal::ai::usage::UsageAggregate) -> u64 {
         row.total_tokens
     } else {
         row.prompt_tokens.saturating_add(row.completion_tokens)
+    }
+}
+
+fn usage_human_tokens(row: &crate::internal::ai::usage::UsageAggregate) -> String {
+    let total = usage_total_tokens(row);
+    let status = usage_status(row.request_count, row.unknown_usage_count);
+    match status {
+        UsageStatus::Known => total.to_string(),
+        UsageStatus::Partial | UsageStatus::Unknown => format!(
+            "{total} ({}; unknown_usage={})",
+            status.as_str(),
+            row.unknown_usage_count
+        ),
     }
 }
 
@@ -680,15 +716,24 @@ mod tests {
             tool_call_count: 0,
             wall_clock_ms: 1,
             cost_usd: Some(0.25),
-            cost_estimate_micro_dollars: Some(250_000),
+            cost_estimate_micro_dollars: None,
+            unknown_usage_count: 0,
+            unknown_cost_count: 0,
         };
         assert_eq!(usage_human_cost(&actual), " $0.2500");
 
         let estimated = UsageAggregate {
             cost_usd: None,
             cost_estimate_micro_dollars: Some(1_350_000),
-            ..actual
+            ..actual.clone()
         };
         assert_eq!(usage_human_cost(&estimated), " ~$1.3500");
+
+        let mixed = UsageAggregate {
+            cost_usd: Some(0.25),
+            cost_estimate_micro_dollars: Some(1_600_000),
+            ..actual
+        };
+        assert_eq!(usage_human_cost(&mixed), " $0.2500 + ~$1.6000");
     }
 }

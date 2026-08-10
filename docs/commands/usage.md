@@ -18,6 +18,9 @@ requests should be included.
 When a provider reports an exact `cost_usd`, Libra stores and displays that
 value. Otherwise it estimates `cost_estimate_micro_dollars` from the built-in
 model capability pricing table or a repository override in `.libra/config.toml`.
+An aggregate can contain both kinds of cost. Human and TUI output display both
+components as `$<actual> + ~$<estimate>`; the estimate is not hidden behind the
+exact subtotal.
 
 ## Subcommands
 
@@ -53,25 +56,38 @@ Human reports print one tab-separated row per selected grouping.
 Default provider/model grouping:
 
 ```text
-<provider>	<model>	requests=<n>	failed=<n>	tokens=<n>	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>]
+<provider>	<model>	requests=<n>	failed=<n>	tokens=<n> [ (partial|unknown; unknown_usage=<n>) ]	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>| $<actual> + ~$<estimate>| unknown ] [ (partial|unknown; unknown_cost=<n>) ]
 ```
 
 Agent grouping:
 
 ```text
-<agent_name>	requests=<n>	failed=<n>	tokens=<n>	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>]
+<agent_name>	requests=<n>	failed=<n>	tokens=<n> [ (partial|unknown; unknown_usage=<n>) ]	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>| $<actual> + ~$<estimate>| unknown ] [ (partial|unknown; unknown_cost=<n>) ]
 ```
 
 Agent/provider/model grouping:
 
 ```text
-<agent_name>	<provider>	<model>	requests=<n>	failed=<n>	tokens=<n>	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>]
+<agent_name>	<provider>	<model>	requests=<n>	failed=<n>	tokens=<n> [ (partial|unknown; unknown_usage=<n>) ]	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>| $<actual> + ~$<estimate>| unknown ] [ (partial|unknown; unknown_cost=<n>) ]
 ```
 
 CSV mode prints a header row followed by comma-separated rows suitable for
 spreadsheet import. The CSV leading columns match the selected grouping, and
 the metric columns include both `cost_usd` and `cost_estimate_micro_dollars`;
-estimated human output is prefixed with `~$`.
+estimated human output is prefixed with `~$`. Its four trailing columns are
+`usage_status`, `unknown_usage_count`, `cost_status`, and
+`unknown_cost_count`. A status is `known` when every request has the
+corresponding data, `partial` when only some requests do, and `unknown` when
+none do. These columns are appended after the existing CSV metrics; consumers
+that require a fixed header must accept the appended fields or select only the
+columns they support.
+
+Human output applies the same contract inline: token subtotals and costs are
+annotated with `partial` or `unknown` and their matching unknown-row count.
+Numeric token and cost values in a partial row are known subtotals, not a
+complete total; an unknown cost is rendered as `unknown`, never `$0`.
+CSV and JSON retain separate `cost_usd` and `cost_estimate_micro_dollars`
+fields, so consumers can preserve the same exact-plus-estimated distinction.
 
 ## Pricing Overrides
 
@@ -120,6 +136,11 @@ passed. The flag always wins over the project config.
 
 `prune` uses `usage.prune` and reports the retention window, cutoff timestamp,
 and deleted row count.
+
+Each object in `data.rows` includes `unknown_usage_count` and
+`unknown_cost_count`. Derive the same `known`/`partial`/`unknown` status from
+each count and `request_count` as described above. The numeric totals in rows
+with a nonzero unknown count are partial known subtotals.
 
 ## Examples
 

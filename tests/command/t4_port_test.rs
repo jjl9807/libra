@@ -2169,7 +2169,7 @@ fn t4_check_doc_contract(doc: &str, ids: &[String]) -> Option<String> {
         let start = doc.find(&format!("{label}: "))?;
         let rest = &doc[start + label.len() + 2..];
         let end = rest
-            .find(&format!("\n功能: "))
+            .find("\n功能: ")
             .or_else(|| rest.find("\n覆盖范围: "))
             .or_else(|| rest.find("\n边界: "))
             .or_else(|| rest.find("\nscenario_id: "))

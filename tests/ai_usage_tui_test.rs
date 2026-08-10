@@ -48,6 +48,8 @@ fn usage_detail_panel_formats_sqlite_aggregates() {
         cost_usd: None,
         cost_estimate_micro_dollars: Some(1234),
         failed_count: 1,
+        unknown_usage_count: 0,
+        unknown_cost_count: 0,
     };
 
     let panel = format_usage_detail_panel(&snapshot, "agent/provider/model", &[aggregate]);

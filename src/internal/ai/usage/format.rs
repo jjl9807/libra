@@ -1,4 +1,5 @@
 use super::query::UsageAggregate;
+use crate::internal::ai::agent::runtime::{UsageStatus, usage_status};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageDisplaySnapshot {
@@ -32,7 +33,7 @@ pub fn format_usage_detail_panel(
             "{} | req {} | tok {} | tools {} | wall {:.1}s | cost {} | failed {}",
             usage_aggregate_label(aggregate),
             aggregate.request_count,
-            compact_count(aggregate.total_tokens),
+            format_aggregate_tokens(aggregate),
             aggregate.tool_call_count,
             aggregate.wall_clock_ms as f64 / 1000.0,
             format_aggregate_cost(aggregate),
@@ -69,14 +70,37 @@ fn usage_aggregate_label(aggregate: &UsageAggregate) -> String {
     }
 }
 
-fn format_aggregate_cost(aggregate: &UsageAggregate) -> String {
-    if let Some(cost) = aggregate.cost_usd {
-        return format!("${cost:.4}");
+pub fn format_aggregate_cost(aggregate: &UsageAggregate) -> String {
+    let cost = match (aggregate.cost_usd, aggregate.cost_estimate_micro_dollars) {
+        (Some(cost), Some(micros)) => {
+            format!("${cost:.4} + ~${:.4}", micros as f64 / 1_000_000.0)
+        }
+        (Some(cost), None) => format!("${cost:.4}"),
+        (None, Some(micros)) => format!("~${:.4}", micros as f64 / 1_000_000.0),
+        (None, None) => "unknown".to_string(),
+    };
+    let status = usage_status(aggregate.request_count, aggregate.unknown_cost_count);
+    match status {
+        UsageStatus::Known => cost,
+        UsageStatus::Partial | UsageStatus::Unknown => format!(
+            "{cost} ({}; unknown_cost={})",
+            status.as_str(),
+            aggregate.unknown_cost_count
+        ),
     }
-    if let Some(micros) = aggregate.cost_estimate_micro_dollars {
-        return format!("~${:.4}", micros as f64 / 1_000_000.0);
+}
+
+fn format_aggregate_tokens(aggregate: &UsageAggregate) -> String {
+    let total = compact_count(aggregate.total_tokens);
+    let status = usage_status(aggregate.request_count, aggregate.unknown_usage_count);
+    match status {
+        UsageStatus::Known => total,
+        UsageStatus::Partial | UsageStatus::Unknown => format!(
+            "{total} ({}; unknown_usage={})",
+            status.as_str(),
+            aggregate.unknown_usage_count
+        ),
     }
-    "-".to_string()
 }
 
 fn compact_count(value: u64) -> String {
@@ -109,6 +133,8 @@ mod tests {
             cost_usd: None,
             cost_estimate_micro_dollars: None,
             failed_count: 0,
+            unknown_usage_count: 0,
+            unknown_cost_count: 0,
         }
     }
 
@@ -188,10 +214,14 @@ mod tests {
     /// `format_aggregate_cost`:
     /// - `cost_usd = Some(v)` → `$v.4`
     /// - `cost_usd = None` + `estimate = Some(micros)` → `~${v.4}`
-    /// - both None → `"-"`
+    /// - both Some → exact and estimated components
+    /// - both None → explicit unknown status
     #[test]
     fn format_aggregate_cost_real_estimate_and_missing_branches() {
         let mut agg = empty_aggregate();
+        // Known-cost fixtures need request_count > 0 so usage_status does not
+        // treat an empty request set as Unknown while a dollar total is present.
+        agg.request_count = 1;
 
         agg.cost_usd = Some(1.2345);
         agg.cost_estimate_micro_dollars = None;
@@ -203,13 +233,16 @@ mod tests {
 
         agg.cost_usd = None;
         agg.cost_estimate_micro_dollars = None;
-        assert_eq!(format_aggregate_cost(&agg), "-");
+        agg.unknown_cost_count = 1;
+        assert_eq!(
+            format_aggregate_cost(&agg),
+            "unknown (unknown; unknown_cost=1)"
+        );
 
-        // Real cost takes priority over estimate even if both are Some
-        // (matches the documented "real overrides estimate" rule).
+        agg.unknown_cost_count = 0;
         agg.cost_usd = Some(2.0);
         agg.cost_estimate_micro_dollars = Some(5_000_000);
-        assert_eq!(format_aggregate_cost(&agg), "$2.0000");
+        assert_eq!(format_aggregate_cost(&agg), "$2.0000 + ~$5.0000");
     }
 
     /// `usage_aggregate_label` cases:
@@ -290,5 +323,34 @@ mod tests {
         assert!(out.contains("wall 2.0s"));
         assert!(out.contains("$0.0500"));
         assert!(out.contains("failed 1"));
+    }
+
+    #[test]
+    fn format_usage_detail_panel_marks_known_subtotals_partial() {
+        let snapshot = UsageDisplaySnapshot {
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            wall_clock_ms: 0,
+            cost_usd: None,
+        };
+        let mut aggregate = empty_aggregate();
+        aggregate.request_count = 2;
+        aggregate.total_tokens = 150;
+        aggregate.cost_usd = Some(0.1);
+        aggregate.unknown_usage_count = 1;
+        aggregate.unknown_cost_count = 1;
+
+        let out = format_usage_detail_panel(&snapshot, "provider/model", &[aggregate]);
+
+        assert!(
+            out.contains("tok 150 (partial; unknown_usage=1)"),
+            "token subtotal must be labelled partial: {out}"
+        );
+        assert!(
+            out.contains("cost $0.1000 (partial; unknown_cost=1)"),
+            "cost subtotal must be labelled partial: {out}"
+        );
     }
 }

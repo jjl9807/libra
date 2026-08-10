@@ -2779,6 +2779,26 @@ where
     let thinking = completion_thinking_for_args(args);
     let reasoning_effort = completion_reasoning_effort_for_args(args);
     let stream = completion_stream_for_args(args);
+    let usage_storage_root = resolve_storage_root(working_dir);
+    let usage_recorder = match usage_storage_root.as_ref() {
+        Some(storage_root) => build_usage_recorder(storage_root).await,
+        None => None,
+    };
+    let usage_repo_id = canonical_usage_repo_id(usage_recorder.as_ref()).await;
+    let usage_context = usage_recorder.as_ref().map(|_| UsageContext {
+        repo_id: usage_repo_id.clone(),
+        session_id: Some(session_state.id.clone()),
+        thread_id: session_canonical_thread_id(&session_state),
+        agent_run_id: None,
+        run_id: None,
+        turn_id: None,
+        event_id: None,
+        provider: provider_name.clone(),
+        model: model_name.clone(),
+        request_kind: "completion".to_string(),
+        intent: None,
+        agent_name: None,
+    });
 
     let config_factory: Arc<dyn Fn() -> ToolLoopConfig + Send + Sync> =
         Arc::new(move || ToolLoopConfig {
@@ -2790,6 +2810,8 @@ where
             preserve_reasoning_content,
             runtime_context: runtime_context.clone(),
             subagent_runtime: subagent_runtime.clone(),
+            usage_recorder: usage_recorder.clone(),
+            usage_context: usage_context.clone(),
             ..Default::default()
         });
 
@@ -3743,12 +3765,16 @@ where
     check_process_terminate(&process_terminate)?;
 
     if let Some(usage_recorder) = build_usage_recorder(&storage_root).await {
+        let usage_repo_id = canonical_usage_repo_id(Some(&usage_recorder)).await;
         config.usage_recorder = Some(usage_recorder);
         config.usage_context = Some(UsageContext {
+            repo_id: usage_repo_id,
             session_id: Some(session.id.clone()),
             thread_id: session_canonical_thread_id(&session),
             agent_run_id: None,
             run_id: None,
+            turn_id: None,
+            event_id: None,
             provider: provider_name.clone(),
             model: model_name.clone(),
             request_kind: "completion".to_string(),
@@ -4950,6 +4976,7 @@ async fn build_subagent_runtime_for_session(
         dispatcher: std::sync::Arc::new(dispatcher),
         parent_thread_id: session_canonical_thread_id(session)
             .unwrap_or_else(|| session.id.clone()),
+        parent_turn_id: None,
         parent_session_id: session.id.clone(),
         parent_agent,
         parent_ruleset: Vec::new(),
@@ -5003,6 +5030,20 @@ async fn build_usage_recorder(storage_root: &Path) -> Option<UsageRecorder> {
         }
         Err(error) => {
             tracing::warn!("usage stats disabled because database open failed: {error}");
+            None
+        }
+    }
+}
+
+async fn canonical_usage_repo_id(usage_recorder: Option<&UsageRecorder>) -> Option<String> {
+    let usage_recorder = usage_recorder?;
+    match usage_recorder.canonical_repo_id().await {
+        Ok(repo_id) => repo_id,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "usage stats will omit repository attribution because libra.repoid could not be read"
+            );
             None
         }
     }
