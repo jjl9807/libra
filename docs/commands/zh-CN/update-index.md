@@ -12,11 +12,11 @@ libra update-index --cacheinfo <mode>,<object>,<path>...
 
 ## 说明
 
-`update-index` 按顺序应用：所有 `--cacheinfo` 条目，然后是位置路径（带 `--remove` 则删除，否则从工作树（重新）暂存），最后保存 index。
+`update-index` 按顺序应用：所有 `--cacheinfo` 条目，然后是位置路径，最后保存 index。`--add` 与 `--remove` 是两项**许可**而非互斥选项：单给 `--remove` 时一律把各路径从 index 删除，单给 `--add` 时从工作树（重新）暂存，两者**同时给出**时则逐路径按其**在工作树中是否存在**分流——仍存在的被暂存，已消失的被移除。
 
 - `--cacheinfo <mode>,<object>,<path>` 直接插入/更新一个条目。该对象**无需已存在**（与 Git 一致），因此可用 `hash-object` 计算的哈希构造 index。`<mode>` 为八进制文件模式：`100644`（文件）、`100755`（可执行）、`120000`（符号链接）、`160000`（gitlink）。对象 id 长度必须匹配仓库 hash 格式。path 是 index 键 —— 绝对路径与 `..` 穿越会被拒绝。后续 `write-tree` 或 `commit` 会校验对象存在性/类型；若 blob/tree 条目仍指向缺失或类型不匹配的对象，会以 `LBR-REPO-002` 失败。
 - `--add <path>...` 从工作树（重新）暂存文件，允许尚未跟踪的路径。不带 `--add` 时，位置路径必须已被跟踪。若路径是符号链接，则暂存 mode `120000`，blob 内容为链接目标字节，并且不会跟随该链接。
-- `--remove <path>...` 从 index 删除指定路径。
+- `--remove <path>...` 从 index 删除指定路径。与 `--add` 同时给出时按磁盘存在性逐路径分流：存在的被暂存、消失的被移除——上游的 setup 步骤正是这样一次调用同时给出两者。`--remove` **单独**给出时一律删除该路径，无论它是否仍然存在。
 
 从工作树暂存时，若 blob 或其耐久云索引 marker 无法写入，命令会返回 `LBR-IO-002`，不会
 panic，也不会保存缺少修复 ownership 的 index 条目；正常重试会重新登记失败调用已经持久化的
@@ -34,7 +34,8 @@ payload。
 | 选项 | 说明 | 示例 |
 |------|------|------|
 | `--add` | 允许位置路径添加新的（未跟踪）文件。 | `libra update-index --add a.txt` |
-| `--remove` | 从 index 删除位置路径。 | `libra update-index --remove old.txt` |
+| `--remove` | 从 index 删除位置路径。与 `--add` 同时给出时按磁盘存在性逐路径分流（存在→暂存，消失→移除）。 | `libra update-index --remove old.txt` |
+| `--add --remove` | 同时给出两项许可：存在的暂存、消失的移除。 | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | 按对象 id 注册条目（可重复）。 | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |
 | `--json` / `--machine` | 结构化输出：`{ updated: <n>, removed: <n> }`。 | `libra --json update-index --add a.txt` |
 
