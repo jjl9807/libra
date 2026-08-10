@@ -13,8 +13,11 @@
 //!   transcript inserts, tool-call lifecycle markers, DAG progress, and
 //!   confirmation prompts that need a `oneshot` reply channel.
 
+use std::sync::{Arc, atomic::AtomicBool};
+
 use serde_json::Value;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::history_cell::HistoryCell;
@@ -143,7 +146,7 @@ pub enum AgentStatus {
 ///
 /// Carries the natural-language explanation and the ordered step list so the
 /// UI can render it as a checklist before the user approves execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderPlanDraft {
     /// Optional human-readable rationale rendered above the step list.
     pub explanation: Option<String>,
@@ -152,7 +155,7 @@ pub struct ProviderPlanDraft {
 }
 
 /// One ordered provider draft step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderPlanDraftStep {
     /// Single-line title for the step shown in the plan checklist.
     pub title: String,
@@ -316,7 +319,19 @@ pub enum AppEvent {
         network_access: bool,
         automatic_repair_attempts: u8,
         automatic_repair_max_attempts: u8,
+        /// True when the worker recorded a pre-mutation cancel for this turn.
+        cancelled: bool,
     },
+    /// Worker-owned plan execution (W2-04) exposes the shared cancel / mutation
+    /// markers so Esc and shutdown observe the same tokens as the tool loop.
+    BindLocalRuntimeTurnTokens {
+        turn_id: TurnId,
+        cancellation: CancellationToken,
+        mutation_started: Arc<AtomicBool>,
+    },
+    /// Worker terminalized plan execution as failed/indeterminate; UI must not
+    /// claim a successful workflow completion.
+    LocalPlanExecutionReconcileRequired { turn_id: TurnId, reason: String },
 }
 
 impl AppEvent {
@@ -353,7 +368,9 @@ impl AppEvent {
             | AppEvent::DagValidationStatus { turn_id, .. }
             | AppEvent::DagReleaseStatus { turn_id, .. }
             | AppEvent::DagTaskMuxClear { turn_id }
-            | AppEvent::ExecuteWorkflowComplete { turn_id, .. } => *turn_id,
+            | AppEvent::ExecuteWorkflowComplete { turn_id, .. }
+            | AppEvent::BindLocalRuntimeTurnTokens { turn_id, .. }
+            | AppEvent::LocalPlanExecutionReconcileRequired { turn_id, .. } => *turn_id,
         }
     }
 }

@@ -319,6 +319,12 @@ impl ToolBoundaryPolicy {
         }
     }
 
+    /// Toggle network access for this policy copy (plan-execution Allow/Deny).
+    pub fn with_network_access(mut self, allow_network: bool) -> Self {
+        self.allow_network = allow_network;
+        self
+    }
+
     pub fn policy_version(&self) -> &str {
         &self.policy_version
     }
@@ -572,6 +578,19 @@ impl ToolBoundaryRuntime {
         )
     }
 
+    /// Return a copy whose policy matches the approved network setting for this
+    /// execution (Phase 1 Allow/Deny), without changing the shared worker
+    /// boundary used for other turns.
+    pub fn with_network_access(&self, allow_network: bool) -> Self {
+        Self {
+            trace_id: self.trace_id,
+            principal: self.principal.clone(),
+            policy: self.policy.clone().with_network_access(allow_network),
+            redactor: self.redactor.clone(),
+            audit_sink: self.audit_sink.clone(),
+        }
+    }
+
     pub fn decide(&self, operation: &ToolOperation) -> BoundaryDecision {
         self.policy.decide(&self.principal, operation)
     }
@@ -819,5 +838,26 @@ mod tests {
             PrincipalRole::Contributor.can_mutate() && !PrincipalRole::Contributor.is_privileged(),
         );
         assert!(PrincipalRole::Owner.can_mutate() && !PrincipalRole::Owner.is_privileged());
+    }
+
+    #[test]
+    fn with_network_access_controls_requires_network_tools() {
+        let denied =
+            ToolBoundaryRuntime::system(Uuid::nil(), Arc::new(InMemoryAuditSink::default()));
+        let network_op = ToolOperation::tool("web_search", false, true);
+        assert!(
+            !denied.decide(&network_op).allowed,
+            "system default must deny requires_network tools"
+        );
+        let allowed = denied.with_network_access(true);
+        assert!(
+            allowed.decide(&network_op).allowed,
+            "Allow network gate must permit requires_network tools"
+        );
+        let redenied = allowed.with_network_access(false);
+        assert!(
+            !redenied.decide(&network_op).allowed,
+            "Deny network gate must reject requires_network tools again"
+        );
     }
 }

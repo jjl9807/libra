@@ -69,6 +69,50 @@ impl RuntimeCommandDurability {
             .complete_code_command_success(&intent.identity, summary)?)
     }
 
+    /// Terminal success plus `InteractionResolved` in one durable append batch.
+    pub fn complete_success_with_interaction_resolved(
+        &self,
+        intent: &CodeCommandIntent,
+        summary: impl Into<String>,
+        interaction_id: impl Into<String>,
+        resolution: impl Into<String>,
+    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
+        Ok(self
+            .session_store
+            .complete_code_command_success_with_interaction_resolved(
+                &intent.identity,
+                summary,
+                interaction_id,
+                resolution,
+            )?)
+    }
+
+    /// Terminal success plus zero-or-more interaction resolutions in one
+    /// durable append batch (W2-05 multi-approval / multi-input turns).
+    pub fn complete_success_with_interaction_resolutions(
+        &self,
+        intent: &CodeCommandIntent,
+        summary: impl Into<String>,
+        resolutions: &[(String, String)],
+    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
+        match resolutions {
+            [] => self.complete_success(intent, summary),
+            [(interaction_id, resolution)] => self.complete_success_with_interaction_resolved(
+                intent,
+                summary,
+                interaction_id.clone(),
+                resolution.clone(),
+            ),
+            _ => Ok(self
+                .session_store
+                .complete_code_command_success_with_interaction_resolutions(
+                    &intent.identity,
+                    summary,
+                    resolutions,
+                )?),
+        }
+    }
+
     /// Record a durable failed terminal result for an admitted command.
     pub fn complete_failure(
         &self,
@@ -158,6 +202,19 @@ impl RuntimeCommandDurability {
         Ok(self
             .session_store
             .recover_pending_mutating_code_commands()?)
+    }
+
+    /// Like [`Self::recover_pending_mutations`], but when `phase0_turn_id`
+    /// identifies the IntentSpec draft turn, that pending mutation is
+    /// completed as success while other pending mutations stay fenced.
+    pub fn recover_pending_mutations_for_intent_review(
+        &self,
+        phase0_turn_id: Option<&str>,
+    ) -> Result<Vec<crate::internal::ai::session::CodeCommandIdentity>, RuntimeCommandDurabilityError>
+    {
+        Ok(self
+            .session_store
+            .recover_pending_mutating_code_commands_for_intent_review(phase0_turn_id)?)
     }
 
     /// Dispatch an explicitly recovered read-only command. This refuses to

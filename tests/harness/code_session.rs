@@ -1160,6 +1160,28 @@ impl CodeSession {
         Ok((status, body))
     }
 
+    /// POST `/interactions/{id}` as the automation controller with a
+    /// caller-supplied `CodeUiInteractionResponse` body. Unlike
+    /// [`Self::respond_interaction_expect_error`] (which always sends
+    /// `{"approved": true}`), this lets callers drive `answers` (for
+    /// `request_user_input`) or `selectedOption` (for `intent_review_choice` /
+    /// `post_plan_choice`) responses through the same automation control
+    /// token used by [`Self::submit_message`].
+    pub fn respond_interaction(
+        &self,
+        interaction_id: &str,
+        body: &Value,
+    ) -> Result<(StatusCode, Value)> {
+        let response = self
+            .authorized_post(&format!("/interactions/{interaction_id}"))
+            .json(body)
+            .send()
+            .context("failed to submit automation interaction response")?;
+        let status = response.status();
+        let body = response.json().unwrap_or_else(|_| json!({}));
+        Ok((status, body))
+    }
+
     pub fn submit_large_message(&self, bytes: usize) -> Result<(StatusCode, Value)> {
         let text = "x".repeat(bytes);
         let response = self

@@ -16,8 +16,10 @@ libra update-index --cacheinfo <mode>,<object>,<path>...
 ## Description
 
 `update-index` applies, in order: every `--cacheinfo` entry, then the positional
-paths (removed with `--remove`, otherwise (re)staged from the working tree), and
-saves the index.
+paths, and saves the index. `--add` and `--remove` are permissions rather than
+alternatives: `--remove` alone drops each named path from the index, `--add` alone
+(re)stages it from the working tree, and given together they route per path by
+whether it still exists — an existing path is staged, a missing one is dropped.
 
 - `--cacheinfo <mode>,<object>,<path>` inserts/updates an entry directly. The
   object **need not exist yet** (matching Git), so you can build an index from
@@ -32,7 +34,10 @@ saves the index.
   yet tracked. Working-tree symlinks are staged as mode `120000` blobs whose
   content is the link target bytes; the target is not followed. Without
   `--add`, a positional path must already be tracked.
-- `--remove <path>...` drops the named paths from the index.
+- `--remove <path>...` drops the named paths from the index. Given together with
+  `--add`, presence on disk decides per path: an existing path is staged, a missing
+  one is dropped — which is how upstream setup steps use `--add --remove` in one
+  call. `--remove` on its own always drops the path, whether or not it still exists.
 
 Working-tree staging returns `LBR-IO-002` if the blob or its durable cloud
 index marker cannot be written; it does not panic or save an index entry that
@@ -53,7 +58,8 @@ agent cleanup fail closed while repair remains pending. With
 | Option | Description | Example |
 |--------|-------------|---------|
 | `--add` | Allow positional paths to add new (untracked) files. | `libra update-index --add a.txt` |
-| `--remove` | Remove the positional paths from the index. | `libra update-index --remove old.txt` |
+| `--remove` | Remove the positional paths from the index. With `--add`, presence on disk decides per path (existing → staged, missing → removed). | `libra update-index --remove old.txt` |
+| `--add --remove` | Both permissions at once: stage what exists, drop what is gone. | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | Register an entry from an object id (repeatable). | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |
 | `--json` / `--machine` | Structured output: `{ updated: <n>, removed: <n> }`. | `libra --json update-index --add a.txt` |
 

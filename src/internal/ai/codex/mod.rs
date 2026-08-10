@@ -107,12 +107,12 @@ use crate::{
             mcp::server::LibraMcpServer,
             runtime::PlanningPromptBuilder,
             web::code_ui::{
-                CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
-                CodeUiInitialController, CodeUiInteractionKind, CodeUiInteractionOption,
-                CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
-                CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
-                CodeUiProviderAdapter, CodeUiProviderInfo, CodeUiReadModel, CodeUiRuntimeHandle,
-                CodeUiSession, CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
+                CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType, CodeUiInitialController,
+                CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
+                CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange,
+                CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiProviderAdapter,
+                CodeUiProviderInfo, CodeUiReadModel, CodeUiRuntimeHandle, CodeUiSession,
+                CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
                 CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
                 initial_snapshot,
             },
@@ -1262,6 +1262,7 @@ fn codex_code_ui_capabilities() -> CodeUiCapabilities {
         interactive_approvals: true,
         structured_questions: false,
         provider_session_resume: false,
+        command_idempotency: false,
     }
 }
 
@@ -1562,7 +1563,6 @@ struct CodexCodeUiAdapter {
     notifies: Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
     thread_id: Arc<Mutex<String>>,
     approval_mode: Arc<Mutex<String>>,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
 }
 
 #[async_trait::async_trait]
@@ -1615,43 +1615,10 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> anyhow::Result<()> {
-        // Validate the decision and locate the pending sender BEFORE mutating
-        // shared `approval_mode`. Otherwise a malformed response (no decision,
-        // unknown interaction id, or already-resolved approval) would still
-        // flip future Codex approvals to accept-all / decline-all, which is a
-        // privilege-escalation risk. Mutate `approval_mode` only after we have
-        // committed to delivering the user's decision.
-        let Some(approved) = response
-            .approved
-            .or(match response.selected_option.as_deref() {
-                Some("approve") | Some("approve_all") => Some(true),
-                Some("decline") | Some("decline_all") => Some(false),
-                _ => None,
-            })
-        else {
-            return Err(anyhow!("Codex approvals require an explicit decision"));
-        };
-
-        let sender = {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.remove(interaction_id)
-        }
-        .ok_or_else(|| anyhow!("Unknown pending approval: {interaction_id}"))?;
-        sender
-            .send(approved)
-            .map_err(|_| anyhow!("The pending approval is no longer awaiting a response"))?;
-
-        if let Some(apply_to_future) = response.apply_to_future.as_ref()
-            && let Some(mut approval_mode) =
-                lock_or_warn(&self.approval_mode, "codex code ui approval mode write")
-        {
-            *approval_mode = match apply_to_future {
-                CodeUiApplyToFuture::No => "ask".to_string(),
-                CodeUiApplyToFuture::AcceptAll => "accept".to_string(),
-                CodeUiApplyToFuture::DeclineAll => "decline".to_string(),
-            };
-        }
-        Ok(())
+        let _ = (interaction_id, response);
+        Err(anyhow!(
+            "Codex approval interactions require an AgentRuntime-owned turn; this managed adapter closes them fail-closed"
+        ))
     }
 }
 
@@ -1689,10 +1656,6 @@ pub async fn start_code_ui_runtime(
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let thread_id = Arc::new(Mutex::new(String::new()));
     let approval_mode = Arc::new(Mutex::new(args.approval.clone()));
-    let pending_approvals = Arc::new(AsyncMutex::new(HashMap::<
-        String,
-        tokio::sync::oneshot::Sender<bool>,
-    >::new()));
 
     let browser_session = CodeUiSession::new(initial_snapshot(
         args.cwd.clone(),
@@ -1827,7 +1790,6 @@ pub async fn start_code_ui_runtime(
     let mcp_server_clone = mcp_server.clone();
     let history_recorder_clone = history_recorder.clone();
     let history_writer_clone = history_writer.clone();
-    let pending_approvals_clone = pending_approvals.clone();
     let working_dir_clone = args.cwd.clone();
     let thread_id_clone = thread_id.clone();
     ClientStorage::spawn_background_index_work(async move {
@@ -2281,34 +2243,17 @@ pub async fn start_code_ui_runtime(
                         } else if current_mode == "decline" {
                             false
                         } else {
-                            let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel();
-                            pending_approvals_clone
-                                .lock()
-                                .await
-                                .insert(request_id.clone(), oneshot_tx);
-                            publish_code_ui_snapshot(
-                                &browser_session_clone,
-                                &codex_session_clone,
-                                &working_dir_clone,
-                            )
-                            .await;
-                            // Default to *deny* when the approval channel is
-                            // dropped (TUI exit, runtime teardown). Auto-
-                            // approving on cancellation could let a sandbox-
-                            // escaping command run after the operator already
-                            // closed the session.
-                            match oneshot_rx.await {
-                                Ok(decision) => decision,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        target: "libra::internal::ai::codex",
-                                        request_id = %request_id,
-                                        "approval channel closed before user response; \
-                                         defaulting to DECLINE"
-                                    );
-                                    false
-                                }
-                            }
+                            // Managed Codex turns do not yet expose an
+                            // AgentRuntime continuation. Do not retain an
+                            // adapter-private approval oneshot: deny until
+                            // the provider can register the interaction with
+                            // the shared runtime owner.
+                            tracing::warn!(
+                                target: "libra::internal::ai::codex",
+                                request_id = %request_id,
+                                "managed Codex approval denied because no AgentRuntime turn owns it"
+                            );
+                            false
                         };
 
                         if let Some(mut session) =
@@ -2465,7 +2410,6 @@ pub async fn start_code_ui_runtime(
         notifies,
         thread_id,
         approval_mode,
-        pending_approvals,
     });
     let mut runtime_options = crate::internal::ai::web::code_ui::CodeUiRuntimeOptions::new(
         browser_write_enabled,

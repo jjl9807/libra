@@ -19,6 +19,578 @@
 //! pair and returns scheduler-facing IDs for both plans; callers must not fall
 //! back to a single-plan write path.
 
+use async_trait::async_trait;
+
+use super::worker::{
+    InteractionResponse, RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+    RuntimeWorkerError, TurnRequest,
+};
+use crate::internal::ai::agent::ToolLoopConfig;
+
+/// Scan durable Code workflow events for a Plan review gate that was requested
+/// but never resolved. Used on TUI resume so Execute/Modify/Cancel (and the
+/// follow-on network-policy gate) cannot disappear across a crash (W2-03).
+///
+/// Returns the oldest unresolved
+/// `(interaction_id, plan_id, turn_id, phase1_turn_id)` tuple. Turn ids may be
+/// empty on markers that predate durable gate-turn recovery.
+pub fn open_plan_review_from_workflow<'a>(
+    events: impl IntoIterator<Item = &'a crate::internal::ai::session::CodeWorkflowEventKind>,
+) -> Option<(String, String, String, String)> {
+    use std::collections::HashMap;
+
+    use crate::internal::ai::session::CodeWorkflowEventKind;
+
+    let mut open: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for event in events {
+        match event {
+            CodeWorkflowEventKind::PlanReviewRequested {
+                interaction_id,
+                plan_id,
+                turn_id,
+                phase1_turn_id,
+            } => {
+                if open
+                    .insert(
+                        interaction_id.clone(),
+                        (plan_id.clone(), turn_id.clone(), phase1_turn_id.clone()),
+                    )
+                    .is_none()
+                {
+                    order.push(interaction_id.clone());
+                }
+            }
+            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
+            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                ..
+            } => {
+                open.remove(interaction_id);
+                order.retain(|id| id != interaction_id);
+            }
+            _ => {}
+        }
+    }
+    order.into_iter().next().and_then(|interaction_id| {
+        open.remove(&interaction_id)
+            .map(|(plan_id, turn_id, phase1_turn_id)| {
+                (interaction_id, plan_id, turn_id, phase1_turn_id)
+            })
+    })
+}
+
+/// Scan durable Code workflow events for a post-plan network-policy gate that
+/// was requested but never answered.
+///
+/// This marker is written *before* the Plan review resolves, so it is the only
+/// durable trace of the human network decision once `InteractionResolved`
+/// closes the plan gate — without it a crash in that window would silently
+/// drop a mandatory human gate on resume (W2-03).
+///
+/// Returns the oldest unresolved `(interaction_id, plan_id, turn_id,
+/// default_allow)` tuple. `turn_id` may be empty on markers that predate
+/// durable gate-turn recovery.
+pub fn open_network_policy_from_workflow<'a>(
+    events: impl IntoIterator<Item = &'a crate::internal::ai::session::CodeWorkflowEventKind>,
+) -> Option<(String, String, String, bool)> {
+    use std::collections::{HashMap, HashSet};
+
+    use crate::internal::ai::session::CodeWorkflowEventKind;
+
+    // Network markers may be written just before or just after Plan Execute
+    // settles. Only restore once a durable Execute resolution exists for the
+    // matching plan review — never while that review is still open (W2-03 r4).
+    // Persisted plans key by `plan_id`; unpersisted plans (empty `plan_id` when
+    // MCP/persist fails) associate the marker with the open review interaction
+    // so Execute can still promote the mandatory network gate (W2-03 r5).
+    let mut open_plan_reviews: HashSet<String> = HashSet::new();
+    let mut open_plan_review_order: Vec<String> = Vec::new();
+    let mut plan_id_by_review: HashMap<String, String> = HashMap::new();
+    let mut open_plan_ids: HashSet<String> = HashSet::new();
+    let mut plan_execute_resolved: HashSet<String> = HashSet::new();
+    // network interaction_id -> (plan_id, turn_id, default_allow, review_interaction_id)
+    let mut pending_network: HashMap<String, (String, String, bool, String)> = HashMap::new();
+    let mut open: HashMap<String, (String, String, bool)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    fn promote_ids(
+        ready: Vec<String>,
+        pending_network: &mut HashMap<String, (String, String, bool, String)>,
+        open: &mut HashMap<String, (String, String, bool)>,
+        order: &mut Vec<String>,
+    ) {
+        for id in ready {
+            if let Some((plan_id, turn_id, default_allow, _)) = pending_network.remove(&id)
+                && open
+                    .insert(id.clone(), (plan_id, turn_id, default_allow))
+                    .is_none()
+            {
+                order.push(id);
+            }
+        }
+    }
+
+    fn promote_by_plan_id(
+        plan_key: &str,
+        pending_network: &mut HashMap<String, (String, String, bool, String)>,
+        open: &mut HashMap<String, (String, String, bool)>,
+        order: &mut Vec<String>,
+    ) {
+        if plan_key.is_empty() {
+            return;
+        }
+        let ready: Vec<_> = pending_network
+            .iter()
+            .filter(|(_, (plan_id, _, _, _))| plan_id == plan_key)
+            .map(|(id, _)| id.clone())
+            .collect();
+        promote_ids(ready, pending_network, open, order);
+    }
+
+    fn promote_by_review_id(
+        review_id: &str,
+        pending_network: &mut HashMap<String, (String, String, bool, String)>,
+        open: &mut HashMap<String, (String, String, bool)>,
+        order: &mut Vec<String>,
+    ) {
+        let ready: Vec<_> = pending_network
+            .iter()
+            .filter(|(_, (plan_id, _, _, associated_review))| {
+                associated_review == review_id || (!plan_id.is_empty() && plan_id == review_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        promote_ids(ready, pending_network, open, order);
+    }
+
+    for event in events {
+        match event {
+            CodeWorkflowEventKind::PlanReviewRequested {
+                interaction_id,
+                plan_id,
+                ..
+            } => {
+                if open_plan_reviews.insert(interaction_id.clone()) {
+                    open_plan_review_order.push(interaction_id.clone());
+                }
+                if !plan_id.is_empty() {
+                    plan_id_by_review.insert(interaction_id.clone(), plan_id.clone());
+                    open_plan_ids.insert(plan_id.clone());
+                    plan_execute_resolved.remove(plan_id);
+                }
+                plan_execute_resolved.remove(interaction_id);
+                // Back (or a fresh review) re-opens the plan gate after a prior
+                // Execute may already have promoted a network marker. Demote
+                // those promoted rows so recovery cannot restore network Allow
+                // while the renewed plan review is still unanswered (W2-03 r14).
+                let demote: Vec<_> = open
+                    .iter()
+                    .filter(|(_, (open_plan_id, _, _))| {
+                        (!plan_id.is_empty() && open_plan_id == plan_id)
+                            || (plan_id.is_empty() && open_plan_id.is_empty())
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in demote {
+                    if let Some((open_plan_id, turn_id, default_allow)) = open.remove(&id) {
+                        pending_network.insert(
+                            id.clone(),
+                            (open_plan_id, turn_id, default_allow, interaction_id.clone()),
+                        );
+                        order.retain(|open_id| open_id != &id);
+                    }
+                }
+            }
+            CodeWorkflowEventKind::NetworkPolicyRequested {
+                interaction_id,
+                plan_id,
+                turn_id,
+                default_allow,
+            } => {
+                let associated_review = if !plan_id.is_empty() {
+                    plan_id_by_review
+                        .iter()
+                        .find_map(|(review_id, stored_plan)| {
+                            (stored_plan == plan_id).then(|| review_id.clone())
+                        })
+                        .unwrap_or_default()
+                } else {
+                    // Unpersisted plan: bind to the latest still-open review.
+                    open_plan_review_order
+                        .iter()
+                        .rev()
+                        .find(|id| open_plan_reviews.contains(*id))
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                pending_network.insert(
+                    interaction_id.clone(),
+                    (
+                        plan_id.clone(),
+                        turn_id.clone(),
+                        *default_allow,
+                        associated_review.clone(),
+                    ),
+                );
+                let plan_approved = (!plan_id.is_empty()
+                    && plan_execute_resolved.contains(plan_id))
+                    || (!associated_review.is_empty()
+                        && plan_execute_resolved.contains(&associated_review))
+                    || plan_execute_resolved.contains(interaction_id);
+                let plan_still_open = (!plan_id.is_empty() && open_plan_ids.contains(plan_id))
+                    || (!associated_review.is_empty()
+                        && open_plan_reviews.contains(&associated_review))
+                    || open_plan_reviews.contains(interaction_id);
+                if plan_approved && !plan_still_open {
+                    if !plan_id.is_empty() {
+                        promote_by_plan_id(plan_id, &mut pending_network, &mut open, &mut order);
+                    } else if !associated_review.is_empty() {
+                        promote_by_review_id(
+                            &associated_review,
+                            &mut pending_network,
+                            &mut open,
+                            &mut order,
+                        );
+                    }
+                }
+            }
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id,
+                resolution,
+            }
+            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                resolution,
+                ..
+            } => {
+                open_plan_reviews.remove(interaction_id);
+                open_plan_review_order.retain(|id| id != interaction_id);
+                if let Some(plan_id) = plan_id_by_review.get(interaction_id).cloned() {
+                    open_plan_ids.remove(&plan_id);
+                }
+                open.remove(interaction_id);
+                pending_network.remove(interaction_id);
+                order.retain(|id| id != interaction_id);
+                let resolved = resolution.trim().to_ascii_lowercase();
+                if matches!(resolved.as_str(), "execute" | "confirm") {
+                    plan_execute_resolved.insert(interaction_id.clone());
+                    if let Some(plan_id) = plan_id_by_review.get(interaction_id).cloned() {
+                        plan_execute_resolved.insert(plan_id.clone());
+                        promote_by_plan_id(&plan_id, &mut pending_network, &mut open, &mut order);
+                    }
+                    // Always promote markers bound to this review interaction
+                    // (covers empty `plan_id` after persist/MCP failure).
+                    promote_by_review_id(
+                        interaction_id,
+                        &mut pending_network,
+                        &mut open,
+                        &mut order,
+                    );
+                } else {
+                    plan_execute_resolved.remove(interaction_id);
+                    if let Some(plan_id) = plan_id_by_review.get(interaction_id) {
+                        plan_execute_resolved.remove(plan_id);
+                    }
+                    // Human non-Execute decisions (cancel/modify) drop associated
+                    // network markers. Rollback/synthetic resolutions must not —
+                    // otherwise a failed Back delivery that revoked a temporary
+                    // plan marker would also erase the network gate (W2-03 r20).
+                    if matches!(
+                        resolved.as_str(),
+                        "cancel" | "modify" | "revise" | "network-deny" | "network-allow" | "back"
+                    ) {
+                        let stale: Vec<_> = pending_network
+                            .iter()
+                            .filter(|(_, (_, _, _, associated_review))| {
+                                associated_review == interaction_id
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect();
+                        for id in stale {
+                            pending_network.remove(&id);
+                            open.remove(&id);
+                            order.retain(|open_id| open_id != &id);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    order.into_iter().next().and_then(|interaction_id| {
+        open.remove(&interaction_id)
+            .map(|(plan_id, turn_id, default_allow)| {
+                (interaction_id, plan_id, turn_id, default_allow)
+            })
+    })
+}
+
+/// Resolve the single mutating command id that startup recovery is allowed to
+/// complete as success because a human review gate still owns its result.
+///
+/// Phase 0 wins when an IntentSpec review is open (the plan draft cannot exist
+/// yet); otherwise an open Plan review contributes its Phase 1 turn. Every
+/// other pending mutation stays fenced, so this never widens recovery beyond
+/// the one draft-writing turn whose durable marker proves it finished.
+///
+/// Returns `None` when no review gate is open, when the marker predates
+/// turn-id recovery (empty id), or when the workflow log cannot be read — all
+/// of which keep the caller on the strict "fence every pending mutation" path.
+pub fn open_review_gate_phase_turn_id(
+    store: &crate::internal::ai::session::jsonl::SessionJsonlStore,
+) -> Option<String> {
+    let replay = store.load_code_workflow_replay().ok()?;
+    let phase0_turn_id =
+        super::phase0::open_intent_review_from_workflow(replay.events.iter().map(|e| &e.event))
+            .map(|(_, _, _, phase0_turn_id)| phase0_turn_id)
+            .filter(|id| !id.is_empty());
+    if phase0_turn_id.is_some() {
+        return phase0_turn_id;
+    }
+    open_plan_review_from_workflow(replay.events.iter().map(|e| &e.event))
+        .map(|(_, _, _, phase1_turn_id)| phase1_turn_id)
+        .filter(|id| !id.is_empty())
+}
+
+/// Phase 1 planning tool-loop policy shared by every caller that drives the
+/// execution-plan drafting conversation. `submit_plan_draft` is the only
+/// terminal tool so Phase 1 cannot silently fall through into a mutating tool
+/// before the formal write in [`write_plan_set`].
+pub fn phase1_plan_tool_loop_config(mut config: ToolLoopConfig) -> ToolLoopConfig {
+    config.allowed_tools = Some(vec![
+        "read_file".to_string(),
+        "list_dir".to_string(),
+        "grep_files".to_string(),
+        "search_files".to_string(),
+        "web_search".to_string(),
+        "submit_plan_draft".to_string(),
+    ]);
+    config.terminal_tools = Some(vec!["submit_plan_draft".to_string()]);
+    config.max_turns = Some(12);
+    config
+}
+
+/// Developer's decision on a pending Plan review
+/// ([`super::worker::InteractionState::AwaitingPlanReview`]).
+///
+/// Stable wire ids match the existing post-plan Code UI options
+/// (`execute` / `modify` / `cancel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanReviewDecision {
+    /// Accept the plan draft and proceed to the network-policy human gate.
+    Execute,
+    /// Reject the draft and wait for a plain-text plan revision.
+    Revise,
+    /// Abandon the review; no execution is started.
+    Cancel,
+}
+
+impl PlanReviewDecision {
+    pub fn wire_id(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Revise => "modify",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    pub fn from_wire_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "execute" | "confirm" => Some(Self::Execute),
+            "modify" | "revise" => Some(Self::Revise),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    /// Map the TUI's `PendingPostPlan::selected` index
+    /// (0=Execute, 1=Modify, 2=Cancel).
+    pub fn from_choice_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Execute),
+            1 => Some(Self::Revise),
+            2 => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// Developer's decision on the post-plan network-policy gate
+/// ([`super::worker::InteractionState::AwaitingNetworkPolicy`]).
+///
+/// `--network-access allow` still requires an explicit human choice here;
+/// Web-only defaults must not skip this gate (W2-03 AC).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkPolicyDecision {
+    Deny,
+    Allow,
+    /// Return to the Plan review dialog without releasing execution.
+    Back,
+}
+
+impl NetworkPolicyDecision {
+    pub fn wire_id(self) -> &'static str {
+        match self {
+            Self::Deny => "network-deny",
+            Self::Allow => "network-allow",
+            Self::Back => "back",
+        }
+    }
+
+    pub fn from_wire_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "network-deny" | "deny" => Some(Self::Deny),
+            "network-allow" | "allow" => Some(Self::Allow),
+            "back" => Some(Self::Back),
+            _ => None,
+        }
+    }
+
+    /// Map the TUI's `PendingNetworkPolicyChoice::selected` index
+    /// (0=Deny, 1=Allow, 2=Back).
+    pub fn from_choice_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Deny),
+            1 => Some(Self::Allow),
+            2 => Some(Self::Back),
+            _ => None,
+        }
+    }
+
+    pub fn network_access(self) -> Option<bool> {
+        match self {
+            Self::Deny => Some(false),
+            Self::Allow => Some(true),
+            Self::Back => None,
+        }
+    }
+}
+
+/// Stable interaction id for the network-policy gate that follows Plan Execute.
+pub fn network_policy_interaction_id(plan_id: Option<&str>) -> String {
+    match plan_id {
+        Some(plan_id) => format!("{plan_id}:network-policy"),
+        None => "post-plan-network-policy".to_string(),
+    }
+}
+
+/// [`RuntimeInteractionDelivery`] for the Phase 1 Plan review gate.
+///
+/// `Execute` parks with [`RuntimeTurnExecution::CompletedHoldQueued`] so the
+/// network-policy gate can register next without admitting mutating work.
+/// `Revise` / `Cancel` use [`RuntimeTurnExecution::CompletedDiscardQueued`].
+#[derive(Debug, Clone, Default)]
+pub struct PlanReviewAckDelivery;
+
+impl PlanReviewAckDelivery {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl RuntimeInteractionDelivery for PlanReviewAckDelivery {
+    fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+        PlanReviewDecision::from_wire_id(&interaction.response)
+            .map(|_| ())
+            .ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(format!(
+                    "unrecognized Plan review response '{}'; expected one of execute/modify/cancel",
+                    interaction.response
+                ))
+            })
+    }
+
+    fn persist_interaction_resolved_after_terminal(&self) -> bool {
+        true
+    }
+
+    async fn deliver(
+        self: Box<Self>,
+        _request: TurnRequest,
+        interaction: InteractionResponse,
+        _context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let decision =
+            PlanReviewDecision::from_wire_id(&interaction.response).ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(format!(
+                    "unrecognized Plan review response '{}'",
+                    interaction.response
+                ))
+            })?;
+        match decision {
+            PlanReviewDecision::Execute => Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                summary: "Plan confirmed; awaiting network policy choice".to_string(),
+            }),
+            PlanReviewDecision::Revise => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "Plan revision requested".to_string(),
+            }),
+            PlanReviewDecision::Cancel => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "Plan review cancelled".to_string(),
+            }),
+        }
+    }
+}
+
+/// [`RuntimeInteractionDelivery`] for the post-plan network-policy gate.
+///
+/// `Allow` / `Deny` complete the gate turn (execution hand-off is a caller /
+/// W2-04 concern). `Back` discards any work queued under the network fence and
+/// returns control so Plan review can be re-opened.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPolicyAckDelivery;
+
+impl NetworkPolicyAckDelivery {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl RuntimeInteractionDelivery for NetworkPolicyAckDelivery {
+    fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+        NetworkPolicyDecision::from_wire_id(&interaction.response)
+            .map(|_| ())
+            .ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(format!(
+                    "unrecognized network policy response '{}'; expected one of network-deny/network-allow/back",
+                    interaction.response
+                ))
+            })
+    }
+
+    fn persist_interaction_resolved_after_terminal(&self) -> bool {
+        true
+    }
+
+    async fn deliver(
+        self: Box<Self>,
+        _request: TurnRequest,
+        interaction: InteractionResponse,
+        _context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let decision =
+            NetworkPolicyDecision::from_wire_id(&interaction.response).ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(format!(
+                    "unrecognized network policy response '{}'",
+                    interaction.response
+                ))
+            })?;
+        match decision {
+            NetworkPolicyDecision::Deny => Ok(RuntimeTurnExecution::Completed {
+                summary: "Network policy: deny; ready to hand off plan execution".to_string(),
+            }),
+            NetworkPolicyDecision::Allow => Ok(RuntimeTurnExecution::Completed {
+                summary: "Network policy: allow; ready to hand off plan execution".to_string(),
+            }),
+            NetworkPolicyDecision::Back => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "Returned to plan review from network policy".to_string(),
+            }),
+        }
+    }
+}
+
 /// Outcome of the [`write_plan_set`] entry point: identifiers for
 /// the paired execution / test plan revisions and the
 /// `task_id → plan_id` map the scheduler will use to advance.
@@ -448,6 +1020,347 @@ mod tests {
         },
         utils::storage::local::LocalStorage,
     };
+
+    /// Startup recovery may complete exactly one draft-writing mutation. With
+    /// only a Plan review open, that is the Phase 1 turn; once an IntentSpec
+    /// review is also open the Phase 0 turn wins, because no plan can have been
+    /// approved while the intent itself is still unconfirmed.
+    #[test]
+    fn open_review_gate_phase_turn_id_prefers_phase0_then_phase1() {
+        use crate::internal::ai::session::{
+            CodeWorkflowEventKind as Kind, jsonl::SessionJsonlStore,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionJsonlStore::new(temp_dir.path().to_path_buf());
+        assert_eq!(
+            open_review_gate_phase_turn_id(&store),
+            None,
+            "an empty workflow log must keep every pending mutation fenced"
+        );
+
+        store
+            .append_code_workflow_durable(Kind::PlanReviewRequested {
+                interaction_id: "plan-1".to_string(),
+                plan_id: "plan-1".to_string(),
+                turn_id: "plan-review-turn".to_string(),
+                phase1_turn_id: "phase1-turn".to_string(),
+            })
+            .expect("append plan review marker");
+        assert_eq!(
+            open_review_gate_phase_turn_id(&store).as_deref(),
+            Some("phase1-turn")
+        );
+
+        store
+            .append_code_workflow_durable(Kind::IntentReviewRequested {
+                interaction_id: "intent-1".to_string(),
+                intent_id: "intent-1".to_string(),
+                turn_id: "intent-review-turn".to_string(),
+                phase0_turn_id: "phase0-turn".to_string(),
+            })
+            .expect("append intent review marker");
+        assert_eq!(
+            open_review_gate_phase_turn_id(&store).as_deref(),
+            Some("phase0-turn")
+        );
+
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "intent-1".to_string(),
+                resolution: "confirm".to_string(),
+            })
+            .expect("append intent resolution");
+        assert_eq!(
+            open_review_gate_phase_turn_id(&store).as_deref(),
+            Some("phase1-turn"),
+            "resolving the IntentSpec gate falls back to the still-open Plan gate"
+        );
+
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "plan-1".to_string(),
+                resolution: "execute".to_string(),
+            })
+            .expect("append plan resolution");
+        assert_eq!(
+            open_review_gate_phase_turn_id(&store),
+            None,
+            "with no gate open, recovery must fence every pending mutation"
+        );
+    }
+
+    /// The network-policy marker must outlive the Plan review it follows: the
+    /// crash window between "plan approved" and "network policy answered" is
+    /// exactly the case where the plan marker is already resolved, so only the
+    /// network marker can prove a human gate is still owed.
+    #[test]
+    fn open_network_policy_survives_resolved_plan_review() {
+        use crate::internal::ai::session::{
+            CodeWorkflowEventKind as Kind, jsonl::SessionJsonlStore,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionJsonlStore::new(temp_dir.path().to_path_buf());
+        let replay_events = |store: &SessionJsonlStore| {
+            store
+                .load_code_workflow_replay()
+                .expect("replay workflow log")
+                .events
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>()
+        };
+
+        store
+            .append_code_workflow_durable(Kind::PlanReviewRequested {
+                interaction_id: "plan-9".to_string(),
+                plan_id: "plan-9".to_string(),
+                turn_id: "plan-review-turn".to_string(),
+                phase1_turn_id: "phase1-turn".to_string(),
+            })
+            .expect("append plan review marker");
+        let events = replay_events(&store);
+        assert!(
+            open_network_policy_from_workflow(events.iter()).is_none(),
+            "a plan review alone must not look like an open network gate"
+        );
+
+        // Execute writes the network marker *before* resolving the plan gate.
+        store
+            .append_code_workflow_durable(Kind::NetworkPolicyRequested {
+                interaction_id: "plan-9:network-policy".to_string(),
+                plan_id: "plan-9".to_string(),
+                turn_id: "network-policy-turn".to_string(),
+                default_allow: true,
+            })
+            .expect("append network policy marker");
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "plan-9".to_string(),
+                resolution: "execute".to_string(),
+            })
+            .expect("append plan resolution");
+
+        let events = replay_events(&store);
+        assert_eq!(
+            open_plan_review_from_workflow(events.iter()),
+            None,
+            "the plan review is resolved once Execute is delivered"
+        );
+        assert_eq!(
+            open_network_policy_from_workflow(events.iter()),
+            Some((
+                "plan-9:network-policy".to_string(),
+                "plan-9".to_string(),
+                "network-policy-turn".to_string(),
+                true,
+            )),
+            "the unanswered network gate must survive the resolved plan review"
+        );
+
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "plan-9:network-policy".to_string(),
+                resolution: "network-allow".to_string(),
+            })
+            .expect("append network policy resolution");
+        let events = replay_events(&store);
+        assert!(
+            open_network_policy_from_workflow(events.iter()).is_none(),
+            "answering the gate must clear the durable marker"
+        );
+    }
+
+    #[test]
+    fn open_network_policy_survives_execute_with_empty_plan_id() {
+        use crate::internal::ai::session::{
+            CodeWorkflowEventKind as Kind, jsonl::SessionJsonlStore,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionJsonlStore::new(temp_dir.path().to_path_buf());
+        let replay_events = |store: &SessionJsonlStore| {
+            store
+                .load_code_workflow_replay()
+                .expect("replay workflow log")
+                .events
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>()
+        };
+
+        // Persist/MCP failure path records an empty plan_id on both markers.
+        store
+            .append_code_workflow_durable(Kind::PlanReviewRequested {
+                interaction_id: "review-empty".to_string(),
+                plan_id: String::new(),
+                turn_id: "plan-review-turn".to_string(),
+                phase1_turn_id: "phase1-turn".to_string(),
+            })
+            .expect("append plan review marker");
+        store
+            .append_code_workflow_durable(Kind::NetworkPolicyRequested {
+                interaction_id: network_policy_interaction_id(None),
+                plan_id: String::new(),
+                turn_id: "network-policy-turn".to_string(),
+                default_allow: false,
+            })
+            .expect("append network policy marker");
+        let events = replay_events(&store);
+        assert!(
+            open_network_policy_from_workflow(events.iter()).is_none(),
+            "empty-plan network marker must not restore while plan review is open"
+        );
+
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "review-empty".to_string(),
+                resolution: "execute".to_string(),
+            })
+            .expect("append plan resolution");
+        let events = replay_events(&store);
+        assert_eq!(
+            open_network_policy_from_workflow(events.iter()),
+            Some((
+                network_policy_interaction_id(None),
+                String::new(),
+                "network-policy-turn".to_string(),
+                false,
+            )),
+            "Execute with empty plan_id must still restore the network gate"
+        );
+    }
+
+    #[test]
+    fn open_network_policy_demotes_when_plan_review_reopens_after_back() {
+        use crate::internal::ai::session::{
+            CodeWorkflowEventKind as Kind, jsonl::SessionJsonlStore,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionJsonlStore::new(temp_dir.path().to_path_buf());
+        let replay_events = |store: &SessionJsonlStore| {
+            store
+                .load_code_workflow_replay()
+                .expect("replay workflow log")
+                .events
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>()
+        };
+
+        store
+            .append_code_workflow_durable(Kind::PlanReviewRequested {
+                interaction_id: "review-back".to_string(),
+                plan_id: "plan-back".to_string(),
+                turn_id: "plan-review-turn".to_string(),
+                phase1_turn_id: "phase1-turn".to_string(),
+            })
+            .expect("plan review");
+        store
+            .append_code_workflow_durable(Kind::NetworkPolicyRequested {
+                interaction_id: "plan-back:network-policy".to_string(),
+                plan_id: "plan-back".to_string(),
+                turn_id: "network-policy-turn".to_string(),
+                default_allow: true,
+            })
+            .expect("network marker");
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "review-back".to_string(),
+                resolution: "execute".to_string(),
+            })
+            .expect("execute");
+        assert_eq!(
+            open_network_policy_from_workflow(replay_events(&store).iter()).map(|(id, ..)| id),
+            Some("plan-back:network-policy".to_string()),
+            "network gate is restorable after Execute"
+        );
+
+        // Crash after Back appends a replacement PlanReviewRequested but before
+        // the network interaction is resolved.
+        store
+            .append_code_workflow_durable(Kind::PlanReviewRequested {
+                interaction_id: "review-back".to_string(),
+                plan_id: "plan-back".to_string(),
+                turn_id: "plan-review-turn-2".to_string(),
+                phase1_turn_id: String::new(),
+            })
+            .expect("back re-opens plan review");
+        assert!(
+            open_network_policy_from_workflow(replay_events(&store).iter()).is_none(),
+            "re-opened plan review must demote the prior network gate"
+        );
+        assert_eq!(
+            open_plan_review_from_workflow(replay_events(&store).iter()).map(|(id, ..)| id),
+            Some("review-back".to_string()),
+            "plan review owns recovery after Back"
+        );
+    }
+
+    /// The marker is written before Plan `Execute` is delivered, so a crash in
+    /// that window leaves it next to a still-open plan review. The plan was
+    /// never approved then, so the gate must stay unrestorable until a durable
+    /// Execute resolution exists — otherwise the network dialog would stand in
+    /// for an approval that never happened.
+    #[test]
+    fn open_network_policy_waits_for_a_durable_plan_execute() {
+        use crate::internal::ai::session::{
+            CodeWorkflowEventKind as Kind, jsonl::SessionJsonlStore,
+        };
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let store = SessionJsonlStore::new(temp_dir.path().to_path_buf());
+        let replay_events = |store: &SessionJsonlStore| {
+            store
+                .load_code_workflow_replay()
+                .expect("replay workflow log")
+                .events
+                .into_iter()
+                .map(|event| event.event)
+                .collect::<Vec<_>>()
+        };
+
+        store
+            .append_code_workflow_durable(Kind::PlanReviewRequested {
+                interaction_id: "review-11".to_string(),
+                plan_id: "plan-11".to_string(),
+                turn_id: "plan-review-turn".to_string(),
+                phase1_turn_id: "phase1-turn".to_string(),
+            })
+            .expect("append plan review marker");
+        store
+            .append_code_workflow_durable(Kind::NetworkPolicyRequested {
+                interaction_id: "plan-11:network-policy".to_string(),
+                plan_id: "plan-11".to_string(),
+                turn_id: "network-policy-turn".to_string(),
+                default_allow: false,
+            })
+            .expect("append network policy marker");
+
+        let events = replay_events(&store);
+        assert!(
+            open_network_policy_from_workflow(events.iter()).is_none(),
+            "a network marker must not open a gate while its plan review is unresolved"
+        );
+        assert!(
+            open_plan_review_from_workflow(events.iter()).is_some(),
+            "the plan review still owns the session in this crash window"
+        );
+
+        // Cancelling the plan must not promote the marker either.
+        store
+            .append_code_workflow_durable(Kind::InteractionResolved {
+                interaction_id: "review-11".to_string(),
+                resolution: "cancel".to_string(),
+            })
+            .expect("append plan cancellation");
+        assert!(
+            open_network_policy_from_workflow(replay_events(&store).iter()).is_none(),
+            "a cancelled plan never owes a network decision"
+        );
+    }
 
     /// `ordered_plan_ids()` must return `(execution, test)` so it lines up
     /// with [`SelectedPlanSet::ordered_ids`] downstream.

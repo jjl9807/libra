@@ -29,8 +29,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{BoundaryDecision, RuntimeCommandDurability, ToolBoundaryRuntime, ToolOperation};
-use crate::internal::ai::session::{CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent};
+use super::{
+    BoundaryDecision, RuntimeCommandDurability, RuntimeCommandDurabilityError, ToolBoundaryRuntime,
+    ToolOperation,
+};
+use crate::internal::ai::session::{
+    CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus,
+    CodeCommandStoreError,
+};
 
 /// A monotonically increasing event position within one runtime session.
 ///
@@ -243,6 +249,24 @@ pub enum RuntimeTurnExecution {
     Completed {
         summary: String,
     },
+    /// Finish the active turn as [`Completed`], but cancel every turn already
+    /// queued for the session instead of admitting them via
+    /// [`AgentRuntimeWorker::start_next_if_idle`].
+    ///
+    /// Used when a gate resolves negatively (e.g. IntentSpec review
+    /// revise/cancel): work submitted while the gate was pending must not
+    /// execute without a confirmed IntentSpec.
+    CompletedDiscardQueued {
+        summary: String,
+    },
+    /// Finish the active turn as [`Completed`] without admitting the next
+    /// queued turn, and keep [`SessionQueue::hold_queued_admission`] set until a
+    /// follow-up gate turn is tracked. Used when an adapter is about to park
+    /// the next human gate (Plan review → network policy, IntentSpec review,
+    /// …) and a concurrent `submit` must not race into the held queue.
+    CompletedHoldQueued {
+        summary: String,
+    },
     AwaitingInteraction(InteractionState),
     /// The executor delivered an interaction response to a continuation that
     /// is still executing (for example a tool-loop handler awaiting a
@@ -322,6 +346,11 @@ pub trait RuntimeTurnExecutor: Send + Sync + 'static {
         let _ = (request, interaction, context);
         Err(RuntimeWorkerError::ExecutorDoesNotSupportResponses)
     }
+
+    /// Invoked when a queued (or otherwise never-executed) admission is removed
+    /// without calling [`Self::execute`] — for example cancel or shutdown drain.
+    /// Executors that stage per-turn work must release it here.
+    fn on_admission_discarded(&self, _request: &TurnRequest) {}
 }
 
 /// Placeholder executor for adapters that use [`AgentRuntimeHandle`] solely
@@ -347,14 +376,32 @@ impl RuntimeTurnExecutor for ExternalTurnTrackingExecutor {
 /// The worker owns this continuation while the interaction is pending, so an
 /// adapter cannot independently remove or resolve it.  Implementations must
 /// validate the opaque response before making the continuation observable to
-/// a tool loop.  In particular, any durable interaction audit required by an
-/// adapter belongs in [`Self::deliver`] before its one-shot sender is used.
+/// a tool loop.  Audit rows that must not outlive a failed terminal command
+/// persistence (for example Code `InteractionResolved`) should opt into
+/// [`Self::persist_interaction_resolved_after_terminal`] so the worker can
+/// append them only after the gate turn is durably complete and before the
+/// caller-facing `respond` acknowledgement succeeds.
 #[async_trait]
 pub trait RuntimeInteractionDelivery: Send + 'static {
     /// Reject malformed input without changing the worker-owned pending
     /// interaction state, so callers can correct a browser/automation form
     /// error instead of losing the continuation.
     fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError>;
+
+    /// When true, the worker appends a Code `InteractionResolved` row after the
+    /// turn's terminal command outcome is durable and fails `respond` if that
+    /// append cannot be persisted.
+    fn persist_interaction_resolved_after_terminal(&self) -> bool {
+        false
+    }
+
+    /// Non-sensitive audit label persisted with `InteractionResolved` when
+    /// [`Self::persist_interaction_resolved_after_terminal`] is enabled.
+    /// Deliveries carrying structured user input must override this instead of
+    /// persisting the opaque response payload, which can contain secrets.
+    fn interaction_resolution(&self, interaction: &InteractionResponse) -> String {
+        interaction.response.clone()
+    }
 
     /// Persist and release the continuation.  This runs outside the actor but
     /// remains serialized by the active turn slot until it returns.
@@ -468,6 +515,21 @@ pub enum RuntimeWorkerError {
     InvalidTurnIdentifier,
     #[error("turn '{turn_id}' already exists in session '{session_id}'")]
     DuplicateTurn { session_id: String, turn_id: String },
+    #[error(
+        "command '{turn_id}' in session '{session_id}' was already admitted with a matching payload ({status})"
+    )]
+    IdempotentCommand {
+        session_id: String,
+        turn_id: String,
+        status: String,
+        /// When false, the prior terminal state was failed/cancelled/indeterminate
+        /// and must not be acknowledged as a successful browser submit.
+        ack_ok: bool,
+    },
+    #[error(
+        "command '{turn_id}' in session '{session_id}' was reused with a different canonical payload"
+    )]
+    CommandPayloadConflict { session_id: String, turn_id: String },
     #[error("session '{session_id}' already has {limit} queued turns")]
     QueueFull { session_id: String, limit: usize },
     #[error("session '{session_id}' requires mutation reconciliation before another turn can run")]
@@ -555,6 +617,13 @@ pub enum RuntimeCommand {
         session_id: String,
         reply: oneshot::Sender<Result<AgentSnapshot, RuntimeWorkerError>>,
     },
+    /// Fail-closed fence after a durable review marker exists but the live
+    /// gate turn could not be parked (W2-02 setup failures).
+    FenceSession {
+        session_id: String,
+        reason: String,
+        reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
+    },
     Observe {
         cursor: EventCursor,
         reply: oneshot::Sender<AgentEventStream>,
@@ -574,6 +643,9 @@ pub enum RuntimeCommand {
         session_id: String,
         turn_id: String,
         interaction_id: String,
+        /// Wire response text used for post-terminal `InteractionResolved`
+        /// when the delivery opted into that audit.
+        resolution: Option<String>,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
         reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
     },
@@ -790,6 +862,29 @@ impl AgentRuntimeHandle {
             .send(RuntimeCommand::Cancel {
                 session_id: session_id.into(),
                 turn_id: turn_id.into(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
+    /// Place the session in [`InteractionState::IndeterminateSideEffect`] so
+    /// further admissions fail closed until restart/recovery (or an explicit
+    /// future reconcile path).
+    pub async fn fence_session(
+        &self,
+        session_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::FenceSession {
+                session_id: session_id.into(),
+                reason: reason.into(),
                 reply: reply_tx,
             })
             .await
@@ -1039,6 +1134,13 @@ impl AgentRuntimeWorker {
                     RuntimeCommand::Snapshot { session_id, reply } => {
                         let _ = reply.send(self.snapshot(&session_id));
                     }
+                    RuntimeCommand::FenceSession {
+                        session_id,
+                        reason,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.fence_session_inner(session_id, reason));
+                    }
                     RuntimeCommand::Observe { cursor, reply } => {
                         let _ = reply.send(self.observe(cursor));
                     }
@@ -1047,16 +1149,22 @@ impl AgentRuntimeWorker {
                         session_id,
                         turn_id,
                         result,
-                    } => self.finish_execution(&session_id, &turn_id, result),
+                    } => self.finish_execution(&session_id, &turn_id, result, true, None),
                     RuntimeCommand::ResponseFinished {
                         session_id,
                         turn_id,
                         interaction_id,
+                        resolution,
                         result,
                         reply,
-                    } => {
-                        self.finish_response(&session_id, &turn_id, &interaction_id, result, reply)
-                    }
+                    } => self.finish_response(
+                        &session_id,
+                        &turn_id,
+                        &interaction_id,
+                        resolution.as_deref(),
+                        result,
+                        reply,
+                    ),
                 },
             }
             if self.shutdown.is_some() && self.shutdown_is_complete() {
@@ -1162,21 +1270,29 @@ impl AgentRuntimeWorker {
             ) {
                 return Err(RuntimeWorkerError::ReconciliationRequired { session_id });
             }
-            if session.active.is_some() || !session.queued.is_empty() {
+            // An active turn still blocks, but a non-empty queue is allowed so
+            // an adapter can park a gate turn (e.g. IntentSpec review) in front
+            // of work that was queued under a prior fence.
+            if session.active.is_some() {
                 return Err(RuntimeWorkerError::QueueFull {
                     session_id,
                     limit: 0,
                 });
             }
         }
-        self.admit_durable_turn(&request)?;
+        // Non-mutating external turns (e.g. IntentSpec review) may re-attach
+        // after a crash while their durable command is still Pending.
+        self.admit_durable_turn_allowing_pending_reattach(&request)?;
         let session = self.sessions.get_mut(&request.session_id).ok_or_else(|| {
             RuntimeWorkerError::UnknownSession {
                 session_id: request.session_id.clone(),
             }
         })?;
+        // A follow-up gate turn now owns the admission fence, so release the
+        // post-`CompletedHoldQueued` hold (active is non-empty below).
+        session.hold_queued_admission = false;
         session.snapshot.active_turn_id = Some(turn_id.clone());
-        session.snapshot.queued_turns = 0;
+        session.snapshot.queued_turns = session.queued.len();
         session.set_state(InteractionState::Running);
         session.active = Some(ActiveTurn {
             request,
@@ -1185,6 +1301,8 @@ impl AgentRuntimeWorker {
             cancel_requested_after_mutation: false,
             interaction: None,
             interaction_delivery: None,
+            interaction_resolutions: Vec::new(),
+            external_adapter_owned: true,
             execution_in_progress: true,
             response_in_progress: false,
             deferred_execution: None,
@@ -1304,6 +1422,12 @@ impl AgentRuntimeWorker {
             }
             active.interaction = Some(interaction.clone());
             active.interaction_delivery = delivery;
+            // Adapter-owned parked gates (IntentSpec review) have no live
+            // executor future: clear the flag so shutdown/cancel can finish
+            // WaitingActive without a 30s timeout.
+            if active.external_adapter_owned && active.interaction_delivery.is_some() {
+                active.execution_in_progress = false;
+            }
             session.set_state(interaction.clone());
         }
         self.emit(
@@ -1401,6 +1525,10 @@ impl AgentRuntimeWorker {
 
         match outcome {
             CancelOutcome::Queued(request) => {
+                // Release any staged executor work for this admission before
+                // durable cancel persistence — plan-execution runners live
+                // outside the worker mailbox.
+                self.config.executor.on_admission_discarded(&request);
                 if let Err(error) = Self::persist_cancelled_turn(
                     self.config.durability.as_ref(),
                     self.config.durability_repo_id.as_deref(),
@@ -1498,6 +1626,7 @@ impl AgentRuntimeWorker {
         }
 
         for (session_id, request) in cancelled_turns {
+            self.config.executor.on_admission_discarded(&request);
             if let Err(error) = Self::persist_cancelled_turn(
                 self.config.durability.as_ref(),
                 self.config.durability_repo_id.as_deref(),
@@ -1648,6 +1777,34 @@ impl AgentRuntimeWorker {
             })
     }
 
+    fn fence_session_inner(
+        &mut self,
+        session_id: String,
+        reason: String,
+    ) -> Result<(), RuntimeWorkerError> {
+        if self.shutdown.is_some() {
+            return Err(RuntimeWorkerError::ShuttingDown);
+        }
+        let event_buffer = self.config.event_buffer.max(1);
+        {
+            let session = self
+                .sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| SessionQueue::new(session_id.clone(), event_buffer));
+            session.active = None;
+            session.snapshot.active_turn_id = None;
+            session.set_state(InteractionState::IndeterminateSideEffect {
+                reason: reason.clone(),
+            });
+        }
+        self.emit(
+            &session_id,
+            None,
+            AgentEventKind::TurnIndeterminateSideEffect { reason },
+        );
+        Ok(())
+    }
+
     fn observe(&mut self, cursor: EventCursor) -> AgentEventStream {
         let event_buffer = self.config.event_buffer.max(1);
         let session = self
@@ -1669,6 +1826,12 @@ impl AgentRuntimeWorker {
                 return;
             };
             if session.active.is_some() {
+                return;
+            }
+            if session.hold_queued_admission {
+                // `CompletedHoldQueued` is waiting for the adapter to park the
+                // next gate turn; do not let a concurrent `submit` drain the
+                // held queue in that window.
                 return;
             }
             if matches!(
@@ -1702,6 +1865,8 @@ impl AgentRuntimeWorker {
                 cancel_requested_after_mutation: false,
                 interaction: None,
                 interaction_delivery: None,
+                interaction_resolutions: Vec::new(),
+                external_adapter_owned: false,
                 execution_in_progress: true,
                 response_in_progress: false,
                 deferred_execution: None,
@@ -1753,6 +1918,11 @@ impl AgentRuntimeWorker {
         let tool_boundary = self.config.tool_boundary.clone();
         let command_tx = self.command_tx.clone();
         let interaction_id = response.interaction.interaction_id.clone();
+        let resolution = response.delivery.as_ref().and_then(|delivery| {
+            delivery
+                .persist_interaction_resolved_after_terminal()
+                .then(|| delivery.interaction_resolution(&response.interaction))
+        });
         tokio::spawn(async move {
             let context = RuntimeExecutionContext {
                 tool_boundary,
@@ -1773,6 +1943,7 @@ impl AgentRuntimeWorker {
                     session_id: response.session_id,
                     turn_id: response.turn_id,
                     interaction_id,
+                    resolution,
                     result,
                     reply: response.reply,
                 })
@@ -1790,10 +1961,11 @@ impl AgentRuntimeWorker {
         session_id: &str,
         turn_id: &str,
         interaction_id: &str,
+        resolution: Option<&str>,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
         reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
     ) {
-        let reply_result = match &result {
+        let mut reply_result = match &result {
             Ok(_) => Ok(()),
             Err(error) => Err(error.clone()),
         };
@@ -1822,6 +1994,10 @@ impl AgentRuntimeWorker {
                     } else {
                         active.cancellation.cancel();
                     }
+                } else if let Some(resolution) = resolution {
+                    active
+                        .interaction_resolutions
+                        .push((interaction_id.to_string(), resolution.to_string()));
                 }
                 (
                     active.deferred_execution.take(),
@@ -1839,22 +2015,59 @@ impl AgentRuntimeWorker {
         {
             session.set_state(InteractionState::Cancelling);
         }
-        if reply_result.is_ok() {
-            self.emit(
-                session_id,
-                Some(turn_id.to_string()),
-                AgentEventKind::InteractionResponded {
-                    interaction_id: interaction_id.to_string(),
-                },
-            );
-        }
+        let resolution_audit = resolution.map(|value| (interaction_id, value));
         if reply_result.is_ok() || response_failure_without_live_execution {
-            self.finish_execution(session_id, turn_id, result);
+            self.finish_execution(session_id, turn_id, result, true, resolution_audit);
         }
         if let Some(deferred_execution) = deferred_execution {
-            self.finish_execution(session_id, turn_id, deferred_execution);
+            self.finish_execution(session_id, turn_id, deferred_execution, true, None);
+        }
+        if reply_result.is_ok() {
+            reply_result =
+                self.finalize_response_acknowledgement(session_id, turn_id, interaction_id);
         }
         let _ = reply.send(reply_result);
+    }
+
+    /// Surface durability/fence failures on `respond` after terminal settlement.
+    fn finalize_response_acknowledgement(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        interaction_id: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        enum TerminalAck {
+            Completed,
+            NonTerminal,
+        }
+        let ack = {
+            let Some(session) = self.sessions.get(session_id) else {
+                return Err(RuntimeWorkerError::UnknownSession {
+                    session_id: session_id.to_string(),
+                });
+            };
+            match &session.snapshot.interaction {
+                InteractionState::IndeterminateSideEffect { .. } => {
+                    return Err(RuntimeWorkerError::ReconciliationRequired {
+                        session_id: session_id.to_string(),
+                    });
+                }
+                InteractionState::Failed { reason } => {
+                    return Err(RuntimeWorkerError::ExecutionFailed(reason.clone()));
+                }
+                InteractionState::Completed => TerminalAck::Completed,
+                _ => TerminalAck::NonTerminal,
+            }
+        };
+        let _ = ack;
+        self.emit(
+            session_id,
+            Some(turn_id.to_string()),
+            AgentEventKind::InteractionResponded {
+                interaction_id: interaction_id.to_string(),
+            },
+        );
+        Ok(())
     }
 
     fn finish_execution(
@@ -1862,6 +2075,8 @@ impl AgentRuntimeWorker {
         session_id: &str,
         turn_id: &str,
         result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+        start_next_on_completed: bool,
+        interaction_resolution: Option<(&str, &str)>,
     ) {
         let durability = self.config.durability.clone();
         let durability_repo_id = self.config.durability_repo_id.clone();
@@ -1885,6 +2100,16 @@ impl AgentRuntimeWorker {
         let cancel_requested_after_mutation = active.cancel_requested_after_mutation;
         let response_delivery_failure = active.response_delivery_failure.clone();
         let request = active.request.clone();
+        // Prefer the accumulated list from the active turn; merge an optional
+        // one-shot from `finish_response` without duplicating the last push.
+        let mut interaction_resolutions = active.interaction_resolutions.clone();
+        if let Some((interaction_id, resolution)) = interaction_resolution {
+            let candidate = (interaction_id.to_string(), resolution.to_string());
+            let already_last = interaction_resolutions.last() == Some(&candidate);
+            if !already_last {
+                interaction_resolutions.push(candidate);
+            }
+        }
 
         if let Some(reason) = response_delivery_failure {
             session.active = None;
@@ -1985,6 +2210,7 @@ impl AgentRuntimeWorker {
             Ok(RuntimeTurnExecution::Completed { summary }) => {
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                session.hold_queued_admission = false;
                 if let Err(error) = Self::persist_successful_turn(
                     durability.as_ref(),
                     durability_repo_id.as_deref(),
@@ -1992,6 +2218,7 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &summary,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
                     return;
@@ -2002,7 +2229,104 @@ impl AgentRuntimeWorker {
                     Some(turn_id.to_string()),
                     AgentEventKind::TurnCompleted { summary },
                 );
-                self.start_next_if_idle(session_id);
+                if start_next_on_completed {
+                    self.start_next_if_idle(session_id);
+                }
+            }
+            Ok(RuntimeTurnExecution::CompletedHoldQueued { summary }) => {
+                // Same durable terminal as `Completed`, including optional
+                // `InteractionResolved` when the delivery opted in — Plan
+                // Execute parks the queue for the network-policy gate but
+                // must still prove the review closed (W2-03 r6). Holding the
+                // queue is about not admitting the next turn *and* rejecting
+                // post-response `submit` races until the follow-up gate is
+                // tracked (W2-03 r9).
+                session.active = None;
+                session.snapshot.active_turn_id = None;
+                session.hold_queued_admission = true;
+                if let Err(error) = Self::persist_successful_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &summary,
+                    &interaction_resolutions,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
+                session.set_state(InteractionState::Completed);
+                self.emit(
+                    session_id,
+                    Some(turn_id.to_string()),
+                    AgentEventKind::TurnCompleted { summary },
+                );
+            }
+            Ok(RuntimeTurnExecution::CompletedDiscardQueued { summary }) => {
+                // Complete the active turn before touching the queue so a
+                // durability failure here leaves queued turns still live.
+                session.active = None;
+                session.snapshot.active_turn_id = None;
+                session.hold_queued_admission = false;
+                if let Err(error) = Self::persist_successful_turn(
+                    durability.as_ref(),
+                    durability_repo_id.as_deref(),
+                    durability_principal_id.as_deref(),
+                    durability_command_kind.as_deref(),
+                    &request,
+                    &summary,
+                    &interaction_resolutions,
+                ) {
+                    self.fence_for_durability_failure(session_id, turn_id, &error);
+                    return;
+                }
+                session.set_state(InteractionState::Completed);
+                // Cancel one queued turn at a time. On persistence failure,
+                // put the unprocessed turn back so live queue and durable
+                // intents stay aligned (already-cancelled entries stay gone).
+                // Collect emit payloads first so the session borrow ends
+                // before `self.emit` re-borrows `self.sessions`.
+                let mut cancelled_turn_ids = Vec::new();
+                let mut discarded_requests = Vec::new();
+                let mut cancel_error = None;
+                while let Some(queued) = session.queued.pop_front() {
+                    session.snapshot.queued_turns = session.queued.len();
+                    let queued_turn_id = queued.turn_id.clone();
+                    if let Err(error) = Self::persist_cancelled_turn(
+                        durability.as_ref(),
+                        durability_repo_id.as_deref(),
+                        durability_principal_id.as_deref(),
+                        durability_command_kind.as_deref(),
+                        &queued,
+                    ) {
+                        session.queued.push_front(queued);
+                        session.snapshot.queued_turns = session.queued.len();
+                        cancel_error = Some((queued_turn_id, error));
+                        break;
+                    }
+                    discarded_requests.push(queued);
+                    cancelled_turn_ids.push(queued_turn_id);
+                }
+                let executor = self.config.executor.clone();
+                for request in &discarded_requests {
+                    executor.on_admission_discarded(request);
+                }
+                self.emit(
+                    session_id,
+                    Some(turn_id.to_string()),
+                    AgentEventKind::TurnCompleted { summary },
+                );
+                for queued_turn_id in cancelled_turn_ids {
+                    self.emit(
+                        session_id,
+                        Some(queued_turn_id),
+                        AgentEventKind::TurnCancelled,
+                    );
+                }
+                if let Some((queued_turn_id, error)) = cancel_error {
+                    self.fence_for_durability_failure(session_id, &queued_turn_id, &error);
+                }
             }
             Err(RuntimeWorkerError::Cancelled) if cancel_requested_after_mutation => {
                 let reason = "mutating dispatch did not report a determinate result after cancellation; reconciliation is required".to_string();
@@ -2164,6 +2488,24 @@ impl AgentRuntimeWorker {
     }
 
     fn admit_durable_turn(&self, request: &TurnRequest) -> Result<(), RuntimeWorkerError> {
+        self.admit_durable_turn_inner(request, false)
+    }
+
+    /// Like [`Self::admit_durable_turn`], but allows re-attaching a
+    /// non-mutating command that is still Pending after a process crash
+    /// (IntentSpec review gate restore).
+    fn admit_durable_turn_allowing_pending_reattach(
+        &self,
+        request: &TurnRequest,
+    ) -> Result<(), RuntimeWorkerError> {
+        self.admit_durable_turn_inner(request, true)
+    }
+
+    fn admit_durable_turn_inner(
+        &self,
+        request: &TurnRequest,
+        allow_pending_reattach: bool,
+    ) -> Result<(), RuntimeWorkerError> {
         let Some(intent) = Self::durable_intent(
             self.config.durability.as_ref(),
             self.config.durability_repo_id.as_deref(),
@@ -2179,18 +2521,35 @@ impl AgentRuntimeWorker {
                 "durability disappeared while admitting a runtime turn".to_string(),
             )
         })?;
-        match durability.admit(intent).map_err(|error| {
-            RuntimeWorkerError::DurabilityFailure(format!(
-                "could not persist intent for turn '{}': {error}",
+        match durability.admit(intent).map_err(|error| match error {
+            RuntimeCommandDurabilityError::Store(CodeCommandStoreError::PayloadConflict {
+                session_id,
+                command_id,
+                ..
+            }) => RuntimeWorkerError::CommandPayloadConflict {
+                session_id,
+                turn_id: command_id,
+            },
+            other => RuntimeWorkerError::DurabilityFailure(format!(
+                "could not persist intent for turn '{}': {other}",
                 request.turn_id
-            ))
+            )),
         })? {
             CodeCommandAdmission::Execute { .. } => Ok(()),
+            CodeCommandAdmission::Existing {
+                status: CodeCommandStatus::Pending,
+            } if allow_pending_reattach && !request.mutating => Ok(()),
             CodeCommandAdmission::Existing { status } => {
-                Err(RuntimeWorkerError::DurabilityFailure(format!(
-                    "turn '{}' already has durable command state {status:?}; refusing to dispatch it again",
-                    request.turn_id
-                )))
+                let ack_ok = matches!(
+                    status,
+                    CodeCommandStatus::Pending | CodeCommandStatus::Succeeded { .. }
+                );
+                Err(RuntimeWorkerError::IdempotentCommand {
+                    session_id: request.session_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    status: format!("{status:?}"),
+                    ack_ok,
+                })
             }
         }
     }
@@ -2233,6 +2592,7 @@ impl AgentRuntimeWorker {
         command_kind: Option<&str>,
         request: &TurnRequest,
         summary: &str,
+        interaction_resolutions: &[(String, String)],
     ) -> Result<(), RuntimeWorkerError> {
         let Some(intent) =
             Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
@@ -2245,10 +2605,19 @@ impl AgentRuntimeWorker {
             )
         })?;
         durability
-            .complete_success(&intent, summary)
+            .complete_success_with_interaction_resolutions(
+                &intent,
+                summary,
+                interaction_resolutions,
+            )
             .map_err(|error| {
                 RuntimeWorkerError::DurabilityFailure(format!(
-                    "could not durably record successful completion for turn '{}': {error}",
+                    "could not durably record successful completion{} for turn '{}': {error}",
+                    if interaction_resolutions.is_empty() {
+                        ""
+                    } else {
+                        " and interaction resolution(s)"
+                    },
                     request.turn_id
                 ))
             })?;
@@ -2381,6 +2750,11 @@ struct SessionQueue {
     event_tx: broadcast::Sender<AgentEvent>,
     queued: VecDeque<TurnRequest>,
     active: Option<ActiveTurn>,
+    /// Set by [`RuntimeTurnExecution::CompletedHoldQueued`] so a concurrent
+    /// `submit` cannot call [`AgentRuntimeWorker::start_next_if_idle`] before
+    /// the adapter parks the follow-up gate turn. Cleared when that gate is
+    /// tracked (or when a terminal that releases/discards the queue lands).
+    hold_queued_admission: bool,
 }
 
 impl SessionQueue {
@@ -2398,6 +2772,7 @@ impl SessionQueue {
             event_tx: broadcast::channel(event_buffer).0,
             queued: VecDeque::new(),
             active: None,
+            hold_queued_admission: false,
         }
     }
 
@@ -2418,6 +2793,16 @@ struct ActiveTurn {
     /// shared owner install a delivery object here instead of retaining a
     /// private pending map.
     interaction_delivery: Option<Box<dyn RuntimeInteractionDelivery>>,
+    /// Resolutions recorded by runtime-owned deliveries. A live tool-loop can
+    /// settle multiple sequential approvals/user-inputs before the turn
+    /// completes; preserve every resolution until terminal durability can
+    /// append them atomically with success.
+    interaction_resolutions: Vec<(String, String)>,
+    /// `true` for [`AgentRuntimeHandle::track_external_turn`] admissions that
+    /// have no worker-spawned executor future. Parked deliveries on these
+    /// turns must clear [`Self::execution_in_progress`] so shutdown/cancel can
+    /// terminalize without waiting for a never-arriving `ExecutionFinished`.
+    external_adapter_owned: bool,
     /// A tool-loop executor can keep running while its handler awaits a UI
     /// response. Cancellation must signal that live future rather than free
     /// the serialized slot as if the executor had already returned.

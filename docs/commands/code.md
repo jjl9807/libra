@@ -19,7 +19,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 The command supports eight AI provider backends (Gemini, OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, Ollama, Codex) and three operating contexts (dev, review, research) that tune the agent's behavior for different workflows. Sessions can be persisted and resumed with Libra's canonical `--resume <thread_id>` flow. Passing `--goal "<objective>"` boots the session directly in goal mode, where a supervisor drives the tool loop toward the stated objective until a verifier accepts completion.
 
-A sandboxed tool-execution layer enforces approval policies that control when the agent can run shell commands, apply patches, web search, or perform other potentially destructive operations. TUI dev sessions default to workspace-write execution with network access denied. After the execution plan is ready, the Plan review dialog includes a `Network: Deny` / `Network: Allow` toggle; the selected value becomes the execution `IntentSpec` network policy for shell, gate, and `web_search` use. Review and research contexts remain read-only and do not grant network access.
+A sandboxed tool-execution layer enforces approval policies that control when the agent can run shell commands, apply patches, web search, or perform other potentially destructive operations. TUI dev sessions default to workspace-write execution with network access denied. After the execution plan is ready, the Plan review dialog offers Execute Plan / Modify Plan / Cancel. Choosing Execute opens a separate mandatory network-policy prompt (`Network: Deny` / `Network: Allow` / `Back`); the choice is applied only after that gate resolves, and both gates are durable across crash/resume. Review and research contexts remain read-only and do not grant network access.
 
 When the TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
@@ -91,7 +91,7 @@ Ollama requests stream `/api/chat` responses by default and add a per-request `r
 
 Write control is local-only. `--control write` is rejected with `--stdio`, and it requires `--host` to be loopback (`127.0.0.1`, `::1`, or `localhost`). A second write-control instance using the same default paths fails fast with `CONTROL_INSTANCE_CONFLICT`; use distinct `--control-token-file` and `--control-info-file` paths only when the caller intentionally manages multiple local instances.
 
-Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB.
+Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB. When the session advertises `capabilities.commandIdempotency` (headless web-only today), `POST /api/code/messages` accepts `{ "text": "...", "commandId": "..." }` for retry de-duplication (same id + same text is idempotent; same id + different text returns `COMMAND_PAYLOAD_CONFLICT`). The runtime namespaces each `commandId` under a SHA-256 fence of the active controller `clientId` before durable admission (the raw clientId is never written into the command log). `commandIdempotency` is advertised only when durable SessionStore command admission is configured.
 
 `GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, use [`libra code-control --stdio`](code-control.md); `libra code --stdio` remains the MCP stdio server and does not control a live TUI.
 
@@ -163,11 +163,14 @@ Code UI API errors use `{ error: { code, message } }`:
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | An automation-only path was called with a non-automation lease. |
 | `CODE_UI_UNAVAILABLE` | 404 | No active `libra code` session is attached to the web server. |
 | `INVALID_QUERY_PARAM` | 400 | Query parsing failed, currently for `/threads` pagination. |
+| `INVALID_COMMAND_ID` | 400 | `commandId` was empty, too long, or contained whitespace/control characters. |
 | `STORAGE_PATH_INVALID` | 500 | Storage-root resolution failed. |
 | `STATUS_UNAVAILABLE` | 500 | Runtime status snapshot is unavailable. |
 | `THREAD_LIST_FAILED` | 500 | Thread projection enumeration failed. |
 | `DB_UNAVAILABLE` | 500 | Session database is offline. |
 | `RECONCILIATION_REQUIRED` | 409 | A mutating turn needs manual reconciliation before another turn can run. |
+| `COMMAND_PAYLOAD_CONFLICT` | 409 | The same `commandId` was reused with a different message payload. |
+| `COMMAND_ALREADY_TERMINAL` | 409 | The same `commandId` already finished failed/cancelled/indeterminate; allocate a new `commandId` to retry. |
 | `INTERNAL_ERROR` | 500 | Fallback internal failure. |
 | `UNSUPPORTED_OPERATION` | 422 | Runtime rejected a requested operation that is not yet supported. |
 
