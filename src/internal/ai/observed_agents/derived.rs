@@ -10,11 +10,16 @@
 //! ```json
 //! {
 //!   "provider": "claude",
+//!   "provider_session_id": "provider-session",
 //!   "kind": "tool_use",         // LifecycleEventKind::ToolUse
 //!   "timestamp": "2026-05-05T10:00:00+00:00",
 //!   "prompt": null,
 //!   "tool_name": "Read",
+//!   "tool_input": {"path": "README.md"},
+//!   "tool_response": {"content": "..."},
 //!   "assistant_message": null,
+//!   "turn_id": "turn-1",
+//!   "tool_use_id": "tool-1",
 //!   "has_model": false,
 //!   "has_tool_input": true,
 //!   "has_tool_response": true

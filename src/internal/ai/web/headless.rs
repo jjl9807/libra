@@ -68,9 +68,9 @@ use crate::internal::ai::{
     },
     runtime::{
         AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
-        InteractionState, RuntimeCommandDurability, RuntimeExecutionContext,
-        RuntimeInteractionDelivery, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
-        TurnRequest, runtime_worker_adapter_message,
+        ExecutionControlService, InteractionState, RuntimeCommandDurability,
+        RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest, runtime_worker_adapter_message,
     },
     sandbox::{ExecApprovalRequest, NetworkAccess, ReviewDecision},
     session::{CodeWorkflowEventKind, SessionJsonlStore, SessionState, SessionStore},
@@ -167,6 +167,12 @@ impl HeadlessSessionPersistence {
         &self.durability_session_id
     }
 
+    /// The shared execution-control service appends replayable Goal envelopes
+    /// to this same per-session JSONL stream.
+    pub fn goal_event_store(&self) -> SessionJsonlStore {
+        self.projection_store.clone()
+    }
+
     async fn record_user_message(
         &self,
         snapshot: CodeUiSessionSnapshot,
@@ -196,24 +202,6 @@ impl HeadlessSessionPersistence {
         let mut state = self.state.lock().await;
         sync_session_metadata_from_snapshot(&mut state, snapshot, sequence)?;
         self.store.save(&state)
-    }
-
-    /// Record the non-sensitive fact that a browser interaction was resolved
-    /// before its continuation is released. Projection deltas make the UI
-    /// resumable, while this durable workflow event is the audit fact used to
-    /// distinguish a response from a merely rendered interaction state.
-    fn record_interaction_resolution(
-        &self,
-        interaction_id: &str,
-        resolution: &str,
-    ) -> io::Result<()> {
-        self.projection_store.append_code_workflow_durable(
-            CodeWorkflowEventKind::InteractionResolved {
-                interaction_id: interaction_id.to_string(),
-                resolution: resolution.to_string(),
-            },
-        )?;
-        Ok(())
     }
 
     /// Persist only the projection fields that changed since the last durable
@@ -364,20 +352,10 @@ fn json_projection_error(error: serde_json::Error) -> io::Error {
     )
 }
 
-struct PendingHeadlessUserInput {
-    questions: Vec<UserInputQuestion>,
-    response_tx: oneshot::Sender<UserInputResponse>,
-}
-
-struct PendingHeadlessExecApproval {
-    request: ExecApprovalRequest,
-}
-
 /// A live tool-loop continuation held by `AgentRuntimeWorker` while the Web
-/// session is awaiting an interaction response.  The legacy pending maps below
-/// are retained only for standalone, no-active-turn adapter calls; browser
-/// turns must register one of these so validation, durable audit, and one-shot
-/// release have a single owner.
+/// session is awaiting an interaction response. Browser turns register one of
+/// these so validation, durable audit, and one-shot release have a single
+/// owner.
 enum HeadlessInteractionDelivery {
     UserInput {
         session: Arc<CodeUiSession>,
@@ -412,6 +390,38 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
             Self::ExecApproval { .. } => review_decision_from_interaction_response(response)
                 .map(|_| ())
                 .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string())),
+        }
+    }
+
+    fn persist_interaction_resolved_after_terminal(&self) -> bool {
+        match self {
+            Self::UserInput { persistence, .. } | Self::ExecApproval { persistence, .. } => {
+                persistence.is_some()
+            }
+        }
+    }
+
+    fn interaction_resolution(
+        &self,
+        interaction: &crate::internal::ai::runtime::InteractionResponse,
+    ) -> String {
+        match self {
+            Self::UserInput { .. } => "answered".to_string(),
+            Self::ExecApproval { .. } => decode_headless_interaction_response(interaction)
+                .ok()
+                .and_then(|response| review_decision_from_interaction_response(response).ok())
+                .map(|decision| match decision {
+                    ReviewDecision::Approved => "approved",
+                    ReviewDecision::ApprovedForSession => "approved_for_session",
+                    ReviewDecision::ApprovedForTtl => "approved_for_ttl",
+                    ReviewDecision::ApprovedForDirectoryTtl => "approved_for_directory_ttl",
+                    ReviewDecision::ApprovedForPatternTtl => "approved_for_pattern_ttl",
+                    ReviewDecision::ApprovedForAllCommands => "approved_for_all_commands",
+                    ReviewDecision::Denied => "denied",
+                    ReviewDecision::Abort => "aborted",
+                })
+                .unwrap_or("approval_resolved")
+                .to_string(),
         }
     }
 
@@ -507,8 +517,6 @@ struct HeadlessDirectTurnExecutor<M: CompletionModel + 'static> {
     /// projected. The original tool-loop may still be unwinding, so its later
     /// terminal result must not overwrite the reconciliation requirement.
     interaction_persistence_failed: Arc<AtomicBool>,
-    pending_user_inputs: Arc<Mutex<HashMap<String, PendingHeadlessUserInput>>>,
-    pending_exec_approvals: Arc<Mutex<HashMap<String, PendingHeadlessExecApproval>>>,
     persistence: Option<HeadlessSessionPersistence>,
 }
 
@@ -555,13 +563,12 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// Every repeated shutdown caller observes this same terminal result,
     /// rather than racing to independently cancel or detach the active turn.
     shutdown_result_tx: watch::Sender<Option<Result<(), String>>>,
-    /// Pending `request_user_input` flows keyed by tool call id.
-    pending_user_inputs: Arc<Mutex<HashMap<String, PendingHeadlessUserInput>>>,
-    /// Pending exec approval flows keyed by tool call id.
-    pending_exec_approvals: Arc<Mutex<HashMap<String, PendingHeadlessExecApproval>>>,
     /// Optional on-disk session persistence used by `libra code --web-only
     /// --resume <thread_id>` for non-Codex providers.
     persistence: Option<HeadlessSessionPersistence>,
+    /// Runtime-owned Goal/task controls. This is deliberately separate from
+    /// the Code UI adapter so browser control never needs a TUI App hop.
+    execution_control: Arc<ExecutionControlService>,
 }
 
 impl<M> HeadlessCodeRuntime<M>
@@ -592,7 +599,7 @@ where
             registry,
             user_input_rx,
             exec_approval_rx,
-            config_factory,
+            config_factory.clone(),
             Vec::new(),
             None,
         )
@@ -658,8 +665,6 @@ where
         let shutdown_timed_out = Arc::new(AtomicBool::new(false));
         let interaction_persistence_failed = Arc::new(AtomicBool::new(false));
         let active_turn_mutations = Arc::new(Mutex::new(HashMap::new()));
-        let pending_user_inputs = Arc::new(Mutex::new(HashMap::new()));
-        let pending_exec_approvals = Arc::new(Mutex::new(HashMap::new()));
         let tool_boundary = registry.hardening().cloned().ok_or_else(|| {
             anyhow!(
                 "Headless Code runtime requires the registry's shared tool-boundary policy; rebuild CodeAgentServices before starting a browser turn"
@@ -673,6 +678,9 @@ where
             capabilities.command_idempotency = false;
             session.set_capabilities(capabilities.clone()).await;
         }
+        // Capture the shared task runtime before moving the config factory
+        // into the turn executor below.
+        let subagent_runtime = (config_factory)().subagent_runtime;
         let executor = Arc::new(HeadlessDirectTurnExecutor {
             session: session.clone(),
             history: history.clone(),
@@ -683,8 +691,6 @@ where
             active_turn_mutations: active_turn_mutations.clone(),
             shutdown_timed_out: shutdown_timed_out.clone(),
             interaction_persistence_failed: interaction_persistence_failed.clone(),
-            pending_user_inputs: pending_user_inputs.clone(),
-            pending_exec_approvals: pending_exec_approvals.clone(),
             persistence: persistence.clone(),
         });
         let mut worker_config = AgentRuntimeWorkerConfig::new(executor, tool_boundary);
@@ -694,6 +700,18 @@ where
             .map(HeadlessSessionPersistence::durability_session_id)
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Goal JSONL store also supplies session_root so task.dispatch can
+        // attach file-history batches (S2-INV-06), matching the TUI `/task` path.
+        let execution_control = Arc::new(
+            ExecutionControlService::new(
+                runtime_session_id.clone(),
+                persistence
+                    .as_ref()
+                    .map(HeadlessSessionPersistence::goal_event_store),
+                subagent_runtime,
+            )
+            .map_err(|error| anyhow!("failed to restore runtime execution controls: {error}"))?,
+        );
         let mut recovered_reconciliation = false;
         if let Some(persistence) = persistence.as_ref() {
             let (durability, repo_id, principal_id) = persistence.worker_durability_config();
@@ -728,9 +746,8 @@ where
             shutdown_timed_out,
             interaction_persistence_failed,
             shutdown_result_tx,
-            pending_user_inputs,
-            pending_exec_approvals,
             persistence,
+            execution_control,
         });
 
         let weak_listener = Arc::downgrade(&runtime);
@@ -954,101 +971,6 @@ where
         release_headless_turn(&self.in_flight, &request.turn_id).await;
         terminal
     }
-
-    async fn respond(
-        &self,
-        _request: TurnRequest,
-        interaction: crate::internal::ai::runtime::InteractionResponse,
-        context: RuntimeExecutionContext,
-    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
-        if context.cancellation().is_cancelled() {
-            return Err(RuntimeWorkerError::Cancelled);
-        }
-        let response = decode_headless_interaction_response(&interaction)?;
-        deliver_headless_interaction_response(
-            &self.session,
-            &self.interaction_persistence_failed,
-            &self.pending_user_inputs,
-            &self.pending_exec_approvals,
-            self.persistence.as_ref(),
-            &interaction.interaction_id,
-            response,
-        )
-        .await
-    }
-}
-
-/// Deliver a validated browser response only from the worker-dispatched
-/// executor path. Keeping removal, durable projection, and oneshot delivery
-/// together prevents the Web adapter from racing the original tool-loop
-/// continuation.
-async fn deliver_headless_interaction_response(
-    session: &Arc<CodeUiSession>,
-    interaction_persistence_failed: &Arc<AtomicBool>,
-    pending_user_inputs: &Arc<Mutex<HashMap<String, PendingHeadlessUserInput>>>,
-    pending_exec_approvals: &Arc<Mutex<HashMap<String, PendingHeadlessExecApproval>>>,
-    persistence: Option<&HeadlessSessionPersistence>,
-    interaction_id: &str,
-    response: CodeUiInteractionResponse,
-) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
-    let exec_response = {
-        let pending = pending_exec_approvals.lock().await;
-        pending
-            .contains_key(interaction_id)
-            .then(|| review_decision_from_interaction_response(response.clone()))
-            .transpose()
-            .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?
-    };
-    if exec_response.is_some() {
-        let pending = {
-            let mut pending = pending_exec_approvals.lock().await;
-            pending.remove(interaction_id).ok_or_else(|| {
-                RuntimeWorkerError::ExecutionFailed(
-                    "the pending execution approval closed before the response was delivered"
-                        .to_string(),
-                )
-            })?
-        };
-        return deliver_headless_exec_approval_response(
-            session,
-            interaction_persistence_failed,
-            persistence,
-            interaction_id,
-            pending.request,
-            response,
-        )
-        .await;
-    }
-
-    {
-        let pending = pending_user_inputs.lock().await;
-        let pending = pending.get(interaction_id).ok_or_else(|| {
-            RuntimeWorkerError::ExecutionFailed(format!(
-                "unknown pending interaction: {interaction_id}"
-            ))
-        })?;
-        let _ = user_input_response_from_code_ui_request(&pending.questions, response.clone())
-            .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
-    }
-    let pending = {
-        let mut pending = pending_user_inputs.lock().await;
-        pending.remove(interaction_id).ok_or_else(|| {
-            RuntimeWorkerError::ExecutionFailed(
-                "the pending user-input request closed before the response was delivered"
-                    .to_string(),
-            )
-        })?
-    };
-    deliver_headless_user_input_response(
-        session,
-        interaction_persistence_failed,
-        persistence,
-        interaction_id,
-        pending.questions,
-        pending.response_tx,
-        response,
-    )
-    .await
 }
 
 fn decode_headless_interaction_response(
@@ -1083,22 +1005,6 @@ async fn deliver_headless_exec_approval_response(
         .await;
         return Err(RuntimeWorkerError::ExecutionFailed(
             "unable to persist the approval response; no tool action was started".to_string(),
-        ));
-    }
-    if let Err(error) = persist_headless_interaction_resolution(
-        persistence,
-        interaction_id,
-        review_decision_resolution(decision),
-    ) {
-        interaction_persistence_failed.store(true, Ordering::Release);
-        mark_persistence_failure(
-            session,
-            "failed to persist resolved exec approval audit event",
-            error,
-        )
-        .await;
-        return Err(RuntimeWorkerError::ExecutionFailed(
-            "unable to persist the approval audit event; no tool action was started".to_string(),
         ));
     }
     if request.response_tx.send(decision).is_err() {
@@ -1145,20 +1051,6 @@ async fn deliver_headless_user_input_response(
             "unable to persist the user-input response; no tool action was started".to_string(),
         ));
     }
-    if let Err(error) =
-        persist_headless_interaction_resolution(persistence, interaction_id, "answered")
-    {
-        interaction_persistence_failed.store(true, Ordering::Release);
-        mark_persistence_failure(
-            session,
-            "failed to persist resolved user-input audit event",
-            error,
-        )
-        .await;
-        return Err(RuntimeWorkerError::ExecutionFailed(
-            "unable to persist the user-input audit event; no tool action was started".to_string(),
-        ));
-    }
     if response_tx.send(user_input_response).is_err() {
         session.set_status(CodeUiSessionStatus::Error).await;
         if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
@@ -1188,30 +1080,6 @@ async fn persist_headless_interaction_snapshot(
             .await?;
     }
     Ok(())
-}
-
-fn persist_headless_interaction_resolution(
-    persistence: Option<&HeadlessSessionPersistence>,
-    interaction_id: &str,
-    resolution: &str,
-) -> io::Result<()> {
-    if let Some(persistence) = persistence {
-        persistence.record_interaction_resolution(interaction_id, resolution)?;
-    }
-    Ok(())
-}
-
-fn review_decision_resolution(decision: ReviewDecision) -> &'static str {
-    match decision {
-        ReviewDecision::Approved => "approved",
-        ReviewDecision::ApprovedForSession => "approved_for_session",
-        ReviewDecision::ApprovedForTtl => "approved_for_ttl",
-        ReviewDecision::ApprovedForDirectoryTtl => "approved_for_directory_ttl",
-        ReviewDecision::ApprovedForPatternTtl => "approved_for_pattern_ttl",
-        ReviewDecision::ApprovedForAllCommands => "approved_for_all_commands",
-        ReviewDecision::Denied => "denied",
-        ReviewDecision::Abort => "aborted",
-    }
 }
 
 fn headless_interaction_id(state: &InteractionState) -> Option<&str> {
@@ -1538,156 +1406,29 @@ where
             let slot = self.in_flight.lock().await;
             slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
         };
-        if let Some(runtime_turn_id) = runtime_turn_id {
-            let response_payload = serde_json::to_string(&response).map_err(|error| {
-                anyhow!(
-                    "Unable to encode the interaction response for AgentRuntime delivery: {error}"
-                )
-            })?;
-            self.runtime
-                .respond(
-                    self.runtime_session_id.clone(),
-                    runtime_turn_id,
-                    crate::internal::ai::runtime::InteractionResponse::new(
-                        interaction_id,
-                        response_payload,
-                    ),
-                )
-                .await
-                .map_err(|error| {
-                    anyhow!("Unable to deliver the interaction response to AgentRuntime: {error}")
-                })?;
-            return Ok(());
-        }
-
-        let exec_decision = {
-            let pending = self.pending_exec_approvals.lock().await;
-            pending
-                .contains_key(interaction_id)
-                .then(|| review_decision_from_interaction_response(response.clone()))
-                .transpose()?
-        };
-        if let Some(decision) = exec_decision {
-            let pending = {
-                let mut pending = self.pending_exec_approvals.lock().await;
-                pending.remove(interaction_id).ok_or_else(|| {
-                    anyhow!(
-                        "The pending execution approval closed before the response was delivered"
-                    )
-                })?
-            };
-            self.session.resolve_interaction(interaction_id).await;
-            self.session
-                .set_status(CodeUiSessionStatus::ExecutingTool)
-                .await;
-            if let Err(error) = self.persist_current_snapshot().await {
-                self.interaction_persistence_failed
-                    .store(true, Ordering::Release);
-                mark_persistence_failure(
-                    &self.session,
-                    "failed to persist resolved exec approval interaction",
-                    error,
-                )
-                .await;
-                return Err(anyhow!(
-                    "Unable to persist the approval response; no tool action was started. Verify session storage before retrying"
-                ));
-            }
-            if let Err(error) = self.persist_interaction_resolution(
-                interaction_id,
-                review_decision_resolution(decision),
-            ) {
-                self.interaction_persistence_failed
-                    .store(true, Ordering::Release);
-                mark_persistence_failure(
-                    &self.session,
-                    "failed to persist resolved exec approval audit event",
-                    error,
-                )
-                .await;
-                return Err(anyhow!(
-                    "Unable to persist the approval audit event; no tool action was started. Verify session storage before retrying"
-                ));
-            }
-            if pending.request.response_tx.send(decision).is_err() {
-                self.session.set_status(CodeUiSessionStatus::Error).await;
-                if let Err(error) = self.persist_current_snapshot().await {
-                    self.interaction_persistence_failed
-                        .store(true, Ordering::Release);
-                    mark_persistence_failure(
-                        &self.session,
-                        "failed to persist closed execution approval request",
-                        error,
-                    )
-                    .await;
-                }
-                return Err(anyhow!(
-                    "The pending execution approval request closed before the response was delivered; no tool action was started"
-                ));
-            }
-            return Ok(());
-        }
-
-        let user_input_response = {
-            let pending = self.pending_user_inputs.lock().await;
-            let pending = pending
-                .get(interaction_id)
-                .ok_or_else(|| anyhow!("Unknown pending interaction: {interaction_id}"))?;
-            user_input_response_from_code_ui_request(&pending.questions, response)?
-        };
-        let pending = {
-            let mut pending = self.pending_user_inputs.lock().await;
-            pending.remove(interaction_id).ok_or_else(|| {
-                anyhow!("The pending user-input request closed before the response was delivered")
-            })?
-        };
-        self.session.resolve_interaction(interaction_id).await;
-        self.session
-            .set_status(CodeUiSessionStatus::ExecutingTool)
-            .await;
-        if let Err(error) = self.persist_current_snapshot().await {
-            self.interaction_persistence_failed
-                .store(true, Ordering::Release);
-            mark_persistence_failure(
-                &self.session,
-                "failed to persist resolved user input interaction",
-                error,
-            )
-            .await;
-            return Err(anyhow!(
-                "Unable to persist the user-input response; no tool action was started. Verify session storage before retrying"
-            ));
-        }
-        if let Err(error) = self.persist_interaction_resolution(interaction_id, "answered") {
-            self.interaction_persistence_failed
-                .store(true, Ordering::Release);
-            mark_persistence_failure(
-                &self.session,
-                "failed to persist resolved user-input audit event",
-                error,
-            )
-            .await;
-            return Err(anyhow!(
-                "Unable to persist the user-input audit event; no tool action was started. Verify session storage before retrying"
-            ));
-        }
-        if pending.response_tx.send(user_input_response).is_err() {
+        let Some(runtime_turn_id) = runtime_turn_id else {
+            self.session.clear_interaction(interaction_id).await;
             self.session.set_status(CodeUiSessionStatus::Error).await;
-            if let Err(error) = self.persist_current_snapshot().await {
-                self.interaction_persistence_failed
-                    .store(true, Ordering::Release);
-                mark_persistence_failure(
-                    &self.session,
-                    "failed to persist closed user-input request",
-                    error,
-                )
-                .await;
-            }
             return Err(anyhow!(
-                "The pending user-input request closed before the response was delivered; no tool action was started"
+                "This interaction has no active AgentRuntime turn and was closed fail-closed"
             ));
-        }
-        Ok(())
+        };
+        let response_payload = serde_json::to_string(&response).map_err(|error| {
+            anyhow!("Unable to encode the interaction response for AgentRuntime delivery: {error}")
+        })?;
+        self.runtime
+            .respond(
+                self.runtime_session_id.clone(),
+                runtime_turn_id,
+                crate::internal::ai::runtime::InteractionResponse::new(
+                    interaction_id,
+                    response_payload,
+                ),
+            )
+            .await
+            .map_err(|error| {
+                anyhow!("Unable to deliver the interaction response to AgentRuntime: {error}")
+            })
     }
 
     async fn cancel_turn(&self) -> anyhow::Result<()> {
@@ -1697,7 +1438,6 @@ where
             slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
         };
         let Some(runtime_turn_id) = runtime_turn_id else {
-            self.clear_pending_user_inputs().await;
             return Ok(());
         };
         let runtime_interaction_id = self
@@ -1734,13 +1474,41 @@ where
         if let Some(interaction_id) = runtime_interaction_id {
             self.session.clear_interaction(&interaction_id).await;
         }
-        self.clear_pending_user_inputs().await;
         if mutation_in_progress {
             return Err(anyhow!(
                 "A mutating tool is already running; cancellation waits for its determinate result and cannot safely abort it"
             ));
         }
         Ok(())
+    }
+
+    async fn task_dispatch(&self, agent: String, prompt: String) -> anyhow::Result<String> {
+        self.ensure_not_shutting_down()?;
+        self.ensure_session_is_recoverable().await?;
+        self.execution_control.task_dispatch(agent, prompt).await
+    }
+
+    async fn goal_start(&self, objective: String) -> anyhow::Result<String> {
+        self.ensure_not_shutting_down()?;
+        self.execution_control
+            .goal_start(objective)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn goal_status(&self) -> anyhow::Result<String> {
+        self.execution_control
+            .goal_status()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn goal_cancel(&self, reason: String) -> anyhow::Result<String> {
+        self.ensure_not_shutting_down()?;
+        self.execution_control
+            .goal_cancel(reason)
+            .await
+            .map_err(Into::into)
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
@@ -1809,7 +1577,6 @@ where
     }
 
     async fn shutdown_once(&self) -> anyhow::Result<()> {
-        self.clear_pending_user_inputs().await;
         let shutdown_result = self.runtime.shutdown().await;
         if shutdown_result.is_err() {
             self.shutdown_timed_out.store(true, Ordering::Release);
@@ -1928,7 +1695,6 @@ where
                 error,
             )
             .await;
-            self.clear_pending_user_inputs().await;
             return;
         }
         let interaction_state = InteractionState::AwaitingUserInput {
@@ -1952,13 +1718,13 @@ where
             return;
         }
 
-        self.pending_user_inputs.lock().await.insert(
+        tracing::error!(
             interaction_id,
-            PendingHeadlessUserInput {
-                questions: request.questions,
-                response_tx: request.response_tx,
-            },
+            "headless user-input request arrived without an active runtime turn; closing fail-closed"
         );
+        self.session.clear_interaction(&interaction_id).await;
+        self.session.set_status(CodeUiSessionStatus::Error).await;
+        drop(request.response_tx);
     }
 
     async fn handle_exec_approval_request(&self, request: ExecApprovalRequest) {
@@ -1988,7 +1754,6 @@ where
                 error,
             )
             .await;
-            self.clear_pending_user_inputs().await;
             return;
         }
         let interaction_state = InteractionState::AwaitingToolApproval {
@@ -2012,10 +1777,13 @@ where
             return;
         }
 
-        self.pending_exec_approvals
-            .lock()
-            .await
-            .insert(interaction_id, PendingHeadlessExecApproval { request });
+        tracing::error!(
+            interaction_id,
+            "headless exec approval arrived without an active runtime turn; denying fail-closed"
+        );
+        self.session.clear_interaction(&interaction_id).await;
+        self.session.set_status(CodeUiSessionStatus::Error).await;
+        let _ = request.response_tx.send(ReviewDecision::Denied);
     }
 
     async fn active_runtime_turn_id(&self) -> Option<String> {
@@ -2024,8 +1792,6 @@ where
     }
 
     /// Transfer a live tool-loop continuation into the serialized worker.
-    /// Standalone adapter calls have no active runtime turn and deliberately
-    /// use the narrow compatibility map above instead.
     async fn register_live_runtime_interaction(
         &self,
         runtime_turn_id: String,
@@ -2048,33 +1814,8 @@ where
                 error = %error,
                 "failed to register a live headless interaction with AgentRuntime; closing the interaction fail-closed"
             );
-            self.clear_pending_user_inputs().await;
             self.session.clear_interaction(interaction_id).await;
             self.session.set_status(CodeUiSessionStatus::Error).await;
-        }
-    }
-
-    async fn clear_pending_user_inputs(&self) {
-        let pending_ids = {
-            let mut pending = self.pending_user_inputs.lock().await;
-            let ids = pending.keys().cloned().collect::<Vec<_>>();
-            pending.clear();
-            ids
-        };
-
-        for interaction_id in pending_ids {
-            self.session.clear_interaction(&interaction_id).await;
-        }
-
-        let pending_ids = {
-            let mut pending = self.pending_exec_approvals.lock().await;
-            let ids = pending.keys().cloned().collect::<Vec<_>>();
-            pending.clear();
-            ids
-        };
-
-        for interaction_id in pending_ids {
-            self.session.clear_interaction(&interaction_id).await;
         }
     }
 
@@ -2104,18 +1845,6 @@ where
                 .await?;
         }
         Ok(())
-    }
-
-    fn persist_interaction_resolution(
-        &self,
-        interaction_id: &str,
-        resolution: &str,
-    ) -> io::Result<()> {
-        persist_headless_interaction_resolution(
-            self.persistence.as_ref(),
-            interaction_id,
-            resolution,
-        )
     }
 }
 

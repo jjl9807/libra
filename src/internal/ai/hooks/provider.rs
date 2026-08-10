@@ -43,6 +43,7 @@ pub enum ProviderHookCommand {
     SessionStart,
     Prompt,
     ToolUse,
+    PermissionRequest,
     ModelUpdate,
     Compaction,
     Stop,
@@ -65,6 +66,7 @@ impl ProviderHookCommand {
             ProviderHookCommand::SessionStart => LifecycleEventKind::SessionStart,
             ProviderHookCommand::Prompt => LifecycleEventKind::TurnStart,
             ProviderHookCommand::ToolUse => LifecycleEventKind::ToolUse,
+            ProviderHookCommand::PermissionRequest => LifecycleEventKind::PermissionRequest,
             ProviderHookCommand::ModelUpdate => LifecycleEventKind::ModelUpdate,
             ProviderHookCommand::Compaction => LifecycleEventKind::Compaction,
             ProviderHookCommand::Stop => LifecycleEventKind::TurnEnd,
@@ -81,6 +83,7 @@ impl fmt::Display for ProviderHookCommand {
             ProviderHookCommand::SessionStart => "session-start",
             ProviderHookCommand::Prompt => "prompt",
             ProviderHookCommand::ToolUse => "tool-use",
+            ProviderHookCommand::PermissionRequest => "permission-request",
             ProviderHookCommand::ModelUpdate => "model-update",
             ProviderHookCommand::Compaction => "compaction",
             ProviderHookCommand::Stop => "stop",
@@ -176,7 +179,7 @@ mod tests {
     use super::*;
 
     /// `ProviderHookCommand::lifecycle_event_kind` is the canonical
-    /// 7-way mapping from CLI subcommand to lifecycle event. Pin every
+    /// command-to-lifecycle mapping. Pin every
     /// pair so a future renumbering / variant addition surfaces
     /// here — the runner's session-state mutation table depends on
     /// this exact mapping.
@@ -189,6 +192,10 @@ mod tests {
             ),
             (ProviderHookCommand::Prompt, LifecycleEventKind::TurnStart),
             (ProviderHookCommand::ToolUse, LifecycleEventKind::ToolUse),
+            (
+                ProviderHookCommand::PermissionRequest,
+                LifecycleEventKind::PermissionRequest,
+            ),
             (
                 ProviderHookCommand::ModelUpdate,
                 LifecycleEventKind::ModelUpdate,
@@ -222,6 +229,7 @@ mod tests {
             (ProviderHookCommand::SessionStart, "session-start"),
             (ProviderHookCommand::Prompt, "prompt"),
             (ProviderHookCommand::ToolUse, "tool-use"),
+            (ProviderHookCommand::PermissionRequest, "permission-request"),
             (ProviderHookCommand::ModelUpdate, "model-update"),
             (ProviderHookCommand::Compaction, "compaction"),
             (ProviderHookCommand::Stop, "stop"),
@@ -243,6 +251,7 @@ mod tests {
             ProviderHookCommand::SessionStart,
             ProviderHookCommand::Prompt,
             ProviderHookCommand::ToolUse,
+            ProviderHookCommand::PermissionRequest,
             ProviderHookCommand::ModelUpdate,
             ProviderHookCommand::Compaction,
             ProviderHookCommand::Stop,
@@ -252,8 +261,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        // 9 distinct variants must populate 9 hash buckets.
-        assert_eq!(set.len(), 9, "all variants must be hash-distinct");
+        // 10 distinct variants must populate 10 hash buckets.
+        assert_eq!(set.len(), 10, "all variants must be hash-distinct");
     }
 
     /// `ProviderInstallOptions::default()` initialises both fields

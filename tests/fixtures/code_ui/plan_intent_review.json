@@ -1,0 +1,55 @@
+{
+  "responses": [
+    {
+      "match": { "contains": "You are running /plan mode." },
+      "type": "tool_call",
+      "id": "call_request_user_input_1",
+      "name": "request_user_input",
+      "arguments": {
+        "questions": [
+          {
+            "id": "risk_profile",
+            "header": "Risk",
+            "question": "What risk level should be used?",
+            "options": ["Low", "Medium", "High"]
+          }
+        ]
+      }
+    },
+    {
+      "match": { "equals": "" },
+      "type": "tool_call",
+      "id": "call_submit_intent_draft_1",
+      "name": "submit_intent_draft",
+      "arguments": {
+        "draft": {
+          "intent": {
+            "summary": "Add a README usage section",
+            "problemStatement": "The README is missing a usage walkthrough for new contributors",
+            "changeType": "feature",
+            "objectives": [
+              { "title": "document usage in README", "kind": "implementation" }
+            ],
+            "inScope": ["README.md"],
+            "outOfScope": []
+          },
+          "acceptance": {
+            "successCriteria": ["README.md contains a Usage section"],
+            "fastChecks": [],
+            "integrationChecks": [],
+            "securityChecks": [],
+            "releaseChecks": []
+          },
+          "risk": {
+            "rationale": "single documentation file change",
+            "level": "low"
+          }
+        }
+      }
+    }
+  ],
+  "fallback": {
+    "type": "text",
+    "text": "fake assistant: unmatched plan-workflow prompt"
+  }
+}

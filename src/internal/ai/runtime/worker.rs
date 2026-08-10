@@ -346,6 +346,11 @@ pub trait RuntimeTurnExecutor: Send + Sync + 'static {
         let _ = (request, interaction, context);
         Err(RuntimeWorkerError::ExecutorDoesNotSupportResponses)
     }
+
+    /// Invoked when a queued (or otherwise never-executed) admission is removed
+    /// without calling [`Self::execute`] — for example cancel or shutdown drain.
+    /// Executors that stage per-turn work must release it here.
+    fn on_admission_discarded(&self, _request: &TurnRequest) {}
 }
 
 /// Placeholder executor for adapters that use [`AgentRuntimeHandle`] solely
@@ -388,6 +393,14 @@ pub trait RuntimeInteractionDelivery: Send + 'static {
     /// append cannot be persisted.
     fn persist_interaction_resolved_after_terminal(&self) -> bool {
         false
+    }
+
+    /// Non-sensitive audit label persisted with `InteractionResolved` when
+    /// [`Self::persist_interaction_resolved_after_terminal`] is enabled.
+    /// Deliveries carrying structured user input must override this instead of
+    /// persisting the opaque response payload, which can contain secrets.
+    fn interaction_resolution(&self, interaction: &InteractionResponse) -> String {
+        interaction.response.clone()
     }
 
     /// Persist and release the continuation.  This runs outside the actor but
@@ -1288,6 +1301,7 @@ impl AgentRuntimeWorker {
             cancel_requested_after_mutation: false,
             interaction: None,
             interaction_delivery: None,
+            interaction_resolutions: Vec::new(),
             external_adapter_owned: true,
             execution_in_progress: true,
             response_in_progress: false,
@@ -1511,6 +1525,10 @@ impl AgentRuntimeWorker {
 
         match outcome {
             CancelOutcome::Queued(request) => {
+                // Release any staged executor work for this admission before
+                // durable cancel persistence — plan-execution runners live
+                // outside the worker mailbox.
+                self.config.executor.on_admission_discarded(&request);
                 if let Err(error) = Self::persist_cancelled_turn(
                     self.config.durability.as_ref(),
                     self.config.durability_repo_id.as_deref(),
@@ -1608,6 +1626,7 @@ impl AgentRuntimeWorker {
         }
 
         for (session_id, request) in cancelled_turns {
+            self.config.executor.on_admission_discarded(&request);
             if let Err(error) = Self::persist_cancelled_turn(
                 self.config.durability.as_ref(),
                 self.config.durability_repo_id.as_deref(),
@@ -1846,6 +1865,7 @@ impl AgentRuntimeWorker {
                 cancel_requested_after_mutation: false,
                 interaction: None,
                 interaction_delivery: None,
+                interaction_resolutions: Vec::new(),
                 external_adapter_owned: false,
                 execution_in_progress: true,
                 response_in_progress: false,
@@ -1901,7 +1921,7 @@ impl AgentRuntimeWorker {
         let resolution = response.delivery.as_ref().and_then(|delivery| {
             delivery
                 .persist_interaction_resolved_after_terminal()
-                .then(|| response.interaction.response.clone())
+                .then(|| delivery.interaction_resolution(&response.interaction))
         });
         tokio::spawn(async move {
             let context = RuntimeExecutionContext {
@@ -1974,6 +1994,10 @@ impl AgentRuntimeWorker {
                     } else {
                         active.cancellation.cancel();
                     }
+                } else if let Some(resolution) = resolution {
+                    active
+                        .interaction_resolutions
+                        .push((interaction_id.to_string(), resolution.to_string()));
                 }
                 (
                     active.deferred_execution.take(),
@@ -2076,6 +2100,16 @@ impl AgentRuntimeWorker {
         let cancel_requested_after_mutation = active.cancel_requested_after_mutation;
         let response_delivery_failure = active.response_delivery_failure.clone();
         let request = active.request.clone();
+        // Prefer the accumulated list from the active turn; merge an optional
+        // one-shot from `finish_response` without duplicating the last push.
+        let mut interaction_resolutions = active.interaction_resolutions.clone();
+        if let Some((interaction_id, resolution)) = interaction_resolution {
+            let candidate = (interaction_id.to_string(), resolution.to_string());
+            let already_last = interaction_resolutions.last() == Some(&candidate);
+            if !already_last {
+                interaction_resolutions.push(candidate);
+            }
+        }
 
         if let Some(reason) = response_delivery_failure {
             session.active = None;
@@ -2184,7 +2218,7 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &summary,
-                    interaction_resolution,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
                     return;
@@ -2217,7 +2251,7 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &summary,
-                    interaction_resolution,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
                     return;
@@ -2242,7 +2276,7 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &summary,
-                    interaction_resolution,
+                    &interaction_resolutions,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
                     return;
@@ -2254,6 +2288,7 @@ impl AgentRuntimeWorker {
                 // Collect emit payloads first so the session borrow ends
                 // before `self.emit` re-borrows `self.sessions`.
                 let mut cancelled_turn_ids = Vec::new();
+                let mut discarded_requests = Vec::new();
                 let mut cancel_error = None;
                 while let Some(queued) = session.queued.pop_front() {
                     session.snapshot.queued_turns = session.queued.len();
@@ -2270,7 +2305,12 @@ impl AgentRuntimeWorker {
                         cancel_error = Some((queued_turn_id, error));
                         break;
                     }
+                    discarded_requests.push(queued);
                     cancelled_turn_ids.push(queued_turn_id);
+                }
+                let executor = self.config.executor.clone();
+                for request in &discarded_requests {
+                    executor.on_admission_discarded(request);
                 }
                 self.emit(
                     session_id,
@@ -2552,7 +2592,7 @@ impl AgentRuntimeWorker {
         command_kind: Option<&str>,
         request: &TurnRequest,
         summary: &str,
-        interaction_resolution: Option<(&str, &str)>,
+        interaction_resolutions: &[(String, String)],
     ) -> Result<(), RuntimeWorkerError> {
         let Some(intent) =
             Self::durable_intent(durability, repo_id, principal_id, command_kind, request)?
@@ -2564,27 +2604,23 @@ impl AgentRuntimeWorker {
                 "durability disappeared while recording successful completion".to_string(),
             )
         })?;
-        match interaction_resolution {
-            Some((interaction_id, resolution)) => durability
-                .complete_success_with_interaction_resolved(
-                    &intent,
-                    summary,
-                    interaction_id,
-                    resolution,
-                )
-                .map_err(|error| {
-                    RuntimeWorkerError::DurabilityFailure(format!(
-                        "could not durably record successful completion and interaction resolution for turn '{}': {error}",
-                        request.turn_id
-                    ))
-                })?,
-            None => durability.complete_success(&intent, summary).map_err(|error| {
+        durability
+            .complete_success_with_interaction_resolutions(
+                &intent,
+                summary,
+                interaction_resolutions,
+            )
+            .map_err(|error| {
                 RuntimeWorkerError::DurabilityFailure(format!(
-                    "could not durably record successful completion for turn '{}': {error}",
+                    "could not durably record successful completion{} for turn '{}': {error}",
+                    if interaction_resolutions.is_empty() {
+                        ""
+                    } else {
+                        " and interaction resolution(s)"
+                    },
                     request.turn_id
                 ))
-            })?,
-        };
+            })?;
         Ok(())
     }
 
@@ -2757,6 +2793,11 @@ struct ActiveTurn {
     /// shared owner install a delivery object here instead of retaining a
     /// private pending map.
     interaction_delivery: Option<Box<dyn RuntimeInteractionDelivery>>,
+    /// Resolutions recorded by runtime-owned deliveries. A live tool-loop can
+    /// settle multiple sequential approvals/user-inputs before the turn
+    /// completes; preserve every resolution until terminal durability can
+    /// append them atomically with success.
+    interaction_resolutions: Vec<(String, String)>,
     /// `true` for [`AgentRuntimeHandle::track_external_turn`] admissions that
     /// have no worker-spawned executor future. Parked deliveries on these
     /// turns must clear [`Self::execution_in_progress`] so shutdown/cancel can

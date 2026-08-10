@@ -61,7 +61,10 @@ mod goal_command;
 // In-memory Goal session state (Created/Cancelled lifecycle) shared
 // between the TUI `/goal` slash commands and the Code Control
 // `goal.*` NDJSON methods.
-mod goal_session;
+// Runtime execution control owns the durable Goal state for both headless and
+// TUI entry points. Keep the session state machine reusable without making the
+// App its sole owner.
+pub mod goal_session;
 // Spinner/elapsed-time status indicator.
 mod status_indicator;
 // Crossterm bootstrap and event streaming.

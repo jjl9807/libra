@@ -1469,9 +1469,28 @@ impl SessionJsonlStore {
         interaction_id: impl Into<String>,
         resolution: impl Into<String>,
     ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        self.complete_code_command_success_with_interaction_resolutions(
+            identity,
+            summary,
+            &[(interaction_id.into(), resolution.into())],
+        )
+    }
+
+    /// Terminalize a command and record every interaction resolution under one
+    /// append lock / fsync. For N>1 resolutions the batch is
+    /// `InteractionResolved` × (N-1) followed by
+    /// `CommandTerminalSuccessWithInteractionResolved` for the last entry, so a
+    /// multi-approval tool loop cannot lose earlier resolutions on crash.
+    pub fn complete_code_command_success_with_interaction_resolutions(
+        &self,
+        identity: &CodeCommandIdentity,
+        summary: impl Into<String>,
+        resolutions: &[(String, String)],
+    ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        if resolutions.is_empty() {
+            return self.complete_code_command_success(identity, summary);
+        }
         let summary = summary.into();
-        let interaction_id = interaction_id.into();
-        let resolution = resolution.into();
         let target = CodeCommandStatus::Succeeded {
             summary: summary.clone(),
         };
@@ -1488,32 +1507,43 @@ impl SessionJsonlStore {
         };
         match status {
             CodeCommandStatus::Pending => {
-                // Single JSONL row: torn writes cannot leave Succeeded without
-                // closing the review marker.
-                self.append_code_workflow_while_locked(
+                let mut kinds = Vec::with_capacity(resolutions.len());
+                if resolutions.len() > 1 {
+                    for (interaction_id, resolution) in &resolutions[..resolutions.len() - 1] {
+                        kinds.push(CodeWorkflowEventKind::InteractionResolved {
+                            interaction_id: interaction_id.clone(),
+                            resolution: resolution.clone(),
+                        });
+                    }
+                }
+                let (last_id, last_resolution) = &resolutions[resolutions.len() - 1];
+                kinds.push(
                     CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
                         command: identity.clone(),
                         summary,
-                        interaction_id,
-                        resolution,
+                        interaction_id: last_id.clone(),
+                        resolution: last_resolution.clone(),
                     },
-                    true,
-                )?;
+                );
+                self.append_code_workflow_kinds_while_locked(&kinds, true)?;
                 if intent.mutating {
                     self.release_mutating_owner_lease_if_no_pending_mutations()?;
                 }
                 Ok(target)
             }
             existing if existing == target => {
-                // Idempotent retry / resume repair: ensure the resolution is
-                // visible when a prior attempt terminalized without it.
-                self.append_code_workflow_while_locked(
-                    CodeWorkflowEventKind::InteractionResolved {
-                        interaction_id,
-                        resolution,
-                    },
-                    true,
-                )?;
+                // Idempotent retry / resume repair: ensure every resolution is
+                // visible when a prior attempt terminalized without them.
+                let kinds: Vec<_> = resolutions
+                    .iter()
+                    .map(|(interaction_id, resolution)| {
+                        CodeWorkflowEventKind::InteractionResolved {
+                            interaction_id: interaction_id.clone(),
+                            resolution: resolution.clone(),
+                        }
+                    })
+                    .collect();
+                self.append_code_workflow_kinds_while_locked(&kinds, true)?;
                 Ok(existing)
             }
             _ => Err(CodeCommandStoreError::TerminalConflict {

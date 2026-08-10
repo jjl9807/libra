@@ -25,6 +25,36 @@
   a path that exists, the command exited 0 without staging it. The two are
   non-exclusive permissions in Git: presence on disk decides per path.
 
+### Added (plan-20260715 W2-06, 2026-08-10)
+
+- **W2-06 migrate Goal / task.dispatch / skill consumer onto runtime control.**
+  `ExecutionControlService` owns durable Goal start/status/cancel (JSONL resume
+  of the latest Created goal), headless overrides Goal/task adapter defaults,
+  `task.dispatch` shares the SubAgentDispatcher gate with file-history batches,
+  and Code skill search/activation consumes A0-07 only
+  (`skill_search_activation_uses_a0_projection`).
+
+### Added (plan-20260715 W2-05, 2026-08-10)
+
+- **W2-05 unify approval and `request_user_input` on runtime interaction state.**
+  TUI/headless register `AwaitingToolApproval`/`AwaitingUserInput` via
+  `register_interaction_with_delivery`; idle/no-turn paths fail closed; managed
+  Codex denies without a runtime turn. Multi-question validation + cancel
+  drop continuations; sequential resolutions persist as a durable batch.
+  Contract: `request_user_input_multi_question_and_cancel_fail_closed`,
+  `interaction_pending_owner_is_runtime_only`,
+  `sequential_user_input_resolutions_all_persist_on_terminal_success`.
+
+### Added (plan-20260715 W2-04, 2026-08-10)
+
+- **W2-04 migrate confirmed plan execution onto the runtime serialized queue.**
+  `submit_confirmed_plan_execution` + `DeferredPlanExecutionExecutor` own
+  Orchestrator::run after network Allow/Deny; TUI uses a three-state crash
+  handoff (network → submitting → admitted), turn-scoped observe completion,
+  JoinError → indeterminate, and keeps managed Code UI off the local runtime.
+  Contract/handoff coverage: `plan_execution_enters_runtime_queue`,
+  `plan_execution_handoff_tests`. Repair loops remain W2-11.
+
 ### Added (plan-20260715 W2-03, 2026-08-10)
 
 - **W2-03 migrate Phase 1 Plan review + network policy into runtime.**

@@ -3040,7 +3040,7 @@ fn apply_hook_event(
     append_raw_hook_event(session, envelope, MAX_RAW_HOOK_EVENTS);
     apply_lifecycle_event(session, event, MAX_TOOL_EVENTS);
     transition_phase(session, event.kind);
-    append_normalized_event(session, event, provider_name);
+    append_normalized_event_with_envelope(session, event, provider_name, Some(envelope));
 }
 
 /// Compute the new [`SessionPhase`] given the previous phase and the incoming
@@ -3093,23 +3093,56 @@ fn transition_phase(session: &mut SessionState, event_kind: LifecycleEventKind) 
 ///
 /// Boundary conditions: capped at `MAX_NORMALIZED_EVENTS`; oldest entries are
 /// dropped first.
+#[cfg(test)]
 pub(crate) fn append_normalized_event(
     session: &mut SessionState,
     event: &LifecycleEvent,
     provider_name: &str,
+) {
+    append_normalized_event_with_envelope(session, event, provider_name, None);
+}
+
+/// Append a normalized event while retaining the provider-native correlation
+/// fields that are not part of [`LifecycleEvent`]. Hook envelopes carry these
+/// fields (`turn_id`, `tool_use_id`, sub-agent identity, compaction trigger,
+/// and permission mode), and preserving them makes the event stream useful for
+/// reconstructing an interaction without re-reading the unstable transcript.
+fn append_normalized_event_with_envelope(
+    session: &mut SessionState,
+    event: &LifecycleEvent,
+    provider_name: &str,
+    envelope: Option<&SessionHookEnvelope>,
 ) {
     let entry = session
         .metadata
         .entry(NORMALIZED_EVENTS_KEY.to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
 
+    let extra = envelope.map(|value| &value.extra);
+
     let normalized = json!({
         "provider": provider_name,
+        "provider_session_id": envelope.map(|value| value.session_id.clone()),
         "kind": event.kind.to_string(),
         "timestamp": event.timestamp.to_rfc3339(),
         "prompt": event.prompt,
         "tool_name": event.tool_name,
+        "tool_input": event.tool_input,
+        "tool_response": event.tool_response,
         "assistant_message": event.assistant_message,
+        "turn_id": extra.and_then(|values| values.get("turn_id")).cloned(),
+        "tool_use_id": extra
+            .and_then(|values| values.get("tool_use_id"))
+            .cloned(),
+        "agent_id": extra.and_then(|values| values.get("agent_id")).cloned(),
+        "agent_type": extra
+            .and_then(|values| values.get("agent_type"))
+            .cloned(),
+        "trigger": extra.and_then(|values| values.get("trigger")).cloned(),
+        "permission_mode": extra
+            .and_then(|values| values.get("permission_mode"))
+            .cloned(),
+        "session_end_reason": extra.and_then(|values| values.get("reason")).cloned(),
         "has_model": event.model.is_some(),
         "has_tool_input": event.tool_input.is_some(),
         "has_tool_response": event.tool_response.is_some(),
@@ -3356,7 +3389,7 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
-    use crate::internal::ai::hooks::providers::{claude_provider, gemini_provider};
+    use crate::internal::ai::hooks::providers::{claude_provider, codex_provider, gemini_provider};
 
     /// AG-21 metadata persistence (codex review R2 P1): the generic E6
     /// path (codex/opencode) must persist `subagent_token_usage` and
@@ -3483,6 +3516,58 @@ mod tests {
             session.metadata.get(SESSION_PHASE_METADATA_KEY),
             Some(&json!("active"))
         );
+    }
+
+    /// Codex-specific correlation fields must survive in the normalized
+    /// projection as well as the raw envelope. This is the data graph views
+    /// need to join prompts, tool calls, compaction, and sub-agent boundaries
+    /// without attempting to decode the provider transcript.
+    #[test]
+    fn codex_hook_projection_preserves_provider_correlation_fields() {
+        let envelope = SessionHookEnvelope {
+            hook_event_name: "PostToolUse".to_string(),
+            session_id: "codex-session".to_string(),
+            cwd: "/tmp".to_string(),
+            transcript_path: Some("/tmp/rollout.jsonl".to_string()),
+            extra: serde_json::json!({
+                "turn_id": "turn-1",
+                "tool_use_id": "tool-1",
+                "tool_name": "Bash",
+                "tool_input": {"command": "printf ok"},
+                "tool_response": {"stdout": "ok", "exit_code": 0},
+                "permission_mode": "default"
+            })
+            .as_object()
+            .expect("object payload")
+            .clone(),
+        };
+        let event = codex_provider()
+            .parse_hook_event("PostToolUse", &envelope)
+            .expect("parse Codex hook");
+        let mut session = SessionState::new("/tmp");
+
+        apply_hook_event(&mut session, &envelope, &event, "codex");
+
+        let normalized = session
+            .metadata
+            .get(NORMALIZED_EVENTS_KEY)
+            .and_then(Value::as_array)
+            .and_then(|events| events.last())
+            .expect("normalized event");
+        assert_eq!(normalized["provider_session_id"], json!("codex-session"));
+        assert_eq!(normalized["turn_id"], json!("turn-1"));
+        assert_eq!(normalized["tool_use_id"], json!("tool-1"));
+        assert_eq!(normalized["tool_input"]["command"], json!("printf ok"));
+        assert_eq!(normalized["tool_response"]["exit_code"], json!(0));
+        assert_eq!(normalized["permission_mode"], json!("default"));
+
+        let raw = session
+            .metadata
+            .get("raw_hook_events")
+            .and_then(Value::as_array)
+            .and_then(|events| events.last())
+            .expect("raw event");
+        assert_eq!(raw["extra"]["tool_use_id"], json!("tool-1"));
     }
 
     // Scenario: the same envelope yields identical dedup keys regardless of

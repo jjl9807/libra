@@ -29,9 +29,8 @@
 //! `tool_name`, `tool_input`, `tool_response`, `last_assistant_message`,
 //! `model`, `source`) from `envelope.extra`.
 //!
-//! Codex has **no `SessionEnd`/`ModelUpdate` hook** — session teardown is not
-//! observable through the hook surface, and the lifecycle fallback list uses
-//! the session-scoped events Codex actually fires.
+//! Codex has no `ModelUpdate` hook. Current Codex releases also provide
+//! `SessionEnd`, which is mapped to the canonical session teardown event.
 //!
 //! Unknown event names are a hard error (mirroring the Claude parser) so
 //! breaking upstream changes surface immediately; the dispatcher
@@ -44,14 +43,19 @@ use super::super::super::lifecycle::{
 };
 
 /// Codex event names that should fall back to `session_id` when no canonical
-/// identity field (event_id, request_id, …) is present in the payload. Codex
-/// has no `SessionEnd`; the compaction pair stands in for the remaining
-/// session-scoped one-shot events.
-pub(super) const CODEX_LIFECYCLE_FALLBACK_EVENTS: &[&str] =
-    &["SessionStart", "Stop", "PreCompact", "PostCompact"];
+/// identity field (event_id, request_id, …) is present in the payload. These
+/// are the Codex session-scoped events for which a missing identity falls back
+/// to the provider session id.
+pub(super) const CODEX_LIFECYCLE_FALLBACK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "Stop",
+    "PreCompact",
+    "PostCompact",
+    "SessionEnd",
+];
 
 /// Every Codex hook event name [`parse_codex_hook_event`] understands
-/// (the full 10-event taxonomy of codex-cli 0.142.4). Keep in sync with its
+/// (the full current 11-event taxonomy). Keep in sync with its
 /// `match`; the dispatcher consults this via `HookProvider::recognizes_event`
 /// to skip-and-log names a newer Codex emits that this build does not know
 /// yet (AG-19).
@@ -66,6 +70,7 @@ pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "SubagentStart",
     "SubagentStop",
     "Stop",
+    "SessionEnd",
 ];
 
 /// Translate a Codex hook event name into a canonical lifecycle event.
@@ -93,6 +98,7 @@ pub(super) fn parse_codex_hook_event(
         "SubagentStart" => LifecycleEventKind::SubagentStart,
         "SubagentStop" => LifecycleEventKind::SubagentEnd,
         "PermissionRequest" => LifecycleEventKind::PermissionRequest,
+        "SessionEnd" => LifecycleEventKind::SessionEnd,
         other => bail!("unknown Codex hook event: '{other}'"),
     };
     Ok(build_lifecycle_event(kind, envelope))
@@ -151,11 +157,11 @@ mod tests {
     }
 
     // Scenario: a hook name not in the known set returns an error. Codex has
-    // no SessionEnd/ModelUpdate hooks, so those must be rejected too.
+    // no ModelUpdate hook, while SessionEnd is supported.
     #[test]
     fn parser_rejects_unknown_hook() {
         let envelope = canonical_envelope();
-        for name in ["UnknownHook", "SessionEnd", "ModelUpdate", "sessionstart"] {
+        for name in ["UnknownHook", "ModelUpdate", "sessionstart"] {
             assert!(
                 parse_codex_hook_event(name, &envelope).is_err(),
                 "event '{name}' must be rejected",
@@ -174,7 +180,7 @@ mod tests {
                 "advertised event '{name}' must parse",
             );
         }
-        assert_eq!(CODEX_HOOK_EVENT_NAMES.len(), 10);
+        assert_eq!(CODEX_HOOK_EVENT_NAMES.len(), 11);
     }
 
     // Scenario: fallback events are a subset of the advertised name table so

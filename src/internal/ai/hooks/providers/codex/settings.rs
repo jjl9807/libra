@@ -83,15 +83,20 @@ const CODEX_STATE_MARKER: &str = "# libra-managed codex hook trust entry (AG-19)
 const CODEX_HOOKS_FILE: &str = "hooks.json";
 const CODEX_CONFIG_FILE: &str = "config.toml";
 
-/// Codex events Libra forwards, with the `libra hooks codex <verb>`
-/// CLI verb embedded in each installed command. `PreToolUse` is deliberately
-/// not installed (PostToolUse carries the response as well); the compaction
-/// pair is parseable but not captured by default.
+/// Every Codex lifecycle event is forwarded through the stable
+/// `libra hooks codex <verb>` command surface. Events sharing a lifecycle kind
+/// intentionally share a verb; the provider event name is preserved in stdin
+/// and in `raw_hook_events`.
 const CODEX_HOOK_FORWARD_MAP: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "tool-use"),
     ("PostToolUse", "tool-use"),
+    ("PermissionRequest", "permission-request"),
+    ("PreCompact", "compaction"),
+    ("PostCompact", "compaction"),
     ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
     ("SubagentStart", "subagent-start"),
     ("SubagentStop", "subagent-end"),
 ];
@@ -290,7 +295,7 @@ fn uninstall_codex_hooks_at(codex_home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// All six forwarded events carry the exact desired command **and** every
+/// All forwarded events carry the exact desired command **and** every
 /// Libra-managed handler has a current trust entry (`codex exec` silently
 /// skips untrusted hooks, so "installed but untrusted" must read as not
 /// installed).
@@ -539,10 +544,10 @@ fn remove_libra_codex_hooks(file: &mut CodexHooksFile) -> bool {
 }
 
 /// Convert a PascalCase Codex event name to the snake_case label used in
-/// `[hooks.state]` keys and canonical identities (matches the ten upstream
+/// `[hooks.state]` keys and canonical identities (matches the eleven upstream
 /// labels: `session_start`, `user_prompt_submit`, `pre_tool_use`,
 /// `post_tool_use`, `stop`, `subagent_start`, `subagent_stop`,
-/// `pre_compact`, `post_compact`, `permission_request`).
+/// `pre_compact`, `post_compact`, `permission_request`, `session_end`).
 fn event_snake_label(event_name: &str) -> String {
     let mut out = String::with_capacity(event_name.len() + 4);
     for (index, ch) in event_name.chars().enumerate() {
@@ -1011,7 +1016,7 @@ mod tests {
         );
     }
 
-    /// The generic PascalCase→snake conversion reproduces all ten upstream
+    /// The generic PascalCase→snake conversion reproduces all eleven upstream
     /// event labels used in `[hooks.state]` keys.
     #[test]
     fn event_snake_label_matches_upstream_labels() {
@@ -1026,6 +1031,7 @@ mod tests {
             ("PreCompact", "pre_compact"),
             ("PostCompact", "post_compact"),
             ("PermissionRequest", "permission_request"),
+            ("SessionEnd", "session_end"),
         ];
         for (event, expected) in cases {
             assert_eq!(event_snake_label(event), expected, "event {event}");
@@ -1131,7 +1137,8 @@ mod tests {
         install_codex_hooks_at(&codex_home, BINARY, 30).expect("install");
 
         // hooks.json: user groups intact, Libra appended after the user's
-        // SessionStart group; PreToolUse (not forwarded) untouched.
+        // SessionStart group; the user's PreToolUse group is preserved and
+        // Libra adds its own forwarding group alongside it.
         let file: CodexHooksFile = load_json_settings(&hooks_path, "Codex").expect("load");
         let session_start = file.hooks.get("SessionStart").expect("SessionStart");
         assert_eq!(session_start.len(), 2);
@@ -1144,6 +1151,7 @@ mod tests {
             file.hooks.get("PreToolUse").expect("PreToolUse")[0].hooks[0].command,
             "echo pre",
         );
+        assert_eq!(file.hooks.get("PreToolUse").expect("PreToolUse").len(), 2);
 
         // config.toml: user bytes are an exact prefix; our sections appended
         // with the user's SessionStart group shifting ours to index 1.

@@ -191,6 +191,25 @@ async fn build_runtime_with_registry_and_config_and_shutdown_timeout(
     (runtime, user_input_tx, exec_approval_tx)
 }
 
+/// Wait until the headless worker reports an active Running turn. Injection of
+/// user-input / exec-approval without this fails closed after W2-05.
+async fn await_worker_running(runtime: &HeadlessCodeRuntime<fake::CompletionModel>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if matches!(
+            runtime.runtime_snapshot().await.expect("worker snapshot"),
+            libra::internal::ai::runtime::AgentSnapshot {
+                interaction: InteractionState::Running,
+                ..
+            }
+        ) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("worker did not reach InteractionState::Running within deadline");
+}
+
 /// Deterministic mutating handler used to prove a cancellation request never
 /// hard-aborts a tool after the side-effect boundary has been crossed.
 struct BlockingMutationHandler {
@@ -1310,8 +1329,8 @@ async fn append_assistant_delta_still_accepts_thinking_status() {
     assert_eq!(entry.content.as_deref(), Some("hello world"));
 }
 
-/// `respond_interaction` should reject unknown interactions and only
-/// accept requests that are currently pending.
+/// `respond_interaction` with no active AgentRuntime turn fail-closes (W2-05
+/// removed idle private pending maps). Unknown-id delivery requires a live turn.
 #[tokio::test(flavor = "multi_thread")]
 async fn respond_interaction_unknown_id() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
@@ -1320,10 +1339,12 @@ async fn respond_interaction_unknown_id() {
     let result = runtime
         .respond_interaction("ignored", CodeUiInteractionResponse::default())
         .await;
-    let error = result.expect_err("interactions must surface a concrete error for unknown id");
+    let error = result.expect_err("idle respond_interaction must fail closed");
     assert!(
-        error.to_string().contains("Unknown pending interaction"),
-        "error message must call out unknown interaction ids, got {error}",
+        error.to_string().contains(
+            "This interaction has no active AgentRuntime turn and was closed fail-closed"
+        ),
+        "idle respond must surface the fail-closed message, got {error}",
     );
 }
 
@@ -1331,7 +1352,13 @@ async fn respond_interaction_unknown_id() {
 async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, user_input_tx, _) =
-        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("slow turn with input".to_string())
+        .await
+        .expect("delayed turn starts");
+    await_worker_running(&runtime).await;
 
     let interaction_id = "request-user-input-1".to_string();
     let question_id = "q1".to_string();
@@ -1405,6 +1432,11 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
             .all(|interaction| interaction.status != CodeUiInteractionStatus::Pending),
         "all pending interactions should be resolved",
     );
+
+    runtime
+        .cancel_turn()
+        .await
+        .expect("cancelling the delayed turn is cooperative");
 }
 
 /// A multi-question `request_user_input` response must be complete and keyed
@@ -1415,7 +1447,13 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
 async fn request_user_input_validates_and_delivers_all_requested_answers() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, user_input_tx, _) =
-        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("slow turn with input".to_string())
+        .await
+        .expect("delayed turn starts");
+    await_worker_running(&runtime).await;
 
     let interaction_id = "request-user-input-many".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel::<UserInputResponse>();
@@ -1522,6 +1560,11 @@ async fn request_user_input_validates_and_delivers_all_requested_answers() {
         response.answers.get("risk").map(|answer| &answer.answers),
         Some(&vec!["low".to_string()]),
     );
+
+    runtime
+        .cancel_turn()
+        .await
+        .expect("cancelling the delayed turn is cooperative");
 }
 
 /// A `request_user_input` emitted during a real browser turn must be visible
@@ -1854,7 +1897,13 @@ async fn live_exec_approval_interaction_is_registered_with_agent_runtime() {
 async fn exec_approval_request_is_reflected_in_snapshot_and_responded_to() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, _, exec_approval_tx) =
-        build_runtime("basic_chat", workdir.path().to_path_buf()).await;
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("slow turn with approval".to_string())
+        .await
+        .expect("delayed turn starts");
+    await_worker_running(&runtime).await;
 
     let interaction_id = "exec-approval-1".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -1945,12 +1994,16 @@ async fn exec_approval_request_is_reflected_in_snapshot_and_responded_to() {
             .all(|interaction| interaction.status != CodeUiInteractionStatus::Pending),
         "all pending interactions should be resolved",
     );
+
+    runtime
+        .cancel_turn()
+        .await
+        .expect("cancelling the delayed turn is cooperative");
 }
 
-/// Cancelling an idle browser runtime must close both kinds of pending
-/// continuation. In particular, an injected exec approval has no active
-/// worker turn to observe cancellation, so retaining its sender would leave
-/// the sandbox/tool loop waiting indefinitely instead of failing closed.
+/// W2-05: an exec approval without an active AgentRuntime turn must fail
+/// closed immediately (deny + drop projection). There is no adapter-private
+/// pending map for idle cancellation to drain.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelling_idle_runtime_closes_pending_exec_approval() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
@@ -1964,7 +2017,7 @@ async fn cancelling_idle_runtime_closes_pending_exec_approval() {
             call_id: interaction_id.clone(),
             command: "cargo check".to_string(),
             cwd: workdir.path().to_path_buf(),
-            reason: Some("verify cancellation closes the approval".to_string()),
+            reason: Some("verify idle approval fails closed without a runtime turn".to_string()),
             is_retry: false,
             sandbox_label: "workspace-write".to_string(),
             network_access: NetworkAccess::Denied,
@@ -1974,34 +2027,28 @@ async fn cancelling_idle_runtime_closes_pending_exec_approval() {
         })
         .expect("exec approval request should enqueue in runtime");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let decision = tokio::time::timeout(Duration::from_secs(2), response_rx)
+        .await
+        .expect("idle approval must resolve without waiting for cancel_turn")
+        .expect("fail-closed path sends Denied rather than dropping the sender");
+    assert_eq!(
+        decision,
+        libra::internal::ai::sandbox::ReviewDecision::Denied,
+        "approvals without a live runtime turn are denied fail-closed"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         if runtime
             .snapshot()
             .await
             .interactions
             .iter()
-            .any(|interaction| {
-                interaction.id == interaction_id
-                    && interaction.status == CodeUiInteractionStatus::Pending
-            })
+            .all(|interaction| interaction.id != interaction_id)
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-
-    runtime
-        .cancel_turn()
-        .await
-        .expect("idle cancellation should close pending interactions");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), response_rx)
-            .await
-            .expect("cancellation must close the approval continuation")
-            .is_err(),
-        "an idle cancellation must drop the approval sender rather than leave a tool waiting",
-    );
     assert!(
         runtime
             .snapshot()
@@ -2009,7 +2056,7 @@ async fn cancelling_idle_runtime_closes_pending_exec_approval() {
             .interactions
             .iter()
             .all(|interaction| interaction.id != interaction_id),
-        "cancelled idle approval must be removed from the browser projection",
+        "fail-closed idle approval must be removed from the browser projection",
     );
 }
 
@@ -2025,12 +2072,18 @@ async fn unpersistable_approval_response_does_not_release_the_tool_loop() {
     let session_id = state.id.clone();
     let persistence = HeadlessSessionPersistence::new(store.clone(), state);
     let (runtime, _, exec_approval_tx) = build_runtime_with_persistence(
-        "basic_chat",
+        "delayed_chat",
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
     )
     .await;
+
+    runtime
+        .submit_message("slow turn with approval".to_string())
+        .await
+        .expect("delayed turn starts");
+    await_worker_running(&runtime).await;
 
     let interaction_id = "persisted-exec-approval".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -2133,13 +2186,21 @@ async fn persisted_approval_response_records_durable_interaction_audit_event() {
     let state = SessionState::new(&workdir.path().to_string_lossy());
     let session_id = state.id.clone();
     let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    // brief_delayed_chat keeps a live turn long enough to register approval,
+    // then completes quickly so post-terminal InteractionResolved is visible.
     let (runtime, _, exec_approval_tx) = build_runtime_with_persistence(
-        "basic_chat",
+        "brief_delayed_chat",
         workdir.path().to_path_buf(),
         Vec::new(),
         Some(persistence),
     )
     .await;
+
+    runtime
+        .submit_message("slow turn with approval".to_string())
+        .await
+        .expect("delayed turn starts");
+    await_worker_running(&runtime).await;
 
     let interaction_id = "durable-exec-approval".to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -2189,18 +2250,54 @@ async fn persisted_approval_response_records_durable_interaction_audit_event() {
         .await
         .expect("approval continuation receives the durable decision");
 
+    // InteractionResolved is appended with the terminal command outcome after
+    // the live turn finishes (persist_interaction_resolved_after_terminal).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if runtime
+            .runtime_snapshot()
+            .await
+            .expect("worker snapshot")
+            .active_turn_id
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        runtime
+            .runtime_snapshot()
+            .await
+            .expect("worker snapshot")
+            .active_turn_id
+            .is_none(),
+        "delayed turn must finish so InteractionResolved can be persisted",
+    );
+
     let replay = SessionJsonlStore::new(store.session_root(&session_id))
         .load_code_workflow_replay()
         .expect("durable interaction audit event can be replayed");
+    let saw_resolution = replay.events.iter().any(|event| match &event.event {
+        CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: event_interaction_id,
+            resolution,
+        }
+        | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            interaction_id: event_interaction_id,
+            resolution,
+            ..
+        } => event_interaction_id == &interaction_id && resolution == "approved",
+        _ => false,
+    });
     assert!(
-        replay.events.iter().any(|event| matches!(
-            &event.event,
-            CodeWorkflowEventKind::InteractionResolved {
-                interaction_id: event_interaction_id,
-                resolution,
-            } if event_interaction_id == &interaction_id && resolution == "approved"
-        )),
-        "approval delivery must have a durable interaction-resolution audit event",
+        saw_resolution,
+        "approval delivery must have a durable interaction-resolution audit event; events={:?}",
+        replay
+            .events
+            .iter()
+            .map(|event| &event.event)
+            .collect::<Vec<_>>(),
     );
 }
 
