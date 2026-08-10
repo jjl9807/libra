@@ -2680,6 +2680,314 @@ async fn runtime_shutdown_on_signal_and_startup_failure() {
     ));
 }
 
+/// W2-04: confirmed plan execution enters the serialized worker queue, and a
+/// mutating tool is refused when the shared hardening boundary denies it.
+#[tokio::test]
+async fn plan_execution_enters_runtime_queue() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, DeferredPlanExecutionExecutor,
+        InMemoryAuditSink, InteractionState, PLAN_EXECUTION_TURN_INPUT, PrincipalContext,
+        PrincipalRole, RuntimeTurnExecution, SecretRedactor, ToolBoundaryPolicy,
+        ToolBoundaryRuntime, is_plan_execution_turn, plan_execution_turn_request,
+        submit_confirmed_plan_execution,
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+
+    let starts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let first_started = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let executor = Arc::new(DeferredPlanExecutionExecutor::new());
+
+    let contributor_boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "plan-execution-contributor".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) = AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(
+        executor.clone(),
+        contributor_boundary,
+    ));
+
+    let starts_for_first = starts.clone();
+    let first_started_notify = first_started.clone();
+    let release_first_for_runner = release_first.clone();
+    submit_confirmed_plan_execution(
+        &handle,
+        executor.as_ref(),
+        "session",
+        "plan-exec-1",
+        Box::new(move |_context| {
+            Box::pin(async move {
+                starts_for_first
+                    .lock()
+                    .await
+                    .push("plan-exec-1".to_string());
+                first_started_notify.notify_one();
+                release_first_for_runner.notified().await;
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "first plan executed".to_string(),
+                })
+            })
+        }),
+    )
+    .await
+    .expect("first plan execution admitted");
+
+    timeout(Duration::from_secs(2), first_started.notified())
+        .await
+        .expect("first plan execution started on the worker");
+    assert_eq!(
+        starts.lock().await.as_slice(),
+        ["plan-exec-1"],
+        "only the dequeued plan-execution turn may start"
+    );
+    let snapshot = handle.snapshot("session").await.expect("snapshot");
+    assert_eq!(snapshot.active_turn_id.as_deref(), Some("plan-exec-1"));
+    assert_eq!(snapshot.queued_turns, 0);
+    assert!(is_plan_execution_turn(&plan_execution_turn_request(
+        "session",
+        "plan-exec-1"
+    )));
+    assert_eq!(
+        plan_execution_turn_request("session", "x").input,
+        PLAN_EXECUTION_TURN_INPUT
+    );
+
+    // While the first plan turn is active, stage+submit a second plan turn —
+    // it must remain queued until cancelled or the first completes.
+    let starts_for_second = starts.clone();
+    submit_confirmed_plan_execution(
+        &handle,
+        executor.as_ref(),
+        "session",
+        "plan-exec-2",
+        Box::new(move |_context| {
+            Box::pin(async move {
+                starts_for_second
+                    .lock()
+                    .await
+                    .push("plan-exec-2".to_string());
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "second plan executed".to_string(),
+                })
+            })
+        }),
+    )
+    .await
+    .expect("second plan execution queued");
+
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot while held");
+    assert_eq!(snapshot.active_turn_id.as_deref(), Some("plan-exec-1"));
+    assert_eq!(snapshot.queued_turns, 1);
+    assert_eq!(
+        starts.lock().await.as_slice(),
+        ["plan-exec-1"],
+        "queued plan must not start while the prior plan-execution turn is active"
+    );
+
+    // Cancel the queued second plan before it dequeues — on_admission_discarded
+    // must release the staged runner so a later plan can stage again.
+    handle
+        .cancel("session", "plan-exec-2")
+        .await
+        .expect("cancel queued plan-execution turn");
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot after queued cancel");
+    assert_eq!(snapshot.active_turn_id.as_deref(), Some("plan-exec-1"));
+    assert_eq!(snapshot.queued_turns, 0);
+    assert_eq!(
+        starts.lock().await.as_slice(),
+        ["plan-exec-1"],
+        "cancelled queued plan must never execute"
+    );
+
+    let third_started = Arc::new(Notify::new());
+    let starts_for_third = starts.clone();
+    let third_started_notify = third_started.clone();
+    submit_confirmed_plan_execution(
+        &handle,
+        executor.as_ref(),
+        "session",
+        "plan-exec-3",
+        Box::new(move |_context| {
+            Box::pin(async move {
+                starts_for_third
+                    .lock()
+                    .await
+                    .push("plan-exec-3".to_string());
+                third_started_notify.notify_one();
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "third plan executed".to_string(),
+                })
+            })
+        }),
+    )
+    .await
+    .expect("third plan stages after queued cancel discarded the second runner");
+
+    release_first.notify_one();
+    timeout(Duration::from_secs(2), third_started.notified())
+        .await
+        .expect("third plan starts after the first completes");
+    assert_eq!(
+        starts.lock().await.as_slice(),
+        ["plan-exec-1", "plan-exec-3"],
+        "cancelled queued plan must stay out of the execution order"
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = handle.snapshot("session").await.expect("snapshot");
+            if snapshot.active_turn_id.is_none()
+                && matches!(snapshot.interaction, InteractionState::Completed)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("third plan reaches a terminal idle snapshot");
+
+    // Shutdown must also discard any remaining queued staged runner.
+    let shutdown_started = Arc::new(Notify::new());
+    let shutdown_release = Arc::new(Notify::new());
+    let shutdown_body = Arc::new(AtomicUsize::new(0));
+    let shutdown_started_notify = shutdown_started.clone();
+    let shutdown_release_wait = shutdown_release.clone();
+    submit_confirmed_plan_execution(
+        &handle,
+        executor.as_ref(),
+        "session",
+        "plan-exec-shutdown-active",
+        Box::new(move |_context| {
+            Box::pin(async move {
+                shutdown_started_notify.notify_one();
+                shutdown_release_wait.notified().await;
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "shutdown active".to_string(),
+                })
+            })
+        }),
+    )
+    .await
+    .expect("shutdown-active plan admitted");
+    timeout(Duration::from_secs(2), shutdown_started.notified())
+        .await
+        .expect("shutdown-active plan started");
+    let shutdown_body_queued = shutdown_body.clone();
+    submit_confirmed_plan_execution(
+        &handle,
+        executor.as_ref(),
+        "session",
+        "plan-exec-shutdown-queued",
+        Box::new(move |_context| {
+            Box::pin(async move {
+                shutdown_body_queued.fetch_add(1, Ordering::SeqCst);
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "should be discarded on shutdown".to_string(),
+                })
+            })
+        }),
+    )
+    .await
+    .expect("shutdown-queued plan staged");
+    let shutdown = handle.shutdown();
+    // Release the active turn so shutdown can finish cooperatively.
+    shutdown_release.notify_one();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown timeout")
+        .expect("worker shutdown discards queued plan admissions");
+    assert_eq!(
+        shutdown_body.load(Ordering::SeqCst),
+        0,
+        "shutdown must discard queued plan runners without executing them"
+    );
+    worker.abort();
+
+    // Observer principal must deny confirmed plan execution before the body runs.
+    let observer_executor = Arc::new(DeferredPlanExecutionExecutor::new());
+    let observer_boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "plan-execution-observer".to_string(),
+            role: PrincipalRole::Observer,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (observer_handle, observer_worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(observer_executor.clone(), observer_boundary),
+    );
+    let body_ran = Arc::new(AtomicUsize::new(0));
+    let body_ran_runner = body_ran.clone();
+    submit_confirmed_plan_execution(
+        &observer_handle,
+        observer_executor.as_ref(),
+        "session",
+        "denied-plan",
+        Box::new(move |_context| {
+            Box::pin(async move {
+                body_ran_runner.fetch_add(1, Ordering::SeqCst);
+                Ok(RuntimeTurnExecution::Completed {
+                    summary: "should not run".to_string(),
+                })
+            })
+        }),
+    )
+    .await
+    .expect("denied plan still admits onto the queue");
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = observer_handle.snapshot("session").await.expect("snapshot");
+            if matches!(
+                snapshot.interaction,
+                InteractionState::Failed { .. } | InteractionState::Completed
+            ) && snapshot.active_turn_id.is_none()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("observer-denied plan reaches a terminal state");
+    assert_eq!(
+        body_ran.load(Ordering::SeqCst),
+        0,
+        "mutating plan body must not run when the tool boundary denies apply_patch"
+    );
+    let denied = observer_handle
+        .snapshot("session")
+        .await
+        .expect("final snapshot");
+    assert!(
+        matches!(denied.interaction, InteractionState::Failed { .. }),
+        "observer deny must fail the plan-execution turn: {denied:?}"
+    );
+    observer_worker.abort();
+}
+
 // ---------------------------------------------------------------------------
 // CEX-00.5: top-level Event / Snapshot trait contract
 // ---------------------------------------------------------------------------

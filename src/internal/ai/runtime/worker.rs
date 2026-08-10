@@ -346,6 +346,11 @@ pub trait RuntimeTurnExecutor: Send + Sync + 'static {
         let _ = (request, interaction, context);
         Err(RuntimeWorkerError::ExecutorDoesNotSupportResponses)
     }
+
+    /// Invoked when a queued (or otherwise never-executed) admission is removed
+    /// without calling [`Self::execute`] — for example cancel or shutdown drain.
+    /// Executors that stage per-turn work must release it here.
+    fn on_admission_discarded(&self, _request: &TurnRequest) {}
 }
 
 /// Placeholder executor for adapters that use [`AgentRuntimeHandle`] solely
@@ -1511,6 +1516,10 @@ impl AgentRuntimeWorker {
 
         match outcome {
             CancelOutcome::Queued(request) => {
+                // Release any staged executor work for this admission before
+                // durable cancel persistence — plan-execution runners live
+                // outside the worker mailbox.
+                self.config.executor.on_admission_discarded(&request);
                 if let Err(error) = Self::persist_cancelled_turn(
                     self.config.durability.as_ref(),
                     self.config.durability_repo_id.as_deref(),
@@ -1608,6 +1617,7 @@ impl AgentRuntimeWorker {
         }
 
         for (session_id, request) in cancelled_turns {
+            self.config.executor.on_admission_discarded(&request);
             if let Err(error) = Self::persist_cancelled_turn(
                 self.config.durability.as_ref(),
                 self.config.durability_repo_id.as_deref(),
@@ -2254,6 +2264,7 @@ impl AgentRuntimeWorker {
                 // Collect emit payloads first so the session borrow ends
                 // before `self.emit` re-borrows `self.sessions`.
                 let mut cancelled_turn_ids = Vec::new();
+                let mut discarded_requests = Vec::new();
                 let mut cancel_error = None;
                 while let Some(queued) = session.queued.pop_front() {
                     session.snapshot.queued_turns = session.queued.len();
@@ -2270,7 +2281,12 @@ impl AgentRuntimeWorker {
                         cancel_error = Some((queued_turn_id, error));
                         break;
                     }
+                    discarded_requests.push(queued);
                     cancelled_turn_ids.push(queued_turn_id);
+                }
+                let executor = self.config.executor.clone();
+                for request in &discarded_requests {
+                    executor.on_admission_discarded(request);
                 }
                 self.emit(
                     session_id,

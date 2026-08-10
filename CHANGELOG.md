@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-04, 2026-08-10)
+
+- **W2-04 migrate confirmed plan execution onto the runtime serialized queue.**
+  `submit_confirmed_plan_execution` + `DeferredPlanExecutionExecutor` own
+  Orchestrator::run after network Allow/Deny; TUI uses a three-state crash
+  handoff (network → submitting → admitted), turn-scoped observe completion,
+  JoinError → indeterminate, and keeps managed Code UI off the local runtime.
+  Contract/handoff coverage: `plan_execution_enters_runtime_queue`,
+  `plan_execution_handoff_tests`. Repair loops remain W2-11.
+
 ### Added (plan-20260715 W2-03, 2026-08-10)
 
 - **W2-03 migrate Phase 1 Plan review + network policy into runtime.**

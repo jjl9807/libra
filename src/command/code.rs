@@ -120,7 +120,7 @@ use crate::{
             },
             runtime::{
                 AgentRuntimeWorker, AgentRuntimeWorkerConfig, CodeAgentApprovalConfig,
-                CodeAgentSandboxProfile, CodeAgentServicesBuilder, ExternalTurnTrackingExecutor,
+                CodeAgentSandboxProfile, CodeAgentServicesBuilder, DeferredPlanExecutionExecutor,
                 InMemoryAuditSink, LifecycleShutdownError, LifecycleShutdownOwner,
                 LifecycleStepError, RuntimeCommandDurability, ToolBoundaryRuntime,
                 lifecycle_resource, tool_runtime_context,
@@ -3641,41 +3641,49 @@ where
         SessionState::new(&working_dir_str)
     };
     check_process_terminate(&process_terminate)?;
-    // Non-managed TUI providers still execute the legacy local tool loop, but
-    // their cancellation authority must be the shared AgentRuntime worker so
-    // admission and any mutation reconciliation are durable.
-    let (mut local_turn_runtime, mut local_turn_runtime_task) = if managed_code_ui_runtime.is_none()
-    {
-        let session_jsonl = SessionJsonlStore::new(session_store.session_root(&session.id));
-        // An unresolved IntentSpec (Phase 0) or Plan (Phase 1) review gate is
-        // durable proof that its draft-writing mutation completed, so recovery
-        // may complete that single command id; every other pending mutation
-        // still lands in the reconciliation fence.
-        let review_gate_turn_id =
-            crate::internal::ai::runtime::phase1::open_review_gate_phase_turn_id(&session_jsonl);
-        let durability = RuntimeCommandDurability::new(session_jsonl);
-        let recovered_mutations = durability
-            .recover_pending_mutations_for_intent_review(review_gate_turn_id.as_deref())
-            .map_err(|error| {
-                CliError::io(format!(
-                    "failed to recover pending durable commands for Code session '{}': {error}",
-                    session.id
-                ))
-            })?;
-        let mut worker_config = AgentRuntimeWorkerConfig::new(
-            Arc::new(ExternalTurnTrackingExecutor),
-            ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
-        )
-        .with_durability(durability, working_dir_str.clone(), "tui-local")
-        .with_durability_command_kind("tui_local_turn");
-        if !recovered_mutations.is_empty() {
-            worker_config = worker_config.with_recovered_reconciliation_session(session.id.clone());
-        }
-        let (handle, worker_task) = AgentRuntimeWorker::spawn(worker_config);
-        (Some(handle), Some(worker_task))
-    } else {
-        (None, None)
-    };
+    // Non-managed TUI owns IntentSpec/Plan review + confirmed plan-exec on the
+    // W1-01 worker. Managed Code UI sessions keep their own chat/tool loop and
+    // must not preadmit control turns onto a parallel local runtime (W2-04).
+    let (mut local_turn_runtime, mut local_turn_runtime_task, plan_execution_executor) =
+        if managed_code_ui_runtime.is_some() {
+            (None, None, None)
+        } else {
+            let session_jsonl = SessionJsonlStore::new(session_store.session_root(&session.id));
+            // An unresolved IntentSpec (Phase 0) or Plan (Phase 1) review gate is
+            // durable proof that its draft-writing mutation completed, so recovery
+            // may complete that single command id; every other pending mutation
+            // still lands in the reconciliation fence.
+            let review_gate_turn_id =
+                crate::internal::ai::runtime::phase1::open_review_gate_phase_turn_id(
+                    &session_jsonl,
+                );
+            let durability = RuntimeCommandDurability::new(session_jsonl);
+            let recovered_mutations = durability
+                .recover_pending_mutations_for_intent_review(review_gate_turn_id.as_deref())
+                .map_err(|error| {
+                    CliError::io(format!(
+                        "failed to recover pending durable commands for Code session '{}': {error}",
+                        session.id
+                    ))
+                })?;
+            let plan_execution_executor = Arc::new(DeferredPlanExecutionExecutor::new());
+            let mut worker_config = AgentRuntimeWorkerConfig::new(
+                plan_execution_executor.clone(),
+                ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+            )
+            .with_durability(durability, working_dir_str.clone(), "tui-local")
+            .with_durability_command_kind("tui_local_turn");
+            if !recovered_mutations.is_empty() {
+                worker_config =
+                    worker_config.with_recovered_reconciliation_session(session.id.clone());
+            }
+            let (handle, worker_task) = AgentRuntimeWorker::spawn(worker_config);
+            (
+                Some(handle),
+                Some(worker_task),
+                Some(plan_execution_executor),
+            )
+        };
     check_process_terminate(&process_terminate)?;
     // v0.17.791 session-bootstrap usage auto-prune: if the
     // operator configured `[usage] retention_days = N` in
@@ -4134,6 +4142,7 @@ where
             managed_code_ui_runtime,
             local_turn_runtime,
             local_turn_runtime_task,
+            plan_execution_executor,
             default_network_access: params.network_access,
             auto_classify_first_user_message,
             initial_goal: params.initial_goal.clone(),

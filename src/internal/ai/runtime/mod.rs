@@ -16,6 +16,7 @@ pub mod phase1;
 pub mod phase2;
 pub mod phase3;
 pub mod phase4;
+pub mod plan_execution;
 pub mod prompt_builders;
 pub mod revision;
 pub mod services;
@@ -50,6 +51,11 @@ pub use phase4::{
     DecisionPolicy, DecisionProposal, DecisionProposalRoute, DecisionProposalStore, FinalDecision,
     FinalDecisionStore, FinalDecisionSummary, RiskScoreBreakdown, aggregate_risk_score,
     build_decision_proposal,
+};
+pub use plan_execution::{
+    DeferredPlanExecutionExecutor, PLAN_EXECUTION_TURN_INPUT, PlanExecutionRunner,
+    ensure_plan_execution_mutating_gate, is_plan_execution_turn, plan_execution_turn_request,
+    submit_confirmed_plan_execution,
 };
 pub use prompt_builders::{IntentPromptBuilder, PlanningPromptBuilder, TaskPromptBuilder};
 pub use services::{

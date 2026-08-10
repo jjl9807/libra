@@ -104,10 +104,11 @@ use crate::{
         projection::ProjectionRebuilder,
         prompt::SystemPromptBuilder,
         runtime::{
-            AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig,
-            ExternalTurnTrackingExecutor, InMemoryAuditSink, InteractionResponse, InteractionState,
-            RuntimeCommandDurability, RuntimeTurnExecution, RuntimeWorkerError,
-            ToolBoundaryRuntime, TurnRequest,
+            AgentEventKind, AgentEventStream, AgentRuntimeHandle, AgentRuntimeWorker,
+            AgentRuntimeWorkerConfig, DeferredPlanExecutionExecutor, EventCursor,
+            InMemoryAuditSink, InteractionResponse, InteractionState, RuntimeCommandDurability,
+            RuntimeExecutionContext, RuntimeTurnExecution, RuntimeWorkerError, ToolBoundaryRuntime,
+            TurnRequest,
             phase0::{
                 ContextSnapshotItem, ContextSnapshotRequest, IntentReviewAckDelivery,
                 IntentReviewDecision, open_intent_review_from_workflow,
@@ -119,7 +120,7 @@ use crate::{
                 open_network_policy_from_workflow, open_plan_review_from_workflow,
                 open_review_gate_phase_turn_id, phase1_plan_tool_loop_config,
             },
-            runtime_worker_adapter_message,
+            runtime_worker_adapter_message, submit_confirmed_plan_execution,
         },
         sandbox::{
             ApprovalMemo, ExecApprovalRequest, FileHistoryRuntimeContext, NetworkAccess,
@@ -211,6 +212,13 @@ const LATEST_PLAN_REVIEW_DRAFT_JSON: &str = "latest_plan_review_draft_json";
 /// Crash bridge between network Allow/Deny settle and execute admission (W2-03).
 /// Holds the chosen `network_access` bool; cleared once execute is admitted.
 const LATEST_PENDING_PLAN_EXECUTION_NETWORK: &str = "latest_pending_plan_execution_network";
+/// Set immediately before `submit` and cleared/replaced on submit settle so a
+/// crash in the pre-admission window fences instead of silently dropping or
+/// replaying the approved plan.
+const LATEST_PENDING_PLAN_EXECUTION_SUBMITTING: &str = "latest_pending_plan_execution_submitting";
+/// Set when a confirmed plan has been `submit`'d onto the worker so crash
+/// recovery will not replay an already-admitted (possibly completed) execute.
+const LATEST_PENDING_PLAN_EXECUTION_ADMITTED: &str = "latest_pending_plan_execution_admitted";
 const LATEST_INTENTSPEC_WORKSPACE_KEY: &str = "latest_intentspec_workspace_key";
 const LATEST_INTENTSPEC_BASE_REF: &str = "latest_intentspec_base_ref";
 const LATEST_INTENTSPEC_BRANCH_LABEL: &str = "latest_intentspec_branch_label";
@@ -499,6 +507,9 @@ pub struct AppConfig {
     pub local_turn_runtime: Option<AgentRuntimeHandle>,
     /// JoinHandle for the local AgentRuntime worker (must be shut down on exit).
     pub local_turn_runtime_task: Option<JoinHandle<()>>,
+    /// Staged confirmed-plan runner slot shared with the local worker executor
+    /// (W2-04). Present whenever `local_turn_runtime` is spawned for TUI.
+    pub plan_execution_executor: Option<Arc<DeferredPlanExecutionExecutor>>,
     /// Default network access policy selected at TUI launch.
     pub default_network_access: bool,
     /// Whether the first unprofiled user message should be model-classified.
@@ -814,6 +825,9 @@ pub struct App<M: CompletionModel> {
     local_turn_runtime: Option<AgentRuntimeHandle>,
     /// JoinHandle for the current local AgentRuntime worker task.
     local_turn_runtime_task: Option<JoinHandle<()>>,
+    /// Shared with the local worker so confirmed plan execution can be submitted
+    /// into the serialized queue (W2-04).
+    plan_execution_executor: Option<Arc<DeferredPlanExecutionExecutor>>,
     /// Default network access policy selected at TUI launch.
     default_network_access: bool,
     /// Whether the first unprofiled user message should be model-classified.
@@ -1007,6 +1021,7 @@ where
             managed_code_ui_runtime: app_config.managed_code_ui_runtime,
             local_turn_runtime: app_config.local_turn_runtime,
             local_turn_runtime_task: app_config.local_turn_runtime_task,
+            plan_execution_executor: app_config.plan_execution_executor,
             default_network_access: app_config.default_network_access,
             auto_classify_first_user_message: app_config.auto_classify_first_user_message,
             next_code_ui_item_id: 1,
@@ -1298,11 +1313,29 @@ where
     /// Complete a tracked local TUI turn in the runtime before clearing App
     /// turn tracking. Workflow terminal events must call this so the durable
     /// command does not remain Pending across the next admission or restart.
+    ///
+    /// Worker-owned plan-execution turns (`plan-exec-*`) already terminalize via
+    /// the executor's `ExecutionFinished`. Calling `finish_external_turn` here
+    /// would race the in-flight orchestrator and release the queue early.
     async fn settle_local_runtime_turn_completed(
         &mut self,
         turn_id: TurnId,
         summary: &str,
     ) -> Result<(), RuntimeWorkerError> {
+        let Some((active_ui_turn, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Ok(());
+        };
+        if active_ui_turn != turn_id {
+            tracing::debug!(
+                stale_turn_id = turn_id,
+                active_turn_id = active_ui_turn,
+                "ignoring stale local runtime finalization for inactive UI turn"
+            );
+            return Ok(());
+        }
+        if runtime_turn_id.starts_with("plan-exec-") {
+            return Ok(());
+        }
         self.finish_local_runtime_turn(
             turn_id,
             Ok(RuntimeTurnExecution::Completed {
@@ -2744,19 +2777,100 @@ where
     }
 
     fn clear_pending_plan_execution_handoff(&mut self) -> Result<(), String> {
-        let Some(previous) = self
+        let previous_network = self
             .session
             .metadata
-            .remove(LATEST_PENDING_PLAN_EXECUTION_NETWORK)
-        else {
+            .remove(LATEST_PENDING_PLAN_EXECUTION_NETWORK);
+        let previous_submitting = self
+            .session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING);
+        let previous_admitted = self
+            .session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_ADMITTED);
+        if previous_network.is_none()
+            && previous_submitting.is_none()
+            && previous_admitted.is_none()
+        {
             return Ok(());
-        };
+        }
         if let Err(error) = self.session_store.save(&self.session) {
-            self.session
-                .metadata
-                .insert(LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(), previous);
+            if let Some(previous) = previous_network {
+                self.session
+                    .metadata
+                    .insert(LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(), previous);
+            }
+            if let Some(previous) = previous_submitting {
+                self.session.metadata.insert(
+                    LATEST_PENDING_PLAN_EXECUTION_SUBMITTING.to_string(),
+                    previous,
+                );
+            }
+            if let Some(previous) = previous_admitted {
+                self.session
+                    .metadata
+                    .insert(LATEST_PENDING_PLAN_EXECUTION_ADMITTED.to_string(), previous);
+            }
             return Err(format!(
                 "failed to clear pending plan-execution handoff: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Persist a pre-submit intent so a crash between save and worker
+    /// admission fences instead of silently dropping or replaying.
+    fn mark_plan_execution_submitting(&mut self, runtime_turn_id: &str) -> Result<(), String> {
+        self.session.metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_SUBMITTING.to_string(),
+            serde_json::Value::String(runtime_turn_id.to_string()),
+        );
+        if let Err(error) = self.session_store.save(&self.session) {
+            return Err(format!(
+                "failed to persist plan-execution submitting marker: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Record that execute was admitted on the worker so a crash after
+    /// completion cannot restore+replay from the network handoff alone.
+    fn mark_plan_execution_admitted(&mut self, runtime_turn_id: &str) -> Result<(), String> {
+        self.session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING);
+        self.session.metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_ADMITTED.to_string(),
+            serde_json::Value::String(runtime_turn_id.to_string()),
+        );
+        if let Err(error) = self.session_store.save(&self.session) {
+            return Err(format!(
+                "failed to persist plan-execution admission marker: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Drop pre-submit markers after a rejected submit so the network handoff
+    /// remains restorable.
+    fn unmark_plan_execution_submitting(&mut self) -> Result<(), String> {
+        let previous = self
+            .session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING);
+        if previous.is_none() {
+            return Ok(());
+        }
+        if let Err(error) = self.session_store.save(&self.session) {
+            if let Some(previous) = previous {
+                self.session.metadata.insert(
+                    LATEST_PENDING_PLAN_EXECUTION_SUBMITTING.to_string(),
+                    previous,
+                );
+            }
+            return Err(format!(
+                "failed to clear plan-execution submitting marker after rejected submit: {error}"
             ));
         }
         Ok(())
@@ -2772,13 +2886,33 @@ where
         {
             return;
         }
-        let Some(network_access) = self
-            .session
-            .metadata
-            .get(LATEST_PENDING_PLAN_EXECUTION_NETWORK)
-            .and_then(|value| value.as_bool())
-        else {
-            return;
+        let network_access = match plan_execution_handoff_restore_action(&self.session.metadata) {
+            PlanExecutionHandoffRestoreAction::None => return,
+            PlanExecutionHandoffRestoreAction::ClearAdmittedNoReplay => {
+                if let Err(error) = self.clear_pending_plan_execution_handoff() {
+                    self.fence_for_unrestorable_review_gate(format!(
+                            "A completed plan-execution admission marker could not be cleared ({error}). Mutation reconciliation is required before another turn can run."
+                        ))
+                        .await;
+                }
+                return;
+            }
+            PlanExecutionHandoffRestoreAction::FenceSubmitting => {
+                if let Err(error) = self.clear_pending_plan_execution_handoff() {
+                    self.fence_for_unrestorable_review_gate(format!(
+                            "A plan-execution submit was interrupted before worker admission could be confirmed, and clearing its handoff failed ({error}). Mutation reconciliation is required before another turn can run."
+                        ))
+                        .await;
+                } else {
+                    self.fence_for_unrestorable_review_gate(
+                            "A plan-execution submit was interrupted before worker admission could be confirmed. Mutation reconciliation is required before another turn can run."
+                                .to_string(),
+                        )
+                        .await;
+                }
+                return;
+            }
+            PlanExecutionHandoffRestoreAction::Replay { network_access } => network_access,
         };
         let context = match self.rebuild_restored_plan_context("").await {
             Ok(context) => context,
@@ -2908,8 +3042,9 @@ where
                 (Vec::new(), true)
             }
         };
+        let plan_execution_executor = Arc::new(DeferredPlanExecutionExecutor::new());
         let mut worker_config = AgentRuntimeWorkerConfig::new(
-            Arc::new(ExternalTurnTrackingExecutor),
+            plan_execution_executor.clone(),
             ToolBoundaryRuntime::system(
                 uuid::Uuid::new_v4(),
                 Arc::new(InMemoryAuditSink::default()),
@@ -2924,6 +3059,7 @@ where
         let (handle, worker_task) = AgentRuntimeWorker::spawn(worker_config);
         self.local_turn_runtime = Some(handle);
         self.local_turn_runtime_task = Some(worker_task);
+        self.plan_execution_executor = Some(plan_execution_executor);
         self.active_local_runtime_turn = None;
     }
 
@@ -2965,7 +3101,10 @@ where
         // Cooperative cancel left the adapter turn alive (typical once a
         // mutation has started). Drain terminal AppEvents until the runtime
         // turn is finalized, then fail-closed to indeterminate.
-        if mutation_in_progress || self.agent_task.is_some() {
+        if mutation_in_progress
+            || self.agent_task.is_some()
+            || self.active_local_runtime_turn.is_some()
+        {
             let deadline = Instant::now() + settle_budget;
             while Instant::now() < deadline {
                 if let Err(error) = self.drain_pending_app_events().await {
@@ -2998,17 +3137,23 @@ where
             self.local_turn_runtime.clone(),
             self.active_local_runtime_turn.clone(),
         ) {
-            let _ = runtime
-                .finish_external_turn(
-                    self.session.id.clone(),
-                    turn_id,
-                    Err(RuntimeWorkerError::IndeterminateSideEffect(
-                        "TUI exited while a local turn was still settling after cancellation"
-                            .to_string(),
-                    )),
-                )
-                .await;
-            self.active_local_runtime_turn = None;
+            // Worker-owned plan-exec turns already receive cancel via the
+            // shared token; do not finish_external_turn (adapter-owned API).
+            if turn_id.starts_with("plan-exec-") {
+                self.active_local_runtime_turn = None;
+            } else {
+                let _ = runtime
+                    .finish_external_turn(
+                        self.session.id.clone(),
+                        turn_id,
+                        Err(RuntimeWorkerError::IndeterminateSideEffect(
+                            "TUI exited while a local turn was still settling after cancellation"
+                                .to_string(),
+                        )),
+                    )
+                    .await;
+                self.active_local_runtime_turn = None;
+            }
         }
         let _ = self.interrupt_agent_task();
     }
@@ -3801,6 +3946,8 @@ where
             .active_local_runtime_turn
             .as_ref()
             .map(|(_, runtime_turn_id)| runtime_turn_id.clone());
+        let mut clear_discarded_plan_execution_ui = false;
+        let mut preserve_indeterminate_fence = false;
         if let (Some(runtime), Some(turn_id)) = (
             self.local_turn_runtime.clone(),
             local_runtime_turn_id.as_ref(),
@@ -3809,7 +3956,47 @@ where
                 .cancel(self.session.id.clone(), turn_id.clone())
                 .await
             {
-                Ok(()) | Err(RuntimeWorkerError::UnknownTurn { .. }) => {}
+                Ok(()) | Err(RuntimeWorkerError::UnknownTurn { .. }) => {
+                    // Queued plan-exec turns are discarded without running the
+                    // executor, so ExecuteWorkflowComplete never arrives.
+                    // Clear the TUI only for that queued-discard case — not when
+                    // the turn already terminalized and a watcher may still emit
+                    // ExecuteWorkflowComplete / ReconcileRequired.
+                    if turn_id.starts_with("plan-exec-") {
+                        let snapshot = runtime.snapshot(self.session.id.clone()).await.ok();
+                        let still_active = snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.active_turn_id.as_deref() == Some(turn_id.as_str())
+                        });
+                        let leave_for_terminal_watcher =
+                            snapshot.as_ref().is_some_and(|snapshot| {
+                                // Cancelled alone is also the queued-discard outcome
+                                // (no runner/watcher). Only leave the UI to a watcher
+                                // when the turn already finished with a durable
+                                // Completed/Failed/Indeterminate result.
+                                matches!(
+                                    snapshot.interaction,
+                                    InteractionState::Completed
+                                        | InteractionState::Failed { .. }
+                                        | InteractionState::IndeterminateSideEffect { .. }
+                                )
+                            });
+                        if !still_active && !leave_for_terminal_watcher {
+                            self.active_local_runtime_turn = None;
+                            clear_discarded_plan_execution_ui = true;
+                            // Queued cancels never emit ExecuteWorkflowComplete,
+                            // so retry the crash-handoff clear here.
+                            if let Err(error) = self.clear_pending_plan_execution_handoff() {
+                                self.fence_for_unrestorable_review_gate(format!(
+                                    "Cancelled a queued plan execution, but clearing its crash handoff failed ({error}). Mutation reconciliation is required before another turn can run."
+                                ))
+                                .await;
+                                // Do not fall through to Idle / cancel_active_turn —
+                                // the fence already marked IndeterminateSideEffect.
+                                preserve_indeterminate_fence = true;
+                            }
+                        }
+                    }
+                }
                 Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) => {
                     return Err(TuiControlError::Internal(runtime_worker_adapter_message(
                         error,
@@ -3858,10 +4045,18 @@ where
                 );
             }
         }
-        let hard_interrupted = self.interrupt_agent_task();
+        let hard_interrupted = self.interrupt_agent_task() || clear_discarded_plan_execution_ui;
+        if clear_discarded_plan_execution_ui {
+            self.pending_auto_plan_repair_execution = None;
+            self.complete_streaming_thinking_cells();
+            self.clear_active_turn();
+            self.running_tool_calls = 0;
+            self.clear_turn_cancellation();
+        }
         if hard_interrupted
             && let (Some(runtime), Some(turn_id)) =
                 (self.local_turn_runtime.clone(), local_runtime_turn_id)
+            && !turn_id.starts_with("plan-exec-")
         {
             runtime
                 .finish_external_turn(
@@ -3879,13 +4074,24 @@ where
         }
         if hard_interrupted {
             self.clear_mcp_run_id();
-            self.widget.bottom_pane.set_status(AgentStatus::Idle);
-            self.sync_mux_input_context();
-            self.complete_streaming_assistant_cell("Interrupted.".to_string());
-            self.complete_running_tool_cells_with_interrupt();
-            self.schedule_draw();
-            if let Some(code_ui_session) = self.code_ui_session.clone() {
-                code_ui_session.cancel_active_turn("Interrupted.").await;
+            if preserve_indeterminate_fence {
+                // Runtime + Code UI are already IndeterminateSideEffect; do
+                // not overwrite with Idle after a failed handoff clear.
+                self.sync_mux_input_context();
+                self.complete_streaming_assistant_cell(
+                    "Interrupted; mutation reconciliation is required.".to_string(),
+                );
+                self.complete_running_tool_cells_with_interrupt();
+                self.schedule_draw();
+            } else {
+                self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                self.sync_mux_input_context();
+                self.complete_streaming_assistant_cell("Interrupted.".to_string());
+                self.complete_running_tool_cells_with_interrupt();
+                self.schedule_draw();
+                if let Some(code_ui_session) = self.code_ui_session.clone() {
+                    code_ui_session.cancel_active_turn("Interrupted.").await;
+                }
             }
         } else {
             self.schedule_draw();
@@ -7057,6 +7263,34 @@ where
                     *slot = run_id;
                 }
             }
+            AppEvent::BindLocalRuntimeTurnTokens {
+                turn_id,
+                cancellation,
+                mutation_started,
+            } => {
+                if self.active_turn_id != Some(turn_id) {
+                    return Ok(());
+                }
+                self.current_turn_cancellation = Some(cancellation);
+                self.current_turn_mutation_started = Some(mutation_started);
+            }
+            AppEvent::LocalPlanExecutionReconcileRequired { turn_id, reason } => {
+                if self.active_turn_id != Some(turn_id)
+                    && self
+                        .active_local_runtime_turn
+                        .as_ref()
+                        .is_none_or(|(ui_turn, _)| *ui_turn != turn_id)
+                {
+                    return Ok(());
+                }
+                let _ = self.clear_pending_plan_execution_handoff();
+                self.active_local_runtime_turn = None;
+                self.finish_turn_state();
+                self.widget.clear_task_mux();
+                self.sync_mux_input_context();
+                // Stay on the indeterminate/fenced surface — do not publish Idle.
+                self.fence_for_unrestorable_review_gate(reason).await;
+            }
             AppEvent::ExecuteWorkflowComplete {
                 turn_id,
                 text,
@@ -7069,11 +7303,39 @@ where
                 network_access,
                 automatic_repair_attempts,
                 automatic_repair_max_attempts,
+                cancelled,
             } => {
+                // Ignore stale completions after Esc/new-turn races so a late
+                // watcher cannot rewrite a subsequent turn's history/repair state.
+                if self.active_turn_id != Some(turn_id)
+                    && self
+                        .active_local_runtime_turn
+                        .as_ref()
+                        .is_none_or(|(ui_turn, _)| *ui_turn != turn_id)
+                {
+                    return Ok(());
+                }
+                // Retry durable handoff clear after the worker has terminalized
+                // (Complete is only emitted post-terminalization for plan-exec).
+                if let Err(error) = self.clear_pending_plan_execution_handoff() {
+                    self.active_local_runtime_turn = None;
+                    self.finish_turn_state();
+                    self.widget.clear_task_mux();
+                    self.sync_mux_input_context();
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "Plan execution finished, but clearing the crash handoff failed ({error}). Mutation reconciliation is required before another turn can run."
+                    ))
+                    .await;
+                    return Ok(());
+                }
                 if let Err(error) = self
                     .settle_local_runtime_turn_completed(
                         turn_id,
-                        "local TUI execute workflow completed",
+                        if cancelled {
+                            "local TUI execute workflow cancelled"
+                        } else {
+                            "local TUI execute workflow completed"
+                        },
                     )
                     .await
                 {
@@ -7089,6 +7351,11 @@ where
                 self.sync_mux_input_context();
                 self.history = new_history;
                 self.session.add_assistant_message(&text);
+                if cancelled {
+                    self.complete_streaming_assistant_cell(text);
+                    self.set_idle_and_draw();
+                    return Ok(());
+                }
                 let repair_required = execution_requires_plan_repair(result.as_deref());
                 let mut repair_plan = result
                     .as_deref()
@@ -8823,10 +9090,19 @@ where
             }
         };
 
+        if self.managed_code_ui_runtime.is_some() {
+            self.pending_auto_plan_repair_execution = None;
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Managed Code UI sessions bypass generic Plan drafting (the managed completion model cannot run IntentSpec/Plan workflows). Use a non-managed TUI provider."
+                    .to_string(),
+            )));
+            self.set_idle_and_draw();
+            return;
+        }
         if self.local_turn_runtime.is_none() {
             self.pending_auto_plan_repair_execution = None;
             self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                "Plan drafting requires a local AgentRuntime so Plan review and network-policy gates stay durable across crash/resume. This managed Code UI session has none — use a non-managed TUI provider."
+                "Plan drafting requires a local AgentRuntime so Plan review and network-policy gates stay durable across crash/resume."
                     .to_string(),
             )));
             self.set_idle_and_draw();
@@ -9414,6 +9690,14 @@ where
         // Crash bridge (W2-03 r18): persist the approved execution handoff
         // *before* resolving the network gate. Otherwise a crash after Allow/
         // Deny settle leaves neither gate open and drops the approved plan.
+        // Drop stale submitting/admitted markers so a prior crash cannot make
+        // restore prefer ClearAdmittedNoReplay over this new handoff.
+        self.session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING);
+        self.session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_ADMITTED);
         self.session.metadata.insert(
             LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(),
             serde_json::Value::Bool(network_access),
@@ -9768,94 +10052,41 @@ where
 
         let model = self.model.clone();
         let registry = self.registry.clone();
+        // Cancellation/mutation markers come from the worker execution context
+        // after submit dequeues the turn (W2-04). Do not attach App-local tokens
+        // that would diverge from runtime.cancel().
         let mut tool_loop_config = self.config.clone();
-        self.attach_turn_cancellation(&mut tool_loop_config);
-        if let Some(runtime) = self.local_turn_runtime.clone() {
-            let cancellation = match self.current_turn_cancellation.as_ref().cloned() {
-                Some(token) => token,
-                None => {
-                    self.finish_turn_state();
-                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                        "Execute workflow was not admitted: local turn cancellation token missing"
-                            .to_string(),
-                    )));
-                    self.set_idle_and_draw();
-                    return;
-                }
-            };
-            let mutation_started = match self.current_turn_mutation_started.as_ref().cloned() {
-                Some(marker) => marker,
-                None => {
-                    self.finish_turn_state();
-                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                        "Execute workflow was not admitted: local turn mutation marker missing"
-                            .to_string(),
-                    )));
-                    self.set_idle_and_draw();
-                    return;
-                }
-            };
-            let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
-            if let Err(error) = self.ensure_session_snapshot_before_admission() {
-                self.finish_turn_state();
-                self.widget
-                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
-                        "Execute workflow was not admitted: {error}"
-                    ))));
-                self.set_idle_and_draw();
-                return;
-            }
-            if let Err(error) = runtime
-                .track_external_turn(
-                    TurnRequest::new(
-                        self.session.id.clone(),
-                        runtime_turn_id.clone(),
-                        "execute workflow".to_string(),
-                        true,
-                    ),
-                    cancellation,
-                    mutation_started,
-                )
-                .await
-            {
-                self.finish_turn_state();
-                self.widget
-                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
-                        "Execute workflow was not admitted: {}",
-                        runtime_worker_adapter_message(error)
-                    ))));
-                self.set_idle_and_draw();
-                return;
-            }
-            self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
-        }
-        // Crash bridge consumed: execution is admitted (or proceeds without a
-        // local runtime). Clear durably before the long-running orchestrator so
-        // a mid-execute restart does not double-start from a stale handoff.
-        if let Err(error) = self.clear_pending_plan_execution_handoff() {
-            if let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.take()
-                && let Some(runtime) = self.local_turn_runtime.clone()
-            {
-                let _ = runtime
-                    .finish_external_turn(
-                        self.session.id.clone(),
-                        runtime_turn_id,
-                        Err(RuntimeWorkerError::ExecutionFailed(error.clone())),
-                    )
-                    .await;
-            }
+
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            self.finish_turn_state();
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Confirmed plan execution requires a local AgentRuntime so mutating work stays on the serialized queue. This managed Code UI session has none — use a non-managed TUI provider."
+                    .to_string(),
+            )));
+            self.set_idle_and_draw();
+            return;
+        };
+        let Some(plan_execution_executor) = self.plan_execution_executor.clone() else {
+            self.finish_turn_state();
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Confirmed plan execution requires a DeferredPlanExecutionExecutor so the worker can own Orchestrator::run."
+                    .to_string(),
+            )));
+            self.set_idle_and_draw();
+            return;
+        };
+        if let Err(error) = self.ensure_session_snapshot_before_admission() {
             self.finish_turn_state();
             self.widget
                 .add_cell(Box::new(AssistantHistoryCell::new(format!(
-                    "Execute workflow was not started: {error}"
+                    "Execute workflow was not admitted: {error}"
                 ))));
             self.set_idle_and_draw();
             return;
         }
-        // Admit before showing a streaming placeholder so a rejected
-        // reconciliation fence cannot leave a stuck spinner cell.
-        self.widget
-            .add_cell(Box::new(AssistantHistoryCell::streaming()));
+        // Keep the durable handoff until submit succeeds so a rejected
+        // queue admission (fence/shutdown) can still restore on restart.
+
         attach_file_history_context(
             &mut tool_loop_config,
             self.session_store.session_root(&self.session.id),
@@ -9884,324 +10115,601 @@ where
             NetworkPolicy::Allow
         );
 
-        let handle = ClientStorage::spawn_background_index_work(async move {
-            struct UiOrchestratorObserver {
-                tx: UnboundedSender<AppEvent>,
-                turn_id: TurnId,
-                task_revisions: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
-                plan_task_counts: Arc<Mutex<HashMap<u32, usize>>>,
-                execution_notes_sent: Arc<Mutex<HashSet<u32>>>,
-            }
-
-            impl UiOrchestratorObserver {
-                fn send_note(&self, text: String) {
-                    let _ = self.tx.send(AppEvent::InsertHistoryCell {
-                        turn_id: self.turn_id,
-                        cell: Box::new(AssistantHistoryCell::new(text)),
-                    });
+        let runtime_turn_id = format!("plan-exec-{}", uuid::Uuid::new_v4());
+        let session_id = self.session.id.clone();
+        let runtime_turn_id_for_wait = runtime_turn_id.clone();
+        let runner_turn_id = turn_id;
+        // Subscribe before submit so TurnCompleted cannot be missed if a
+        // queued successor starts immediately after this turn finishes.
+        let plan_execution_events =
+            match open_local_plan_execution_event_stream(&runtime, &session_id).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.finish_turn_state();
+                    self.widget
+                        .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                            "Execute workflow was not admitted: {error}"
+                        ))));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+        let runner = Box::new(move |context: RuntimeExecutionContext| {
+            Box::pin(async move {
+                let mut plan_execution_events = plan_execution_events;
+                let _ = tx.clone().send(AppEvent::BindLocalRuntimeTurnTokens {
+                    turn_id: runner_turn_id,
+                    cancellation: context.cancellation(),
+                    mutation_started: context.mutation_started_marker(),
+                });
+                let cancel_token = context.cancellation();
+                let mutation_marker = context.mutation_started_marker();
+                tool_loop_config.cancellation = Some(ToolLoopCancellation::new(
+                    context.cancellation(),
+                    context.mutation_started_marker(),
+                ));
+                let hardened_boundary = context
+                    .tool_boundary()
+                    .with_network_access(execution_network_access);
+                let registry = Arc::new(
+                    (*registry)
+                        .clone()
+                        .with_hardening(hardened_boundary.clone()),
+                );
+                if let Some(subagent_runtime) = tool_loop_config.subagent_runtime.as_mut() {
+                    // Task children dispatch through this registry, not the
+                    // parent Arc above — keep network Allow/Deny aligned.
+                    subagent_runtime.tool_registry = (*registry).clone();
                 }
 
-                fn scoped_call_id(task: &TaskSpec, call_id: &str) -> String {
-                    format!("{}:{call_id}", task.id())
-                }
+                // Keep an outer clone for post-join UI events; the orchestrator
+                // task moves its own clone into observers.
+                let tx_after_join = tx.clone();
+                let join = ClientStorage::spawn_background_index_work(async move {
+                    struct UiOrchestratorObserver {
+                        tx: UnboundedSender<AppEvent>,
+                        turn_id: TurnId,
+                        task_revisions: Arc<Mutex<HashMap<uuid::Uuid, u32>>>,
+                        plan_task_counts: Arc<Mutex<HashMap<u32, usize>>>,
+                        execution_notes_sent: Arc<Mutex<HashSet<u32>>>,
+                    }
 
-                fn remember_plan(&self, plan: &ExecutionPlanSpec) {
-                    if let Ok(mut task_revisions) = self.task_revisions.lock() {
-                        for task in &plan.tasks {
-                            task_revisions.insert(task.id(), plan.revision);
+                    impl UiOrchestratorObserver {
+                        fn send_note(&self, text: String) {
+                            let _ = self.tx.send(AppEvent::InsertHistoryCell {
+                                turn_id: self.turn_id,
+                                cell: Box::new(AssistantHistoryCell::new(text)),
+                            });
+                        }
+
+                        fn scoped_call_id(task: &TaskSpec, call_id: &str) -> String {
+                            format!("{}:{call_id}", task.id())
+                        }
+
+                        fn remember_plan(&self, plan: &ExecutionPlanSpec) {
+                            if let Ok(mut task_revisions) = self.task_revisions.lock() {
+                                for task in &plan.tasks {
+                                    task_revisions.insert(task.id(), plan.revision);
+                                }
+                            }
+                            if let Ok(mut plan_task_counts) = self.plan_task_counts.lock() {
+                                plan_task_counts.insert(plan.revision, plan.tasks.len());
+                            }
+                        }
+
+                        fn send_execution_note_once(&self, task: &TaskSpec) {
+                            let revision =
+                                self.task_revisions.lock().ok().and_then(|task_revisions| {
+                                    task_revisions.get(&task.id()).copied()
+                                });
+                            let Some(revision) = revision else {
+                                return;
+                            };
+
+                            let should_send = self
+                                .execution_notes_sent
+                                .lock()
+                                .map(|mut sent| sent.insert(revision))
+                                .unwrap_or(false);
+                            if !should_send {
+                                return;
+                            }
+
+                            let task_count = self
+                                .plan_task_counts
+                                .lock()
+                                .ok()
+                                .and_then(|plan_task_counts| {
+                                    plan_task_counts.get(&revision).copied()
+                                })
+                                .unwrap_or(0);
+                            self.send_note(format_plan_execution_stage_note(revision, task_count));
                         }
                     }
-                    if let Ok(mut plan_task_counts) = self.plan_task_counts.lock() {
-                        plan_task_counts.insert(plan.revision, plan.tasks.len());
-                    }
-                }
 
-                fn send_execution_note_once(&self, task: &TaskSpec) {
-                    let revision = self
-                        .task_revisions
-                        .lock()
-                        .ok()
-                        .and_then(|task_revisions| task_revisions.get(&task.id()).copied());
-                    let Some(revision) = revision else {
-                        return;
-                    };
-
-                    let should_send = self
-                        .execution_notes_sent
-                        .lock()
-                        .map(|mut sent| sent.insert(revision))
-                        .unwrap_or(false);
-                    if !should_send {
-                        return;
-                    }
-
-                    let task_count = self
-                        .plan_task_counts
-                        .lock()
-                        .ok()
-                        .and_then(|plan_task_counts| plan_task_counts.get(&revision).copied())
-                        .unwrap_or(0);
-                    self.send_note(format_plan_execution_stage_note(revision, task_count));
-                }
-            }
-
-            impl OrchestratorObserver for UiOrchestratorObserver {
-                fn on_plan_compiled(&self, plan: &ExecutionPlanSpec) {
-                    self.remember_plan(plan);
-                    let _ = self.tx.send(AppEvent::DagGraphBegin {
-                        turn_id: self.turn_id,
-                        plan: plan.clone(),
-                    });
-                    self.send_note(format_plan_compiled_stage_note(plan));
-                }
-
-                fn on_task_runtime_event(&self, task: &TaskSpec, event: TaskRuntimeEvent) {
-                    match &event {
-                        TaskRuntimeEvent::Phase(TaskRuntimePhase::Starting) => {
-                            self.send_execution_note_once(task);
-                            let _ = self.tx.send(AppEvent::AgentStatusUpdate {
+                    impl OrchestratorObserver for UiOrchestratorObserver {
+                        fn on_plan_compiled(&self, plan: &ExecutionPlanSpec) {
+                            self.remember_plan(plan);
+                            let _ = self.tx.send(AppEvent::DagGraphBegin {
                                 turn_id: self.turn_id,
-                                status: AgentStatus::Thinking,
+                                plan: plan.clone(),
                             });
-                            let _ = self.tx.send(AppEvent::DagTaskStatus {
+                            self.send_note(format_plan_compiled_stage_note(plan));
+                        }
+
+                        fn on_task_runtime_event(&self, task: &TaskSpec, event: TaskRuntimeEvent) {
+                            match &event {
+                                TaskRuntimeEvent::Phase(TaskRuntimePhase::Starting) => {
+                                    self.send_execution_note_once(task);
+                                    let _ = self.tx.send(AppEvent::AgentStatusUpdate {
+                                        turn_id: self.turn_id,
+                                        status: AgentStatus::Thinking,
+                                    });
+                                    let _ = self.tx.send(AppEvent::DagTaskStatus {
+                                        turn_id: self.turn_id,
+                                        task_id: task.id(),
+                                        status: TaskNodeStatus::Running,
+                                    });
+                                }
+                                TaskRuntimeEvent::Phase(TaskRuntimePhase::Completed) => {
+                                    let _ = self.tx.send(AppEvent::DagTaskStatus {
+                                        turn_id: self.turn_id,
+                                        task_id: task.id(),
+                                        status: TaskNodeStatus::Completed,
+                                    });
+                                }
+                                TaskRuntimeEvent::Phase(TaskRuntimePhase::Failed) => {
+                                    let _ = self.tx.send(AppEvent::DagTaskStatus {
+                                        turn_id: self.turn_id,
+                                        task_id: task.id(),
+                                        status: TaskNodeStatus::Failed,
+                                    });
+                                }
+                                TaskRuntimeEvent::WorkspaceReady {
+                                    working_dir,
+                                    isolated,
+                                    backend,
+                                    main_working_dir,
+                                } => {
+                                    self.send_note(format_task_workspace_note(
+                                        task.title(),
+                                        working_dir,
+                                        *isolated,
+                                        *backend,
+                                        main_working_dir.as_deref(),
+                                    ));
+                                }
+                                TaskRuntimeEvent::Note { level, text } => {
+                                    let title = match level {
+                                        TaskRuntimeNoteLevel::Info => {
+                                            format!("Task · {}", task.title())
+                                        }
+                                        TaskRuntimeNoteLevel::Error => {
+                                            format!("Task Failed · {}", task.title())
+                                        }
+                                    };
+                                    self.send_note(format!("{title}  \n{text}"));
+                                }
+                                TaskRuntimeEvent::ThinkingDelta(delta) if !delta.is_empty() => {
+                                    let _ = self.tx.send(AppEvent::AgentEvent {
+                                        turn_id: self.turn_id,
+                                        event: AgentEvent::ThinkingDelta {
+                                            delta: delta.clone(),
+                                        },
+                                    });
+                                }
+                                TaskRuntimeEvent::UsageUpdated {
+                                    usage,
+                                    wall_clock_ms,
+                                } => {
+                                    let _ = self.tx.send(AppEvent::AgentEvent {
+                                        turn_id: self.turn_id,
+                                        event: AgentEvent::UsageUpdated {
+                                            usage: usage.clone(),
+                                            wall_clock_ms: *wall_clock_ms,
+                                        },
+                                    });
+                                }
+                                _ => {}
+                            }
+
+                            let mux_event = match event {
+                                TaskRuntimeEvent::ToolCallBegin {
+                                    call_id,
+                                    tool_name,
+                                    arguments,
+                                } => TaskRuntimeEvent::ToolCallBegin {
+                                    call_id: Self::scoped_call_id(task, &call_id),
+                                    tool_name,
+                                    arguments,
+                                },
+                                TaskRuntimeEvent::ToolCallEnd {
+                                    call_id,
+                                    tool_name,
+                                    result,
+                                } => TaskRuntimeEvent::ToolCallEnd {
+                                    call_id: Self::scoped_call_id(task, &call_id),
+                                    tool_name,
+                                    result,
+                                },
+                                other => other,
+                            };
+
+                            let _ = self.tx.send(AppEvent::TaskRuntimeEvent {
                                 turn_id: self.turn_id,
                                 task_id: task.id(),
-                                status: TaskNodeStatus::Running,
+                                event: mux_event,
                             });
                         }
-                        TaskRuntimeEvent::Phase(TaskRuntimePhase::Completed) => {
-                            let _ = self.tx.send(AppEvent::DagTaskStatus {
+
+                        fn on_graph_progress(&self, completed: usize, total: usize) {
+                            let _ = self.tx.send(AppEvent::DagGraphProgress {
                                 turn_id: self.turn_id,
-                                task_id: task.id(),
-                                status: TaskNodeStatus::Completed,
+                                completed,
+                                total,
                             });
                         }
-                        TaskRuntimeEvent::Phase(TaskRuntimePhase::Failed) => {
-                            let _ = self.tx.send(AppEvent::DagTaskStatus {
+
+                        fn on_graph_checkpoint_saved(
+                            &self,
+                            _checkpoint_id: &str,
+                            _pc: usize,
+                            _completed_nodes: usize,
+                        ) {
+                        }
+
+                        fn on_graph_checkpoint_restored(&self, _checkpoint_id: &str, _pc: usize) {}
+
+                        fn on_system_verification(
+                            &self,
+                            plan: &ExecutionPlanSpec,
+                            report: &SystemReport,
+                        ) {
+                            let _ = self.tx.send(AppEvent::DagTaskMuxClear {
                                 turn_id: self.turn_id,
-                                task_id: task.id(),
-                                status: TaskNodeStatus::Failed,
                             });
+                            // The right-side workflow graph tracks whether Phase 3 ran.
+                            // Pass/fail details remain in the verification summary.
+                            let _ = self.tx.send(AppEvent::DagValidationStatus {
+                                turn_id: self.turn_id,
+                                passed: true,
+                            });
+                            self.send_note(format_system_verification_stage_note(plan, report));
                         }
-                        TaskRuntimeEvent::WorkspaceReady {
-                            working_dir,
-                            isolated,
-                            backend,
-                            main_working_dir,
-                        } => {
-                            self.send_note(format_task_workspace_note(
-                                task.title(),
-                                working_dir,
-                                *isolated,
-                                *backend,
-                                main_working_dir.as_deref(),
+
+                        fn on_decision(
+                            &self,
+                            plan: &ExecutionPlanSpec,
+                            decision: &DecisionOutcome,
+                        ) {
+                            // The release row represents Phase 4 completion, not whether
+                            // the decision was Commit, HumanReviewRequired, or Abandon.
+                            let _ = self.tx.send(AppEvent::DagReleaseStatus {
+                                turn_id: self.turn_id,
+                                passed: true,
+                            });
+                            self.send_note(format_decision_stage_note(plan, decision));
+                        }
+
+                        fn on_replan(
+                            &self,
+                            current_revision: u32,
+                            next_revision: u32,
+                            reason: &str,
+                            diff_summary: &str,
+                        ) {
+                            let _ = self.tx.send(AppEvent::DagTaskMuxClear {
+                                turn_id: self.turn_id,
+                            });
+                            self.send_note(format_replan_stage_note(
+                                current_revision,
+                                next_revision,
+                                reason,
+                                diff_summary,
                             ));
                         }
-                        TaskRuntimeEvent::Note { level, text } => {
-                            let title = match level {
-                                TaskRuntimeNoteLevel::Info => format!("Task · {}", task.title()),
-                                TaskRuntimeNoteLevel::Error => {
-                                    format!("Task Failed · {}", task.title())
-                                }
-                            };
-                            self.send_note(format!("{title}  \n{text}"));
-                        }
-                        TaskRuntimeEvent::ThinkingDelta(delta) if !delta.is_empty() => {
-                            let _ = self.tx.send(AppEvent::AgentEvent {
-                                turn_id: self.turn_id,
-                                event: AgentEvent::ThinkingDelta {
-                                    delta: delta.clone(),
-                                },
-                            });
-                        }
-                        TaskRuntimeEvent::UsageUpdated {
-                            usage,
-                            wall_clock_ms,
-                        } => {
-                            let _ = self.tx.send(AppEvent::AgentEvent {
-                                turn_id: self.turn_id,
-                                event: AgentEvent::UsageUpdated {
-                                    usage: usage.clone(),
-                                    wall_clock_ms: *wall_clock_ms,
-                                },
-                            });
-                        }
-                        _ => {}
+
+                        fn on_persistence_complete(&self, _execution: &PersistedExecution) {}
                     }
 
-                    let mux_event = match event {
-                        TaskRuntimeEvent::ToolCallBegin {
-                            call_id,
-                            tool_name,
-                            arguments,
-                        } => TaskRuntimeEvent::ToolCallBegin {
-                            call_id: Self::scoped_call_id(task, &call_id),
-                            tool_name,
-                            arguments,
-                        },
-                        TaskRuntimeEvent::ToolCallEnd {
-                            call_id,
-                            tool_name,
-                            result,
-                        } => TaskRuntimeEvent::ToolCallEnd {
-                            call_id: Self::scoped_call_id(task, &call_id),
-                            tool_name,
-                            result,
-                        },
-                        other => other,
+                    let observer: Arc<dyn OrchestratorObserver> =
+                        Arc::new(UiOrchestratorObserver {
+                            tx: tx.clone(),
+                            turn_id,
+                            task_revisions: Arc::new(Mutex::new(HashMap::new())),
+                            plan_task_counts: Arc::new(Mutex::new(HashMap::new())),
+                            execution_notes_sent: Arc::new(Mutex::new(HashSet::new())),
+                        });
+                    struct TuiPhaseConfirmer {
+                        tx: UnboundedSender<AppEvent>,
+                        turn_id: TurnId,
+                    }
+
+                    #[async_trait]
+                    impl OrchestratorPhaseConfirmer for TuiPhaseConfirmer {
+                        async fn confirm(
+                            &self,
+                            prompt: PhaseConfirmationPrompt,
+                        ) -> PhaseConfirmationDecision {
+                            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                            if self
+                                .tx
+                                .send(AppEvent::PhaseConfirmationRequired {
+                                    turn_id: self.turn_id,
+                                    prompt,
+                                    response_tx,
+                                })
+                                .is_err()
+                            {
+                                return PhaseConfirmationDecision::Abort;
+                            }
+                            response_rx
+                                .await
+                                .unwrap_or(PhaseConfirmationDecision::Abort)
+                        }
+                    }
+
+                    let config = OrchestratorConfig {
+                        working_dir,
+                        base_commit: None,
+                        persisted_intent_id,
+                        persisted_plan_bundle,
+                        persisted_plan_id,
+                        initial_plan: approved_plan,
+                        dagrs_resume_checkpoint_id: None,
+                        tool_loop_config,
+                        coder_preamble,
+                        reviewer_preamble,
+                        mcp_server,
+                        observer: Some(observer),
+                        phase_confirmer: Some(Arc::new(TuiPhaseConfirmer {
+                            tx: tx.clone(),
+                            turn_id,
+                        })),
+                    };
+                    let orchestrator = Orchestrator::new(model, registry, config);
+
+                    let result = orchestrator.run(spec).await;
+
+                    let (summary, ui_result) = match &result {
+                        Ok(r) => (format_orchestrator_result(r), Some(Box::new(r.clone()))),
+                        Err(e) => (format!("Orchestrator failed: {e}"), None),
                     };
 
-                    let _ = self.tx.send(AppEvent::TaskRuntimeEvent {
-                        turn_id: self.turn_id,
-                        task_id: task.id(),
-                        event: mux_event,
-                    });
-                }
+                    let mut new_history = history;
+                    new_history.push(Message::assistant(summary.clone()));
 
-                fn on_graph_progress(&self, completed: usize, total: usize) {
-                    let _ = self.tx.send(AppEvent::DagGraphProgress {
-                        turn_id: self.turn_id,
-                        completed,
-                        total,
-                    });
-                }
-
-                fn on_graph_checkpoint_saved(
-                    &self,
-                    _checkpoint_id: &str,
-                    _pc: usize,
-                    _completed_nodes: usize,
-                ) {
-                }
-
-                fn on_graph_checkpoint_restored(&self, _checkpoint_id: &str, _pc: usize) {}
-
-                fn on_system_verification(&self, plan: &ExecutionPlanSpec, report: &SystemReport) {
-                    let _ = self.tx.send(AppEvent::DagTaskMuxClear {
-                        turn_id: self.turn_id,
-                    });
-                    // The right-side workflow graph tracks whether Phase 3 ran.
-                    // Pass/fail details remain in the verification summary.
-                    let _ = self.tx.send(AppEvent::DagValidationStatus {
-                        turn_id: self.turn_id,
-                        passed: true,
-                    });
-                    self.send_note(format_system_verification_stage_note(plan, report));
-                }
-
-                fn on_decision(&self, plan: &ExecutionPlanSpec, decision: &DecisionOutcome) {
-                    // The release row represents Phase 4 completion, not whether
-                    // the decision was Commit, HumanReviewRequired, or Abandon.
-                    let _ = self.tx.send(AppEvent::DagReleaseStatus {
-                        turn_id: self.turn_id,
-                        passed: true,
-                    });
-                    self.send_note(format_decision_stage_note(plan, decision));
-                }
-
-                fn on_replan(
-                    &self,
-                    current_revision: u32,
-                    next_revision: u32,
-                    reason: &str,
-                    diff_summary: &str,
-                ) {
-                    let _ = self.tx.send(AppEvent::DagTaskMuxClear {
-                        turn_id: self.turn_id,
-                    });
-                    self.send_note(format_replan_stage_note(
-                        current_revision,
-                        next_revision,
-                        reason,
-                        diff_summary,
-                    ));
-                }
-
-                fn on_persistence_complete(&self, _execution: &PersistedExecution) {}
-            }
-
-            let observer: Arc<dyn OrchestratorObserver> = Arc::new(UiOrchestratorObserver {
-                tx: tx.clone(),
-                turn_id,
-                task_revisions: Arc::new(Mutex::new(HashMap::new())),
-                plan_task_counts: Arc::new(Mutex::new(HashMap::new())),
-                execution_notes_sent: Arc::new(Mutex::new(HashSet::new())),
-            });
-            struct TuiPhaseConfirmer {
-                tx: UnboundedSender<AppEvent>,
-                turn_id: TurnId,
-            }
-
-            #[async_trait]
-            impl OrchestratorPhaseConfirmer for TuiPhaseConfirmer {
-                async fn confirm(
-                    &self,
-                    prompt: PhaseConfirmationPrompt,
-                ) -> PhaseConfirmationDecision {
-                    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                    if self
-                        .tx
-                        .send(AppEvent::PhaseConfirmationRequired {
-                            turn_id: self.turn_id,
-                            prompt,
-                            response_tx,
-                        })
-                        .is_err()
-                    {
-                        return PhaseConfirmationDecision::Abort;
+                    let cancelled = cancel_token.is_cancelled()
+                        && !mutation_marker.load(std::sync::atomic::Ordering::Acquire);
+                    (
+                        cancelled,
+                        summary,
+                        ui_result,
+                        new_history,
+                        execution_spec_json,
+                        execution_intent_id,
+                        execution_plan_draft,
+                        plan_warnings,
+                        execution_network_access,
+                        automatic_repair_attempts,
+                        automatic_repair_max_attempts,
+                        turn_id,
+                    )
+                });
+                match join.await {
+                    Ok((
+                        cancelled,
+                        summary,
+                        ui_result,
+                        new_history,
+                        execution_spec_json,
+                        execution_intent_id,
+                        execution_plan_draft,
+                        plan_warnings,
+                        execution_network_access,
+                        automatic_repair_attempts,
+                        automatic_repair_max_attempts,
+                        turn_id,
+                    )) => {
+                        let terminal = if cancelled {
+                            Err(RuntimeWorkerError::Cancelled)
+                        } else {
+                            Ok(RuntimeTurnExecution::Completed {
+                                summary: "local TUI execute workflow completed".to_string(),
+                            })
+                        };
+                        // Watcher lives outside the orchestrator task so a
+                        // JoinError still emits a UI terminal/reconcile event.
+                        // Turn-scoped observe (opened before submit) so a queued
+                        // successor cannot steal this turn's outcome.
+                        let wait_turn = runtime_turn_id_for_wait.clone();
+                        let complete_tx = tx_after_join.clone();
+                        tokio::spawn(async move {
+                            match wait_for_local_plan_execution_terminal(
+                                &mut plan_execution_events,
+                                &wait_turn,
+                            )
+                            .await
+                            {
+                                LocalPlanExecutionTerminal::Completed => {
+                                    let _ = complete_tx.send(AppEvent::ExecuteWorkflowComplete {
+                                        turn_id,
+                                        text: summary,
+                                        new_history,
+                                        result: ui_result,
+                                        spec_json: execution_spec_json,
+                                        intent_id: execution_intent_id,
+                                        plan_draft: execution_plan_draft,
+                                        warnings: plan_warnings,
+                                        network_access: execution_network_access,
+                                        automatic_repair_attempts,
+                                        automatic_repair_max_attempts,
+                                        cancelled: false,
+                                    });
+                                }
+                                LocalPlanExecutionTerminal::Cancelled => {
+                                    let _ = complete_tx.send(AppEvent::ExecuteWorkflowComplete {
+                                        turn_id,
+                                        text: summary,
+                                        new_history,
+                                        result: ui_result,
+                                        spec_json: execution_spec_json,
+                                        intent_id: execution_intent_id,
+                                        plan_draft: execution_plan_draft,
+                                        warnings: plan_warnings,
+                                        network_access: execution_network_access,
+                                        automatic_repair_attempts,
+                                        automatic_repair_max_attempts,
+                                        cancelled: true,
+                                    });
+                                }
+                                LocalPlanExecutionTerminal::Failed(reason)
+                                | LocalPlanExecutionTerminal::Indeterminate(reason) => {
+                                    let _ = complete_tx.send(
+                                        AppEvent::LocalPlanExecutionReconcileRequired {
+                                            turn_id,
+                                            reason,
+                                        },
+                                    );
+                                }
+                                LocalPlanExecutionTerminal::TimedOut => {
+                                    let _ = complete_tx.send(
+                                        AppEvent::LocalPlanExecutionReconcileRequired {
+                                            turn_id,
+                                            reason: "timed out waiting for the runtime to terminalize confirmed plan execution"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                LocalPlanExecutionTerminal::SnapshotError(reason) => {
+                                    let _ = complete_tx.send(
+                                        AppEvent::LocalPlanExecutionReconcileRequired {
+                                            turn_id,
+                                            reason,
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                        terminal
                     }
-                    response_rx
-                        .await
-                        .unwrap_or(PhaseConfirmationDecision::Abort)
+                    Err(error) => {
+                        let _ = tx_after_join.send(local_plan_execution_task_join_failure_event(
+                            runner_turn_id,
+                            &error,
+                        ));
+                        // Unknown whether tools already mutated — fail closed
+                        // to durable indeterminate rather than ordinary Failed.
+                        Err(RuntimeWorkerError::IndeterminateSideEffect(format!(
+                            "confirmed plan execution task failed before terminalization: {error}"
+                        )))
+                    }
                 }
-            }
-
-            let config = OrchestratorConfig {
-                working_dir,
-                base_commit: None,
-                persisted_intent_id,
-                persisted_plan_bundle,
-                persisted_plan_id,
-                initial_plan: approved_plan,
-                dagrs_resume_checkpoint_id: None,
-                tool_loop_config,
-                coder_preamble,
-                reviewer_preamble,
-                mcp_server,
-                observer: Some(observer),
-                phase_confirmer: Some(Arc::new(TuiPhaseConfirmer {
-                    tx: tx.clone(),
-                    turn_id,
-                })),
-            };
-            let orchestrator = Orchestrator::new(model, registry, config);
-
-            let result = orchestrator.run(spec).await;
-
-            let (summary, ui_result) = match &result {
-                Ok(r) => (format_orchestrator_result(r), Some(Box::new(r.clone()))),
-                Err(e) => (format!("Orchestrator failed: {e}"), None),
-            };
-
-            let mut new_history = history;
-            new_history.push(Message::assistant(summary.clone()));
-
-            let _ = tx.send(AppEvent::ExecuteWorkflowComplete {
-                turn_id,
-                text: summary,
-                new_history,
-                result: ui_result,
-                spec_json: execution_spec_json,
-                intent_id: execution_intent_id,
-                plan_draft: execution_plan_draft,
-                warnings: plan_warnings,
-                network_access: execution_network_access,
-                automatic_repair_attempts,
-                automatic_repair_max_attempts,
-            });
+            })
+                as std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<RuntimeTurnExecution, RuntimeWorkerError>,
+                            > + Send,
+                    >,
+                >
         });
 
-        self.agent_task = Some(handle);
+        // Pre-submit marker fences crash recovery; admitted marker (post
+        // submit) suppresses replay of an already-queued mutating turn.
+        if let Err(error) = self.mark_plan_execution_submitting(&runtime_turn_id) {
+            self.session
+                .metadata
+                .remove(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING);
+            // The network handoff is still durable — clear it or fence so a
+            // restart cannot Replay after we told the user admission failed.
+            if let Err(clear_error) = self.clear_pending_plan_execution_handoff() {
+                self.finish_turn_state();
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Execute workflow was not admitted: {error}. Clearing the pending handoff also failed ({clear_error})."
+                    ))));
+                self.fence_for_unrestorable_review_gate(format!(
+                    "Plan execution could not persist its submitting marker ({error}) and could not clear the network handoff ({clear_error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            self.finish_turn_state();
+            self.widget
+                .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Execute workflow was not admitted: {error}"
+                ))));
+            self.set_idle_and_draw();
+            return;
+        }
+
+        match submit_confirmed_plan_execution(
+            &runtime,
+            plan_execution_executor.as_ref(),
+            session_id,
+            runtime_turn_id.clone(),
+            runner,
+        )
+        .await
+        {
+            Ok(_) => {
+                self.active_local_runtime_turn = Some((turn_id, runtime_turn_id.clone()));
+                if let Err(error) = self.mark_plan_execution_admitted(&runtime_turn_id) {
+                    // Submit already succeeded — keep tracking. In-memory
+                    // admitted/submitting state remains so this process will
+                    // not replay; retry durable clear on terminalization.
+                    tracing::error!(
+                        %error,
+                        turn_id = %runtime_turn_id,
+                        "failed to persist plan-execution admission marker after submit"
+                    );
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Warning: plan execution was admitted but its durable admission marker could not be saved ({error}). Execution continues; reconciliation may be required if this process crashes before completion."
+                    ))));
+                    self.widget
+                        .add_cell(Box::new(AssistantHistoryCell::streaming()));
+                    return;
+                }
+                if let Err(error) = self.clear_pending_plan_execution_handoff() {
+                    tracing::warn!(
+                        %error,
+                        "failed to clear pending plan-execution handoff after admit; will retry when execution terminalizes"
+                    );
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Warning: could not clear the plan-execution crash handoff after admission ({error}). Execution continues; handoff clear will retry when it finishes."
+                    ))));
+                }
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::streaming()));
+            }
+            Err(error) => {
+                if let Err(unmark_error) = self.unmark_plan_execution_submitting() {
+                    tracing::error!(
+                        %unmark_error,
+                        "failed to clear pre-submit submitting marker after rejected submit"
+                    );
+                    self.finish_turn_state();
+                    self.widget
+                        .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                            "Execute workflow was not admitted: {}. Additionally, clearing the pre-submit submitting marker failed ({unmark_error}). Mutation reconciliation is required before another turn can run.",
+                            runtime_worker_adapter_message(error)
+                        ))));
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "Rejected plan-execution submit left an unrestorable submitting marker ({unmark_error})."
+                    ))
+                    .await;
+                    return;
+                }
+                self.finish_turn_state();
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Execute workflow was not admitted: {}",
+                        runtime_worker_adapter_message(error)
+                    ))));
+                self.set_idle_and_draw();
+            }
+        }
     }
 
     async fn start_plan_workflow(&mut self, request: &str) {
@@ -10258,9 +10766,17 @@ where
     }
 
     async fn begin_plan_workflow(&mut self, user_text: String, prompt: String) {
+        if self.managed_code_ui_runtime.is_some() {
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Managed Code UI sessions bypass the generic `/plan` planner (the managed completion model cannot run IntentSpec/Plan workflows). Use a non-managed TUI provider for `/plan`."
+                    .to_string(),
+            )));
+            self.schedule_draw();
+            return;
+        }
         if self.local_turn_runtime.is_none() {
             self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                "Planning requires a local AgentRuntime so IntentSpec/Plan review gates stay durable across crash/resume. This managed Code UI session has none — use a non-managed TUI provider for `/plan`."
+                "Planning requires a local AgentRuntime so IntentSpec/Plan review gates stay durable across crash/resume."
                     .to_string(),
             )));
             self.schedule_draw();
@@ -10900,6 +11416,13 @@ where
             if let Some(token) = self.current_turn_abort_token.take() {
                 token.cancel();
             }
+            // Submit-owned plan execution has no App JoinHandle; the worker
+            // owns the turn. Cooperative cancel via runtime.cancel already
+            // ran — wait for ExecuteWorkflowComplete rather than pretending
+            // we hard-aborted the UI turn.
+            if self.agent_task.is_none() && self.active_local_runtime_turn.is_some() {
+                return false;
+            }
             if let Some(handle) = self.agent_task.take() {
                 handle.abort();
             }
@@ -10928,7 +11451,7 @@ where
             AgentStatus::AwaitingUserInput
         } else if self.running_tool_calls > 0 {
             AgentStatus::ExecutingTool
-        } else if self.agent_task.is_some() {
+        } else if self.agent_task.is_some() || self.active_local_runtime_turn.is_some() {
             AgentStatus::Thinking
         } else {
             AgentStatus::Idle
@@ -12754,6 +13277,11 @@ mod tests {
         assert!(
             !body.contains("create_context_snapshot_impl("),
             "begin_plan_workflow must not write ContextSnapshot directly through MCP"
+        );
+        assert!(
+            body.contains("managed_code_ui_runtime.is_some()")
+                && body.contains("bypass the generic `/plan` planner"),
+            "managed Codex sessions must stay out of the generic planner even when local_turn_runtime is present for W2-04"
         );
     }
 
@@ -15483,6 +16011,120 @@ fn attach_file_history_context(
     });
 }
 
+/// Crash-recovery decision for the plan-execution handoff markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanExecutionHandoffRestoreAction {
+    None,
+    ClearAdmittedNoReplay,
+    FenceSubmitting,
+    Replay { network_access: bool },
+}
+
+fn plan_execution_handoff_restore_action(
+    metadata: &std::collections::HashMap<String, serde_json::Value>,
+) -> PlanExecutionHandoffRestoreAction {
+    if metadata.contains_key(LATEST_PENDING_PLAN_EXECUTION_ADMITTED) {
+        return PlanExecutionHandoffRestoreAction::ClearAdmittedNoReplay;
+    }
+    if metadata.contains_key(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING) {
+        return PlanExecutionHandoffRestoreAction::FenceSubmitting;
+    }
+    match metadata
+        .get(LATEST_PENDING_PLAN_EXECUTION_NETWORK)
+        .and_then(|value| value.as_bool())
+    {
+        Some(network_access) => PlanExecutionHandoffRestoreAction::Replay { network_access },
+        None => PlanExecutionHandoffRestoreAction::None,
+    }
+}
+
+/// Open a turn-scoped event stream before submit so terminal events for a
+/// confirmed plan cannot be missed when a queued successor starts immediately.
+async fn open_local_plan_execution_event_stream(
+    runtime: &AgentRuntimeHandle,
+    session_id: &str,
+) -> Result<AgentEventStream, String> {
+    let cursor = match runtime.snapshot(session_id.to_string()).await {
+        Ok(snapshot) => snapshot.cursor,
+        Err(_) => EventCursor::new(session_id, 0),
+    };
+    runtime.observe(cursor).await.map_err(|error| {
+        format!(
+            "failed to observe runtime events before admitting plan execution: {}",
+            runtime_worker_adapter_message(error)
+        )
+    })
+}
+
+/// UI event when the orchestrator background task panics/aborts before the
+/// post-terminal watcher can publish `ExecuteWorkflowComplete`.
+fn local_plan_execution_task_join_failure_event(
+    turn_id: TurnId,
+    error: &impl std::fmt::Display,
+) -> AppEvent {
+    AppEvent::LocalPlanExecutionReconcileRequired {
+        turn_id,
+        reason: format!("confirmed plan execution task failed before terminalization: {error}"),
+    }
+}
+
+/// Wait until a worker-owned plan-execution turn emits a turn-scoped terminal
+/// event, so UI completion cannot race durability or a queued successor.
+#[derive(Debug)]
+enum LocalPlanExecutionTerminal {
+    Completed,
+    Cancelled,
+    Failed(String),
+    Indeterminate(String),
+    TimedOut,
+    SnapshotError(String),
+}
+
+async fn wait_for_local_plan_execution_terminal(
+    stream: &mut AgentEventStream,
+    turn_id: &str,
+) -> LocalPlanExecutionTerminal {
+    use tokio::time::{Duration, timeout};
+
+    for _ in 0..400 {
+        match timeout(Duration::from_millis(25), stream.recv()).await {
+            Ok(Ok(event)) => {
+                if event.turn_id.as_deref() != Some(turn_id) {
+                    continue;
+                }
+                match event.kind {
+                    AgentEventKind::TurnCompleted { .. } => {
+                        return LocalPlanExecutionTerminal::Completed;
+                    }
+                    AgentEventKind::TurnCancelled => {
+                        return LocalPlanExecutionTerminal::Cancelled;
+                    }
+                    AgentEventKind::TurnFailed { reason } => {
+                        return LocalPlanExecutionTerminal::Failed(reason);
+                    }
+                    AgentEventKind::TurnIndeterminateSideEffect { reason } => {
+                        return LocalPlanExecutionTerminal::Indeterminate(reason);
+                    }
+                    _ => continue,
+                }
+            }
+            Ok(Err(crate::internal::ai::runtime::RuntimeObserveError::Lagged { skipped })) => {
+                return LocalPlanExecutionTerminal::Indeterminate(format!(
+                    "runtime event consumer lagged by {skipped} events while waiting for plan execution terminal; mutation reconciliation is required"
+                ));
+            }
+            Ok(Err(crate::internal::ai::runtime::RuntimeObserveError::Closed)) => {
+                return LocalPlanExecutionTerminal::SnapshotError(
+                    "runtime event stream closed while waiting for plan execution terminal"
+                        .to_string(),
+                );
+            }
+            Err(_) => continue,
+        }
+    }
+    LocalPlanExecutionTerminal::TimedOut
+}
+
 fn normalize_terminal_paste_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -16512,5 +17154,336 @@ mod orchestrator_result_tests {
         let rendered = format_orchestrator_result(&result);
 
         assert!(rendered.contains("Reason: clippy (exit 101: lint failed)"));
+    }
+}
+
+#[cfg(test)]
+mod plan_execution_handoff_tests {
+    use std::sync::Arc;
+
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+
+    use super::{
+        LATEST_PENDING_PLAN_EXECUTION_ADMITTED, LATEST_PENDING_PLAN_EXECUTION_NETWORK,
+        LATEST_PENDING_PLAN_EXECUTION_SUBMITTING, LocalPlanExecutionTerminal,
+        PlanExecutionHandoffRestoreAction, local_plan_execution_task_join_failure_event,
+        open_local_plan_execution_event_stream, plan_execution_handoff_restore_action,
+        wait_for_local_plan_execution_terminal,
+    };
+    use crate::internal::{
+        ai::{
+            runtime::{
+                AgentRuntimeWorker, AgentRuntimeWorkerConfig, DeferredPlanExecutionExecutor,
+                InMemoryAuditSink, RuntimeTurnExecution, ToolBoundaryRuntime, ToolOperation,
+                submit_confirmed_plan_execution,
+            },
+            session::{SessionState, SessionStore},
+        },
+        tui::app_event::AppEvent,
+    };
+
+    #[test]
+    fn plan_execution_join_failure_emits_reconcile_required() {
+        let event = local_plan_execution_task_join_failure_event(42, &"task panicked");
+        match event {
+            AppEvent::LocalPlanExecutionReconcileRequired { turn_id, reason } => {
+                assert_eq!(turn_id, 42);
+                assert!(
+                    reason.contains("failed before terminalization"),
+                    "join failure must force UI reconcile instead of leaving the turn active: {reason}"
+                );
+                assert!(reason.contains("task panicked"));
+            }
+            other => panic!("expected LocalPlanExecutionReconcileRequired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tui_plan_execution_handoff_waits_for_worker_terminal_and_cancel() {
+        let executor = Arc::new(DeferredPlanExecutionExecutor::new());
+        let (handle, worker) = AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(
+            executor.clone(),
+            ToolBoundaryRuntime::system(
+                uuid::Uuid::new_v4(),
+                Arc::new(InMemoryAuditSink::default()),
+            ),
+        ));
+
+        let mut complete_stream = open_local_plan_execution_event_stream(&handle, "tui-session")
+            .await
+            .expect("observe before submit");
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let started_notify = started.clone();
+        let release_wait = release.clone();
+        submit_confirmed_plan_execution(
+            &handle,
+            executor.as_ref(),
+            "tui-session",
+            "plan-exec-complete",
+            Box::new(move |_context| {
+                Box::pin(async move {
+                    started_notify.notify_one();
+                    release_wait.notified().await;
+                    Ok(RuntimeTurnExecution::Completed {
+                        summary: "plan done".to_string(),
+                    })
+                })
+            }),
+        )
+        .await
+        .expect("plan execution admitted");
+
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("plan execution started");
+
+        let wait_task = tokio::spawn(async move {
+            wait_for_local_plan_execution_terminal(&mut complete_stream, "plan-exec-complete").await
+        });
+        release.notify_one();
+        let terminal = timeout(Duration::from_secs(2), wait_task)
+            .await
+            .expect("wait join")
+            .expect("wait task");
+        assert!(
+            matches!(terminal, LocalPlanExecutionTerminal::Completed),
+            "post-submit TUI watcher must see Completed after worker terminalization: {terminal:?}"
+        );
+
+        let mut cancel_stream = open_local_plan_execution_event_stream(&handle, "tui-session")
+            .await
+            .expect("observe before cancel target");
+        let cancel_started = Arc::new(Notify::new());
+        let cancel_release = Arc::new(Notify::new());
+        let cancel_started_notify = cancel_started.clone();
+        let cancel_release_wait = cancel_release.clone();
+        submit_confirmed_plan_execution(
+            &handle,
+            executor.as_ref(),
+            "tui-session",
+            "plan-exec-cancel",
+            Box::new(move |context| {
+                Box::pin(async move {
+                    cancel_started_notify.notify_one();
+                    cancel_release_wait.notified().await;
+                    if context.cancellation().is_cancelled() {
+                        return Err(crate::internal::ai::runtime::RuntimeWorkerError::Cancelled);
+                    }
+                    Ok(RuntimeTurnExecution::Completed {
+                        summary: "should not complete".to_string(),
+                    })
+                })
+            }),
+        )
+        .await
+        .expect("cancel target admitted");
+
+        timeout(Duration::from_secs(2), cancel_started.notified())
+            .await
+            .expect("cancel target started");
+        handle
+            .cancel("tui-session", "plan-exec-cancel")
+            .await
+            .expect("cancel active plan-execution turn");
+        cancel_release.notify_one();
+
+        let cancel_terminal = timeout(
+            Duration::from_secs(2),
+            wait_for_local_plan_execution_terminal(&mut cancel_stream, "plan-exec-cancel"),
+        )
+        .await
+        .expect("cancel wait");
+        assert!(
+            matches!(cancel_terminal, LocalPlanExecutionTerminal::Cancelled),
+            "Esc/cancel must terminalize as Cancelled for ExecuteWorkflowComplete(cancelled): {cancel_terminal:?}"
+        );
+
+        // Queued successor must not steal the first turn's observe outcome.
+        let mut first_stream = open_local_plan_execution_event_stream(&handle, "tui-session")
+            .await
+            .expect("observe before queued pair");
+        let first_started = Arc::new(Notify::new());
+        let first_release = Arc::new(Notify::new());
+        let first_started_notify = first_started.clone();
+        let first_release_wait = first_release.clone();
+        submit_confirmed_plan_execution(
+            &handle,
+            executor.as_ref(),
+            "tui-session",
+            "plan-exec-first",
+            Box::new(move |_context| {
+                Box::pin(async move {
+                    first_started_notify.notify_one();
+                    first_release_wait.notified().await;
+                    Ok(RuntimeTurnExecution::Completed {
+                        summary: "first".to_string(),
+                    })
+                })
+            }),
+        )
+        .await
+        .expect("first admitted");
+        submit_confirmed_plan_execution(
+            &handle,
+            executor.as_ref(),
+            "tui-session",
+            "plan-exec-second",
+            Box::new(move |_context| {
+                Box::pin(async move {
+                    Ok(RuntimeTurnExecution::Completed {
+                        summary: "second".to_string(),
+                    })
+                })
+            }),
+        )
+        .await
+        .expect("second queued");
+
+        timeout(Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("first started");
+        let first_wait = tokio::spawn(async move {
+            wait_for_local_plan_execution_terminal(&mut first_stream, "plan-exec-first").await
+        });
+        first_release.notify_one();
+        let first_terminal = timeout(Duration::from_secs(2), first_wait)
+            .await
+            .expect("first wait join")
+            .expect("first wait task");
+        assert!(
+            matches!(first_terminal, LocalPlanExecutionTerminal::Completed),
+            "turn-scoped observe must complete for the first plan even when a successor is queued: {first_terminal:?}"
+        );
+
+        handle.shutdown().await.expect("shutdown worker");
+        let _ = worker.await;
+    }
+
+    #[test]
+    fn plan_execution_network_allow_deny_binds_hardening_boundary() {
+        let source = include_str!("app.rs");
+        assert!(
+            source.contains("with_network_access(execution_network_access)"),
+            "plan-exec runner must bind Allow/Deny onto the shared hardening boundary"
+        );
+        assert!(
+            source.contains("subagent_runtime.tool_registry = (*registry).clone()"),
+            "Deny/Allow must also reach task child registries"
+        );
+
+        let network_tool = ToolOperation::tool("web_search", false, true);
+        let denied =
+            ToolBoundaryRuntime::system(uuid::Uuid::nil(), Arc::new(InMemoryAuditSink::default()))
+                .with_network_access(false);
+        assert!(
+            !denied.decide(&network_tool).allowed,
+            "Deny must block requires_network tools during confirmed plan execution"
+        );
+        let allowed = denied.with_network_access(true);
+        assert!(
+            allowed.decide(&network_tool).allowed,
+            "Allow must permit requires_network tools during confirmed plan execution"
+        );
+    }
+
+    #[test]
+    fn plan_execution_handoff_restore_actions_cover_marker_states() {
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::new();
+        assert_eq!(
+            plan_execution_handoff_restore_action(&metadata),
+            PlanExecutionHandoffRestoreAction::None
+        );
+
+        metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        assert_eq!(
+            plan_execution_handoff_restore_action(&metadata),
+            PlanExecutionHandoffRestoreAction::Replay {
+                network_access: true
+            }
+        );
+
+        metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(),
+            serde_json::Value::Bool(false),
+        );
+        assert_eq!(
+            plan_execution_handoff_restore_action(&metadata),
+            PlanExecutionHandoffRestoreAction::Replay {
+                network_access: false
+            }
+        );
+
+        metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_SUBMITTING.to_string(),
+            serde_json::Value::String("plan-exec-1".into()),
+        );
+        assert_eq!(
+            plan_execution_handoff_restore_action(&metadata),
+            PlanExecutionHandoffRestoreAction::FenceSubmitting,
+            "submitting must fence even when network handoff is still present"
+        );
+
+        metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_ADMITTED.to_string(),
+            serde_json::Value::String("plan-exec-1".into()),
+        );
+        assert_eq!(
+            plan_execution_handoff_restore_action(&metadata),
+            PlanExecutionHandoffRestoreAction::ClearAdmittedNoReplay,
+            "admitted wins over submitting/network and must not replay"
+        );
+    }
+
+    #[test]
+    fn plan_execution_handoff_markers_survive_session_store_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path());
+        let mut session = SessionState::new("/tmp/plan-handoff");
+        session.metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(),
+            serde_json::Value::Bool(false),
+        );
+        store.save(&session).expect("save network handoff");
+        let reloaded = store.load(&session.id).expect("reload network handoff");
+        assert_eq!(
+            plan_execution_handoff_restore_action(&reloaded.metadata),
+            PlanExecutionHandoffRestoreAction::Replay {
+                network_access: false
+            }
+        );
+
+        session.metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_SUBMITTING.to_string(),
+            serde_json::Value::String("plan-exec-submit".into()),
+        );
+        store.save(&session).expect("save submitting");
+        let reloaded = store.load(&session.id).expect("reload submitting");
+        assert_eq!(
+            plan_execution_handoff_restore_action(&reloaded.metadata),
+            PlanExecutionHandoffRestoreAction::FenceSubmitting
+        );
+
+        session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_SUBMITTING);
+        session.metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_ADMITTED.to_string(),
+            serde_json::Value::String("plan-exec-done".into()),
+        );
+        store.save(&session).expect("save admitted");
+        let reloaded = store.load(&session.id).expect("reload admitted");
+        assert_eq!(
+            plan_execution_handoff_restore_action(&reloaded.metadata),
+            PlanExecutionHandoffRestoreAction::ClearAdmittedNoReplay
+        );
     }
 }
