@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-02, 2026-08-09)
+
+- **W2-02 migrate Phase 0 IntentSpec review into runtime interaction state.**
+  Runtime owns confirm/revise/cancel via `IntentReviewAckDelivery` with durable
+  `IntentReviewRequested`/resolution, crash-resume reopens the gate, and
+  mutating turns stay fenced until confirm. Marker-persistence failure leaves
+  Phase 0 Pending (fail-closed) instead of terminalizing success.
+
 ### Added (plan-20260715 W1-08, 2026-08-09)
 
 - **W1-08 structured process lifecycle shutdown for `libra code`.**

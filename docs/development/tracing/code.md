@@ -117,7 +117,7 @@ bridge 仍未迁入，不能把这条 direct-chat 链路当作 Web-only completi
 | C7 | `runtime::hardening` 是 mutating policy；A0-05 fix 仍 fail-closed `LBR-AGENT-010`（`review.rs:23,74` / `investigate.rs:22,77`）。 | 不能把不存在的 bridge 当可复用实现，也不能另建 mutation/approval 表。 | W1-01/W2-04/W6-02；bridge 仍 deferred。 |
 | C8 | command docs、compat matrix、tests index 尚描述 TUI/current commands。 | 源码迁移会留下错误的公开行为承诺。 | W4-05/W6-01/W6-02；用户可见文档为发布门禁。 |
 | C9 | MCP authorizer 仍是显式 deferred，生产没有 handler 时不可视为完整 authz。 | Web write security 不能依赖 MCP authorization 的不存在保证。 | W3-05/W4-03；保持 loopback/token/lease/tool ACL 的独立边界。 |
-| C10 | headless direct-turn 已通过 `AgentRuntimeWorker` 执行（`headless.rs:718`），但仍跳过 Phase 0/1 IntentSpec/Plan 审阅（TUI 仍拥有 `pending_intent_review`/`pending_plan_revision` @ `app.rs:524,526`）。 | 这不是 Web-only completion，也不能安全替换 TUI workflow。 | W2-02/W2-03；完成后才更新 C10 文案。 |
+| C10 | headless direct-turn 已通过 `AgentRuntimeWorker` 执行（`headless.rs:718`）；**W2-02**：IntentSpec review gate 已迁入 runtime interaction state（`IntentReviewAckDelivery` / durable `IntentReviewRequested`），TUI `pending_intent_review` 仅为 UI mirror。Plan review（`pending_plan_revision`）仍为 TUI-owned。 | Plan/network policy 仍未进 runtime，不能宣称 headless workflow parity。 | W2-03 迁移 Plan review；W2-16 交付可操作 Web 组件。 |
 
 ### A0 接口漂移登记表（W0-01）
 

@@ -5,13 +5,13 @@ mod harness;
 use std::{path::PathBuf, time::Duration};
 
 #[cfg(feature = "test-provider")]
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(feature = "test-provider")]
 use harness::{CodeSession, CodeSessionOptions, Scenario};
 #[cfg(feature = "test-provider")]
 use reqwest::StatusCode;
 #[cfg(feature = "test-provider")]
-use serde_json::Value;
+use serde_json::{Value, json};
 #[cfg(feature = "test-provider")]
 use serial_test::serial;
 
@@ -599,6 +599,229 @@ fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
     );
 }
 
+/// Drive `/plan` through risk profile + `submit_intent_draft` until an
+/// `intent_review_choice` interaction is pending, then respond with
+/// `selected_option` and wait until the session leaves `awaiting_interaction`.
+#[cfg(feature = "test-provider")]
+fn plan_workflow_intent_review_respond(name: &str, selected_option: &str) -> Result<()> {
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new(name, fixture("plan_intent_review")).with_context("dev"),
+    )?;
+    session.attach_automation(&format!("scenario-{name}"))?;
+
+    // A plain (non-slash) message routes into the Phase 0 plan workflow
+    // (`should_route_plain_message_to_plan`), matching the fixture's
+    // "You are running /plan mode." rule.
+    session.submit_message("Add a Usage section to the README documenting the CLI commands.")?;
+
+    // Phase 0's tool-loop policy requires a risk-profile question before the
+    // draft can be submitted; answer it through the same `answers` shape
+    // `respond_pending_user_input_from_code_ui` expects.
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        interaction_status(snapshot, "call_request_user_input_1") == Some("pending")
+    })?;
+    let (http_status, body) = session.respond_interaction(
+        "call_request_user_input_1",
+        &json!({ "answers": { "risk_profile": ["Low"] } }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "risk profile answer rejected: {body}"
+    );
+
+    // Once `submit_intent_draft` lands, the review must be projectable over
+    // the wire as `intent_review_choice` (AC2) rather than staying purely
+    // TUI-internal state.
+    let snapshot = session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        find_interaction_by_kind(snapshot, "intent_review_choice").is_some()
+    })?;
+    assert_eq!(
+        status(&snapshot),
+        Some("awaiting_interaction"),
+        "IntentSpec review must hold the session in awaiting_interaction: {snapshot}"
+    );
+    let interaction = find_interaction_by_kind(&snapshot, "intent_review_choice")
+        .expect("intent_review_choice interaction must be present");
+    let interaction_id = interaction
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("intent_review_choice interaction must carry an id")
+        .to_string();
+    let option_ids: Vec<&str> = interaction
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option.get("id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        option_ids,
+        vec!["confirm", "modify", "cancel"],
+        "intent_review_choice options must stay stable for automation clients"
+    );
+
+    let (http_status, body) = session.respond_interaction(
+        &interaction_id,
+        &json!({ "selectedOption": selected_option }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "{selected_option} should be accepted: {body}"
+    );
+
+    // `resolve_interaction` retains the wire item and flips status to
+    // `resolved` (it does not delete the entry), so wait for that rather
+    // than absence of the interaction.
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        status(snapshot) != Some("awaiting_interaction")
+            && find_interaction_by_kind(snapshot, "intent_review_choice")
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("resolved")
+    })?;
+
+    session.shutdown()
+}
+
+/// W2-02 AC2/AC4 (cargo filter: `plan_workflow`).
+///
+/// Confirming via `/api/code/interactions/{id}` drains the session out of
+/// `awaiting_interaction` and releases the mutation fence (worker-owned).
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_workflow_intent_review_confirm_transitions_session_past_review() -> Result<()> {
+    plan_workflow_intent_review_respond("plan-intent-review-confirm", "confirm")
+}
+
+/// W2-02: `modify` takes the `CompletedDiscardQueued` path and clears the
+/// review interaction so a follow-up revise prompt can be admitted.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_workflow_intent_review_modify_clears_review_interaction() -> Result<()> {
+    plan_workflow_intent_review_respond("plan-intent-review-modify", "modify")
+}
+
+/// W2-02: `cancel` takes the `CompletedDiscardQueued` path and leaves the
+/// session idle without an open IntentSpec review interaction.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_workflow_intent_review_cancel_clears_review_interaction() -> Result<()> {
+    plan_workflow_intent_review_respond("plan-intent-review-cancel", "cancel")
+}
+
+/// W2-02 recovery: leave an unresolved IntentSpec review, `--resume` the
+/// session, and confirm the restored gate still blocks progression until
+/// resolved through `/api/code/interactions/{id}`.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<()> {
+    use std::process::Command;
+
+    let case_name = "plan-intent-review-resume";
+    let repo_root = tempfile::Builder::new()
+        .prefix(&format!("{case_name}-"))
+        .tempdir()
+        .context("failed to create IntentSpec review resume tempdir")?;
+    let repo_dir = repo_root.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).context("failed to create resume repo subdir")?;
+    let init = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(["init", "--vault=false", "--quiet"])
+        .arg(&repo_dir)
+        .output()
+        .context("failed to run libra init for IntentSpec review resume")?;
+    if !init.status.success() {
+        anyhow::bail!(
+            "libra init failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+    }
+
+    let session_id = {
+        let mut session = CodeSession::spawn(
+            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_intent_review"))
+                .with_existing_repo_dir(repo_dir.clone())
+                .with_context("dev"),
+        )?;
+        session.attach_automation(&format!("{case_name}-spawn"))?;
+        session
+            .submit_message("Add a Usage section to the README documenting the CLI commands.")?;
+        session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+            interaction_status(snapshot, "call_request_user_input_1") == Some("pending")
+        })?;
+        let (http_status, body) = session.respond_interaction(
+            "call_request_user_input_1",
+            &json!({ "answers": { "risk_profile": ["Low"] } }),
+        )?;
+        assert_eq!(
+            http_status,
+            StatusCode::OK,
+            "risk profile answer rejected: {body}"
+        );
+        let snapshot = session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+            find_interaction_by_kind(snapshot, "intent_review_choice")
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("pending")
+        })?;
+        let id = snapshot
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("snapshot missing sessionId: {snapshot}"))?;
+        // Hard-kill without resolving the review. Clean shutdown /
+        // SIGTERM can cancel the pending dialog and append
+        // `InteractionResolved`, which is exactly what resume must not see.
+        session.kill_without_cleanup()?;
+        id
+    };
+
+    let mut resumed = CodeSession::spawn(
+        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_intent_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_resume_thread(&session_id)
+            .with_context("dev"),
+    )?;
+    resumed.attach_automation(&format!("{case_name}-resume"))?;
+    let snapshot = resumed.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        find_interaction_by_kind(snapshot, "intent_review_choice")
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    assert_eq!(
+        status(&snapshot),
+        Some("awaiting_interaction"),
+        "resumed session must reopen the IntentSpec review gate: {snapshot}"
+    );
+    let interaction_id = find_interaction_by_kind(&snapshot, "intent_review_choice")
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("restored intent_review_choice missing id"))?
+        .to_string();
+    let (http_status, body) =
+        resumed.respond_interaction(&interaction_id, &json!({ "selectedOption": "confirm" }))?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "confirm on restored review should be accepted: {body}"
+    );
+    resumed.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        status(snapshot) != Some("awaiting_interaction")
+            && find_interaction_by_kind(snapshot, "intent_review_choice")
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("resolved")
+    })?;
+    resumed.shutdown()
+}
+
 /// W0-02 baseline skeleton (cargo filter: `plan_review`).
 ///
 /// Pins the network-policy human gate that follows Plan approval.
@@ -732,6 +955,32 @@ fn error_code(body: &Value) -> Option<&str> {
 #[cfg(feature = "test-provider")]
 fn status_eq(snapshot: &Value, expected: &str) -> bool {
     status(snapshot) == Some(expected)
+}
+
+/// Status (`pending` / `resolved` / `cancelled`) of the interaction with the
+/// given id, or `None` if no interaction with that id is present yet.
+#[cfg(feature = "test-provider")]
+fn interaction_status<'a>(snapshot: &'a Value, interaction_id: &str) -> Option<&'a str> {
+    snapshot
+        .get("interactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|interaction| interaction.get("id").and_then(Value::as_str) == Some(interaction_id))
+        .and_then(|interaction| interaction.get("status"))
+        .and_then(Value::as_str)
+}
+
+/// First interaction of the given wire `kind` (e.g. `"intent_review_choice"`)
+/// regardless of status, or `None` if none has been projected yet.
+#[cfg(feature = "test-provider")]
+fn find_interaction_by_kind<'a>(snapshot: &'a Value, kind: &str) -> Option<&'a Value> {
+    snapshot
+        .get("interactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|interaction| interaction.get("kind").and_then(Value::as_str) == Some(kind))
 }
 
 #[cfg(feature = "test-provider")]

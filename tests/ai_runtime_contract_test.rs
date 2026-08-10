@@ -622,6 +622,397 @@ async fn cancel_during_mutation_requires_reconciliation() {
     worker.abort();
 }
 
+/// W2-02 AC3/AC4: while a Phase 0 IntentSpec review is pending
+/// (`InteractionState::AwaitingIntentReview`), the worker — not
+/// `pending_intent_review` in the TUI — is the durable owner of the mutation
+/// fence. A follow-on turn on the same session (e.g. a stray mutating tool
+/// call outside the `phase0_plan_tool_loop_config` allowlist) must queue
+/// rather than execute, because the tracked Phase 0 turn stays active until
+/// `IntentReviewAckDelivery` resolves it via `respond`. Only `confirm`
+/// releases the fence for the queued turn to start.
+#[tokio::test]
+async fn intentspec_review_blocks_mutation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase0::{IntentReviewAckDelivery, IntentReviewDecision},
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+        notify: Arc::clone(&notify),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "intentspec-review-fence-test".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    // Track the Phase 0 turn the way the TUI/web adapter does once
+    // `submit_intent_draft` fires: `track_external_turn` keeps it active
+    // while the tool loop itself has already exited.
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("phase0 turn tracked");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "phase0-turn",
+            InteractionState::AwaitingIntentReview {
+                interaction_id: "intent-1".to_string(),
+            },
+            Box::new(IntentReviewAckDelivery::new()),
+        )
+        .await
+        .expect("worker owns the IntentSpec review interaction");
+
+    // A follow-on turn must queue, not run, while the review is pending.
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutating turn is accepted into the queue");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "no mutating tool call may execute before the IntentSpec review is confirmed"
+    );
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot while awaiting review");
+    assert_eq!(
+        snapshot.interaction,
+        InteractionState::AwaitingIntentReview {
+            interaction_id: "intent-1".to_string(),
+        }
+    );
+    assert_eq!(snapshot.queued_turns, 1);
+
+    // Confirming the review resolves the Phase 0 turn and releases the fence.
+    handle
+        .respond(
+            "session",
+            "phase0-turn",
+            InteractionResponse::new("intent-1", IntentReviewDecision::Confirm.wire_id()),
+        )
+        .await
+        .expect("confirm resolves the review");
+    timeout(Duration::from_secs(1), notify.notified())
+        .await
+        .expect("queued mutating turn starts once the review is resolved");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    worker.abort();
+}
+
+/// W2-02 recovery: Phase 0 must be durably terminalized before the review
+/// gate parks, and the gate itself must be non-mutating so a crash cannot
+/// reopen an indeterminate reconciliation fence.
+#[tokio::test]
+async fn intentspec_review_gate_is_non_mutating_after_phase0_terminalizes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase0::{IntentReviewAckDelivery, IntentReviewDecision},
+    };
+    use tokio::time::{Duration, sleep};
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "intentspec-review-hold-queued".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("phase0 turn tracked");
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutating turn queues behind phase0");
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    // Mirror the TUI register path: terminalize Phase 0 without releasing the
+    // queue, then park a non-mutating review gate in front of it.
+    handle
+        .finish_external_turn(
+            "session",
+            "phase0-turn",
+            Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                summary: "IntentSpec draft persisted; awaiting review".to_string(),
+            }),
+        )
+        .await
+        .expect("phase0 terminalizes without releasing the queue");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "CompletedHoldQueued must not start queued mutations"
+    );
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "intent-review-turn", "IntentSpec review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("non-mutating review gate can park in front of the queue");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "intent-review-turn",
+            InteractionState::AwaitingIntentReview {
+                interaction_id: "intent-1".to_string(),
+            },
+            Box::new(IntentReviewAckDelivery::new()),
+        )
+        .await
+        .expect("review gate owns AwaitingIntentReview");
+
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("snapshot")
+            .queued_turns,
+        1
+    );
+
+    handle
+        .respond(
+            "session",
+            "intent-review-turn",
+            InteractionResponse::new("intent-1", IntentReviewDecision::Confirm.wire_id()),
+        )
+        .await
+        .expect("confirm resolves the non-mutating gate");
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "confirm releases the held queue"
+    );
+    worker.abort();
+}
+
+/// W2-02 AC3: revise/cancel must discard turns queued under the IntentSpec
+/// review fence. Completing the Phase 0 turn alone is not enough — those
+/// queued mutations never received a confirmed IntentSpec.
+#[tokio::test]
+async fn intentspec_review_non_confirm_discards_queued_mutations() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase0::{IntentReviewAckDelivery, IntentReviewDecision},
+    };
+    use tokio::time::{Duration, sleep};
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    for decision in [IntentReviewDecision::Revise, IntentReviewDecision::Cancel] {
+        let started = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(MutatingExecutor {
+            started: Arc::clone(&started),
+        });
+        let boundary = ToolBoundaryRuntime::new(
+            Uuid::new_v4(),
+            PrincipalContext {
+                principal_id: format!("intentspec-review-{}-fence", decision.wire_id()),
+                role: PrincipalRole::Contributor,
+            },
+            ToolBoundaryPolicy::default_runtime(),
+            SecretRedactor::default_runtime(),
+            Arc::new(InMemoryAuditSink::default()),
+        );
+        let (handle, worker) =
+            AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("phase0 turn tracked");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "phase0-turn",
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: "intent-1".to_string(),
+                },
+                Box::new(IntentReviewAckDelivery::new()),
+            )
+            .await
+            .expect("worker owns the IntentSpec review interaction");
+        handle
+            .submit(TurnRequest::new(
+                "session",
+                "mutating-turn",
+                "apply_patch",
+                true,
+            ))
+            .await
+            .expect("mutating turn is accepted into the queue");
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+
+        handle
+            .respond(
+                "session",
+                "phase0-turn",
+                InteractionResponse::new("intent-1", decision.wire_id()),
+            )
+            .await
+            .expect("non-confirm decision resolves the review");
+        // Give the worker a moment to (incorrectly) start the queued turn if
+        // the fence regresses; then assert it never ran.
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "{} must discard queued mutations, not release them",
+            decision.wire_id()
+        );
+        let snapshot = handle
+            .snapshot("session")
+            .await
+            .expect("snapshot after non-confirm");
+        assert_eq!(snapshot.interaction, InteractionState::Completed);
+        assert_eq!(
+            snapshot.queued_turns,
+            0,
+            "{} must empty the queue of fenced mutations",
+            decision.wire_id()
+        );
+        worker.abort();
+    }
+}
+
 /// W1-04: the legacy TUI tool loop is externally executed, but its cancel
 /// request must still enter the runtime before the adapter signals its local
 /// cooperative token. A mutation marker shared with the runtime turns an

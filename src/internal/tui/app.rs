@@ -105,11 +105,13 @@ use crate::{
         prompt::SystemPromptBuilder,
         runtime::{
             AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig,
-            ExternalTurnTrackingExecutor, InMemoryAuditSink, RuntimeCommandDurability,
-            RuntimeTurnExecution, RuntimeWorkerError, ToolBoundaryRuntime, TurnRequest,
+            ExternalTurnTrackingExecutor, InMemoryAuditSink, InteractionResponse, InteractionState,
+            RuntimeCommandDurability, RuntimeTurnExecution, RuntimeWorkerError,
+            ToolBoundaryRuntime, TurnRequest,
             phase0::{
-                ContextSnapshotItem, ContextSnapshotRequest, write_context_snapshot_if_needed,
-                write_intent,
+                ContextSnapshotItem, ContextSnapshotRequest, IntentReviewAckDelivery,
+                IntentReviewDecision, open_intent_review_from_workflow,
+                phase0_plan_tool_loop_config, write_context_snapshot_if_needed, write_intent,
             },
             runtime_worker_adapter_message,
         },
@@ -118,7 +120,7 @@ use crate::{
             ReviewDecision,
         },
         session::{
-            SessionState, SessionStore,
+            CodeWorkflowEventKind, SessionState, SessionStore,
             file_history::FileHistoryError,
             jsonl::{SessionEvent, SessionJsonlStore},
         },
@@ -1267,6 +1269,502 @@ where
         .await
     }
 
+    /// Hand the Phase 0 IntentSpec review gate to the [`AgentRuntimeHandle`]
+    /// so the worker — not [`PendingIntentReview`] — is the durable owner of
+    /// [`InteractionState::AwaitingIntentReview`] (W2-02 AC4).
+    ///
+    /// The mutating Phase 0 turn is terminalized first
+    /// ([`RuntimeTurnExecution::CompletedHoldQueued`]) so a crash while the
+    /// review dialog is open cannot leave a Pending mutating command that
+    /// `recover_pending_mutations` would fence as indeterminate. A fresh
+    /// **non-mutating** gate turn then owns the review interaction and keeps
+    /// the session fenced until confirm/revise/cancel (AC3).
+    async fn register_local_runtime_intent_review(
+        &mut self,
+        turn_id: TurnId,
+        interaction_id: String,
+        intent_id: Option<String>,
+        spec_json: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(());
+        };
+        let Some((active_ui_turn, phase0_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Ok(());
+        };
+        // Ignore stale terminal AppEvents from a previous UI turn so they
+        // cannot register an interaction against a newer durable admission.
+        if active_ui_turn != turn_id {
+            tracing::debug!(
+                stale_turn_id = turn_id,
+                active_turn_id = active_ui_turn,
+                "ignoring stale local runtime IntentSpec review registration for inactive UI turn"
+            );
+            return Ok(());
+        }
+
+        // Persist the IntentSpec snapshot and review marker *before* parking
+        // the runtime gate so a JSONL failure cannot leave an active gate
+        // without a recoverable marker (and so a crash after the marker can
+        // always rehydrate the dialog).
+        self.session.metadata.insert(
+            LATEST_INTENTSPEC_JSON.to_string(),
+            serde_json::Value::String(spec_json.to_string()),
+        );
+        let binding = current_intentspec_binding(self.registry.working_dir());
+        self.session.metadata.insert(
+            LATEST_INTENTSPEC_WORKSPACE_KEY.to_string(),
+            serde_json::Value::String(binding.workspace_key),
+        );
+        self.session.metadata.insert(
+            LATEST_INTENTSPEC_BASE_REF.to_string(),
+            serde_json::Value::String(binding.base_ref),
+        );
+        if let Some(branch_label) = binding.branch_label {
+            self.session.metadata.insert(
+                LATEST_INTENTSPEC_BRANCH_LABEL.to_string(),
+                serde_json::Value::String(branch_label),
+            );
+        } else {
+            self.session.metadata.remove(LATEST_INTENTSPEC_BRANCH_LABEL);
+        }
+        // Only record a real MCP intent id in metadata. Synthetic interaction
+        // ids must not be treated as object ids on restore/confirm.
+        if let Some(ref id) = intent_id {
+            self.session.metadata.insert(
+                LATEST_INTENTSPEC_INTENT_ID.to_string(),
+                serde_json::Value::String(id.clone()),
+            );
+        } else {
+            self.session.metadata.remove(LATEST_INTENTSPEC_INTENT_ID);
+        }
+        if let Err(error) = self.session_store.save(&self.session) {
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    phase0_turn_id.clone(),
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "IntentSpec snapshot persistence failed".to_string(),
+                    }),
+                )
+                .await;
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "IntentSpec review setup failed while persisting the session snapshot: {error}"
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                "failed to persist IntentSpec snapshot before review gate: {error}"
+            )));
+        }
+
+        // Persist the review marker before terminalizing Phase 0 so a crash
+        // after the draft snapshot cannot leave an unconfirmable IntentSpec
+        // without a recoverable gate. Startup recovery completes any still-
+        // pending Phase 0 mutation when this marker is open (instead of
+        // fencing indeterminate).
+        let review_turn_id = format!("intent-review-{}", uuid::Uuid::new_v4());
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        if let Err(error) =
+            store.append_code_workflow_durable(CodeWorkflowEventKind::IntentReviewRequested {
+                interaction_id: interaction_id.clone(),
+                // Empty when MCP persistence was unavailable — restore reads
+                // `LATEST_INTENTSPEC_INTENT_ID` for the real object id.
+                intent_id: intent_id.clone().unwrap_or_default(),
+                turn_id: review_turn_id.clone(),
+                phase0_turn_id: phase0_turn_id.clone(),
+            })
+        {
+            // Marker failed: do **not** terminalize Phase 0 as success — leave
+            // the mutating command Pending so restart recovery fences it.
+            // Clear the in-memory active slot via fence_session so this process
+            // cannot admit follow-up turns either.
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "IntentSpec draft is durable but the review marker could not be persisted: {error}"
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                "failed to persist IntentSpec review request: {error}"
+            )));
+        }
+
+        if let Err(error) = runtime
+            .finish_external_turn(
+                self.session.id.clone(),
+                phase0_turn_id,
+                Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                    summary: "IntentSpec draft persisted; awaiting review".to_string(),
+                }),
+            )
+            .await
+        {
+            // Marker is durable without a live gate: fence admissions until
+            // resume restores the review.
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "IntentSpec review marker is durable but Phase 0 could not be terminalized: {}",
+                        runtime_worker_adapter_message(error.clone())
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(error);
+        }
+        self.active_local_runtime_turn = None;
+
+        if let Err(error) = runtime
+            .track_external_turn(
+                TurnRequest::new(
+                    self.session.id.clone(),
+                    review_turn_id.clone(),
+                    "IntentSpec review",
+                    false,
+                ),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        {
+            // Durable marker exists without a live gate: fence admissions so a
+            // follow-up turn cannot mutate before resume restores the review.
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "IntentSpec review marker is durable but the gate turn could not be parked: {}",
+                        runtime_worker_adapter_message(error.clone())
+                    ),
+                )
+                .await;
+            return Err(error);
+        }
+        self.active_local_runtime_turn = Some((turn_id, review_turn_id.clone()));
+
+        if let Err(error) = runtime
+            .register_interaction_with_delivery(
+                self.session.id.clone(),
+                review_turn_id.clone(),
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: interaction_id.clone(),
+                },
+                Box::new(IntentReviewAckDelivery::new()),
+            )
+            .await
+        {
+            // Roll back the orphan gate turn; marker remains for resume, so
+            // fence the session until recovery re-parks the review.
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    review_turn_id,
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "IntentSpec review gate registration failed".to_string(),
+                    }),
+                )
+                .await;
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "IntentSpec review marker is durable but gate registration failed: {}",
+                        runtime_worker_adapter_message(error.clone())
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Deliver the developer's IntentSpec review decision to the runtime,
+    /// resolving the tracked Phase 0 turn via [`IntentReviewAckDelivery`] and
+    /// releasing `active_local_runtime_turn` so the next admission (Phase 1
+    /// hand-off on confirm, a fresh Phase 0 turn on revise, idle on cancel)
+    /// is not blocked behind it.
+    ///
+    /// Fail-closed: `active_local_runtime_turn` is cleared only after
+    /// `respond` succeeds. A delivery failure keeps the handle so the
+    /// caller can restore `pending_intent_review` and retry instead of
+    /// treating the review as resolved while the worker still holds the
+    /// active turn. A missing runtime/turn (e.g. headless mode without a
+    /// tracked Phase 0 admission) is a no-op success — there is no
+    /// worker-owned gate to acknowledge.
+    async fn settle_local_runtime_intent_review(
+        &mut self,
+        decision: IntentReviewDecision,
+        interaction_id: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(());
+        };
+        let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Ok(());
+        };
+        // Worker persists terminal command durability first, then
+        // `InteractionResolved`; `respond` fails if either step cannot settle.
+        runtime
+            .respond(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionResponse::new(interaction_id, decision.wire_id()),
+            )
+            .await?;
+        self.active_local_runtime_turn = None;
+        Ok(())
+    }
+
+    async fn fence_for_unrestorable_intent_review(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(runtime) = self.local_turn_runtime.clone() {
+            let _ = runtime
+                .fence_session(self.session.id.clone(), reason.clone())
+                .await;
+        }
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            code_ui_session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+        }
+        self.widget
+            .add_cell(Box::new(AssistantHistoryCell::new(reason)));
+        self.schedule_draw();
+    }
+
+    /// Rehydrate an unresolved IntentSpec review after process restart so the
+    /// confirm/modify/cancel gate cannot disappear while an IntentSpec draft
+    /// remains unconfirmed (W2-02 recovery).
+    pub async fn restore_pending_intent_review_gate(&mut self) {
+        if self.pending_intent_review.is_some() {
+            return;
+        }
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        let replay = match store.load_code_workflow_replay() {
+            Ok(replay) => replay,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load Code workflow replay while restoring IntentSpec review"
+                );
+                return;
+            }
+        };
+        let Some((interaction_id, workflow_intent_id, stored_turn_id, phase0_turn_id)) =
+            open_intent_review_from_workflow(replay.events.iter().map(|event| &event.event))
+        else {
+            return;
+        };
+        // Reuse the same checkout/workspace binding guard as `/intent show`
+        // so resume cannot re-open a review against a stale worktree/HEAD.
+        let spec_json = match self.load_latest_intentspec_json().await {
+            LatestIntentSpecLoad::Found(json) => json,
+            LatestIntentSpecLoad::Missing => {
+                self.fence_for_unrestorable_intent_review(format!(
+                    "An unresolved IntentSpec review ({interaction_id}) was found, but the IntentSpec snapshot is missing. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            LatestIntentSpecLoad::BindingMismatch(message) => {
+                self.fence_for_unrestorable_intent_review(format!(
+                    "An unresolved IntentSpec review was found, but it does not match this checkout: {message}. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+        };
+        // Prefer the metadata object id; never promote a synthetic interaction
+        // id (stored in the workflow event when MCP persistence failed).
+        let persisted_intent_id = self
+            .session
+            .metadata
+            .get(LATEST_INTENTSPEC_INTENT_ID)
+            .and_then(|value| value.as_str().map(str::to_string));
+
+        // Fail closed: only present a restorable review dialog when the
+        // runtime gate is successfully re-established. Otherwise the user
+        // could "confirm" through a no-op settle while the worker is still
+        // fenced (e.g. ReconciliationRequired).
+        if self.local_turn_runtime.is_none() {
+            self.fence_for_unrestorable_intent_review(format!(
+                "An unresolved IntentSpec review ({interaction_id}) was found, but no local runtime is available to re-park the gate. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return;
+        }
+        if self.active_local_runtime_turn.is_some() {
+            self.fence_for_unrestorable_intent_review(format!(
+                "An unresolved IntentSpec review ({interaction_id}) was found while another local runtime turn is already active. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return;
+        }
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return;
+        };
+        // Reuse the parked gate turn when the marker recorded one so crash/
+        // resume does not leave a permanently Pending audit command. If that
+        // turn already terminalized without InteractionResolved, admit a
+        // replacement gate turn so the unresolved marker stays fenced.
+        let mut review_turn_id = if stored_turn_id.is_empty() {
+            format!("intent-review-restore-{}", uuid::Uuid::new_v4())
+        } else {
+            stored_turn_id
+        };
+        if let Err(error) = runtime
+            .track_external_turn(
+                TurnRequest::new(
+                    self.session.id.clone(),
+                    review_turn_id.clone(),
+                    "IntentSpec review",
+                    false,
+                ),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        {
+            let retry_with_fresh_turn = matches!(
+                &error,
+                RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. }
+            );
+            if retry_with_fresh_turn {
+                review_turn_id = format!("intent-review-restore-{}", uuid::Uuid::new_v4());
+                // Record the replacement turn id so a later crash does not keep
+                // re-admitting against the already-terminal original gate turn.
+                if let Err(error) = store.append_code_workflow_durable(
+                    CodeWorkflowEventKind::IntentReviewRequested {
+                        interaction_id: interaction_id.clone(),
+                        intent_id: workflow_intent_id.clone(),
+                        turn_id: review_turn_id.clone(),
+                        phase0_turn_id: phase0_turn_id.clone(),
+                    },
+                ) {
+                    self.fence_for_unrestorable_intent_review(format!(
+                        "An unresolved IntentSpec review could not record a replacement gate turn ({error}). Mutation reconciliation is required before another turn can run."
+                    ))
+                    .await;
+                    return;
+                }
+                if let Err(retry_error) = runtime
+                    .track_external_turn(
+                        TurnRequest::new(
+                            self.session.id.clone(),
+                            review_turn_id.clone(),
+                            "IntentSpec review",
+                            false,
+                        ),
+                        CancellationToken::new(),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                {
+                    self.fence_for_unrestorable_intent_review(format!(
+                        "An unresolved IntentSpec review could not be restored ({}). Mutation reconciliation is required before another turn can run.",
+                        runtime_worker_adapter_message(retry_error)
+                    ))
+                    .await;
+                    return;
+                }
+            } else {
+                self.fence_for_unrestorable_intent_review(format!(
+                    "An unresolved IntentSpec review could not be restored ({}). Mutation reconciliation is required before another turn can run.",
+                    runtime_worker_adapter_message(error)
+                ))
+                .await;
+                return;
+            }
+        }
+        if let Err(error) = runtime
+            .register_interaction_with_delivery(
+                self.session.id.clone(),
+                review_turn_id.clone(),
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: interaction_id.clone(),
+                },
+                Box::new(IntentReviewAckDelivery::new()),
+            )
+            .await
+        {
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    review_turn_id,
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "restored IntentSpec review gate registration failed".to_string(),
+                    }),
+                )
+                .await;
+            self.fence_for_unrestorable_intent_review(format!(
+                "An unresolved IntentSpec review could not be re-registered ({}). Mutation reconciliation is required before another turn can run.",
+                runtime_worker_adapter_message(error)
+            ))
+            .await;
+            return;
+        }
+        self.active_local_runtime_turn = Some((0, review_turn_id));
+
+        self.pending_intent_review = Some(PendingIntentReview {
+            spec_json,
+            intent_id: persisted_intent_id,
+            warnings: Vec::new(),
+            interaction_id: interaction_id.clone(),
+            selected: 0,
+        });
+        self.widget
+            .bottom_pane
+            .set_status(AgentStatus::AwaitingIntentReviewChoice);
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            let interaction = CodeUiInteractionRequest {
+                id: interaction_id,
+                kind: CodeUiInteractionKind::IntentReviewChoice,
+                title: Some("Review IntentSpec".to_string()),
+                description: Some(
+                    "Confirm this IntentSpec before Libra generates an execution plan.".to_string(),
+                ),
+                prompt: None,
+                options: vec![
+                    CodeUiInteractionOption {
+                        id: "confirm".to_string(),
+                        label: "Confirm".to_string(),
+                        description: Some("Generate the execution plan".to_string()),
+                    },
+                    CodeUiInteractionOption {
+                        id: "modify".to_string(),
+                        label: "Modify".to_string(),
+                        description: Some("Revise the IntentSpec".to_string()),
+                    },
+                    CodeUiInteractionOption {
+                        id: "cancel".to_string(),
+                        label: "Cancel".to_string(),
+                        description: Some("Leave the IntentSpec in place and stop".to_string()),
+                    },
+                ],
+                status: CodeUiInteractionStatus::Pending,
+                metadata: serde_json::json!({}),
+                requested_at: Utc::now(),
+                resolved_at: None,
+            };
+            code_ui_session.upsert_interaction(interaction).await;
+            code_ui_session
+                .set_status(CodeUiSessionStatus::AwaitingInteraction)
+                .await;
+        }
+        self.sync_mux_input_context();
+        self.schedule_draw();
+    }
+
     async fn report_local_runtime_finalization_fence(
         &mut self,
         error: RuntimeWorkerError,
@@ -1307,10 +1805,20 @@ where
         }
 
         let working_dir = self.registry.working_dir().to_string_lossy().into_owned();
-        let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(
-            self.session_store.session_root(&self.session.id),
-        ));
-        let (recovered_mutations, recovery_failed) = match durability.recover_pending_mutations() {
+        let session_jsonl =
+            SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        let phase0_turn_id = session_jsonl
+            .load_code_workflow_replay()
+            .ok()
+            .and_then(|replay| {
+                open_intent_review_from_workflow(replay.events.iter().map(|event| &event.event))
+            })
+            .map(|(_, _, _, phase0_turn_id)| phase0_turn_id)
+            .filter(|id| !id.is_empty());
+        let durability = RuntimeCommandDurability::new(session_jsonl);
+        let (recovered_mutations, recovery_failed) = match durability
+            .recover_pending_mutations_for_intent_review(phase0_turn_id.as_deref())
+        {
             Ok(mutations) => (mutations, false),
             Err(error) => {
                 tracing::error!(
@@ -2054,8 +2562,7 @@ where
             if let Some(pending) = self.pending_intent_review.as_mut() {
                 pending.selected = selected;
             }
-            self.handle_intent_review_choice().await;
-            return Ok(());
+            return self.handle_intent_review_choice().await;
         }
 
         if self.pending_post_plan.as_ref().is_some_and(|pending| {
@@ -2138,6 +2645,41 @@ where
             CancelSource::Automation => "Turn interrupted by automation",
             CancelSource::Budget => "Turn interrupted by budget cap",
         };
+        // A Phase 0 turn awaiting IntentSpec review has no executor future
+        // left running (it finished when the review interaction was
+        // registered), so the generic `runtime.cancel()` call below — which
+        // assumes a live executor will observe the cancellation token or
+        // report `ExecutionFinished` — would strand it in `Cancelling`
+        // forever. Resolve it directly through the same
+        // `IntentReviewAckDelivery` path as an explicit dialog cancel first,
+        // so `active_local_runtime_turn` is already clear by the time the
+        // generic path below runs. Fail closed if acknowledgement fails —
+        // restoring the pending review keeps the worker fence intact.
+        if let Some(pending) = self.pending_intent_review.take() {
+            if let Err(error) = self
+                .settle_local_runtime_intent_review(
+                    IntentReviewDecision::Cancel,
+                    &pending.interaction_id,
+                )
+                .await
+            {
+                self.pending_intent_review = Some(pending);
+                return Err(TuiControlError::Internal(format!(
+                    "failed to cancel pending IntentSpec review: {}",
+                    runtime_worker_adapter_message(error)
+                )));
+            }
+            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                code_ui_session
+                    .clear_interaction(&pending.interaction_id)
+                    .await;
+            }
+            // The review gate had no live executor; settling Cancel frees the
+            // worker but does not interrupt an agent task, so the generic
+            // hard-interrupt idle path below may not run. Return to Idle here
+            // so control `/messages` can accept the next turn.
+            self.set_idle_and_draw();
+        }
         let local_runtime_turn_id = self
             .active_local_runtime_turn
             .as_ref()
@@ -2266,6 +2808,9 @@ where
 
     async fn clear_pending_code_ui_dialogs(&mut self) {
         let mut ids = Vec::new();
+        // `pending_intent_review` (if any) is already resolved by
+        // `cancel_current_turn` before this is called, so this is limited to
+        // dialogs that do not own a durable runtime interaction.
         if let Some(pending) = self.pending_intent_review.take() {
             ids.push(pending.interaction_id);
         }
@@ -2552,10 +3097,10 @@ where
                         self.schedule_draw();
                     }
                     KeyCode::Enter => {
-                        self.handle_intent_review_choice().await;
+                        let _ = self.handle_intent_review_choice().await;
                     }
                     KeyCode::Esc => {
-                        self.dismiss_intent_review_dialog();
+                        self.dismiss_intent_review_dialog().await;
                     }
                     _ => {}
                 }
@@ -4754,21 +5299,31 @@ where
                 spec_json,
                 warnings,
             } => {
+                let interaction_id = intent_id
+                    .clone()
+                    .unwrap_or_else(|| format!("intent-review-{turn_id}"));
+                // Terminalize Phase 0 durability, then park a non-mutating
+                // review-gate turn that owns `AwaitingIntentReview` (W2-02
+                // AC3/AC4). The worker — not `pending_intent_review` alone —
+                // refuses new execution on this session until the developer
+                // confirms/revises/cancels.
                 if let Err(error) = self
-                    .settle_local_runtime_turn_completed(
+                    .register_local_runtime_intent_review(
                         turn_id,
-                        "local TUI IntentSpec review ready",
+                        interaction_id.clone(),
+                        intent_id.clone(),
+                        &spec_json,
                     )
                     .await
                 {
                     self.report_local_runtime_finalization_fence(
                         error,
-                        "IntentSpec review is ready, but its durable finalization requires reconciliation before continuing",
+                        "IntentSpec review is ready, but the runtime could not register the review gate",
                     )
                     .await;
                     return Ok(());
                 }
-                self.finish_turn_state();
+                self.finish_turn_state_keep_local_runtime_turn();
                 self.widget.clear_task_mux();
                 self.sync_mux_input_context();
                 self.history = new_history;
@@ -4822,9 +5377,6 @@ where
                         text.clone(),
                     )));
                 }
-                let interaction_id = intent_id
-                    .clone()
-                    .unwrap_or_else(|| format!("intent-review-{turn_id}"));
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     let transcript_entry = CodeUiTranscriptEntry {
                         id: Self::code_ui_assistant_entry_id(turn_id),
@@ -6543,7 +7095,7 @@ where
             self.dismiss_network_policy_dialog();
         }
         if self.pending_intent_review.is_some() {
-            self.dismiss_intent_review_dialog();
+            self.dismiss_intent_review_dialog().await;
         }
         self.pending_execution_plan_revision = None;
         self.pending_plan_revision = None;
@@ -6776,6 +7328,22 @@ where
         self.clear_turn_tracking();
     }
 
+    /// Like [`Self::finish_turn_state`], but preserves
+    /// `active_local_runtime_turn`. Used when the local tool-loop task has
+    /// finished but the runtime turn it was tracking is still open behind a
+    /// registered interaction (e.g. Phase 0's `AwaitingIntentReview` gate),
+    /// so a later `respond`/cancel can still resolve it.
+    fn finish_turn_state_keep_local_runtime_turn(&mut self) {
+        self.cancel_pending_phase_confirmation();
+        self.cancel_pending_exec_approval();
+        self.complete_streaming_thinking_cells();
+        self.agent_task = None;
+        self.running_tool_calls = 0;
+        self.clear_active_turn();
+        self.clear_mcp_run_id();
+        self.clear_turn_cancellation();
+    }
+
     fn save_session_snapshot_after_user_message(&self) {
         if let Err(error) = self.session_store.save(&self.session) {
             tracing::warn!(
@@ -6856,13 +7424,38 @@ where
 
     // ── IntentSpec review dialog ────────────────────────────────────
 
-    async fn handle_intent_review_choice(&mut self) {
+    async fn handle_intent_review_choice(&mut self) -> Result<(), TuiControlError> {
         let pending = match self.pending_intent_review.take() {
             Some(p) => p,
-            None => return,
+            None => return Ok(()),
         };
         let interaction_id = pending.interaction_id.clone();
         let selected = pending.selected;
+
+        // Drive the durable decision through the runtime first (worker-owned
+        // AwaitingIntentReview, W2-02 AC4). Confirm releases the fence;
+        // revise/cancel discard any turns queued under it. Fail closed if
+        // acknowledgement fails so the TUI cannot proceed while the worker
+        // still holds the active Phase 0 turn — and so Code UI automation
+        // receives an error instead of a false success.
+        if let Some(decision) = IntentReviewDecision::from_choice_index(selected)
+            && let Err(error) = self
+                .settle_local_runtime_intent_review(decision, &interaction_id)
+                .await
+        {
+            self.pending_intent_review = Some(pending);
+            let message = format!(
+                "IntentSpec review was not applied: {}. The review is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            );
+            self.widget
+                .add_cell(Box::new(AssistantHistoryCell::new(message.clone())));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingIntentReviewChoice);
+            self.schedule_draw();
+            return Err(TuiControlError::Internal(message));
+        }
 
         match selected {
             0 => {
@@ -6902,20 +7495,38 @@ where
             });
         }
         self.schedule_draw();
+        Ok(())
     }
 
-    fn dismiss_intent_review_dialog(&mut self) {
-        if let Some(interaction_id) = self
-            .pending_intent_review
-            .as_ref()
-            .map(|pending| pending.interaction_id.clone())
-            && let Some(code_ui_session) = self.code_ui_session.clone()
+    async fn dismiss_intent_review_dialog(&mut self) {
+        let Some(pending) = self.pending_intent_review.take() else {
+            self.set_idle_and_draw();
+            return;
+        };
+        if let Err(error) = self
+            .settle_local_runtime_intent_review(
+                IntentReviewDecision::Cancel,
+                &pending.interaction_id,
+            )
+            .await
         {
+            self.pending_intent_review = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "IntentSpec review cancel was not applied: {}. The review is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingIntentReviewChoice);
+            self.schedule_draw();
+            return;
+        }
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            let interaction_id = pending.interaction_id;
             tokio::spawn(async move {
                 code_ui_session.clear_interaction(&interaction_id).await;
             });
         }
-        self.pending_intent_review = None;
         self.set_idle_and_draw();
     }
 
@@ -12784,21 +13395,6 @@ fn is_phase1_plan_draft_tool(tool_name: &str) -> bool {
 
 fn should_forward_phase1_model_text_delta(_delta: &str) -> bool {
     false
-}
-
-fn phase0_plan_tool_loop_config(mut config: ToolLoopConfig) -> ToolLoopConfig {
-    config.allowed_tools = Some(vec![
-        "read_file".to_string(),
-        "list_dir".to_string(),
-        "grep_files".to_string(),
-        "search_files".to_string(),
-        "web_search".to_string(),
-        "request_user_input".to_string(),
-        "submit_intent_draft".to_string(),
-    ]);
-    config.terminal_tools = Some(vec!["submit_intent_draft".to_string()]);
-    config.max_turns = Some(12);
-    config
 }
 
 fn phase1_plan_tool_loop_config(mut config: ToolLoopConfig) -> ToolLoopConfig {

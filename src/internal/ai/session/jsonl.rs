@@ -144,6 +144,16 @@ pub enum CodeWorkflowEventKind {
     IntentReviewRequested {
         interaction_id: String,
         intent_id: String,
+        /// Non-mutating runtime turn that owns the parked review gate.
+        /// Empty on rows written before W2-02 turn-id recovery; resume then
+        /// allocates a replacement turn and must terminalize any orphan.
+        #[serde(default)]
+        turn_id: String,
+        /// Mutating Phase 0 turn that wrote the IntentSpec draft. Startup
+        /// recovery may complete this identity as success when the marker is
+        /// open; other pending mutations stay fenced/cancelled.
+        #[serde(default)]
+        phase0_turn_id: String,
     },
     PlanReviewRequested {
         interaction_id: String,
@@ -184,6 +194,15 @@ pub enum CodeWorkflowEventKind {
     CommandTerminalSuccess {
         command: CodeCommandIdentity,
         summary: String,
+    },
+    /// Crash-atomic terminal success + interaction resolution for review gates
+    /// (W2-02). A single JSONL row so a torn write cannot leave the command
+    /// succeeded while the review marker stays open.
+    CommandTerminalSuccessWithInteractionResolved {
+        command: CodeCommandIdentity,
+        summary: String,
+        interaction_id: String,
+        resolution: String,
     },
     CommandTerminalFailure {
         command: CodeCommandIdentity,
@@ -554,7 +573,19 @@ fn code_workflow_event_summary(event: &CodeWorkflowEventKind) -> String {
         CodeWorkflowEventKind::IntentReviewRequested {
             interaction_id,
             intent_id,
-        } => format!("intent review {interaction_id} ({intent_id})"),
+            turn_id,
+            phase0_turn_id,
+        } => {
+            let mut summary = if turn_id.is_empty() {
+                format!("intent review {interaction_id} ({intent_id})")
+            } else {
+                format!("intent review {interaction_id} ({intent_id}) turn={turn_id}")
+            };
+            if !phase0_turn_id.is_empty() {
+                summary.push_str(&format!(" phase0={phase0_turn_id}"));
+            }
+            summary
+        }
         CodeWorkflowEventKind::PlanReviewRequested {
             interaction_id,
             plan_id,
@@ -590,6 +621,15 @@ fn code_workflow_event_summary(event: &CodeWorkflowEventKind) -> String {
                 command.command_id
             )
         }
+        CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            command,
+            summary,
+            interaction_id,
+            resolution,
+        } => format!(
+            "durable command {} succeeded: {summary}; interaction {interaction_id} resolved ({resolution})",
+            command.command_id
+        ),
         CodeWorkflowEventKind::CommandTerminalFailure { command, reason } => {
             format!("durable command {} failed: {reason}", command.command_id)
         }
@@ -622,6 +662,17 @@ fn apply_command_status_event(
             (&command.identity, Some(command), None)
         }
         CodeWorkflowEventKind::CommandTerminalSuccess { command, summary } => (
+            command,
+            None,
+            Some(CodeCommandStatus::Succeeded {
+                summary: summary.clone(),
+            }),
+        ),
+        CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+            command,
+            summary,
+            ..
+        } => (
             command,
             None,
             Some(CodeCommandStatus::Succeeded {
@@ -822,14 +873,43 @@ impl SessionJsonlStore {
         event: CodeWorkflowEventKind,
         durable: bool,
     ) -> io::Result<CodeWorkflowEvent> {
-        let sequence = self.next_code_workflow_sequence()?;
-        let workflow_event = CodeWorkflowEvent::new(sequence, event);
-        self.append_unchecked(
-            &SessionEvent::code_workflow(workflow_event.clone()),
-            durable,
-        )?;
-        self.update_command_status_cache(&workflow_event.event);
-        Ok(workflow_event)
+        let mut events = self.append_code_workflow_kinds_while_locked(&[event], durable)?;
+        // INVARIANT: exactly one event was requested.
+        Ok(events
+            .pop()
+            .expect("append_code_workflow_kinds_while_locked returns one event per input"))
+    }
+
+    fn append_code_workflow_kinds_while_locked(
+        &self,
+        events: &[CodeWorkflowEventKind],
+        durable: bool,
+    ) -> io::Result<Vec<CodeWorkflowEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut workflow_events = Vec::with_capacity(events.len());
+        let mut session_events = Vec::with_capacity(events.len());
+        // Allocate once: `next_code_workflow_sequence` reads the on-disk tail,
+        // so calling it per item before the batch is written would reuse the
+        // same sequence for every row.
+        let mut sequence = self.next_code_workflow_sequence()?;
+        for event in events {
+            let workflow_event = CodeWorkflowEvent::new(sequence, event.clone());
+            session_events.push(SessionEvent::code_workflow(workflow_event.clone()));
+            workflow_events.push(workflow_event);
+            sequence = sequence.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cannot append Code workflow event: sequence reached u64::MAX",
+                )
+            })?;
+        }
+        self.append_unchecked_batch(&session_events, durable)?;
+        for workflow_event in &workflow_events {
+            self.update_command_status_cache(&workflow_event.event);
+        }
+        Ok(workflow_events)
     }
 
     fn append_unchecked(&self, event: &SessionEvent, durable: bool) -> io::Result<()> {
@@ -873,6 +953,77 @@ impl SessionJsonlStore {
         serde_json::to_writer(&mut file, event)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         file.write_all(b"\n").map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to append session event log '{}': {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        if durable {
+            file.sync_data().map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to fsync durable session event log '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn append_unchecked_batch(&self, events: &[SessionEvent], durable: bool) -> io::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() == 1 {
+            return self.append_unchecked(&events[0], durable);
+        }
+        fs::create_dir_all(&self.session_root).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to create session directory '{}': {err}",
+                    self.session_root.display()
+                ),
+            )
+        })?;
+        let path = self.events_path();
+        let needs_separator = recover_truncated_tail_for_append(&path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to open session event log '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+        if needs_separator {
+            file.write_all(b"\n").map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "failed to restore JSONL line boundary in '{}': {err}",
+                        path.display()
+                    ),
+                )
+            })?;
+        }
+        let mut buffer = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut buffer, event)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            buffer.push(b'\n');
+        }
+        file.write_all(&buffer).map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!(
@@ -1261,6 +1412,151 @@ impl SessionJsonlStore {
                 summary,
             },
         )
+    }
+
+    /// Terminalize a command and record an interaction resolution under one
+    /// append lock / fsync so a crash cannot leave `Succeeded` without
+    /// `InteractionResolved` (or the reverse).
+    pub fn complete_code_command_success_with_interaction_resolved(
+        &self,
+        identity: &CodeCommandIdentity,
+        summary: impl Into<String>,
+        interaction_id: impl Into<String>,
+        resolution: impl Into<String>,
+    ) -> Result<CodeCommandStatus, CodeCommandStoreError> {
+        let summary = summary.into();
+        let interaction_id = interaction_id.into();
+        let resolution = resolution.into();
+        let target = CodeCommandStatus::Succeeded {
+            summary: summary.clone(),
+        };
+        if !identity.is_complete() {
+            return Err(CodeCommandStoreError::InvalidIntent);
+        }
+        fs::create_dir_all(&self.session_root)?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        self.invalidate_command_status_cache();
+        let Some((intent, status)) = self.code_command_status(identity)? else {
+            return Err(CodeCommandStoreError::MissingIntent {
+                command_id: identity.command_id.clone(),
+            });
+        };
+        match status {
+            CodeCommandStatus::Pending => {
+                // Single JSONL row: torn writes cannot leave Succeeded without
+                // closing the review marker.
+                self.append_code_workflow_while_locked(
+                    CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                        command: identity.clone(),
+                        summary,
+                        interaction_id,
+                        resolution,
+                    },
+                    true,
+                )?;
+                if intent.mutating {
+                    self.release_mutating_owner_lease_if_no_pending_mutations()?;
+                }
+                Ok(target)
+            }
+            existing if existing == target => {
+                // Idempotent retry / resume repair: ensure the resolution is
+                // visible when a prior attempt terminalized without it.
+                self.append_code_workflow_while_locked(
+                    CodeWorkflowEventKind::InteractionResolved {
+                        interaction_id,
+                        resolution,
+                    },
+                    true,
+                )?;
+                Ok(existing)
+            }
+            _ => Err(CodeCommandStoreError::TerminalConflict {
+                command_id: identity.command_id.clone(),
+            }),
+        }
+    }
+
+    /// When an IntentSpec review marker identifies a Phase 0 turn, that
+    /// pending mutating command is completed as success (draft at rest) while
+    /// every other pending mutation is fenced as indeterminate. Without a
+    /// Phase 0 turn id, falls back to ordinary recovery fencing.
+    pub fn recover_pending_mutating_code_commands_for_intent_review(
+        &self,
+        phase0_turn_id: Option<&str>,
+    ) -> Result<Vec<CodeCommandIdentity>, CodeCommandStoreError> {
+        let Some(phase0_turn_id) = phase0_turn_id.filter(|id| !id.is_empty()) else {
+            return self.recover_pending_mutating_code_commands();
+        };
+        match fs::metadata(self.events_path()) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        self.invalidate_command_status_cache();
+        let mut fence_mutations = Vec::new();
+        let mut pending_to_complete = Vec::new();
+        let mut pending_to_fence = Vec::new();
+        for (identity, cached) in self.all_code_command_statuses()? {
+            if cached.payload_conflict {
+                return Err(payload_conflict(&identity));
+            }
+            if cached.terminal_conflict {
+                return Err(CodeCommandStoreError::TerminalConflict {
+                    command_id: identity.command_id.clone(),
+                });
+            }
+            match (&cached.intent, &cached.status) {
+                (Some(intent), Some(status)) if intent.mutating => match status {
+                    CodeCommandStatus::Pending if !self.live_mutating_owner_exists() => {
+                        if identity.command_id == phase0_turn_id {
+                            pending_to_complete.push(identity.clone());
+                        } else {
+                            pending_to_fence.push(identity.clone());
+                            fence_mutations.push(identity);
+                        }
+                    }
+                    CodeCommandStatus::Indeterminate { .. } => {
+                        fence_mutations.push(identity);
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        for identity in &pending_to_complete {
+            self.append_code_workflow_while_locked(
+                CodeWorkflowEventKind::CommandTerminalSuccess {
+                    command: identity.clone(),
+                    summary: "IntentSpec draft durable; awaiting review confirmation".to_string(),
+                },
+                true,
+            )?;
+        }
+        for identity in &pending_to_fence {
+            self.append_code_workflow_while_locked(
+                CodeWorkflowEventKind::CommandIndeterminateSideEffect {
+                    command: identity.clone(),
+                    effect: "unknown_mutating_dispatch".to_string(),
+                    reason:
+                        "runtime stopped after durable intent; manual reconciliation is required"
+                            .to_string(),
+                },
+                true,
+            )?;
+        }
+        if !pending_to_complete.is_empty() || !pending_to_fence.is_empty() {
+            self.release_mutating_owner_lease_if_no_pending_mutations()?;
+        }
+        Ok(fence_mutations)
     }
 
     pub fn complete_code_command_failure(
@@ -1826,6 +2122,7 @@ fn parse_code_workflow_event_value(
         | "indeterminate_side_effect"
         | "command_intent_persisted"
         | "command_terminal_success"
+        | "command_terminal_success_with_interaction_resolved"
         | "command_terminal_failure"
         | "command_indeterminate_side_effect" => serde_json::from_value(value).map(Some),
         unknown => {

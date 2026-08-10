@@ -3646,15 +3646,26 @@ where
     // admission and any mutation reconciliation are durable.
     let (mut local_turn_runtime, mut local_turn_runtime_task) = if managed_code_ui_runtime.is_none()
     {
-        let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(
-            session_store.session_root(&session.id),
-        ));
-        let recovered_mutations = durability.recover_pending_mutations().map_err(|error| {
-            CliError::io(format!(
-                "failed to recover pending durable commands for Code session '{}': {error}",
-                session.id
-            ))
-        })?;
+        let session_jsonl = SessionJsonlStore::new(session_store.session_root(&session.id));
+        let phase0_turn_id = session_jsonl
+            .load_code_workflow_replay()
+            .ok()
+            .and_then(|replay| {
+                crate::internal::ai::runtime::phase0::open_intent_review_from_workflow(
+                    replay.events.iter().map(|event| &event.event),
+                )
+            })
+            .map(|(_, _, _, phase0_turn_id)| phase0_turn_id)
+            .filter(|id| !id.is_empty());
+        let durability = RuntimeCommandDurability::new(session_jsonl);
+        let recovered_mutations = durability
+            .recover_pending_mutations_for_intent_review(phase0_turn_id.as_deref())
+            .map_err(|error| {
+                CliError::io(format!(
+                    "failed to recover pending durable commands for Code session '{}': {error}",
+                    session.id
+                ))
+            })?;
         let mut worker_config = AgentRuntimeWorkerConfig::new(
             Arc::new(ExternalTurnTrackingExecutor),
             ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
@@ -4134,6 +4145,9 @@ where
             process_terminate: Some(process_terminate),
         },
     );
+    // W2-02: reopen an unresolved IntentSpec review after crash/resume so
+    // confirm/modify/cancel cannot disappear while a draft remains unconfirmed.
+    app.restore_pending_intent_review_gate().await;
 
     let run_result = app.run().await;
     // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI

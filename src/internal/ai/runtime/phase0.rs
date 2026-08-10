@@ -22,16 +22,234 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use git_internal::internal::object::{context::SelectionStrategy, types::ActorRef};
 use rmcp::model::CallToolResult;
 
+use super::worker::{
+    InteractionResponse, RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+    RuntimeWorkerError, TurnRequest,
+};
 use crate::internal::ai::{
+    agent::ToolLoopConfig,
     intentspec::{IntentSpec, persistence::persist_intentspec},
     mcp::{
         resource::{ContextItemParams, CreateContextSnapshotParams},
         server::LibraMcpServer,
     },
 };
+
+/// Scan durable Code workflow events for an IntentSpec review gate that was
+/// requested but never resolved. Used on TUI resume so confirm/modify/cancel
+/// cannot disappear across a crash (W2-02 recovery).
+///
+/// Returns the oldest unresolved
+/// `(interaction_id, intent_id, turn_id, phase0_turn_id)` tuple. Multiple open
+/// requests are tracked independently so resolving a later review cannot drop
+/// an earlier unresolved gate. Turn ids may be empty on markers that predate
+/// durable gate-turn recovery.
+pub fn open_intent_review_from_workflow<'a>(
+    events: impl IntoIterator<Item = &'a crate::internal::ai::session::CodeWorkflowEventKind>,
+) -> Option<(String, String, String, String)> {
+    use std::collections::HashMap;
+
+    use crate::internal::ai::session::CodeWorkflowEventKind;
+
+    let mut open: HashMap<String, (String, String, String)> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for event in events {
+        match event {
+            CodeWorkflowEventKind::IntentReviewRequested {
+                interaction_id,
+                intent_id,
+                turn_id,
+                phase0_turn_id,
+            } => {
+                if open
+                    .insert(
+                        interaction_id.clone(),
+                        (intent_id.clone(), turn_id.clone(), phase0_turn_id.clone()),
+                    )
+                    .is_none()
+                {
+                    order.push(interaction_id.clone());
+                }
+            }
+            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
+            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                ..
+            } => {
+                open.remove(interaction_id);
+                order.retain(|id| id != interaction_id);
+            }
+            _ => {}
+        }
+    }
+    order.into_iter().next().and_then(|interaction_id| {
+        open.remove(&interaction_id)
+            .map(|(intent_id, turn_id, phase0_turn_id)| {
+                (interaction_id, intent_id, turn_id, phase0_turn_id)
+            })
+    })
+}
+
+/// Phase 0 planning tool-loop policy shared by every caller that drives the
+/// IntentSpec drafting conversation (TUI today; a future
+/// [`RuntimeTurnExecutor`](super::worker::RuntimeTurnExecutor) adapter).
+/// `submit_intent_draft` is the only terminal tool, matching the AC1
+/// requirement that Phase 0 cannot silently fall through into a mutating
+/// tool before the formal write in [`write_intent`].
+pub fn phase0_plan_tool_loop_config(mut config: ToolLoopConfig) -> ToolLoopConfig {
+    config.allowed_tools = Some(vec![
+        "read_file".to_string(),
+        "list_dir".to_string(),
+        "grep_files".to_string(),
+        "search_files".to_string(),
+        "web_search".to_string(),
+        "request_user_input".to_string(),
+        "submit_intent_draft".to_string(),
+    ]);
+    config.terminal_tools = Some(vec!["submit_intent_draft".to_string()]);
+    config.max_turns = Some(12);
+    config
+}
+
+/// The developer's decision on a pending IntentSpec review
+/// ([`super::worker::InteractionState::AwaitingIntentReview`]).
+///
+/// Stable wire ids ([`Self::wire_id`]) are the contract browser/automation
+/// clients depend on; TUI keyboard-menu copy lives separately in
+/// `crate::internal::tui::workflow_baseline` and may diverge in wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntentReviewDecision {
+    /// Accept the IntentSpec as drafted; the caller should hand off toward
+    /// Phase 1 (execution plan generation).
+    Confirm,
+    /// Reject the current draft and re-enter Phase 0 with the existing spec
+    /// as a revision baseline.
+    Revise,
+    /// Abandon the review; the persisted IntentSpec draft remains on disk
+    /// but no further phase is entered.
+    Cancel,
+}
+
+impl IntentReviewDecision {
+    /// Stable wire identifier used by [`InteractionResponse::response`] and
+    /// [`crate::internal::ai::web::code_ui::CodeUiInteractionOption::id`].
+    pub fn wire_id(self) -> &'static str {
+        match self {
+            Self::Confirm => "confirm",
+            Self::Revise => "modify",
+            Self::Cancel => "cancel",
+        }
+    }
+
+    /// Parse a wire response id, accepting both `"modify"` (the browser
+    /// option id) and `"revise"` (a more descriptive alias) for
+    /// [`Self::Revise`].
+    pub fn from_wire_id(id: &str) -> Option<Self> {
+        match id.trim().to_ascii_lowercase().as_str() {
+            "confirm" => Some(Self::Confirm),
+            "modify" | "revise" => Some(Self::Revise),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    /// Map the TUI's `PendingIntentReview::selected` index
+    /// (0=Confirm, 1=Modify, 2=Cancel) onto the same decision so the
+    /// keyboard-menu path and the wire path stay in lockstep.
+    pub fn from_choice_index(index: usize) -> Option<Self> {
+        match index {
+            0 => Some(Self::Confirm),
+            1 => Some(Self::Revise),
+            2 => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+}
+
+/// [`RuntimeInteractionDelivery`] for the Phase 0 IntentSpec review gate.
+///
+/// `Confirm` retires the tracked Phase 0 turn with
+/// [`RuntimeTurnExecution::Completed`] so any turn queued while the review
+/// was pending may start (the mutation fence releases only on confirm).
+/// `Revise` / `Cancel` also free the active-turn slot, but use
+/// [`RuntimeTurnExecution::CompletedDiscardQueued`] so work submitted under
+/// the fence cannot execute without a confirmed IntentSpec. This deliberately
+/// avoids reporting [`RuntimeWorkerError::Cancelled`] for `Cancel`: that
+/// error path assumes a still-running executor continuation will reconcile
+/// the ambiguous outcome, which does not exist for an externally-tracked
+/// turn (the TUI's Phase 0 background task already finished before the
+/// review was ever registered) and would otherwise strand the turn in
+/// `Cancelling` forever. The confirm/revise/cancel distinction itself is a
+/// caller-level (TUI/Web) concern carried in the `summary` text and driven
+/// off the same [`IntentReviewDecision`] the caller parsed from the wire
+/// response — the runtime's [`super::worker::InteractionState`] taxonomy has
+/// no "the user declined this business decision" variant, only
+/// mutation-safety states.
+///
+/// Malformed responses are rejected in [`Self::validate`] before the pending
+/// interaction is consumed, so a browser/automation client can retry with a
+/// corrected `selectedOption` instead of losing the review gate.
+///
+/// Terminal IntentSpec review delivery. `InteractionResolved` is **not**
+/// written here: the worker appends it only after the gate turn's terminal
+/// command outcome is durable, so a transient terminal-persistence failure
+/// cannot clear the review while fencing the session.
+#[derive(Debug, Clone, Default)]
+pub struct IntentReviewAckDelivery;
+
+impl IntentReviewAckDelivery {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl RuntimeInteractionDelivery for IntentReviewAckDelivery {
+    fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+        IntentReviewDecision::from_wire_id(&interaction.response)
+            .map(|_| ())
+            .ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(format!(
+                    "unrecognized IntentSpec review response '{}'; expected one of confirm/modify/cancel",
+                    interaction.response
+                ))
+            })
+    }
+
+    fn persist_interaction_resolved_after_terminal(&self) -> bool {
+        true
+    }
+
+    async fn deliver(
+        self: Box<Self>,
+        _request: TurnRequest,
+        interaction: InteractionResponse,
+        _context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let decision =
+            IntentReviewDecision::from_wire_id(&interaction.response).ok_or_else(|| {
+                RuntimeWorkerError::ExecutionFailed(format!(
+                    "unrecognized IntentSpec review response '{}'",
+                    interaction.response
+                ))
+            })?;
+        match decision {
+            IntentReviewDecision::Confirm => Ok(RuntimeTurnExecution::Completed {
+                summary: "IntentSpec confirmed; ready to generate an execution plan".to_string(),
+            }),
+            IntentReviewDecision::Revise => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "IntentSpec revision requested".to_string(),
+            }),
+            IntentReviewDecision::Cancel => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "IntentSpec review cancelled".to_string(),
+            }),
+        }
+    }
+}
 
 /// Outcome of [`write_intent`]: the persisted intent revision id alongside a
 /// reference back to the source [`IntentSpec`] so audit / observer code can
@@ -506,5 +724,303 @@ mod tests {
     fn parse_snapshot_id_returns_none_for_empty_id() {
         let result = CallToolResult::success(vec![Content::text("ID:   ")]);
         assert_eq!(parse_snapshot_id(&result), None);
+    }
+
+    /// AC1: Phase 0's tool-loop config must only allow read-only
+    /// investigation tools plus the two interactive/terminal tools, with
+    /// `submit_intent_draft` as the sole terminal tool. No mutating tool
+    /// (e.g. `apply_patch`, `shell`) may appear on the allowlist — that is
+    /// the mutation fence for "no mutating tools before confirm".
+    #[test]
+    fn phase0_plan_tool_loop_config_allows_only_read_only_and_draft_tools() {
+        let config = phase0_plan_tool_loop_config(ToolLoopConfig::default());
+        let allowed = config
+            .allowed_tools
+            .as_ref()
+            .expect("phase0 config must set an explicit allowlist");
+        for mutating in [
+            "apply_patch",
+            "shell",
+            "submit_plan_draft",
+            "submit_task_complete",
+        ] {
+            assert!(
+                !allowed.iter().any(|tool| tool == mutating),
+                "phase0 allowlist must not include mutating tool '{mutating}': {allowed:?}"
+            );
+        }
+        assert!(allowed.iter().any(|tool| tool == "submit_intent_draft"));
+        assert!(allowed.iter().any(|tool| tool == "request_user_input"));
+        assert_eq!(
+            config.terminal_tools.as_deref(),
+            Some(["submit_intent_draft".to_string()].as_slice()),
+            "submit_intent_draft must be the only Phase 0 terminal tool"
+        );
+    }
+
+    #[test]
+    fn open_intent_review_from_workflow_tracks_unresolved_gate() {
+        use crate::internal::ai::session::CodeWorkflowEventKind;
+
+        let requested = CodeWorkflowEventKind::IntentReviewRequested {
+            interaction_id: "intent-1".to_string(),
+            intent_id: "spec-1".to_string(),
+            turn_id: "gate-1".to_string(),
+            phase0_turn_id: "phase0-1".to_string(),
+        };
+        assert_eq!(
+            open_intent_review_from_workflow([&requested]),
+            Some((
+                "intent-1".to_string(),
+                "spec-1".to_string(),
+                "gate-1".to_string(),
+                "phase0-1".to_string()
+            ))
+        );
+
+        let resolved = CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "intent-1".to_string(),
+            resolution: "confirm".to_string(),
+        };
+        assert_eq!(
+            open_intent_review_from_workflow([&requested, &resolved]),
+            None
+        );
+
+        let other_resolved = CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "other".to_string(),
+            resolution: "cancel".to_string(),
+        };
+        assert_eq!(
+            open_intent_review_from_workflow([&requested, &other_resolved]),
+            Some((
+                "intent-1".to_string(),
+                "spec-1".to_string(),
+                "gate-1".to_string(),
+                "phase0-1".to_string()
+            ))
+        );
+
+        let second = CodeWorkflowEventKind::IntentReviewRequested {
+            interaction_id: "intent-2".to_string(),
+            intent_id: "spec-2".to_string(),
+            turn_id: "gate-2".to_string(),
+            phase0_turn_id: "phase0-2".to_string(),
+        };
+        let second_resolved = CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "intent-2".to_string(),
+            resolution: "confirm".to_string(),
+        };
+        assert_eq!(
+            open_intent_review_from_workflow([&requested, &second, &second_resolved]),
+            Some((
+                "intent-1".to_string(),
+                "spec-1".to_string(),
+                "gate-1".to_string(),
+                "phase0-1".to_string()
+            )),
+            "resolving a later review must not drop an earlier unresolved gate"
+        );
+
+        let atomic_resolved =
+            CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                command: crate::internal::ai::session::CodeCommandIdentity::new(
+                    "repo",
+                    "session",
+                    "principal",
+                    "gate-1",
+                ),
+                summary: "confirmed".to_string(),
+                interaction_id: "intent-1".to_string(),
+                resolution: "confirm".to_string(),
+            };
+        assert_eq!(
+            open_intent_review_from_workflow([&requested, &atomic_resolved]),
+            None,
+            "crash-atomic terminal+resolution must close the review gate"
+        );
+    }
+
+    #[test]
+    fn intent_review_decision_round_trips_through_wire_ids() {
+        for decision in [
+            IntentReviewDecision::Confirm,
+            IntentReviewDecision::Revise,
+            IntentReviewDecision::Cancel,
+        ] {
+            assert_eq!(
+                IntentReviewDecision::from_wire_id(decision.wire_id()),
+                Some(decision)
+            );
+        }
+        assert_eq!(
+            IntentReviewDecision::from_wire_id("revise"),
+            Some(IntentReviewDecision::Revise),
+            "the descriptive alias 'revise' must also parse to Revise"
+        );
+        assert_eq!(
+            IntentReviewDecision::from_wire_id("CONFIRM"),
+            Some(IntentReviewDecision::Confirm)
+        );
+        assert_eq!(IntentReviewDecision::from_wire_id("bogus"), None);
+    }
+
+    #[test]
+    fn intent_review_decision_choice_index_matches_tui_pending_review_layout() {
+        // 0=Confirm, 1=Modify, 2=Cancel — see `PendingIntentReview::selected`
+        // in `crate::internal::tui::app`.
+        assert_eq!(
+            IntentReviewDecision::from_choice_index(0),
+            Some(IntentReviewDecision::Confirm)
+        );
+        assert_eq!(
+            IntentReviewDecision::from_choice_index(1),
+            Some(IntentReviewDecision::Revise)
+        );
+        assert_eq!(
+            IntentReviewDecision::from_choice_index(2),
+            Some(IntentReviewDecision::Cancel)
+        );
+        assert_eq!(IntentReviewDecision::from_choice_index(3), None);
+    }
+
+    #[test]
+    fn intent_review_ack_delivery_rejects_unrecognized_response_without_consuming_it() {
+        let delivery = IntentReviewAckDelivery::new();
+        let error = delivery
+            .validate(&InteractionResponse::new("intent-1", "not-a-decision"))
+            .expect_err("unrecognized response must fail validation");
+        assert!(matches!(error, RuntimeWorkerError::ExecutionFailed(_)));
+    }
+
+    /// End-to-end through a real [`AgentRuntimeWorker`]: an
+    /// externally-tracked Phase 0 turn (mirroring the TUI's
+    /// `track_external_turn` adapter) registers the IntentSpec review via
+    /// [`IntentReviewAckDelivery`], then `confirm` releases the turn as
+    /// `Completed` so a follow-up admission (Phase 1, or a new Phase 0 turn
+    /// for `revise`) is possible again.
+    #[tokio::test]
+    async fn intent_review_ack_delivery_confirm_completes_the_tracked_turn() {
+        use uuid::Uuid;
+
+        use crate::internal::ai::runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExternalTurnTrackingExecutor,
+            InMemoryAuditSink, InteractionState, ToolBoundaryRuntime,
+        };
+
+        let (handle, worker) = AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(
+            Arc::new(ExternalTurnTrackingExecutor),
+            ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+        ));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mutation_started = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+                cancellation,
+                mutation_started,
+            )
+            .await
+            .expect("phase0 turn tracked");
+
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "phase0-turn",
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: "intent-1".to_string(),
+                },
+                Box::new(IntentReviewAckDelivery::new()),
+            )
+            .await
+            .expect("worker owns the IntentSpec review interaction");
+        assert_eq!(
+            handle.snapshot("session").await.unwrap().interaction,
+            InteractionState::AwaitingIntentReview {
+                interaction_id: "intent-1".to_string(),
+            }
+        );
+
+        handle
+            .respond(
+                "session",
+                "phase0-turn",
+                InteractionResponse::new("intent-1", "confirm"),
+            )
+            .await
+            .expect("confirm must be accepted");
+        assert_eq!(
+            handle.snapshot("session").await.unwrap().interaction,
+            InteractionState::Completed
+        );
+
+        // The tracked turn slot must be free for a new admission (e.g. the
+        // hand-off toward Phase 1), matching the AC3 "release once resolved"
+        // half of the mutation fence.
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase1-turn", "execution plan", true),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await
+            .expect("a new turn can be admitted once the review is resolved");
+        worker.abort();
+    }
+
+    /// `cancel` must resolve the tracked Phase 0 turn as `Completed` (not
+    /// `Cancelling`/`IndeterminateSideEffect`) because there is no live
+    /// executor continuation left to reconcile an ambiguous outcome for an
+    /// externally-tracked turn, and the only mutation that occurred —
+    /// persisting the draft via `write_intent` — is inert data at rest, not
+    /// a partially applied side effect requiring reconciliation. Queued
+    /// follow-ups are discarded via [`RuntimeTurnExecution::CompletedDiscardQueued`].
+    #[tokio::test]
+    async fn intent_review_ack_delivery_cancel_completes_without_reconciliation() {
+        use uuid::Uuid;
+
+        use crate::internal::ai::runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExternalTurnTrackingExecutor,
+            InMemoryAuditSink, InteractionState, ToolBoundaryRuntime,
+        };
+
+        let (handle, worker) = AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(
+            Arc::new(ExternalTurnTrackingExecutor),
+            ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+        ));
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+                tokio_util::sync::CancellationToken::new(),
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            )
+            .await
+            .expect("phase0 turn tracked");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "phase0-turn",
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: "intent-1".to_string(),
+                },
+                Box::new(IntentReviewAckDelivery::new()),
+            )
+            .await
+            .expect("worker owns the IntentSpec review interaction");
+
+        handle
+            .respond(
+                "session",
+                "phase0-turn",
+                InteractionResponse::new("intent-1", "cancel"),
+            )
+            .await
+            .expect("cancel must be accepted and resolve the turn");
+        assert_eq!(
+            handle.snapshot("session").await.unwrap().interaction,
+            InteractionState::Completed,
+            "cancelling a resolved-draft review must not open a reconciliation fence"
+        );
+        worker.abort();
     }
 }
