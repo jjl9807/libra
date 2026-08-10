@@ -131,6 +131,32 @@ pub fn fold_code_ui_snapshot(
                 snapshot.status = CodeUiSessionStatus::Completed;
                 snapshot.updated_at = workflow_event.recorded_at;
             }
+            CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                ..
+            } => {
+                snapshot.status = CodeUiSessionStatus::Completed;
+                snapshot.updated_at = workflow_event.recorded_at;
+                if let Some(interaction) = snapshot
+                    .interactions
+                    .iter_mut()
+                    .find(|item| item.id == *interaction_id)
+                {
+                    interaction.status = CodeUiInteractionStatus::Resolved;
+                    interaction.resolved_at = Some(workflow_event.recorded_at);
+                }
+            }
+            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. } => {
+                if let Some(interaction) = snapshot
+                    .interactions
+                    .iter_mut()
+                    .find(|item| item.id == *interaction_id)
+                {
+                    interaction.status = CodeUiInteractionStatus::Resolved;
+                    interaction.resolved_at = Some(workflow_event.recorded_at);
+                }
+                snapshot.updated_at = workflow_event.recorded_at;
+            }
             CodeWorkflowEventKind::TerminalFailure { .. }
             | CodeWorkflowEventKind::CommandTerminalFailure { .. } => {
                 snapshot.status = CodeUiSessionStatus::Error;

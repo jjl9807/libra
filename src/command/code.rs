@@ -3646,15 +3646,22 @@ where
     // admission and any mutation reconciliation are durable.
     let (mut local_turn_runtime, mut local_turn_runtime_task) = if managed_code_ui_runtime.is_none()
     {
-        let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(
-            session_store.session_root(&session.id),
-        ));
-        let recovered_mutations = durability.recover_pending_mutations().map_err(|error| {
-            CliError::io(format!(
-                "failed to recover pending durable commands for Code session '{}': {error}",
-                session.id
-            ))
-        })?;
+        let session_jsonl = SessionJsonlStore::new(session_store.session_root(&session.id));
+        // An unresolved IntentSpec (Phase 0) or Plan (Phase 1) review gate is
+        // durable proof that its draft-writing mutation completed, so recovery
+        // may complete that single command id; every other pending mutation
+        // still lands in the reconciliation fence.
+        let review_gate_turn_id =
+            crate::internal::ai::runtime::phase1::open_review_gate_phase_turn_id(&session_jsonl);
+        let durability = RuntimeCommandDurability::new(session_jsonl);
+        let recovered_mutations = durability
+            .recover_pending_mutations_for_intent_review(review_gate_turn_id.as_deref())
+            .map_err(|error| {
+                CliError::io(format!(
+                    "failed to recover pending durable commands for Code session '{}': {error}",
+                    session.id
+                ))
+            })?;
         let mut worker_config = AgentRuntimeWorkerConfig::new(
             Arc::new(ExternalTurnTrackingExecutor),
             ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
@@ -4134,6 +4141,20 @@ where
             process_terminate: Some(process_terminate),
         },
     );
+    // W2-02: reopen an unresolved IntentSpec review after crash/resume so
+    // confirm/modify/cancel cannot disappear while a draft remains unconfirmed.
+    app.restore_pending_intent_review_gate().await;
+    // W2-03: an unanswered post-plan network-policy choice is restored before
+    // the plan review, because an open network marker means the plan review is
+    // already resolved — that gate is the only one still owed a human answer.
+    app.restore_pending_network_policy_gate().await;
+    // W2-03: likewise for an unresolved execution-plan review. Phase 0 is
+    // restored first because an open IntentSpec gate means no plan was ever
+    // approved; the plan restore then no-ops on the already-parked gate.
+    app.restore_pending_plan_review_gate().await;
+    // W2-03 r18: network Allow/Deny may have settled while execute admission
+    // never ran — resume that handoff after the review gates no-op.
+    app.restore_pending_plan_execution_handoff().await;
 
     let run_result = app.run().await;
     // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI

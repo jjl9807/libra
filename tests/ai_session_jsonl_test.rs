@@ -462,6 +462,67 @@ fn command_idempotency_and_indeterminate_recovery() {
 }
 
 #[test]
+fn intent_review_recovery_completes_only_phase0_pending_mutation() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let jsonl = SessionJsonlStore::new(tmp.path().join("session"));
+    let phase0_identity = CodeCommandIdentity::new("repo-a", "session-a", "alice", "phase0-1");
+    let queued_identity = CodeCommandIdentity::new("repo-a", "session-a", "alice", "queued-1");
+
+    // Crash window: IntentReviewRequested is durable while Phase 0 and a
+    // queued mutation are still Pending (no live owner after restart).
+    jsonl
+        .append_code_workflow_durable(CodeWorkflowEventKind::CommandIntentPersisted {
+            command: CodeCommandIntent::new(
+                phase0_identity.clone(),
+                "tui_local_turn",
+                "sha256:phase0",
+                true,
+            ),
+        })
+        .unwrap();
+    jsonl
+        .append_code_workflow_durable(CodeWorkflowEventKind::IntentReviewRequested {
+            interaction_id: "intent-1".to_string(),
+            intent_id: "spec-1".to_string(),
+            turn_id: "gate-1".to_string(),
+            phase0_turn_id: "phase0-1".to_string(),
+        })
+        .unwrap();
+    jsonl
+        .append_code_workflow_durable(CodeWorkflowEventKind::CommandIntentPersisted {
+            command: CodeCommandIntent::new(
+                queued_identity.clone(),
+                "tui_local_turn",
+                "sha256:queued",
+                true,
+            ),
+        })
+        .unwrap();
+
+    let fenced = jsonl
+        .recover_pending_mutating_code_commands_for_intent_review(Some("phase0-1"))
+        .unwrap();
+    assert_eq!(
+        fenced,
+        vec![queued_identity.clone()],
+        "only the non-Phase-0 pending mutation must remain fenced"
+    );
+
+    assert!(matches!(
+        jsonl.recover_code_command(&phase0_identity).unwrap(),
+        CodeCommandRecovery::Existing {
+            status: CodeCommandStatus::Succeeded { .. }
+        }
+    ));
+    assert!(matches!(
+        jsonl.recover_code_command(&queued_identity).unwrap(),
+        CodeCommandRecovery::Existing {
+            status: CodeCommandStatus::Indeterminate { .. }
+        }
+    ));
+}
+
+#[test]
 fn terminal_before_intent_fails_closed_on_admit() {
     let tmp = tempfile::TempDir::new().unwrap();
     let jsonl = SessionJsonlStore::new(tmp.path().join("session"));

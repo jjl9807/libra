@@ -622,6 +622,1547 @@ async fn cancel_during_mutation_requires_reconciliation() {
     worker.abort();
 }
 
+/// W2-02 AC3/AC4: while a Phase 0 IntentSpec review is pending
+/// (`InteractionState::AwaitingIntentReview`), the worker — not
+/// `pending_intent_review` in the TUI — is the durable owner of the mutation
+/// fence. A follow-on turn on the same session (e.g. a stray mutating tool
+/// call outside the `phase0_plan_tool_loop_config` allowlist) must queue
+/// rather than execute, because the tracked Phase 0 turn stays active until
+/// `IntentReviewAckDelivery` resolves it via `respond`. Only `confirm`
+/// releases the fence for the queued turn to start.
+#[tokio::test]
+async fn intentspec_review_blocks_mutation() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase0::{IntentReviewAckDelivery, IntentReviewDecision},
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+        notify: Arc::clone(&notify),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "intentspec-review-fence-test".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    // Track the Phase 0 turn the way the TUI/web adapter does once
+    // `submit_intent_draft` fires: `track_external_turn` keeps it active
+    // while the tool loop itself has already exited.
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("phase0 turn tracked");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "phase0-turn",
+            InteractionState::AwaitingIntentReview {
+                interaction_id: "intent-1".to_string(),
+            },
+            Box::new(IntentReviewAckDelivery::new()),
+        )
+        .await
+        .expect("worker owns the IntentSpec review interaction");
+
+    // A follow-on turn must queue, not run, while the review is pending.
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutating turn is accepted into the queue");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "no mutating tool call may execute before the IntentSpec review is confirmed"
+    );
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot while awaiting review");
+    assert_eq!(
+        snapshot.interaction,
+        InteractionState::AwaitingIntentReview {
+            interaction_id: "intent-1".to_string(),
+        }
+    );
+    assert_eq!(snapshot.queued_turns, 1);
+
+    // Confirming the review resolves the Phase 0 turn and releases the fence.
+    handle
+        .respond(
+            "session",
+            "phase0-turn",
+            InteractionResponse::new("intent-1", IntentReviewDecision::Confirm.wire_id()),
+        )
+        .await
+        .expect("confirm resolves the review");
+    timeout(Duration::from_secs(1), notify.notified())
+        .await
+        .expect("queued mutating turn starts once the review is resolved");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    worker.abort();
+}
+
+/// W2-02 recovery: Phase 0 must be durably terminalized before the review
+/// gate parks, and the gate itself must be non-mutating so a crash cannot
+/// reopen an indeterminate reconciliation fence.
+#[tokio::test]
+async fn intentspec_review_gate_is_non_mutating_after_phase0_terminalizes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase0::{IntentReviewAckDelivery, IntentReviewDecision},
+    };
+    use tokio::time::{Duration, sleep};
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "intentspec-review-hold-queued".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("phase0 turn tracked");
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutating turn queues behind phase0");
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    // Mirror the TUI register path: terminalize Phase 0 without releasing the
+    // queue, then park a non-mutating review gate in front of it.
+    handle
+        .finish_external_turn(
+            "session",
+            "phase0-turn",
+            Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                summary: "IntentSpec draft persisted; awaiting review".to_string(),
+            }),
+        )
+        .await
+        .expect("phase0 terminalizes without releasing the queue");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "CompletedHoldQueued must not start queued mutations"
+    );
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "intent-review-turn", "IntentSpec review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("non-mutating review gate can park in front of the queue");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "intent-review-turn",
+            InteractionState::AwaitingIntentReview {
+                interaction_id: "intent-1".to_string(),
+            },
+            Box::new(IntentReviewAckDelivery::new()),
+        )
+        .await
+        .expect("review gate owns AwaitingIntentReview");
+
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("snapshot")
+            .queued_turns,
+        1
+    );
+
+    handle
+        .respond(
+            "session",
+            "intent-review-turn",
+            InteractionResponse::new("intent-1", IntentReviewDecision::Confirm.wire_id()),
+        )
+        .await
+        .expect("confirm resolves the non-mutating gate");
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "confirm releases the held queue"
+    );
+    worker.abort();
+}
+
+/// W2-02 AC3: revise/cancel must discard turns queued under the IntentSpec
+/// review fence. Completing the Phase 0 turn alone is not enough — those
+/// queued mutations never received a confirmed IntentSpec.
+#[tokio::test]
+async fn intentspec_review_non_confirm_discards_queued_mutations() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase0::{IntentReviewAckDelivery, IntentReviewDecision},
+    };
+    use tokio::time::{Duration, sleep};
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    for decision in [IntentReviewDecision::Revise, IntentReviewDecision::Cancel] {
+        let started = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(MutatingExecutor {
+            started: Arc::clone(&started),
+        });
+        let boundary = ToolBoundaryRuntime::new(
+            Uuid::new_v4(),
+            PrincipalContext {
+                principal_id: format!("intentspec-review-{}-fence", decision.wire_id()),
+                role: PrincipalRole::Contributor,
+            },
+            ToolBoundaryPolicy::default_runtime(),
+            SecretRedactor::default_runtime(),
+            Arc::new(InMemoryAuditSink::default()),
+        );
+        let (handle, worker) =
+            AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "phase0-turn", "plan workflow", true),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("phase0 turn tracked");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "phase0-turn",
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: "intent-1".to_string(),
+                },
+                Box::new(IntentReviewAckDelivery::new()),
+            )
+            .await
+            .expect("worker owns the IntentSpec review interaction");
+        handle
+            .submit(TurnRequest::new(
+                "session",
+                "mutating-turn",
+                "apply_patch",
+                true,
+            ))
+            .await
+            .expect("mutating turn is accepted into the queue");
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+
+        handle
+            .respond(
+                "session",
+                "phase0-turn",
+                InteractionResponse::new("intent-1", decision.wire_id()),
+            )
+            .await
+            .expect("non-confirm decision resolves the review");
+        // Give the worker a moment to (incorrectly) start the queued turn if
+        // the fence regresses; then assert it never ran.
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "{} must discard queued mutations, not release them",
+            decision.wire_id()
+        );
+        let snapshot = handle
+            .snapshot("session")
+            .await
+            .expect("snapshot after non-confirm");
+        assert_eq!(snapshot.interaction, InteractionState::Completed);
+        assert_eq!(
+            snapshot.queued_turns,
+            0,
+            "{} must empty the queue of fenced mutations",
+            decision.wire_id()
+        );
+        worker.abort();
+    }
+}
+
+/// W2-03: Plan Execute must not release mutating work until the network-policy
+/// human gate resolves. Revise/Cancel discard queued mutations (same fence
+/// contract as IntentSpec review).
+#[tokio::test]
+async fn plan_review_network_policy_gate() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase1::{
+            NetworkPolicyAckDelivery, NetworkPolicyDecision, PlanReviewAckDelivery,
+            PlanReviewDecision,
+        },
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+        notify: Arc::clone(&notify),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "plan-review-network-policy-gate".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "plan-review-turn", "plan review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("plan review turn tracked");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "plan-review-turn",
+            InteractionState::AwaitingPlanReview {
+                interaction_id: "plan-1".to_string(),
+            },
+            Box::new(PlanReviewAckDelivery::new()),
+        )
+        .await
+        .expect("worker owns the Plan review interaction");
+
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutating turn is accepted into the queue");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "no mutating tool may run before Plan review + network policy resolve"
+    );
+
+    handle
+        .respond(
+            "session",
+            "plan-review-turn",
+            InteractionResponse::new("plan-1", PlanReviewDecision::Execute.wire_id()),
+        )
+        .await
+        .expect("Execute advances to network policy");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "Execute must HoldQueued — network policy still required"
+    );
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "network-policy-turn", "network policy", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("network policy turn tracked");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "network-policy-turn",
+            InteractionState::AwaitingNetworkPolicy {
+                interaction_id: "plan-1:network-policy".to_string(),
+            },
+            Box::new(NetworkPolicyAckDelivery::new()),
+        )
+        .await
+        .expect("worker owns the network policy interaction");
+
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot while awaiting network policy");
+    assert_eq!(
+        snapshot.interaction,
+        InteractionState::AwaitingNetworkPolicy {
+            interaction_id: "plan-1:network-policy".to_string(),
+        }
+    );
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    handle
+        .respond(
+            "session",
+            "network-policy-turn",
+            InteractionResponse::new(
+                "plan-1:network-policy",
+                NetworkPolicyDecision::Allow.wire_id(),
+            ),
+        )
+        .await
+        .expect("network allow releases the fence");
+
+    timeout(Duration::from_secs(2), notify.notified())
+        .await
+        .expect("queued mutation should start after network allow");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "network allow releases the held mutating queue"
+    );
+    worker.abort();
+}
+
+/// W2-03 end-to-end fence, mirroring `intentspec_review_blocks_mutation` but
+/// for the full Phase 1 sequence the TUI drives: a mutating Phase 1 turn
+/// terminalizes with `CompletedHoldQueued`, a non-mutating Plan review gate
+/// parks in front of the held queue, Execute hands off to a non-mutating
+/// network-policy gate, and only `network-allow` releases the mutation.
+#[tokio::test]
+async fn plan_review_gate_holds_phase1_queue_until_network_policy_resolves() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase1::{
+            NetworkPolicyAckDelivery, NetworkPolicyDecision, PlanReviewAckDelivery,
+            PlanReviewDecision, network_policy_interaction_id,
+        },
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, sleep, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+        notify: Arc::clone(&notify),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "plan-review-phase1-hold-queued".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    // The mutating Phase 1 turn that wrote the plan draft is still tracked when
+    // `PlanWorkflowComplete` lands, exactly as `track_external_turn` leaves it.
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase1-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("phase1 turn tracked");
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutating turn queues behind phase1");
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    handle
+        .finish_external_turn(
+            "session",
+            "phase1-turn",
+            Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                summary: "Execution plan draft persisted; awaiting review".to_string(),
+            }),
+        )
+        .await
+        .expect("phase1 terminalizes without releasing the queue");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "CompletedHoldQueued must not start queued mutations"
+    );
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "plan-review-turn", "Plan review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("non-mutating plan review gate parks in front of the queue");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "plan-review-turn",
+            InteractionState::AwaitingPlanReview {
+                interaction_id: "plan-7".to_string(),
+            },
+            Box::new(PlanReviewAckDelivery::new()),
+        )
+        .await
+        .expect("review gate owns AwaitingPlanReview");
+
+    sleep(Duration::from_millis(50)).await;
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot while awaiting plan review");
+    assert_eq!(
+        snapshot.interaction,
+        InteractionState::AwaitingPlanReview {
+            interaction_id: "plan-7".to_string(),
+        }
+    );
+    assert_eq!(snapshot.queued_turns, 1);
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    handle
+        .respond(
+            "session",
+            "plan-review-turn",
+            InteractionResponse::new("plan-7", PlanReviewDecision::Execute.wire_id()),
+        )
+        .await
+        .expect("Execute resolves the plan review gate");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "Execute alone must not admit mutating work — network policy is still unanswered"
+    );
+
+    let network_interaction_id = network_policy_interaction_id(Some("plan-7"));
+    assert_eq!(network_interaction_id, "plan-7:network-policy");
+    handle
+        .track_external_turn(
+            TurnRequest::new(
+                "session",
+                "network-policy-turn",
+                "network policy (default: deny)",
+                false,
+            ),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("network policy gate parks after Execute");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "network-policy-turn",
+            InteractionState::AwaitingNetworkPolicy {
+                interaction_id: network_interaction_id.clone(),
+            },
+            Box::new(NetworkPolicyAckDelivery::new()),
+        )
+        .await
+        .expect("network policy gate owns AwaitingNetworkPolicy");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "a preselected network default must not skip the human gate"
+    );
+
+    handle
+        .respond(
+            "session",
+            "network-policy-turn",
+            InteractionResponse::new(
+                network_interaction_id.as_str(),
+                NetworkPolicyDecision::Allow.wire_id(),
+            ),
+        )
+        .await
+        .expect("network allow resolves the last gate");
+    timeout(Duration::from_secs(2), notify.notified())
+        .await
+        .expect("queued mutation starts once both Phase 1 gates resolve");
+    assert_eq!(started.load(Ordering::SeqCst), 1);
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot after both gates resolved");
+    assert_eq!(snapshot.queued_turns, 0);
+    worker.abort();
+}
+
+/// W2-03 recovery: after Plan `Execute` durably resolves the review, the
+/// `NetworkPolicyRequested` marker keeps the mandatory network human gate
+/// recoverable across restart. Markers observed without a prior Execute
+/// resolution must not reopen (otherwise an unapproved plan could execute).
+#[test]
+fn plan_review_execute_leaves_network_policy_gate_recoverable() {
+    use libra::internal::ai::{
+        runtime::phase1::{
+            network_policy_interaction_id, open_network_policy_from_workflow,
+            open_plan_review_from_workflow,
+        },
+        session::{CodeWorkflowEventKind, jsonl::SessionJsonlStore},
+    };
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let network_interaction_id = network_policy_interaction_id(Some("plan-42"));
+
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "review-42".to_string(),
+            plan_id: "plan-42".to_string(),
+            turn_id: "plan-review-turn".to_string(),
+            phase1_turn_id: "phase1-turn".to_string(),
+        })
+        .expect("plan review marker persists");
+    // Premature marker (before Execute) must not restore.
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::NetworkPolicyRequested {
+            interaction_id: network_interaction_id.clone(),
+            plan_id: "plan-42".to_string(),
+            turn_id: "network-policy-turn".to_string(),
+            default_allow: true,
+        })
+        .expect("premature network policy marker persists");
+    {
+        let premature = SessionJsonlStore::new(session_root.clone());
+        let events: Vec<_> = premature
+            .load_code_workflow_replay()
+            .expect("replay")
+            .events
+            .into_iter()
+            .map(|e| e.event)
+            .collect();
+        assert!(
+            open_network_policy_from_workflow(events.iter()).is_none(),
+            "network marker before Plan Execute must not be restorable"
+        );
+    }
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "review-42".to_string(),
+            resolution: "execute".to_string(),
+        })
+        .expect("plan review resolution persists");
+
+    // Restart: a fresh store over the same session root.
+    let reloaded = SessionJsonlStore::new(session_root);
+    let events = |store: &SessionJsonlStore| {
+        store
+            .load_code_workflow_replay()
+            .expect("workflow replay")
+            .events
+            .into_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>()
+    };
+    let replayed = events(&reloaded);
+    assert_eq!(
+        open_plan_review_from_workflow(replayed.iter()),
+        None,
+        "the plan review is durably resolved, so its restore must no-op"
+    );
+    assert_eq!(
+        open_network_policy_from_workflow(replayed.iter()),
+        Some((
+            network_interaction_id.clone(),
+            "plan-42".to_string(),
+            "network-policy-turn".to_string(),
+            true,
+        )),
+        "after Execute, the unanswered network-policy gate must survive restart"
+    );
+
+    reloaded
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: network_interaction_id,
+            resolution: "network-allow".to_string(),
+        })
+        .expect("network policy resolution persists");
+    assert!(
+        open_network_policy_from_workflow(events(&reloaded).iter()).is_none(),
+        "answering the gate must clear the durable marker"
+    );
+}
+
+/// W2-03 r6: `PlanReviewAckDelivery` Execute returns `CompletedHoldQueued`,
+/// which must still append durable `InteractionResolved` so network-policy
+/// recovery can prove the plan was approved.
+#[tokio::test]
+async fn plan_review_execute_hold_queued_persists_interaction_resolved() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+            InteractionState, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+            phase1::{
+                PlanReviewAckDelivery, PlanReviewDecision, network_policy_interaction_id,
+                open_network_policy_from_workflow, open_plan_review_from_workflow,
+            },
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(session_root.clone()));
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "plan-review-hold-persist".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(libra::internal::ai::runtime::ExternalTurnTrackingExecutor),
+            boundary,
+        )
+        .with_durability(durability, "repo", "principal")
+        .with_durability_command_kind("tui_local_turn"),
+    );
+
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "review-hold".to_string(),
+            plan_id: "plan-hold".to_string(),
+            turn_id: "plan-review-turn".to_string(),
+            phase1_turn_id: "phase1-turn".to_string(),
+        })
+        .expect("plan review marker");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::NetworkPolicyRequested {
+            interaction_id: network_policy_interaction_id(Some("plan-hold")),
+            plan_id: "plan-hold".to_string(),
+            turn_id: "network-policy-turn".to_string(),
+            default_allow: true,
+        })
+        .expect("network policy marker before Execute");
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "plan-review-turn", "Plan review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("plan review gate tracked");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "plan-review-turn",
+            InteractionState::AwaitingPlanReview {
+                interaction_id: "review-hold".to_string(),
+            },
+            Box::new(PlanReviewAckDelivery::new()),
+        )
+        .await
+        .expect("plan review delivery registered");
+    handle
+        .respond(
+            "session",
+            "plan-review-turn",
+            InteractionResponse::new("review-hold", PlanReviewDecision::Execute.wire_id()),
+        )
+        .await
+        .expect("Execute settles via CompletedHoldQueued");
+
+    let events: Vec<_> = store
+        .load_code_workflow_replay()
+        .expect("replay")
+        .events
+        .into_iter()
+        .map(|event| event.event)
+        .collect();
+    assert!(
+        events.iter().any(|event| match event {
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id,
+                resolution,
+            }
+            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                resolution,
+                ..
+            } => {
+                interaction_id == "review-hold" && resolution.eq_ignore_ascii_case("execute")
+            }
+            _ => false,
+        }),
+        "CompletedHoldQueued Execute must append a durable execute resolution: {events:?}"
+    );
+    assert_eq!(
+        open_plan_review_from_workflow(events.iter()),
+        None,
+        "plan review must be closed after durable Execute"
+    );
+    assert_eq!(
+        open_network_policy_from_workflow(events.iter()),
+        Some((
+            network_policy_interaction_id(Some("plan-hold")),
+            "plan-hold".to_string(),
+            "network-policy-turn".to_string(),
+            true,
+        )),
+        "network gate must become restorable once Execute is durably resolved"
+    );
+    worker.abort();
+}
+
+/// W2-03 r9: after Plan `Execute` returns `CompletedHoldQueued`, a concurrent
+/// `submit` must not drain the held queue before the network-policy gate is
+/// tracked — otherwise a mutation can start without an explicit network choice.
+#[tokio::test]
+async fn plan_review_execute_hold_blocks_submit_until_network_gate_parks() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase1::{
+            NetworkPolicyAckDelivery, NetworkPolicyDecision, PlanReviewAckDelivery,
+            PlanReviewDecision, network_policy_interaction_id,
+        },
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, sleep, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let started = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let executor = Arc::new(MutatingExecutor {
+        started: Arc::clone(&started),
+        notify: Arc::clone(&notify),
+    });
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "plan-review-hold-submit-race".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase1-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("phase1 turn tracked");
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-before-execute",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutation queues behind phase1");
+    handle
+        .finish_external_turn(
+            "session",
+            "phase1-turn",
+            Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                summary: "plan draft ready".to_string(),
+            }),
+        )
+        .await
+        .expect("phase1 hold");
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "plan-review-turn", "Plan review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("plan review parks");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "plan-review-turn",
+            InteractionState::AwaitingPlanReview {
+                interaction_id: "review-race".to_string(),
+            },
+            Box::new(PlanReviewAckDelivery::new()),
+        )
+        .await
+        .expect("plan review registered");
+    handle
+        .respond(
+            "session",
+            "plan-review-turn",
+            InteractionResponse::new("review-race", PlanReviewDecision::Execute.wire_id()),
+        )
+        .await
+        .expect("Execute holds for network gate");
+
+    // Race window: a late submit after Execute must queue without starting the
+    // held mutation or this new one before the network gate is parked.
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-after-execute",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("post-Execute submit is accepted into the held queue");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "submit after Execute must not start mutations before the network gate parks"
+    );
+
+    let network_id = network_policy_interaction_id(Some("plan-race"));
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "network-policy-turn", "network policy", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("network gate parks");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "network-policy-turn",
+            InteractionState::AwaitingNetworkPolicy {
+                interaction_id: network_id.clone(),
+            },
+            Box::new(NetworkPolicyAckDelivery::new()),
+        )
+        .await
+        .expect("network delivery registered");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "network gate must keep mutations fenced"
+    );
+
+    handle
+        .respond(
+            "session",
+            "network-policy-turn",
+            InteractionResponse::new(&network_id, NetworkPolicyDecision::Allow.wire_id()),
+        )
+        .await
+        .expect("network allow");
+    timeout(Duration::from_secs(2), notify.notified())
+        .await
+        .expect("held mutations eventually start");
+    assert!(started.load(Ordering::SeqCst) >= 1);
+    worker.abort();
+}
+
+/// W2-03 r12: end-to-end crash/restart for the App-owned Execute → network
+/// marker ordering. Simulates the durable rows `App` writes, drops the live
+/// worker before `register_local_runtime_network_policy`, then recovers the
+/// gate from the session store and proves mutations stay fenced until Allow.
+#[tokio::test]
+async fn plan_review_network_gate_survives_worker_restart_after_execute() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+            InteractionState, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            RuntimeExecutionContext, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+            phase1::{
+                NetworkPolicyAckDelivery, NetworkPolicyDecision, PlanReviewAckDelivery,
+                PlanReviewDecision, network_policy_interaction_id,
+                open_network_policy_from_workflow, open_plan_review_from_workflow,
+            },
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, sleep, timeout},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let started = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(Notify::new());
+    let boundary = || {
+        ToolBoundaryRuntime::new(
+            Uuid::new_v4(),
+            PrincipalContext {
+                principal_id: "plan-review-restart".to_string(),
+                role: PrincipalRole::Contributor,
+            },
+            ToolBoundaryPolicy::default_runtime(),
+            SecretRedactor::default_runtime(),
+            Arc::new(InMemoryAuditSink::default()),
+        )
+    };
+
+    // Process 1: Phase 1 hold → Plan review → App-ordered network marker → Execute.
+    let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(session_root.clone()));
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(MutatingExecutor {
+                started: Arc::clone(&started),
+                notify: Arc::clone(&notify),
+            }),
+            boundary(),
+        )
+        .with_durability(durability, "repo", "principal")
+        .with_durability_command_kind("tui_local_turn"),
+    );
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "phase1-turn", "plan workflow", true),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .await
+        .expect("phase1 admitted");
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-turn",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("mutation queued");
+    handle
+        .finish_external_turn(
+            "session",
+            "phase1-turn",
+            Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                summary: "plan draft ready".to_string(),
+            }),
+        )
+        .await
+        .expect("phase1 hold");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "review-restart".to_string(),
+            plan_id: "plan-restart".to_string(),
+            turn_id: "plan-review-turn".to_string(),
+            phase1_turn_id: "phase1-turn".to_string(),
+        })
+        .expect("plan review marker");
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "plan-review-turn", "Plan review", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("plan review parks");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "plan-review-turn",
+            InteractionState::AwaitingPlanReview {
+                interaction_id: "review-restart".to_string(),
+            },
+            Box::new(PlanReviewAckDelivery::new()),
+        )
+        .await
+        .expect("plan review registered");
+
+    let network_id = network_policy_interaction_id(Some("plan-restart"));
+    // App writes the network marker *before* Execute settles.
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::NetworkPolicyRequested {
+            interaction_id: network_id.clone(),
+            plan_id: "plan-restart".to_string(),
+            turn_id: "network-policy-turn".to_string(),
+            default_allow: false,
+        })
+        .expect("network marker before Execute");
+    handle
+        .respond(
+            "session",
+            "plan-review-turn",
+            InteractionResponse::new("review-restart", PlanReviewDecision::Execute.wire_id()),
+        )
+        .await
+        .expect("Execute settles");
+    // Crash before register_local_runtime_network_policy.
+    worker.abort();
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 0);
+
+    let events = |root: &std::path::Path| {
+        SessionJsonlStore::new(root.to_path_buf())
+            .load_code_workflow_replay()
+            .expect("replay")
+            .events
+            .into_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>()
+    };
+    let replayed = events(&session_root);
+    assert_eq!(
+        open_plan_review_from_workflow(replayed.iter()),
+        None,
+        "Execute must have closed the plan review on disk"
+    );
+    assert_eq!(
+        open_network_policy_from_workflow(replayed.iter()),
+        Some((
+            network_id.clone(),
+            "plan-restart".to_string(),
+            "network-policy-turn".to_string(),
+            false,
+        )),
+        "network gate must survive restart after Execute"
+    );
+
+    // Process 2: restore gate and keep mutations fenced until Allow.
+    let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(session_root.clone()));
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(MutatingExecutor {
+                started: Arc::clone(&started),
+                notify: Arc::clone(&notify),
+            }),
+            boundary(),
+        )
+        .with_durability(durability, "repo", "principal")
+        .with_durability_command_kind("tui_local_turn"),
+    );
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "network-policy-turn", "network policy", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("restored network gate parks");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "network-policy-turn",
+            InteractionState::AwaitingNetworkPolicy {
+                interaction_id: network_id.clone(),
+            },
+            Box::new(NetworkPolicyAckDelivery::new()),
+        )
+        .await
+        .expect("network delivery registered");
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "mutating-after-restore",
+            "apply_patch",
+            true,
+        ))
+        .await
+        .expect("post-restore mutation queues");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "restored network gate must fence execution"
+    );
+    handle
+        .respond(
+            "session",
+            "network-policy-turn",
+            InteractionResponse::new(&network_id, NetworkPolicyDecision::Allow.wire_id()),
+        )
+        .await
+        .expect("network allow after restore");
+    timeout(Duration::from_secs(2), notify.notified())
+        .await
+        .expect("mutations start after restored Allow");
+    assert!(started.load(Ordering::SeqCst) >= 1);
+    worker.abort();
+}
+
+/// W2-03: Modify/Cancel on the Plan review must discard the mutations queued
+/// under the review fence rather than release them — the developer never
+/// approved the plan those turns would execute.
+#[tokio::test]
+async fn plan_review_non_execute_discards_queued_mutations() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+        InteractionState, PrincipalContext, PrincipalRole, RuntimeExecutionContext,
+        RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor,
+        ToolBoundaryPolicy, ToolBoundaryRuntime, TurnRequest,
+        phase1::{PlanReviewAckDelivery, PlanReviewDecision},
+    };
+    use tokio::time::{Duration, sleep};
+    use tokio_util::sync::CancellationToken;
+
+    struct MutatingExecutor {
+        started: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for MutatingExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "mutation applied".to_string(),
+            })
+        }
+    }
+
+    for decision in [PlanReviewDecision::Revise, PlanReviewDecision::Cancel] {
+        let started = Arc::new(AtomicUsize::new(0));
+        let executor = Arc::new(MutatingExecutor {
+            started: Arc::clone(&started),
+        });
+        let boundary = ToolBoundaryRuntime::new(
+            Uuid::new_v4(),
+            PrincipalContext {
+                principal_id: format!("plan-review-{}-fence", decision.wire_id()),
+                role: PrincipalRole::Contributor,
+            },
+            ToolBoundaryPolicy::default_runtime(),
+            SecretRedactor::default_runtime(),
+            Arc::new(InMemoryAuditSink::default()),
+        );
+        let (handle, worker) =
+            AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
+
+        handle
+            .track_external_turn(
+                TurnRequest::new("session", "plan-review-turn", "Plan review", false),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .expect("plan review gate tracked");
+        handle
+            .register_interaction_with_delivery(
+                "session",
+                "plan-review-turn",
+                InteractionState::AwaitingPlanReview {
+                    interaction_id: "plan-7".to_string(),
+                },
+                Box::new(PlanReviewAckDelivery::new()),
+            )
+            .await
+            .expect("worker owns the Plan review interaction");
+        handle
+            .submit(TurnRequest::new(
+                "session",
+                "mutating-turn",
+                "apply_patch",
+                true,
+            ))
+            .await
+            .expect("mutating turn is accepted into the queue");
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+
+        handle
+            .respond(
+                "session",
+                "plan-review-turn",
+                InteractionResponse::new("plan-7", decision.wire_id()),
+            )
+            .await
+            .expect("non-execute decision resolves the review");
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            0,
+            "{} must discard queued mutations, not release them",
+            decision.wire_id()
+        );
+        let snapshot = handle
+            .snapshot("session")
+            .await
+            .expect("snapshot after non-execute decision");
+        assert_eq!(snapshot.interaction, InteractionState::Completed);
+        assert_eq!(
+            snapshot.queued_turns,
+            0,
+            "{} must empty the queue of fenced mutations",
+            decision.wire_id()
+        );
+        worker.abort();
+    }
+}
+
 /// W1-04: the legacy TUI tool loop is externally executed, but its cancel
 /// request must still enter the runtime before the adapter signals its local
 /// cooperative token. A mutation marker shared with the runtime turns an
