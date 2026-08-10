@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4007-rename-3.sh"
 libra_command = "rev-parse"
 libra_surface = "rev-parse"
+libra_tests = ["command::t4_port_test::t4_port_t4007_prepare_reference_tree"]
 
 [[scenario]]
 id = "t4007-rename-3::prepare-work-tree"
@@ -31,6 +32,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4007-rename-3.sh"
 libra_command = "update-index"
 libra_surface = "--add"
+libra_tests = ["command::t4_port_test::t4_port_t4007_prepare_work_tree"]
 
 [[scenario]]
 id = "t4007-rename-3::copy-detection"
@@ -165,6 +167,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4007-rename-3.sh"
 libra_command = "update-index"
 libra_surface = "--remove"
+libra_tests = ["command::t4_port_test::t4_port_t4007_tweak_index"]
 
 [[scenario]]
 id = "t4007-rename-3::rename-detection"

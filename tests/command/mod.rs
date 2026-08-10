@@ -406,6 +406,7 @@ mod switch_error_test;
 mod switch_json_test;
 mod switch_test;
 mod symbolic_ref_test;
+mod t4_port_test;
 mod tag_test;
 mod update_index_test;
 mod update_ref_test;

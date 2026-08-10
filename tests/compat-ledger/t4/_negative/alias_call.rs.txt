@@ -1,0 +1,17 @@
+// NEGATIVE FIXTURE — this file must be REJECTED by the clean-room gate.
+//
+// Shape: the same foreign execution as `direct_process`, hidden one level
+// deeper — the process spawned is a shell, and the script it runs sources the
+// upstream harness library. The command name is no longer `git`, so a check
+// that only blacklisted binary names would pass this.
+
+#[test]
+fn t4_port_bogus_alias_call() {
+    let script = ". ./test-lib.sh && git diff --stat >actual";
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .expect("spawn sh");
+    assert!(out.status.success());
+}

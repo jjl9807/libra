@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "diff"
+libra_tests = ["command::t4_port_test::t4_port_t4001_setup"]
 
 [[scenario]]
 id = "t4001-diff-rename::update-index-add-a-file"
@@ -31,6 +32,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "update-index"
 libra_surface = "--add"
+libra_tests = ["command::t4_port_test::t4_port_t4001_update_index_add_a_file"]
 
 [[scenario]]
 id = "t4001-diff-rename::write-that-tree"
@@ -45,6 +47,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "write-tree"
 libra_surface = "write-tree"
+libra_tests = ["command::t4_port_test::t4_port_t4001_write_that_tree"]
 
 [[scenario]]
 id = "t4001-diff-rename::renamed-and-edited-the-file"
@@ -59,6 +62,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "update-index"
 libra_surface = "--add"
+libra_tests = ["command::t4_port_test::t4_port_t4001_renamed_and_edited_the_file"]
 
 [[scenario]]
 id = "t4001-diff-rename::git-diff-index-p-m-after-rename-and-editing"
@@ -133,6 +137,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "diff"
+libra_tests = ["command::t4_port_test::t4_port_t4001_test_diff_renames_unset"]
 
 [[scenario]]
 id = "t4001-diff-rename::favour-same-basenames-over-different-ones"
@@ -147,6 +152,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "status"
 libra_surface = "status"
+libra_tests = ["command::t4_port_test::t4_port_t4001_favour_same_basenames_over_different_ones"]
 
 [[scenario]]
 id = "t4001-diff-rename::test-diff-renames-true-for-git-status"
@@ -191,6 +197,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "status"
 libra_surface = "status"
+libra_tests = ["command::t4_port_test::t4_port_t4001_favour_same_basenames_even_with_minor_differences"]
 
 [[scenario]]
 id = "t4001-diff-rename::two-files-with-same-basename-and-same-content"
@@ -205,6 +212,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "status"
 libra_surface = "status"
+libra_tests = ["command::t4_port_test::t4_port_t4001_two_files_with_same_basename_and_same_content"]
 
 [[scenario]]
 id = "t4001-diff-rename::setup-for-many-rename-source-candidates"
@@ -234,6 +242,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "-M"
+libra_tests = ["command::t4_port_test::t4_port_t4001_rename_pretty_print_with_nothing_in_common"]
 
 [[scenario]]
 id = "t4001-diff-rename::rename-pretty-print-with-common-prefix"
@@ -248,6 +257,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "-M"
+libra_tests = ["command::t4_port_test::t4_port_t4001_rename_pretty_print_with_common_prefix"]
 
 [[scenario]]
 id = "t4001-diff-rename::rename-pretty-print-with-common-suffix"
@@ -262,6 +272,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "-M"
+libra_tests = ["command::t4_port_test::t4_port_t4001_rename_pretty_print_with_common_suffix"]
 
 [[scenario]]
 id = "t4001-diff-rename::rename-pretty-print-with-common-prefix-and-suffix"
@@ -276,6 +287,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "-M"
+libra_tests = ["command::t4_port_test::t4_port_t4001_rename_pretty_print_with_common_prefix_and_suffix"]
 
 [[scenario]]
 id = "t4001-diff-rename::rename-pretty-print-common-prefix-and-suffix-overlap"
@@ -290,6 +302,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4001-diff-rename.sh"
 libra_command = "diff"
 libra_surface = "-M"
+libra_tests = ["command::t4_port_test::t4_port_t4001_rename_pretty_print_common_prefix_and_suffix_overlap"]
 
 [[scenario]]
 id = "t4001-diff-rename::diff-tree-l0-defaults-to-a-big-rename-limit-not-zero"

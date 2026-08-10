@@ -1,0 +1,21 @@
+// NEGATIVE FIXTURE — this file must be REJECTED by the clean-room gate.
+//
+// Shape: a migrated case that shells out to the real `git` binary instead of
+// exercising Libra, and orients itself with the upstream harness's directory
+// variable. Text-similarity checks alone would not catch a rewrite like this,
+// so the token sieve is what has to fire.
+//
+// Not compiled. Lives under `_negative/`, which the change-set token scan
+// excludes by design — a deliberate violation sample cannot also be required
+// to be clean.
+
+#[test]
+fn t4_port_bogus_direct_process() {
+    let root = std::env::var("TEST_DIRECTORY").expect("upstream harness root");
+    let out = std::process::Command::new("git")
+        .args(["diff", "--stat"])
+        .current_dir(&root)
+        .output()
+        .expect("spawn git");
+    assert!(out.status.success());
+}

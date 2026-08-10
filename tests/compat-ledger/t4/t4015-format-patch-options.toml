@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "commit"
 libra_surface = "-m"
+libra_tests = ["command::t4_port_test::t4_port_t4015_setup"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-base-commit-adds-base-commit-info"
@@ -31,6 +32,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--base"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_base_commit_adds_base_commit_info"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-base-with-multi-patch-puts-base-commit-on-last-patch-only"
@@ -45,6 +47,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--base"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_base_with_multi_patch_puts_base_commit_on_last_patch_only"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-s-adds-signed-off-by"
@@ -59,6 +62,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "-s"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_s_adds_signed_off_by"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-signoff-adds-signed-off-by"
@@ -73,6 +77,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--signoff"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_signoff_adds_signed_off_by"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-in-reply-to-adds-in-reply-to-and-references"
@@ -87,6 +92,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--in-reply-to"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_in_reply_to_adds_in_reply_to_and_references"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-cc-adds-cc-header"
@@ -101,6 +107,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--cc"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_cc_adds_cc_header"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-to-adds-to-header"
@@ -115,6 +122,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--to"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_to_adds_to_header"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-cc-and-to-can-be-combined"
@@ -129,6 +137,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--cc"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_cc_and_to_can_be_combined"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-attach-produces-mime-attachment"
@@ -143,6 +152,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--attach"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_attach_produces_mime_attachment"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-inline-produces-mime-inline"
@@ -157,6 +167,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4015-format-patch-options.sh"
 libra_command = "format-patch"
 libra_surface = "--inline"
+libra_tests = ["command::t4_port_test::t4_port_t4015_format_patch_inline_produces_mime_inline"]
 
 [[scenario]]
 id = "t4015-format-patch-options::format-patch-k-keeps-subject-without-patch-prefix"
