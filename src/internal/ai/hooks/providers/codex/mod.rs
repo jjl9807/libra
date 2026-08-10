@@ -23,7 +23,7 @@
 //! - **Event names** (PascalCase in config): `PreToolUse`,
 //!   `PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`,
 //!   `SessionStart`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`,
-//!   `Stop`. There is **no `SessionEnd`**.
+//!   `Stop`, `SessionEnd`.
 //! - **Hook stdin payload is Claude Code-compatible** single-line JSON:
 //!   `{"session_id", "transcript_path", "cwd", "hook_event_name", "model",
 //!   "permission_mode", …}`; `UserPromptSubmit` adds `prompt` + `turn_id`;
@@ -69,20 +69,18 @@ use super::super::{
 /// in [`super`] (mirroring `CLAUDE_PROVIDER` / `GEMINI_PROVIDER`).
 pub static CODEX_PROVIDER: CodexProvider = CodexProvider;
 
-/// Hook commands the Codex provider can install and parse *today*. Codex has
-/// no `SessionEnd`/`ModelUpdate` hook, so those variants are absent;
-/// `Compaction` covers `PreCompact` (with `PostCompact` mapping to the
-/// CompactionCompleted lifecycle kind at parse time). Codex's
-/// Codex natively emits sub-agent lifecycle hooks (`SubagentStart` /
-/// `SubagentStop`), forwarded to the `subagent-start` / `subagent-end`
-/// verbs (AG-19). `Compaction` covers the parsed `PreCompact` event even
-/// though the default installer does not forward it.
+/// Hook commands the Codex provider can install and parse. Events that share a
+/// lifecycle kind intentionally share a command: both `PreToolUse` and
+/// `PostToolUse` use `tool-use`, while `PreCompact` and `PostCompact` use
+/// `compaction`; the original provider event name remains in the envelope.
 const SUPPORTED_COMMANDS: &[ProviderHookCommand] = &[
     ProviderHookCommand::SessionStart,
     ProviderHookCommand::Prompt,
     ProviderHookCommand::ToolUse,
+    ProviderHookCommand::PermissionRequest,
     ProviderHookCommand::Compaction,
     ProviderHookCommand::Stop,
+    ProviderHookCommand::SessionEnd,
     ProviderHookCommand::SubagentStart,
     ProviderHookCommand::SubagentEnd,
 ];
@@ -160,9 +158,9 @@ mod tests {
             CANONICAL_DEDUP_IDENTITY_KEYS
         );
         assert_eq!(provider.supported_commands(), SUPPORTED_COMMANDS);
-        assert_eq!(provider.supported_commands().len(), 7);
+        assert_eq!(provider.supported_commands().len(), 9);
 
-        // recognizes_event follows the parser's 10-event name table; names
+        // recognizes_event follows the parser's 11-event name table; names
         // Codex never emits are skip-and-logged upstream.
         for name in [
             "SessionStart",
@@ -175,10 +173,11 @@ mod tests {
             "SubagentStop",
             "PermissionRequest",
             "Stop",
+            "SessionEnd",
         ] {
             assert!(provider.recognizes_event(name), "must recognize '{name}'");
         }
-        for name in ["SessionEnd", "ModelUpdate", "session.created", "stop"] {
+        for name in ["ModelUpdate", "session.created", "stop"] {
             assert!(
                 !provider.recognizes_event(name),
                 "must not recognize '{name}'",

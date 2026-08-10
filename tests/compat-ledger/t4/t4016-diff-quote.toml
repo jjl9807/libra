@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4016-diff-quote.sh"
 libra_command = "mv"
 libra_surface = "mv"
+libra_tests = ["command::t4_port_test::t4_port_t4016_setup"]
 
 [[scenario]]
 id = "t4016-diff-quote::setup-expected-files"
@@ -31,6 +32,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4016-diff-quote.sh"
 libra_command = "mv"
 libra_surface = "mv"
+libra_tests = ["command::t4_port_test::t4_port_t4016_setup_expected_files"]
 
 [[scenario]]
 id = "t4016-diff-quote::git-diff-summary-m-head"
@@ -45,6 +47,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4016-diff-quote.sh"
 libra_command = "diff"
 libra_surface = "--summary"
+libra_tests = ["command::t4_port_test::t4_port_t4016_git_diff_summary_m_head"]
 
 [[scenario]]
 id = "t4016-diff-quote::git-diff-numstat-m-head"
@@ -59,6 +62,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4016-diff-quote.sh"
 libra_command = "diff"
 libra_surface = "--numstat"
+libra_tests = ["command::t4_port_test::t4_port_t4016_git_diff_numstat_m_head"]
 
 [[scenario]]
 id = "t4016-diff-quote::git-diff-stat-m-head"
@@ -73,3 +77,4 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4016-diff-quote.sh"
 libra_command = "diff"
 libra_surface = "--stat"
+libra_tests = ["command::t4_port_test::t4_port_t4016_git_diff_stat_m_head"]

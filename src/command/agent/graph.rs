@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{Local, TimeZone};
 use clap::Args;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
@@ -135,6 +136,19 @@ struct CheckpointContentSummary {
     assistant_message_count: usize,
     user_preview: Option<String>,
     assistant_preview: Option<String>,
+    thinking_count: usize,
+    thinking_encrypted: bool,
+    thinking_preview: Option<String>,
+    turns: BTreeMap<String, TurnContentSummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TurnContentSummary {
+    user_inputs: Vec<String>,
+    assistant_previews: Vec<String>,
+    thinking_previews: Vec<String>,
+    thinking_count: usize,
+    thinking_encrypted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -160,7 +174,12 @@ pub async fn execute_safe(args: GraphArgs, output: &OutputConfig) -> CliResult<(
             .with_hint("verify that --repo names an initialized Libra repository.")
     })?;
     let interactive = stdin().is_terminal() && stdout().is_terminal();
-    let projection = load_agent_graph(&storage_root, &args.session, interactive).await?;
+    let projection = load_agent_graph(
+        &storage_root,
+        &args.session,
+        interactive && !output.is_json(),
+    )
+    .await?;
 
     if output.is_json() {
         return emit_json_data("agent_graph", &projection.output, output);
@@ -363,6 +382,9 @@ async fn load_checkpoints<C: ConnectionTrait>(
 
 const GRAPH_CONTENT_READ_MAX_BYTES: u64 = 256 * 1024;
 const GRAPH_PREVIEW_MAX_CHARS: usize = 240;
+const GRAPH_MAX_TURN_CONTENT_ROWS: usize = 128;
+const GRAPH_MAX_PREVIEWS_PER_TURN: usize = 8;
+const UNATTRIBUTED_TURN_KEY: &str = "__unattributed__";
 
 fn load_checkpoint_content_summary(
     storage_root: &Path,
@@ -397,26 +419,53 @@ fn summarize_transcript(bytes: &[u8], truncated: bool) -> CheckpointContentSumma
         let Some(payload) = value.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(serde_json::Value::as_str) != Some("message") {
-            continue;
-        }
-        let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(text) = message_text(payload) else {
-            continue;
-        };
-        let Some(preview) = compact_preview(&text) else {
-            continue;
-        };
-        match role {
-            "user" => {
-                summary.user_message_count += 1;
-                summary.user_preview = Some(preview);
+        let turn_key = transcript_turn_key(payload);
+        match payload.get("type").and_then(serde_json::Value::as_str) {
+            Some("message") => {
+                let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let Some(text) = message_text(payload) else {
+                    continue;
+                };
+                let Some(preview) = compact_preview(&text) else {
+                    continue;
+                };
+                match role {
+                    "user" => {
+                        summary.user_message_count += 1;
+                        summary.user_preview = Some(preview.clone());
+                        let turn = turn_summary_mut(&mut summary, turn_key.as_deref());
+                        push_preview(&mut turn.user_inputs, preview);
+                    }
+                    "assistant" => {
+                        summary.assistant_message_count += 1;
+                        summary.assistant_preview = Some(preview.clone());
+                        let turn = turn_summary_mut(&mut summary, turn_key.as_deref());
+                        push_preview(&mut turn.assistant_previews, preview);
+                    }
+                    _ => {}
+                }
             }
-            "assistant" => {
-                summary.assistant_message_count += 1;
-                summary.assistant_preview = Some(preview);
+            Some("reasoning") | Some("thinking") => {
+                summary.thinking_count += 1;
+                let encrypted = payload
+                    .get("encrypted_content")
+                    .is_some_and(serde_json::Value::is_string);
+                if encrypted {
+                    summary.thinking_encrypted = true;
+                }
+                let preview = reasoning_preview(payload);
+                if let Some(preview) = &preview {
+                    summary.thinking_preview = Some(preview.clone());
+                }
+                let turn = turn_summary_mut(&mut summary, turn_key.as_deref());
+                turn.thinking_count += 1;
+                if let Some(preview) = preview {
+                    push_preview(&mut turn.thinking_previews, preview);
+                } else {
+                    turn.thinking_encrypted = encrypted;
+                }
             }
             _ => {}
         }
@@ -424,21 +473,68 @@ fn summarize_transcript(bytes: &[u8], truncated: bool) -> CheckpointContentSumma
     summary
 }
 
+fn transcript_turn_key(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .or_else(|| payload.get("internal_chat_message_metadata"))
+        .and_then(|metadata| metadata.get("turn_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn turn_summary_mut<'a>(
+    summary: &'a mut CheckpointContentSummary,
+    turn_key: Option<&str>,
+) -> &'a mut TurnContentSummary {
+    let key = turn_key.unwrap_or(UNATTRIBUTED_TURN_KEY).to_string();
+    if !summary.turns.contains_key(&key) && summary.turns.len() >= GRAPH_MAX_TURN_CONTENT_ROWS {
+        return summary
+            .turns
+            .entry(UNATTRIBUTED_TURN_KEY.to_string())
+            .or_default();
+    }
+    summary.turns.entry(key).or_default()
+}
+
+fn push_preview(previews: &mut Vec<String>, preview: String) {
+    if previews.len() < GRAPH_MAX_PREVIEWS_PER_TURN {
+        previews.push(preview);
+    }
+}
+
+fn reasoning_preview(payload: &serde_json::Value) -> Option<String> {
+    let summary = payload.get("summary")?;
+    let text = match summary {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .or_else(|| item.get("text").and_then(serde_json::Value::as_str))
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    compact_preview(&text)
+}
+
 fn message_text(payload: &serde_json::Value) -> Option<String> {
     if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
         return Some(text.to_string());
     }
-    payload
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .map(|blocks| {
-            blocks
+    match payload.get("content")? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let text = blocks
                 .iter()
                 .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
                 .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .filter(|text| !text.trim().is_empty())
+                .join(" ");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
+    }
 }
 
 fn compact_preview(text: &str) -> Option<String> {
@@ -703,6 +799,7 @@ struct TuiRow {
 struct AgentGraphTuiApp {
     rows: Vec<TuiRow>,
     state: ListState,
+    agent_kind: String,
 }
 
 fn append_content_details(
@@ -741,10 +838,97 @@ fn append_content_details(
     if let Some(preview) = &content.assistant_preview {
         details.push(("assistant_content".to_string(), preview.clone()));
     }
+    if content.thinking_count > 0 {
+        details.push((
+            "thinking_events".to_string(),
+            content.thinking_count.to_string(),
+        ));
+        if let Some(preview) = &content.thinking_preview {
+            details.push(("thinking_summary".to_string(), preview.clone()));
+        } else if content.thinking_encrypted {
+            details.push((
+                "thinking_status".to_string(),
+                "encrypted; plaintext summary unavailable".to_string(),
+            ));
+        }
+    }
+}
+
+fn append_turn_content_details(
+    details: &mut Vec<(String, String)>,
+    content: Option<&CheckpointContentSummary>,
+    logical_turn_key: &str,
+    ordinal: usize,
+) {
+    let Some(content) = content else {
+        details.push((
+            format!("turn[{ordinal}]_input"),
+            "unavailable (checkpoint not linked)".to_string(),
+        ));
+        return;
+    };
+    let Some(turn) = content
+        .turns
+        .get(logical_turn_key)
+        .or_else(|| content.turns.get(UNATTRIBUTED_TURN_KEY))
+    else {
+        details.push((
+            format!("turn[{ordinal}]_input"),
+            "unavailable in captured transcript".to_string(),
+        ));
+        if content.thinking_encrypted {
+            details.push((
+                format!("turn[{ordinal}]_thinking_status"),
+                "encrypted; plaintext summary unavailable".to_string(),
+            ));
+        }
+        return;
+    };
+    if turn.user_inputs.is_empty() {
+        details.push((
+            format!("turn[{ordinal}]_input"),
+            "none recorded".to_string(),
+        ));
+    } else {
+        for input in &turn.user_inputs {
+            details.push((format!("turn[{ordinal}]_input"), input.clone()));
+        }
+    }
+    if turn.thinking_previews.is_empty() {
+        if turn.thinking_encrypted {
+            details.push((
+                format!("turn[{ordinal}]_thinking_status"),
+                "encrypted; plaintext summary unavailable".to_string(),
+            ));
+        }
+    } else {
+        for thinking in &turn.thinking_previews {
+            details.push((format!("turn[{ordinal}]_thinking"), thinking.clone()));
+        }
+    }
+}
+
+fn format_local_timestamp(timestamp: i64) -> String {
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|value| {
+            format!(
+                "{} (unix: {timestamp})",
+                value.format("%Y-%m-%d %H:%M:%S %:z")
+            )
+        })
+        .unwrap_or_else(|| timestamp.to_string())
 }
 
 impl AgentGraphTuiApp {
     fn new(projection: &AgentGraphProjection) -> Self {
+        let agent_kind = projection
+            .output
+            .session
+            .as_ref()
+            .map(|session| safe_display(&session.agent_kind))
+            .unwrap_or_else(|| "unknown".to_string());
         let mut rows = Vec::new();
         if projection.output.state == "erased" {
             rows.push(TuiRow {
@@ -753,10 +937,16 @@ impl AgentGraphTuiApp {
             });
         } else if let Some(session) = &projection.output.session {
             let mut session_details = vec![
-                ("agent_kind".to_string(), safe_display(&session.agent_kind)),
+                ("agent".to_string(), safe_display(&session.agent_kind)),
                 ("state".to_string(), safe_display(&session.state)),
-                ("created_at".to_string(), session.created_at.to_string()),
-                ("updated_at".to_string(), session.updated_at.to_string()),
+                (
+                    "created_at".to_string(),
+                    format_local_timestamp(session.created_at),
+                ),
+                (
+                    "updated_at".to_string(),
+                    format_local_timestamp(session.updated_at),
+                ),
                 (
                     "checkpoints".to_string(),
                     projection.checkpoints.len().to_string(),
@@ -765,13 +955,30 @@ impl AgentGraphTuiApp {
             let latest_checkpoint = projection
                 .checkpoints
                 .values()
+                .filter(|checkpoint| checkpoint.content.event_count > 0)
                 .max_by_key(|checkpoint| checkpoint.created_at);
             append_content_details(
                 &mut session_details,
                 latest_checkpoint.map(|checkpoint| &checkpoint.content),
             );
+            for turn in &projection.output.turns {
+                let checkpoint = turn
+                    .checkpoint_id
+                    .as_ref()
+                    .and_then(|id| projection.checkpoints.get(id));
+                append_turn_content_details(
+                    &mut session_details,
+                    checkpoint.map(|value| &value.content),
+                    &turn.logical_turn_key,
+                    turn.ordinal,
+                );
+            }
             rows.push(TuiRow {
-                label: format!("session {}", safe_display(&session.session_id)),
+                label: format!(
+                    "session [{}] {}",
+                    safe_display(&session.agent_kind),
+                    safe_display(&session.session_id)
+                ),
                 details: session_details,
             });
             for turn in &projection.output.turns {
@@ -809,6 +1016,12 @@ impl AgentGraphTuiApp {
                     &mut turn_details,
                     current_checkpoint.map(|checkpoint| &checkpoint.content),
                 );
+                append_turn_content_details(
+                    &mut turn_details,
+                    current_checkpoint.map(|checkpoint| &checkpoint.content),
+                    &turn.logical_turn_key,
+                    turn.ordinal,
+                );
                 rows.push(TuiRow {
                     label: format!(
                         "  turn[{}] {} [{}]",
@@ -831,7 +1044,10 @@ impl AgentGraphTuiApp {
                                 .map(|value| value.scope.clone())
                                 .unwrap_or_else(|| "unknown".to_string()),
                         ),
-                        ("created_at".to_string(), revision.created_at.to_string()),
+                        (
+                            "created_at".to_string(),
+                            format_local_timestamp(revision.created_at),
+                        ),
                     ];
                     append_content_details(
                         &mut revision_details,
@@ -868,10 +1084,11 @@ impl AgentGraphTuiApp {
                         ),
                         (
                             "created_at".to_string(),
-                            checkpoint
-                                .map(|value| value.created_at)
-                                .unwrap_or(node.created_at)
-                                .to_string(),
+                            format_local_timestamp(
+                                checkpoint
+                                    .map(|value| value.created_at)
+                                    .unwrap_or(node.created_at),
+                            ),
                         ),
                     ];
                     append_content_details(
@@ -907,7 +1124,11 @@ impl AgentGraphTuiApp {
         if !rows.is_empty() {
             state.select(Some(0));
         }
-        Self { rows, state }
+        Self {
+            rows,
+            state,
+            agent_kind,
+        }
     }
 
     fn move_up(&mut self) {
@@ -967,7 +1188,10 @@ fn render_agent_graph(frame: &mut Frame<'_>, app: &mut AgentGraphTuiApp) {
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled(" Libra ", Style::default().fg(COLOR_ACCENT)),
-        Span::styled("Agent Capture Graph", Style::default().fg(COLOR_FG)),
+        Span::styled(
+            format!("Agent Capture Graph [{}]", safe_display(&app.agent_kind)),
+            Style::default().fg(COLOR_FG),
+        ),
     ]))
     .block(
         Block::default()
@@ -1105,6 +1329,17 @@ mod tests {
                             assistant_message_count: 1,
                             user_preview: Some("show the captured turn".to_string()),
                             assistant_preview: Some("the turn was captured".to_string()),
+                            turns: BTreeMap::from([(
+                                "turn:1".to_string(),
+                                TurnContentSummary {
+                                    user_inputs: vec!["show the captured turn".to_string()],
+                                    thinking_previews: vec![
+                                        "inspect the captured input".to_string(),
+                                    ],
+                                    thinking_count: 1,
+                                    ..TurnContentSummary::default()
+                                },
+                            )]),
                             ..CheckpointContentSummary::default()
                         },
                     },
@@ -1125,7 +1360,7 @@ mod tests {
 
     #[test]
     fn agent_graph_renders_session_turn_revisions_and_subagents() {
-        let backend = TestBackend::new(120, 30);
+        let backend = TestBackend::new(120, 50);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         let mut app = AgentGraphTuiApp::new(&fixture_projection());
         terminal
@@ -1139,24 +1374,37 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Agent Capture Graph"));
+        assert!(rendered.contains("[codex]"));
         assert!(rendered.contains("codex__fixture"));
         assert!(rendered.contains("turn[0] turn:1"));
         assert!(rendered.contains("revision 1 incomplete"));
         assert!(rendered.contains("subagent-content"));
         assert!(rendered.contains("show the captured turn"));
         assert!(rendered.contains("the turn was captured"));
+        assert!(rendered.contains("turn[0]_input"));
+        assert!(rendered.contains("inspect the captured input"));
     }
 
     #[test]
     fn graph_content_preview_extracts_redacted_user_and_assistant_messages() {
         let transcript = br#"
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect AKIAIOSFODNN7EXAMPLE"}]}}
-{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done\nwith details"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect AKIAIOSFODNN7EXAMPLE"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[{"text":"inspect the request safely"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done\nwith details"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"opaque","internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
 "#;
         let summary = summarize_transcript(transcript, false);
-        assert_eq!(summary.event_count, 2);
+        assert_eq!(summary.event_count, 4);
         assert_eq!(summary.user_message_count, 1);
         assert_eq!(summary.assistant_message_count, 1);
+        assert_eq!(summary.thinking_count, 2);
+        assert!(summary.thinking_encrypted);
+        assert_eq!(summary.turns["turn:1"].user_inputs.len(), 1);
+        assert!(summary.turns["turn:1"].user_inputs[0].contains("<REDACTED:"));
+        assert_eq!(
+            summary.turns["turn:1"].thinking_previews,
+            vec!["inspect the request safely".to_string()]
+        );
         assert!(
             summary
                 .user_preview
@@ -1167,6 +1415,13 @@ mod tests {
             summary.assistant_preview.as_deref(),
             Some("done with details")
         );
+    }
+
+    #[test]
+    fn graph_formats_local_time_while_retaining_unix_timestamp() {
+        let formatted = format_local_timestamp(1);
+        assert!(formatted.contains("(unix: 1)"));
+        assert!(formatted.contains(":00:01"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4005-diff-rename-2.sh"
 libra_command = "hash-object"
 libra_surface = "hash-object"
+libra_tests = ["command::t4_port_test::t4_port_t4005_setup_reference_tree"]
 
 [[scenario]]
 id = "t4005-diff-rename-2::validate-output-from-rename-copy-detection-1"

@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4006-diff-mode.sh"
 libra_command = "write-tree"
 libra_surface = "write-tree"
+libra_tests = ["command::t4_port_test::t4_port_t4006_setup"]
 
 [[scenario]]
 id = "t4006-diff-mode::chmod"
@@ -46,6 +47,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4006-diff-mode.sh"
 libra_command = "commit"
 libra_surface = "-m"
+libra_tests = ["command::t4_port_test::t4_port_t4006_prepare_binary_file"]
 
 [[scenario]]
 id = "t4006-diff-mode::stat-output-after-text-chmod"
@@ -60,6 +62,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4006-diff-mode.sh"
 libra_command = "diff"
 libra_surface = "--stat"
+libra_tests = ["command::t4_port_test::t4_port_t4006_stat_output_after_text_chmod"]
 
 [[scenario]]
 id = "t4006-diff-mode::shortstat-output-after-text-chmod"
@@ -74,6 +77,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4006-diff-mode.sh"
 libra_command = "diff"
 libra_surface = "--shortstat"
+libra_tests = ["command::t4_port_test::t4_port_t4006_shortstat_output_after_text_chmod"]
 
 [[scenario]]
 id = "t4006-diff-mode::stat-output-after-binary-chmod"
@@ -88,6 +92,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4006-diff-mode.sh"
 libra_command = "diff"
 libra_surface = "--stat"
+libra_tests = ["command::t4_port_test::t4_port_t4006_stat_output_after_binary_chmod"]
 
 [[scenario]]
 id = "t4006-diff-mode::shortstat-output-after-binary-chmod"
@@ -102,3 +107,4 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4006-diff-mode.sh"
 libra_command = "diff"
 libra_surface = "--shortstat"
+libra_tests = ["command::t4_port_test::t4_port_t4006_shortstat_output_after_binary_chmod"]

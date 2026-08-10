@@ -11,6 +11,29 @@
   `maxAttempts` to extend an exhausted automatic-repair limit. English and
   zh-CN Code/control documentation describe the wire contract.
 
+### Added (plan-20260729 CT3-02, 2026-08-10)
+
+- **First clean-room wave of upstream Git compatibility tests (t4).** 77
+  scenarios from the upstream `t4*` diff family, rewritten against Libra's own
+  helpers with expectations taken from the Git-side contract, land as
+  `tests/command/t4_port_test.rs` (`command::t4_port_test::*`). Each test maps
+  to exactly one row in the evidence ledger under `tests/compat-ledger/t4/`,
+  which records the command, the surface it proves, and the doc anchor that
+  documents it; `PROVENANCE.md` additionally records, per scenario, a replayable
+  three-part source for the expected value and the output Libra actually
+  produced. No upstream text is vendored — a clean-room gate rejects any shared
+  8-token window or 40-character common substring with the pinned corpus.
+
+### Fixed (plan-20260729 CTF-P01/CTF-P03, 2026-08-10)
+
+- **`diff --check --exit-code` lost the "there is a difference" status bit.**
+  Git adds the two contributions — 1 for a difference, 2 for whitespace damage —
+  so a clean difference is `1` and a damaged one is `3`. Libra returned `0` and
+  `2`. Migrating the upstream scenarios surfaced it.
+- **`update-index --add --remove` silently staged nothing.** Given both flags on
+  a path that exists, the command exited 0 without staging it. The two are
+  non-exclusive permissions in Git: presence on disk decides per path.
+
 ### Added (plan-20260715 W2-06, 2026-08-10)
 
 - **W2-06 migrate Goal / task.dispatch / skill consumer onto runtime control.**

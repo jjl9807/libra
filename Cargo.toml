@@ -511,3 +511,7 @@ required-features = ["test-live-ai"]
 name = "ai_ollama_live_gate_test"
 path = "tests/ai_ollama_live_gate_test.rs"
 required-features = ["test-live-ai"]
+
+[[test]]
+name = "compat_serial_registry"
+path = "tests/compat/serial_registry.rs"
