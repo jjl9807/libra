@@ -175,7 +175,13 @@ revision, or subagent additionally shows a bounded content summary: event
 counts plus compact user/assistant message previews from the linked
 checkpoint. The TUI reads at most 256 KiB per checkpoint, follows the stored
 manifest, and applies the default redactor again; it never renders the full
-transcript or provider file path. A locally erased session succeeds with `state="erased"`, a
+transcript or provider file path. The session row and title identify the
+captured agent, and human-readable `created_at`/`updated_at` values use the
+machine's local timezone while retaining the Unix value. Turn rows also show
+the captured input for that turn. Thinking is shown only from a stored,
+redacted provider summary; when the provider stores reasoning as encrypted
+content without a summary, the TUI reports that it is unavailable rather than
+attempting to decrypt it. A locally erased session succeeds with `state="erased"`, a
 null session, empty turns, and unavailable subagents; it is not recreated.
 An id absent from both the session catalog and erasure tombstones fails with
 `LBR-AGENT-021`. Without global `--json` or `--machine`, stdin and stdout must
@@ -387,6 +393,15 @@ checkpoint's immutable traces commit. Both evidence types remain listable,
 showable, exportable, prunable, and doctor-visible. An empty or metadata-only
 child file has no normalized turn evidence and is therefore recorded as
 `partial`, never as a complete child transcript.
+
+Codex capture installs all currently documented lifecycle events: `SessionStart`,
+`SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`,
+`PostToolUse`, `PreCompact`, `PostCompact`, `Stop`, `SubagentStart`, and
+`SubagentStop`. The checkpoint event projection preserves provider correlation
+fields such as `turn_id`, `tool_use_id`, `agent_id`, `agent_type`, compaction
+trigger, permission mode, tool input, and tool response. Codex's encrypted
+reasoning payload is retained only as an encrypted/unavailable status; hooks do
+not provide a decryption key or plaintext internal reasoning.
 
 Cloud mirroring publishes the capture catalog as dependency-ordered batches
 (`session → checkpoint → revision → link → claim`) under a token-fenced

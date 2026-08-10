@@ -139,6 +139,10 @@ description、metadata JSON、redaction report 或 coverage digest。交互式 T
 session、turn、revision 或 subagent 后，detail 会额外显示关联 checkpoint 的受限内容摘要：
 事件计数以及紧凑的 user/assistant 消息预览。TUI 每个 checkpoint 最多读取 256 KiB，
 严格按 manifest 读取，并再次经过默认脱敏；不会显示完整 transcript 或 provider 文件路径。
+session 行和标题会标明对应的 Agent；人类可读的 `created_at`/`updated_at` 使用本机时区，
+同时保留 Unix 时间戳。每个 turn 的 detail 会显示该 turn 的实际输入。thinking 只显示
+provider 保存的、已脱敏的摘要；如果 provider 只保存加密 reasoning 且没有摘要，TUI 会明确
+显示内容不可用，不会尝试解密。
 本地已擦除 session 成功返回 `state="erased"`、null session、空 turns 与 unavailable
 subagents，且不会重建；session 与 tombstone 均不存在时返回 `LBR-AGENT-021`。未指定全局 `--json`
 或 `--machine` 时，stdin/stdout 都必须是终端；非交互调用在初始化 TUI 前返回 usage
@@ -276,6 +280,8 @@ tombstone 的另一台机器仍可取回。所以 `agent erase` 应视为对**�
 人类可读的 `agent session list` 表格会把 `started_at` 按当前机器时钟显示为相对时间（例如 `2 hours ago`）；JSON 输出仍保留原始 Unix 时间戳，供自动化使用。
 
 每个 checkpoint 行携带 `scope`。`committed` checkpoint 在 turn/session 边界（`Stop` / `SessionEnd`）写入，携带脱敏的 transcript 快照。`subagent` 下有两类刻意分离的证据：Codex 的 `SubagentStart` / `SubagentEnd` hook 写空 transcript 的 **boundary checkpoint**，并以 `parent_checkpoint_id` 表达结构归属；Claude `<session>/subagents/*.jsonl` 则逐文件写独立的 **content checkpoint**，其 `parent_checkpoint_id` 保持 null，通过由安全打开的 provider-root-relative source 派生的 opaque SHA-256 claim 与 append-only revision 选出唯一 current content leaf；本地 project slug/文件名不落库，物理历史也不改写。Claude 当前不提供能与 boundary 对齐的稳定 ID，因此常态是 `link_state=unresolved`；`agent doctor` 会报告但不会猜测。只有 provider 给出稳定 ID 且唯一匹配时，才在独立 association 行中关联 boundary，不修改不可变 traces commit。两类证据均可 list/show/export/prune，且 doctor 可见。
+
+Codex 捕获会安装当前文档定义的全部生命周期事件：`SessionStart`、`SessionEnd`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`PreCompact`、`PostCompact`、`Stop`、`SubagentStart` 与 `SubagentStop`。checkpoint 的事件投影会保留 `turn_id`、`tool_use_id`、`agent_id`、`agent_type`、压缩触发原因、权限模式、工具输入和工具输出等关联字段。Codex 的加密 reasoning 只记录为加密/不可用状态；Hook 不会提供解密密钥，也不能还原明文内部 reasoning。
 
 云端镜像在 token-fenced generation 下按依赖顺序发布 catalog 批次（`session → checkpoint → revision → link → claim`）。session、checkpoint、link 与可变 claim 投影各自使用独立单调 sync generation，因此 prune 回退 current 子节点时不会制造同代冲突，retained traces 链的重写也不会被旧 clone 写回。显式 `--restore-erased` import 会为 session 与 opaque child-source namespace 启动新的耐久复制 incarnation；远端删除传播仍 deferred 时也不会复用旧 key。generation 同时绑定远端 object index 的 canonical digest；sync 会在 D1 与 R2 复验每个 checkpoint 对象，restore 只有在读取前后 manifest 与 object-index digest 均未变化时才接受 catalog。当前客户端只使用版本化的 v2 远端 session/checkpoint 表；v2 激活后，D1 trigger 会以升级提示拒绝旧客户端的无 fence 写入，避免其破坏一致恢复快照。
 

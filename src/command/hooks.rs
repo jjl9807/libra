@@ -32,7 +32,7 @@ use crate::{
 /// `hooks` is the entry point invoked by external AI agent hook
 /// configurations (Claude Code, Gemini) — it reads the hook event JSON
 /// on stdin and records it into the libra session store. Each provider
-/// exposes the seven Claude-Code-style lifecycle events; the banner
+/// exposes the provider's lifecycle events; the banner
 /// pins the most commonly wired ones (`session-start`, `prompt`,
 /// `tool-use`, `stop`, `session-end`) for both providers so operators
 /// see what to put in their hook config without reading the design
@@ -46,6 +46,7 @@ EXAMPLES:
     libra hooks claude stop                  Claude Stop hook entry
     libra hooks claude session-end           Claude SessionEnd hook entry
     libra hooks codex session-start          Codex SessionStart hook entry (AG-19 capture path)
+    libra hooks codex permission-request    Codex PermissionRequest hook entry
     libra hooks codex stop                   Codex Stop hook entry (checkpoint boundary)
     libra hooks codex subagent-start         Codex SubagentStart hook entry
     libra hooks gemini <event>               Rejected with a hint: gemini is uninstall-only
@@ -88,6 +89,7 @@ pub enum ProviderHookSubcommand {
     SessionStart,
     Prompt,
     ToolUse,
+    PermissionRequest,
     ModelUpdate,
     Compaction,
     Stop,
@@ -104,6 +106,7 @@ impl ProviderHookSubcommand {
             Self::SessionStart => ProviderHookCommand::SessionStart,
             Self::Prompt => ProviderHookCommand::Prompt,
             Self::ToolUse => ProviderHookCommand::ToolUse,
+            Self::PermissionRequest => ProviderHookCommand::PermissionRequest,
             Self::ModelUpdate => ProviderHookCommand::ModelUpdate,
             Self::Compaction => ProviderHookCommand::Compaction,
             Self::Stop => ProviderHookCommand::Stop,
