@@ -16,10 +16,10 @@ libra update-index --cacheinfo <mode>,<object>,<path>...
 ## Description
 
 `update-index` applies, in order: every `--cacheinfo` entry, then the positional
-paths (removed with `--remove`, otherwise (re)staged from the working tree), and
-saves the index. `--add` and `--remove` are permissions rather than alternatives,
-so they may be given together: for each path, one that still exists in the working
-tree is staged and one that is gone is dropped from the index.
+paths, and saves the index. `--add` and `--remove` are permissions rather than
+alternatives: `--remove` alone drops each named path from the index, `--add` alone
+(re)stages it from the working tree, and given together they route per path by
+whether it still exists — an existing path is staged, a missing one is dropped.
 
 - `--cacheinfo <mode>,<object>,<path>` inserts/updates an entry directly. The
   object **need not exist yet** (matching Git), so you can build an index from
