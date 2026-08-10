@@ -260,8 +260,10 @@ pub enum RuntimeTurnExecution {
         summary: String,
     },
     /// Finish the active turn as [`Completed`] without admitting the next
-    /// queued turn. Used when an adapter is about to track a follow-up gate
-    /// turn (e.g. IntentSpec review) that must keep the session fenced.
+    /// queued turn, and keep [`SessionQueue::hold_queued_admission`] set until a
+    /// follow-up gate turn is tracked. Used when an adapter is about to park
+    /// the next human gate (Plan review → network policy, IntentSpec review,
+    /// …) and a concurrent `submit` must not race into the held queue.
     CompletedHoldQueued {
         summary: String,
     },
@@ -1273,6 +1275,9 @@ impl AgentRuntimeWorker {
                 session_id: request.session_id.clone(),
             }
         })?;
+        // A follow-up gate turn now owns the admission fence, so release the
+        // post-`CompletedHoldQueued` hold (active is non-empty below).
+        session.hold_queued_admission = false;
         session.snapshot.active_turn_id = Some(turn_id.clone());
         session.snapshot.queued_turns = session.queued.len();
         session.set_state(InteractionState::Running);
@@ -1804,6 +1809,12 @@ impl AgentRuntimeWorker {
             if session.active.is_some() {
                 return;
             }
+            if session.hold_queued_admission {
+                // `CompletedHoldQueued` is waiting for the adapter to park the
+                // next gate turn; do not let a concurrent `submit` drain the
+                // held queue in that window.
+                return;
+            }
             if matches!(
                 session.snapshot.interaction,
                 InteractionState::IndeterminateSideEffect { .. }
@@ -2165,6 +2176,7 @@ impl AgentRuntimeWorker {
             Ok(RuntimeTurnExecution::Completed { summary }) => {
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                session.hold_queued_admission = false;
                 if let Err(error) = Self::persist_successful_turn(
                     durability.as_ref(),
                     durability_repo_id.as_deref(),
@@ -2188,8 +2200,16 @@ impl AgentRuntimeWorker {
                 }
             }
             Ok(RuntimeTurnExecution::CompletedHoldQueued { summary }) => {
+                // Same durable terminal as `Completed`, including optional
+                // `InteractionResolved` when the delivery opted in — Plan
+                // Execute parks the queue for the network-policy gate but
+                // must still prove the review closed (W2-03 r6). Holding the
+                // queue is about not admitting the next turn *and* rejecting
+                // post-response `submit` races until the follow-up gate is
+                // tracked (W2-03 r9).
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                session.hold_queued_admission = true;
                 if let Err(error) = Self::persist_successful_turn(
                     durability.as_ref(),
                     durability_repo_id.as_deref(),
@@ -2197,7 +2217,7 @@ impl AgentRuntimeWorker {
                     durability_command_kind.as_deref(),
                     &request,
                     &summary,
-                    None,
+                    interaction_resolution,
                 ) {
                     self.fence_for_durability_failure(session_id, turn_id, &error);
                     return;
@@ -2214,6 +2234,7 @@ impl AgentRuntimeWorker {
                 // durability failure here leaves queued turns still live.
                 session.active = None;
                 session.snapshot.active_turn_id = None;
+                session.hold_queued_admission = false;
                 if let Err(error) = Self::persist_successful_turn(
                     durability.as_ref(),
                     durability_repo_id.as_deref(),
@@ -2693,6 +2714,11 @@ struct SessionQueue {
     event_tx: broadcast::Sender<AgentEvent>,
     queued: VecDeque<TurnRequest>,
     active: Option<ActiveTurn>,
+    /// Set by [`RuntimeTurnExecution::CompletedHoldQueued`] so a concurrent
+    /// `submit` cannot call [`AgentRuntimeWorker::start_next_if_idle`] before
+    /// the adapter parks the follow-up gate turn. Cleared when that gate is
+    /// tracked (or when a terminal that releases/discards the queue lands).
+    hold_queued_admission: bool,
 }
 
 impl SessionQueue {
@@ -2710,6 +2736,7 @@ impl SessionQueue {
             event_tx: broadcast::channel(event_buffer).0,
             queued: VecDeque::new(),
             active: None,
+            hold_queued_admission: false,
         }
     }
 

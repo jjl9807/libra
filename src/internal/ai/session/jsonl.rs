@@ -158,6 +158,35 @@ pub enum CodeWorkflowEventKind {
     PlanReviewRequested {
         interaction_id: String,
         plan_id: String,
+        /// Non-mutating runtime turn that owns the parked plan-review gate.
+        /// Empty on rows written before W2-03 turn-id recovery; resume then
+        /// allocates a replacement turn and must terminalize any orphan.
+        #[serde(default)]
+        turn_id: String,
+        /// Mutating Phase 1 turn that wrote the plan draft. Startup recovery
+        /// may complete this identity as success when the marker is open;
+        /// other pending mutations stay fenced/cancelled.
+        #[serde(default)]
+        phase1_turn_id: String,
+    },
+    /// Post-plan network-policy gate marker (W2-03 recovery).
+    ///
+    /// Written **before** the Plan review resolves so a crash in the window
+    /// between "plan approved" and "network policy answered" still leaves a
+    /// durable record of the required human decision — the resolved plan
+    /// marker alone would make plan-review recovery a no-op and silently drop
+    /// the gate.
+    NetworkPolicyRequested {
+        interaction_id: String,
+        plan_id: String,
+        /// Non-mutating runtime turn that owns the parked network-policy gate.
+        /// Empty on rows written before durable gate-turn recovery; resume
+        /// then allocates a replacement turn and records it in a fresh marker.
+        #[serde(default)]
+        turn_id: String,
+        /// Default selection hint (IntentSpec network allow already true).
+        #[serde(default)]
+        default_allow: bool,
     },
     InteractionResolved {
         interaction_id: String,
@@ -589,7 +618,23 @@ fn code_workflow_event_summary(event: &CodeWorkflowEventKind) -> String {
         CodeWorkflowEventKind::PlanReviewRequested {
             interaction_id,
             plan_id,
+            ..
         } => format!("plan review {interaction_id} ({plan_id})"),
+        CodeWorkflowEventKind::NetworkPolicyRequested {
+            interaction_id,
+            plan_id,
+            turn_id,
+            default_allow,
+        } => {
+            let default = if *default_allow { "allow" } else { "deny" };
+            if turn_id.is_empty() {
+                format!("network policy {interaction_id} ({plan_id}) default={default}")
+            } else {
+                format!(
+                    "network policy {interaction_id} ({plan_id}) default={default} turn={turn_id}"
+                )
+            }
+        }
         CodeWorkflowEventKind::InteractionResolved {
             interaction_id,
             resolution,
@@ -2115,6 +2160,7 @@ fn parse_code_workflow_event_value(
         "command_accepted"
         | "intent_review_requested"
         | "plan_review_requested"
+        | "network_policy_requested"
         | "interaction_resolved"
         | "code_ui_projection_delta"
         | "terminal_success"

@@ -143,7 +143,7 @@ pub enum AgentStatus {
 ///
 /// Carries the natural-language explanation and the ordered step list so the
 /// UI can render it as a checklist before the user approves execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderPlanDraft {
     /// Optional human-readable rationale rendered above the step list.
     pub explanation: Option<String>,
@@ -152,7 +152,7 @@ pub struct ProviderPlanDraft {
 }
 
 /// One ordered provider draft step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderPlanDraftStep {
     /// Single-line title for the step shown in the plan checklist.
     pub title: String,

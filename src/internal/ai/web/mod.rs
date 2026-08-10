@@ -1591,10 +1591,12 @@ mod tests {
 
         use axum::extract::connect_info::MockConnectInfo;
 
+        type SubmittedCommandIds = Vec<(String, Option<String>)>;
+
         #[derive(Clone)]
         struct CommandIdAdapter {
             session: Arc<CodeUiSession>,
-            submitted: Arc<Mutex<Vec<(String, Option<String>)>>>,
+            submitted: Arc<Mutex<SubmittedCommandIds>>,
         }
 
         #[async_trait::async_trait]

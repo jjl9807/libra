@@ -113,6 +113,12 @@ use crate::{
                 IntentReviewDecision, open_intent_review_from_workflow,
                 phase0_plan_tool_loop_config, write_context_snapshot_if_needed, write_intent,
             },
+            phase1::{
+                NetworkPolicyAckDelivery, NetworkPolicyDecision, PlanReviewAckDelivery,
+                PlanReviewDecision, network_policy_interaction_id,
+                open_network_policy_from_workflow, open_plan_review_from_workflow,
+                open_review_gate_phase_turn_id, phase1_plan_tool_loop_config,
+            },
             runtime_worker_adapter_message,
         },
         sandbox::{
@@ -193,6 +199,18 @@ impl McpWriteTracker {
 const LATEST_INTENTSPEC_INTENT_ID: &str = "latest_intentspec_intent_id";
 const LATEST_EXECUTION_PLAN_ID: &str = "latest_execution_plan_id";
 const LATEST_INTENTSPEC_JSON: &str = "latest_intentspec_json";
+/// IntentSpec used to compile the plan the developer actually reviewed
+/// (LLM draft objectives applied). Distinct from [`LATEST_INTENTSPEC_JSON`],
+/// which keeps the pre-draft Phase 0 snapshot.
+const LATEST_PLAN_REVIEW_SPEC_JSON: &str = "latest_plan_review_spec_json";
+/// Exact [`ExecutionPlanSpec`] shown in the Plan review / network-policy
+/// dialogs so crash recovery cannot recompile a different plan.
+const LATEST_PLAN_REVIEW_EXECUTION_JSON: &str = "latest_plan_review_execution_json";
+/// [`ProviderPlanDraft`] that produced the reviewed plan (Modify baseline).
+const LATEST_PLAN_REVIEW_DRAFT_JSON: &str = "latest_plan_review_draft_json";
+/// Crash bridge between network Allow/Deny settle and execute admission (W2-03).
+/// Holds the chosen `network_access` bool; cleared once execute is admitted.
+const LATEST_PENDING_PLAN_EXECUTION_NETWORK: &str = "latest_pending_plan_execution_network";
 const LATEST_INTENTSPEC_WORKSPACE_KEY: &str = "latest_intentspec_workspace_key";
 const LATEST_INTENTSPEC_BASE_REF: &str = "latest_intentspec_base_ref";
 const LATEST_INTENTSPEC_BRANCH_LABEL: &str = "latest_intentspec_branch_label";
@@ -314,6 +332,10 @@ struct PendingUserInput {
 /// Post-plan dialog state: stores the spec and user selection.
 struct PendingPostPlan {
     spec_json: String,
+    /// Stable id shared by the Code UI `post_plan_choice` interaction and the
+    /// runtime-owned `AwaitingPlanReview` gate, so a Web/automation response
+    /// and the durable review marker address the same review (W2-03).
+    interaction_id: String,
     intent_id: Option<String>,
     plan_id: Option<String>,
     persisted_plan_bundle: Option<PersistedPlanReviewBundle>,
@@ -330,6 +352,27 @@ struct PendingPostPlan {
 struct PendingNetworkPolicyChoice {
     post_plan: PendingPostPlan,
     selected: usize, // 0=Deny, 1=Allow, 2=Back
+}
+
+/// Durable Phase 1 review context rebuilt on resume, shared by the Plan review
+/// and network-policy restore paths.
+struct RestoredPlanContext {
+    spec_json: String,
+    /// Network access the stored IntentSpec asks for; only a default hint.
+    network_access: bool,
+    plan: ExecutionPlanSpec,
+    plan_draft: ProviderPlanDraft,
+    plan_id: Option<String>,
+    intent_id: Option<String>,
+}
+
+/// Why a durable Phase 1 review gate could not be rebuilt from session state.
+/// Each caller renders its own user-facing fence message from these.
+enum RestoredPlanContextError {
+    MissingSnapshot,
+    BindingMismatch(String),
+    InvalidSpec(String),
+    UncompilablePlan(String),
 }
 
 /// Execution-plan revision state after the user chooses Modify on the plan review.
@@ -1525,7 +1568,11 @@ where
         Ok(())
     }
 
-    async fn fence_for_unrestorable_intent_review(&mut self, reason: impl Into<String>) {
+    /// Fail-closed handler for a durable review gate (IntentSpec or Plan) that
+    /// could not be re-established: fence the runtime session, mark the Code UI
+    /// session indeterminate, and tell the developer why no further turn can
+    /// run until the mutation state is reconciled.
+    async fn fence_for_unrestorable_review_gate(&mut self, reason: impl Into<String>) {
         let reason = reason.into();
         if let Some(runtime) = self.local_turn_runtime.clone() {
             let _ = runtime
@@ -1570,14 +1617,14 @@ where
         let spec_json = match self.load_latest_intentspec_json().await {
             LatestIntentSpecLoad::Found(json) => json,
             LatestIntentSpecLoad::Missing => {
-                self.fence_for_unrestorable_intent_review(format!(
+                self.fence_for_unrestorable_review_gate(format!(
                     "An unresolved IntentSpec review ({interaction_id}) was found, but the IntentSpec snapshot is missing. Mutation reconciliation is required before another turn can run."
                 ))
                 .await;
                 return;
             }
             LatestIntentSpecLoad::BindingMismatch(message) => {
-                self.fence_for_unrestorable_intent_review(format!(
+                self.fence_for_unrestorable_review_gate(format!(
                     "An unresolved IntentSpec review was found, but it does not match this checkout: {message}. Mutation reconciliation is required before another turn can run."
                 ))
                 .await;
@@ -1597,14 +1644,14 @@ where
         // could "confirm" through a no-op settle while the worker is still
         // fenced (e.g. ReconciliationRequired).
         if self.local_turn_runtime.is_none() {
-            self.fence_for_unrestorable_intent_review(format!(
+            self.fence_for_unrestorable_review_gate(format!(
                 "An unresolved IntentSpec review ({interaction_id}) was found, but no local runtime is available to re-park the gate. Mutation reconciliation is required before another turn can run."
             ))
             .await;
             return;
         }
         if self.active_local_runtime_turn.is_some() {
-            self.fence_for_unrestorable_intent_review(format!(
+            self.fence_for_unrestorable_review_gate(format!(
                 "An unresolved IntentSpec review ({interaction_id}) was found while another local runtime turn is already active. Mutation reconciliation is required before another turn can run."
             ))
             .await;
@@ -1651,7 +1698,7 @@ where
                         phase0_turn_id: phase0_turn_id.clone(),
                     },
                 ) {
-                    self.fence_for_unrestorable_intent_review(format!(
+                    self.fence_for_unrestorable_review_gate(format!(
                         "An unresolved IntentSpec review could not record a replacement gate turn ({error}). Mutation reconciliation is required before another turn can run."
                     ))
                     .await;
@@ -1670,7 +1717,7 @@ where
                     )
                     .await
                 {
-                    self.fence_for_unrestorable_intent_review(format!(
+                    self.fence_for_unrestorable_review_gate(format!(
                         "An unresolved IntentSpec review could not be restored ({}). Mutation reconciliation is required before another turn can run.",
                         runtime_worker_adapter_message(retry_error)
                     ))
@@ -1678,7 +1725,7 @@ where
                     return;
                 }
             } else {
-                self.fence_for_unrestorable_intent_review(format!(
+                self.fence_for_unrestorable_review_gate(format!(
                     "An unresolved IntentSpec review could not be restored ({}). Mutation reconciliation is required before another turn can run.",
                     runtime_worker_adapter_message(error)
                 ))
@@ -1706,7 +1753,7 @@ where
                     }),
                 )
                 .await;
-            self.fence_for_unrestorable_intent_review(format!(
+            self.fence_for_unrestorable_review_gate(format!(
                 "An unresolved IntentSpec review could not be re-registered ({}). Mutation reconciliation is required before another turn can run.",
                 runtime_worker_adapter_message(error)
             ))
@@ -1765,6 +1812,1035 @@ where
         self.schedule_draw();
     }
 
+    // ── Phase 1 Plan review / network-policy runtime gates (W2-03) ──
+
+    /// Append the durable `PlanReviewRequested` marker so a crash while the
+    /// Execute/Modify/Cancel dialog is open can rehydrate the gate on resume.
+    fn append_plan_review_marker(
+        &self,
+        interaction_id: &str,
+        plan_id: Option<&str>,
+        review_turn_id: &str,
+        phase1_turn_id: &str,
+    ) -> std::io::Result<()> {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        store
+            .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+                interaction_id: interaction_id.to_string(),
+                // Empty when the plan revision could not be persisted through
+                // MCP — restore falls back to `LATEST_EXECUTION_PLAN_ID`.
+                plan_id: plan_id.unwrap_or_default().to_string(),
+                turn_id: review_turn_id.to_string(),
+                phase1_turn_id: phase1_turn_id.to_string(),
+            })
+            .map(|_| ())
+    }
+
+    /// Append the durable `NetworkPolicyRequested` marker.
+    ///
+    /// This must land **before** the Plan review is settled as `Execute`: once
+    /// the plan marker is resolved, `restore_pending_plan_review_gate` no-ops,
+    /// so this row is the only durable proof that a human still owes a network
+    /// decision (W2-03 recovery).
+    fn append_network_policy_marker(
+        &self,
+        interaction_id: &str,
+        plan_id: Option<&str>,
+        gate_turn_id: &str,
+        default_allow: bool,
+    ) -> std::io::Result<()> {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        store
+            .append_code_workflow_durable(CodeWorkflowEventKind::NetworkPolicyRequested {
+                interaction_id: interaction_id.to_string(),
+                plan_id: plan_id.unwrap_or_default().to_string(),
+                turn_id: gate_turn_id.to_string(),
+                default_allow,
+            })
+            .map(|_| ())
+    }
+
+    /// Best-effort rollback of a network-policy marker that was written in
+    /// advance but whose gate never opened (for example the Plan `Execute`
+    /// delivery failed afterwards). Leaving the marker would re-open the
+    /// network dialog on resume for a plan that is still unapproved; that path
+    /// is still safe (its "Back" option returns to the plan review), so a
+    /// failed rollback is logged rather than escalated.
+    fn revoke_network_policy_marker(&self, interaction_id: &str, reason: &str) {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        if let Err(error) =
+            store.append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+                interaction_id: interaction_id.to_string(),
+                resolution: reason.to_string(),
+            })
+        {
+            tracing::warn!(
+                error = %error,
+                interaction_id,
+                "failed to revoke an unopened network-policy gate marker"
+            );
+        }
+    }
+
+    /// Park a **non-mutating** runtime turn that owns
+    /// [`InteractionState::AwaitingPlanReview`] for `interaction_id`, so the
+    /// worker — not `pending_post_plan` — fences the session until the
+    /// developer picks Execute/Modify/Cancel.
+    ///
+    /// When `review_turn_id` was already terminalized (crash/resume against a
+    /// recorded marker), a replacement turn id is allocated and recorded in a
+    /// fresh marker so a later crash does not keep re-admitting the terminal
+    /// identity. Fail-closed: on registration failure the orphan gate turn is
+    /// discarded and the caller is expected to fence the session.
+    async fn park_plan_review_gate(
+        &mut self,
+        interaction_id: &str,
+        plan_id: Option<&str>,
+        review_turn_id: String,
+        ui_turn_id: TurnId,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(());
+        };
+        let mut review_turn_id = review_turn_id;
+        if let Err(error) = runtime
+            .track_external_turn(
+                TurnRequest::new(
+                    self.session.id.clone(),
+                    review_turn_id.clone(),
+                    "Plan review",
+                    false,
+                ),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        {
+            if !matches!(
+                &error,
+                RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. }
+            ) {
+                return Err(error);
+            }
+            review_turn_id = format!("plan-review-{}", uuid::Uuid::new_v4());
+            self.append_plan_review_marker(interaction_id, plan_id, &review_turn_id, "")
+                .map_err(|error| {
+                    RuntimeWorkerError::DurabilityFailure(format!(
+                        "failed to record a replacement Plan review gate turn: {error}"
+                    ))
+                })?;
+            runtime
+                .track_external_turn(
+                    TurnRequest::new(
+                        self.session.id.clone(),
+                        review_turn_id.clone(),
+                        "Plan review",
+                        false,
+                    ),
+                    CancellationToken::new(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await?;
+        }
+        self.active_local_runtime_turn = Some((ui_turn_id, review_turn_id.clone()));
+        if let Err(error) = runtime
+            .register_interaction_with_delivery(
+                self.session.id.clone(),
+                review_turn_id,
+                InteractionState::AwaitingPlanReview {
+                    interaction_id: interaction_id.to_string(),
+                },
+                Box::new(PlanReviewAckDelivery::new()),
+            )
+            .await
+        {
+            let Some((_, orphan_turn_id)) = self.active_local_runtime_turn.take() else {
+                return Err(error);
+            };
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    orphan_turn_id,
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "Plan review gate registration failed".to_string(),
+                    }),
+                )
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Hand the Phase 1 Plan review gate to the [`AgentRuntimeHandle`] so the
+    /// worker owns [`InteractionState::AwaitingPlanReview`] (W2-03), mirroring
+    /// [`Self::register_local_runtime_intent_review`].
+    ///
+    /// The mutating Phase 1 turn is terminalized with
+    /// [`RuntimeTurnExecution::CompletedHoldQueued`] *after* the durable review
+    /// marker lands, so a crash while the dialog is open never leaves a Pending
+    /// mutating command without a recoverable gate — and never reports success
+    /// for a plan whose review marker could not be persisted.
+    async fn register_local_runtime_plan_review(
+        &mut self,
+        turn_id: TurnId,
+        interaction_id: String,
+        plan_id: Option<String>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            // Managed Code UI sessions intentionally omit the local AgentRuntime
+            // worker. Presenting Execute/Modify/Cancel without a durable marker
+            // and worker fence would lose the human gate across crash/resume
+            // (W2-03 r11) — fail closed instead of a silent no-op success.
+            return Err(RuntimeWorkerError::ExecutionFailed(
+                "Plan review requires a local AgentRuntime to record a durable recovery gate; this session has none (managed Code UI). Re-run planning from a non-managed TUI session."
+                    .to_string(),
+            ));
+        };
+        let Some((active_ui_turn, phase1_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Err(RuntimeWorkerError::ExecutionFailed(
+                "Plan review requires an active Phase 1 runtime turn before the gate can be parked."
+                    .to_string(),
+            ));
+        };
+        // Ignore stale terminal AppEvents from a previous UI turn so they
+        // cannot register an interaction against a newer durable admission.
+        if active_ui_turn != turn_id {
+            tracing::debug!(
+                stale_turn_id = turn_id,
+                active_turn_id = active_ui_turn,
+                "ignoring stale local runtime Plan review registration for inactive UI turn"
+            );
+            return Ok(());
+        }
+
+        // The caller already staged the IntentSpec/plan pointers in session
+        // metadata; persist them before the gate so resume can rebuild the
+        // dialog from a snapshot that matches the marker.
+        if let Err(error) = self.session_store.save(&self.session) {
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    phase1_turn_id.clone(),
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "plan snapshot persistence failed".to_string(),
+                    }),
+                )
+                .await;
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "Plan review setup failed while persisting the session snapshot: {error}"
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                "failed to persist plan snapshot before review gate: {error}"
+            )));
+        }
+
+        let review_turn_id = format!("plan-review-{}", uuid::Uuid::new_v4());
+        if let Err(error) = self.append_plan_review_marker(
+            &interaction_id,
+            plan_id.as_deref(),
+            &review_turn_id,
+            &phase1_turn_id,
+        ) {
+            // Marker failed: do **not** terminalize Phase 1 as success — leave
+            // the mutating command Pending so restart recovery fences it.
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "The execution plan is durable but its review marker could not be persisted: {error}"
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(RuntimeWorkerError::DurabilityFailure(format!(
+                "failed to persist Plan review request: {error}"
+            )));
+        }
+
+        if let Err(error) = runtime
+            .finish_external_turn(
+                self.session.id.clone(),
+                phase1_turn_id,
+                Ok(RuntimeTurnExecution::CompletedHoldQueued {
+                    summary: "Execution plan draft persisted; awaiting review".to_string(),
+                }),
+            )
+            .await
+        {
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "Plan review marker is durable but Phase 1 could not be terminalized: {}",
+                        runtime_worker_adapter_message(error.clone())
+                    ),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(error);
+        }
+        self.active_local_runtime_turn = None;
+
+        if let Err(error) = self
+            .park_plan_review_gate(&interaction_id, plan_id.as_deref(), review_turn_id, turn_id)
+            .await
+        {
+            let _ = runtime
+                .fence_session(
+                    self.session.id.clone(),
+                    format!(
+                        "Plan review marker is durable but the gate turn could not be parked: {}",
+                        runtime_worker_adapter_message(error.clone())
+                    ),
+                )
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Deliver the developer's Plan review decision to the runtime via
+    /// [`PlanReviewAckDelivery`]. `Execute` keeps queued work fenced
+    /// (`CompletedHoldQueued`) so the network-policy gate can park next;
+    /// `Revise`/`Cancel` discard it.
+    ///
+    /// Fail-closed: `active_local_runtime_turn` is released only after
+    /// `respond` succeeds, so a delivery failure lets the caller restore the
+    /// dialog instead of proceeding while the worker still holds the gate.
+    async fn settle_local_runtime_plan_review(
+        &mut self,
+        decision: PlanReviewDecision,
+        interaction_id: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(());
+        };
+        let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Ok(());
+        };
+        runtime
+            .respond(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionResponse::new(interaction_id, decision.wire_id()),
+            )
+            .await?;
+        self.active_local_runtime_turn = None;
+        Ok(())
+    }
+
+    /// Park the post-plan network-policy gate after Plan `Execute` settles.
+    ///
+    /// `--network-access allow` (or an IntentSpec that already asks for it)
+    /// only preselects an option; a human still has to answer this gate before
+    /// [`Self::start_execute_workflow`] may run, so the worker keeps refusing
+    /// mutating admissions in the meantime (W2-03 AC).
+    ///
+    /// `gate_turn_id` is preallocated by the caller and already recorded in a
+    /// durable `NetworkPolicyRequested` marker. When that turn id was already
+    /// terminalized (crash/resume against a recorded marker), a replacement is
+    /// allocated and written to a fresh marker before it is admitted, so a
+    /// later crash cannot keep re-admitting the terminal identity.
+    async fn register_local_runtime_network_policy(
+        &mut self,
+        plan_id: Option<String>,
+        network_access_default: bool,
+        gate_turn_id: String,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Err(RuntimeWorkerError::ExecutionFailed(
+                "Network-policy gate requires a local AgentRuntime to record a durable recovery gate; this session has none (managed Code UI). Re-run planning from a non-managed TUI session."
+                    .to_string(),
+            ));
+        };
+        let interaction_id = network_policy_interaction_id(plan_id.as_deref());
+        let mut gate_turn_id = gate_turn_id;
+        let input = if network_access_default {
+            "network policy (default: allow)"
+        } else {
+            "network policy (default: deny)"
+        };
+        if let Err(error) = runtime
+            .track_external_turn(
+                TurnRequest::new(self.session.id.clone(), gate_turn_id.clone(), input, false),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        {
+            if !matches!(
+                &error,
+                RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. }
+            ) {
+                return Err(error);
+            }
+            gate_turn_id = format!("network-policy-{}", uuid::Uuid::new_v4());
+            self.append_network_policy_marker(
+                &interaction_id,
+                plan_id.as_deref(),
+                &gate_turn_id,
+                network_access_default,
+            )
+            .map_err(|error| {
+                RuntimeWorkerError::DurabilityFailure(format!(
+                    "failed to record a replacement network-policy gate turn: {error}"
+                ))
+            })?;
+            runtime
+                .track_external_turn(
+                    TurnRequest::new(self.session.id.clone(), gate_turn_id.clone(), input, false),
+                    CancellationToken::new(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await?;
+        }
+        self.active_local_runtime_turn = Some((0, gate_turn_id.clone()));
+        if let Err(error) = runtime
+            .register_interaction_with_delivery(
+                self.session.id.clone(),
+                gate_turn_id.clone(),
+                InteractionState::AwaitingNetworkPolicy {
+                    interaction_id: interaction_id.clone(),
+                },
+                Box::new(NetworkPolicyAckDelivery::new()),
+            )
+            .await
+        {
+            let _ = runtime
+                .finish_external_turn(
+                    self.session.id.clone(),
+                    gate_turn_id,
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "network policy gate registration failed".to_string(),
+                    }),
+                )
+                .await;
+            self.active_local_runtime_turn = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Deliver the developer's network-policy decision through
+    /// [`NetworkPolicyAckDelivery`]. Allow/Deny complete the gate turn so plan
+    /// execution can be handed off; `Back` discards work queued under the
+    /// network fence and returns control to the Plan review dialog.
+    async fn settle_local_runtime_network_policy(
+        &mut self,
+        decision: NetworkPolicyDecision,
+        interaction_id: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Ok(());
+        };
+        let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Ok(());
+        };
+        runtime
+            .respond(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionResponse::new(interaction_id, decision.wire_id()),
+            )
+            .await?;
+        self.active_local_runtime_turn = None;
+        Ok(())
+    }
+
+    /// Rehydrate an unresolved Plan review after process restart so
+    /// Execute/Modify/Cancel (and the follow-on network-policy gate) cannot
+    /// disappear while an execution plan remains unapproved (W2-03 recovery).
+    ///
+    /// The dialog body is rebuilt best-effort from durable session metadata:
+    /// the IntentSpec snapshot is re-compiled into an `ExecutionPlanSpec` and
+    /// the plan id is read back from `LATEST_EXECUTION_PLAN_ID`. Anything that
+    /// cannot be reconstructed — a missing snapshot, a checkout that no longer
+    /// matches, an uncompilable spec, or a runtime that refuses the gate —
+    /// fences the session instead of presenting a review the runtime would
+    /// not honour.
+    pub async fn restore_pending_plan_review_gate(&mut self) {
+        if self.pending_post_plan.is_some()
+            || self.pending_network_policy.is_some()
+            || self.pending_intent_review.is_some()
+        {
+            return;
+        }
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        let replay = match store.load_code_workflow_replay() {
+            Ok(replay) => replay,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load Code workflow replay while restoring Plan review"
+                );
+                return;
+            }
+        };
+        let Some((interaction_id, workflow_plan_id, stored_turn_id, _phase1_turn_id)) =
+            open_plan_review_from_workflow(replay.events.iter().map(|event| &event.event))
+        else {
+            return;
+        };
+        // Same checkout/workspace binding guard as the IntentSpec review: a
+        // plan drafted against a different worktree/HEAD must not be re-opened.
+        let context = match self.rebuild_restored_plan_context(&workflow_plan_id).await {
+            Ok(context) => context,
+            Err(RestoredPlanContextError::MissingSnapshot) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved execution-plan review ({interaction_id}) was found, but the IntentSpec snapshot it was drafted from is missing. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::BindingMismatch(message)) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved execution-plan review was found, but it does not match this checkout: {message}. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::InvalidSpec(error)) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved execution-plan review ({interaction_id}) was found, but the stored IntentSpec JSON is invalid ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::UncompilablePlan(error)) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved execution-plan review ({interaction_id}) was found, but its plan could not be rebuilt from the stored IntentSpec ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+        };
+        let RestoredPlanContext {
+            spec_json,
+            network_access,
+            plan,
+            plan_draft,
+            plan_id,
+            intent_id,
+        } = context;
+
+        // Fail closed: only present a restorable review dialog when the
+        // runtime gate is successfully re-established, so a "Execute" cannot
+        // slip through a no-op settle while the worker is fenced.
+        if self.local_turn_runtime.is_none() {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unresolved execution-plan review ({interaction_id}) was found, but no local runtime is available to re-park the gate. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return;
+        }
+        if self.active_local_runtime_turn.is_some() {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unresolved execution-plan review ({interaction_id}) was found while another local runtime turn is already active. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return;
+        }
+
+        let review_turn_id = if stored_turn_id.is_empty() {
+            // Pre-W2-03 markers omit turn ids. Persist a replacement marker for
+            // the synthesized id before parking so a second crash cannot keep
+            // admitting fresh Pending gate commands against an empty marker.
+            let review_turn_id = format!("plan-review-restore-{}", uuid::Uuid::new_v4());
+            if let Err(error) = self.append_plan_review_marker(
+                &interaction_id,
+                plan_id.as_deref(),
+                &review_turn_id,
+                "",
+            ) {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved execution-plan review could not record a replacement gate turn ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            review_turn_id
+        } else {
+            stored_turn_id
+        };
+        if let Err(error) = self
+            .park_plan_review_gate(
+                &interaction_id,
+                plan_id.as_deref(),
+                review_turn_id,
+                // No UI turn owns a restored gate; `0` matches the IntentSpec
+                // restore path and is never a live `begin_turn` id.
+                0,
+            )
+            .await
+        {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unresolved execution-plan review could not be restored ({}). Mutation reconciliation is required before another turn can run.",
+                runtime_worker_adapter_message(error)
+            ))
+            .await;
+            return;
+        }
+
+        let browser_plan_steps = plan
+            .tasks
+            .iter()
+            .map(|task| CodeUiPlanStep {
+                step: task.title().to_string(),
+                status: "pending".to_string(),
+            })
+            .collect::<Vec<_>>();
+        self.mcp_plan_id = plan_id.clone();
+        self.widget.show_dag_preview(plan.clone());
+        self.pending_post_plan = Some(PendingPostPlan {
+            spec_json,
+            interaction_id: interaction_id.clone(),
+            intent_id: intent_id.clone(),
+            plan_id: plan_id.clone(),
+            // The Phase 1 review bundle is not part of the durable marker;
+            // execution re-persists it from the approved plan.
+            persisted_plan_bundle: None,
+            plan,
+            plan_draft,
+            warnings: Vec::new(),
+            network_access,
+            automatic_repair_attempts: 0,
+            automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            selected: 0,
+        });
+        self.widget.bottom_pane.reset_post_plan_selection();
+        self.widget
+            .bottom_pane
+            .set_post_plan_network_access(network_access);
+        self.widget
+            .bottom_pane
+            .set_status(AgentStatus::AwaitingPostPlanChoice);
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            code_ui_session
+                .upsert_plan(CodeUiPlanSnapshot {
+                    id: interaction_id.clone(),
+                    title: Some("Execution Plan".to_string()),
+                    summary: None,
+                    status: "ready".to_string(),
+                    steps: browser_plan_steps,
+                    updated_at: Utc::now(),
+                })
+                .await;
+            code_ui_session
+                .upsert_interaction(CodeUiInteractionRequest {
+                    id: interaction_id,
+                    kind: CodeUiInteractionKind::PostPlanChoice,
+                    title: Some("Choose next step".to_string()),
+                    description: Some(
+                        "The plan is ready. Execute it, revise it, or cancel.".to_string(),
+                    ),
+                    prompt: None,
+                    options: post_plan_choice_options(),
+                    status: CodeUiInteractionStatus::Pending,
+                    metadata: serde_json::json!({
+                        "intentId": intent_id,
+                        "planId": plan_id,
+                        "networkAccess": network_access,
+                        "restored": true,
+                    }),
+                    requested_at: Utc::now(),
+                    resolved_at: None,
+                })
+                .await;
+            code_ui_session
+                .set_status(CodeUiSessionStatus::AwaitingInteraction)
+                .await;
+        }
+        self.sync_mux_input_context();
+        self.schedule_draw();
+    }
+
+    /// Rebuild the durable Phase 1 review context (IntentSpec snapshot,
+    /// compiled execution plan, persisted ids) shared by the Plan review and
+    /// network-policy restore paths. Callers own the user-facing wording for
+    /// each failure so the two gates keep their distinct fence messages.
+    async fn rebuild_restored_plan_context(
+        &self,
+        workflow_plan_id: &str,
+    ) -> Result<RestoredPlanContext, RestoredPlanContextError> {
+        // Prefer the plan-review snapshot (LLM draft applied). Falling back to
+        // the Phase 0 IntentSpec would silently drop draft objectives (Codex
+        // W2-03 r3). Binding checks still apply: a snapshot from another
+        // worktree/HEAD must not rehydrate into an executable gate (W2-03 r8).
+        let binding = current_intentspec_binding(self.registry.working_dir());
+        if !latest_intentspec_binding_matches(&self.session.metadata, &binding) {
+            return Err(RestoredPlanContextError::BindingMismatch(
+                latest_intentspec_binding_mismatch_message(&self.session.metadata, &binding)
+                    .unwrap_or_else(|| {
+                        "Latest IntentSpec belongs to a different workspace or HEAD.".to_string()
+                    }),
+            ));
+        }
+        let spec_json = if let Some(json) = self
+            .session
+            .metadata
+            .get(LATEST_PLAN_REVIEW_SPEC_JSON)
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| serde_json::to_string(value).ok())
+            }) {
+            let spec = serde_json::from_str::<IntentSpec>(&json)
+                .map_err(|error| RestoredPlanContextError::InvalidSpec(error.to_string()))?;
+            if !intentspec_matches_workspace(&spec, &binding.workspace_key, &binding.base_ref) {
+                return Err(RestoredPlanContextError::BindingMismatch(
+                    format_intentspec_target_mismatch(
+                        spec.metadata.target.repo.locator.as_str(),
+                        &spec.metadata.target.base_ref,
+                        self.session
+                            .metadata
+                            .get(LATEST_INTENTSPEC_BRANCH_LABEL)
+                            .and_then(|value| value.as_str()),
+                        &binding,
+                    ),
+                ));
+            }
+            json
+        } else {
+            match self.load_latest_intentspec_json().await {
+                LatestIntentSpecLoad::Found(json) => json,
+                LatestIntentSpecLoad::Missing => {
+                    return Err(RestoredPlanContextError::MissingSnapshot);
+                }
+                LatestIntentSpecLoad::BindingMismatch(message) => {
+                    return Err(RestoredPlanContextError::BindingMismatch(message));
+                }
+            }
+        };
+        let spec = serde_json::from_str::<IntentSpec>(&spec_json)
+            .map_err(|error| RestoredPlanContextError::InvalidSpec(error.to_string()))?;
+        let plan = if let Some(plan) = self
+            .session
+            .metadata
+            .get(LATEST_PLAN_REVIEW_EXECUTION_JSON)
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ExecutionPlanSpec>(value).ok())
+        {
+            plan
+        } else {
+            compile_execution_plan_spec(&spec)
+                .map_err(|error| RestoredPlanContextError::UncompilablePlan(error.to_string()))?
+        };
+        let plan_draft = self
+            .session
+            .metadata
+            .get(LATEST_PLAN_REVIEW_DRAFT_JSON)
+            .cloned()
+            .and_then(|value| serde_json::from_value::<ProviderPlanDraft>(value).ok())
+            .unwrap_or_else(|| ProviderPlanDraft {
+                explanation: None,
+                steps: plan
+                    .tasks
+                    .iter()
+                    .map(|task| ProviderPlanDraftStep {
+                        title: task.title().to_string(),
+                    })
+                    .collect(),
+            });
+        let plan_id = self
+            .session
+            .metadata
+            .get(LATEST_EXECUTION_PLAN_ID)
+            .and_then(|value| value.as_str().map(str::to_string))
+            .or_else(|| (!workflow_plan_id.is_empty()).then(|| workflow_plan_id.to_string()));
+        let intent_id = self
+            .session
+            .metadata
+            .get(LATEST_INTENTSPEC_INTENT_ID)
+            .and_then(|value| value.as_str().map(str::to_string));
+        Ok(RestoredPlanContext {
+            spec_json,
+            network_access: matches!(
+                spec.constraints.security.network_policy,
+                NetworkPolicy::Allow
+            ),
+            plan,
+            plan_draft,
+            plan_id,
+            intent_id,
+        })
+    }
+
+    /// Rehydrate an unanswered post-plan network-policy gate after process
+    /// restart (W2-03 recovery).
+    ///
+    /// This covers the crash window that plan-review recovery cannot see: the
+    /// plan was already durably approved, so `open_plan_review_from_workflow`
+    /// returns `None`, yet no human has answered the network question. The
+    /// durable `NetworkPolicyRequested` marker is written before the plan
+    /// review settles precisely so this gate can be rebuilt here.
+    ///
+    /// Must run **before** [`Self::restore_pending_plan_review_gate`].
+    /// [`open_network_policy_from_workflow`] only reports a marker once a
+    /// durable Execute resolved its plan review, so a marker from the crash
+    /// window *before* Execute landed is left pending here and the plan review
+    /// restore owns the session instead — a restored network dialog can never
+    /// stand in for an approval that never happened.
+    pub async fn restore_pending_network_policy_gate(&mut self) {
+        if self.pending_post_plan.is_some()
+            || self.pending_network_policy.is_some()
+            || self.pending_intent_review.is_some()
+        {
+            return;
+        }
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        let replay = match store.load_code_workflow_replay() {
+            Ok(replay) => replay,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load Code workflow replay while restoring the network-policy gate"
+                );
+                return;
+            }
+        };
+        let Some((interaction_id, workflow_plan_id, stored_turn_id, default_allow)) =
+            open_network_policy_from_workflow(replay.events.iter().map(|event| &event.event))
+        else {
+            return;
+        };
+        // "Back" re-parks the *plan* review, so the rebuilt dialog needs that
+        // gate's own interaction id rather than the network gate's.
+        let plan_review_interaction_id = replay
+            .events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.event {
+                CodeWorkflowEventKind::PlanReviewRequested {
+                    interaction_id,
+                    plan_id,
+                    ..
+                } if workflow_plan_id.is_empty() || *plan_id == workflow_plan_id => {
+                    Some(interaction_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| interaction_id.clone());
+        let context = match self.rebuild_restored_plan_context(&workflow_plan_id).await {
+            Ok(context) => context,
+            Err(RestoredPlanContextError::MissingSnapshot) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unanswered network-policy choice ({interaction_id}) was found, but the IntentSpec snapshot its plan was drafted from is missing. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::BindingMismatch(message)) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unanswered network-policy choice was found, but it does not match this checkout: {message}. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::InvalidSpec(error)) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unanswered network-policy choice ({interaction_id}) was found, but the stored IntentSpec JSON is invalid ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::UncompilablePlan(error)) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unanswered network-policy choice ({interaction_id}) was found, but its plan could not be rebuilt from the stored IntentSpec ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+        };
+
+        // Fail closed for the same reason as the Plan review restore: without a
+        // live worker-owned gate, Allow/Deny would settle through a no-op and
+        // release execution the runtime never approved.
+        if self.local_turn_runtime.is_none() {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unanswered network-policy choice ({interaction_id}) was found, but no local runtime is available to re-park the gate. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return;
+        }
+        if self.active_local_runtime_turn.is_some() {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unanswered network-policy choice ({interaction_id}) was found while another local runtime turn is already active. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return;
+        }
+
+        let gate_turn_id = if stored_turn_id.is_empty() {
+            let gate_turn_id = format!("network-policy-restore-{}", uuid::Uuid::new_v4());
+            if let Err(error) = self.append_network_policy_marker(
+                &interaction_id,
+                context.plan_id.as_deref(),
+                &gate_turn_id,
+                default_allow,
+            ) {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unanswered network-policy choice could not record a replacement gate turn ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            gate_turn_id
+        } else {
+            stored_turn_id
+        };
+        if let Err(error) = self
+            .register_local_runtime_network_policy(
+                context.plan_id.clone(),
+                default_allow,
+                gate_turn_id,
+            )
+            .await
+        {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unanswered network-policy choice could not be restored ({}). Mutation reconciliation is required before another turn can run.",
+                runtime_worker_adapter_message(error)
+            ))
+            .await;
+            return;
+        }
+
+        let RestoredPlanContext {
+            spec_json,
+            network_access: _,
+            plan,
+            plan_draft,
+            plan_id,
+            intent_id,
+        } = context;
+        self.mcp_plan_id = plan_id.clone();
+        self.widget.show_dag_preview(plan.clone());
+        // The plan review that precedes this gate is already resolved, so the
+        // rebuilt `PendingPostPlan` exists only to carry execution inputs and
+        // the "Back" target; its interaction id is the resolved plan review.
+        self.show_network_policy_dialog(PendingPostPlan {
+            spec_json,
+            interaction_id: plan_review_interaction_id,
+            intent_id,
+            plan_id,
+            persisted_plan_bundle: None,
+            plan,
+            plan_draft,
+            warnings: Vec::new(),
+            // The durable marker owns the default selection: it is what the
+            // developer was shown before the crash.
+            network_access: default_allow,
+            automatic_repair_attempts: 0,
+            automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            selected: 0,
+        });
+        self.schedule_draw();
+    }
+
+    fn clear_pending_plan_execution_handoff(&mut self) -> Result<(), String> {
+        let Some(previous) = self
+            .session
+            .metadata
+            .remove(LATEST_PENDING_PLAN_EXECUTION_NETWORK)
+        else {
+            return Ok(());
+        };
+        if let Err(error) = self.session_store.save(&self.session) {
+            self.session
+                .metadata
+                .insert(LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(), previous);
+            return Err(format!(
+                "failed to clear pending plan-execution handoff: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resume an approved plan whose network gate settled but whose execute
+    /// turn never admitted (crash between Allow/Deny and
+    /// [`Self::start_execute_workflow`], W2-03 r18).
+    pub async fn restore_pending_plan_execution_handoff(&mut self) {
+        if self.pending_post_plan.is_some()
+            || self.pending_network_policy.is_some()
+            || self.pending_intent_review.is_some()
+        {
+            return;
+        }
+        let Some(network_access) = self
+            .session
+            .metadata
+            .get(LATEST_PENDING_PLAN_EXECUTION_NETWORK)
+            .and_then(|value| value.as_bool())
+        else {
+            return;
+        };
+        let context = match self.rebuild_restored_plan_context("").await {
+            Ok(context) => context,
+            Err(RestoredPlanContextError::MissingSnapshot) => {
+                let _ = self.clear_pending_plan_execution_handoff();
+                self.fence_for_unrestorable_review_gate(
+                    "A pending plan-execution handoff was found, but the IntentSpec snapshot is missing. Mutation reconciliation is required before another turn can run."
+                        .to_string(),
+                )
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::BindingMismatch(message)) => {
+                let _ = self.clear_pending_plan_execution_handoff();
+                self.fence_for_unrestorable_review_gate(message).await;
+                return;
+            }
+            Err(RestoredPlanContextError::InvalidSpec(error)) => {
+                let _ = self.clear_pending_plan_execution_handoff();
+                self.fence_for_unrestorable_review_gate(format!(
+                    "A pending plan-execution handoff was found, but the stored IntentSpec JSON is invalid ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+            Err(RestoredPlanContextError::UncompilablePlan(error)) => {
+                let _ = self.clear_pending_plan_execution_handoff();
+                self.fence_for_unrestorable_review_gate(format!(
+                    "A pending plan-execution handoff was found, but its plan could not be rebuilt ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
+        };
+        let RestoredPlanContext {
+            spec_json,
+            network_access: _,
+            plan,
+            plan_draft,
+            plan_id,
+            intent_id,
+        } = context;
+        let pending = PendingPostPlan {
+            spec_json,
+            interaction_id: plan_id
+                .clone()
+                .unwrap_or_else(|| "restored-plan-execution".to_string()),
+            intent_id,
+            plan_id,
+            persisted_plan_bundle: None,
+            plan,
+            plan_draft,
+            warnings: Vec::new(),
+            network_access,
+            automatic_repair_attempts: 0,
+            automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            selected: 0,
+        };
+        let request = Self::execute_request_from_post_plan(pending, network_access);
+        self.start_execute_workflow(request).await;
+    }
+
     async fn report_local_runtime_finalization_fence(
         &mut self,
         error: RuntimeWorkerError,
@@ -1807,17 +2883,13 @@ where
         let working_dir = self.registry.working_dir().to_string_lossy().into_owned();
         let session_jsonl =
             SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
-        let phase0_turn_id = session_jsonl
-            .load_code_workflow_replay()
-            .ok()
-            .and_then(|replay| {
-                open_intent_review_from_workflow(replay.events.iter().map(|event| &event.event))
-            })
-            .map(|(_, _, _, phase0_turn_id)| phase0_turn_id)
-            .filter(|id| !id.is_empty());
+        // An open IntentSpec (Phase 0) or Plan (Phase 1) review gate proves its
+        // draft-writing mutation finished, so recovery completes that one
+        // command id and still fences every other pending mutation.
+        let review_gate_turn_id = open_review_gate_phase_turn_id(&session_jsonl);
         let durability = RuntimeCommandDurability::new(session_jsonl);
         let (recovered_mutations, recovery_failed) = match durability
-            .recover_pending_mutations_for_intent_review(phase0_turn_id.as_deref())
+            .recover_pending_mutations_for_intent_review(review_gate_turn_id.as_deref())
         {
             Ok(mutations) => (mutations, false),
             Err(error) => {
@@ -2565,9 +3637,11 @@ where
             return self.handle_intent_review_choice().await;
         }
 
-        if self.pending_post_plan.as_ref().is_some_and(|pending| {
-            pending.plan_id.as_deref().unwrap_or("post-plan-choice") == interaction_id
-        }) {
+        if self
+            .pending_post_plan
+            .as_ref()
+            .is_some_and(|pending| pending.interaction_id == interaction_id)
+        {
             let selected = selection_from_response(
                 &["execute", "modify", "cancel"],
                 &response,
@@ -2678,6 +3752,49 @@ where
             // worker but does not interrupt an agent task, so the generic
             // hard-interrupt idle path below may not run. Return to Idle here
             // so control `/messages` can accept the next turn.
+            self.set_idle_and_draw();
+        }
+        // The Phase 1 Plan review and its follow-on network-policy gate are
+        // worker-owned for the same reason (W2-03): resolve them here so the
+        // generic `runtime.cancel()` below does not strand a gate turn that has
+        // no executor left to observe the cancellation token.
+        if let Some(pending) = self.pending_post_plan.take() {
+            if let Err(error) = self
+                .settle_local_runtime_plan_review(
+                    PlanReviewDecision::Cancel,
+                    &pending.interaction_id,
+                )
+                .await
+            {
+                self.pending_post_plan = Some(pending);
+                return Err(TuiControlError::Internal(format!(
+                    "failed to cancel the pending execution-plan review: {}",
+                    runtime_worker_adapter_message(error)
+                )));
+            }
+            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                code_ui_session
+                    .clear_interaction(&pending.interaction_id)
+                    .await;
+            }
+            self.set_idle_and_draw();
+        }
+        if let Some(pending) = self.pending_network_policy.take() {
+            let interaction_id =
+                network_policy_interaction_id(pending.post_plan.plan_id.as_deref());
+            if let Err(error) = self
+                .settle_local_runtime_network_policy(NetworkPolicyDecision::Back, &interaction_id)
+                .await
+            {
+                self.pending_network_policy = Some(pending);
+                return Err(TuiControlError::Internal(format!(
+                    "failed to cancel the pending network-policy choice: {}",
+                    runtime_worker_adapter_message(error)
+                )));
+            }
+            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                code_ui_session.clear_interaction(&interaction_id).await;
+            }
             self.set_idle_and_draw();
         }
         let local_runtime_turn_id = self
@@ -2815,11 +3932,7 @@ where
             ids.push(pending.interaction_id);
         }
         if let Some(pending) = self.pending_post_plan.take() {
-            ids.push(
-                pending
-                    .plan_id
-                    .unwrap_or_else(|| "post-plan-choice".to_string()),
-            );
+            ids.push(pending.interaction_id);
         }
         if let Some(pending) = self.pending_network_policy.take() {
             ids.push(network_policy_interaction_id(
@@ -3038,7 +4151,7 @@ where
                         self.handle_post_plan_choice().await;
                     }
                     KeyCode::Esc => {
-                        self.dismiss_post_plan_dialog();
+                        self.dismiss_post_plan_dialog().await;
                     }
                     _ => {}
                 }
@@ -3069,7 +4182,7 @@ where
                         self.handle_network_policy_choice().await;
                     }
                     KeyCode::Esc => {
-                        self.return_to_post_plan_dialog();
+                        self.return_to_post_plan_dialog().await;
                     }
                     _ => {}
                 }
@@ -5051,42 +6164,36 @@ where
                 automatic_repair_attempts,
                 automatic_repair_max_attempts,
             } => {
-                if let Err(error) = self
-                    .settle_local_runtime_turn_completed(
-                        turn_id,
-                        "local TUI plan workflow completed",
-                    )
-                    .await
-                {
-                    self.report_local_runtime_finalization_fence(
-                        error,
-                        "Plan workflow completed, but its durable finalization requires reconciliation before continuing",
-                    )
-                    .await;
-                    return Ok(());
-                }
-                self.finish_turn_state();
-                self.history = new_history;
+                // Interaction id shared by the Code UI `post_plan_choice`
+                // request and the runtime-owned `AwaitingPlanReview` gate.
+                let interaction_id = plan_id.clone().unwrap_or_else(|| format!("plan-{turn_id}"));
+                // Automatic plan repair (W2-11) re-enters execution without a
+                // human review, so Phase 1 durably completes instead of parking
+                // a gate the developer would never see.
+                let auto_repair_pending = self.pending_auto_plan_repair_execution.is_some();
                 self.session.add_assistant_message(&text);
-                self.enqueue_llm_context_frame(
-                    "step_summary",
-                    "Phase 1 plan",
-                    intent_id.clone(),
-                    plan_id.clone(),
-                    text.clone(),
-                );
-                let browser_plan_steps = plan
-                    .tasks
-                    .iter()
-                    .map(|task| CodeUiPlanStep {
-                        step: task.title().to_string(),
-                        status: "pending".to_string(),
-                    })
-                    .collect::<Vec<_>>();
                 self.session.metadata.insert(
                     LATEST_INTENTSPEC_JSON.to_string(),
                     serde_json::Value::String(spec_json.clone()),
                 );
+                // Persist the plan the developer actually reviewed (LLM draft
+                // applied) so crash recovery cannot recompile from the Phase 0
+                // snapshot alone (W2-03 r3).
+                if let Ok(value) = serde_json::to_value(spec.as_ref()) {
+                    self.session
+                        .metadata
+                        .insert(LATEST_PLAN_REVIEW_SPEC_JSON.to_string(), value);
+                }
+                if let Ok(value) = serde_json::to_value(plan.as_ref()) {
+                    self.session
+                        .metadata
+                        .insert(LATEST_PLAN_REVIEW_EXECUTION_JSON.to_string(), value);
+                }
+                if let Ok(value) = serde_json::to_value(&plan_draft) {
+                    self.session
+                        .metadata
+                        .insert(LATEST_PLAN_REVIEW_DRAFT_JSON.to_string(), value);
+                }
                 let binding = current_intentspec_binding(self.registry.working_dir());
                 self.session.metadata.insert(
                     LATEST_INTENTSPEC_WORKSPACE_KEY.to_string(),
@@ -5123,6 +6230,62 @@ where
                     self.mcp_plan_id = None;
                 }
 
+                if auto_repair_pending {
+                    if let Err(error) = self
+                        .settle_local_runtime_turn_completed(
+                            turn_id,
+                            "local TUI plan workflow completed",
+                        )
+                        .await
+                    {
+                        self.report_local_runtime_finalization_fence(
+                            error,
+                            "Plan workflow completed, but its durable finalization requires reconciliation before continuing",
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    self.finish_turn_state();
+                } else {
+                    // Terminalize Phase 1 durability, then park a non-mutating
+                    // review-gate turn that owns `AwaitingPlanReview` (W2-03).
+                    // The worker — not `pending_post_plan` alone — refuses new
+                    // execution on this session until Execute/Modify/Cancel and
+                    // the follow-on network-policy gate both resolve.
+                    if let Err(error) = self
+                        .register_local_runtime_plan_review(
+                            turn_id,
+                            interaction_id.clone(),
+                            plan_id.clone(),
+                        )
+                        .await
+                    {
+                        self.report_local_runtime_finalization_fence(
+                            error,
+                            "The execution plan is ready, but the runtime could not register the plan review gate",
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    self.finish_turn_state_keep_local_runtime_turn();
+                }
+                self.history = new_history;
+                self.enqueue_llm_context_frame(
+                    "step_summary",
+                    "Phase 1 plan",
+                    intent_id.clone(),
+                    plan_id.clone(),
+                    text.clone(),
+                );
+                let browser_plan_steps = plan
+                    .tasks
+                    .iter()
+                    .map(|task| CodeUiPlanStep {
+                        step: task.title().to_string(),
+                        status: "pending".to_string(),
+                    })
+                    .collect::<Vec<_>>();
+
                 let execution_plan = (*plan).clone();
                 self.widget.show_dag_preview(execution_plan.clone());
                 let network_access = matches!(
@@ -5152,7 +6315,7 @@ where
                     self.session.add_assistant_message(&note);
                     if let Some(code_ui_session) = self.code_ui_session.clone() {
                         let plan_snapshot = CodeUiPlanSnapshot {
-                            id: plan_id.clone().unwrap_or_else(|| format!("plan-{turn_id}")),
+                            id: interaction_id.clone(),
                             title: Some("Execution Plan".to_string()),
                             summary: Some(text.clone()),
                             status: "executing".to_string(),
@@ -5199,7 +6362,7 @@ where
                 }
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     let plan_snapshot = CodeUiPlanSnapshot {
-                        id: plan_id.clone().unwrap_or_else(|| format!("plan-{turn_id}")),
+                        id: interaction_id.clone(),
                         title: Some("Execution Plan".to_string()),
                         summary: Some(text.clone()),
                         status: "ready".to_string(),
@@ -5228,25 +6391,7 @@ where
                             "The plan is ready. Execute it, revise it, or cancel.".to_string(),
                         ),
                         prompt: None,
-                        options: vec![
-                            CodeUiInteractionOption {
-                                id: "execute".to_string(),
-                                label: "Execute Plan".to_string(),
-                                description: Some(
-                                    "Confirm the plan and choose network policy".to_string(),
-                                ),
-                            },
-                            CodeUiInteractionOption {
-                                id: "modify".to_string(),
-                                label: "Modify Plan".to_string(),
-                                description: Some("Revise the execution plan".to_string()),
-                            },
-                            CodeUiInteractionOption {
-                                id: "cancel".to_string(),
-                                label: "Cancel".to_string(),
-                                description: Some("Leave the plan in place and stop".to_string()),
-                            },
-                        ],
+                        options: post_plan_choice_options(),
                         status: CodeUiInteractionStatus::Pending,
                         metadata: serde_json::json!({
                             "intentId": transcript_entry.metadata["intentId"].clone(),
@@ -5269,6 +6414,7 @@ where
                 // Show post-plan dialog instead of returning to Idle
                 self.pending_post_plan = Some(PendingPostPlan {
                     spec_json,
+                    interaction_id,
                     intent_id,
                     plan_id,
                     persisted_plan_bundle,
@@ -7089,10 +8235,10 @@ where
         self.cancel_pending_phase_confirmation();
         self.cancel_pending_exec_approval();
         if self.pending_post_plan.is_some() {
-            self.dismiss_post_plan_dialog();
+            self.dismiss_post_plan_dialog().await;
         }
         if self.pending_network_policy.is_some() {
-            self.dismiss_network_policy_dialog();
+            self.dismiss_network_policy_dialog().await;
         }
         if self.pending_intent_review.is_some() {
             self.dismiss_intent_review_dialog().await;
@@ -7677,6 +8823,16 @@ where
             }
         };
 
+        if self.local_turn_runtime.is_none() {
+            self.pending_auto_plan_repair_execution = None;
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Plan drafting requires a local AgentRuntime so Plan review and network-policy gates stay durable across crash/resume. This managed Code UI session has none — use a non-managed TUI provider."
+                    .to_string(),
+            )));
+            self.set_idle_and_draw();
+            return;
+        }
+
         let turn_id = self.begin_turn();
         self.running_tool_calls = 0;
         self.widget.clear_dag_panel();
@@ -7693,6 +8849,76 @@ where
         config.context_frame_session_root = Some(session_root);
         config.context_frame_prompt_id = Some(format!("turn-{turn_id}"));
         self.attach_turn_cancellation(&mut config);
+
+        // IntentSpec confirm (and plan revision) clear the Phase 0 review turn
+        // before this workflow starts. Admit a Phase 1 drafting turn now so
+        // `PlanWorkflowComplete` can terminalize it and park `AwaitingPlanReview`
+        // — without this, `register_local_runtime_plan_review` no-ops and the
+        // plan dialog has no durable/runtime fence (W2-03 r10).
+        if let Some(runtime) = self.local_turn_runtime.clone() {
+            let cancellation = match self.current_turn_cancellation.as_ref().cloned() {
+                Some(token) => token,
+                None => {
+                    self.clear_turn_tracking();
+                    self.pending_auto_plan_repair_execution = None;
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Plan workflow was not admitted: local turn cancellation token missing"
+                            .to_string(),
+                    )));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+            let mutation_started = match self.current_turn_mutation_started.as_ref().cloned() {
+                Some(marker) => marker,
+                None => {
+                    self.clear_turn_tracking();
+                    self.pending_auto_plan_repair_execution = None;
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Plan workflow was not admitted: local turn mutation marker missing"
+                            .to_string(),
+                    )));
+                    self.set_idle_and_draw();
+                    return;
+                }
+            };
+            if let Err(error) = self.ensure_session_snapshot_before_admission() {
+                self.clear_turn_tracking();
+                self.pending_auto_plan_repair_execution = None;
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Plan workflow was not admitted: {error}"
+                    ))));
+                self.set_idle_and_draw();
+                return;
+            }
+            let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
+            if let Err(error) = runtime
+                .track_external_turn(
+                    TurnRequest::new(
+                        self.session.id.clone(),
+                        runtime_turn_id.clone(),
+                        "plan workflow".to_string(),
+                        true,
+                    ),
+                    cancellation,
+                    mutation_started,
+                )
+                .await
+            {
+                self.clear_turn_tracking();
+                self.pending_auto_plan_repair_execution = None;
+                self.widget
+                    .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Plan workflow was not admitted: {}",
+                        runtime_worker_adapter_message(error)
+                    ))));
+                self.set_idle_and_draw();
+                return;
+            }
+            self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+        }
+
         let tx = self.app_event_tx.clone();
         let mcp_server = self.mcp_server.clone();
         let fallback_history = self.history.clone();
@@ -7966,14 +9192,103 @@ where
             Some(p) => p,
             None => return,
         };
-        let interaction_id = pending
-            .plan_id
-            .clone()
-            .unwrap_or_else(|| "post-plan-choice".to_string());
+        let interaction_id = pending.interaction_id.clone();
         let selected = pending.selected;
+
+        // Crash ordering (W2-03 r1): the `NetworkPolicyRequested` marker must
+        // be durable *before* Plan `Execute` resolves. Once the plan review is
+        // resolved, `restore_pending_plan_review_gate` no-ops, so a marker
+        // written afterwards can be lost together with the mandatory human
+        // network decision. The converse hazard — a marker without a durable
+        // Execute — is closed on the recovery side:
+        // `open_network_policy_from_workflow` only reports a marker once its
+        // plan review resolved as Execute, so replaying this window can never
+        // skip plan approval.
+        let network_gate = (selected == 0 && self.local_turn_runtime.is_some()).then(|| {
+            (
+                network_policy_interaction_id(pending.plan_id.as_deref()),
+                format!("network-policy-{}", uuid::Uuid::new_v4()),
+            )
+        });
+        if let Some((network_interaction_id, gate_turn_id)) = network_gate.as_ref()
+            && let Err(error) = self.append_network_policy_marker(
+                network_interaction_id,
+                pending.plan_id.as_deref(),
+                gate_turn_id,
+                pending.network_access,
+            )
+        {
+            // Fail closed: leave the plan review open rather than approving a
+            // plan whose follow-on network gate could not be made recoverable.
+            self.pending_post_plan = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The plan was not approved because the network-policy gate could not record its recovery marker: {error}. The review is still pending — try again."
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingPostPlanChoice);
+            self.schedule_draw();
+            return;
+        }
+
+        // Drive the durable decision through the runtime (worker-owned
+        // `AwaitingPlanReview`, W2-03). Execute holds the queue fenced for the
+        // network-policy gate; revise/cancel discard anything queued under it.
+        // Fail closed so a delivery error re-opens the dialog instead of
+        // letting the TUI proceed while the worker still owns the gate.
+        if let Some(decision) = PlanReviewDecision::from_choice_index(selected)
+            && let Err(error) = self
+                .settle_local_runtime_plan_review(decision, &interaction_id)
+                .await
+        {
+            // The plan stays unapproved, so the marker written above must not
+            // survive as a restorable gate.
+            if let Some((network_interaction_id, _)) = network_gate.as_ref() {
+                self.revoke_network_policy_marker(
+                    network_interaction_id,
+                    "plan-review-delivery-failed",
+                );
+            }
+            self.pending_post_plan = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The plan review decision was not applied: {}. The review is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingPostPlanChoice);
+            self.schedule_draw();
+            return;
+        }
 
         match selected {
             0 => {
+                // Park the network-policy gate before the dialog opens so the
+                // worker keeps refusing mutating admissions between Execute and
+                // Allow/Deny — an IntentSpec that already asks for network
+                // access must not skip this human gate. The gate turn id is the
+                // one already recorded in the durable marker above.
+                let gate_turn_id = network_gate
+                    .map(|(_, gate_turn_id)| gate_turn_id)
+                    .unwrap_or_else(|| format!("network-policy-{}", uuid::Uuid::new_v4()));
+                if let Err(error) = self
+                    .register_local_runtime_network_policy(
+                        pending.plan_id.clone(),
+                        pending.network_access,
+                        gate_turn_id,
+                    )
+                    .await
+                {
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "The plan was approved, but the network-policy gate could not be registered ({}). Mutation reconciliation is required before execution can start.",
+                        runtime_worker_adapter_message(error)
+                    ))
+                    .await;
+                    self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                    self.sync_mux_input_context();
+                    self.schedule_draw();
+                    return;
+                }
                 self.show_network_policy_dialog(pending);
             }
             _ => {
@@ -8085,14 +9400,60 @@ where
             None => return,
         };
         let selected = pending.selected;
+        let interaction_id = network_policy_interaction_id(pending.post_plan.plan_id.as_deref());
+
+        // Allow / Deny: settle the network gate first, then hand off to execute.
+        // Back is handled separately so the replacement PlanReviewRequested
+        // marker is durable before the network gate resolves (W2-03 r8).
         if selected == 2 {
-            self.restore_post_plan_dialog(pending.post_plan);
-            self.schedule_draw();
+            self.return_from_network_to_plan_review(pending).await;
             return;
         }
 
         let network_access = selected == 1;
-        let interaction_id = network_policy_interaction_id(pending.post_plan.plan_id.as_deref());
+        // Crash bridge (W2-03 r18): persist the approved execution handoff
+        // *before* resolving the network gate. Otherwise a crash after Allow/
+        // Deny settle leaves neither gate open and drops the approved plan.
+        self.session.metadata.insert(
+            LATEST_PENDING_PLAN_EXECUTION_NETWORK.to_string(),
+            serde_json::Value::Bool(network_access),
+        );
+        if let Err(error) = self.session_store.save(&self.session) {
+            self.session
+                .metadata
+                .remove(LATEST_PENDING_PLAN_EXECUTION_NETWORK);
+            self.pending_network_policy = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The network-policy choice was not applied because the execution handoff could not be recorded: {error}. The choice is still pending — try again."
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingNetworkPolicyChoice);
+            self.schedule_draw();
+            return;
+        }
+
+        if let Some(decision) = NetworkPolicyDecision::from_choice_index(selected)
+            && let Err(error) = self
+                .settle_local_runtime_network_policy(decision, &interaction_id)
+                .await
+        {
+            self.session
+                .metadata
+                .remove(LATEST_PENDING_PLAN_EXECUTION_NETWORK);
+            let _ = self.session_store.save(&self.session);
+            self.pending_network_policy = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The network-policy choice was not applied: {}. The choice is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingNetworkPolicyChoice);
+            self.schedule_draw();
+            return;
+        }
+
         let request = Self::execute_request_from_post_plan(pending.post_plan, network_access);
         self.start_execute_workflow(request).await;
 
@@ -8107,26 +9468,174 @@ where
         self.schedule_draw();
     }
 
-    fn return_to_post_plan_dialog(&mut self) {
+    /// Esc from the network-policy dialog: same contract as choosing "Back".
+    async fn return_to_post_plan_dialog(&mut self) {
         let Some(pending) = self.pending_network_policy.take() else {
             return;
         };
-        self.restore_post_plan_dialog(pending.post_plan);
+        self.return_from_network_to_plan_review(pending).await;
+    }
+
+    /// Crash-safe Back/Esc from the network-policy gate to Plan review.
+    ///
+    /// Order matters: append the replacement `PlanReviewRequested` marker
+    /// *before* resolving the network interaction. Resolving first would leave
+    /// a window where neither gate is open on restart (W2-03 r8).
+    async fn return_from_network_to_plan_review(&mut self, pending: PendingNetworkPolicyChoice) {
+        let network_interaction_id =
+            network_policy_interaction_id(pending.post_plan.plan_id.as_deref());
+        let plan_interaction_id = pending.post_plan.interaction_id.clone();
+        let plan_id = pending.post_plan.plan_id.clone();
+        let review_turn_id = if self.local_turn_runtime.is_some() {
+            let review_turn_id = format!("plan-review-{}", uuid::Uuid::new_v4());
+            if let Err(error) = self.append_plan_review_marker(
+                &plan_interaction_id,
+                plan_id.as_deref(),
+                &review_turn_id,
+                "",
+            ) {
+                self.pending_network_policy = Some(pending);
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Returning to the plan review could not record its recovery marker: {error}. The network-policy choice is still pending — try again."
+                ))));
+                self.widget
+                    .bottom_pane
+                    .set_status(AgentStatus::AwaitingNetworkPolicyChoice);
+                self.schedule_draw();
+                return;
+            }
+            Some(review_turn_id)
+        } else {
+            None
+        };
+
+        if let Err(error) = self
+            .settle_local_runtime_network_policy(
+                NetworkPolicyDecision::Back,
+                &network_interaction_id,
+            )
+            .await
+        {
+            // Keep the replacement PlanReviewRequested marker. Revoking it
+            // would also clear the associated network pending row in replay,
+            // leaving neither gate restorable after a crash (W2-03 r20). The
+            // open plan review demotes the network marker on restore instead.
+            self.pending_network_policy = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "Returning to the plan review was not applied: {}. The network-policy choice is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingNetworkPolicyChoice);
+            self.schedule_draw();
+            return;
+        }
+
+        self.reopen_post_plan_dialog(pending.post_plan, review_turn_id)
+            .await;
+    }
+
+    /// Re-park the Plan review gate and re-open its dialog after the developer
+    /// backs out of the network-policy choice. The Back delivery already
+    /// discarded the previous gate turn, so a fresh `AwaitingPlanReview` turn
+    /// must own the review again before the dialog is shown; failing to park it
+    /// fences the session rather than presenting a review the worker would not
+    /// honour.
+    ///
+    /// `preallocated_review_turn_id` is set when
+    /// [`Self::return_from_network_to_plan_review`] already appended the durable
+    /// marker before settling the network gate.
+    async fn reopen_post_plan_dialog(
+        &mut self,
+        pending: PendingPostPlan,
+        preallocated_review_turn_id: Option<String>,
+    ) {
+        let interaction_id = pending.interaction_id.clone();
+        let plan_id = pending.plan_id.clone();
+        if self.local_turn_runtime.is_some() {
+            let review_turn_id = match preallocated_review_turn_id {
+                Some(turn_id) => turn_id,
+                None => {
+                    let review_turn_id = format!("plan-review-{}", uuid::Uuid::new_v4());
+                    if let Err(error) = self.append_plan_review_marker(
+                        &interaction_id,
+                        plan_id.as_deref(),
+                        &review_turn_id,
+                        "",
+                    ) {
+                        self.fence_for_unrestorable_review_gate(format!(
+                            "Returning to the plan review could not record its recovery marker ({error}). Mutation reconciliation is required before another turn can run."
+                        ))
+                        .await;
+                        return;
+                    }
+                    review_turn_id
+                }
+            };
+            if let Err(error) = self
+                .park_plan_review_gate(&interaction_id, plan_id.as_deref(), review_turn_id, 0)
+                .await
+            {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "Returning to the plan review could not re-park its runtime gate ({}). Mutation reconciliation is required before another turn can run.",
+                    runtime_worker_adapter_message(error)
+                ))
+                .await;
+                return;
+            }
+        }
+        // `restore_post_plan_dialog` re-upserts the `post_plan_choice` request
+        // that Execute resolved, so the browser can answer the re-parked gate.
+        self.restore_post_plan_dialog(pending);
         self.schedule_draw();
     }
 
     fn restore_post_plan_dialog(&mut self, mut pending: PendingPostPlan) {
         pending.selected = 0;
-        let interaction_id = network_policy_interaction_id(pending.plan_id.as_deref());
+        let plan_interaction_id = pending.interaction_id.clone();
+        let network_interaction_id = network_policy_interaction_id(pending.plan_id.as_deref());
+        let intent_id = pending.intent_id.clone();
+        let plan_id = pending.plan_id.clone();
+        let network_access = pending.network_access;
         self.pending_post_plan = Some(pending);
         self.widget.bottom_pane.reset_post_plan_selection();
+        self.widget
+            .bottom_pane
+            .set_post_plan_network_access(network_access);
         self.widget
             .bottom_pane
             .set_status(AgentStatus::AwaitingPostPlanChoice);
         self.sync_mux_input_context();
         if let Some(code_ui_session) = self.code_ui_session.clone() {
+            // Back already resolved the previous `post_plan_choice` when Execute
+            // was chosen; re-upsert it as Pending so browser/automation can
+            // answer the re-parked Plan review gate (W2-03 r2).
             tokio::spawn(async move {
-                code_ui_session.clear_interaction(&interaction_id).await;
+                code_ui_session
+                    .clear_interaction(&network_interaction_id)
+                    .await;
+                code_ui_session
+                    .upsert_interaction(CodeUiInteractionRequest {
+                        id: plan_interaction_id,
+                        kind: CodeUiInteractionKind::PostPlanChoice,
+                        title: Some("Choose next step".to_string()),
+                        description: Some(
+                            "The plan is ready. Execute it, revise it, or cancel.".to_string(),
+                        ),
+                        prompt: None,
+                        options: post_plan_choice_options(),
+                        status: CodeUiInteractionStatus::Pending,
+                        metadata: serde_json::json!({
+                            "intentId": intent_id,
+                            "planId": plan_id,
+                            "networkAccess": network_access,
+                            "restoredFromNetworkBack": true,
+                        }),
+                        requested_at: Utc::now(),
+                        resolved_at: None,
+                    })
+                    .await;
                 code_ui_session
                     .set_status(CodeUiSessionStatus::AwaitingInteraction)
                     .await;
@@ -8134,33 +9643,63 @@ where
         }
     }
 
-    fn dismiss_post_plan_dialog(&mut self) {
-        if let Some(interaction_id) = self
-            .pending_post_plan
-            .as_ref()
-            .and_then(|pending| pending.plan_id.clone())
-            && let Some(code_ui_session) = self.code_ui_session.clone()
+    async fn dismiss_post_plan_dialog(&mut self) {
+        let Some(pending) = self.pending_post_plan.take() else {
+            self.set_idle_and_draw();
+            return;
+        };
+        // Esc is an explicit Cancel: release the worker-owned gate so the
+        // session is not left fenced behind an interaction nobody can answer.
+        if let Err(error) = self
+            .settle_local_runtime_plan_review(PlanReviewDecision::Cancel, &pending.interaction_id)
+            .await
         {
+            self.pending_post_plan = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The plan review cancel was not applied: {}. The review is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingPostPlanChoice);
+            self.schedule_draw();
+            return;
+        }
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            let interaction_id = pending.interaction_id;
             tokio::spawn(async move {
                 code_ui_session.clear_interaction(&interaction_id).await;
             });
         }
-        self.pending_post_plan = None;
         self.set_idle_and_draw();
     }
 
-    fn dismiss_network_policy_dialog(&mut self) {
-        if let Some(interaction_id) = self
-            .pending_network_policy
-            .as_ref()
-            .map(|pending| network_policy_interaction_id(pending.post_plan.plan_id.as_deref()))
-            && let Some(code_ui_session) = self.code_ui_session.clone()
+    async fn dismiss_network_policy_dialog(&mut self) {
+        let Some(pending) = self.pending_network_policy.take() else {
+            self.set_idle_and_draw();
+            return;
+        };
+        let interaction_id = network_policy_interaction_id(pending.post_plan.plan_id.as_deref());
+        if let Err(error) = self
+            .settle_local_runtime_network_policy(NetworkPolicyDecision::Back, &interaction_id)
+            .await
         {
+            self.pending_network_policy = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The network-policy dismissal was not applied: {}. The choice is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingNetworkPolicyChoice);
+            self.schedule_draw();
+            return;
+        }
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
             tokio::spawn(async move {
                 code_ui_session.clear_interaction(&interaction_id).await;
             });
         }
-        self.pending_network_policy = None;
         self.set_idle_and_draw();
     }
 
@@ -8207,6 +9746,7 @@ where
         let mut spec: IntentSpec = match serde_json::from_str(&spec_json) {
             Ok(s) => s,
             Err(e) => {
+                let _ = self.clear_pending_plan_execution_handoff();
                 self.widget
                     .add_cell(Box::new(AssistantHistoryCell::new(format!(
                         "Failed to parse IntentSpec: {e}"
@@ -8288,6 +9828,29 @@ where
                 return;
             }
             self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+        }
+        // Crash bridge consumed: execution is admitted (or proceeds without a
+        // local runtime). Clear durably before the long-running orchestrator so
+        // a mid-execute restart does not double-start from a stale handoff.
+        if let Err(error) = self.clear_pending_plan_execution_handoff() {
+            if let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.take()
+                && let Some(runtime) = self.local_turn_runtime.clone()
+            {
+                let _ = runtime
+                    .finish_external_turn(
+                        self.session.id.clone(),
+                        runtime_turn_id,
+                        Err(RuntimeWorkerError::ExecutionFailed(error.clone())),
+                    )
+                    .await;
+            }
+            self.finish_turn_state();
+            self.widget
+                .add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Execute workflow was not started: {error}"
+                ))));
+            self.set_idle_and_draw();
+            return;
         }
         // Admit before showing a streaming placeholder so a rejected
         // reconciliation fence cannot leave a stuck spinner cell.
@@ -8695,6 +10258,14 @@ where
     }
 
     async fn begin_plan_workflow(&mut self, user_text: String, prompt: String) {
+        if self.local_turn_runtime.is_none() {
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Planning requires a local AgentRuntime so IntentSpec/Plan review gates stay durable across crash/resume. This managed Code UI session has none — use a non-managed TUI provider for `/plan`."
+                    .to_string(),
+            )));
+            self.schedule_draw();
+            return;
+        }
         self.pending_plan_revision = None;
         let turn_id = self.begin_turn();
         self.running_tool_calls = 0;
@@ -13382,11 +14953,27 @@ fn apply_developer_network_access(spec: &mut IntentSpec, network_access: bool) {
     };
 }
 
-fn network_policy_interaction_id(plan_id: Option<&str>) -> String {
-    match plan_id {
-        Some(plan_id) => format!("{plan_id}:network-policy"),
-        None => "post-plan-network-policy".to_string(),
-    }
+/// Option list for the Code UI `post_plan_choice` interaction. Shared by the
+/// live Phase 1 completion path and by Plan-review restore so a rehydrated
+/// gate offers exactly the same wire ids (`execute` / `modify` / `cancel`).
+fn post_plan_choice_options() -> Vec<CodeUiInteractionOption> {
+    vec![
+        CodeUiInteractionOption {
+            id: "execute".to_string(),
+            label: "Execute Plan".to_string(),
+            description: Some("Confirm the plan and choose network policy".to_string()),
+        },
+        CodeUiInteractionOption {
+            id: "modify".to_string(),
+            label: "Modify Plan".to_string(),
+            description: Some("Revise the execution plan".to_string()),
+        },
+        CodeUiInteractionOption {
+            id: "cancel".to_string(),
+            label: "Cancel".to_string(),
+            description: Some("Leave the plan in place and stop".to_string()),
+        },
+    ]
 }
 
 fn is_phase1_plan_draft_tool(tool_name: &str) -> bool {
@@ -13395,20 +14982,6 @@ fn is_phase1_plan_draft_tool(tool_name: &str) -> bool {
 
 fn should_forward_phase1_model_text_delta(_delta: &str) -> bool {
     false
-}
-
-fn phase1_plan_tool_loop_config(mut config: ToolLoopConfig) -> ToolLoopConfig {
-    config.allowed_tools = Some(vec![
-        "read_file".to_string(),
-        "list_dir".to_string(),
-        "grep_files".to_string(),
-        "search_files".to_string(),
-        "web_search".to_string(),
-        "submit_plan_draft".to_string(),
-    ]);
-    config.terminal_tools = Some(vec!["submit_plan_draft".to_string()]);
-    config.max_turns = Some(12);
-    config
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

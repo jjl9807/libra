@@ -822,12 +822,176 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
     resumed.shutdown()
 }
 
-/// W0-02 baseline skeleton (cargo filter: `plan_review`).
+/// Drive `/plan` through IntentSpec confirm → Phase 1 `post_plan_choice` →
+/// Execute → network-policy gate, then hard-kill and `--resume` so the
+/// network gate is restored before Allow/Deny.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn plan_review_network_policy_survives_resume_and_can_be_denied() -> Result<()> {
+    use std::process::Command;
+
+    let case_name = "plan-review-network-resume";
+    let repo_root = tempfile::Builder::new()
+        .prefix(&format!("{case_name}-"))
+        .tempdir()
+        .context("failed to create plan-review resume tempdir")?;
+    let repo_dir = repo_root.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).context("failed to create resume repo subdir")?;
+    std::fs::write(
+        repo_dir.join("README.md"),
+        "# Fixture\n\nPlaceholder for plan-review PTY.\n",
+    )
+    .context("failed to seed README.md")?;
+    let init = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(["init", "--vault=false", "--quiet"])
+        .arg(&repo_dir)
+        .output()
+        .context("failed to run libra init for plan-review resume")?;
+    if !init.status.success() {
+        anyhow::bail!(
+            "libra init failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&init.stdout),
+            String::from_utf8_lossy(&init.stderr)
+        );
+    }
+
+    let session_id = {
+        let mut session = CodeSession::spawn(
+            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
+                .with_existing_repo_dir(repo_dir.clone())
+                .with_context("dev"),
+        )?;
+        session.attach_automation(&format!("{case_name}-spawn"))?;
+        session
+            .submit_message("Add a Usage section to the README documenting the CLI commands.")?;
+        session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+            interaction_status(snapshot, "call_request_user_input_1") == Some("pending")
+        })?;
+        let (http_status, body) = session.respond_interaction(
+            "call_request_user_input_1",
+            &json!({ "answers": { "risk_profile": ["Low"] } }),
+        )?;
+        assert_eq!(
+            http_status,
+            StatusCode::OK,
+            "risk profile answer rejected: {body}"
+        );
+
+        let snapshot = session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+            find_interaction_by_kind(snapshot, "intent_review_choice")
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("pending")
+        })?;
+        let intent_id = find_interaction_by_kind(&snapshot, "intent_review_choice")
+            .and_then(|interaction| interaction.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("intent_review_choice missing id: {snapshot}"))?
+            .to_string();
+        let (http_status, body) =
+            session.respond_interaction(&intent_id, &json!({ "selectedOption": "confirm" }))?;
+        assert_eq!(
+            http_status,
+            StatusCode::OK,
+            "intent confirm rejected: {body}"
+        );
+
+        let snapshot = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+            find_post_plan_execute_interaction(snapshot)
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("pending")
+        })?;
+        let plan_id = find_post_plan_execute_interaction(&snapshot)
+            .and_then(|interaction| interaction.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("post_plan_choice missing id: {snapshot}"))?
+            .to_string();
+        let (http_status, body) =
+            session.respond_interaction(&plan_id, &json!({ "selectedOption": "execute" }))?;
+        assert_eq!(http_status, StatusCode::OK, "plan Execute rejected: {body}");
+
+        session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+            find_network_policy_interaction(snapshot)
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("pending")
+        })?;
+        let id = session
+            .wait_for_snapshot(Duration::from_secs(5), |snapshot| {
+                snapshot.get("sessionId").and_then(Value::as_str).is_some()
+            })?
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("snapshot missing sessionId"))?;
+        session.kill_without_cleanup()?;
+        id
+    };
+
+    let mut resumed = CodeSession::spawn(
+        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
+            .with_existing_repo_dir(repo_dir)
+            .with_resume_thread(&session_id)
+            .with_context("dev"),
+    )?;
+    resumed.attach_automation(&format!("{case_name}-resume"))?;
+    let snapshot = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
+        find_network_policy_interaction(snapshot)
+            .and_then(|interaction| interaction.get("status"))
+            .and_then(Value::as_str)
+            == Some("pending")
+    })?;
+    assert_eq!(
+        status(&snapshot),
+        Some("awaiting_interaction"),
+        "resumed session must reopen the network-policy gate: {snapshot}"
+    );
+    let interaction_id = find_network_policy_interaction(&snapshot)
+        .and_then(|interaction| interaction.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("restored network gate missing id: {snapshot}"))?
+        .to_string();
+    let (http_status, body) = resumed.respond_interaction(
+        &interaction_id,
+        &json!({ "selectedOption": "network-deny" }),
+    )?;
+    assert_eq!(
+        http_status,
+        StatusCode::OK,
+        "network-deny on restored gate should be accepted: {body}"
+    );
+    resumed.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
+        status(snapshot) != Some("awaiting_interaction")
+            && find_network_policy_interaction(snapshot)
+                .and_then(|interaction| interaction.get("status"))
+                .and_then(Value::as_str)
+                == Some("resolved")
+    })?;
+    resumed.shutdown()
+}
+
+/// W2-03 Plan review / network-policy recovery contract (cargo filter: `plan_review`).
 ///
-/// Pins the network-policy human gate that follows Plan approval.
+/// Pins the network-policy human-gate labels and exercises the same
+/// `open_plan_review_from_workflow` / `open_network_policy_from_workflow`
+/// scans that `App::restore_pending_*` call after crash/resume — including
+/// the App-owned Execute→network marker ordering and the Back demote window.
+/// End-to-end PTY coverage lives in
+/// `plan_review_network_policy_survives_resume_and_can_be_denied`.
 #[test]
 fn plan_review_baseline_pins_network_policy_choices() {
-    use libra::internal::tui::NETWORK_POLICY_CHOICES;
+    use libra::internal::{
+        ai::{
+            runtime::phase1::{
+                network_policy_interaction_id, open_network_policy_from_workflow,
+                open_plan_review_from_workflow,
+            },
+            session::{CodeWorkflowEventKind, SessionJsonlStore},
+        },
+        tui::NETWORK_POLICY_CHOICES,
+    };
 
     assert_eq!(
         NETWORK_POLICY_CHOICES,
@@ -838,6 +1002,75 @@ fn plan_review_baseline_pins_network_policy_choices() {
             .iter()
             .any(|choice| choice.contains("Execute")),
         "network policy must not reuse post-plan Execute labels"
+    );
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+    let events = |store: &SessionJsonlStore| {
+        store
+            .load_code_workflow_replay()
+            .expect("replay")
+            .events
+            .into_iter()
+            .map(|event| event.event)
+            .collect::<Vec<_>>()
+    };
+
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "review-scenario".to_string(),
+            plan_id: "plan-scenario".to_string(),
+            turn_id: "plan-review-turn".to_string(),
+            phase1_turn_id: "phase1-turn".to_string(),
+        })
+        .expect("plan review marker");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::NetworkPolicyRequested {
+            interaction_id: network_policy_interaction_id(Some("plan-scenario")),
+            plan_id: "plan-scenario".to_string(),
+            turn_id: "network-policy-turn".to_string(),
+            default_allow: false,
+        })
+        .expect("App writes network marker before Execute");
+    assert!(
+        open_network_policy_from_workflow(events(&store).iter()).is_none(),
+        "network gate must not restore while plan review is still open"
+    );
+
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "review-scenario".to_string(),
+            resolution: "execute".to_string(),
+        })
+        .expect("Execute resolves plan review");
+    assert_eq!(
+        open_plan_review_from_workflow(events(&store).iter()),
+        None,
+        "Execute closes the plan review restore scan"
+    );
+    assert_eq!(
+        open_network_policy_from_workflow(events(&store).iter()).map(|(id, ..)| id),
+        Some(network_policy_interaction_id(Some("plan-scenario"))),
+        "after Execute, App restore must reopen the network gate"
+    );
+
+    // Back crash window: replacement PlanReviewRequested before network resolve.
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "review-scenario".to_string(),
+            plan_id: "plan-scenario".to_string(),
+            turn_id: "plan-review-turn-2".to_string(),
+            phase1_turn_id: String::new(),
+        })
+        .expect("Back re-opens plan review");
+    assert!(
+        open_network_policy_from_workflow(events(&store).iter()).is_none(),
+        "Back must demote the network gate so Allow cannot skip renewed plan review"
+    );
+    assert_eq!(
+        open_plan_review_from_workflow(events(&store).iter()).map(|(id, ..)| id),
+        Some("review-scenario".to_string()),
+        "Back leaves plan review as the restorable gate"
     );
 }
 
@@ -981,6 +1214,50 @@ fn find_interaction_by_kind<'a>(snapshot: &'a Value, kind: &str) -> Option<&'a V
         .into_iter()
         .flatten()
         .find(|interaction| interaction.get("kind").and_then(Value::as_str) == Some(kind))
+}
+
+/// Plan-review Execute gate (`post_plan_choice` without `phase=networkPolicy`).
+/// Prefer a pending item when both Execute and network gates are present.
+#[cfg(feature = "test-provider")]
+fn find_post_plan_execute_interaction(snapshot: &Value) -> Option<&Value> {
+    let interactions = snapshot.get("interactions").and_then(Value::as_array)?;
+    let mut fallback = None;
+    for interaction in interactions {
+        if interaction.get("kind").and_then(Value::as_str) != Some("post_plan_choice") {
+            continue;
+        }
+        if interaction
+            .get("metadata")
+            .and_then(|metadata| metadata.get("phase"))
+            .and_then(Value::as_str)
+            == Some("networkPolicy")
+        {
+            continue;
+        }
+        if interaction.get("status").and_then(Value::as_str) == Some("pending") {
+            return Some(interaction);
+        }
+        fallback = Some(interaction);
+    }
+    fallback
+}
+
+/// Network-policy gate projected as `post_plan_choice` with `phase=networkPolicy`.
+#[cfg(feature = "test-provider")]
+fn find_network_policy_interaction(snapshot: &Value) -> Option<&Value> {
+    snapshot
+        .get("interactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|interaction| {
+            interaction.get("kind").and_then(Value::as_str) == Some("post_plan_choice")
+                && interaction
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("phase"))
+                    .and_then(Value::as_str)
+                    == Some("networkPolicy")
+        })
 }
 
 #[cfg(feature = "test-provider")]
