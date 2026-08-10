@@ -4209,9 +4209,16 @@ where
     // restored first because an open IntentSpec gate means no plan was ever
     // approved; the plan restore then no-ops on the already-parked gate.
     app.restore_pending_plan_review_gate().await;
+    // W2-11: restore a durable Continue/Cancel repair gate before considering
+    // any execution handoff. A corrupt/unreadable repair replay fences the
+    // session and must never fall through to replay approved mutations.
+    let repair_gate_allows_handoff = app.restore_pending_plan_execution_repair_gate().await;
     // W2-03 r18: network Allow/Deny may have settled while execute admission
-    // never ran — resume that handoff after the review gates no-op.
-    app.restore_pending_plan_execution_handoff().await;
+    // never ran — resume that handoff only after repair recovery confirms that
+    // no unresolved Continue/Cancel decision is owed.
+    if should_restore_plan_execution_handoff(repair_gate_allows_handoff) {
+        app.restore_pending_plan_execution_handoff().await;
+    }
 
     let run_result = app.run().await;
     // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI
@@ -5352,6 +5359,12 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     Ok(())
 }
 
+/// A repair replay failure is a fail-closed startup condition: the execution
+/// handoff may be replayed only when the repair restore explicitly permits it.
+fn should_restore_plan_execution_handoff(repair_gate_allows_handoff: bool) -> bool {
+    repair_gate_allows_handoff
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5373,6 +5386,26 @@ mod tests {
 
     use super::*;
     use crate::internal::ai::sandbox::SandboxPolicy;
+
+    #[test]
+    fn corrupt_repair_replay_blocks_pending_execution_handoff() {
+        use crate::internal::ai::session::SessionJsonlStore;
+
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = SessionJsonlStore::new(temp.path().to_path_buf());
+        std::fs::write(store.events_path(), "{not valid JSONL}\n")
+            .expect("write corrupt workflow replay");
+
+        let repair_gate_allows_handoff = store.load_code_workflow_replay().is_ok();
+        assert!(
+            !repair_gate_allows_handoff,
+            "a corrupt repair replay must be treated as unrecoverable"
+        );
+        assert!(
+            !should_restore_plan_execution_handoff(repair_gate_allows_handoff),
+            "startup must not replay a pending mutating execution handoff when repair recovery fails"
+        );
+    }
 
     /// CEX-S2-12 "single sub-agent behind flag": the dispatcher
     /// concurrency cap is forced to 1 for every configured value —

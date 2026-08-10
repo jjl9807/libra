@@ -210,6 +210,9 @@ pub enum AppEvent {
         warnings: Vec<String>,
         automatic_repair_attempts: u8,
         automatic_repair_max_attempts: u8,
+        /// Durable repair handoff retained through plan review until repaired
+        /// execution enters the runtime queue.
+        repair_continuation_interaction_id: Option<String>,
     },
     /// Complete result for the Phase 0 IntentSpec review gate. Triggers the
     /// confirm / modify / cancel choice popup.

@@ -31,7 +31,7 @@ pub const NETWORK_POLICY_HELP: &[&str] = &[
 ];
 
 /// Frozen threshold message when automatic plan repair stops for developer
-/// confirmation. Callers must keep the `/plan continue` affordance.
+/// confirmation. Callers must require a higher `/plan continue` limit.
 pub fn plan_repair_threshold_baseline_message(
     report: &str,
     attempts: u8,
@@ -41,7 +41,7 @@ pub fn plan_repair_threshold_baseline_message(
         "Automatic plan repair stopped after {attempts} failed repair attempts (automatic threshold: {max_attempts}).\n\
 Developer confirmation is required before more automatic correction.\n\
 {report}\n\
-Reply `continue` or `/plan continue <max-attempts>` to allow more automatic repair attempts, describe specific Plan repair guidance, or use `/plan cancel` to stop."
+Reply `/plan continue <higher-limit>` to raise the automatic repair limit, describe specific Plan repair guidance, or use `/plan cancel` to stop."
     )
 }
 
@@ -66,7 +66,8 @@ mod tests {
     fn plan_repair_threshold_baseline_keeps_plan_continue_affordance() {
         let message = plan_repair_threshold_baseline_message("boom", 3, 3);
         assert!(message.contains("Automatic plan repair stopped after 3 failed repair attempts"));
-        assert!(message.contains("/plan continue"));
+        assert!(message.contains("/plan continue <higher-limit>"));
+        assert!(!message.contains("Reply `continue`"));
         assert!(message.contains("boom"));
     }
 }

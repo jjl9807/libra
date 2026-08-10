@@ -93,6 +93,19 @@ pub async fn submit_confirmed_plan_execution(
     }
 }
 
+/// Re-admit a repaired plan through the same serialized mutating boundary as
+/// its original confirmed execution. Repair adapters must use this entry after
+/// a runtime repair decision; they may not invoke an execution runner directly.
+pub async fn submit_repaired_plan_execution(
+    runtime: &AgentRuntimeHandle,
+    executor: &DeferredPlanExecutionExecutor,
+    session_id: impl Into<String>,
+    turn_id: impl Into<String>,
+    runner: PlanExecutionRunner,
+) -> Result<TurnReceipt, RuntimeWorkerError> {
+    submit_confirmed_plan_execution(runtime, executor, session_id, turn_id, runner).await
+}
+
 /// Runner body supplied by an adapter (TUI/Web). The worker invokes it only
 /// after the turn has been dequeued, so queue ownership stays with runtime.
 pub type PlanExecutionRunner = Box<

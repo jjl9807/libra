@@ -16,8 +16,9 @@ use super::code_ui::{
     CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot, CodeUiToolCallSnapshot,
     CodeUiTranscriptEntry,
 };
-use crate::internal::ai::session::{
-    CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap,
+use crate::internal::ai::{
+    runtime::PlanExecutionRepairState,
+    session::{CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap},
 };
 
 /// The fold never silently applies an unbounded historical suffix.  A later
@@ -181,6 +182,10 @@ fn apply_projection_delta(
     match projection {
         "status" => snapshot.status = decode(projection, payload)?,
         "controller" => snapshot.controller = decode(projection, payload)?,
+        "plan_execution_repair" => {
+            snapshot.plan_execution_repair =
+                decode::<Option<PlanExecutionRepairState>>(projection, payload)?
+        }
         "transcript_upsert" => {
             let entry: CodeUiTranscriptEntry = decode(projection, payload)?;
             upsert_by_id(&mut snapshot.transcript, entry, |entry| entry.id.as_str());

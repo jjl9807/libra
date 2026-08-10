@@ -205,7 +205,8 @@ fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
     assert!(message.contains(
         "Automatic plan repair stopped after 2 failed repair attempts (automatic threshold: 2)."
     ));
-    assert!(message.contains("Reply `continue` or `/plan continue"));
+    assert!(message.contains("Reply `/plan continue <higher-limit>`"));
+    assert!(!message.contains("Reply `continue`"));
     assert!(message.contains("step failed"));
 }
 

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-11, 2026-08-11)
+
+- **W2-11 migrates plan-execution failure classification and repair loops into
+  the runtime.** Runtime-owned repair state classifies plan, IntentSpec, and
+  manual-action failures; persists Continue/Cancel gates for crash recovery;
+  projects bounded redacted failure evidence to Code UI; and requires a higher
+  `maxAttempts` to extend an exhausted automatic-repair limit. English and
+  zh-CN Code/control documentation describe the wire contract.
+
 ### Added (plan-20260715 W2-06, 2026-08-10)
 
 - **W2-06 migrate Goal / task.dispatch / skill consumer onto runtime control.**

@@ -239,6 +239,13 @@ fn code_ui_projection_deltas(
             &current.controller,
         )?);
     }
+    if previous.plan_execution_repair != current.plan_execution_repair {
+        deltas.push(projection_delta(
+            "plan_execution_repair",
+            "plan execution repair changed",
+            &current.plan_execution_repair,
+        )?);
+    }
     append_changed_projection_items(
         &mut deltas,
         "transcript_upsert",
@@ -1086,6 +1093,7 @@ fn headless_interaction_id(state: &InteractionState) -> Option<&str> {
     match state {
         InteractionState::AwaitingIntentReview { interaction_id }
         | InteractionState::AwaitingPlanReview { interaction_id }
+        | InteractionState::AwaitingPlanRepair { interaction_id }
         | InteractionState::AwaitingNetworkPolicy { interaction_id }
         | InteractionState::AwaitingUserInput { interaction_id }
         | InteractionState::AwaitingToolApproval { interaction_id, .. } => Some(interaction_id),

@@ -8,14 +8,18 @@
 //! **Layer:** L1 — pure serde, no I/O, no async.
 
 use chrono::{DateTime, Utc};
-use libra::internal::ai::web::code_ui::{
-    CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiControllerAttachRequest,
-    CodeUiControllerAttachResponse, CodeUiControllerKind, CodeUiControllerState,
-    CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind, CodeUiInteractionOption,
-    CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
-    CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
-    CodeUiProviderInfo, CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
-    CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
+use libra::internal::ai::{
+    runtime::{ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState},
+    web::code_ui::{
+        CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiControllerAttachRequest,
+        CodeUiControllerAttachResponse, CodeUiControllerKind, CodeUiControllerState,
+        CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind, CodeUiInteractionOption,
+        CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
+        CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
+        CodeUiProviderInfo, CodeUiSession, CodeUiSessionSnapshot, CodeUiSessionStatus,
+        CodeUiTaskSnapshot, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+        CodeUiTranscriptEntryKind,
+    },
 };
 use serde_json::{Value, json};
 
@@ -121,6 +125,16 @@ fn fully_populated_snapshot() -> CodeUiSessionSnapshot {
             requested_at: ts,
             resolved_at: None,
         }],
+        plan_execution_repair: Some(PlanExecutionRepairState::AwaitingUser {
+            interaction_id: "repair-1".to_string(),
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence: ExecutionFailureEvidence {
+                output: "Decision: Abandon.".to_string(),
+                diagnostics: vec!["verification failed".to_string()],
+                attempt: 2,
+                max_attempts: 2,
+            },
+        }),
         updated_at: ts,
     }
 }
@@ -201,6 +215,14 @@ fn snapshot_round_trips_through_camel_case_wire_shape() {
         serialized["interactions"][0]["status"],
         Value::String("pending".into())
     );
+    assert_eq!(
+        serialized["planExecutionRepair"]["state"],
+        Value::String("awaiting_user".into())
+    );
+    assert_eq!(
+        serialized["planExecutionRepair"]["interaction_id"],
+        Value::String("repair-1".into())
+    );
 
     // Patchset path round-trips with `changeType` (camelCase from `change_type`).
     assert_eq!(
@@ -280,7 +302,7 @@ fn transcript_entry_kinds_use_snake_case_values() {
     }
 }
 
-/// All five interaction kinds shipped to the browser must keep their snake_case
+/// All interaction kinds shipped to the browser must keep their snake_case
 /// wire tags. These are the exact strings the InteractionPanel switches on.
 #[test]
 fn interaction_kinds_use_snake_case_values() {
@@ -296,6 +318,10 @@ fn interaction_kinds_use_snake_case_values() {
             "intent_review_choice",
         ),
         (CodeUiInteractionKind::PostPlanChoice, "post_plan_choice"),
+        (
+            CodeUiInteractionKind::PlanExecutionRepair,
+            "plan_execution_repair",
+        ),
     ] {
         let value = serde_json::to_value(variant).unwrap();
         assert_eq!(value, Value::String(expected.into()));
@@ -399,14 +425,15 @@ fn thread_list_response_envelope_uses_camel_case_wire_shape() {
 }
 
 /// Interaction-response payload — the only request body that has optional
-/// fields with mixed naming. Pins `selectedOption`, `applyToFuture`, and the
-/// `answers` map's plain string keys.
+/// fields with mixed naming. Pins `selectedOption`, `applyToFuture`,
+/// `maxAttempts`, and the `answers` map's plain string keys.
 #[test]
 fn interaction_response_serialization_drops_none_fields() {
     let response = CodeUiInteractionResponse {
         approved: Some(true),
         apply_to_future: Some(CodeUiApplyToFuture::AcceptAll),
         selected_option: Some("execute".to_string()),
+        max_attempts: Some(3),
         note: None,
         answers: [("q1".to_string(), vec!["yes".to_string()])]
             .into_iter()
@@ -416,6 +443,44 @@ fn interaction_response_serialization_drops_none_fields() {
     assert_eq!(value["approved"], Value::Bool(true));
     assert_eq!(value["applyToFuture"], Value::String("accept_all".into()));
     assert_eq!(value["selectedOption"], Value::String("execute".into()));
+    assert_eq!(value["maxAttempts"], Value::from(3));
     assert!(value.get("note").is_none(), "None options must be skipped");
     assert_eq!(value["answers"]["q1"][0], Value::String("yes".into()));
+}
+
+/// W2-11 r16: local TUI repair continuation must settle the browser's
+/// interaction before it publishes the retrying repair state.
+#[tokio::test]
+async fn local_repair_continuation_resolves_code_ui_prompt_before_retry() {
+    let session = CodeUiSession::new(fully_populated_snapshot());
+
+    session.resolve_interaction("int-1").await;
+    session
+        .set_plan_execution_repair(Some(PlanExecutionRepairState::AutomaticRepair {
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence: ExecutionFailureEvidence {
+                output: "retrying repaired plan".to_string(),
+                diagnostics: Vec::new(),
+                attempt: 2,
+                max_attempts: 3,
+            },
+        }))
+        .await;
+    session.set_status(CodeUiSessionStatus::Thinking).await;
+
+    let snapshot = session.snapshot().await;
+    assert_eq!(snapshot.status, CodeUiSessionStatus::Thinking);
+    assert!(matches!(
+        snapshot.plan_execution_repair,
+        Some(PlanExecutionRepairState::AutomaticRepair { .. })
+    ));
+    assert_eq!(
+        snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.id == "int-1")
+            .map(|interaction| &interaction.status),
+        Some(&CodeUiInteractionStatus::Resolved),
+        "the old repair prompt must not remain selectable after local continuation"
+    );
 }

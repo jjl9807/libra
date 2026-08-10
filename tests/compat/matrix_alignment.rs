@@ -220,6 +220,7 @@ fn docs_consistency_covers_code_command_router_contracts() {
         "CONTROLLER_CONFLICT",
         "SESSION_BUSY",
         "INTERACTION_NOT_ACTIVE",
+        "PLAN_REPAIR_RETRY_LIMIT_REACHED",
     ] {
         assert_contains(&source_and_docs, code, "source/docs control error contract");
     }

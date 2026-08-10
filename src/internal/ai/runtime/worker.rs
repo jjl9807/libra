@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BoundaryDecision, RuntimeCommandDurability, RuntimeCommandDurabilityError, ToolBoundaryRuntime,
-    ToolOperation,
+    ToolOperation, plan_execution_repair::PlanExecutionRepairState,
 };
 use crate::internal::ai::session::{
     CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandStatus,
@@ -73,6 +73,9 @@ pub enum InteractionState {
     AwaitingPlanReview {
         interaction_id: String,
     },
+    AwaitingPlanRepair {
+        interaction_id: String,
+    },
     AwaitingNetworkPolicy {
         interaction_id: String,
     },
@@ -101,6 +104,7 @@ impl InteractionState {
             self,
             Self::AwaitingIntentReview { .. }
                 | Self::AwaitingPlanReview { .. }
+                | Self::AwaitingPlanRepair { .. }
                 | Self::AwaitingNetworkPolicy { .. }
                 | Self::AwaitingToolApproval { .. }
                 | Self::AwaitingUserInput { .. }
@@ -111,6 +115,7 @@ impl InteractionState {
         match self {
             Self::AwaitingIntentReview { interaction_id }
             | Self::AwaitingPlanReview { interaction_id }
+            | Self::AwaitingPlanRepair { interaction_id }
             | Self::AwaitingNetworkPolicy { interaction_id }
             | Self::AwaitingUserInput { interaction_id } => Some(interaction_id),
             Self::AwaitingToolApproval { interaction_id, .. } => Some(interaction_id),
@@ -215,6 +220,9 @@ pub struct AgentSnapshot {
     pub active_turn_id: Option<String>,
     pub queued_turns: usize,
     pub interaction: InteractionState,
+    /// Runtime-owned failure evidence and repair route for Code UI adapters.
+    #[serde(default)]
+    pub plan_execution_repair: Option<PlanExecutionRepairState>,
 }
 
 /// Normalized event payload.  No variant carries raw request text, response
@@ -617,6 +625,11 @@ pub enum RuntimeCommand {
         session_id: String,
         reply: oneshot::Sender<Result<AgentSnapshot, RuntimeWorkerError>>,
     },
+    SetPlanExecutionRepair {
+        session_id: String,
+        repair: Option<PlanExecutionRepairState>,
+        reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
+    },
     /// Fail-closed fence after a durable review marker exists but the live
     /// gate turn could not be parked (W2-02 setup failures).
     FenceSession {
@@ -912,6 +925,29 @@ impl AgentRuntimeHandle {
             .map_err(|_| RuntimeWorkerError::ResponseDropped)?
     }
 
+    /// Publish or clear the runtime-owned repair decision exposed through the
+    /// session snapshot. This does not admit work; re-admission must use
+    /// `submit_repaired_plan_execution`.
+    pub async fn set_plan_execution_repair(
+        &self,
+        session_id: impl Into<String>,
+        repair: Option<PlanExecutionRepairState>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::SetPlanExecutionRepair {
+                session_id: session_id.into(),
+                repair,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
     /// Subscribe to events strictly after `cursor`.  A lagged consumer gets a
     /// concrete error and must recover from durable session state; it is never
     /// allowed to make this bounded in-memory channel grow without limit.
@@ -1133,6 +1169,20 @@ impl AgentRuntimeWorker {
                     }
                     RuntimeCommand::Snapshot { session_id, reply } => {
                         let _ = reply.send(self.snapshot(&session_id));
+                    }
+                    RuntimeCommand::SetPlanExecutionRepair {
+                        session_id,
+                        repair,
+                        reply,
+                    } => {
+                        let result = self
+                            .sessions
+                            .get_mut(&session_id)
+                            .map(|session| {
+                                session.snapshot.plan_execution_repair = repair;
+                            })
+                            .ok_or(RuntimeWorkerError::UnknownSession { session_id });
+                        let _ = reply.send(result);
                     }
                     RuntimeCommand::FenceSession {
                         session_id,
@@ -2767,6 +2817,7 @@ impl SessionQueue {
                 active_turn_id: None,
                 queued_turns: 0,
                 interaction: InteractionState::Idle,
+                plan_execution_repair: None,
             },
             state_machine: TurnStateMachine::new(),
             event_tx: broadcast::channel(event_buffer).0,

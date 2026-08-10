@@ -24,7 +24,7 @@ use crate::internal::ai::{
     projection::{PlanHeadRef, ThreadBundle},
     runtime::{
         ControllerLease, ControllerService, ControllerServiceError, ControllerServiceOptions,
-        ControllerSnapshot, hardening::SecretRedactor,
+        ControllerSnapshot, PlanExecutionRepairState, hardening::SecretRedactor,
     },
     session::CodeWorkflowReplay,
 };
@@ -130,6 +130,7 @@ pub enum CodeUiInteractionKind {
     RequestUserInput,
     IntentReviewChoice,
     PostPlanChoice,
+    PlanExecutionRepair,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -189,6 +190,10 @@ pub struct CodeUiInteractionResponse {
     pub apply_to_future: Option<CodeUiApplyToFuture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_option: Option<String>,
+    /// Replacement automatic repair limit requested with a
+    /// `plan_execution_repair` Continue response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default)]
@@ -277,6 +282,10 @@ pub struct CodeUiSessionSnapshot {
     pub tool_calls: Vec<CodeUiToolCallSnapshot>,
     pub patchsets: Vec<CodeUiPatchsetSnapshot>,
     pub interactions: Vec<CodeUiInteractionRequest>,
+    /// Runtime-owned route, evidence, and retry counters after plan execution
+    /// fails. Kept in the Rust wire model for remote Code UI consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_execution_repair: Option<PlanExecutionRepairState>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -296,6 +305,7 @@ impl Default for CodeUiSessionSnapshot {
             tool_calls: Vec::new(),
             patchsets: Vec::new(),
             interactions: Vec::new(),
+            plan_execution_repair: None,
             updated_at: Utc::now(),
         }
     }
@@ -635,6 +645,13 @@ impl CodeUiSession {
             snapshot
                 .interactions
                 .retain(|interaction| interaction.id != interaction_id);
+        })
+        .await;
+    }
+
+    pub async fn set_plan_execution_repair(&self, repair: Option<PlanExecutionRepairState>) {
+        self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
+            snapshot.plan_execution_repair = repair;
         })
         .await;
     }
@@ -1581,6 +1598,7 @@ pub fn initial_snapshot(
         tool_calls: Vec::new(),
         patchsets: Vec::new(),
         interactions: Vec::new(),
+        plan_execution_repair: None,
         updated_at: Utc::now(),
     }
 }
@@ -1767,6 +1785,30 @@ mod tests {
             stored_status(&session.snapshot().await).as_deref(),
             Some("failed")
         );
+    }
+
+    #[tokio::test]
+    async fn plan_execution_repair_is_exposed_in_snapshot() {
+        let session = test_session();
+        let repair = PlanExecutionRepairState::ManualAction {
+            evidence: PlanExecutionRepairState::AutomaticRepair {
+                route: crate::internal::ai::runtime::ExecutionFailureRevision::PlanRevision,
+                evidence: crate::internal::ai::runtime::ExecutionFailureEvidence {
+                    output: "Decision: Abandon.".to_string(),
+                    diagnostics: vec!["verification failed".to_string()],
+                    attempt: 2,
+                    max_attempts: 2,
+                },
+            }
+            .evidence()
+            .clone(),
+        };
+
+        session
+            .set_plan_execution_repair(Some(repair.clone()))
+            .await;
+
+        assert_eq!(session.snapshot().await.plan_execution_repair, Some(repair));
     }
 
     #[test]
