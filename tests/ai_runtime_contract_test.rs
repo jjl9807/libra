@@ -25,6 +25,71 @@ use libra::internal::ai::{
 };
 use uuid::Uuid;
 
+/// W2-06: Code's runtime control path must consume the A0-07 projection and
+/// curated registry directly. This pins both the source boundary (no second
+/// skill discovery store) and the behavior of search/activation.
+#[test]
+fn skill_search_activation_uses_a0_projection() {
+    use libra::internal::ai::{
+        observed_agents::{
+            AgentKind, SkillEvent, SkillEventProjection,
+            capability::{SkillEventSignal, SkillEventSource, SkillEventType, SkillRef},
+        },
+        runtime::{CodeSkillActivation, CodeSkillSearch, ExecutionControlService},
+    };
+
+    let service = ExecutionControlService::new("contract-session", None, None)
+        .expect("in-memory runtime control service");
+    let mut projection = SkillEventProjection::new();
+    projection.ingest(
+        "contract-session",
+        Some("checkpoint-1"),
+        "codex",
+        vec![SkillEvent {
+            id: "turn-1:/review".to_string(),
+            event_type: SkillEventType::PromptInvocation,
+            skill: SkillRef {
+                name: "/review".to_string(),
+            },
+            source: SkillEventSource {
+                agent: "codex".to_string(),
+                signal: SkillEventSignal::InputSlashCommand,
+                confidence: 1.0,
+            },
+            turn_id: "turn-1".to_string(),
+            timestamp: "2026-07-15T00:00:00Z".to_string(),
+            transcript_anchor: None,
+            native: false,
+            collapse: false,
+        }],
+    );
+    let matched = service.skill_search(
+        &projection,
+        &CodeSkillSearch {
+            provider: Some("codex".to_string()),
+            skill: Some("/review".to_string()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].event.skill.name, "/review");
+    service
+        .skill_activate(&CodeSkillActivation {
+            provider: AgentKind::Codex.as_cli_slug().to_string(),
+            name: "/review".to_string(),
+        })
+        .expect("activation must use the curated Codex A0-07 registry");
+
+    let control_source = include_str!("../src/internal/ai/runtime/execution_control.rs");
+    let projection_source = include_str!("../src/internal/ai/observed_agents/skill_projection.rs");
+    let extract_source = include_str!("../src/internal/ai/observed_agents/extract.rs");
+    assert!(control_source.contains("SkillEventProjection"));
+    assert!(control_source.contains("discover_skills"));
+    assert!(projection_source.contains("skill_registry_for"));
+    assert!(extract_source.contains("pub fn skill_registry_for"));
+    assert!(!control_source.contains("SkillDispatcher"));
+}
+
 /// Generic adapter that turns any `CompletionModel` into a `TaskExecutor`.
 ///
 /// Demonstrates the wiring an integrator would write to plug a custom provider into

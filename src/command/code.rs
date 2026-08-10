@@ -2716,12 +2716,6 @@ where
     let projection_sequence = folded.projection_sequence;
     let snapshot = folded.snapshot;
     let session = CodeUiSession::new(snapshot.clone());
-    let persistence = HeadlessSessionPersistence::with_projection_checkpoint(
-        session_store,
-        session_state,
-        snapshot,
-        projection_sequence,
-    );
 
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
     let runtime_context = Some(default_tui_runtime_context(
@@ -2733,6 +2727,52 @@ where
     ));
 
     let registry = build_headless_tool_registry(working_dir, user_input_tx);
+    // Headless Web explicit `task.dispatch` uses the same dispatcher bundle as
+    // the TUI. Keep its construction here, before the per-turn config factory,
+    // so both model `task` calls and Web controls observe the same budget,
+    // approval, depth, and concurrency gates.
+    let agents_config_path = working_dir.join(".libra").join("agents.toml");
+    let agents_config = AgentsConfig::load_or_default(&agents_config_path).unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            path = %agents_config_path.display(),
+            "failed to load agents.toml for headless task dispatch; using defaults"
+        );
+        AgentsConfig::default()
+    });
+    let agent_router = AgentProfileRouter::new(load_profiles(working_dir));
+    let subagent_runtime = if agents_config.sub_agents.enabled {
+        match resolve_storage_root(working_dir) {
+            Some(storage_root) => match build_subagent_runtime_for_session(
+                &agents_config,
+                registry.clone(),
+                &session_state,
+                session_store.as_ref(),
+                &storage_root,
+                &model_name,
+                &provider_name,
+                &agent_router,
+                None,
+                runtime_context.clone(),
+            )
+            .await
+            {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to build headless SubAgentToolLoopRuntime; task.dispatch remains unavailable");
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(
+                    "headless task.dispatch unavailable because Libra storage root could not be resolved"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let preamble = system_preamble(working_dir, args.context, args.provider, Some(&model_name));
     let preserve_reasoning_content = preserve_reasoning_content_for_provider(args.provider);
     let temperature = args.temperature;
@@ -2749,8 +2789,16 @@ where
             stream,
             preserve_reasoning_content,
             runtime_context: runtime_context.clone(),
+            subagent_runtime: subagent_runtime.clone(),
             ..Default::default()
         });
+
+    let persistence = HeadlessSessionPersistence::with_projection_checkpoint(
+        session_store,
+        session_state,
+        snapshot,
+        projection_sequence,
+    );
 
     let adapter = HeadlessCodeRuntime::new_with_persistence(
         session,

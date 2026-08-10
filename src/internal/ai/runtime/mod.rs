@@ -9,6 +9,7 @@ mod derived_records;
 pub mod durability;
 pub mod environment;
 pub mod event;
+pub mod execution_control;
 pub mod hardening;
 pub mod lifecycle;
 pub mod phase0;
@@ -34,6 +35,9 @@ pub use durability::{
     DurableCommandCrashPoint, RuntimeCommandDurability, RuntimeCommandDurabilityError,
 };
 pub use event::{Event, audit_action_for};
+pub use execution_control::{
+    CodeSkillActivation, CodeSkillSearch, ExecutionControlService, GoalControlError,
+};
 pub use hardening::{
     AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,
     SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, ToolOperation, ToolOperationDetails,

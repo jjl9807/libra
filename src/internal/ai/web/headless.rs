@@ -68,9 +68,9 @@ use crate::internal::ai::{
     },
     runtime::{
         AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
-        InteractionState, RuntimeCommandDurability, RuntimeExecutionContext,
-        RuntimeInteractionDelivery, RuntimeTurnExecution, RuntimeTurnExecutor, RuntimeWorkerError,
-        TurnRequest, runtime_worker_adapter_message,
+        ExecutionControlService, InteractionState, RuntimeCommandDurability,
+        RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest, runtime_worker_adapter_message,
     },
     sandbox::{ExecApprovalRequest, NetworkAccess, ReviewDecision},
     session::{CodeWorkflowEventKind, SessionJsonlStore, SessionState, SessionStore},
@@ -165,6 +165,12 @@ impl HeadlessSessionPersistence {
 
     pub fn durability_session_id(&self) -> &str {
         &self.durability_session_id
+    }
+
+    /// The shared execution-control service appends replayable Goal envelopes
+    /// to this same per-session JSONL stream.
+    pub fn goal_event_store(&self) -> SessionJsonlStore {
+        self.projection_store.clone()
     }
 
     async fn record_user_message(
@@ -560,6 +566,9 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// Optional on-disk session persistence used by `libra code --web-only
     /// --resume <thread_id>` for non-Codex providers.
     persistence: Option<HeadlessSessionPersistence>,
+    /// Runtime-owned Goal/task controls. This is deliberately separate from
+    /// the Code UI adapter so browser control never needs a TUI App hop.
+    execution_control: Arc<ExecutionControlService>,
 }
 
 impl<M> HeadlessCodeRuntime<M>
@@ -590,7 +599,7 @@ where
             registry,
             user_input_rx,
             exec_approval_rx,
-            config_factory,
+            config_factory.clone(),
             Vec::new(),
             None,
         )
@@ -669,6 +678,9 @@ where
             capabilities.command_idempotency = false;
             session.set_capabilities(capabilities.clone()).await;
         }
+        // Capture the shared task runtime before moving the config factory
+        // into the turn executor below.
+        let subagent_runtime = (config_factory)().subagent_runtime;
         let executor = Arc::new(HeadlessDirectTurnExecutor {
             session: session.clone(),
             history: history.clone(),
@@ -688,6 +700,18 @@ where
             .map(HeadlessSessionPersistence::durability_session_id)
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // Goal JSONL store also supplies session_root so task.dispatch can
+        // attach file-history batches (S2-INV-06), matching the TUI `/task` path.
+        let execution_control = Arc::new(
+            ExecutionControlService::new(
+                runtime_session_id.clone(),
+                persistence
+                    .as_ref()
+                    .map(HeadlessSessionPersistence::goal_event_store),
+                subagent_runtime,
+            )
+            .map_err(|error| anyhow!("failed to restore runtime execution controls: {error}"))?,
+        );
         let mut recovered_reconciliation = false;
         if let Some(persistence) = persistence.as_ref() {
             let (durability, repo_id, principal_id) = persistence.worker_durability_config();
@@ -723,6 +747,7 @@ where
             interaction_persistence_failed,
             shutdown_result_tx,
             persistence,
+            execution_control,
         });
 
         let weak_listener = Arc::downgrade(&runtime);
@@ -1455,6 +1480,35 @@ where
             ));
         }
         Ok(())
+    }
+
+    async fn task_dispatch(&self, agent: String, prompt: String) -> anyhow::Result<String> {
+        self.ensure_not_shutting_down()?;
+        self.ensure_session_is_recoverable().await?;
+        self.execution_control.task_dispatch(agent, prompt).await
+    }
+
+    async fn goal_start(&self, objective: String) -> anyhow::Result<String> {
+        self.ensure_not_shutting_down()?;
+        self.execution_control
+            .goal_start(objective)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn goal_status(&self) -> anyhow::Result<String> {
+        self.execution_control
+            .goal_status()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn goal_cancel(&self, reason: String) -> anyhow::Result<String> {
+        self.ensure_not_shutting_down()?;
+        self.execution_control
+            .goal_cancel(reason)
+            .await
+            .map_err(Into::into)
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
