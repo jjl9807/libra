@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-05, 2026-08-10)
+
+- **W2-05 unify approval and `request_user_input` on runtime interaction state.**
+  TUI/headless register `AwaitingToolApproval`/`AwaitingUserInput` via
+  `register_interaction_with_delivery`; idle/no-turn paths fail closed; managed
+  Codex denies without a runtime turn. Multi-question validation + cancel
+  drop continuations; sequential resolutions persist as a durable batch.
+  Contract: `request_user_input_multi_question_and_cancel_fail_closed`,
+  `interaction_pending_owner_is_runtime_only`,
+  `sequential_user_input_resolutions_all_persist_on_terminal_success`.
+
 ### Added (plan-20260715 W2-04, 2026-08-10)
 
 - **W2-04 migrate confirmed plan execution onto the runtime serialized queue.**

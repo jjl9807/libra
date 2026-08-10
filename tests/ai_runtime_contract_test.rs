@@ -2988,6 +2988,425 @@ async fn plan_execution_enters_runtime_queue() {
     observer_worker.abort();
 }
 
+/// W2-05: a tool loop with sequential user-input deliveries must persist
+/// every `InteractionResolved` atomically with terminal success — not only
+/// the last response stored on `ActiveTurn`.
+#[tokio::test]
+async fn sequential_user_input_resolutions_all_persist_on_terminal_success() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, InMemoryAuditSink, InteractionResponse,
+            InteractionState, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+            RuntimeTurnExecutor, RuntimeWorkerError, SecretRedactor, ToolBoundaryPolicy,
+            ToolBoundaryRuntime, TurnRequest,
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+    use tokio::{
+        sync::Notify,
+        time::{Duration, timeout},
+    };
+
+    struct LiveToolLoopExecutor {
+        started: Arc<Notify>,
+        allow_complete: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RuntimeTurnExecutor for LiveToolLoopExecutor {
+        async fn execute(
+            &self,
+            _request: TurnRequest,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.started.notify_one();
+            self.allow_complete.notified().await;
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "both inputs answered".to_string(),
+            })
+        }
+    }
+
+    struct PersistUserInputDelivery;
+
+    #[async_trait]
+    impl RuntimeInteractionDelivery for PersistUserInputDelivery {
+        fn validate(&self, _interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+            Ok(())
+        }
+
+        fn persist_interaction_resolved_after_terminal(&self) -> bool {
+            true
+        }
+
+        fn interaction_resolution(&self, interaction: &InteractionResponse) -> String {
+            interaction.response.clone()
+        }
+
+        async fn deliver(
+            self: Box<Self>,
+            _request: TurnRequest,
+            _interaction: InteractionResponse,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let durability = RuntimeCommandDurability::new(SessionJsonlStore::new(session_root.clone()));
+    let started = Arc::new(Notify::new());
+    let allow_complete = Arc::new(Notify::new());
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "multi-resolution-persist".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(LiveToolLoopExecutor {
+                started: Arc::clone(&started),
+                allow_complete: Arc::clone(&allow_complete),
+            }),
+            boundary,
+        )
+        .with_durability(durability, "repo", "principal")
+        .with_durability_command_kind("tui_local_turn"),
+    );
+
+    handle
+        .submit(TurnRequest::new(
+            "session",
+            "multi-input-turn",
+            "request input",
+            false,
+        ))
+        .await
+        .expect("tool-loop turn accepted");
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("live executor started");
+
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "multi-input-turn",
+            InteractionState::AwaitingUserInput {
+                interaction_id: "input-first".to_string(),
+            },
+            Box::new(PersistUserInputDelivery),
+        )
+        .await
+        .expect("first user-input delivery registered");
+    handle
+        .respond(
+            "session",
+            "multi-input-turn",
+            InteractionResponse::new("input-first", "answered-first"),
+        )
+        .await
+        .expect("first user-input settles without completing the turn");
+
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "multi-input-turn",
+            InteractionState::AwaitingUserInput {
+                interaction_id: "input-second".to_string(),
+            },
+            Box::new(PersistUserInputDelivery),
+        )
+        .await
+        .expect("second user-input delivery registered");
+    handle
+        .respond(
+            "session",
+            "multi-input-turn",
+            InteractionResponse::new("input-second", "answered-second"),
+        )
+        .await
+        .expect("second user-input settles");
+
+    allow_complete.notify_one();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = handle.snapshot("session").await.expect("snapshot");
+            if !matches!(
+                snapshot.interaction,
+                InteractionState::Running
+                    | InteractionState::AwaitingUserInput { .. }
+                    | InteractionState::Cancelling
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn leaves Running after both resolutions");
+
+    let events: Vec<_> = store
+        .load_code_workflow_replay()
+        .expect("replay")
+        .events
+        .into_iter()
+        .map(|event| event.event)
+        .collect();
+    let resolved_ids: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            CodeWorkflowEventKind::InteractionResolved { interaction_id, .. }
+            | CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                ..
+            } => Some(interaction_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        resolved_ids.contains(&"input-first"),
+        "first sequential resolution must be durable: {events:?}"
+    );
+    assert!(
+        resolved_ids.contains(&"input-second"),
+        "second sequential resolution must be durable: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            CodeWorkflowEventKind::InteractionResolved {
+                interaction_id,
+                resolution,
+            } if interaction_id == "input-first" && resolution == "answered-first"
+        )),
+        "earlier resolution must appear as InteractionResolved before terminal: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            CodeWorkflowEventKind::CommandTerminalSuccessWithInteractionResolved {
+                interaction_id,
+                resolution,
+                ..
+            } if interaction_id == "input-second" && resolution == "answered-second"
+        )),
+        "last resolution must ride with CommandTerminalSuccessWithInteractionResolved: {events:?}"
+    );
+    worker.abort();
+}
+
+/// W2-05: multi-question request input remains pending until every answer is
+/// present, and runtime cancellation drops the continuation fail-closed.
+async fn exercise_request_user_input_multi_question_and_cancel_fail_closed() {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    use libra::internal::ai::runtime::{
+        AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExternalTurnTrackingExecutor,
+        InMemoryAuditSink, InteractionResponse, InteractionState, RuntimeExecutionContext,
+        RuntimeInteractionDelivery, RuntimeTurnExecution, RuntimeWorkerError, ToolBoundaryRuntime,
+        TurnRequest,
+    };
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    struct MultiQuestionDelivery {
+        question_ids: Vec<String>,
+        sender: oneshot::Sender<HashMap<String, Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl RuntimeInteractionDelivery for MultiQuestionDelivery {
+        fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+            let answers =
+                serde_json::from_str::<HashMap<String, Vec<String>>>(&interaction.response)
+                    .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+            for question_id in &self.question_ids {
+                let values = answers.get(question_id).ok_or_else(|| {
+                    RuntimeWorkerError::ExecutionFailed(format!(
+                        "missing answer for question '{question_id}'"
+                    ))
+                })?;
+                if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+                    return Err(RuntimeWorkerError::ExecutionFailed(format!(
+                        "empty answer for question '{question_id}'"
+                    )));
+                }
+            }
+            if answers.len() != self.question_ids.len() {
+                return Err(RuntimeWorkerError::ExecutionFailed(
+                    "response contains an unknown question id".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn deliver(
+            self: Box<Self>,
+            _request: TurnRequest,
+            interaction: InteractionResponse,
+            _context: RuntimeExecutionContext,
+        ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+            self.validate(&interaction)?;
+            let answers = serde_json::from_str(&interaction.response)
+                .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+            self.sender.send(answers).map_err(|_| {
+                RuntimeWorkerError::ExecutionFailed(
+                    "request_user_input receiver closed".to_string(),
+                )
+            })?;
+            Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+        }
+    }
+
+    let (handle, worker) = AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(
+        Arc::new(ExternalTurnTrackingExecutor),
+        ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
+    ));
+
+    let (answer_tx, answer_rx) = oneshot::channel();
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "answer-turn", "request input", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("runtime tracks request_user_input turn");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "answer-turn",
+            InteractionState::AwaitingUserInput {
+                interaction_id: "input-1".to_string(),
+            },
+            Box::new(MultiQuestionDelivery {
+                question_ids: vec!["language".to_string(), "edition".to_string()],
+                sender: answer_tx,
+            }),
+        )
+        .await
+        .expect("runtime owns multi-question continuation");
+
+    assert!(
+        handle
+            .respond(
+                "session",
+                "answer-turn",
+                InteractionResponse::new("input-1", r#"{"language":["Rust"]}"#),
+            )
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("snapshot")
+            .interaction,
+        InteractionState::AwaitingUserInput { .. }
+    ));
+    handle
+        .respond(
+            "session",
+            "answer-turn",
+            InteractionResponse::new("input-1", r#"{"language":["Rust"],"edition":["2024"]}"#),
+        )
+        .await
+        .expect("complete multi-question response is delivered once");
+    assert_eq!(
+        answer_rx
+            .await
+            .expect("tool continuation receives answers")
+            .len(),
+        2
+    );
+    handle
+        .finish_external_turn(
+            "session",
+            "answer-turn",
+            Ok(RuntimeTurnExecution::Completed {
+                summary: "input answered".to_string(),
+            }),
+        )
+        .await
+        .expect("answered turn finalizes");
+
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "cancel-turn", "request input", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("runtime tracks cancellation turn");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "cancel-turn",
+            InteractionState::AwaitingUserInput {
+                interaction_id: "input-2".to_string(),
+            },
+            Box::new(MultiQuestionDelivery {
+                question_ids: vec!["confirm".to_string()],
+                sender: cancel_tx,
+            }),
+        )
+        .await
+        .expect("runtime owns cancellation continuation");
+    handle
+        .cancel("session", "cancel-turn")
+        .await
+        .expect("runtime cancellation accepted");
+    assert!(
+        cancel_rx.await.is_err(),
+        "cancellation drops delivery sender fail-closed"
+    );
+    worker.abort();
+}
+
+/// W2-05: runtime state, not an adapter-local map, remains the source of
+/// truth while malformed input is retried.
+#[tokio::test]
+async fn request_user_input_multi_question_and_cancel_fail_closed() {
+    exercise_request_user_input_multi_question_and_cancel_fail_closed().await;
+}
+
+/// W2-05: adapters must not keep private pending maps; runtime registration is
+/// the sole owner of approval/user-input continuations.
+#[tokio::test]
+async fn interaction_pending_owner_is_runtime_only() {
+    // Behavioral owner: malformed answers stay on InteractionState until a
+    // complete respond succeeds (same exercise as multi-question AC).
+    exercise_request_user_input_multi_question_and_cancel_fail_closed().await;
+
+    // Source pin: headless/Codex no longer retain HashMap-backed pending
+    // continuations outside AgentRuntimeWorker.
+    let headless = include_str!("../src/internal/ai/web/headless.rs");
+    assert!(
+        !headless.contains("pending_user_inputs") && !headless.contains("pending_exec_approvals"),
+        "headless must not own private pending_user_inputs/pending_exec_approvals maps"
+    );
+    let codex = include_str!("../src/internal/ai/codex/mod.rs");
+    assert!(
+        !codex.contains("pending_approvals"),
+        "managed Codex adapter must not own a private pending_approvals map"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CEX-00.5: top-level Event / Snapshot trait contract
 // ---------------------------------------------------------------------------

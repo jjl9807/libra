@@ -107,8 +107,8 @@ use crate::{
             AgentEventKind, AgentEventStream, AgentRuntimeHandle, AgentRuntimeWorker,
             AgentRuntimeWorkerConfig, DeferredPlanExecutionExecutor, EventCursor,
             InMemoryAuditSink, InteractionResponse, InteractionState, RuntimeCommandDurability,
-            RuntimeExecutionContext, RuntimeTurnExecution, RuntimeWorkerError, ToolBoundaryRuntime,
-            TurnRequest,
+            RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
+            RuntimeWorkerError, ToolBoundaryRuntime, TurnRequest,
             phase0::{
                 ContextSnapshotItem, ContextSnapshotRequest, IntentReviewAckDelivery,
                 IntentReviewDecision, open_intent_review_from_workflow,
@@ -137,7 +137,7 @@ use crate::{
             ToolOutput, ToolRegistry,
             context::{
                 RequestUserInputArgs, SubmitPlanDraftArgs, UpdatePlanArgs, UserInputAnswer,
-                UserInputRequest, UserInputResponse,
+                UserInputQuestion, UserInputRequest, UserInputResponse,
             },
             handlers::submit_intent_draft::parse_submit_intent_draft_value,
         },
@@ -323,8 +323,9 @@ pub struct AppExitInfo {
 
 /// Pending user-input state while the TUI waits for the user to answer.
 struct PendingUserInput {
-    /// The original request (questions, etc.).
-    request: UserInputRequest,
+    /// UI-only request metadata. The continuation sender lives exclusively in
+    /// the runtime delivery registered for this interaction.
+    request: PendingUserInputRequest,
     /// Index of the question currently being answered.
     current_question: usize,
     /// Answers collected so far, keyed by question id.
@@ -335,6 +336,11 @@ struct PendingUserInput {
     notes_focused: bool,
     /// Notes text being composed for the current question.
     notes_text: String,
+}
+
+struct PendingUserInputRequest {
+    call_id: String,
+    questions: Vec<UserInputQuestion>,
 }
 
 /// Post-plan dialog state: stores the spec and user selection.
@@ -459,9 +465,138 @@ fn review_scroll_action(key: crossterm::event::KeyEvent) -> Option<ReviewScrollA
 
 /// Pending sandbox approval state.
 struct PendingExecApproval {
-    request: ExecApprovalRequest,
+    /// UI-only request metadata. The runtime delivery owns `response_tx`.
+    request: PendingExecApprovalRequest,
     selected: usize,
     allow_all_confirmation_requested: bool,
+}
+
+struct PendingExecApprovalRequest {
+    call_id: String,
+    command: String,
+    cwd: PathBuf,
+    is_retry: bool,
+    sandbox_label: String,
+    network_access: NetworkAccess,
+    writable_roots: Vec<PathBuf>,
+    cache_disabled_reason: Option<String>,
+}
+
+impl From<&ExecApprovalRequest> for PendingExecApprovalRequest {
+    fn from(request: &ExecApprovalRequest) -> Self {
+        Self {
+            call_id: request.call_id.clone(),
+            command: request.command.clone(),
+            cwd: request.cwd.clone(),
+            is_retry: request.is_retry,
+            sandbox_label: request.sandbox_label.clone(),
+            network_access: request.network_access.clone(),
+            writable_roots: request.writable_roots.clone(),
+            cache_disabled_reason: request.cache_disabled_reason.clone(),
+        }
+    }
+}
+
+/// Runtime-owned continuation for sandbox approvals and structured user input.
+/// TUI pending structs intentionally retain only render state.
+enum TuiInteractionDelivery {
+    UserInput {
+        questions: Vec<UserInputQuestion>,
+        response_tx: tokio::sync::oneshot::Sender<UserInputResponse>,
+    },
+    ExecApproval {
+        cache_disabled: bool,
+        response_tx: tokio::sync::oneshot::Sender<ReviewDecision>,
+    },
+}
+
+#[async_trait]
+impl RuntimeInteractionDelivery for TuiInteractionDelivery {
+    fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+        let response = decode_tui_interaction_response(interaction)?;
+        match self {
+            Self::UserInput { questions, .. } => {
+                user_input_response_from_code_ui_request(questions, response)
+                    .map(|_| ())
+                    .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))
+            }
+            Self::ExecApproval { cache_disabled, .. } => {
+                exec_approval_response_from_code_ui(*cache_disabled, response)
+                    .map(|_| ())
+                    .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))
+            }
+        }
+    }
+
+    fn persist_interaction_resolved_after_terminal(&self) -> bool {
+        true
+    }
+
+    fn interaction_resolution(&self, interaction: &InteractionResponse) -> String {
+        match self {
+            Self::UserInput { .. } => "answered".to_string(),
+            Self::ExecApproval { cache_disabled, .. } => {
+                decode_tui_interaction_response(interaction)
+                    .ok()
+                    .and_then(|response| {
+                        exec_approval_response_from_code_ui(*cache_disabled, response).ok()
+                    })
+                    .map(|decision| match decision {
+                        ReviewDecision::Approved => "approved",
+                        ReviewDecision::ApprovedForSession => "approved_for_session",
+                        ReviewDecision::ApprovedForTtl => "approved_for_ttl",
+                        ReviewDecision::ApprovedForDirectoryTtl => "approved_for_directory_ttl",
+                        ReviewDecision::ApprovedForPatternTtl => "approved_for_pattern_ttl",
+                        ReviewDecision::ApprovedForAllCommands => "approved_for_all_commands",
+                        ReviewDecision::Denied => "denied",
+                        ReviewDecision::Abort => "aborted",
+                    })
+                    .unwrap_or("approval_resolved")
+                    .to_string()
+            }
+        }
+    }
+
+    async fn deliver(
+        self: Box<Self>,
+        _request: TurnRequest,
+        interaction: InteractionResponse,
+        context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        if context.cancellation().is_cancelled() {
+            return Err(RuntimeWorkerError::Cancelled);
+        }
+        let response = decode_tui_interaction_response(&interaction)?;
+        match *self {
+            Self::UserInput {
+                questions,
+                response_tx,
+            } => response_tx
+                .send(
+                    user_input_response_from_code_ui_request(&questions, response)
+                        .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?,
+                )
+                .map_err(|_| {
+                    RuntimeWorkerError::ExecutionFailed(
+                        "the pending user-input request closed before runtime delivery".to_string(),
+                    )
+                })?,
+            Self::ExecApproval {
+                cache_disabled,
+                response_tx,
+            } => response_tx
+                .send(
+                    exec_approval_response_from_code_ui(cache_disabled, response)
+                        .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?,
+                )
+                .map_err(|_| {
+                    RuntimeWorkerError::ExecutionFailed(
+                        "the pending sandbox approval closed before runtime delivery".to_string(),
+                    )
+                })?,
+        }
+        Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+    }
 }
 
 /// Pending managed-provider interaction mirrored into the approval dialog.
@@ -1171,13 +1306,13 @@ where
                 // Handle user-input requests from the tool handler
                 Some(request) = self.user_input_rx.recv() => {
                     self.drain_pending_app_events().await?;
-                    self.handle_user_input_request(request);
+                    self.handle_user_input_request(request).await;
                 }
 
                 // Handle exec-approval requests from sandbox-governed handlers.
                 Some(request) = self.exec_approval_rx.recv() => {
                     self.drain_pending_app_events().await?;
-                    self.handle_exec_approval_request(request);
+                    self.handle_exec_approval_request(request).await;
                 }
 
                 // Drive subtle status/tool animations while the agent is active.
@@ -3823,19 +3958,45 @@ where
         Err(TuiControlError::InteractionNotActive)
     }
 
+    /// Resolve a tool-loop interaction exclusively through the active runtime
+    /// turn. UI state is cleared only after this acknowledgement succeeds.
+    async fn respond_local_runtime_interaction(
+        &self,
+        interaction_id: &str,
+        response: CodeUiInteractionResponse,
+    ) -> Result<(), TuiControlError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Err(TuiControlError::InteractionNotActive);
+        };
+        let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            return Err(TuiControlError::InteractionNotActive);
+        };
+        let payload = serde_json::to_string(&response).map_err(|error| {
+            TuiControlError::Internal(format!(
+                "unable to encode interaction response for AgentRuntime: {error}"
+            ))
+        })?;
+        runtime
+            .respond(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionResponse::new(interaction_id, payload),
+            )
+            .await
+            .map_err(|error| TuiControlError::Internal(runtime_worker_adapter_message(error)))
+    }
+
     async fn respond_pending_user_input_from_code_ui(
         &mut self,
         response: CodeUiInteractionResponse,
     ) -> Result<(), TuiControlError> {
-        let Some(pending) = self.pending_user_input.take() else {
+        let Some(pending) = self.pending_user_input.as_ref() else {
             return Err(TuiControlError::InteractionNotActive);
         };
         let interaction_id = pending.request.call_id.clone();
-        let answers = user_input_answers_from_code_ui(&pending, response)?;
-        let _ = pending
-            .request
-            .response_tx
-            .send(UserInputResponse { answers });
+        self.respond_local_runtime_interaction(&interaction_id, response)
+            .await?;
+        self.pending_user_input.take();
         self.widget.bottom_pane.set_user_input_questions(None);
         self.widget.bottom_pane.clear();
         self.widget
@@ -4285,7 +4446,7 @@ where
                 _ => {}
             },
             AgentStatus::AwaitingUserInput => {
-                self.handle_user_input_key(key);
+                self.handle_user_input_key(key).await;
             }
             AgentStatus::AwaitingApproval => match key.code {
                 KeyCode::Up => {
@@ -4326,7 +4487,7 @@ where
                     if self.pending_phase_confirmation.is_some() {
                         self.reject_pending_phase_confirmation();
                     } else {
-                        self.reject_pending_exec_approval();
+                        self.reject_pending_exec_approval().await;
                     }
                 }
                 _ => {}
@@ -4511,7 +4672,7 @@ where
     }
 
     /// Handle keyboard input while in the AwaitingUserInput state.
-    fn handle_user_input_key(&mut self, key: crossterm::event::KeyEvent) {
+    async fn handle_user_input_key(&mut self, key: crossterm::event::KeyEvent) {
         let is_freeform = self.pending_user_input.as_ref().is_some_and(|p| {
             let q = &p.request.questions[p.current_question];
             q.options.as_ref().is_none_or(|o| o.is_empty())
@@ -4593,21 +4754,18 @@ where
             }
             // Submit answer
             KeyCode::Enter => {
-                self.submit_user_input_answer();
+                self.submit_user_input_answer().await;
             }
             // Cancel
             KeyCode::Esc => {
-                self.cancel_pending_user_input();
-                self.widget.bottom_pane.set_status(AgentStatus::Thinking);
-                self.sync_mux_input_context();
-                self.schedule_draw();
+                let _ = self.cancel_current_turn(CancelSource::Esc).await;
             }
             _ => {}
         }
     }
 
     /// Submit the currently selected answer for the active question.
-    fn submit_user_input_answer(&mut self) {
+    async fn submit_user_input_answer(&mut self) {
         let interaction_id = self
             .pending_user_input
             .as_ref()
@@ -4681,10 +4839,25 @@ where
             let Some(pending) = self.pending_user_input.take() else {
                 return;
             };
-            let response = UserInputResponse {
-                answers: pending.answers,
+            let response = CodeUiInteractionResponse {
+                approved: None,
+                apply_to_future: None,
+                selected_option: None,
+                note: None,
+                answers: pending
+                    .answers
+                    .iter()
+                    .map(|(question_id, answer)| (question_id.clone(), answer.answers.clone()))
+                    .collect(),
             };
-            let _ = pending.request.response_tx.send(response);
+            if let Err(error) = self
+                .respond_local_runtime_interaction(&pending.request.call_id, response)
+                .await
+            {
+                tracing::warn!(call_id = %pending.request.call_id, error = %error, "runtime rejected TUI user-input response; keeping dialog open");
+                self.pending_user_input = Some(pending);
+                return;
+            }
             self.widget
                 .bottom_pane
                 .set_status(AgentStatus::ExecutingTool);
@@ -4705,7 +4878,8 @@ where
         }
     }
 
-    /// Cancel the pending user-input interaction (drops the oneshot sender).
+    /// Clear UI-only state after the runtime cancellation path has closed the
+    /// delivery-owned continuation.
     fn cancel_pending_user_input(&mut self) {
         if let Some(pending) = self.pending_user_input.take() {
             let interaction_id = pending.request.call_id.clone();
@@ -4716,8 +4890,6 @@ where
                 total_questions = pending.request.questions.len(),
                 "tui user-input request cancelled"
             );
-            // Dropping response_tx signals cancellation to the handler.
-            drop(pending.request.response_tx);
             self.widget.bottom_pane.set_user_input_questions(None);
             if let Some(code_ui_session) = self.code_ui_session.clone() {
                 tokio::spawn(async move {
@@ -4738,7 +4910,7 @@ where
     }
 
     /// Handle a user-input request from the tool handler.
-    fn handle_user_input_request(&mut self, request: UserInputRequest) {
+    async fn handle_user_input_request(&mut self, request: UserInputRequest) {
         let first_question = request.questions.first();
         tracing::debug!(
             target: "libra::internal::tui::interaction",
@@ -4751,6 +4923,17 @@ where
                 .unwrap_or_default(),
             "tui user-input request received"
         );
+
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            tracing::error!(call_id = %request.call_id, "tui user-input request denied without AgentRuntime");
+            drop(request.response_tx);
+            return;
+        };
+        let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            tracing::error!(call_id = %request.call_id, "tui user-input request denied without an active AgentRuntime turn");
+            drop(request.response_tx);
+            return;
+        };
 
         let interaction = CodeUiInteractionRequest {
             id: request.call_id.clone(),
@@ -4799,13 +4982,35 @@ where
             resolved_at: None,
         };
 
+        let ui_request = PendingUserInputRequest {
+            call_id: request.call_id.clone(),
+            questions: request.questions.clone(),
+        };
+        if let Err(error) = runtime
+            .register_interaction_with_delivery(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionState::AwaitingUserInput {
+                    interaction_id: request.call_id.clone(),
+                },
+                Box::new(TuiInteractionDelivery::UserInput {
+                    questions: request.questions,
+                    response_tx: request.response_tx,
+                }),
+            )
+            .await
+        {
+            tracing::error!(call_id = %ui_request.call_id, error = %error, "failed to register TUI user-input interaction with AgentRuntime");
+            return;
+        }
+
         // Store question info for the bottom pane to render.
         self.widget
             .bottom_pane
-            .set_user_input_questions(Some(&request.questions));
+            .set_user_input_questions(Some(&ui_request.questions));
 
         self.pending_user_input = Some(PendingUserInput {
-            request,
+            request: ui_request,
             current_question: 0,
             answers: HashMap::new(),
             selected_option: 0,
@@ -4829,17 +5034,27 @@ where
         }
     }
 
-    fn handle_exec_approval_request(&mut self, request: ExecApprovalRequest) {
-        if self.active_turn_id.is_none() {
+    async fn handle_exec_approval_request(&mut self, request: ExecApprovalRequest) {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
             tracing::debug!(
                 target: "libra::internal::tui::interaction",
                 call_id = %request.call_id,
                 command = %log_preview_text(&request.command),
-                "tui sandbox approval denied because there is no active turn"
+                "tui sandbox approval denied because there is no AgentRuntime"
             );
             let _ = request.response_tx.send(ReviewDecision::Denied);
             return;
-        }
+        };
+        let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+            tracing::debug!(
+                target: "libra::internal::tui::interaction",
+                call_id = %request.call_id,
+                command = %log_preview_text(&request.command),
+                "tui sandbox approval denied because there is no active runtime turn"
+            );
+            let _ = request.response_tx.send(ReviewDecision::Denied);
+            return;
+        };
 
         tracing::debug!(
             target: "libra::internal::tui::interaction",
@@ -4874,9 +5089,29 @@ where
             resolved_at: None,
         };
 
+        let ui_request = PendingExecApprovalRequest::from(&request);
         self.widget.bottom_pane.set_exec_approval(Some(&request));
+        if let Err(error) = runtime
+            .register_interaction_with_delivery(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionState::AwaitingToolApproval {
+                    interaction_id: request.call_id.clone(),
+                    tool_name: "shell".to_string(),
+                },
+                Box::new(TuiInteractionDelivery::ExecApproval {
+                    cache_disabled: request.cache_disabled_reason.is_some(),
+                    response_tx: request.response_tx,
+                }),
+            )
+            .await
+        {
+            tracing::error!(call_id = %ui_request.call_id, error = %error, "failed to register TUI sandbox approval with AgentRuntime");
+            return;
+        }
+
         self.pending_exec_approval = Some(PendingExecApproval {
-            request,
+            request: ui_request,
             selected: 0,
             allow_all_confirmation_requested: false,
         });
@@ -5080,7 +5315,19 @@ where
             command = %log_preview_text(&pending.request.command),
             "tui sandbox approval resolved"
         );
-        let _ = pending.request.response_tx.send(decision);
+        let response = code_ui_response_from_exec_selection(
+            pending.selected,
+            cache_disabled,
+            pending.allow_all_confirmation_requested,
+        );
+        if let Err(error) = self
+            .respond_local_runtime_interaction(&interaction_id, response)
+            .await
+        {
+            tracing::warn!(call_id = %interaction_id, error = %error, "runtime rejected TUI sandbox approval response; keeping dialog open");
+            self.pending_exec_approval = Some(pending);
+            return;
+        }
 
         self.widget.bottom_pane.set_exec_approval(None);
 
@@ -5188,7 +5435,7 @@ where
         }
     }
 
-    fn reject_pending_exec_approval(&mut self) {
+    async fn reject_pending_exec_approval(&mut self) {
         if self.pending_managed_interaction.is_some() {
             self.reject_pending_managed_interaction();
             return;
@@ -5202,7 +5449,23 @@ where
                 command = %log_preview_text(&pending.request.command),
                 "tui sandbox approval rejected"
             );
-            let _ = pending.request.response_tx.send(ReviewDecision::Denied);
+            if let Err(error) = self
+                .respond_local_runtime_interaction(
+                    &interaction_id,
+                    CodeUiInteractionResponse {
+                        approved: Some(false),
+                        apply_to_future: None,
+                        selected_option: None,
+                        note: None,
+                        answers: HashMap::new(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(call_id = %interaction_id, error = %error, "runtime rejected TUI sandbox denial; keeping dialog open");
+                self.pending_exec_approval = Some(pending);
+                return;
+            }
             if let Some(code_ui_session) = self.code_ui_session.clone() {
                 tokio::spawn(async move {
                     code_ui_session.resolve_interaction(&interaction_id).await;
@@ -5234,7 +5497,6 @@ where
                 command = %log_preview_text(&pending.request.command),
                 "tui sandbox approval cancelled"
             );
-            let _ = pending.request.response_tx.send(ReviewDecision::Denied);
             if let Some(code_ui_session) = self.code_ui_session.clone() {
                 tokio::spawn(async move {
                     code_ui_session.clear_interaction(&interaction_id).await;
@@ -14530,21 +14792,85 @@ fn selection_from_response(
     }
 }
 
-fn user_input_answers_from_code_ui(
-    pending: &PendingUserInput,
+fn decode_tui_interaction_response(
+    interaction: &InteractionResponse,
+) -> Result<CodeUiInteractionResponse, RuntimeWorkerError> {
+    serde_json::from_str(&interaction.response).map_err(|error| {
+        RuntimeWorkerError::ExecutionFailed(format!(
+            "TUI interaction response could not be decoded: {error}"
+        ))
+    })
+}
+
+fn user_input_response_from_code_ui_request(
+    questions: &[UserInputQuestion],
     response: CodeUiInteractionResponse,
-) -> Result<HashMap<String, UserInputAnswer>, TuiControlError> {
-    let mut answers = pending.answers.clone();
-    if !response.answers.is_empty() {
-        for (question_id, values) in response.answers {
-            answers.insert(question_id, UserInputAnswer { answers: values });
-        }
-        return Ok(answers);
+) -> anyhow::Result<UserInputResponse> {
+    if questions.is_empty() {
+        return Err(anyhow::anyhow!("User input request contains no questions"));
+    }
+    if questions
+        .iter()
+        .any(|question| question.id.trim().is_empty())
+    {
+        return Err(anyhow::anyhow!(
+            "User input request contains a question without a stable id"
+        ));
+    }
+    let question_ids = questions
+        .iter()
+        .map(|question| question.id.as_str())
+        .collect::<HashSet<_>>();
+    if question_ids.len() != questions.len() {
+        return Err(anyhow::anyhow!(
+            "User input request contains duplicate question ids and cannot be answered safely"
+        ));
     }
 
-    let Some(question) = pending.request.questions.get(pending.current_question) else {
-        return Err(TuiControlError::InteractionNotActive);
-    };
+    if !response.answers.is_empty() {
+        let unknown_question_ids = response
+            .answers
+            .keys()
+            .filter(|question_id| !question_ids.contains(question_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown_question_ids.is_empty() {
+            return Err(anyhow::anyhow!(
+                "User input response contains answers for unknown question ids: {}",
+                unknown_question_ids.join(", ")
+            ));
+        }
+        let mut answers = HashMap::with_capacity(questions.len());
+        for question in questions {
+            let values = response.answers.get(&question.id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "User input response is missing an answer for question '{}'",
+                    question.id
+                )
+            })?;
+            if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+                return Err(anyhow::anyhow!(
+                    "User input response must include a non-empty answer for question '{}'",
+                    question.id
+                ));
+            }
+            answers.insert(
+                question.id.clone(),
+                UserInputAnswer {
+                    answers: values.clone(),
+                },
+            );
+        }
+        return Ok(UserInputResponse { answers });
+    }
+
+    if questions.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "User input response must answer each of the {} requested questions",
+            questions.len()
+        ));
+    }
+    let question = &questions[0];
 
     let mut values = Vec::new();
     if let Some(selected_option) = response.selected_option.as_deref()
@@ -14570,11 +14896,51 @@ fn user_input_answers_from_code_ui(
         }
     }
     if values.is_empty() {
-        return Err(TuiControlError::UnsupportedInteractionKind);
+        return Err(anyhow::anyhow!("User input response must include answers"));
     }
 
-    answers.insert(question.id.clone(), UserInputAnswer { answers: values });
-    Ok(answers)
+    Ok(UserInputResponse {
+        answers: [(question.id.clone(), UserInputAnswer { answers: values })]
+            .into_iter()
+            .collect(),
+    })
+}
+
+fn exec_approval_response_from_code_ui(
+    cache_disabled: bool,
+    response: CodeUiInteractionResponse,
+) -> anyhow::Result<ReviewDecision> {
+    if response.selected_option.as_deref() == Some("confirm_allow_all_commands") {
+        return Ok(ReviewDecision::ApprovedForAllCommands);
+    }
+    let option_ids = exec_approval_option_ids(cache_disabled, false);
+    let selected = selection_from_response(
+        &option_ids,
+        &response,
+        Some(0),
+        Some(exec_approval_deny_selection(cache_disabled, false)),
+    )
+    .ok_or_else(|| anyhow::anyhow!("Exec approvals require an explicit decision"))?;
+    Ok(exec_approval_decision_from_selection(
+        selected,
+        cache_disabled,
+        false,
+    ))
+}
+
+fn code_ui_response_from_exec_selection(
+    selected: usize,
+    cache_disabled: bool,
+    allow_all_confirmation_requested: bool,
+) -> CodeUiInteractionResponse {
+    let option_ids = exec_approval_option_ids(cache_disabled, allow_all_confirmation_requested);
+    CodeUiInteractionResponse {
+        approved: None,
+        apply_to_future: None,
+        selected_option: option_ids.get(selected).map(|id| (*id).to_string()),
+        note: None,
+        answers: HashMap::new(),
+    }
 }
 
 fn summarize_retry_error(error: &str) -> String {

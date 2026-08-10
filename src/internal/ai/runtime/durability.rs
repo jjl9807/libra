@@ -87,6 +87,32 @@ impl RuntimeCommandDurability {
             )?)
     }
 
+    /// Terminal success plus zero-or-more interaction resolutions in one
+    /// durable append batch (W2-05 multi-approval / multi-input turns).
+    pub fn complete_success_with_interaction_resolutions(
+        &self,
+        intent: &CodeCommandIntent,
+        summary: impl Into<String>,
+        resolutions: &[(String, String)],
+    ) -> Result<CodeCommandStatus, RuntimeCommandDurabilityError> {
+        match resolutions {
+            [] => self.complete_success(intent, summary),
+            [(interaction_id, resolution)] => self.complete_success_with_interaction_resolved(
+                intent,
+                summary,
+                interaction_id.clone(),
+                resolution.clone(),
+            ),
+            _ => Ok(self
+                .session_store
+                .complete_code_command_success_with_interaction_resolutions(
+                    &intent.identity,
+                    summary,
+                    resolutions,
+                )?),
+        }
+    }
+
     /// Record a durable failed terminal result for an admitted command.
     pub fn complete_failure(
         &self,

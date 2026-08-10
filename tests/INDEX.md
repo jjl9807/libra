@@ -154,6 +154,7 @@ Machine-readable inventory for Checkpoint A. Later Web harness work must **retar
 | `agent_capture_migration_test` | 2 | `agent_capture` / checkpoint-paging and W4 capture-workspace-scope migrations, including legacy bootstrap and guarded down→up compatibility via `MigrationRunner` | `src/internal/db.rs`, `sql/migrations/2026050303_agent_capture.sql`, `sql/migrations/2026080401_agent_capture_workspace_scope.sql` |
 | `ai_agent_baseline_test` | 2 | Step 1.0 / CEX-00 single-agent baseline tests | `src/command/code.rs`, `src/internal/ai/agent/` |
 | `ai_approval_ttl_test` | 2 | CEX-11 approval TTL and canonical key contract tests | `src/internal/ai/agent/` |
+| `ai_subagent_permission_test` | 2 | GC-06 subagent permission mediation and fail-closed approval contracts | `src/internal/ai/agent/`, `src/internal/ai/runtime/` |
 | `ai_classifier_test` | 2 | CEX-08 TaskIntent classifier contract tests | `src/internal/ai/completion/` |
 | `ai_command_safety_test` | 2 | CEX-01 command safety contract tests | `src/internal/ai/commands/` |
 | `ai_compaction_filter_test` | 2 | Integration tests for filter_compacted projection | `src/internal/ai/context_budget/` |
