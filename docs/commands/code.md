@@ -116,6 +116,8 @@ Selecting `loopback` is rejected when `--host` is not a loopback address, and th
 
 Browser write requests share the same 256 KiB body limit and audit-sink wiring as automation control. The browser persists the lease only in memory; reloading the page drops the lease and the next write reattaches.
 
+The embedded SPA session-lifecycle panels list threads via `GET /api/code/threads`, cancel the active turn through `POST /api/code/control/cancel` (fail-closed when `controller.canWrite` is false), and classify resume targets from the live snapshot (`capabilities.providerSessionResume` plus terminal/awaiting phases). Browser resume HTTP is deferred to a later wire card; until then the UI explains restarting with `libra code --resume <thread_id>` from the session's original working directory. Thread list is repository-storage-scoped (shared across linked worktrees), while CLI `--resume` is working-directory scoped — a foreign-worktree thread fails if started from the wrong cwd.
+
 When the server is bound to a non-loopback host, non-loopback browsers receive a static remote access notice for HTML navigation instead of the SPA. The notice is zero JavaScript, includes only bind/remote/version/commit placeholders, and asset/API fallbacks return 404 so remote clients cannot probe session state.
 
 When `--browser-control loopback` is requested and the browser holds the active lease, the TUI initial controller is `LocalTui` (visible owner, can be reclaimed) instead of `Fixed { Tui }` (permanently blocking). If the TUI also wants to drive writes, `--control write` must be supplied alongside `--browser-control loopback`; the two writers serialize through the same `TuiControlCommand` channel.

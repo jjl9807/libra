@@ -15,22 +15,29 @@ pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Current UI status (W2-07 + W2-08 + W2-09)
+## Current UI status (W2-07 + W2-08 + W2-09 + W2-10)
 
 The shipped page mounts the shared session/SSE store and browser-controller
 lease provider, shows the current session title and phase, renders the
 pending approval / `request_user_input` panel when the snapshot has one
-(`SessionInteractions` → `InteractionsHost`), and mounts goal/task/skill
-controls (`SessionGoalTaskSkill`). It does not yet ship a three-pane
-workspace, composer, thread sidebar, terminal, or workflow tabs.
+(`SessionInteractions` → `InteractionsHost`), mounts goal/task/skill
+controls (`SessionGoalTaskSkill`), and mounts session lifecycle controls
+(`SessionLifecycle`: thread list via `GET /api/code/threads`, cancel via
+`POST /api/code/control/cancel`, resume affordance that explains process
+`libra code --resume <thread_id>` until W3-01 lands browser resume HTTP).
+It does not yet ship a three-pane workspace, composer, terminal, or
+workflow tabs.
 
 W2-07 owns the shared wire foundation under `web/src/lib/code-ui/`. W2-08 owns
 approval and structured user-input under `web/src/lib/code-ui/interactions/`
 and `web/src/components/workspace/interactions/`. W2-09 owns goal/task/skill
 under `web/src/lib/code-ui/goal-task-skill/` and
 `web/src/components/workspace/goal-task-skill/` (skills use the A0-07 curated
-registry until W3-01 exposes Code UI skill HTTP). Later domain panels remain
-with later W2 cards (usage W2-13, workflow review W2-16, etc.).
+registry until W3-01 exposes Code UI skill HTTP). W2-10 owns session
+lifecycle under `web/src/lib/code-ui/session-lifecycle/` and
+`web/src/components/workspace/session-lifecycle/`. Later domain panels remain
+with later W2 cards (usage W2-13, execution/repair W2-14, SSE reconnect
+W2-15, workflow review W2-16, etc.).
 
 ## Live API contract
 
@@ -67,27 +74,31 @@ web/src/
 ├── app/                       # Next.js app router entry (mounts domain panels)
 ├── components/workspace/
 │   ├── interactions/          # Approval + request_user_input panels (W2-08)
-│   └── goal-task-skill/       # Goal / task / skill panels (W2-09)
+│   ├── goal-task-skill/       # Goal / task / skill panels (W2-09)
+│   └── session-lifecycle/     # Thread list / resume / cancel (W2-10)
 └── lib/
     └── code-ui/               # Shared wire types, client, store, controller (W2-07)
         ├── interactions/      # Approval/user-input helpers + fixtures (W2-08)
-        └── goal-task-skill/   # Goal/task API + A0-07 skill helpers (W2-09)
+        ├── goal-task-skill/   # Goal/task API + A0-07 skill helpers (W2-09)
+        └── session-lifecycle/ # Threads API + resume affordance (W2-10)
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions` plus `SessionGoalTaskSkill` so pending prompts and goal/task/skill controls resolve through the leased controller.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions`, `SessionGoalTaskSkill`, and `SessionLifecycle` so pending prompts, goal/task/skill controls, and thread resume/cancel resolve through the leased controller.
 
 ## Browser write surface
 
 Composer and other domain writers will continue to land in later W2 cards.
-Approval, `request_user_input`, Goal start/cancel, and task dispatch already flow
-through `useBrowserController()` via `SessionInteractions` /
-`SessionGoalTaskSkill`: writes post with `X-Code-Controller-Token` after
-`withLease` recovery. Skill buttons only validate the A0-07 curated registry
-until W3-01 exposes skill HTTP. On the first write the hook calls
-`POST /api/code/controller/attach`, caches `controllerToken` + `leaseExpiresAt`
-in memory, and replays the original request. The browser `clientId` is
-persisted in `sessionStorage` so an unexpected reload can renew the same
-lease; an explicit detach still clears write access for a clean hand-off.
+Approval, `request_user_input`, Goal start/cancel, task dispatch, and turn
+cancel already flow through `useBrowserController()` via `SessionInteractions` /
+`SessionGoalTaskSkill` / `SessionLifecycle`: writes post with
+`X-Code-Controller-Token` after `withLease` recovery. Skill buttons only
+validate the A0-07 curated registry until W3-01 exposes skill HTTP. Thread
+resume remains process-level (`libra code --resume`) until W3-01. On the first
+write the hook calls `POST /api/code/controller/attach`, caches
+`controllerToken` + `leaseExpiresAt` in memory, and replays the original
+request. The browser `clientId` is persisted in `sessionStorage` so an
+unexpected reload can renew the same lease; an explicit detach still clears
+write access for a clean hand-off.
 
 Recovery semantics in `controller.tsx`:
 
