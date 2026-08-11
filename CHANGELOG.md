@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-05, 2026-08-12)
+
+- **W3-05 hardens Code UI write identity/request boundaries.** Browser
+  attach/writes require a trusted loopback `Origin` (or same-origin Referer)
+  derived from the bind address (including non-canonical loopback and port 80
+  forms); automation keeps bearer/control-token auth without Origin.
+  Per-session write rate limiting (`LIBRA_CODE_SESSION_WRITE_RATE_*`) returns
+  `429 RATE_LIMITED` with `Retry-After`. Body limit remains fail-closed on both
+  paths. Omitted attach `kind` with a control token resolves to automation so
+  `libra code-control` stays compatible.
+
 ### Added (plan-20260715 W3-04, 2026-08-11)
 
 - **W3-04 normalizes Codex websocket events into the shared `AgentEvent`

@@ -8,6 +8,7 @@ pub mod code_ui;
 pub mod code_ui_projection;
 pub mod headless;
 pub mod web_admission;
+pub mod write_guards;
 
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -31,11 +32,17 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 use uuid::Uuid;
 pub use web_admission::{CODE_UI_WEB_TURN_KIND, WebTurnMode, should_route_plain_message_to_plan};
 
-use self::code_ui::{
-    CodeUiApiError, CodeUiControllerDetachRequest, CodeUiControllerKind, CodeUiGoalCancelRequest,
-    CodeUiGoalStartRequest, CodeUiInteractionResponse, CodeUiMessageRequest, CodeUiRuntimeHandle,
-    CodeUiSessionResumeRequest, CodeUiSessionStatus, CodeUiSkillActivateRequest,
-    CodeUiTaskDispatchRequest, browser_controller_token_from_headers, ensure_session_updated_event,
+use self::{
+    code_ui::{
+        CodeUiApiError, CodeUiControllerDetachRequest, CodeUiControllerKind,
+        CodeUiGoalCancelRequest, CodeUiGoalStartRequest, CodeUiInteractionResponse,
+        CodeUiMessageRequest, CodeUiRuntimeHandle, CodeUiSessionResumeRequest, CodeUiSessionStatus,
+        CodeUiSkillActivateRequest, CodeUiTaskDispatchRequest,
+        browser_controller_token_from_headers, ensure_session_updated_event,
+    },
+    write_guards::{
+        SessionWriteRateLimiter, ensure_trusted_browser_origin, trusted_loopback_origins,
+    },
 };
 use crate::{
     command::code::{
@@ -69,6 +76,10 @@ struct WebAppState {
     automation_control_token: Option<Arc<str>>,
     audit_sink: Arc<dyn AuditSink>,
     control_trace_id: Uuid,
+    /// Bound listen address used to mint trusted loopback Origins (W3-05).
+    bound_addr: SocketAddr,
+    /// Per Code UI session write rate limiter (browser + automation, W3-05).
+    write_rate_limiter: Arc<SessionWriteRateLimiter>,
 }
 
 #[derive(Clone, Default)]
@@ -194,6 +205,8 @@ pub async fn start(
             .audit_sink
             .unwrap_or_else(|| Arc::new(TracingAuditSink)),
         control_trace_id: Uuid::new_v4(),
+        bound_addr,
+        write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
     });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -474,6 +487,7 @@ async fn repo_status_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "STATUS_UNAVAILABLE".to_string(),
             message: format!("failed to collect repository status: {err}"),
+            retry_after_secs: None,
         })
 }
 
@@ -527,12 +541,14 @@ async fn code_usage_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "STORAGE_ROOT_UNRESOLVED".to_string(),
             message: "cannot resolve repository storage for usage query".to_string(),
+            retry_after_secs: None,
         })?;
     let db_path = storage_root.join("libra.db");
     let db_path = db_path.to_str().ok_or_else(|| WebApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "STORAGE_PATH_INVALID".to_string(),
         message: "libra database path is not valid UTF-8".to_string(),
+        retry_after_secs: None,
     })?;
     let db = establish_connection(db_path)
         .await
@@ -540,6 +556,7 @@ async fn code_usage_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "DB_UNAVAILABLE".to_string(),
             message: format!("failed to open usage storage: {error}"),
+            retry_after_secs: None,
         })?;
     let usage = RuntimeUsageService::new(UsageRecorder::new(db));
     // Do not mix a caller-supplied scope with the live snapshot's other
@@ -597,6 +614,7 @@ async fn code_usage_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "USAGE_UNAVAILABLE".to_string(),
             message: format!("failed to query runtime usage: {error}"),
+            retry_after_secs: None,
         })?;
     let turn_delta = match query.turn_id.clone() {
         Some(turn_id) => Some(usage.current_turn(turn_id.clone(), filter).await.map_err(
@@ -604,6 +622,7 @@ async fn code_usage_handler(
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "USAGE_UNAVAILABLE".to_string(),
                 message: format!("failed to query runtime turn usage: {error}"),
+                retry_after_secs: None,
             },
         )?),
         None => None,
@@ -692,6 +711,7 @@ fn parse_optional_u64(field: &str, value: Option<&str>) -> Result<Option<u64>, W
         status: StatusCode::BAD_REQUEST,
         code: "INVALID_QUERY_PARAM".to_string(),
         message: format!("query parameter `{field}` must be a non-negative integer"),
+        retry_after_secs: None,
     })
 }
 
@@ -743,12 +763,14 @@ async fn code_threads_handler(
             message: "cannot resolve the repository storage root; if this is a linked worktree, \
                       run `libra worktree repair --confirm <worktree-path>`"
                 .to_string(),
+            retry_after_secs: None,
         })?;
     let db_path = storage_root.join("libra.db");
     let db_path_str = db_path.to_str().ok_or_else(|| WebApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "STORAGE_PATH_INVALID".to_string(),
         message: "libra database path is not valid UTF-8".to_string(),
+        retry_after_secs: None,
     })?;
 
     let db = establish_connection(db_path_str)
@@ -757,6 +779,7 @@ async fn code_threads_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "DB_UNAVAILABLE".to_string(),
             message: format!("failed to open libra database: {err}"),
+            retry_after_secs: None,
         })?;
 
     let projections = ThreadProjection::list_active(&db, limit, offset)
@@ -765,6 +788,7 @@ async fn code_threads_handler(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "THREAD_LIST_FAILED".to_string(),
             message: format!("failed to list active threads: {err}"),
+            retry_after_secs: None,
         })?;
 
     let next_offset = if (projections.len() as u64) < limit {
@@ -813,6 +837,7 @@ async fn code_skills_handler(
                 status: StatusCode::BAD_REQUEST,
                 code: "INVALID_SKILL_PROVIDER".to_string(),
                 message: format!("unknown skill provider '{provider}'; use an A0-07 agent slug"),
+                retry_after_secs: None,
             })?,
         ),
     };
@@ -859,19 +884,22 @@ async fn code_skill_activate_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         let provider = body.provider.trim();
         let name = body.name.trim();
         let kind = AgentKind::from_cli_slug(provider).ok_or_else(|| WebApiError {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_SKILL_PROVIDER".to_string(),
             message: format!("unknown skill provider '{provider}'; use an A0-07 agent slug"),
+            retry_after_secs: None,
         })?;
         if !discover_skills(kind).iter().any(|skill| skill.name == name) {
             return Err(WebApiError {
                 status: StatusCode::BAD_REQUEST,
                 code: "SKILL_NOT_DISCOVERABLE".to_string(),
                 message: format!("skill '{name}' is not discoverable for provider '{provider}'"),
-            });
+            retry_after_secs: None,
+        });
         }
         // Discoverability is confirmed, but there is still no in-process
         // activation path that persists a selection or notifies the live
@@ -884,6 +912,7 @@ async fn code_skill_activate_handler(
             message: format!(
                 "skill '{name}' is discoverable for '{provider}', but in-process skill activation is not available yet; the provider emits SkillEvent when it consumes the skill on a later turn"
             ),
+            retry_after_secs: None,
         })
     }
     .await;
@@ -920,6 +949,7 @@ async fn code_session_resume_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         let live = runtime.snapshot().await;
         if matches!(
             live.status,
@@ -950,12 +980,14 @@ async fn code_session_resume_handler(
                 status: StatusCode::NOT_FOUND,
                 code: "SESSION_RESUME_NOT_FOUND".to_string(),
                 message: error.to_string(),
-            },
+            retry_after_secs: None,
+        },
             ResumeCodeUiSessionError::LoadFailed { .. } => WebApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "SESSION_RESUME_LOAD_FAILED".to_string(),
                 message: error.to_string(),
-            },
+            retry_after_secs: None,
+        },
         })?;
         Err(WebApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -975,6 +1007,7 @@ async fn code_session_resume_handler(
                 },
                 body.thread_id
             ),
+            retry_after_secs: None,
         })
     }
     .await;
@@ -998,12 +1031,17 @@ async fn code_controller_attach_handler(
 ) -> Result<Json<serde_json::Value>, WebApiError> {
     ensure_loopback_api_request(remote_addr)?;
     let runtime = code_ui_runtime(&state)?;
+    let kind = resolve_controller_attach_kind(body.kind, &headers);
     let result = async {
-        if body.kind == CodeUiControllerKind::Automation {
+        if kind == CodeUiControllerKind::Browser {
+            ensure_browser_origin_for_write(&state, &headers)?;
+        }
+        if kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        ensure_session_write_rate_limit(&state, &runtime).await?;
         runtime
-            .attach_controller(body.kind, &body.client_id)
+            .attach_controller(kind, &body.client_id)
             .await
             .map_err(WebApiError::from)
     }
@@ -1012,13 +1050,38 @@ async fn code_controller_attach_handler(
         &state,
         &runtime,
         "controller.attach",
-        body.kind,
+        kind,
         &body.client_id,
         control_audit_outcome(&result),
     )
     .await;
     let response = result?;
     Ok(Json(serde_json::to_value(response)?))
+}
+
+/// Resolve attach `kind` when callers omit it.
+///
+/// `libra code-control` historically posts `{ clientId }` with
+/// `X-Libra-Control-Token` and no `kind`. Prefer automation in that case so
+/// the Origin gate does not break the shim. Browser SPAs either send
+/// `kind: "browser"` or omit both `kind` and the control token.
+fn resolve_controller_attach_kind(
+    kind: Option<CodeUiControllerKind>,
+    headers: &HeaderMap,
+) -> CodeUiControllerKind {
+    if let Some(kind) = kind {
+        return kind;
+    }
+    let has_control_token = headers
+        .get("x-libra-control-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if has_control_token {
+        CodeUiControllerKind::Automation
+    } else {
+        CodeUiControllerKind::Browser
+    }
 }
 
 async fn code_controller_detach_handler(
@@ -1042,6 +1105,7 @@ async fn code_controller_detach_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .detach_controller(lease.kind, &body.client_id, &token)
             .await
@@ -1081,6 +1145,7 @@ async fn code_message_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .submit_message(token.as_deref(), body.text, body.command_id)
             .await
@@ -1123,6 +1188,7 @@ async fn code_interaction_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .respond_interaction(token.as_deref(), &interaction_id, body)
             .await
@@ -1176,6 +1242,7 @@ async fn code_cancel_handler(
                 )));
             }
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .cancel_turn(token.as_deref())
             .await
@@ -1222,6 +1289,7 @@ async fn code_task_dispatch_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .task_dispatch(token.as_deref(), body.agent, body.prompt)
             .await
@@ -1268,6 +1336,7 @@ async fn code_goal_start_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .goal_start(token.as_deref(), body.objective)
             .await
@@ -1326,6 +1395,7 @@ async fn code_goal_cancel_handler(
         if lease.kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
         }
+        enforce_code_write_identity_gates(&state, &runtime, &headers, lease.kind).await?;
         runtime
             .goal_cancel(token.as_deref(), body.reason)
             .await
@@ -1398,6 +1468,7 @@ fn code_control_body_too_large_response() -> Response {
         status: StatusCode::PAYLOAD_TOO_LARGE,
         code: "PAYLOAD_TOO_LARGE".to_string(),
         message: "Code UI write request bodies are limited to 256KiB".to_string(),
+        retry_after_secs: None,
     }
     .into_response()
 }
@@ -1407,6 +1478,40 @@ fn code_ui_runtime(state: &WebAppState) -> Result<Arc<CodeUiRuntimeHandle>, WebA
         .code_ui
         .clone()
         .ok_or_else(|| WebApiError::from(CodeUiApiError::unavailable()))
+}
+
+fn ensure_browser_origin_for_write(
+    state: &WebAppState,
+    headers: &HeaderMap,
+) -> Result<(), WebApiError> {
+    let trusted = trusted_loopback_origins(state.bound_addr);
+    ensure_trusted_browser_origin(headers, &trusted)
+        .map_err(|error| WebApiError::forbidden(error.code(), error.message()))
+}
+
+async fn ensure_session_write_rate_limit(
+    state: &WebAppState,
+    runtime: &CodeUiRuntimeHandle,
+) -> Result<(), WebApiError> {
+    let session_id = runtime.snapshot().await.session_id;
+    state
+        .write_rate_limiter
+        .check_and_record(&session_id)
+        .map_err(WebApiError::rate_limited)
+}
+
+/// Shared post-auth write gates for browser Origin (when applicable) and
+/// per-session rate limiting (W3-05).
+async fn enforce_code_write_identity_gates(
+    state: &WebAppState,
+    runtime: &CodeUiRuntimeHandle,
+    headers: &HeaderMap,
+    controller_kind: CodeUiControllerKind,
+) -> Result<(), WebApiError> {
+    if controller_kind == CodeUiControllerKind::Browser {
+        ensure_browser_origin_for_write(state, headers)?;
+    }
+    ensure_session_write_rate_limit(state, runtime).await
 }
 
 fn code_ui_event_to_sse(event: code_ui::CodeUiEventEnvelope) -> Event {
@@ -1559,6 +1664,8 @@ struct WebApiError {
     status: StatusCode,
     code: String,
     message: String,
+    /// Optional `Retry-After` delay in whole seconds (ceil of remaining window).
+    retry_after_secs: Option<u64>,
 }
 
 impl WebApiError {
@@ -1567,8 +1674,27 @@ impl WebApiError {
             status: StatusCode::FORBIDDEN,
             code: code.into(),
             message: message.into(),
+            retry_after_secs: None,
         }
     }
+
+    fn rate_limited(retry_after: Duration) -> Self {
+        let secs = retry_after_secs_ceil(retry_after);
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "RATE_LIMITED".to_string(),
+            message: format!("Code UI session write rate limit exceeded; retry after {secs}s"),
+            retry_after_secs: Some(secs),
+        }
+    }
+}
+
+/// Ceil a retry delay to whole seconds so clients waiting the advertised
+/// value are not immediately re-throttled by truncated `as_secs()`.
+fn retry_after_secs_ceil(retry_after: Duration) -> u64 {
+    let millis = retry_after.as_millis();
+    let secs = ((millis + 999) / 1000) as u64;
+    secs.max(1)
 }
 
 impl From<CodeUiApiError> for WebApiError {
@@ -1577,6 +1703,7 @@ impl From<CodeUiApiError> for WebApiError {
             status: StatusCode::from_u16(value.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             code: value.code,
             message: value.message,
+            retry_after_secs: None,
         }
     }
 }
@@ -1599,12 +1726,14 @@ impl From<anyhow::Error> for WebApiError {
                         session_id: session_id.clone(),
                     },
                 ),
+                retry_after_secs: None,
             };
         }
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "INTERNAL_ERROR".to_string(),
             message: value.to_string(),
+            retry_after_secs: None,
         }
     }
 }
@@ -1617,7 +1746,7 @@ impl From<serde_json::Error> for WebApiError {
 
 impl IntoResponse for WebApiError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(serde_json::json!({
                 "error": {
@@ -1626,7 +1755,13 @@ impl IntoResponse for WebApiError {
                 }
             })),
         )
-            .into_response()
+            .into_response();
+        if let Some(secs) = self.retry_after_secs {
+            if let Ok(value) = header::HeaderValue::from_str(&secs.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -1771,6 +1906,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -1814,6 +1951,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -1864,6 +2003,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -1895,6 +2036,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -1921,6 +2064,8 @@ mod tests {
             automation_control_token: None,
             audit_sink: Arc::new(TracingAuditSink),
             control_trace_id: Uuid::new_v4(),
+            bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+            write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
         });
         let oversized_text = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
         let body = format!(r#"{{"text":"{oversized_text}"}}"#);
@@ -2027,6 +2172,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2035,6 +2182,7 @@ mod tests {
             .method(Method::POST)
             .uri("/messages")
             .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
             .header("X-Code-Controller-Token", attach.controller_token.clone())
             .body(Body::from(body))
             .unwrap();
@@ -2061,6 +2209,7 @@ mod tests {
             .method(Method::POST)
             .uri("/messages")
             .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
             .header("X-Code-Controller-Token", attach.controller_token)
             .body(Body::from(r#"{"text":"hello","commandId":" padded "}"#))
             .unwrap();
@@ -2100,6 +2249,8 @@ mod tests {
             automation_control_token: Some(Arc::from("control-token-secret")),
             audit_sink: audit_sink.clone(),
             control_trace_id: Uuid::new_v4(),
+            bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+            write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
         });
         let request = Request::builder()
             .method(Method::POST)
@@ -2387,6 +2538,8 @@ mod tests {
             automation_control_token: None,
             audit_sink: Arc::new(TracingAuditSink),
             control_trace_id: Uuid::new_v4(),
+            bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+            write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
         });
         let oversized = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
         for uri in ["/skills/activate", "/session/resume"] {
@@ -2456,6 +2609,8 @@ mod tests {
                 automation_control_token: Some(Arc::from("control-token-secret")),
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2463,6 +2618,7 @@ mod tests {
             .method(Method::POST)
             .uri("/session/resume")
             .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
             .header("X-Code-Controller-Token", attach.controller_token.clone())
             .body(Body::from(r#"{"threadId":"thread-missing"}"#))
             .unwrap();
@@ -2476,6 +2632,7 @@ mod tests {
             .method(Method::POST)
             .uri("/session/resume")
             .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
             .header("X-Code-Controller-Token", attach.controller_token)
             .header("X-Libra-Control-Token", "control-token-secret")
             .body(Body::from(r#"{"threadId":"thread-missing"}"#))
@@ -2504,6 +2661,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2551,6 +2710,8 @@ mod tests {
                 automation_control_token: None,
                 audit_sink: audit_sink.clone(),
                 control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2558,6 +2719,7 @@ mod tests {
             .method(Method::POST)
             .uri("/skills/activate")
             .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
             .header("X-Code-Controller-Token", attach.controller_token)
             .body(Body::from(r#"{"provider":"claude-code","name":"/review"}"#))
             .unwrap();
@@ -2700,6 +2862,8 @@ mod tests {
                     automation_control_token: None,
                     audit_sink: Arc::new(TracingAuditSink),
                     control_trace_id: Uuid::new_v4(),
+                    bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                    write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 })
                 .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
         };

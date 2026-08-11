@@ -726,6 +726,29 @@ impl CodeSession {
         Ok(token)
     }
 
+    /// Automation attach with only `clientId` (no `kind`) — mirrors the
+    /// historical `libra code-control` shim payload (W3-05).
+    pub fn attach_automation_omitted_kind(
+        &mut self,
+        client_id: &str,
+    ) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .post(self.url("/controller/attach"))
+            .header("X-Libra-Control-Token", &self.control_token)
+            .json(&json!({ "clientId": client_id }))
+            .send()
+            .context("failed to send omitted-kind automation attach")?;
+        let status = response.status();
+        let body = response.json().unwrap_or_else(|_| json!({}));
+        if status.is_success()
+            && let Some(token) = body.get("controllerToken").and_then(Value::as_str)
+        {
+            self.controller_token = Some(token.to_string());
+        }
+        Ok((status, body))
+    }
+
     /// Attach as a `browser` controller. Unlike automation attach, the
     /// browser path does **not** require `X-Libra-Control-Token` — only the
     /// returned `controllerToken` is needed for follow-up writes. Caller is
@@ -736,6 +759,7 @@ impl CodeSession {
         let response = self
             .client
             .post(self.url("/controller/attach"))
+            .header("Origin", self.base_url.as_str())
             .json(&json!({ "clientId": client_id, "kind": "browser" }))
             .send()
             .context("failed to send browser attach request")?;
@@ -763,6 +787,7 @@ impl CodeSession {
         let response = self
             .client
             .post(self.url("/controller/attach"))
+            .header("Origin", self.base_url.as_str())
             .json(&json!({ "clientId": client_id, "kind": "browser" }))
             .send()
             .context("failed to send browser attach request")?;
@@ -771,21 +796,70 @@ impl CodeSession {
         Ok((status, body))
     }
 
+    /// Browser attach without an Origin header (W3-05 fail-closed case).
+    pub fn attach_browser_without_origin(&self, client_id: &str) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .post(self.url("/controller/attach"))
+            .json(&json!({ "clientId": client_id, "kind": "browser" }))
+            .send()
+            .context("failed to send browser attach without Origin")?;
+        let status = response.status();
+        let body = response.json().unwrap_or_else(|_| json!({}));
+        Ok((status, body))
+    }
+
+    /// Browser attach with an explicit Origin (trusted or cross-site).
+    pub fn attach_browser_with_origin(
+        &self,
+        client_id: &str,
+        origin: &str,
+    ) -> Result<(StatusCode, Value)> {
+        let response = self
+            .client
+            .post(self.url("/controller/attach"))
+            .header("Origin", origin)
+            .json(&json!({ "clientId": client_id, "kind": "browser" }))
+            .send()
+            .context("failed to send browser attach with Origin")?;
+        let status = response.status();
+        let body = response.json().unwrap_or_else(|_| json!({}));
+        Ok((status, body))
+    }
+
     /// Submit a `/messages` request as a browser controller — only the lease
     /// token is sent, **not** the automation control token. Mirrors the
-    /// frontend `useBrowserController()` write semantics.
+    /// frontend `useBrowserController()` write semantics. Sends a trusted
+    /// loopback `Origin` derived from the session base URL (W3-05).
     pub fn browser_submit_message(
         &self,
         controller_token: &str,
         text: &str,
     ) -> Result<(StatusCode, Value)> {
-        let response = self
+        self.browser_submit_message_with_origin(
+            controller_token,
+            text,
+            Some(self.base_url.as_str()),
+        )
+    }
+
+    /// Like [`Self::browser_submit_message`] but lets tests override or omit
+    /// the `Origin` header (W3-05 Origin fail-closed cases).
+    pub fn browser_submit_message_with_origin(
+        &self,
+        controller_token: &str,
+        text: &str,
+        origin: Option<&str>,
+    ) -> Result<(StatusCode, Value)> {
+        let mut request = self
             .client
             .post(self.url("/messages"))
             .header("X-Code-Controller-Token", controller_token)
-            .json(&json!({ "text": text }))
-            .send()
-            .context("failed to submit browser message")?;
+            .json(&json!({ "text": text }));
+        if let Some(origin) = origin {
+            request = request.header("Origin", origin);
+        }
+        let response = request.send().context("failed to submit browser message")?;
         let status = response.status();
         let body = response.json().unwrap_or_else(|_| json!({}));
         Ok((status, body))
@@ -799,6 +873,7 @@ impl CodeSession {
             .client
             .post(self.url("/control/cancel"))
             .header("X-Code-Controller-Token", controller_token)
+            .header("Origin", self.base_url.as_str())
             .send()
             .context("failed to send browser cancel request")?;
         let status = response.status();
@@ -817,6 +892,7 @@ impl CodeSession {
             .client
             .post(self.url("/controller/detach"))
             .header("X-Code-Controller-Token", controller_token)
+            .header("Origin", self.base_url.as_str())
             .json(&json!({ "clientId": client_id }))
             .send()
             .context("failed to send browser detach request")?;
@@ -839,6 +915,7 @@ impl CodeSession {
             .client
             .post(self.url("/messages"))
             .header("X-Code-Controller-Token", controller_token)
+            .header("Origin", self.base_url.as_str())
             .json(&json!({ "text": text }))
             .send()
             .context("failed to submit oversized browser message")?;
@@ -859,6 +936,7 @@ impl CodeSession {
             .client
             .post(self.url(&format!("/interactions/{interaction_id}")))
             .header("X-Code-Controller-Token", controller_token)
+            .header("Origin", self.base_url.as_str())
             .json(&json!({ "approved": true }))
             .send()
             .context("failed to send browser interaction response")?;
@@ -1164,6 +1242,23 @@ impl CodeSession {
         let status = response.status();
         let body = response.json().unwrap_or_else(|_| json!({}));
         Ok((status, body))
+    }
+
+    /// Like [`Self::submit_message_expect_error`], also returning response headers
+    /// so callers can assert contracts such as `Retry-After` (W3-05).
+    pub fn submit_message_expect_error_with_headers(
+        &self,
+        text: &str,
+    ) -> Result<(StatusCode, reqwest::header::HeaderMap, Value)> {
+        let response = self
+            .authorized_post("/messages")
+            .json(&json!({ "text": text }))
+            .send()
+            .context("failed to submit automation message")?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.json().unwrap_or_else(|_| json!({}));
+        Ok((status, headers, body))
     }
 
     pub fn respond_interaction_expect_error(

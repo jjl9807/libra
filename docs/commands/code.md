@@ -117,6 +117,8 @@ Selecting `loopback` is rejected when `--host` is not a loopback address, and th
 
 Browser write requests share the same 256 KiB body limit and audit-sink wiring as automation control. The browser persists the lease only in memory; reloading the page drops the lease and the next write reattaches.
 
+Browser writes (including `POST /controller/attach` with `kind: "browser"`) additionally require a trusted loopback `Origin` (or same-origin `Referer` fallback) that matches the Code UI bind address (exact `http://<bound-ip>:<port>`, plus `localhost` / `127.0.0.1` / `[::1]` aliases when bound to canonical loopback). Missing or cross-site Origin fails closed with `ORIGIN_REQUIRED`. Automation writes authenticate with `X-Libra-Control-Token` / controller lease and do **not** use Origin as a substitute. Per-session write rate limiting applies to both browser and automation producers (`LIBRA_CODE_SESSION_WRITE_RATE_LIMIT` / `LIBRA_CODE_SESSION_WRITE_RATE_WINDOW_SECS`, default 120 writes / 60s) and returns `429 RATE_LIMITED` until the window recovers.
+
 The embedded SPA session-lifecycle panels list threads via `GET /api/code/threads`, cancel the active turn through `POST /api/code/control/cancel` (fail-closed when `controller.canWrite` is false), and post resume selection through `POST /api/code/session/resume` with `{ "threadId": "..." }`. Thread list is repository-storage-scoped (shared across linked worktrees), while resume is working-directory scoped; listed items omit `workingDir` until ThreadProjection persists a per-thread cwd.
 
 The usage panel mirrors the W2-12 `RuntimeUsageTotals` read model (cumulative, current-turn delta, sub-agent attribution) and keeps `partial`/`unknown`/`error` visible instead of pretending zero spend. `GET /api/code/usage` reads durable totals and returns an error rather than fabricated zeroes. When durable sub-agent enumeration is unavailable, the response omits `subAgents` and sets `subAgentsStatus: "unavailable"` instead of an empty array.
@@ -168,6 +170,8 @@ Code UI API errors use `{ error: { code, message } }`:
 |------|------|---------|
 | `LOOPBACK_REQUIRED` | 403 | Non-loopback client attempted an API route. |
 | `PAYLOAD_TOO_LARGE` | 413 | Write request body exceeded 256 KiB. |
+| `ORIGIN_REQUIRED` | 403 | Browser write/attach lacked a trusted loopback `Origin` (or same-origin `Referer`), or presented a cross-site Origin. |
+| `RATE_LIMITED` | 429 | Per-session write budget exhausted; retry after the rate-limit window (see `Retry-After` / wait for window recovery). |
 | `CONTROL_DISABLED` | 403 | Automation control is not enabled for this process. |
 | `MISSING_CONTROL_TOKEN` | 403 | Automation control token is absent. |
 | `INVALID_CONTROL_TOKEN` | 403 | Automation control token is invalid. |

@@ -258,9 +258,9 @@ async fn dispatch_json_rpc_request(
                 Err(error) => return DispatchResult::Error(error),
             };
             let mut body = json!({ "clientId": params.client_id });
-            if let Some(kind) = params.kind {
-                body["kind"] = Value::String(kind);
-            }
+            // Default omitted kind to automation: this shim always authenticates
+            // with X-Libra-Control-Token and never sends a browser Origin.
+            body["kind"] = Value::String(params.kind.unwrap_or_else(|| "automation".to_string()));
             send_post(
                 client,
                 base_url,

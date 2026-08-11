@@ -344,12 +344,11 @@ pub struct CodeUiEventEnvelope {
 #[serde(rename_all = "camelCase")]
 pub struct CodeUiControllerAttachRequest {
     pub client_id: String,
-    #[serde(default = "default_controller_attach_kind")]
-    pub kind: CodeUiControllerKind,
-}
-
-fn default_controller_attach_kind() -> CodeUiControllerKind {
-    CodeUiControllerKind::Browser
+    /// When omitted, the HTTP handler resolves `browser` vs `automation` from
+    /// whether `X-Libra-Control-Token` is present (`code-control` shim omits
+    /// `kind` and authenticates with the control token).
+    #[serde(default)]
+    pub kind: Option<CodeUiControllerKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1546,6 +1545,10 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("LOOPBACK_REQUIRED", 403),
         // Then the body-limit middleware (write surface only).
         ("PAYLOAD_TOO_LARGE", 413),
+        // Browser Origin / CSRF gate (W3-05); automation skips this check.
+        ("ORIGIN_REQUIRED", 403),
+        // Per-session write rate limit (browser + automation, W3-05).
+        ("RATE_LIMITED", 429),
         // Then automation control-token gate.
         ("CONTROL_DISABLED", 403),
         ("MISSING_CONTROL_TOKEN", 403),
@@ -1914,11 +1917,11 @@ mod tests {
     }
 
     #[test]
-    fn attach_request_defaults_to_browser_kind() {
+    fn attach_request_omitted_kind_deserializes_as_none() {
         let request: CodeUiControllerAttachRequest =
             serde_json::from_value(serde_json::json!({ "clientId": "browser-1" })).unwrap();
 
-        assert_eq!(request.kind, CodeUiControllerKind::Browser);
+        assert_eq!(request.kind, None);
     }
 
     #[tokio::test]
@@ -2101,6 +2104,10 @@ mod tests {
             // mod.rs `enforce_code_write_body_limit` /
             // `code_control_body_too_large_response`.
             ("PAYLOAD_TOO_LARGE", 413),
+            // mod.rs browser Origin gate / write_guards (W3-05).
+            ("ORIGIN_REQUIRED", 403),
+            // mod.rs per-session write rate limiter (W3-05).
+            ("RATE_LIMITED", 429),
             // mod.rs `parse_optional_u64` (?limit/?offset parser).
             ("INVALID_QUERY_PARAM", 400),
             // mod.rs `code_threads_handler` storage path build.
