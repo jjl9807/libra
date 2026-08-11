@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4010-diff-pathspec.sh"
 libra_command = "hash-object"
 libra_surface = "hash-object"
+libra_tests = ["command::t4_port_test::t4_port_t4010_setup"]
 
 [[scenario]]
 id = "t4010-diff-pathspec::limit-to-path-should-show-nothing"
@@ -211,6 +212,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4010-diff-pathspec.sh"
 libra_command = "commit"
 libra_surface = "-m"
+libra_tests = ["command::t4_port_test::t4_port_t4010_setup_submodules"]
 
 [[scenario]]
 id = "t4010-diff-pathspec::diff-tree-ignores-trailing-slash-on-submodule-path"
@@ -225,6 +227,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4010-diff-pathspec.sh"
 libra_command = "diff"
 libra_surface = "--name-only"
+libra_tests = ["command::t4_port_test::t4_port_t4010_diff_tree_ignores_trailing_slash_on_submodule_path"]
 
 [[scenario]]
 id = "t4010-diff-pathspec::diff-multiple-wildcard-pathspecs"
@@ -239,6 +242,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4010-diff-pathspec.sh"
 libra_command = "diff"
 libra_surface = "--name-only"
+libra_tests = ["command::t4_port_test::t4_port_t4010_diff_multiple_wildcard_pathspecs"]
 
 [[scenario]]
 id = "t4010-diff-pathspec::diff-cache-ignores-trailing-slash-on-submodule-path"
@@ -253,3 +257,4 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4010-diff-pathspec.sh"
 libra_command = "diff"
 libra_surface = "--name-only"
+libra_tests = ["command::t4_port_test::t4_port_t4010_diff_cache_ignores_trailing_slash_on_submodule_path"]

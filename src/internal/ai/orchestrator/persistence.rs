@@ -5390,7 +5390,12 @@ mod tests {
     #[test]
     fn session_jsonl_store_for_thread_loads_matching_code_session() {
         let temp_dir = tempdir().unwrap();
-        let working_dir = temp_dir.path().to_path_buf();
+        // Canonicalize before anything derives from the path: storage
+        // resolution canonicalizes the gitdir (util.rs `try_get_paths_full`),
+        // and on macOS a tempdir under `/var/folders` canonicalizes to
+        // `/private/var/...` — without this, the saved cwd and the resolved
+        // session root disagree on spelling and never match.
+        let working_dir = temp_dir.path().canonicalize().unwrap();
         let storage_root = working_dir.join(".libra");
         fs::create_dir_all(storage_root.join("objects")).unwrap();
         fs::create_dir_all(storage_root.join("hooks")).unwrap();

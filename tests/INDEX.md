@@ -109,9 +109,11 @@
 
 ## Wave 2 — Code UI & local automation
 
-### plan-20260715 W0-02 — TUI behavior baselines
+### plan-20260715 W0-02 — workflow behavior baselines
 
-Machine-readable inventory for Checkpoint A. Later Web harness work must **retarget** these rows, not delete the behaviors.
+Machine-readable inventory for Checkpoint A. W3-02 Web harness retargets these
+rows onto `--web-only` HTTP/SSE (baselines live in
+`src/internal/ai/workflow_baseline.rs`; TUI re-exports for in-process panes).
 
 | TUI-owned behavior | baseline test name | expected output / assertion |
 |---|---|---|
@@ -125,16 +127,26 @@ Machine-readable inventory for Checkpoint A. Later Web harness work must **retar
 | User-input | `code_ui_scenarios::user_input_baseline_interaction_kind_is_request_user_input` | wire kind = `request_user_input` |
 | Generation / CLI entry | `code_ui_remote_generation_matrix::generation_sse_observes_tool_execution_and_final_completion`; `code_cli_dispatch_test::defaults_are_observe_control_and_deny_network` | generation settles idle; CLI defaults observe + deny-network |
 
+### plan-20260715 W3-02 — Code UI Web harness
+
+Default `CodeSession` spawn is `libra code --web-only` with `--port 0` /
+`--mcp-port 0`. Readiness waits on `control.json` (MCP URL populated) then an
+HTTP `/session` snapshot — not sleep-only. Use
+`CodeSessionOptions::with_pty_tui()` only for reclaim / legacy TUI lifecycle
+cases. Always run Code UI harness targets with
+`LIBRA_ENABLE_TEST_PROVIDER=1`, `--features test-provider`, and
+`--test-threads=1` (shared control-file / port contention otherwise).
+
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
-| `harness_self_test` | 2 | Smoke-checks the PTY harness itself | `tests/harness/` |
-| `code_ui_scenarios` | 2 | End-to-end scenarios on the Code UI through the harness; includes plan-20260715 W0-02 `plan_workflow` / `plan_review` / `repair` / `user_input` / `goal_task` baseline filters | `src/command/code.rs`, `src/internal/tui/` |
+| `harness_self_test` | 2 | Smoke-checks the Code UI Web harness (control files, SIGTERM port release) | `tests/harness/` |
+| `code_ui_scenarios` | 2 | End-to-end scenarios on the Code UI through the Web harness; includes plan-20260715 W0-02 `plan_workflow` / `plan_review` / `repair` / `user_input` / `goal_task` baseline filters | `src/command/code.rs`, `src/internal/ai/web/`, `src/internal/ai/workflow_baseline.rs` |
 | `code_ui_remote_lease_matrix` | 2 | Browser/automation lease lifecycle matrix | `src/command/code.rs` controller, `src/command/code_control.rs` |
-| `code_ui_remote_sse_matrix` | 2 | SSE event stream matrix from web view | `src/internal/tui/`, `src/command/code.rs` (axum) |
-| `code_ui_remote_state_matrix` | 2 | Cross-surface state replication matrix, including mid-turn detach/cancel settling | `src/internal/tui/`, `src/internal/ai/web/code_ui.rs`, `src/command/code_control.rs` |
+| `code_ui_remote_sse_matrix` | 2 | SSE event stream matrix from web view | `src/internal/ai/web/`, `src/command/code.rs` (axum) |
+| `code_ui_remote_state_matrix` | 2 | Cross-surface state replication matrix, including mid-turn detach/cancel settling | `src/internal/ai/web/code_ui.rs`, `src/command/code_control.rs`, `src/internal/ai/workflow_baseline.rs` |
 | `code_ui_remote_security_matrix` | 2 | Auth/token/origin enforcement matrix | `src/command/code_control*.rs` |
-| `code_ui_remote_generation_matrix` | 2 | Generation control across surfaces (no live LLM) | `src/internal/tui/app.rs` |
-| `code_ui_remote_approval_matrix` | 2 | Approval flow across TUI/Web/automation | `src/internal/ai/agent/` approvals |
+| `code_ui_remote_generation_matrix` | 2 | Generation control across surfaces (no live LLM) | `src/internal/ai/web/`, `src/command/code.rs` |
+| `code_ui_remote_approval_matrix` | 2 | Approval flow across Web/automation | `src/internal/ai/agent/` approvals |
 | `code_cli_dispatch_test` | 2 | `libra code …` argv parsing & dispatch | `src/command/code.rs` |
 | `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code`, including the shared env-file → process → Vault factory used by TUI and headless launch | `src/command/code.rs`, `src/internal/ai/providers/`, `src/internal/ai/runtime/services.rs` |
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
@@ -143,8 +155,8 @@ Machine-readable inventory for Checkpoint A. Later Web harness work must **retar
 | `code_codex_default_tui_test` | 2 | `--provider codex` routes through the default managed-runtime TUI (legacy stdin loop unreachable) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
 | `code_codex_runtime_test` | 2 | `--provider codex` WS runtime boot: `--codex-port` validation, managed app-server initialize/thread-start, approval-interaction regression | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
-| `ai_code_ui_projection_test` | 2 | Projection snapshot replication | `src/internal/ai/history.rs`, `src/internal/tui/` |
-| `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events | `src/internal/tui/`, `src/internal/ai/agent/` |
+| `ai_code_ui_projection_test` | 2 | Projection snapshot replication | `src/internal/ai/history.rs`, `src/internal/ai/web/` |
+| `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events | `src/internal/ai/web/`, `src/internal/ai/agent/` |
 | `intent_flow_test` | 2 | IntentSpec → Plan → Run pipeline (no live LLM) | `src/internal/ai/intentspec/`, `src/internal/ai/orchestrator/` |
 | `e2e_mcp_flow` | 2 | End-to-end MCP server flow | `src/internal/ai/mcp/` |
 | `mcp_integration_test` | 2 | MCP integration tests | `src/internal/ai/mcp/` |
@@ -200,7 +212,7 @@ Machine-readable inventory for Checkpoint A. Later Web harness work must **retar
 | `ai_subagent_user_initiated_test` | 3 | OC-Phase 3 UserInitiated{bypass_permission_ask:true} E2E: rejecting asker proves bypass really skips step 8; rest of the chain matches the LlmInitiated sibling | `src/internal/ai/agent/runtime/`, `src/internal/ai/providers/fake/`. Gated `--features test-provider`. |
 | `ai_subagent_user_initiated_cancel_test` | 3 | OC-Phase 3 UserInitiated cancel E2E: pre-flight cancel short-circuits before JSONL writes; mid-flight parent abort returns `Cancelled { ParentAbort }`, parent JSONL writes `Spawned + Cancelled { UserRequested }`, and child JSONL replays to a cancelled snapshot | `src/internal/ai/agent/runtime/`. Gated `--features test-provider`. |
 | `ai_subagent_worktree_readonly_test` | 3 | Sub-agent worktree isolation guard: pins historical edit-tool pre-filter and `libra code` workspace-isolation bootstrap wiring | `src/internal/ai/tools/registry.rs`, `src/internal/ai/permission/`, `src/command/code.rs` |
-| `ai_usage_stats_test` | 2 | CEX-16 usage stats persistence and aggregation tests | `src/internal/ai/usage/` |
+| `ai_usage_stats_test` | 2 | CEX-16 usage persistence plus W2-12 replay-safe runtime totals, uncertainty states, per-turn deltas, and child attribution | `src/internal/ai/usage/`, `src/internal/ai/agent/runtime/usage.rs` |
 | `ai_usage_tui_test` | 2 | CEX-16 usage display formatting tests | `src/internal/ai/usage/` |
 | `ai_validation_decision_flow_test` | 2 | Phase D validation and decision derived-record tests | `src/internal/ai/orchestrator/` |
 | `diagnostics_redaction_test` | 2 | Diagnostics logs redaction and sanitization | `src/internal/ai/usage/` |

@@ -417,8 +417,8 @@ mod tests {
     }
 
     /// Scenario (test-provider only): the `Fake` variant forwards
-    /// `usage_summary()` faithfully (the fake provider returns `None`) and is
-    /// reported as `provider_id::FAKE`.
+    /// `usage_summary()` faithfully (this fixture has no usage) and is reported
+    /// as `provider_id::FAKE`.
     #[cfg(feature = "test-provider")]
     #[test]
     fn fake_variant_reports_none_usage_and_fake_provider_id() {
@@ -426,6 +426,7 @@ mod tests {
         let resp = AnyCompletionRawResponse::Fake(FakeRawResponse {
             model: "fake".to_string(),
             matched_response_index: Some(0),
+            usage: None,
         });
         assert!(resp.usage_summary().is_none());
         assert_eq!(resp.provider_id(), provider_id::FAKE);

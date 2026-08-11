@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.19.116"
+version = "0.19.129"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -511,3 +511,7 @@ required-features = ["test-live-ai"]
 name = "ai_ollama_live_gate_test"
 path = "tests/ai_ollama_live_gate_test.rs"
 required-features = ["test-live-ai"]
+
+[[test]]
+name = "compat_serial_registry"
+path = "tests/compat/serial_registry.rs"

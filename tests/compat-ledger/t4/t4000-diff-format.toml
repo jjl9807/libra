@@ -17,6 +17,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "update-index"
 libra_surface = "--add"
+libra_tests = ["command::t4_port_test::t4_port_t4000_update_index_add_two_files_with_and_without_x"]
 
 [[scenario]]
 id = "t4000-diff-format::git-diff-files-p-after-editing-work-tree"
@@ -466,6 +467,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "diff"
 libra_surface = "--no-patch"
+libra_tests = ["command::t4_port_test::t4_port_t4000_no_patch_in_git_diff_no_patch_stat_is_a_no_op"]
 
 [[scenario]]
 id = "t4000-diff-format::no-patch-in-git-diff-no-patch-raw-is-a-no-op"
@@ -480,6 +482,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "diff"
 libra_surface = "--no-patch"
+libra_tests = ["command::t4_port_test::t4_port_t4000_no_patch_in_git_diff_no_patch_raw_is_a_no_op"]
 
 [[scenario]]
 id = "t4000-diff-format::no-patch-in-git-diff-no-patch-numstat-is-a-no-op"
@@ -494,6 +497,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "diff"
 libra_surface = "--no-patch"
+libra_tests = ["command::t4_port_test::t4_port_t4000_no_patch_in_git_diff_no_patch_numstat_is_a_no_op"]
 
 [[scenario]]
 id = "t4000-diff-format::no-patch-in-git-diff-no-patch-shortstat-is-a-no-op"
@@ -508,6 +512,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "diff"
 libra_surface = "--no-patch"
+libra_tests = ["command::t4_port_test::t4_port_t4000_no_patch_in_git_diff_no_patch_shortstat_is_a_no_op"]
 
 [[scenario]]
 id = "t4000-diff-format::no-patch-in-git-diff-no-patch-summary-is-a-no-op"
@@ -522,6 +527,7 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "diff"
 libra_surface = "--no-patch"
+libra_tests = ["command::t4_port_test::t4_port_t4000_no_patch_in_git_diff_no_patch_summary_is_a_no_op"]
 
 [[scenario]]
 id = "t4000-diff-format::no-patch-in-git-diff-no-patch-dirstat-is-a-no-op"
@@ -611,3 +617,4 @@ upstream_revision = "dfb079967b9cbc99e533c21e65f674bb3f5e8b07"
 upstream_file = "t4000-diff-format.sh"
 libra_command = "diff"
 libra_surface = "--no-patch"
+libra_tests = ["command::t4_port_test::t4_port_t4000_no_patch_in_git_diff_no_patch_compact_summary_is_a_no_op"]

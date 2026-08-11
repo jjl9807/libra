@@ -199,13 +199,14 @@ fn state_matrix_requires_test_provider_feature() {
 /// affordance discoverable from the state-matrix target listed in the plan.
 #[test]
 fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
-    use libra::internal::tui::plan_repair_threshold_baseline_message;
+    use libra::internal::ai::workflow_baseline::plan_repair_threshold_baseline_message;
 
     let message = plan_repair_threshold_baseline_message("step failed", 2, 2);
     assert!(message.contains(
         "Automatic plan repair stopped after 2 failed repair attempts (automatic threshold: 2)."
     ));
-    assert!(message.contains("Reply `continue` or `/plan continue"));
+    assert!(message.contains("Reply `/plan continue <higher-limit>`"));
+    assert!(!message.contains("Reply `continue`"));
     assert!(message.contains("step failed"));
 }
 

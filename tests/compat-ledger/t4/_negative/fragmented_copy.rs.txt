@@ -1,0 +1,19 @@
+// NEGATIVE FIXTURE — this file must be REJECTED by the clean-room gate.
+//
+// Shape: upstream test structure transliterated into Rust rather than copied as
+// text — the assertion helper and the case wrapper keep their upstream names, so
+// the migration is a translation of the original rather than a rewrite from the
+// scenario's intent. This is the shape ADR-CT-01 is really aimed at, and the one
+// a reader is most likely to defend as "not a copy".
+
+#[test]
+fn t4_port_bogus_fragmented_copy() {
+    // test_expect_success 'validate diff output' '
+    //     git diff-files -p >actual &&
+    //     test_cmp expected actual
+    // '
+    let expected = "expected";
+    let actual = "actual";
+    assert_eq!(expected, expected);
+    assert_eq!(actual, actual);
+}

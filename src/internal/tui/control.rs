@@ -80,6 +80,8 @@ pub enum TuiControlError {
     Busy,
     InteractionNotActive,
     UnsupportedInteractionKind,
+    /// A repair gate remains open, but its automatic retry budget is exhausted.
+    PlanRepairRetryLimitReached,
     ControllerConflict,
     /// Durable mutation reconciliation is required before another turn can run.
     ReconciliationRequired(String),
@@ -111,6 +113,7 @@ impl TuiControlError {
             Self::Busy => 409,
             Self::InteractionNotActive => 409,
             Self::UnsupportedInteractionKind => 422,
+            Self::PlanRepairRetryLimitReached => 409,
             Self::ControllerConflict => 409,
             Self::ReconciliationRequired(_) => 409,
             Self::Internal(_) => 500,
@@ -126,6 +129,7 @@ impl TuiControlError {
             Self::Busy => "SESSION_BUSY",
             Self::InteractionNotActive => "INTERACTION_NOT_ACTIVE",
             Self::UnsupportedInteractionKind => "UNSUPPORTED_INTERACTION_KIND",
+            Self::PlanRepairRetryLimitReached => "PLAN_REPAIR_RETRY_LIMIT_REACHED",
             Self::ControllerConflict => "CONTROLLER_CONFLICT",
             Self::ReconciliationRequired(_) => "RECONCILIATION_REQUIRED",
             Self::Internal(_) => "TUI_CONTROL_INTERNAL",
@@ -144,6 +148,9 @@ impl TuiControlError {
             }
             Self::UnsupportedInteractionKind => {
                 "This interaction kind cannot be answered by automation".to_string()
+            }
+            Self::PlanRepairRetryLimitReached => {
+                "Plan repair has reached its automatic retry limit; cancel the repair or provide manual revision guidance".to_string()
             }
             Self::ControllerConflict => {
                 "The local TUI controller is not reclaimable in this session".to_string()
@@ -211,6 +218,10 @@ mod tests {
             "This interaction kind cannot be answered by automation",
         );
         assert_eq!(
+            TuiControlError::PlanRepairRetryLimitReached.to_string(),
+            "Plan repair has reached its automatic retry limit; cancel the repair or provide manual revision guidance",
+        );
+        assert_eq!(
             TuiControlError::ControllerConflict.to_string(),
             "The local TUI controller is not reclaimable in this session",
         );
@@ -250,6 +261,7 @@ mod tests {
         assert_eq!(TuiControlError::Busy.status(), 409);
         assert_eq!(TuiControlError::InteractionNotActive.status(), 409);
         assert_eq!(TuiControlError::UnsupportedInteractionKind.status(), 422);
+        assert_eq!(TuiControlError::PlanRepairRetryLimitReached.status(), 409);
         assert_eq!(TuiControlError::ControllerConflict.status(), 409);
         assert_eq!(
             TuiControlError::ReconciliationRequired(String::new()).status(),
@@ -282,6 +294,10 @@ mod tests {
         assert_eq!(
             TuiControlError::UnsupportedInteractionKind.code(),
             "UNSUPPORTED_INTERACTION_KIND",
+        );
+        assert_eq!(
+            TuiControlError::PlanRepairRetryLimitReached.code(),
+            "PLAN_REPAIR_RETRY_LIMIT_REACHED",
         );
         assert_eq!(
             TuiControlError::ControllerConflict.code(),

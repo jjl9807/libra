@@ -40,8 +40,9 @@ fn basic_chat_submit_updates_transcript() -> Result<()> {
 #[test]
 #[serial]
 fn automation_reclaim_returns_control_to_tui() -> Result<()> {
-    let mut session =
-        CodeSession::spawn(CodeSessionOptions::new("reclaim", fixture("basic_chat")))?;
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("reclaim", fixture("basic_chat")).with_pty_tui(),
+    )?;
     session.attach_automation("scenario-reclaim")?;
     session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
         controller_kind(snapshot) == Some("automation")
@@ -300,7 +301,9 @@ fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Resul
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-expired-token", fixture("basic_chat"))
             .with_browser_control_loopback()
-            .with_lease_duration_ms(50),
+            // Headless Web startup is slower than TUI; keep the lease long
+            // enough to observe the attached browser controller before expiry.
+            .with_lease_duration_ms(500),
     )?;
 
     let token = session.attach_browser("scenario-browser-expired-token")?;
@@ -308,13 +311,15 @@ fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Resul
         controller_kind(snapshot) == Some("browser")
     })?;
 
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(700));
     let (status, body) = session.browser_submit_message(&token, "/chat hello")?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error_code(&body), Some("CONTROLLER_CONFLICT"));
 
+    // Web-only headless starts Unclaimed (no local TUI owner); expiry returns
+    // control to `none`. PTY/TUI spawns reclaim to `tui`.
     session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
-        controller_kind(snapshot) == Some("tui")
+        matches!(controller_kind(snapshot), Some("tui") | Some("none"))
     })?;
 
     session.shutdown()
@@ -515,7 +520,8 @@ fn browser_write_appends_redacted_control_audit() -> Result<()> {
 fn local_tui_reclaim_invalidates_browser_lease() -> Result<()> {
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-reclaim", fixture("basic_chat"))
-            .with_browser_control_loopback(),
+            .with_browser_control_loopback()
+            .with_pty_tui(),
     )?;
 
     let token = session.attach_browser("scenario-browser-reclaim")?;
@@ -581,7 +587,7 @@ fn code_ui_scenarios_require_test_provider_feature() {
 /// later Web harness work can retarget these contracts instead of deleting them.
 #[test]
 fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
-    use libra::internal::tui::{INTENT_REVIEW_CHOICES, POST_PLAN_CHOICES};
+    use libra::internal::ai::workflow_baseline::{INTENT_REVIEW_CHOICES, POST_PLAN_CHOICES};
 
     assert_eq!(
         INTENT_REVIEW_CHOICES,
@@ -605,7 +611,11 @@ fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
 #[cfg(feature = "test-provider")]
 fn plan_workflow_intent_review_respond(name: &str, selected_option: &str) -> Result<()> {
     let mut session = CodeSession::spawn(
-        CodeSessionOptions::new(name, fixture("plan_intent_review")).with_context("dev"),
+        // Plan Phase-0 routing still depends on the TUI App path until W3-03
+        // merges headless plan ownership; keep these scenarios on PTY/TUI.
+        CodeSessionOptions::new(name, fixture("plan_intent_review"))
+            .with_context("dev")
+            .with_pty_tui(),
     )?;
     session.attach_automation(&format!("scenario-{name}"))?;
 
@@ -747,7 +757,8 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
         let mut session = CodeSession::spawn(
             CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_intent_review"))
                 .with_existing_repo_dir(repo_dir.clone())
-                .with_context("dev"),
+                .with_context("dev")
+                .with_pty_tui(),
         )?;
         session.attach_automation(&format!("{case_name}-spawn"))?;
         session
@@ -786,7 +797,8 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
         CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_intent_review"))
             .with_existing_repo_dir(repo_dir)
             .with_resume_thread(&session_id)
-            .with_context("dev"),
+            .with_context("dev")
+            .with_pty_tui(),
     )?;
     resumed.attach_automation(&format!("{case_name}-resume"))?;
     let snapshot = resumed.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
@@ -860,7 +872,8 @@ fn plan_review_network_policy_survives_resume_and_can_be_denied() -> Result<()> 
         let mut session = CodeSession::spawn(
             CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
                 .with_existing_repo_dir(repo_dir.clone())
-                .with_context("dev"),
+                .with_context("dev")
+                .with_pty_tui(),
         )?;
         session.attach_automation(&format!("{case_name}-spawn"))?;
         session
@@ -934,7 +947,8 @@ fn plan_review_network_policy_survives_resume_and_can_be_denied() -> Result<()> 
         CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
             .with_existing_repo_dir(repo_dir)
             .with_resume_thread(&session_id)
-            .with_context("dev"),
+            .with_context("dev")
+            .with_pty_tui(),
     )?;
     resumed.attach_automation(&format!("{case_name}-resume"))?;
     let snapshot = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
@@ -982,15 +996,13 @@ fn plan_review_network_policy_survives_resume_and_can_be_denied() -> Result<()> 
 /// `plan_review_network_policy_survives_resume_and_can_be_denied`.
 #[test]
 fn plan_review_baseline_pins_network_policy_choices() {
-    use libra::internal::{
-        ai::{
-            runtime::phase1::{
-                network_policy_interaction_id, open_network_policy_from_workflow,
-                open_plan_review_from_workflow,
-            },
-            session::{CodeWorkflowEventKind, SessionJsonlStore},
+    use libra::internal::ai::{
+        runtime::phase1::{
+            network_policy_interaction_id, open_network_policy_from_workflow,
+            open_plan_review_from_workflow,
         },
-        tui::NETWORK_POLICY_CHOICES,
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+        workflow_baseline::NETWORK_POLICY_CHOICES,
     };
 
     assert_eq!(
@@ -1077,7 +1089,7 @@ fn plan_review_baseline_pins_network_policy_choices() {
 /// W0-02 baseline for automatic plan-repair threshold copy (filter: `repair`).
 #[test]
 fn repair_loop_baseline_threshold_keeps_plan_continue_affordance() {
-    use libra::internal::tui::plan_repair_threshold_baseline_message;
+    use libra::internal::ai::workflow_baseline::plan_repair_threshold_baseline_message;
 
     let message = plan_repair_threshold_baseline_message("task failed: missing fixture", 3, 3);
     assert!(message.contains(

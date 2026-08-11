@@ -82,3 +82,7 @@ Invalid params map to `-32602`. HTTP 4xx/5xx errors map to `-32000` with
 `data.status` and `data.code`, preserving Libra errors such as
 `INVALID_CONTROL_TOKEN`, `INVALID_CONTROLLER_TOKEN`, `CONTROLLER_CONFLICT`, and
 `INTERACTION_NOT_ACTIVE`.
+
+| Code | HTTP | Meaning |
+|------|------|---------|
+| `PLAN_REPAIR_RETRY_LIMIT_REACHED` | 409 | A plan-repair Continue request did not raise the exhausted automatic retry cap. Retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |

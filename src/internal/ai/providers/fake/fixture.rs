@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::internal::ai::completion::CompletionUsageSummary;
+
 #[derive(Debug, Error)]
 pub enum FakeFixtureError {
     #[error("failed to read fake provider fixture '{path}': {source}")]
@@ -97,6 +99,9 @@ pub enum FakeResponseAction {
         delay_ms: u64,
         #[serde(default)]
         stream: Vec<FakeStreamDelta>,
+        /// Optional deterministic provider usage emitted with this response.
+        #[serde(default)]
+        usage: Option<CompletionUsageSummary>,
     },
     ToolCall {
         id: String,
@@ -107,6 +112,9 @@ pub enum FakeResponseAction {
         delay_ms: u64,
         #[serde(default)]
         stream: Vec<FakeStreamDelta>,
+        /// Optional deterministic provider usage emitted with this response.
+        #[serde(default)]
+        usage: Option<CompletionUsageSummary>,
     },
     Error {
         message: String,
@@ -140,6 +148,13 @@ impl FakeResponseAction {
             Self::Error { .. } => &[],
         }
     }
+
+    pub fn usage(&self) -> Option<CompletionUsageSummary> {
+        match self {
+            Self::Text { usage, .. } | Self::ToolCall { usage, .. } => usage.clone(),
+            Self::Error { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -165,6 +180,7 @@ mod tests {
                     text: "hi".to_string(),
                     delay_ms: 0,
                     stream: vec![],
+                    usage: None,
                 },
             }],
             fallback: None,

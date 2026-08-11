@@ -18,6 +18,7 @@ pub mod phase2;
 pub mod phase3;
 pub mod phase4;
 pub mod plan_execution;
+pub mod plan_execution_repair;
 pub mod prompt_builders;
 pub mod revision;
 pub mod services;
@@ -59,7 +60,16 @@ pub use phase4::{
 pub use plan_execution::{
     DeferredPlanExecutionExecutor, PLAN_EXECUTION_TURN_INPUT, PlanExecutionRunner,
     ensure_plan_execution_mutating_gate, is_plan_execution_turn, plan_execution_turn_request,
-    submit_confirmed_plan_execution,
+    submit_confirmed_plan_execution, submit_repaired_plan_execution,
+};
+pub use plan_execution_repair::{
+    DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS, ExecutionFailureEvidence, ExecutionFailureRevision,
+    MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS, PlanExecutionRepairAckDelivery, PlanExecutionRepairService,
+    PlanExecutionRepairState, open_plan_execution_repair_from_workflow,
+    park_plan_execution_repair_gate, persist_and_park_plan_execution_repair_gate,
+    persist_plan_execution_repair_gate, persist_plan_execution_repair_gate_superseding,
+    persist_plan_execution_repair_gate_with_predecessor, redacted_failure_summary,
+    speculative_plan_execution_repair_continuations_from_workflow,
 };
 pub use prompt_builders::{IntentPromptBuilder, PlanningPromptBuilder, TaskPromptBuilder};
 pub use services::{

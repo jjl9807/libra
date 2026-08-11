@@ -50,11 +50,12 @@ impl CompletionModel {
 pub struct FakeRawResponse {
     pub model: String,
     pub matched_response_index: Option<usize>,
+    pub usage: Option<crate::internal::ai::completion::CompletionUsageSummary>,
 }
 
 impl CompletionUsage for FakeRawResponse {
     fn usage_summary(&self) -> Option<crate::internal::ai::completion::CompletionUsageSummary> {
-        None
+        self.usage.clone()
     }
 }
 
@@ -112,6 +113,7 @@ impl CompletionModelTrait for CompletionModel {
                 return Err(CompletionError::ProviderError(message.clone()));
             }
         };
+        let usage = action.usage();
 
         Ok(CompletionResponse {
             content,
@@ -119,6 +121,7 @@ impl CompletionModelTrait for CompletionModel {
             raw_response: FakeRawResponse {
                 model: self.model.clone(),
                 matched_response_index,
+                usage,
             },
         })
     }
@@ -166,6 +169,7 @@ mod tests {
                     text: "fake hello".to_string(),
                     delay_ms: 0,
                     stream: vec![],
+                    usage: None,
                 },
             }],
             fallback: Some(FakeResponseAction::Error {
@@ -201,6 +205,7 @@ mod tests {
                     arguments: json!({"question":"Continue?"}),
                     delay_ms: 0,
                     stream: vec![],
+                    usage: None,
                 },
             }],
             fallback: None,

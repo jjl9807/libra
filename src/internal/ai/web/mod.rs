@@ -3,12 +3,15 @@
 //! This module serves the static Next.js bundle and the provider-agnostic
 //! `/api/code/*` protocol used by the browser UI.
 
+pub mod agent_runtime_adapter;
 pub mod code_ui;
 pub mod code_ui_projection;
 pub mod headless;
+pub mod web_admission;
 
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
+pub use agent_runtime_adapter::AgentRuntimeCodeUiAdapter;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -26,22 +29,29 @@ use serde::Serialize;
 use tokio::{sync::oneshot, time::timeout};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 use uuid::Uuid;
+pub use web_admission::{CODE_UI_WEB_TURN_KIND, WebTurnMode, should_route_plain_message_to_plan};
 
 use self::code_ui::{
     CodeUiApiError, CodeUiControllerDetachRequest, CodeUiControllerKind, CodeUiGoalCancelRequest,
     CodeUiGoalStartRequest, CodeUiInteractionResponse, CodeUiMessageRequest, CodeUiRuntimeHandle,
+    CodeUiSessionResumeRequest, CodeUiSessionStatus, CodeUiSkillActivateRequest,
     CodeUiTaskDispatchRequest, browser_controller_token_from_headers, ensure_session_updated_event,
 };
 use crate::{
-    command::code::resolve_storage_root,
+    command::code::{
+        ResumeCodeUiSessionError, resolve_storage_root, resume_code_ui_session_to_thread,
+    },
     internal::{
         ai::{
+            agent::runtime::RuntimeUsageService,
+            observed_agents::{AgentKind, discover_skills},
             projection::ThreadProjection,
             runtime::{
                 RuntimeWorkerError,
                 hardening::{AuditEvent, AuditSink, SecretRedactor, TracingAuditSink},
                 runtime_worker_adapter_message,
             },
+            usage::{UsageQueryFilter, UsageRecorder},
         },
         db::establish_connection,
     },
@@ -247,6 +257,8 @@ fn code_router() -> Router<WebAppState> {
         .route("/events", get(code_events_handler))
         .route("/diagnostics", get(code_diagnostics_handler))
         .route("/threads", get(code_threads_handler))
+        .route("/usage", get(code_usage_handler))
+        .route("/skills", get(code_skills_handler))
         .route("/goal/status", get(code_goal_status_handler))
         .route("/controller/attach", post(code_controller_attach_handler))
         .route("/controller/detach", post(code_controller_detach_handler))
@@ -268,6 +280,8 @@ fn code_write_router() -> Router<WebAppState> {
         .route("/task/dispatch", post(code_task_dispatch_handler))
         .route("/goal/start", post(code_goal_start_handler))
         .route("/goal/cancel", post(code_goal_cancel_handler))
+        .route("/skills/activate", post(code_skill_activate_handler))
+        .route("/session/resume", post(code_session_resume_handler))
         .layer(middleware::from_fn(enforce_code_write_body_limit))
 }
 
@@ -472,6 +486,140 @@ async fn code_session_handler(
     Ok(Json(serde_json::to_value(runtime.snapshot().await)?))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageRawQuery {
+    session_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageReadModelResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    cumulative: crate::internal::ai::agent::runtime::RuntimeUsageTotals,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_delta: Option<crate::internal::ai::agent::runtime::RuntimeUsageTotals>,
+    /// Absent when durable per-sub-agent enumeration is unavailable. An empty
+    /// array would falsely mean "known zero sub-agents".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub_agents: Option<Vec<serde_json::Value>>,
+    /// `unavailable` until RuntimeUsageService can enumerate child agents.
+    sub_agents_status: &'static str,
+}
+
+/// `GET /api/code/usage` exposes persisted runtime usage, never synthetic
+/// zeroes.  A database failure is surfaced as an API error so callers can
+/// retain the usage read model's unknown/partial semantics.
+async fn code_usage_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebAppState>,
+    Query(query): Query<UsageRawQuery>,
+) -> Result<Json<UsageReadModelResponse>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    let snapshot = code_ui_runtime(&state)?.snapshot().await;
+    let storage_root =
+        resolve_storage_root(state.working_dir.as_path()).ok_or_else(|| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "STORAGE_ROOT_UNRESOLVED".to_string(),
+            message: "cannot resolve repository storage for usage query".to_string(),
+        })?;
+    let db_path = storage_root.join("libra.db");
+    let db_path = db_path.to_str().ok_or_else(|| WebApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "STORAGE_PATH_INVALID".to_string(),
+        message: "libra database path is not valid UTF-8".to_string(),
+    })?;
+    let db = establish_connection(db_path)
+        .await
+        .map_err(|error| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "DB_UNAVAILABLE".to_string(),
+            message: format!("failed to open usage storage: {error}"),
+        })?;
+    let usage = RuntimeUsageService::new(UsageRecorder::new(db));
+    // Do not mix a caller-supplied scope with the live snapshot's other
+    // dimension: `?sessionId=historical` must not AND against the live
+    // threadId (and vice versa). Only fall back to the live snapshot when
+    // the caller omitted both filters.
+    let (response_session_id, requested_thread) = match (
+        query
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        query
+            .thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    ) {
+        (None, None) => (
+            Some(snapshot.session_id.clone()),
+            snapshot.thread_id.clone(),
+        ),
+        (session, thread) => (session.map(str::to_string), thread.map(str::to_string)),
+    };
+    // Generated headless sessions often mirror session_id into
+    // snapshot.threadId while durable usage rows store NULL thread_id.
+    // Drop only that synthetic mirror; preserve any other nonempty ID.
+    let thread_id = requested_thread.and_then(|tid| {
+        if response_session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id == tid)
+        {
+            return None;
+        }
+        Some(tid)
+    });
+    // Prefer a single durable scope for the SQL filter. When the SPA sends
+    // both snapshot IDs, AND-ing them rejects TUI projections that historically
+    // mirrored the thread UUID into sessionId while usage rows store
+    // SessionState.id. Thread id is the stable join key once present; session
+    // id remains the response echo / session-only fallback.
+    let filter = UsageQueryFilter {
+        session_id: if thread_id.is_some() {
+            None
+        } else {
+            response_session_id.clone()
+        },
+        thread_id: thread_id.clone(),
+        ..UsageQueryFilter::default()
+    };
+    let cumulative = usage
+        .cumulative(filter.clone())
+        .await
+        .map_err(|error| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "USAGE_UNAVAILABLE".to_string(),
+            message: format!("failed to query runtime usage: {error}"),
+        })?;
+    let turn_delta = match query.turn_id.clone() {
+        Some(turn_id) => Some(usage.current_turn(turn_id.clone(), filter).await.map_err(
+            |error| WebApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "USAGE_UNAVAILABLE".to_string(),
+                message: format!("failed to query runtime turn usage: {error}"),
+            },
+        )?),
+        None => None,
+    };
+    Ok(Json(UsageReadModelResponse {
+        turn_id: query.turn_id,
+        session_id: response_session_id,
+        cumulative,
+        turn_delta,
+        // Do not emit an empty array: that would look like "known zero
+        // sub-agents" while durable enumeration is still unavailable.
+        sub_agents: None,
+        sub_agents_status: "unavailable",
+    }))
+}
+
 async fn code_events_handler(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<WebAppState>,
@@ -552,13 +700,18 @@ const MAX_THREAD_LIST_LIMIT: u64 = 200;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ThreadListItem {
-    id: String,
-    title: Option<String>,
-    archived: bool,
-    current_intent_id: Option<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
+pub struct ThreadListItem {
+    pub id: String,
+    pub title: Option<String>,
+    pub archived: bool,
+    pub current_intent_id: Option<String>,
+    /// Per-thread cwd is not persisted on ThreadProjection yet. Omit rather
+    /// than stamp the server cwd onto repository-shared (linked-worktree)
+    /// threads — that would falsely mark foreign threads as resume-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -627,12 +780,214 @@ async fn code_threads_handler(
             title: p.title,
             archived: p.archived,
             current_intent_id: p.current_intent_id.map(|id| id.to_string()),
+            working_dir: None,
             created_at: p.created_at,
             updated_at: p.updated_at,
         })
         .collect();
 
     Ok(Json(ThreadListResponse { items, next_offset }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsRawQuery {
+    provider: Option<String>,
+    skill: Option<String>,
+}
+
+async fn code_skills_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<SkillsRawQuery>,
+) -> Result<Json<serde_json::Value>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    let provider_filter = match query
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => None,
+        Some(provider) => Some(
+            AgentKind::from_cli_slug(provider).ok_or_else(|| WebApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "INVALID_SKILL_PROVIDER".to_string(),
+                message: format!("unknown skill provider '{provider}'; use an A0-07 agent slug"),
+            })?,
+        ),
+    };
+    let kinds = match provider_filter {
+        Some(kind) => vec![kind],
+        None => vec![AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode],
+    };
+    let mut rows = kinds
+        .into_iter()
+        .flat_map(discover_skills)
+        .filter(|skill| {
+            query
+                .skill
+                .as_deref()
+                .is_none_or(|name| name.trim() == skill.name)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(Json(serde_json::json!({ "items": rows })))
+}
+
+async fn code_skill_activate_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+    Json(body): Json<CodeUiSkillActivateRequest>,
+) -> Result<Json<serde_json::Value>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    let runtime = code_ui_runtime(&state)?;
+    let token = browser_controller_token_from_headers(&headers);
+    let mut audit_kind = CodeUiControllerKind::None;
+    let mut audit_client_id = "unknown".to_string();
+    let result = async {
+        let lease = runtime
+            .ensure_controller_write_access(token.as_deref())
+            .await
+            .map_err(WebApiError::from)?;
+        audit_kind = lease.kind;
+        audit_client_id = lease.client_id.clone();
+        if lease.kind == CodeUiControllerKind::Automation {
+            ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
+        }
+        let provider = body.provider.trim();
+        let name = body.name.trim();
+        let kind = AgentKind::from_cli_slug(provider).ok_or_else(|| WebApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "INVALID_SKILL_PROVIDER".to_string(),
+            message: format!("unknown skill provider '{provider}'; use an A0-07 agent slug"),
+        })?;
+        if !discover_skills(kind).iter().any(|skill| skill.name == name) {
+            return Err(WebApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "SKILL_NOT_DISCOVERABLE".to_string(),
+                message: format!("skill '{name}' is not discoverable for provider '{provider}'"),
+            });
+        }
+        // Discoverability is confirmed, but there is still no in-process
+        // activation path that persists a selection or notifies the live
+        // provider. Fail closed instead of returning accepted:true with no
+        // observable effect — providers emit SkillEvent when they consume a
+        // skill on a later turn.
+        Err(WebApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "SKILL_ACTIVATION_UNSUPPORTED".to_string(),
+            message: format!(
+                "skill '{name}' is discoverable for '{provider}', but in-process skill activation is not available yet; the provider emits SkillEvent when it consumes the skill on a later turn"
+            ),
+        })
+    }
+    .await;
+    append_control_audit(
+        &state,
+        &runtime,
+        "skills.activate",
+        audit_kind,
+        &audit_client_id,
+        control_audit_outcome(&result),
+    )
+    .await;
+    Ok(Json(result?))
+}
+
+async fn code_session_resume_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebAppState>,
+    headers: HeaderMap,
+    Json(body): Json<CodeUiSessionResumeRequest>,
+) -> Result<Json<serde_json::Value>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    let runtime = code_ui_runtime(&state)?;
+    let token = browser_controller_token_from_headers(&headers);
+    let mut audit_kind = CodeUiControllerKind::None;
+    let mut audit_client_id = "unknown".to_string();
+    let result = async {
+        let lease = runtime
+            .ensure_controller_write_access(token.as_deref())
+            .await
+            .map_err(WebApiError::from)?;
+        audit_kind = lease.kind;
+        audit_client_id = lease.client_id.clone();
+        if lease.kind == CodeUiControllerKind::Automation {
+            ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
+        }
+        let live = runtime.snapshot().await;
+        if matches!(
+            live.status,
+            CodeUiSessionStatus::Thinking | CodeUiSessionStatus::ExecutingTool
+        ) {
+            return Err(WebApiError::from(CodeUiApiError::conflict(
+                "SESSION_RESUME_BUSY",
+                "the active Code session is still running; wait for it to settle before selecting another thread",
+            )));
+        }
+        if live.status == CodeUiSessionStatus::IndeterminateSideEffect {
+            return Err(WebApiError::from(CodeUiApiError::reconciliation_required(
+                "the active Code session has an indeterminate side effect; reconcile it before resuming another thread",
+            )));
+        }
+        // Prove the target thread is loadable under this cwd, but do not swap
+        // only the browser projection: the live AgentRuntime still owns the
+        // original history/worker session. In-process runtime swap is not
+        // available yet — fail closed with a restart hint.
+        let snapshot = resume_code_ui_session_to_thread(
+            state.working_dir.as_path(),
+            &body.thread_id,
+            live.provider.clone(),
+            live.capabilities.clone(),
+        )
+        .map_err(|error| match error {
+            ResumeCodeUiSessionError::NotFound { .. } => WebApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "SESSION_RESUME_NOT_FOUND".to_string(),
+                message: error.to_string(),
+            },
+            ResumeCodeUiSessionError::LoadFailed { .. } => WebApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "SESSION_RESUME_LOAD_FAILED".to_string(),
+                message: error.to_string(),
+            },
+        })?;
+        Err(WebApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "SESSION_RESUME_REQUIRES_RESTART".to_string(),
+            message: format!(
+                "thread '{}' is resumable under '{}' (projected status {}); restart with `libra code --resume {}` from that working directory. In-process AgentRuntime swap is not yet available",
+                body.thread_id,
+                snapshot.working_dir,
+                match snapshot.status {
+                    CodeUiSessionStatus::Idle => "idle",
+                    CodeUiSessionStatus::Thinking => "thinking",
+                    CodeUiSessionStatus::ExecutingTool => "executing_tool",
+                    CodeUiSessionStatus::AwaitingInteraction => "awaiting_interaction",
+                    CodeUiSessionStatus::Completed => "completed",
+                    CodeUiSessionStatus::Error => "error",
+                    CodeUiSessionStatus::IndeterminateSideEffect => "indeterminate_side_effect",
+                },
+                body.thread_id
+            ),
+        })
+    }
+    .await;
+    append_control_audit(
+        &state,
+        &runtime,
+        "session.resume",
+        audit_kind,
+        &audit_client_id,
+        control_audit_outcome(&result),
+    )
+    .await;
+    Ok(Json(result?))
 }
 
 async fn code_controller_attach_handler(
@@ -2019,5 +2374,366 @@ mod tests {
             "cap must be char-based, not byte-based; a byte cap \
              would have yielded ~80 bytes",
         );
+    }
+
+    /// W3-01: skill activate / session resume live on the write router
+    /// (256 KiB body cap) and must reject oversized bodies before the
+    /// handler runs.
+    #[tokio::test]
+    async fn code_skill_activate_and_resume_routes_enforce_write_body_limit() {
+        let app = code_write_router().with_state(WebAppState {
+            working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+            code_ui: None,
+            automation_control_token: None,
+            audit_sink: Arc::new(TracingAuditSink),
+            control_trace_id: Uuid::new_v4(),
+        });
+        let oversized = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
+        for uri in ["/skills/activate", "/session/resume"] {
+            let body = format!(
+                r#"{{"threadId":"{oversized}","provider":"claude-code","name":"/review"}}"#
+            );
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len().to_string())
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{uri} must honor the write body limit"
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["error"]["code"], "PAYLOAD_TOO_LARGE");
+        }
+    }
+
+    /// W3-01: automation leases on resume / skill-activate require the
+    /// secondary control token, matching other write handlers.
+    #[tokio::test]
+    async fn code_session_resume_requires_automation_control_token() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities {
+                provider_session_resume: true,
+                ..CodeUiCapabilities::default()
+            },
+        ));
+        let runtime = CodeUiRuntimeHandle::build_with_control(
+            ReadOnlyCodeUiAdapter::new(
+                session,
+                CodeUiCapabilities {
+                    provider_session_resume: true,
+                    ..CodeUiCapabilities::default()
+                },
+            ),
+            false,
+            true,
+            CodeUiInitialController::Unclaimed,
+        )
+        .await;
+        let attach = runtime
+            .attach_controller(CodeUiControllerKind::Automation, "automation-a")
+            .await
+            .expect("automation controller should attach");
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime),
+                automation_control_token: Some(Arc::from("control-token-secret")),
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let missing = Request::builder()
+            .method(Method::POST)
+            .uri("/session/resume")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Code-Controller-Token", attach.controller_token.clone())
+            .body(Body::from(r#"{"threadId":"thread-missing"}"#))
+            .unwrap();
+        let response = app.clone().oneshot(missing).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "MISSING_CONTROL_TOKEN");
+
+        let with_token = Request::builder()
+            .method(Method::POST)
+            .uri("/session/resume")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Code-Controller-Token", attach.controller_token)
+            .header("X-Libra-Control-Token", "control-token-secret")
+            .body(Body::from(r#"{"threadId":"thread-missing"}"#))
+            .unwrap();
+        let response = app.oneshot(with_token).await.unwrap();
+        // After the control token check, resume either cannot find the
+        // thread or fail-closes on in-process swap — never a silent 200.
+        assert_ne!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let code = value["error"]["code"].as_str().unwrap_or_default();
+        assert!(
+            code == "SESSION_RESUME_NOT_FOUND" || code == "SESSION_RESUME_REQUIRES_RESTART",
+            "expected resume failure after auth, got {value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_skills_rejects_unknown_provider_query() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: None,
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/skills?provider=not-an-agent")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "INVALID_SKILL_PROVIDER");
+    }
+
+    #[tokio::test]
+    async fn code_skill_activate_rejects_discoverable_skill_without_activation_effect() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        let runtime = CodeUiRuntimeHandle::build(
+            ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
+            true,
+            CodeUiInitialController::Unclaimed,
+        )
+        .await;
+        let attach = runtime
+            .attach_browser_controller("browser-skill")
+            .await
+            .expect("browser controller should attach");
+        let audit_sink = Arc::new(InMemoryAuditSink::default());
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                audit_sink: audit_sink.clone(),
+                control_trace_id: Uuid::new_v4(),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/skills/activate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Code-Controller-Token", attach.controller_token)
+            .body(Body::from(r#"{"provider":"claude-code","name":"/review"}"#))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "SKILL_ACTIVATION_UNSUPPORTED");
+
+        let events = audit_sink.events().await;
+        assert!(
+            events.iter().any(|event| event.action == "skills.activate"),
+            "leased skill activate must append audit"
+        );
+    }
+
+    #[test]
+    fn usage_thread_filter_ignores_synthetic_session_mirrored_ids() {
+        let session_id = Some("session-not-a-uuid".to_string());
+        let mirrored = Some("session-not-a-uuid".to_string());
+        let canonical = Some("canonical-thread-from-session-meta".to_string());
+
+        let ignore_mirrored = mirrored.clone().and_then(|tid| {
+            let trimmed = tid.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if session_id
+                .as_deref()
+                .is_some_and(|session| session == trimmed)
+            {
+                return None;
+            }
+            Some(trimmed.to_string())
+        });
+        assert_eq!(ignore_mirrored, None);
+
+        let keep_canonical = canonical.clone().and_then(|tid| {
+            let trimmed = tid.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if session_id
+                .as_deref()
+                .is_some_and(|session| session == trimmed)
+            {
+                return None;
+            }
+            Some(trimmed.to_string())
+        });
+        assert_eq!(
+            keep_canonical.as_deref(),
+            Some("canonical-thread-from-session-meta")
+        );
+    }
+
+    #[tokio::test]
+    async fn code_usage_returns_persisted_totals_for_session_filter() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        use crate::{
+            internal::{
+                ai::{
+                    completion::CompletionUsageSummary,
+                    usage::{UsageContext, UsageRecorder},
+                },
+                db::establish_connection,
+            },
+            utils::test::setup_with_new_libra_in,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        setup_with_new_libra_in(tmp.path()).await;
+        let storage_root =
+            resolve_storage_root(tmp.path()).expect("initialized temp repo has a storage root");
+        let db_path = storage_root.join("libra.db");
+        let db = establish_connection(db_path.to_str().expect("utf-8 db path"))
+            .await
+            .expect("open libra.db");
+        let recorder = UsageRecorder::new(db);
+        recorder
+            .record_summary(
+                &UsageContext {
+                    repo_id: Some("repo-usage-route".to_string()),
+                    session_id: Some("session-usage-route".to_string()),
+                    thread_id: Some("thread-usage-route".to_string()),
+                    agent_run_id: None,
+                    run_id: Some("run-usage-route".to_string()),
+                    turn_id: Some("turn-usage-route".to_string()),
+                    event_id: None,
+                    provider: "test".to_string(),
+                    model: "test-model".to_string(),
+                    request_kind: "completion".to_string(),
+                    intent: None,
+                    agent_name: None,
+                },
+                &CompletionUsageSummary {
+                    input_tokens: 11,
+                    output_tokens: 7,
+                    cached_tokens: None,
+                    reasoning_tokens: None,
+                    total_tokens: Some(18),
+                    cost_usd: Some(0.02),
+                },
+                Some(100),
+            )
+            .await
+            .expect("persist usage row");
+
+        let session = CodeUiSession::new(initial_snapshot(
+            tmp.path().to_string_lossy(),
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        session
+            .replace_snapshot(code_ui::CodeUiEventType::SessionUpdated, {
+                let mut snapshot = session.snapshot().await;
+                snapshot.session_id = "session-usage-route".to_string();
+                snapshot.thread_id = Some("thread-usage-route".to_string());
+                snapshot
+            })
+            .await;
+        let runtime = CodeUiRuntimeHandle::build(
+            ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
+            true,
+            CodeUiInitialController::Unclaimed,
+        )
+        .await;
+
+        let build_app = |runtime: Arc<CodeUiRuntimeHandle>| {
+            code_router()
+                .with_state(WebAppState {
+                    working_dir: Arc::new(tmp.path().to_path_buf()),
+                    code_ui: Some(runtime),
+                    automation_control_token: None,
+                    audit_sink: Arc::new(TracingAuditSink),
+                    control_trace_id: Uuid::new_v4(),
+                })
+                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+        };
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/usage?sessionId=session-usage-route&threadId=thread-usage-route")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_app(runtime.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["sessionId"], "session-usage-route");
+        assert_eq!(value["cumulative"]["requestCount"], 1);
+        assert_eq!(value["cumulative"]["totalTokens"], 18);
+        assert!(value.get("subAgents").is_none());
+        assert_eq!(value["subAgentsStatus"], "unavailable");
+
+        // Prefer thread scope when both IDs are present: a stale/projected
+        // sessionId must not zero out totals that match the durable thread.
+        let mismatched = Request::builder()
+            .method(Method::GET)
+            .uri("/usage?sessionId=not-the-durable-session&threadId=thread-usage-route")
+            .body(Body::empty())
+            .unwrap();
+        let mismatched_response = build_app(runtime).oneshot(mismatched).await.unwrap();
+        assert_eq!(mismatched_response.status(), StatusCode::OK);
+        let mismatched_body = to_bytes(mismatched_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mismatched_value: serde_json::Value = serde_json::from_slice(&mismatched_body).unwrap();
+        assert_eq!(mismatched_value["sessionId"], "not-the-durable-session");
+        assert_eq!(mismatched_value["cumulative"]["requestCount"], 1);
+        assert_eq!(mismatched_value["cumulative"]["totalTokens"], 18);
     }
 }

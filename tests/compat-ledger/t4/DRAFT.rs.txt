@@ -71,6 +71,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_compact_summary_is_a_no_op() {
     let out = run_libra_command(&["diff", "--no-patch"], repo.path());
     assert_cli_success(&out, "diff --no-patch");
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
+    t4_actual(
+        "t4000-diff-format::no-patch-in-git-diff-no-patch-compact-summary-is-a-no-op",
+        &out,
+    );
 }
 
 /// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
@@ -85,6 +89,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_numstat_is_a_no_op() {
     let out = run_libra_command(&["diff", "--no-patch"], repo.path());
     assert_cli_success(&out, "diff --no-patch");
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
+    t4_actual(
+        "t4000-diff-format::no-patch-in-git-diff-no-patch-numstat-is-a-no-op",
+        &out,
+    );
 }
 
 /// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
@@ -99,6 +107,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_raw_is_a_no_op() {
     let out = run_libra_command(&["diff", "--no-patch"], repo.path());
     assert_cli_success(&out, "diff --no-patch");
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
+    t4_actual(
+        "t4000-diff-format::no-patch-in-git-diff-no-patch-raw-is-a-no-op",
+        &out,
+    );
 }
 
 /// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
@@ -113,6 +125,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_shortstat_is_a_no_op() {
     let out = run_libra_command(&["diff", "--no-patch"], repo.path());
     assert_cli_success(&out, "diff --no-patch");
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
+    t4_actual(
+        "t4000-diff-format::no-patch-in-git-diff-no-patch-shortstat-is-a-no-op",
+        &out,
+    );
 }
 
 /// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
@@ -127,6 +143,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_stat_is_a_no_op() {
     let out = run_libra_command(&["diff", "--no-patch"], repo.path());
     assert_cli_success(&out, "diff --no-patch");
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
+    t4_actual(
+        "t4000-diff-format::no-patch-in-git-diff-no-patch-stat-is-a-no-op",
+        &out,
+    );
 }
 
 /// 功能: 在有改动的工作区上运行 --no-patch，断言命令成功但不打印任何补丁正文。
@@ -141,6 +161,10 @@ fn t4_port_t4000_no_patch_in_git_diff_no_patch_summary_is_a_no_op() {
     let out = run_libra_command(&["diff", "--no-patch"], repo.path());
     assert_cli_success(&out, "diff --no-patch");
     assert!(t4_stdout(&out).is_empty(), "no patch body is printed");
+    t4_actual(
+        "t4000-diff-format::no-patch-in-git-diff-no-patch-summary-is-a-no-op",
+        &out,
+    );
 }
 
 /// 功能: 用 update-index --add 直接把路径写进索引，断言 ls-files 能看到它。
@@ -160,6 +184,10 @@ fn t4_port_t4000_update_index_add_two_files_with_and_without_x() {
         t4_stdout(&listed).contains("indexed.txt"),
         "the path is in the index"
     );
+    t4_actual(
+        "t4000-diff-format::update-index-add-two-files-with-and-without-x",
+        &listed,
+    );
 }
 
 /// 功能: 改动一个被跟踪路径后运行 status，断言 porcelain 输出报告了它。
@@ -175,6 +203,10 @@ fn t4_port_t4001_favour_same_basenames_even_with_minor_differences() {
     assert_cli_success(&out, "status --porcelain=v1");
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the modified path is listed: {text}");
+    t4_actual(
+        "t4001-diff-rename::favour-same-basenames-even-with-minor-differences",
+        &out,
+    );
 }
 
 /// 功能: 改动一个被跟踪路径后运行 status，断言 porcelain 输出报告了它。
@@ -190,6 +222,10 @@ fn t4_port_t4001_favour_same_basenames_over_different_ones() {
     assert_cli_success(&out, "status --porcelain=v1");
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the modified path is listed: {text}");
+    t4_actual(
+        "t4001-diff-rename::favour-same-basenames-over-different-ones",
+        &out,
+    );
 }
 
 /// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
@@ -215,6 +251,10 @@ fn t4_port_t4001_rename_pretty_print_common_prefix_and_suffix_overlap() {
     assert!(
         text.contains("1 file changed"),
         "a rename is one changed path, not two: {text}"
+    );
+    t4_actual(
+        "t4001-diff-rename::rename-pretty-print-common-prefix-and-suffix-overlap",
+        &out,
     );
 }
 
@@ -242,6 +282,10 @@ fn t4_port_t4001_rename_pretty_print_with_common_prefix() {
         text.contains("1 file changed"),
         "a rename is one changed path, not two: {text}"
     );
+    t4_actual(
+        "t4001-diff-rename::rename-pretty-print-with-common-prefix",
+        &out,
+    );
 }
 
 /// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
@@ -267,6 +311,10 @@ fn t4_port_t4001_rename_pretty_print_with_common_prefix_and_suffix() {
     assert!(
         text.contains("1 file changed"),
         "a rename is one changed path, not two: {text}"
+    );
+    t4_actual(
+        "t4001-diff-rename::rename-pretty-print-with-common-prefix-and-suffix",
+        &out,
     );
 }
 
@@ -294,6 +342,10 @@ fn t4_port_t4001_rename_pretty_print_with_common_suffix() {
         text.contains("1 file changed"),
         "a rename is one changed path, not two: {text}"
     );
+    t4_actual(
+        "t4001-diff-rename::rename-pretty-print-with-common-suffix",
+        &out,
+    );
 }
 
 /// 功能: 先用 mv 制造重命名，再以 -M --stat 渲染，断言统计行把新旧路径写成一对且只记一个改动文件。
@@ -319,6 +371,10 @@ fn t4_port_t4001_rename_pretty_print_with_nothing_in_common() {
     assert!(
         text.contains("1 file changed"),
         "a rename is one changed path, not two: {text}"
+    );
+    t4_actual(
+        "t4001-diff-rename::rename-pretty-print-with-nothing-in-common",
+        &out,
     );
 }
 
@@ -361,6 +417,7 @@ fn t4_port_t4001_renamed_and_edited_the_file() {
         "--remove took the vanished path back out: {}",
         t4_stdout(&after)
     );
+    t4_actual("t4001-diff-rename::renamed-and-edited-the-file", &after);
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -378,6 +435,7 @@ fn t4_port_t4001_setup() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual("t4001-diff-rename::setup", &out);
 }
 
 /// 功能: 暂存改动后以 --cached 比较索引与 HEAD，并断言工作区已无剩余差异，证明是 --cached 看到了它。
@@ -405,6 +463,7 @@ fn t4_port_t4001_test_diff_renames_unset() {
         t4_stdout(&worktree).is_empty(),
         "nothing is left unstaged, so --cached is what showed the change"
     );
+    t4_actual("t4001-diff-rename::test-diff-renames-unset", &worktree);
 }
 
 /// 功能: 改动一个被跟踪路径后运行 status，断言 porcelain 输出报告了它。
@@ -420,6 +479,10 @@ fn t4_port_t4001_two_files_with_same_basename_and_same_content() {
     assert_cli_success(&out, "status --porcelain=v1");
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the modified path is listed: {text}");
+    t4_actual(
+        "t4001-diff-rename::two-files-with-same-basename-and-same-content",
+        &out,
+    );
 }
 
 /// 功能: 用 update-index --add 直接把路径写进索引，断言 ls-files 能看到它。
@@ -439,6 +502,7 @@ fn t4_port_t4001_update_index_add_a_file() {
         t4_stdout(&listed).contains("indexed.txt"),
         "the path is in the index"
     );
+    t4_actual("t4001-diff-rename::update-index-add-a-file", &listed);
 }
 
 /// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
@@ -454,6 +518,7 @@ fn t4_port_t4001_write_that_tree() {
     let id = t4_stdout(&out);
     assert_eq!(id.len(), 40, "an object id: {id}");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    t4_actual("t4001-diff-rename::write-that-tree", &out);
 }
 
 /// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
@@ -469,6 +534,7 @@ fn t4_port_t4003_prepare_reference_tree() {
     let id = t4_stdout(&out);
     assert_eq!(id.len(), 40, "an object id: {id}");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    t4_actual("t4003-diff-rename-1::prepare-reference-tree", &out);
 }
 
 /// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
@@ -484,6 +550,7 @@ fn t4_port_t4004_prepare_reference_tree() {
     let id = t4_stdout(&out);
     assert_eq!(id.len(), 40, "an object id: {id}");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    t4_actual("t4004-diff-rename-symlink::prepare-reference-tree", &out);
 }
 
 /// 功能: 一次调用同时给出 --add 与 --remove：先断言新路径进入索引，删除该文件后再断言它被移出索引。
@@ -525,6 +592,7 @@ fn t4_port_t4004_prepare_work_tree() {
         "--remove took the vanished path back out: {}",
         t4_stdout(&after)
     );
+    t4_actual("t4004-diff-rename-symlink::prepare-work-tree", &after);
 }
 
 /// 功能: 对同一内容两次求 id，断言结果一致，证明它是内容的纯函数。
@@ -546,6 +614,7 @@ fn t4_port_t4005_setup_reference_tree() {
         "the id is deterministic"
     );
     assert_eq!(t4_stdout(&first).len(), 40);
+    t4_actual("t4005-diff-rename-2::setup-reference-tree", &second);
 }
 
 /// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
@@ -572,6 +641,7 @@ fn t4_port_t4006_prepare_binary_file() {
         t4_stdout(&log).contains("recorded subject"),
         "the message is recorded"
     );
+    t4_actual("t4006-diff-mode::prepare-binary-file", &log);
 }
 
 /// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
@@ -587,6 +657,7 @@ fn t4_port_t4006_setup() {
     let id = t4_stdout(&out);
     assert_eq!(id.len(), 40, "an object id: {id}");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    t4_actual("t4006-diff-mode::setup", &out);
 }
 
 /// 功能: 运行 --shortstat，断言输出收敛为单行汇总。
@@ -604,6 +675,7 @@ fn t4_port_t4006_shortstat_output_after_binary_chmod() {
     assert_eq!(text.lines().count(), 1, "one line: {text}");
     assert!(text.contains("1 file changed"), "{text}");
     assert!(text.contains("1 insertion"), "{text}");
+    t4_actual("t4006-diff-mode::shortstat-output-after-binary-chmod", &out);
 }
 
 /// 功能: 运行 --shortstat，断言输出收敛为单行汇总。
@@ -621,6 +693,7 @@ fn t4_port_t4006_shortstat_output_after_text_chmod() {
     assert_eq!(text.lines().count(), 1, "one line: {text}");
     assert!(text.contains("1 file changed"), "{text}");
     assert!(text.contains("1 insertion"), "{text}");
+    t4_actual("t4006-diff-mode::shortstat-output-after-text-chmod", &out);
 }
 
 /// 功能: 运行 --stat，断言每个路径带变更条、末尾给出总计。
@@ -637,6 +710,7 @@ fn t4_port_t4006_stat_output_after_binary_chmod() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the stat names the path: {text}");
     assert!(text.contains("1 file changed"), "{text}");
+    t4_actual("t4006-diff-mode::stat-output-after-binary-chmod", &out);
 }
 
 /// 功能: 运行 --stat，断言每个路径带变更条、末尾给出总计。
@@ -653,6 +727,7 @@ fn t4_port_t4006_stat_output_after_text_chmod() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the stat names the path: {text}");
     assert!(text.contains("1 file changed"), "{text}");
+    t4_actual("t4006-diff-mode::stat-output-after-text-chmod", &out);
 }
 
 /// 功能: 解析 HEAD，断言得到一个具体的对象 id。
@@ -668,6 +743,7 @@ fn t4_port_t4007_prepare_reference_tree() {
     let id = t4_stdout(&out);
     assert_eq!(id.len(), 40, "an object id: {id}");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    t4_actual("t4007-rename-3::prepare-reference-tree", &out);
 }
 
 /// 功能: 一次调用同时给出 --add 与 --remove：先断言新路径进入索引，删除该文件后再断言它被移出索引。
@@ -709,6 +785,7 @@ fn t4_port_t4007_prepare_work_tree() {
         "--remove took the vanished path back out: {}",
         t4_stdout(&after)
     );
+    t4_actual("t4007-rename-3::prepare-work-tree", &after);
 }
 
 /// 功能: 用 update-index --remove 把路径移出索引，断言 ls-files 不再列出它。
@@ -728,6 +805,7 @@ fn t4_port_t4007_tweak_index() {
         !t4_stdout(&listed).contains(&name),
         "the path left the index"
     );
+    t4_actual("t4007-rename-3::tweak-index", &listed);
 }
 
 /// 功能: 把索引写成树对象，断言输出是一个可解析的对象 id。
@@ -743,6 +821,7 @@ fn t4_port_t4009_prepare_reference_tree() {
     let id = t4_stdout(&out);
     assert_eq!(id.len(), 40, "an object id: {id}");
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    t4_actual("t4009-diff-rename-4::prepare-reference-tree", &out);
 }
 
 /// 功能: 运行 --name-only，断言输出只剩改动路径而没有补丁正文。
@@ -757,6 +836,10 @@ fn t4_port_t4010_diff_cache_ignores_trailing_slash_on_submodule_path() {
     let out = run_libra_command(&["diff", "--name-only"], repo.path());
     assert_cli_success(&out, "diff --name-only");
     assert_eq!(t4_stdout(&out), name);
+    t4_actual(
+        "t4010-diff-pathspec::diff-cache-ignores-trailing-slash-on-submodule-path",
+        &out,
+    );
 }
 
 /// 功能: 运行 --name-only，断言输出只剩改动路径而没有补丁正文。
@@ -771,6 +854,10 @@ fn t4_port_t4010_diff_multiple_wildcard_pathspecs() {
     let out = run_libra_command(&["diff", "--name-only"], repo.path());
     assert_cli_success(&out, "diff --name-only");
     assert_eq!(t4_stdout(&out), name);
+    t4_actual(
+        "t4010-diff-pathspec::diff-multiple-wildcard-pathspecs",
+        &out,
+    );
 }
 
 /// 功能: 运行 --name-only，断言输出只剩改动路径而没有补丁正文。
@@ -785,6 +872,10 @@ fn t4_port_t4010_diff_tree_ignores_trailing_slash_on_submodule_path() {
     let out = run_libra_command(&["diff", "--name-only"], repo.path());
     assert_cli_success(&out, "diff --name-only");
     assert_eq!(t4_stdout(&out), name);
+    t4_actual(
+        "t4010-diff-pathspec::diff-tree-ignores-trailing-slash-on-submodule-path",
+        &out,
+    );
 }
 
 /// 功能: 对同一内容两次求 id，断言结果一致，证明它是内容的纯函数。
@@ -806,6 +897,7 @@ fn t4_port_t4010_setup() {
         "the id is deterministic"
     );
     assert_eq!(t4_stdout(&first).len(), 40);
+    t4_actual("t4010-diff-pathspec::setup", &second);
 }
 
 /// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
@@ -832,6 +924,7 @@ fn t4_port_t4010_setup_submodules() {
         t4_stdout(&log).contains("recorded subject"),
         "the message is recorded"
     );
+    t4_actual("t4010-diff-pathspec::setup-submodules", &log);
 }
 
 /// 功能: 带 --attach 生成邮件，断言产出的邮件里带上了该标记。
@@ -863,6 +956,10 @@ fn t4_port_t4015_format_patch_attach_produces_mime_attachment() {
     assert!(
         text.contains("Content-Type:"),
         "the mail carries Content-Type: : {text}"
+    );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-attach-produces-mime-attachment",
+        &out,
     );
 }
 
@@ -902,6 +999,10 @@ fn t4_port_t4015_format_patch_base_commit_adds_base_commit_info() {
         text.contains("base-commit:"),
         "the mail carries base-commit: : {text}"
     );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-base-commit-adds-base-commit-info",
+        &out,
+    );
 }
 
 /// 功能: 带 --base 生成邮件，断言产出的邮件里带上了该标记。
@@ -940,6 +1041,10 @@ fn t4_port_t4015_format_patch_base_with_multi_patch_puts_base_commit_on_last_pat
         text.contains("base-commit:"),
         "the mail carries base-commit: : {text}"
     );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-base-with-multi-patch-puts-base-commit-on-last-patch-only",
+        &out,
+    );
 }
 
 /// 功能: 带 --cc 生成邮件，断言邮件头里出现了抄送标记。
@@ -975,6 +1080,10 @@ fn t4_port_t4015_format_patch_cc_adds_cc_header() {
     assert_cli_success(&out, "format-patch --cc");
     let text = t4_stdout(&out);
     assert!(text.contains("Cc:"), "the mail carries Cc: : {text}");
+    t4_actual(
+        "t4015-format-patch-options::format-patch-cc-adds-cc-header",
+        &out,
+    );
 }
 
 /// 功能: 同时给出 --cc 与 --to，断言两个收件头都出现在同一封邮件里。
@@ -1021,6 +1130,10 @@ fn t4_port_t4015_format_patch_cc_and_to_can_be_combined() {
         text.contains("To: maintainer@example.com"),
         "the mail carries the To: recipient: {text}"
     );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-cc-and-to-can-be-combined",
+        &out,
+    );
 }
 
 /// 功能: 带 --in-reply-to 生成邮件，断言产出的邮件里带上了该标记。
@@ -1059,6 +1172,10 @@ fn t4_port_t4015_format_patch_in_reply_to_adds_in_reply_to_and_references() {
         text.contains("In-Reply-To:"),
         "the mail carries In-Reply-To: : {text}"
     );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-in-reply-to-adds-in-reply-to-and-references",
+        &out,
+    );
 }
 
 /// 功能: 带 --inline 生成邮件，断言产出的邮件里带上了该标记。
@@ -1090,6 +1207,10 @@ fn t4_port_t4015_format_patch_inline_produces_mime_inline() {
     assert!(
         text.contains("Content-Type:"),
         "the mail carries Content-Type: : {text}"
+    );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-inline-produces-mime-inline",
+        &out,
     );
 }
 
@@ -1123,6 +1244,10 @@ fn t4_port_t4015_format_patch_s_adds_signed_off_by() {
         text.contains("Signed-off-by:"),
         "the mail carries Signed-off-by: : {text}"
     );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-s-adds-signed-off-by",
+        &out,
+    );
 }
 
 /// 功能: 带 --signoff 生成邮件，断言产出的邮件里带上了签名行。
@@ -1154,6 +1279,10 @@ fn t4_port_t4015_format_patch_signoff_adds_signed_off_by() {
     assert!(
         text.contains("Signed-off-by:"),
         "the mail carries Signed-off-by: : {text}"
+    );
+    t4_actual(
+        "t4015-format-patch-options::format-patch-signoff-adds-signed-off-by",
+        &out,
     );
 }
 
@@ -1190,6 +1319,10 @@ fn t4_port_t4015_format_patch_to_adds_to_header() {
     assert_cli_success(&out, "format-patch --to");
     let text = t4_stdout(&out);
     assert!(text.contains("To:"), "the mail carries To: : {text}");
+    t4_actual(
+        "t4015-format-patch-options::format-patch-to-adds-to-header",
+        &out,
+    );
 }
 
 /// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
@@ -1216,6 +1349,7 @@ fn t4_port_t4015_setup() {
         t4_stdout(&log).contains("recorded subject"),
         "the message is recorded"
     );
+    t4_actual("t4015-format-patch-options::setup", &log);
 }
 
 /// 功能: 重命名后以 --numstat -M 输出，断言得到一条增删均为 0、路径列为新旧成对的记录。
@@ -1238,6 +1372,7 @@ fn t4_port_t4016_git_diff_numstat_m_head() {
         format!("0\t0\t{name} => moved.txt"),
         "one rename record with zero added and zero deleted"
     );
+    t4_actual("t4016-diff-quote::git-diff-numstat-m-head", &out);
 }
 
 /// 功能: 重命名后以 --stat -M 输出，断言统计行把新旧路径写成一对。
@@ -1263,6 +1398,7 @@ fn t4_port_t4016_git_diff_stat_m_head() {
         text.contains("1 file changed"),
         "the rename counts as one changed path: {text}"
     );
+    t4_actual("t4016-diff-quote::git-diff-stat-m-head", &out);
 }
 
 /// 功能: 重命名后以 --summary -M 输出，断言摘要显式写出 rename 与相似度。
@@ -1284,6 +1420,7 @@ fn t4_port_t4016_git_diff_summary_m_head() {
         text.contains(&format!("rename {name} => moved.txt")),
         "the summary names the rename: {text}"
     );
+    t4_actual("t4016-diff-quote::git-diff-summary-m-head", &out);
 }
 
 /// 功能: 用 mv 重命名一个被跟踪路径，断言重命名的两端都已进入索引。
@@ -1294,15 +1431,14 @@ fn t4_port_t4016_git_diff_summary_m_head() {
 fn t4_port_t4016_setup() {
     // `mv` renames a tracked path and stages both halves of the rename.
     let (repo, name) = t4_repo("t053");
-    assert_cli_success(
-        &run_libra_command(&["mv", &name, "renamed.txt"], repo.path()),
-        "mv",
-    );
+    let out = run_libra_command(&["mv", &name, "renamed.txt"], repo.path());
+    assert_cli_success(&out, "mv");
     assert!(
         repo.path().join("renamed.txt").is_file(),
         "the new path exists"
     );
     assert!(!repo.path().join(&name).exists(), "the old path is gone");
+    t4_actual("t4016-diff-quote::setup", &out);
 }
 
 /// 功能: 用 mv 重命名一个被跟踪路径，断言重命名的两端都已进入索引。
@@ -1313,15 +1449,14 @@ fn t4_port_t4016_setup() {
 fn t4_port_t4016_setup_expected_files() {
     // `mv` renames a tracked path and stages both halves of the rename.
     let (repo, name) = t4_repo("t054");
-    assert_cli_success(
-        &run_libra_command(&["mv", &name, "renamed.txt"], repo.path()),
-        "mv",
-    );
+    let out = run_libra_command(&["mv", &name, "renamed.txt"], repo.path());
+    assert_cli_success(&out, "mv");
     assert!(
         repo.path().join("renamed.txt").is_file(),
         "the new path exists"
     );
     assert!(!repo.path().join(&name).exists(), "the old path is gone");
+    t4_actual("t4016-diff-quote::setup-expected-files", &out);
 }
 
 /// 功能: 用 add 把工作区路径移入索引，断言它随后出现在索引里。
@@ -1343,6 +1478,10 @@ fn t4_port_t4017_check_detects_leftover_conflict_markers() {
         t4_stdout(&out).contains("staged.txt"),
         "status reports the staged path"
     );
+    t4_actual(
+        "t4017-diff-retval::check-detects-leftover-conflict-markers",
+        &out,
+    );
 }
 
 /// 功能: 在无差异的仓库上运行 --check --exit-code，断言退出码为 0，作为另外两个取值的基线。
@@ -1360,6 +1499,10 @@ fn t4_port_t4017_check_exit_code_returns_0_for_no_difference() {
         Some(0),
         "no difference and no damage is exit 0: {}",
         t4_stderr(&out)
+    );
+    t4_actual(
+        "t4017-diff-retval::check-exit-code-returns-0-for-no-difference",
+        &out,
     );
 }
 
@@ -1384,6 +1527,10 @@ fn t4_port_t4017_check_exit_code_returns_1_for_a_clean_difference() {
         Some(1),
         "a clean difference is exit 1: {}",
         t4_stderr(&out)
+    );
+    t4_actual(
+        "t4017-diff-retval::check-exit-code-returns-1-for-a-clean-difference",
+        &out,
     );
 }
 
@@ -1411,6 +1558,10 @@ fn t4_port_t4017_check_exit_code_returns_3_for_a_dirty_difference() {
         Some(3),
         "a dirty difference is exit 1 + 2 = 3: {text}"
     );
+    t4_actual(
+        "t4017-diff-retval::check-exit-code-returns-3-for-a-dirty-difference",
+        &out,
+    );
 }
 
 /// 功能: 构造尾随空白并运行 --check，断言它报出该路径与空白问题。
@@ -1432,6 +1583,10 @@ fn t4_port_t4017_check_honors_conflict_marker_length() {
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
     assert!(text.contains("ws.txt"), "the report names the path: {text}");
     assert!(text.contains("trailing whitespace"), "{text}");
+    t4_actual(
+        "t4017-diff-retval::check-honors-conflict-marker-length",
+        &out,
+    );
 }
 
 /// 功能: 构造尾随空白并运行 --check，断言它报出该路径与空白问题。
@@ -1453,6 +1608,10 @@ fn t4_port_t4017_check_should_test_not_just_the_last_line() {
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
     assert!(text.contains("ws.txt"), "the report names the path: {text}");
     assert!(text.contains("trailing whitespace"), "{text}");
+    t4_actual(
+        "t4017-diff-retval::check-should-test-not-just-the-last-line",
+        &out,
+    );
 }
 
 /// 功能: 构造尾随空白并运行 --check，断言它报出该路径与空白问题。
@@ -1474,6 +1633,10 @@ fn t4_port_t4017_check_with_no_pager_returns_2_for_dirty_difference() {
     let text = format!("{}{}", t4_stdout(&out), t4_stderr(&out));
     assert!(text.contains("ws.txt"), "the report names the path: {text}");
     assert!(text.contains("trailing whitespace"), "{text}");
+    t4_actual(
+        "t4017-diff-retval::check-with-no-pager-returns-2-for-dirty-difference",
+        &out,
+    );
 }
 
 /// 功能: 分别在干净与改动状态下运行 --exit-code，断言退出码为 0 与 1。
@@ -1494,6 +1657,10 @@ fn t4_port_t4017_git_diff_exit_code_returns_1_for_changed_binary_file() {
     t4_touch(&repo, &name);
     let dirty = run_libra_command(&["diff", "--exit-code"], repo.path());
     assert_eq!(dirty.status.code(), Some(1), "a difference is exit 1");
+    t4_actual(
+        "t4017-diff-retval::git-diff-exit-code-returns-1-for-changed-binary-file",
+        &dirty,
+    );
 }
 
 /// 功能: mv 暂存重命名后，用 --cached --exit-code 询问索引侧的状态，断言从 0 变为 1。
@@ -1524,6 +1691,10 @@ fn t4_port_t4017_git_diff_exit_code_returns_1_for_renamed_file() {
         "a staged rename is a difference: {}",
         t4_stderr(&dirty)
     );
+    t4_actual(
+        "t4017-diff-retval::git-diff-exit-code-returns-1-for-renamed-file",
+        &dirty,
+    );
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -1541,6 +1712,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual(
+        "t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo",
+        &out,
+    );
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -1558,6 +1733,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_2() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual(
+        "t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-2",
+        &out,
+    );
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -1575,6 +1754,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_3() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual(
+        "t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-3",
+        &out,
+    );
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -1592,6 +1775,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_4() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual(
+        "t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-4",
+        &out,
+    );
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -1609,6 +1796,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_5() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual(
+        "t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-5",
+        &out,
+    );
 }
 
 /// 功能: 比较工作区与索引并输出补丁，断言补丁里出现被改动的路径与新增的那一行。
@@ -1626,6 +1817,10 @@ fn t4_port_t4017_git_diff_opts_returns_1_for_dirty_subrepo_6() {
     let text = t4_stdout(&out);
     assert!(text.contains(&name), "the patch names the path: {text}");
     assert!(text.contains("three"), "the added line appears: {text}");
+    t4_actual(
+        "t4017-diff-retval::git-diff-opts-returns-1-for-dirty-subrepo-6",
+        &out,
+    );
 }
 
 /// 功能: 分别在干净与改动状态下运行 --quiet，断言退出码为 0 与非 0 且不打印内容。
@@ -1650,6 +1845,7 @@ fn t4_port_t4017_git_diff_quiet_head_head() {
         Some(1),
         "a modified path makes it non-zero"
     );
+    t4_actual("t4017-diff-retval::git-diff-quiet-head-head", &dirty);
 }
 
 /// 功能: 分别在干净与改动状态下运行 --quiet，断言退出码为 0 与非 0 且不打印内容。
@@ -1673,6 +1869,10 @@ fn t4_port_t4017_git_diff_quiet_returns_1_for_changed_binary_file() {
         dirty.status.code(),
         Some(1),
         "a modified path makes it non-zero"
+    );
+    t4_actual(
+        "t4017-diff-retval::git-diff-quiet-returns-1-for-changed-binary-file",
+        &dirty,
     );
 }
 
@@ -1707,6 +1907,10 @@ fn t4_port_t4017_git_diff_quiet_returns_1_for_renamed_file() {
         "--quiet prints nothing: {}",
         t4_stdout(&dirty)
     );
+    t4_actual(
+        "t4017-diff-retval::git-diff-quiet-returns-1-for-renamed-file",
+        &dirty,
+    );
 }
 
 /// 功能: 只做空白改动，断言不带 -w 时是差异（退出 1）、带 -w 时不是差异（退出 0）。
@@ -1738,6 +1942,7 @@ fn t4_port_t4017_git_diff_quiet_w_head_head() {
         "with -w the whitespace-only edit is not a difference: {}",
         t4_stderr(&with_w)
     );
+    t4_actual("t4017-diff-retval::git-diff-quiet-w-head-head", &with_w);
 }
 
 /// 功能: 只做空白改动，断言不带 -w 时是差异（退出 1）、带 -w 时不是差异（退出 0）。
@@ -1769,6 +1974,7 @@ fn t4_port_t4017_git_diff_quiet_w_head_head_2() {
         "with -w the whitespace-only edit is not a difference: {}",
         t4_stderr(&with_w)
     );
+    t4_actual("t4017-diff-retval::git-diff-quiet-w-head-head-2", &with_w);
 }
 
 /// 功能: 用 commit -a -m 提交而不预先 add，断言消息被记录且工作区不再有剩余改动。
@@ -1800,6 +2006,7 @@ fn t4_port_t4017_setup() {
         "-a swept the modification into the commit: {}",
         t4_stdout(&left)
     );
+    t4_actual("t4017-diff-retval::setup", &left);
 }
 
 /// 功能: 以 -m 提交并回读日志，断言给定的消息被原样记录。
@@ -1826,6 +2033,7 @@ fn t4_port_t4017_setup_dirty_subrepo() {
         t4_stdout(&log).contains("recorded subject"),
         "the message is recorded"
     );
+    t4_actual("t4017-diff-retval::setup-dirty-subrepo", &log);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1877,6 +2085,26 @@ const T4_PORT_GUARDS: &[&str] = &[
     "t4_port_tests_document_scope_and_boundaries",
     "t4_port_direct_rows_have_tests",
 ];
+
+/// Emit this scenario's observed CLI behaviour as one machine-readable line.
+///
+/// `PROVENANCE.md` records, per migrated scenario, what Libra actually did — and
+/// the gate that checks it will not accept the test harness's own chatter as
+/// evidence. So each scenario prints exactly one marker built from the output it
+/// captured, and the gate binds to that line alone.
+fn t4_actual(scenario_id: &str, output: &std::process::Output) {
+    let joined = format!("{}{}", t4_stdout(output), t4_stderr(output));
+    let cleaned: String = joined
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut summary = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if summary.is_empty() {
+        summary = format!("<no output; exit {:?}>", output.status.code());
+    }
+    let summary: String = summary.chars().take(180).collect();
+    println!("LIBRA_ACTUAL {scenario_id}\t{summary}");
+}
 
 /// The `///` block immediately above each `fn t4_port_*`, keyed by function name.
 fn t4_doc_blocks(text: &str) -> Vec<(String, String)> {

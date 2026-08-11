@@ -107,20 +107,31 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 当 `--host` 不是 loopback 地址时，选择 `loopback` 会被拒绝；该标志也与 `--stdio` 冲突。浏览器服务端 endpoints 在 `code_router()` audit matrix（`src/internal/ai/web/mod.rs`）中标记：
 
-- `GET /api/code/session`、`GET /api/code/events`、`GET /api/code/diagnostics`、`GET /api/code/threads`、`GET /api/code/goal/status` — 仅 loopback observe。
+- `GET /api/code/session`、`GET /api/code/events`、`GET /api/code/diagnostics`、`GET /api/code/threads`、`GET /api/code/usage`、`GET /api/code/skills`、`GET /api/code/goal/status` — 仅 loopback observe。
 - `POST /api/code/controller/attach` — loopback。`kind: "automation"` 请求还要求 `X-Libra-Control-Token`。handler **签发** lease 的 `controllerToken`（不期待调用方发送它）。
 - `POST /api/code/controller/detach`、`POST /api/code/messages`、`POST /api/code/interactions/{id}` — loopback + `X-Code-Controller-Token`；`Automation` leases 还要求 `X-Libra-Control-Token`。
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`。`Automation` leases 也要求 `X-Libra-Control-Token`；这是与 TUI `Esc` cancel 路径的唯一区别。
-- `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`；用户发起的 sub-agent dispatch 需要 automation lease。
+- `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`；用户发起的 sub-agent dispatch 需要 active controller write lease（browser 或 automation）。Automation lease 额外要求 `X-Libra-Control-Token`。
 - `POST /api/code/goal/start`、`POST /api/code/goal/cancel` — loopback + `X-Code-Controller-Token`；goal mutation 需要 active controller lease。
+- `POST /api/code/skills/activate`、`POST /api/code/session/resume` — loopback + `X-Code-Controller-Token`（位于 write router，256 KiB body limit）；两者均需要 controller write lease；Automation lease 另需 `X-Libra-Control-Token`。resume 会拒绝 busy 或 `indeterminate_side_effect` snapshot；在证明目标 thread 可加载后当前 fail-closed 为 `SESSION_RESUME_REQUIRES_RESTART`（尚无 in-process AgentRuntime swap）。skill activate 在 discoverability 校验后 fail-closed 为 `SKILL_ACTIVATION_UNSUPPORTED`，直到存在 provider 消费路径。
 
 浏览器写请求共享与自动化控制相同的 256 KiB body limit 和 audit-sink wiring。浏览器只在内存中持久化 lease；重新加载页面会丢弃 lease，下一次写入会重新 attach。
+
+嵌入式 SPA 的 session-lifecycle 面板通过 `GET /api/code/threads` 列出 threads，经 `POST /api/code/control/cancel` 取消当前 turn（当 `controller.canWrite` 为 false 时 fail-closed），并经 `POST /api/code/session/resume` 以 `{ "threadId": "..." }` 发起 resume。Thread 列表按仓库存储根共享（跨 linked worktree）；列表项在 ThreadProjection 持久化 per-thread cwd 之前省略 `workingDir`。
+
+Usage 面板镜像 W2-12 `RuntimeUsageTotals` read model（累计、本 turn 增量、sub-agent 归因），并保持 `partial`/`unknown`/`error` 可见，而不是伪装成零花费。`GET /api/code/usage` 从 durable totals 读取，失败时返回错误而不伪造零值。当 durable sub-agent 枚举不可用时，响应省略 `subAgents` 并设置 `subAgentsStatus: "unavailable"`，而不是返回空数组。
+
+Execution/repair 面板从 live session snapshot 投影 `plans[]`、`toolCalls[]` 与 `planExecutionRepair`。Continue/Cancel 经 `POST /api/code/interactions/{id}` 发送 `selectedOption`（`continue` / `cancel`）；当投影的 `attempt >= max_attempts` 时，Continue 还会带上提高后的 `maxAttempts`（上限 10），且不在浏览器侧重新分类失败。
+
+SSE resilience 面板展示 reconnecting / resync-required / resynced 状态，同时保留最后一次投影的 session snapshot 与 wire 提供的 cursor seq（浏览器从不自造序号）。显式 snapshot resync 走共享 store 的 `refresh()`，仅在 refresh 成功应用（或被更新的 live 更新 superseded）时报告成功；production v2 backlog/resync 事件在后续 wire 卡（W3-06/W3-08）落地，内置 SPA 切换归 W3-09。
+
+Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。
 
 当服务器绑定到非 loopback host 时，非 loopback 浏览器的 HTML navigation 会收到静态 remote access notice，而不是 SPA。该 notice 零 JavaScript，只包含 bind/remote/version/commit 占位符；asset/API fallback 返回 404，使远程 clients 无法探测 session state。
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。
 
-对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs)，浏览器 submit 会先进入串行的 `AgentRuntimeWorker`，再由其 executor 运行标准 agent tool loop，使浏览器可以驱动真实会话，无需终端。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
+对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走与 TUI 等价的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop。完整 IntentSpec → Phase 1 → repair 对等仍属 GATE-WEB-PLAN。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
 
 ### Code UI Wire Contract
 
@@ -139,12 +150,15 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | `status` | string | `idle`、`thinking`、`executing_tool`、`awaiting_interaction`、`completed`、`error` 或 `indeterminate_side_effect`。最后一种表示变异命令可能已生效；再次尝试前必须先完成 reconciliation。 |
 | `transcript` | array | 带 `id`、`kind`、可选 `title` / `content` / `status`、`streaming`、`metadata`、`createdAt`、`updatedAt` 的条目。 |
 | `plans` / `tasks` / `toolCalls` / `patchsets` | arrays | Workflow、Summary、Diff 和 Terminal panes 使用的 runtime projections。 |
-| `interactions` | array | 待处理/已解决的 UI prompts。`kind` 是 `approval`、`sandbox_approval`、`request_user_input`、`intent_review_choice` 或 `post_plan_choice`。 |
+| `interactions` | array | 待处理/已解决的 UI prompts。`kind` 是 `approval`、`sandbox_approval`、`request_user_input`、`intent_review_choice`、`post_plan_choice` 或 `plan_execution_repair`。待处理的 plan-repair interaction 提供 `continue` 和 `cancel`，通过正常 interaction endpoint 回应。 |
+| `planExecutionRepair` | object, optional | Runtime-owned plan-execution repair 状态。它含 snake_case 的 `state`、有界且经 runtime 脱敏的 failure `evidence`（`output`、`diagnostics`、`attempt`、`max_attempts`），并在 `awaiting_user` 时含 `interaction_id`。`automatic_repair` 表示进行中的重试；`awaiting_user` 只会在配置的重试次数耗尽后出现：Code UI Continue 必须提供更高的 `maxAttempts`（例如当前上限为 2 时发送 `{ "selectedOption": "continue", "maxAttempts": 3 }`），否则返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`；也可以提供手动修订指导。Cancel 为终态。`intent_spec_revision` 和 `manual_action` 需要新的用户定向 workflow。 |
 | `updatedAt` | string | ISO 8601 更新时间戳。 |
 
 `GET /api/code/events` 流式传输 `CodeUiEventEnvelope` 记录，包含 `seq`、`type`、`at` 和 `data`。事件 `type` 是 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
 
-`GET /api/code/threads` 返回 `{ items, nextOffset? }`。每个 item 有 `id`、可选 `title`、`archived`、可选 `currentIntentId`、`createdAt` 和 `updatedAt`。`limit` 默认 50 并 clamp 到 200；格式错误的 `limit` 或 `offset` 返回 `INVALID_QUERY_PARAM`。
+`GET /api/code/threads` 返回 `{ items, nextOffset? }`。每个 item 有 `id`、可选 `title`、`archived`、可选 `currentIntentId`、可选 `workingDir`、`createdAt` 和 `updatedAt`。在 ThreadProjection 持久化 per-thread cwd 之前省略 `workingDir`（不要用 server cwd 冒充 linked-worktree thread）。`limit` 默认 50 并 clamp 到 200；格式错误的 `limit` 或 `offset` 返回 `INVALID_QUERY_PARAM`。
+
+`GET /api/code/skills?provider=<slug>&skill=<name>` 返回 curated A0-07 `{ items: [{ name, provider }] }`。未知 `provider` slug 返回 `INVALID_SKILL_PROVIDER`（与 activate 相同）；省略 `provider` 时列出全部 curated providers。`POST /api/code/skills/activate` 接受 `{ provider, name }`；在 discoverability 校验后当前返回 `SKILL_ACTIVATION_UNSUPPORTED`，直到存在 in-process provider activation 路径。
 
 Code UI API 错误使用 `{ error: { code, message } }`：
 
@@ -157,15 +171,22 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |
 | `INVALID_CONTROLLER_KIND` | 400 | Controller attach 请求了不支持的 kind。 |
 | `CONTROLLER_CONFLICT` | 409 | 另一个 live controller 拥有 lease，或会话正忙。 |
+| `INTERACTION_NOT_ACTIVE` | 409 | respond 目标 interaction 没有活跃的 runtime turn。 |
 | `BROWSER_CONTROL_DISABLED` | 403 | 浏览器写控制已禁用。 |
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | 用非 automation lease 调用了 automation-only 路径。 |
 | `CODE_UI_UNAVAILABLE` | 404 | 没有 active `libra code` session 附加到 Web 服务器。 |
 | `INVALID_QUERY_PARAM` | 400 | 查询解析失败，目前用于 `/threads` 分页。 |
 | `INVALID_COMMAND_ID` | 400 | `commandId` 为空、过长，或包含空白/控制字符。 |
-| `STORAGE_PATH_INVALID` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database 或 fallback internal failure。 |
+| `STORAGE_PATH_INVALID` / `STORAGE_ROOT_UNRESOLVED` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `USAGE_UNAVAILABLE` / `SESSION_RESUME_LOAD_FAILED` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database、usage、resume load 或 fallback internal failure。 |
+| `INVALID_SKILL_PROVIDER` / `SKILL_NOT_DISCOVERABLE` | 400 | skill provider 不是 A0-07 slug，或 skill 对该 provider 不可发现。 |
+| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | skill 可发现，但尚无 in-process activation 路径。 |
+| `SESSION_RESUME_BUSY` | 409 | thinking 或 tool-running session 不能被替换。 |
+| `SESSION_RESUME_NOT_FOUND` | 404 | 当前工作目录下没有匹配 session。 |
+| `SESSION_RESUME_REQUIRES_RESTART` | 422 | 目标 thread 可加载，但尚无 in-process AgentRuntime swap；需用 `libra code --resume <threadId>` 重启。 |
 | `RECONCILIATION_REQUIRED` | 409 | 变异 turn 需要人工 reconciliation；在检查 durable session 数据前不要自动重放。 |
 | `COMMAND_PAYLOAD_CONFLICT` | 409 | 相同 `commandId` 被复用到不同的消息 payload。 |
 | `COMMAND_ALREADY_TERMINAL` | 409 | 相同 `commandId` 已以 failed/cancelled/indeterminate 终态结束；重试需分配新的 `commandId`。 |
+| `PLAN_REPAIR_RETRY_LIMIT_REACHED` | 409 | plan-repair Continue 请求未提高已耗尽的自动重试上限。使用更高的 `maxAttempts` 重试（例如当前上限为 2 时 `{ "selectedOption": "continue", "maxAttempts": 3 }`）、提供手动修订指导，或取消 repair。 |
 | `UNSUPPORTED_OPERATION` | 422 | Runtime 拒绝尚不支持的请求操作。 |
 
 ### Web Search
@@ -259,7 +280,7 @@ libra code --provider codex --plan-mode
 
 ## 人工输出
 
-输出会根据模式通过 TUI、Web 界面或 MCP 协议交付。默认 TUI 模式没有面向行的 stdout。在 generic provider TUI 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。如果已确认计划执行失败，或 orchestrator 在到达最终决策前中止，Libra 会将失败证据反馈给 planner，要求其添加或调整修复步骤，并在自动修复阈值内自动运行修订计划。达到阈值后，TUI 会等待开发者用 `/plan continue` 继续自动修复，或提供显式计划修复指导。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
+输出会根据模式通过 TUI、Web 界面或 MCP 协议交付。默认 TUI 模式没有面向行的 stdout。在 generic provider TUI 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。如果已确认计划执行失败，或 orchestrator 在到达最终决策前中止，Libra 会将失败证据反馈给 planner，要求其添加或调整修复步骤，并在自动修复阈值内自动运行修订计划。达到阈值后，TUI 会等待开发者使用更高的重试限制继续（例如 `/plan continue <higher-limit>`），或提供显式计划修复指导；普通 `continue` 会保留已耗尽的限制并返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`。Cancel 为终态。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
 
 ## Diagnostics
 

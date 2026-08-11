@@ -559,6 +559,8 @@ mod tests {
                 cost_usd: Some(0.0123),
                 cost_estimate_micro_dollars: None,
                 failed_count: 0,
+                unknown_usage_count: 0,
+                unknown_cost_count: 0,
             },
             UsageAggregate {
                 agent_name: None,
@@ -575,6 +577,8 @@ mod tests {
                 cost_usd: None,
                 cost_estimate_micro_dollars: None,
                 failed_count: 0,
+                unknown_usage_count: 0,
+                unknown_cost_count: 0,
             },
         ];
         let out = format_usage_table(&rows);

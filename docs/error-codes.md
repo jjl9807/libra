@@ -266,6 +266,16 @@ patterns continue to match them.
 | --- | --- |
 | `LBR-WARN-001` | Command completed with warnings (`--exit-code-on-warning`) |
 
+## Code UI And Control Wire Codes
+
+The Code UI and `code-control` surfaces use `{ error: { code, message } }`
+wire errors rather than CLI `LBR-*` stable codes. JSON-RPC exposes these HTTP
+failures as `-32000` with `data.status` and `data.code`.
+
+| Wire code | HTTP | Meaning |
+| --- | --- | --- |
+| `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
+
 ## How To Use Codes
 
 ### Shell And CI

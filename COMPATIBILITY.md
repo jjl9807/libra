@@ -358,6 +358,25 @@ recorded, with its governing number, in
 | tag | common-user-flow | config-aware, plumbing-compatible | — | — |
 | write-tree | common-user-flow | plumbing-compatible | — | — |
 
+**t4 wave evidence (plan-20260729 CT-01, first batch).** The rows above for
+`add`, `commit`, `diff`, `format-patch`, `hash-object`, `mv`, `rev-parse`,
+`status`, `update-index` and `write-tree` are now backed by 77 migrated upstream
+scenarios, one ledger row each, under
+[`tests/compat-ledger/t4/`](tests/compat-ledger/t4/). Each row cites the surface
+it proves and the doc anchor that documents it; the tests are
+`command::t4_port_test::*`.
+
+No tier was promoted on the strength of this wave. Migrating one upstream family
+shows that the surfaces those scenarios touch behave like Git — it does not show
+that a whole face is closed, and grading a face `supported` on that basis is
+precisely the overclaim this ledger exists to prevent. The wave's own result
+argues for the current grades rather than against them: running it surfaced two
+real defects in commands already graded `partial` — `diff --check --exit-code`
+discarded the "there is a difference" status bit, and `update-index --add
+--remove` exited 0 having staged nothing. Both are fixed; both were invisible to
+the previous coverage.
+
+
 The graded command set is pinned to the plan's P0/P1 surface; the
 `compat_subface_labels` guard fails if it drifts from that set or from
 `src/cli.rs::Commands`, or if any cell names a label outside the fixed

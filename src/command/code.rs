@@ -1179,6 +1179,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
                 session_store,
                 session_state,
                 browser_control == BrowserControlMode::Loopback,
+                mcp_server.clone(),
             )
             .await?
             {
@@ -2578,7 +2579,6 @@ fn build_code_ui_resume_bootstrap_snapshot(
         },
         None => None,
     };
-    let used_checkpoint = checkpoint.is_some();
     let mut snapshot = match (checkpoint, projection_bundle) {
         (Some(checkpoint), _) => checkpoint,
         (None, Some(bundle)) => snapshot_from_thread_bundle(
@@ -2592,11 +2592,15 @@ fn build_code_ui_resume_bootstrap_snapshot(
         }
     };
 
-    if used_checkpoint || projection_bundle.is_none() {
-        snapshot.session_id = session.id.clone();
-        snapshot.thread_id =
-            Some(session_canonical_thread_id(session).unwrap_or_else(|| session.id.clone()));
-    }
+    // Always stamp durable session/thread identity — including the
+    // ThreadBundle bootstrap path. `snapshot_from_thread_bundle` only sets
+    // thread_id; leaving session_id as a random placeholder (or historically
+    // as the thread UUID) breaks SPA `/usage` filters that AND both IDs
+    // against rows recorded under SessionState.id + canonical thread_id.
+    snapshot.session_id = session.id.clone();
+    snapshot.thread_id = session_canonical_thread_id(session)
+        .or_else(|| projection_bundle.map(|bundle| bundle.thread.thread_id.to_string()))
+        .or_else(|| Some(session.id.clone()));
     snapshot.working_dir = working_dir;
     snapshot.provider = provider;
     snapshot.capabilities = capabilities;
@@ -2659,13 +2663,94 @@ fn fold_code_ui_resume_from_session(
     })
 }
 
+/// Rebuild a browser Code UI snapshot for a selected durable thread.
+///
+/// Session stores are scoped to the current working directory until
+/// `ThreadProjection` records per-thread paths, so callers must provide the
+/// server working directory rather than infer it from the repository-wide
+/// thread list.
+pub enum ResumeCodeUiSessionError {
+    NotFound {
+        thread_id: String,
+        working_dir: String,
+    },
+    LoadFailed {
+        thread_id: String,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ResumeCodeUiSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound {
+                thread_id,
+                working_dir,
+            } => write!(
+                f,
+                "no Code session for thread '{thread_id}' exists under '{working_dir}'; resume from that thread's original working directory"
+            ),
+            Self::LoadFailed { thread_id, message } => write!(
+                f,
+                "failed to load Code session for thread '{thread_id}': {message}"
+            ),
+        }
+    }
+}
+
+pub fn resume_code_ui_session_to_thread(
+    working_dir: &Path,
+    thread_id: &str,
+    provider: CodeUiProviderInfo,
+    capabilities: CodeUiCapabilities,
+) -> Result<CodeUiSessionSnapshot, ResumeCodeUiSessionError> {
+    let storage_root =
+        resolve_storage_root(working_dir).ok_or_else(|| ResumeCodeUiSessionError::LoadFailed {
+            thread_id: thread_id.to_string(),
+            message: "cannot resolve the repository storage root; if this is a linked worktree, \
+                      run `libra worktree repair --confirm <worktree-path>`"
+                .to_string(),
+        })?;
+    // Match the CLI `--resume` path: sessions live on the shared repository
+    // storage root, not under a linked worktree's local `.libra/`.
+    let session_store = SessionStore::from_storage_path(&storage_root);
+    let working_dir_string = working_dir.to_string_lossy().to_string();
+    let session = session_store
+        .load_for_thread_id(thread_id, &working_dir_string)
+        .map_err(|error| ResumeCodeUiSessionError::LoadFailed {
+            thread_id: thread_id.to_string(),
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| ResumeCodeUiSessionError::NotFound {
+            thread_id: thread_id.to_string(),
+            working_dir: working_dir.display().to_string(),
+        })?;
+    let bootstrap = build_code_ui_resume_bootstrap_snapshot(
+        working_dir_string,
+        &session,
+        provider,
+        capabilities,
+        None,
+    )
+    .map_err(|message| ResumeCodeUiSessionError::LoadFailed {
+        thread_id: thread_id.to_string(),
+        message,
+    })?;
+    fold_code_ui_resume_from_session(&session_store, &session, bootstrap)
+        .map(|fold| fold.snapshot)
+        .map_err(|message| ResumeCodeUiSessionError::LoadFailed {
+            thread_id: thread_id.to_string(),
+            message,
+        })
+}
+
 /// Build a headless Code UI runtime for `--web-only` non-Codex providers.
 ///
-/// Constructs a minimal local-read-only [`ToolRegistry`]
-/// and wires it into a [`HeadlessCodeRuntime`] so the browser composer can
-/// drive a real agent turn against the supplied `model`. The result is
-/// exposed through [`CodeUiRuntimeHandle`] just like the TUI flow, so the
-/// rest of `start_web_server` can use it without per-mode special cases.
+/// Constructs a minimal local-read-only [`ToolRegistry`] and a
+/// [`HeadlessCodeRuntime`] lifecycle host, then mounts the production
+/// [`AgentRuntimeCodeUiAdapter`] write path on [`CodeUiRuntimeHandle`].
+/// Plain browser chat enters Phase 0 plan routing; slash/`/` messages keep an
+/// explicit direct tool loop.
 ///
 /// `browser_write_enabled` should mirror the resolved
 /// [`BrowserControlMode::Loopback`] so the runtime advertises browser writes
@@ -2679,6 +2764,7 @@ async fn build_headless_web_code_ui_runtime<M>(
     model_name: String,
     approval_channels: HeadlessApprovalChannels,
     browser_write_enabled: bool,
+    mcp_server: Arc<LibraMcpServer>,
 ) -> CliResult<Arc<CodeUiRuntimeHandle>>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
@@ -2779,6 +2865,26 @@ where
     let thinking = completion_thinking_for_args(args);
     let reasoning_effort = completion_reasoning_effort_for_args(args);
     let stream = completion_stream_for_args(args);
+    let usage_storage_root = resolve_storage_root(working_dir);
+    let usage_recorder = match usage_storage_root.as_ref() {
+        Some(storage_root) => build_usage_recorder(storage_root).await,
+        None => None,
+    };
+    let usage_repo_id = canonical_usage_repo_id(usage_recorder.as_ref()).await;
+    let usage_context = usage_recorder.as_ref().map(|_| UsageContext {
+        repo_id: usage_repo_id.clone(),
+        session_id: Some(session_state.id.clone()),
+        thread_id: session_canonical_thread_id(&session_state),
+        agent_run_id: None,
+        run_id: None,
+        turn_id: None,
+        event_id: None,
+        provider: provider_name.clone(),
+        model: model_name.clone(),
+        request_kind: "completion".to_string(),
+        intent: None,
+        agent_name: None,
+    });
 
     let config_factory: Arc<dyn Fn() -> ToolLoopConfig + Send + Sync> =
         Arc::new(move || ToolLoopConfig {
@@ -2790,6 +2896,8 @@ where
             preserve_reasoning_content,
             runtime_context: runtime_context.clone(),
             subagent_runtime: subagent_runtime.clone(),
+            usage_recorder: usage_recorder.clone(),
+            usage_context: usage_context.clone(),
             ..Default::default()
         });
 
@@ -2800,7 +2908,7 @@ where
         projection_sequence,
     );
 
-    let adapter = HeadlessCodeRuntime::new_with_persistence(
+    let lifecycle = HeadlessCodeRuntime::new_with_persistence(
         session,
         capabilities,
         model,
@@ -2810,6 +2918,7 @@ where
         config_factory,
         initial_history,
         Some(persistence),
+        Some(mcp_server),
     )
     .await
     .map_err(|error| {
@@ -2818,13 +2927,25 @@ where
         ))
     })?;
 
+    // W3-03: mount AgentRuntimeCodeUiAdapter as the production write-path owner.
+    // HeadlessCodeRuntime remains lifecycle-only (worker, listeners, shutdown).
+    let adapter = lifecycle.command_adapter();
+
+    let automation_write_enabled = args.control == ControlMode::Write;
     let mut runtime_options = CodeUiRuntimeOptions::new(
         browser_write_enabled,
-        false,
+        automation_write_enabled,
         CodeUiInitialController::Unclaimed,
     );
     runtime_options.lease_duration = code_ui_test_lease_duration_override()?;
-    Ok(CodeUiRuntimeHandle::build_with_options(adapter, runtime_options).await)
+    // Retain the lifecycle host on the handle; the adapter only holds a Weak
+    // shutdown hook so drop cannot form an adapter↔host retain cycle.
+    Ok(CodeUiRuntimeHandle::build_with_options_and_lifecycle(
+        adapter,
+        runtime_options,
+        Some(lifecycle),
+    )
+    .await)
 }
 
 fn build_headless_tool_registry(
@@ -2854,6 +2975,7 @@ async fn build_non_codex_headless_runtime(
     session_store: Arc<SessionStore>,
     session_state: SessionState,
     browser_write_enabled: bool,
+    mcp_server: Arc<LibraMcpServer>,
 ) -> CliResult<Option<Arc<CodeUiRuntimeHandle>>> {
     let (exec_approval_tx, exec_approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
@@ -2883,6 +3005,7 @@ async fn build_non_codex_headless_runtime(
                         exec_approval_rx,
                     },
                     browser_write_enabled,
+                    mcp_server,
                 )
                 .await?,
             ))
@@ -2909,6 +3032,7 @@ async fn build_non_codex_headless_runtime(
                         exec_approval_rx,
                     },
                     browser_write_enabled,
+                    mcp_server,
                 )
                 .await?,
             ))
@@ -3743,12 +3867,16 @@ where
     check_process_terminate(&process_terminate)?;
 
     if let Some(usage_recorder) = build_usage_recorder(&storage_root).await {
+        let usage_repo_id = canonical_usage_repo_id(Some(&usage_recorder)).await;
         config.usage_recorder = Some(usage_recorder);
         config.usage_context = Some(UsageContext {
+            repo_id: usage_repo_id,
             session_id: Some(session.id.clone()),
             thread_id: session_canonical_thread_id(&session),
             agent_run_id: None,
             run_id: None,
+            turn_id: None,
+            event_id: None,
             provider: provider_name.clone(),
             model: model_name.clone(),
             request_kind: "completion".to_string(),
@@ -3775,6 +3903,9 @@ where
     };
     let code_ui_runtime = if let Some(runtime) = managed_code_ui_runtime.clone() {
         if let Some(control_tx) = code_control_tx {
+            // Managed Codex owns the AgentRuntime, but HTTP writes for the
+            // TUI+browser path still need TuiCodeUiAdapter so cancel / interact /
+            // goal / task / automation-lease route through the TUI control channel.
             let adapter = runtime.adapter();
             let code_ui_session = adapter.session();
             let capabilities = adapter.capabilities();
@@ -4209,9 +4340,16 @@ where
     // restored first because an open IntentSpec gate means no plan was ever
     // approved; the plan restore then no-ops on the already-parked gate.
     app.restore_pending_plan_review_gate().await;
+    // W2-11: restore a durable Continue/Cancel repair gate before considering
+    // any execution handoff. A corrupt/unreadable repair replay fences the
+    // session and must never fall through to replay approved mutations.
+    let repair_gate_allows_handoff = app.restore_pending_plan_execution_repair_gate().await;
     // W2-03 r18: network Allow/Deny may have settled while execute admission
-    // never ran — resume that handoff after the review gates no-op.
-    app.restore_pending_plan_execution_handoff().await;
+    // never ran — resume that handoff only after repair recovery confirms that
+    // no unresolved Continue/Cancel decision is owed.
+    if should_restore_plan_execution_handoff(repair_gate_allows_handoff) {
+        app.restore_pending_plan_execution_handoff().await;
+    }
 
     let run_result = app.run().await;
     // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI
@@ -4943,6 +5081,7 @@ async fn build_subagent_runtime_for_session(
         dispatcher: std::sync::Arc::new(dispatcher),
         parent_thread_id: session_canonical_thread_id(session)
             .unwrap_or_else(|| session.id.clone()),
+        parent_turn_id: None,
         parent_session_id: session.id.clone(),
         parent_agent,
         parent_ruleset: Vec::new(),
@@ -4996,6 +5135,20 @@ async fn build_usage_recorder(storage_root: &Path) -> Option<UsageRecorder> {
         }
         Err(error) => {
             tracing::warn!("usage stats disabled because database open failed: {error}");
+            None
+        }
+    }
+}
+
+async fn canonical_usage_repo_id(usage_recorder: Option<&UsageRecorder>) -> Option<String> {
+    let usage_recorder = usage_recorder?;
+    match usage_recorder.canonical_repo_id().await {
+        Ok(repo_id) => repo_id,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "usage stats will omit repository attribution because libra.repoid could not be read"
+            );
             None
         }
     }
@@ -5293,9 +5446,12 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 ///
 /// Flags that stay rejected in BOTH non-TUI modes (design / safety / deferred
 /// work): `--env-file` (its bootstrap source is shared with TUI, but accepting
-/// the public Web-only flag remains a later compatibility decision),
-/// `--network-access allow` (safety gate), plus `--context`,
-/// `--approval-policy`, and `--approval-ttl`.
+/// the public Web-only flag remains a later compatibility decision) and
+/// `--network-access allow` (safety gate).
+/// W3-02: `--context` and `--approval-policy` are accepted under Web-only so
+/// Code UI harness scenarios can drive the same plan/generation paths as TUI;
+/// they remain rejected for MCP `--stdio`. `--approval-ttl` stays rejected in
+/// both until a dedicated TTL surface lands.
 /// `--resume` is accepted only for the non-Codex Web headless path; it remains
 /// rejected for MCP stdio and managed Codex, which do not share that session
 /// protocol.
@@ -5326,6 +5482,12 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
         reject_mode_flag(args.deepseek_stream.is_some(), "--deepseek-stream", mode)?;
         reject_mode_flag(args.kimi_thinking.is_some(), "--kimi-thinking", mode)?;
         reject_mode_flag(args.kimi_stream.is_some(), "--kimi-stream", mode)?;
+        reject_mode_flag(args.context.is_some(), "--context", mode)?;
+        reject_mode_flag(
+            args.approval_policy != CodeApprovalPolicy::OnRequest,
+            "--approval-policy",
+            mode,
+        )?;
     }
 
     // Rejected in BOTH non-TUI modes.
@@ -5334,15 +5496,9 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     // later public-compatibility decision. Keep the flag rejected until that
     // compatibility work lands.
     reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
-    reject_mode_flag(args.context.is_some(), "--context", mode)?;
     if !web_only {
         reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
     }
-    reject_mode_flag(
-        args.approval_policy != CodeApprovalPolicy::OnRequest,
-        "--approval-policy",
-        mode,
-    )?;
     reject_mode_flag(args.approval_ttl.is_some(), "--approval-ttl", mode)?;
     reject_mode_flag(
         args.network_access != CodeNetworkAccess::Deny,
@@ -5350,6 +5506,12 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
         mode,
     )?;
     Ok(())
+}
+
+/// A repair replay failure is a fail-closed startup condition: the execution
+/// handoff may be replayed only when the repair restore explicitly permits it.
+fn should_restore_plan_execution_handoff(repair_gate_allows_handoff: bool) -> bool {
+    repair_gate_allows_handoff
 }
 
 // ---------------------------------------------------------------------------
@@ -5373,6 +5535,26 @@ mod tests {
 
     use super::*;
     use crate::internal::ai::sandbox::SandboxPolicy;
+
+    #[test]
+    fn corrupt_repair_replay_blocks_pending_execution_handoff() {
+        use crate::internal::ai::session::SessionJsonlStore;
+
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = SessionJsonlStore::new(temp.path().to_path_buf());
+        std::fs::write(store.events_path(), "{not valid JSONL}\n")
+            .expect("write corrupt workflow replay");
+
+        let repair_gate_allows_handoff = store.load_code_workflow_replay().is_ok();
+        assert!(
+            !repair_gate_allows_handoff,
+            "a corrupt repair replay must be treated as unrecoverable"
+        );
+        assert!(
+            !should_restore_plan_execution_handoff(repair_gate_allows_handoff),
+            "startup must not replay a pending mutating execution handoff when repair recovery fails"
+        );
+    }
 
     /// CEX-S2-12 "single sub-agent behind flag": the dispatcher
     /// concurrency cap is forced to 1 for every configured value —
@@ -7294,6 +7476,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("headless Ollama should build through ProviderFactory")
@@ -7325,6 +7508,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("headless OpenAI should use the shared provider factory")
@@ -7360,6 +7544,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("headless Fake should build through ProviderFactory")
@@ -7428,6 +7613,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("Codex arm must return Ok(None), not an error");

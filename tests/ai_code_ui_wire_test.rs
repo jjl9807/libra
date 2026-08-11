@@ -8,14 +8,23 @@
 //! **Layer:** L1 — pure serde, no I/O, no async.
 
 use chrono::{DateTime, Utc};
-use libra::internal::ai::web::code_ui::{
-    CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiControllerAttachRequest,
-    CodeUiControllerAttachResponse, CodeUiControllerKind, CodeUiControllerState,
-    CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind, CodeUiInteractionOption,
-    CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
-    CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
-    CodeUiProviderInfo, CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
-    CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
+use libra::internal::ai::{
+    agent::runtime::{RuntimeUsageTotals, UsageStatus},
+    runtime::{ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState},
+    web::{
+        ThreadListItem,
+        code_ui::{
+            CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities,
+            CodeUiControllerAttachRequest, CodeUiControllerAttachResponse, CodeUiControllerKind,
+            CodeUiControllerState, CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind,
+            CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionResponse,
+            CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot,
+            CodeUiPlanStep, CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest,
+            CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiSkillActivateRequest,
+            CodeUiTaskSnapshot, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+            CodeUiTranscriptEntryKind,
+        },
+    },
 };
 use serde_json::{Value, json};
 
@@ -121,6 +130,16 @@ fn fully_populated_snapshot() -> CodeUiSessionSnapshot {
             requested_at: ts,
             resolved_at: None,
         }],
+        plan_execution_repair: Some(PlanExecutionRepairState::AwaitingUser {
+            interaction_id: "repair-1".to_string(),
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence: ExecutionFailureEvidence {
+                output: "Decision: Abandon.".to_string(),
+                diagnostics: vec!["verification failed".to_string()],
+                attempt: 2,
+                max_attempts: 2,
+            },
+        }),
         updated_at: ts,
     }
 }
@@ -201,6 +220,14 @@ fn snapshot_round_trips_through_camel_case_wire_shape() {
         serialized["interactions"][0]["status"],
         Value::String("pending".into())
     );
+    assert_eq!(
+        serialized["planExecutionRepair"]["state"],
+        Value::String("awaiting_user".into())
+    );
+    assert_eq!(
+        serialized["planExecutionRepair"]["interaction_id"],
+        Value::String("repair-1".into())
+    );
 
     // Patchset path round-trips with `changeType` (camelCase from `change_type`).
     assert_eq!(
@@ -280,7 +307,7 @@ fn transcript_entry_kinds_use_snake_case_values() {
     }
 }
 
-/// All five interaction kinds shipped to the browser must keep their snake_case
+/// All interaction kinds shipped to the browser must keep their snake_case
 /// wire tags. These are the exact strings the InteractionPanel switches on.
 #[test]
 fn interaction_kinds_use_snake_case_values() {
@@ -296,6 +323,10 @@ fn interaction_kinds_use_snake_case_values() {
             "intent_review_choice",
         ),
         (CodeUiInteractionKind::PostPlanChoice, "post_plan_choice"),
+        (
+            CodeUiInteractionKind::PlanExecutionRepair,
+            "plan_execution_repair",
+        ),
     ] {
         let value = serde_json::to_value(variant).unwrap();
         assert_eq!(value, Value::String(expected.into()));
@@ -399,14 +430,15 @@ fn thread_list_response_envelope_uses_camel_case_wire_shape() {
 }
 
 /// Interaction-response payload — the only request body that has optional
-/// fields with mixed naming. Pins `selectedOption`, `applyToFuture`, and the
-/// `answers` map's plain string keys.
+/// fields with mixed naming. Pins `selectedOption`, `applyToFuture`,
+/// `maxAttempts`, and the `answers` map's plain string keys.
 #[test]
 fn interaction_response_serialization_drops_none_fields() {
     let response = CodeUiInteractionResponse {
         approved: Some(true),
         apply_to_future: Some(CodeUiApplyToFuture::AcceptAll),
         selected_option: Some("execute".to_string()),
+        max_attempts: Some(3),
         note: None,
         answers: [("q1".to_string(), vec!["yes".to_string()])]
             .into_iter()
@@ -416,6 +448,133 @@ fn interaction_response_serialization_drops_none_fields() {
     assert_eq!(value["approved"], Value::Bool(true));
     assert_eq!(value["applyToFuture"], Value::String("accept_all".into()));
     assert_eq!(value["selectedOption"], Value::String("execute".into()));
+    assert_eq!(value["maxAttempts"], Value::from(3));
     assert!(value.get("note").is_none(), "None options must be skipped");
     assert_eq!(value["answers"]["q1"][0], Value::String("yes".into()));
+}
+
+/// W2-11 r16: local TUI repair continuation must settle the browser's
+/// interaction before it publishes the retrying repair state.
+#[tokio::test]
+async fn local_repair_continuation_resolves_code_ui_prompt_before_retry() {
+    let session = CodeUiSession::new(fully_populated_snapshot());
+
+    session.resolve_interaction("int-1").await;
+    session
+        .set_plan_execution_repair(Some(PlanExecutionRepairState::AutomaticRepair {
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence: ExecutionFailureEvidence {
+                output: "retrying repaired plan".to_string(),
+                diagnostics: Vec::new(),
+                attempt: 2,
+                max_attempts: 3,
+            },
+        }))
+        .await;
+    session.set_status(CodeUiSessionStatus::Thinking).await;
+
+    let snapshot = session.snapshot().await;
+    assert_eq!(snapshot.status, CodeUiSessionStatus::Thinking);
+    assert!(matches!(
+        snapshot.plan_execution_repair,
+        Some(PlanExecutionRepairState::AutomaticRepair { .. })
+    ));
+    assert_eq!(
+        snapshot
+            .interactions
+            .iter()
+            .find(|interaction| interaction.id == "int-1")
+            .map(|interaction| &interaction.status),
+        Some(&CodeUiInteractionStatus::Resolved),
+        "the old repair prompt must not remain selectable after local continuation"
+    );
+}
+
+/// W3-01: usage is a separate camelCase read model rather than fabricated
+/// fields on the session snapshot. This pins the browser's `UsageReadModel`
+/// totals contract used by `GET /api/code/usage`, including the fail-closed
+/// `subAgentsStatus` when durable child attribution is unavailable.
+#[test]
+fn code_ui_command_surface_full() {
+    let totals = RuntimeUsageTotals {
+        request_count: 3,
+        total_tokens: 120,
+        cost_usd: Some(0.01),
+        cost_estimate_micro_dollars: Some(10_000),
+        usage_status: UsageStatus::Partial,
+        cost_status: UsageStatus::Known,
+        error_status: UsageStatus::Known,
+        failed_count: 0,
+        unknown_usage_count: 1,
+        unknown_cost_count: 0,
+    };
+    let value = serde_json::to_value(totals).expect("usage totals serialize");
+    assert_eq!(value["requestCount"], Value::from(3));
+    assert_eq!(value["totalTokens"], Value::from(120));
+    assert_eq!(value["usageStatus"], Value::String("partial".to_string()));
+    assert_eq!(value["costStatus"], Value::String("known".to_string()));
+    assert_eq!(value["unknownUsageCount"], Value::from(1));
+
+    let activation = CodeUiSkillActivateRequest {
+        provider: "claude-code".to_string(),
+        name: "/review".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(activation).expect("skill activation serializes"),
+        json!({ "provider": "claude-code", "name": "/review" })
+    );
+
+    let usage_envelope = json!({
+        "cumulative": value,
+        "subAgentsStatus": "unavailable",
+    });
+    assert!(
+        usage_envelope.get("subAgents").is_none(),
+        "omit empty subAgents when attribution is unavailable"
+    );
+}
+
+/// W3-01: resume selection retains the original working directory and refuses
+/// to reinterpret an indeterminate session as a resumable idle snapshot.
+/// Thread list items omit workingDir until projections persist per-thread cwd.
+#[test]
+fn code_ui_browser_resume_contract() {
+    let snapshot = fully_populated_snapshot();
+    let value = serde_json::to_value(snapshot).expect("resume snapshot serializes");
+    assert_eq!(value["threadId"], Value::String("thread-1".to_string()));
+    assert_eq!(value["workingDir"], Value::String("/repo".to_string()));
+    assert_eq!(
+        value["status"],
+        Value::String("awaiting_interaction".to_string()),
+        "the browser must receive the live projected state before selecting resume"
+    );
+    let thread = ThreadListItem {
+        id: "thread-1".to_string(),
+        title: None,
+        archived: false,
+        current_intent_id: None,
+        working_dir: None,
+        created_at: fixed_ts(),
+        updated_at: fixed_ts(),
+    };
+    let thread_value = serde_json::to_value(thread).expect("thread list item serializes");
+    assert!(
+        thread_value.get("workingDir").is_none(),
+        "do not stamp server cwd onto repository-shared threads: {thread_value}"
+    );
+    let request = CodeUiSessionResumeRequest {
+        thread_id: "thread-1".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(request).expect("resume request serializes"),
+        json!({ "threadId": "thread-1" })
+    );
+    assert!(matches!(
+        CodeUiSessionStatus::Thinking,
+        CodeUiSessionStatus::Thinking | CodeUiSessionStatus::ExecutingTool
+    ));
+    assert_eq!(
+        CodeUiSessionStatus::IndeterminateSideEffect,
+        CodeUiSessionStatus::IndeterminateSideEffect
+    );
 }

@@ -188,6 +188,28 @@ pub enum CodeWorkflowEventKind {
         #[serde(default)]
         default_allow: bool,
     },
+    /// Plan-execution repair gate marker (W2-11 recovery).
+    ///
+    /// Written before the runtime parks Continue/Cancel so a process restart
+    /// cannot discard the human repair decision and re-admit plan execution.
+    PlanExecutionRepairRequested {
+        interaction_id: String,
+        /// Non-mutating runtime turn that owns the parked repair gate.
+        #[serde(default)]
+        turn_id: String,
+        /// The unresolved repair marker this speculative continuation replaces.
+        ///
+        /// Empty for an initial repair gate and markers written before
+        /// continuation lineage was recorded. Recovery uses this relationship
+        /// to retire a pre-ack continuation after restoring its predecessor.
+        #[serde(default)]
+        predecessor_interaction_id: String,
+        /// Whether this marker is a replacement that makes its predecessor
+        /// obsolete, rather than a speculative pre-ack continuation.
+        #[serde(default)]
+        supersedes_predecessor: bool,
+        repair: crate::internal::ai::runtime::PlanExecutionRepairState,
+    },
     InteractionResolved {
         interaction_id: String,
         resolution: String,
@@ -633,6 +655,17 @@ fn code_workflow_event_summary(event: &CodeWorkflowEventKind) -> String {
                 format!(
                     "network policy {interaction_id} ({plan_id}) default={default} turn={turn_id}"
                 )
+            }
+        }
+        CodeWorkflowEventKind::PlanExecutionRepairRequested {
+            interaction_id,
+            turn_id,
+            ..
+        } => {
+            if turn_id.is_empty() {
+                format!("plan execution repair {interaction_id}")
+            } else {
+                format!("plan execution repair {interaction_id} turn={turn_id}")
             }
         }
         CodeWorkflowEventKind::InteractionResolved {
@@ -2191,6 +2224,7 @@ fn parse_code_workflow_event_value(
         | "intent_review_requested"
         | "plan_review_requested"
         | "network_policy_requested"
+        | "plan_execution_repair_requested"
         | "interaction_resolved"
         | "code_ui_projection_delta"
         | "terminal_success"
@@ -2322,7 +2356,7 @@ fn process_appears_alive(
         let _ = (lock_path, recorded_starttime, recorded_boot_id);
         // SAFETY: kill(pid, 0) is a existence/permission probe and does not
         // deliver a signal.
-        return unsafe { libc::kill(pid as i32, 0) == 0 };
+        unsafe { libc::kill(pid as i32, 0) == 0 }
     }
     #[cfg(not(unix))]
     {

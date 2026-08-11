@@ -1351,6 +1351,26 @@ pub fn builtin_migrations() -> Vec<Migration> {
                 "../../../sql/migrations/2026080401_agent_capture_workspace_scope_down.sql"
             ),
         ),
+        // plan-20260715 W2-12: shared runtime usage dimensions and replay-safe
+        // event identity. Legacy rows remain queryable with NULL dimensions.
+        sql_migration(
+            2026080402,
+            "agent_usage_runtime_attribution",
+            include_str!("../../../sql/migrations/2026080402_agent_usage_runtime_attribution.sql"),
+            include_str!(
+                "../../../sql/migrations/2026080402_agent_usage_runtime_attribution_down.sql"
+            ),
+        ),
+        // W2-12 follow-up: event replay keys are unique per durable session,
+        // so independent headless sessions can reuse a browser command ID.
+        sql_migration(
+            2026080403,
+            "agent_usage_event_session_scope",
+            include_str!("../../../sql/migrations/2026080403_agent_usage_event_session_scope.sql"),
+            include_str!(
+                "../../../sql/migrations/2026080403_agent_usage_event_session_scope_down.sql"
+            ),
+        ),
     ]
 }
 
@@ -1798,9 +1818,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 52);
+        assert_eq!(runner.len(), 54);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026080401));
+        assert_eq!(runner.max_registered_version(), Some(2026080403));
     }
 
     #[test]

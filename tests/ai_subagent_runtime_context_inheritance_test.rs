@@ -244,6 +244,7 @@ async fn child_tool_invocation_inherits_parent_runtime_context() {
     let abort_token = AbortToken::new();
     let context = DispatchContext {
         parent_thread_id: "thread-runtime-ctx",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,
@@ -444,6 +445,7 @@ async fn child_apply_patch_records_undo_preimage_under_inherited_batch() {
     let abort_token = AbortToken::new();
     let context = DispatchContext {
         parent_thread_id: "thread-preimage",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,

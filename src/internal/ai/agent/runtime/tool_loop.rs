@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -232,6 +232,9 @@ pub struct ToolLoopConfig {
     pub usage_recorder: Option<UsageRecorder>,
     /// Provider/model/thread metadata attached to usage rows.
     pub usage_context: Option<UsageContext>,
+    /// Shared model-turn sequence for cancellation accounting. The TUI records a
+    /// cancellation fallback against the active request's durable event key.
+    pub active_model_turn: Option<Arc<AtomicUsize>>,
     /// Optional Source Pool whose enabled handlers are merged into the tool
     /// registry at the start of each tool-loop run.
     pub source_pool: Option<SourcePool>,
@@ -285,6 +288,7 @@ impl Default for ToolLoopConfig {
             context_frame_attachment_threshold_bytes: None,
             usage_recorder: None,
             usage_context: None,
+            active_model_turn: None,
             source_pool: None,
             source_session_id: None,
             preserve_reasoning_content: false,
@@ -451,6 +455,9 @@ where
             )));
         }
         turn_count += 1;
+        if let Some(active_model_turn) = &config.active_model_turn {
+            active_model_turn.store(turn_count, Ordering::Release);
+        }
 
         let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
         let request = CompletionRequest {
@@ -500,7 +507,11 @@ where
                     config.usage_recorder.as_ref(),
                     config.usage_context.as_ref(),
                 ) && let Err(record_error) = recorder
-                    .record_failure(context, completion_error_kind(&error), Some(wall_clock_ms))
+                    .record_failure(
+                        &usage_event_context(context, turn_count),
+                        completion_error_kind(&error),
+                        Some(wall_clock_ms),
+                    )
                     .await
                 {
                     tracing::warn!("failed to record failed model usage stats: {record_error}");
@@ -525,12 +536,13 @@ where
             config.usage_recorder.as_ref(),
             config.usage_context.as_ref(),
         ) {
+            let event_context = usage_event_context(context, turn_count);
             let tool_call_count = u64::try_from(tool_calls.len()).unwrap_or(u64::MAX);
             match response.raw_response.usage_summary() {
                 Some(usage) => {
                     if let Err(error) = recorder
                         .record_summary_with_tool_count(
-                            context,
+                            &event_context,
                             &usage,
                             Some(wall_clock_ms),
                             tool_call_count,
@@ -543,7 +555,7 @@ where
                 }
                 None => {
                     if let Err(error) = recorder
-                        .record_missing_usage(context, Some(wall_clock_ms), tool_call_count)
+                        .record_missing_usage(&event_context, Some(wall_clock_ms), tool_call_count)
                         .await
                     {
                         tracing::warn!("failed to record estimated model usage stats: {error}");
@@ -845,6 +857,17 @@ where
         }
         return Err(empty_or_reasoning_only_error(&response));
     }
+}
+
+/// Make a provider event unique within a tool-loop run while preserving the
+/// caller's durable runtime event identity across retries.
+fn usage_event_context(context: &UsageContext, model_turn: usize) -> UsageContext {
+    let mut event_context = context.clone();
+    event_context.event_id = context
+        .event_id
+        .as_ref()
+        .map(|event_id| format!("{event_id}:model-turn:{model_turn}"));
+    event_context
 }
 
 /// Normalize tool-call arguments to the JSON string shape that tool dispatch expects.
@@ -2154,6 +2177,7 @@ mod tests {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
                 preserve_reasoning_content: false,
@@ -2325,6 +2349,7 @@ mod tests {
         let runtime = SubAgentToolLoopRuntime {
             dispatcher: dispatcher.clone(),
             parent_thread_id: "thread-task".to_string(),
+            parent_turn_id: None,
             parent_session_id: "session-task".to_string(),
             parent_agent: AgentExecutionSpec {
                 name: "build".to_string(),
@@ -2915,6 +2940,7 @@ mod tests {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
                 preserve_reasoning_content: false,
@@ -3052,6 +3078,7 @@ mod tests {
                 context_frame_attachment_threshold_bytes: None,
                 usage_recorder: None,
                 usage_context: None,
+                active_model_turn: None,
                 source_pool: None,
                 source_session_id: None,
                 preserve_reasoning_content: false,

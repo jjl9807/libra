@@ -24,7 +24,7 @@ use crate::internal::ai::{
     projection::{PlanHeadRef, ThreadBundle},
     runtime::{
         ControllerLease, ControllerService, ControllerServiceError, ControllerServiceOptions,
-        ControllerSnapshot, hardening::SecretRedactor,
+        ControllerSnapshot, PlanExecutionRepairState, hardening::SecretRedactor,
     },
     session::CodeWorkflowReplay,
 };
@@ -130,6 +130,7 @@ pub enum CodeUiInteractionKind {
     RequestUserInput,
     IntentReviewChoice,
     PostPlanChoice,
+    PlanExecutionRepair,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -189,6 +190,10 @@ pub struct CodeUiInteractionResponse {
     pub apply_to_future: Option<CodeUiApplyToFuture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selected_option: Option<String>,
+    /// Replacement automatic repair limit requested with a
+    /// `plan_execution_repair` Continue response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     #[serde(default)]
@@ -277,6 +282,10 @@ pub struct CodeUiSessionSnapshot {
     pub tool_calls: Vec<CodeUiToolCallSnapshot>,
     pub patchsets: Vec<CodeUiPatchsetSnapshot>,
     pub interactions: Vec<CodeUiInteractionRequest>,
+    /// Runtime-owned route, evidence, and retry counters after plan execution
+    /// fails. Kept in the Rust wire model for remote Code UI consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_execution_repair: Option<PlanExecutionRepairState>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -296,6 +305,7 @@ impl Default for CodeUiSessionSnapshot {
             tool_calls: Vec::new(),
             patchsets: Vec::new(),
             interactions: Vec::new(),
+            plan_execution_repair: None,
             updated_at: Utc::now(),
         }
     }
@@ -399,6 +409,21 @@ pub struct CodeUiGoalStartRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CodeUiGoalCancelRequest {
     pub reason: String,
+}
+
+/// `POST /api/code/skills/activate` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiSkillActivateRequest {
+    pub provider: String,
+    pub name: String,
+}
+
+/// `POST /api/code/session/resume` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiSessionResumeRequest {
+    pub thread_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -639,6 +664,13 @@ impl CodeUiSession {
         .await;
     }
 
+    pub async fn set_plan_execution_repair(&self, repair: Option<PlanExecutionRepairState>) {
+        self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
+            snapshot.plan_execution_repair = repair;
+        })
+        .await;
+    }
+
     pub async fn upsert_plan(&self, plan: CodeUiPlanSnapshot) {
         self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
             // Monotonic plan status: a plan that has already reached a terminal
@@ -823,6 +855,12 @@ pub use crate::internal::ai::runtime::ControllerInitial as CodeUiInitialControll
 pub struct CodeUiRuntimeHandle {
     adapter: Arc<dyn CodeUiProviderAdapter>,
     controller_service: ControllerService,
+    /// Retains the web-only lifecycle host (worker / listeners) while this
+    /// handle is alive. The production adapter only holds a [`std::sync::Weak`]
+    /// shutdown hook so drop without an adapter↔host retain cycle.
+    #[allow(dead_code)]
+    lifecycle_host:
+        Option<Arc<dyn crate::internal::ai::web::agent_runtime_adapter::CodeUiLifecycleShutdown>>,
 }
 
 /// Bag of constructor options for [`CodeUiRuntimeHandle::build_with_options`].
@@ -831,7 +869,12 @@ pub struct CodeUiRuntimeHandle {
 /// [`CodeUiRuntimeHandle::build_with_control`] with the default 120 s lease
 /// TTL. Tests that need to exercise lease expiry without sleeping for two
 /// minutes pass a custom `lease_duration` through this struct.
-#[derive(Debug, Clone)]
+///
+/// Web-only lifecycle retention is intentionally **not** part of this public
+/// options bag — pass it via
+/// [`CodeUiRuntimeHandle::build_with_options_and_lifecycle`] so adding the
+/// W3-03 host retain path does not break external struct-literal callers.
+#[derive(Clone, Debug)]
 pub struct CodeUiRuntimeOptions {
     pub browser_write_enabled: bool,
     pub automation_write_enabled: bool,
@@ -928,6 +971,18 @@ impl CodeUiRuntimeHandle {
         adapter: Arc<dyn CodeUiProviderAdapter>,
         options: CodeUiRuntimeOptions,
     ) -> Arc<Self> {
+        Self::build_with_options_and_lifecycle(adapter, options, None).await
+    }
+
+    /// Like [`Self::build_with_options`], but retains an optional web-only
+    /// lifecycle host (worker / approval listeners) for the handle's lifetime.
+    pub async fn build_with_options_and_lifecycle(
+        adapter: Arc<dyn CodeUiProviderAdapter>,
+        options: CodeUiRuntimeOptions,
+        lifecycle_host: Option<
+            Arc<dyn crate::internal::ai::web::agent_runtime_adapter::CodeUiLifecycleShutdown>,
+        >,
+    ) -> Arc<Self> {
         let mut controller_options = ControllerServiceOptions::new(
             options.browser_write_enabled,
             options.automation_write_enabled,
@@ -939,6 +994,7 @@ impl CodeUiRuntimeHandle {
         let handle = Arc::new(Self {
             adapter,
             controller_service: ControllerService::new(controller_options),
+            lifecycle_host,
         });
         handle.sync_controller_snapshot().await;
         handle
@@ -1499,6 +1555,7 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("INVALID_CONTROLLER_TOKEN", 403),
         ("INVALID_CONTROLLER_KIND", 400),
         ("CONTROLLER_CONFLICT", 409),
+        ("INTERACTION_NOT_ACTIVE", 409),
         ("BROWSER_CONTROL_DISABLED", 403),
         ("AUTOMATION_CONTROLLER_REQUIRED", 403),
         // Tail: read-side and runtime-availability errors.
@@ -1506,12 +1563,22 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("INVALID_QUERY_PARAM", 400),
         ("INVALID_COMMAND_ID", 400),
         ("STORAGE_PATH_INVALID", 500),
+        ("STORAGE_ROOT_UNRESOLVED", 500),
         ("STATUS_UNAVAILABLE", 500),
         ("THREAD_LIST_FAILED", 500),
         ("DB_UNAVAILABLE", 500),
+        ("USAGE_UNAVAILABLE", 500),
+        ("INVALID_SKILL_PROVIDER", 400),
+        ("SKILL_NOT_DISCOVERABLE", 400),
+        ("SKILL_ACTIVATION_UNSUPPORTED", 422),
+        ("SESSION_RESUME_BUSY", 409),
+        ("SESSION_RESUME_NOT_FOUND", 404),
+        ("SESSION_RESUME_REQUIRES_RESTART", 422),
+        ("SESSION_RESUME_LOAD_FAILED", 500),
         ("RECONCILIATION_REQUIRED", 409),
         ("COMMAND_PAYLOAD_CONFLICT", 409),
         ("COMMAND_ALREADY_TERMINAL", 409),
+        ("PLAN_REPAIR_RETRY_LIMIT_REACHED", 409),
         ("INTERNAL_ERROR", 500),
         ("UNSUPPORTED_OPERATION", 422),
     ]
@@ -1581,6 +1648,7 @@ pub fn initial_snapshot(
         tool_calls: Vec::new(),
         patchsets: Vec::new(),
         interactions: Vec::new(),
+        plan_execution_repair: None,
         updated_at: Utc::now(),
     }
 }
@@ -1616,7 +1684,11 @@ pub fn apply_thread_bundle_to_snapshot(
     bundle: &ThreadBundle,
 ) {
     let thread_id = bundle.thread.thread_id.to_string();
-    snapshot.session_id = thread_id.clone();
+    // Keep snapshot.session_id intact. Durable usage rows key on
+    // SessionState.id; projecting the thread UUID into sessionId makes the
+    // SPA AND `/usage?sessionId=&threadId=` against the wrong session scope.
+    // Callers that own a SessionState must stamp session_id explicitly
+    // (see `build_code_ui_resume_bootstrap_snapshot`).
     snapshot.thread_id = Some(thread_id);
     snapshot.status = if bundle.scheduler.active_run_id.is_some() {
         CodeUiSessionStatus::ExecutingTool
@@ -1767,6 +1839,30 @@ mod tests {
             stored_status(&session.snapshot().await).as_deref(),
             Some("failed")
         );
+    }
+
+    #[tokio::test]
+    async fn plan_execution_repair_is_exposed_in_snapshot() {
+        let session = test_session();
+        let repair = PlanExecutionRepairState::ManualAction {
+            evidence: PlanExecutionRepairState::AutomaticRepair {
+                route: crate::internal::ai::runtime::ExecutionFailureRevision::PlanRevision,
+                evidence: crate::internal::ai::runtime::ExecutionFailureEvidence {
+                    output: "Decision: Abandon.".to_string(),
+                    diagnostics: vec!["verification failed".to_string()],
+                    attempt: 2,
+                    max_attempts: 2,
+                },
+            }
+            .evidence()
+            .clone(),
+        };
+
+        session
+            .set_plan_execution_repair(Some(repair.clone()))
+            .await;
+
+        assert_eq!(session.snapshot().await.plan_execution_repair, Some(repair));
     }
 
     #[test]

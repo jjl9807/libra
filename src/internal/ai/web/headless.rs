@@ -1,37 +1,17 @@
-//! Headless web-only runtime for non-Codex providers.
+//! Headless web-only **lifecycle** host for non-Codex providers.
 //!
-//! `--web-only --provider <X>` (X != codex) used to fall back to a read-only
-//! placeholder snapshot, leaving the browser unable to drive the agent. This
-//! module provides the minimum-viable replacement: a [`HeadlessCodeRuntime`]
-//! that owns a [`CodeUiSession`], submits each browser turn to the shared
-//! [`crate::internal::ai::runtime::AgentRuntimeWorker`], and streams the
-//! model's output back into the session transcript through that worker's
-//! executor boundary.
+//! `--web-only --provider <X>` (X != codex) builds a [`HeadlessCodeRuntime`] that
+//! owns session construction, worker spawn, approval listeners, persistence
+//! helpers, and shutdown. The production browser write path is
+//! [`super::agent_runtime_adapter::AgentRuntimeCodeUiAdapter`] (see W3-03):
+//! plain messages route through Phase 0 (`phase0_plan_tool_loop_config`) so
+//! direct chat cannot bypass the default mutating gate; slash/`/`-prefixed
+//! messages remain an explicit direct tool loop.
 //!
-//! # v0 scope (Phase 3 minimum)
-//!
-//! - `submitMessage` queues a user message through `AgentRuntimeHandle` — the
-//!   worker's executor runs the standard `run_tool_loop_with_history_and_observer`
-//!   and the assistant reply lands in the live snapshot, streamed delta-by-delta.
-//! - `cancelTurn` cooperatively stops model or read-only work and marks the
-//!   assistant entry as cancelled. A started mutation is never hard-aborted:
-//!   cancellation returns an actionable error until its determinate result is
-//!   available.
-//! - The runtime reuses the caller-provided [`ToolRegistry`] and
-//!   [`ToolLoopConfig`], so the same allow-list / hooks / sandbox boundaries
-//!   that protect the TUI agent also apply here.
-//!
-//! # Phase 3 follow-up target
-//!
-//! - IntentSpec / Plan workflow integration. The TUI's Phase 0/1 review loop
-//!   is deeply coupled to the ratatui [`crate::internal::tui::app::App`]; this
-//!   runtime treats every browser submit as a single direct turn instead.
-//! - Full IntentSpec plan approval remains future work; direct `update_plan`
-//!   and `apply_patch` tool projections are surfaced in the shared Code UI
-//!   snapshot.
-//!
-//! These follow-ups are explicitly called out in
-//! `docs/development/commands/_general.md` and will land in subsequent phases.
+//! Confirmed plan execution still goes through
+//! [`crate::internal::ai::runtime::plan_execution`] /
+//! `ensure_plan_execution_mutating_gate`. Full IntentSpec → Phase 1 → repair
+//! parity with the TUI remains GATE-WEB-PLAN.
 
 use std::{
     collections::HashMap,
@@ -39,7 +19,7 @@ use std::{
     marker::PhantomData,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -53,12 +33,20 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::code_ui::{
-    CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
-    CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
-    CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot,
-    CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiReadModel, CodeUiSession, CodeUiSessionSnapshot,
-    CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
+use super::{
+    agent_runtime_adapter::{AgentRuntimeCodeUiAdapter, CodeUiLifecycleShutdown},
+    code_ui::{
+        CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
+        CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
+        CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange,
+        CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiReadModel, CodeUiSession,
+        CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+        CodeUiTranscriptEntryKind,
+    },
+    web_admission::{
+        CODE_UI_WEB_TURN_KIND, InFlightTurn, WebCodeUiAdmission, WebTurnMode, release_web_turn,
+        wait_for_web_turn_start,
+    },
 };
 use crate::internal::ai::{
     agent::runtime::{ToolLoopCancellation, run_tool_loop_with_history_and_observer},
@@ -68,9 +56,14 @@ use crate::internal::ai::{
     },
     runtime::{
         AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig, AgentSnapshot,
-        ExecutionControlService, InteractionState, RuntimeCommandDurability,
+        ExecutionControlService, InteractionResponse, InteractionState, RuntimeCommandDurability,
         RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
-        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest, runtime_worker_adapter_message,
+        RuntimeTurnExecutor, RuntimeWorkerError, TurnRequest,
+        phase0::{
+            IntentReviewDecision, open_intent_review_from_workflow, phase0_plan_tool_loop_config,
+            phase0_planning_prompt, phase0_revision_help_message, phase0_revision_prompt,
+        },
+        phase1::open_review_gate_phase_turn_id,
     },
     sandbox::{ExecApprovalRequest, NetworkAccess, ReviewDecision},
     session::{CodeWorkflowEventKind, SessionJsonlStore, SessionState, SessionStore},
@@ -83,11 +76,12 @@ use crate::internal::ai::{
     },
 };
 
-/// Capabilities advertised by the headless runtime.
+/// Capabilities advertised by the headless lifecycle / web adapter mount.
 ///
-/// `messageInput`, streaming text, tool calls, direct plan updates, patchsets,
-/// approval interactions, structured questions, and session resume are delivered
-/// by the headless runtime. Full IntentSpec workflow approval stays gated.
+/// `messageInput`, streaming text, tool calls, plan updates, patchsets,
+/// approval interactions, structured questions, and session resume are
+/// delivered. Plain chat enters Phase 0 plan routing; full IntentSpec →
+/// Phase 1 → repair parity remains GATE-WEB-PLAN.
 pub fn headless_capabilities() -> CodeUiCapabilities {
     CodeUiCapabilities {
         message_input: true,
@@ -107,7 +101,33 @@ pub fn headless_capabilities() -> CodeUiCapabilities {
 /// the caller must surface it rather than silently treating shutdown as clean.
 const HEADLESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const HEADLESS_BROWSER_PRINCIPAL: &str = "web-headless-browser";
-const HEADLESS_DIRECT_TURN_KIND: &str = "headless_direct_turn";
+const PENDING_INTENT_REVISION_FILE: &str = "pending_revision.json";
+
+/// In-memory + durable baseline for IntentSpec Modify → next plain message.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingIntentRevision {
+    intent_spec: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+}
+
+impl PendingIntentRevision {
+    fn revision_request(&self, follow_up: &str) -> String {
+        let follow_up = follow_up.trim();
+        match (
+            self.note
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty()),
+            follow_up.is_empty(),
+        ) {
+            (Some(note), true) => note.to_string(),
+            (Some(note), false) => format!("{note}\n\nAdditional follow-up:\n{follow_up}"),
+            (None, _) => follow_up.to_string(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct HeadlessSessionPersistence {
@@ -173,7 +193,7 @@ impl HeadlessSessionPersistence {
         self.projection_store.clone()
     }
 
-    async fn record_user_message(
+    pub(crate) async fn record_user_message(
         &self,
         snapshot: CodeUiSessionSnapshot,
         content: &str,
@@ -185,7 +205,7 @@ impl HeadlessSessionPersistence {
         self.store.save(&state)
     }
 
-    async fn record_assistant_message(
+    pub(crate) async fn record_assistant_message(
         &self,
         snapshot: CodeUiSessionSnapshot,
         content: &str,
@@ -197,7 +217,7 @@ impl HeadlessSessionPersistence {
         self.store.save(&state)
     }
 
-    async fn persist_snapshot(&self, snapshot: CodeUiSessionSnapshot) -> io::Result<()> {
+    pub(crate) async fn persist_snapshot(&self, snapshot: CodeUiSessionSnapshot) -> io::Result<()> {
         let sequence = self.persist_projection_deltas(&snapshot).await?;
         let mut state = self.state.lock().await;
         sync_session_metadata_from_snapshot(&mut state, snapshot, sequence)?;
@@ -237,6 +257,13 @@ fn code_ui_projection_deltas(
             "controller",
             "controller state changed",
             &current.controller,
+        )?);
+    }
+    if previous.plan_execution_repair != current.plan_execution_repair {
+        deltas.push(projection_delta(
+            "plan_execution_repair",
+            "plan execution repair changed",
+            &current.plan_execution_repair,
         )?);
     }
     append_changed_projection_items(
@@ -372,6 +399,18 @@ enum HeadlessInteractionDelivery {
         interaction_id: String,
         request: ExecApprovalRequest,
     },
+    /// Phase 0 IntentSpec review after `submit_intent_draft`. Durable
+    /// `InteractionResolved` is deferred until the worker terminal succeeds
+    /// ([`RuntimeInteractionDelivery::persist_interaction_resolved_after_terminal`]).
+    IntentReview {
+        session: Arc<CodeUiSession>,
+        expected_interaction_id: String,
+        pending_intent_reviews: Arc<Mutex<HashMap<String, String>>>,
+        pending_intent_revision: Arc<Mutex<Option<PendingIntentRevision>>>,
+        persistence: Option<HeadlessSessionPersistence>,
+        in_flight: Arc<Mutex<Option<InFlightTurn>>>,
+        active_turn_mutations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    },
 }
 
 #[async_trait]
@@ -380,16 +419,31 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
         &self,
         interaction: &crate::internal::ai::runtime::InteractionResponse,
     ) -> Result<(), RuntimeWorkerError> {
-        let response = decode_headless_interaction_response(interaction)?;
         match self {
             Self::UserInput { questions, .. } => {
+                let response = decode_headless_interaction_response(interaction)?;
                 user_input_response_from_code_ui_request(questions, response)
                     .map(|_| ())
                     .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))
             }
-            Self::ExecApproval { .. } => review_decision_from_interaction_response(response)
-                .map(|_| ())
-                .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string())),
+            Self::ExecApproval { .. } => {
+                let response = decode_headless_interaction_response(interaction)?;
+                review_decision_from_interaction_response(response)
+                    .map(|_| ())
+                    .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))
+            }
+            Self::IntentReview {
+                expected_interaction_id,
+                ..
+            } => {
+                if interaction.interaction_id != *expected_interaction_id {
+                    return Err(RuntimeWorkerError::ExecutionFailed(format!(
+                        "IntentSpec review response targeted '{}' but pending gate is '{expected_interaction_id}'",
+                        interaction.interaction_id
+                    )));
+                }
+                intent_review_decision_from_response(interaction).map(|_| ())
+            }
         }
     }
 
@@ -398,6 +452,10 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
             Self::UserInput { persistence, .. } | Self::ExecApproval { persistence, .. } => {
                 persistence.is_some()
             }
+            // IntentSpec review resolution is appended by web admission after
+            // `respond` returns Ok (post-terminal), shared by the live park and
+            // resume-restore paths. Avoid a second worker-owned append.
+            Self::IntentReview { .. } => false,
         }
     }
 
@@ -422,19 +480,21 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
                 })
                 .unwrap_or("approval_resolved")
                 .to_string(),
+            Self::IntentReview { .. } => intent_review_decision_from_response(interaction)
+                .map(|decision| decision.wire_id().to_string())
+                .unwrap_or_else(|_| "intent_review_resolved".to_string()),
         }
     }
 
     async fn deliver(
         self: Box<Self>,
-        _request: TurnRequest,
+        request: TurnRequest,
         interaction: crate::internal::ai::runtime::InteractionResponse,
         context: RuntimeExecutionContext,
     ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
         if context.cancellation().is_cancelled() {
             return Err(RuntimeWorkerError::Cancelled);
         }
-        let response = decode_headless_interaction_response(&interaction)?;
         match *self {
             Self::UserInput {
                 session,
@@ -444,6 +504,7 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
                 questions,
                 response_tx,
             } => {
+                let response = decode_headless_interaction_response(&interaction)?;
                 deliver_headless_user_input_response(
                     &session,
                     &interaction_persistence_failed,
@@ -460,50 +521,82 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
                 interaction_persistence_failed,
                 persistence,
                 interaction_id,
-                request,
+                request: approval_request,
             } => {
+                let response = decode_headless_interaction_response(&interaction)?;
                 deliver_headless_exec_approval_response(
                     &session,
                     &interaction_persistence_failed,
                     persistence.as_ref(),
                     &interaction_id,
-                    request,
+                    approval_request,
                     response,
                 )
                 .await
+            }
+            Self::IntentReview {
+                session,
+                expected_interaction_id,
+                pending_intent_reviews,
+                pending_intent_revision,
+                persistence,
+                in_flight,
+                active_turn_mutations,
+            } => {
+                let decision = intent_review_decision_from_response(&interaction)?;
+                if interaction.interaction_id != expected_interaction_id {
+                    return Err(RuntimeWorkerError::ExecutionFailed(format!(
+                        "IntentSpec review response targeted '{}' but pending gate is '{expected_interaction_id}'",
+                        interaction.interaction_id
+                    )));
+                }
+                if decision == IntentReviewDecision::Revise {
+                    enter_web_intent_revision_mode(
+                        &session,
+                        persistence.as_ref(),
+                        &pending_intent_revision,
+                        &expected_interaction_id,
+                        interaction_note_from_response(&interaction),
+                    )
+                    .await?;
+                }
+                // Live UI only here. Durable InteractionResolved + Code UI
+                // snapshot persistence happen in web admission after `respond`
+                // returns Ok (post-terminal).
+                session
+                    .resolve_interaction(&interaction.interaction_id)
+                    .await;
+                session.set_status(CodeUiSessionStatus::Idle).await;
+                pending_intent_reviews.lock().await.remove(&request.turn_id);
+                active_turn_mutations.lock().await.remove(&request.turn_id);
+                release_web_turn(&in_flight, &request.turn_id).await;
+                match decision {
+                    IntentReviewDecision::Confirm => Ok(RuntimeTurnExecution::Completed {
+                        summary:
+                            "IntentSpec confirmed; Phase 1 plan generation remains GATE-WEB-PLAN"
+                                .to_string(),
+                    }),
+                    IntentReviewDecision::Revise => {
+                        Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                            summary: "IntentSpec revision mode armed; send a plain message with requested changes".to_string(),
+                        })
+                    }
+                    IntentReviewDecision::Cancel => {
+                        Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                            summary: "IntentSpec review cancelled".to_string(),
+                        })
+                    }
+                }
             }
         }
     }
 }
 
-/// Adapter that runs an agent tool loop in response to browser-driven messages.
-///
-/// Generic over a [`CompletionModel`] so each provider (Ollama, OpenAI, Gemini,
-/// …) can plug in its own client. The model is held inside an `Arc<Mutex<…>>`
-/// so the spawned turn task can take exclusive access while the next submit
-/// waits in the queue.
-/// Bookkeeping for a browser turn accepted by the serialized worker.
-///
-/// The gate keeps the worker executor from running a tool before the browser
-/// turn's durable initial projection has been written. This preserves the
-/// retry-safe persistence precondition even though worker admission itself is
-/// intentionally asynchronous.
-struct InFlightTurn {
-    runtime_turn_id: String,
-    /// Canonical browser text admitted with this command id (retry compare).
-    input: String,
-    assistant_entry_id: String,
-    start_gate: Arc<tokio::sync::Notify>,
-    start_open: Arc<AtomicBool>,
-    /// Signals once terminal UI state and the worker's active-turn slot have
-    /// settled, including admission rollback after a durability failure.
-    completion: Arc<tokio::sync::Notify>,
-}
-
-/// Adapter from the UI-neutral serialized runtime to the existing headless
+/// Adapter from the UI-neutral serialized runtime to the headless
 /// provider/tool-loop stack. It deliberately owns no queueing state: ordering,
-/// cancellation and shutdown belong to `AgentRuntimeWorker`.
-struct HeadlessDirectTurnExecutor<M: CompletionModel + 'static> {
+/// cancellation and shutdown belong to `AgentRuntimeWorker`. Plain messages
+/// run Phase 0 allowlists; slash/`/` messages keep an explicit direct loop.
+struct HeadlessTurnExecutor<M: CompletionModel + 'static> {
     session: Arc<CodeUiSession>,
     history: Arc<Mutex<Vec<Message>>>,
     model: Arc<M>,
@@ -518,6 +611,14 @@ struct HeadlessDirectTurnExecutor<M: CompletionModel + 'static> {
     /// terminal result must not overwrite the reconciliation requirement.
     interaction_persistence_failed: Arc<AtomicBool>,
     persistence: Option<HeadlessSessionPersistence>,
+    /// PlanPhase0 turns that parked an IntentSpec review, keyed by runtime
+    /// turn id → browser interaction id. Cleared when the review settles.
+    pending_intent_reviews: Arc<Mutex<HashMap<String, String>>>,
+    /// After Modify/Revise, the current IntentSpec JSON awaits the next plain
+    /// Phase 0 message (TUI `pending_plan_revision` parity).
+    pending_intent_revision: Arc<Mutex<Option<PendingIntentRevision>>>,
+    /// Optional MCP server for formal Phase 0 `write_intent` persistence.
+    mcp_server: Option<Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
 }
 
 pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
@@ -526,18 +627,8 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     // for one provider type with a differently typed headless handle.
     model_type: PhantomData<M>,
     session: Arc<CodeUiSession>,
-    capabilities: CodeUiCapabilities,
-    /// Active turn slot. `submit_message` holds the lock while it spawns and
-    /// stores the worker request so two concurrent submits can never both see
-    /// an empty slot. `cancel_turn` and the runtime executor acquire the lock
-    /// to release / finalize the slot.
+    /// Active turn slot shared with [`WebCodeUiAdmission`] / the executor.
     in_flight: Arc<Mutex<Option<InFlightTurn>>>,
-    /// Admitted command inputs retained through worker finalization so a
-    /// completion-race `DuplicateTurn` retry can still enforce payload match.
-    admitted_command_inputs: Arc<Mutex<HashMap<String, String>>>,
-    /// Monotonic turn id; used by spawned tasks to detect that a successor
-    /// turn has claimed the slot before they cleared their own entry.
-    next_turn_id: Arc<AtomicU64>,
     /// Session identity for the in-memory worker. It is intentionally opaque
     /// to the browser and never contains request text.
     runtime_session_id: String,
@@ -546,13 +637,9 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// Retained so explicit shutdown can join the worker and report a panic
     /// rather than silently detaching the lifecycle owner.
     runtime_worker_task: Mutex<Option<JoinHandle<()>>>,
-    /// Worker-owned mutation markers registered by the executor. The browser
-    /// adapter reads these only to preserve its actionable "cannot safely
-    /// abort" response after it has asked the runtime to reconcile a turn.
-    active_turn_mutations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Once shutdown begins, no adapter command may start a replacement turn
     /// while the previous in-flight turn is being reconciled.
-    shutting_down: AtomicBool,
+    shutting_down: Arc<AtomicBool>,
     /// A bounded shutdown timed out before its active turn reported a
     /// determinate result. The turn task must not later overwrite the durable
     /// indeterminate state if it happens to finish before process exit.
@@ -566,9 +653,13 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// Optional on-disk session persistence used by `libra code --web-only
     /// --resume <thread_id>` for non-Codex providers.
     persistence: Option<HeadlessSessionPersistence>,
-    /// Runtime-owned Goal/task controls. This is deliberately separate from
-    /// the Code UI adapter so browser control never needs a TUI App hop.
-    execution_control: Arc<ExecutionControlService>,
+    /// Production Code UI write-path owner (submit/cancel/respond/goal/task).
+    runtime_bridge: Arc<AgentRuntimeCodeUiAdapter>,
+    /// Shared with the executor so resume can rehydrate a parked IntentSpec
+    /// review gate after process restart.
+    pending_intent_reviews: Arc<Mutex<HashMap<String, String>>>,
+    /// Shared with the executor for Modify → next plain-message revision.
+    pending_intent_revision: Arc<Mutex<Option<PendingIntentRevision>>>,
 }
 
 impl<M> HeadlessCodeRuntime<M>
@@ -602,6 +693,7 @@ where
             config_factory.clone(),
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -621,6 +713,7 @@ where
         >,
         initial_history: Vec<Message>,
         persistence: Option<HeadlessSessionPersistence>,
+        mcp_server: Option<Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
     ) -> anyhow::Result<Arc<Self>> {
         Self::new_with_persistence_and_shutdown_timeout(
             session,
@@ -632,6 +725,7 @@ where
             config_factory,
             initial_history,
             persistence,
+            mcp_server,
             HEADLESS_SHUTDOWN_TIMEOUT,
         )
         .await
@@ -656,15 +750,16 @@ where
         >,
         initial_history: Vec<Message>,
         persistence: Option<HeadlessSessionPersistence>,
+        mcp_server: Option<Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
         shutdown_timeout: Duration,
     ) -> anyhow::Result<Arc<Self>> {
         let (shutdown_result_tx, _) = watch::channel(None);
         let in_flight = Arc::new(Mutex::new(None));
-        let admitted_command_inputs = Arc::new(Mutex::new(HashMap::new()));
         let history = Arc::new(Mutex::new(initial_history));
         let shutdown_timed_out = Arc::new(AtomicBool::new(false));
         let interaction_persistence_failed = Arc::new(AtomicBool::new(false));
         let active_turn_mutations = Arc::new(Mutex::new(HashMap::new()));
+        let shutting_down = Arc::new(AtomicBool::new(false));
         let tool_boundary = registry.hardening().cloned().ok_or_else(|| {
             anyhow!(
                 "Headless Code runtime requires the registry's shared tool-boundary policy; rebuild CodeAgentServices before starting a browser turn"
@@ -681,7 +776,14 @@ where
         // Capture the shared task runtime before moving the config factory
         // into the turn executor below.
         let subagent_runtime = (config_factory)().subagent_runtime;
-        let executor = Arc::new(HeadlessDirectTurnExecutor {
+        let pending_intent_reviews = Arc::new(Mutex::new(HashMap::new()));
+        let pending_intent_revision = Arc::new(Mutex::new(None));
+        let runtime_session_id = persistence
+            .as_ref()
+            .map(HeadlessSessionPersistence::durability_session_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let executor = Arc::new(HeadlessTurnExecutor {
             session: session.clone(),
             history: history.clone(),
             model: Arc::new(model),
@@ -692,14 +794,12 @@ where
             shutdown_timed_out: shutdown_timed_out.clone(),
             interaction_persistence_failed: interaction_persistence_failed.clone(),
             persistence: persistence.clone(),
+            pending_intent_reviews: pending_intent_reviews.clone(),
+            pending_intent_revision: pending_intent_revision.clone(),
+            mcp_server,
         });
         let mut worker_config = AgentRuntimeWorkerConfig::new(executor, tool_boundary);
         worker_config.shutdown_timeout = shutdown_timeout;
-        let runtime_session_id = persistence
-            .as_ref()
-            .map(HeadlessSessionPersistence::durability_session_id)
-            .map(str::to_owned)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         // Goal JSONL store also supplies session_root so task.dispatch can
         // attach file-history batches (S2-INV-06), matching the TUI `/task` path.
         let execution_control = Arc::new(
@@ -713,17 +813,25 @@ where
             .map_err(|error| anyhow!("failed to restore runtime execution controls: {error}"))?,
         );
         let mut recovered_reconciliation = false;
+        let mut durability_for_adapter = None;
         if let Some(persistence) = persistence.as_ref() {
             let (durability, repo_id, principal_id) = persistence.worker_durability_config();
-            let recovered_mutations = durability.recover_pending_mutations().map_err(|error| {
-                anyhow!(
-                    "failed to recover pending durable commands for headless Code session '{}': {error}",
-                    persistence.durability_session_id()
-                )
-            })?;
+            durability_for_adapter = Some(durability.clone());
+            // An unresolved IntentSpec review proves the Phase 0 draft mutation
+            // finished; complete that one command id and still fence others.
+            let goal_store = persistence.goal_event_store();
+            let review_gate_turn_id = open_review_gate_phase_turn_id(&goal_store);
+            let recovered_mutations = durability
+                .recover_pending_mutations_for_intent_review(review_gate_turn_id.as_deref())
+                .map_err(|error| {
+                    anyhow!(
+                        "failed to recover pending durable commands for headless Code session '{}': {error}",
+                        persistence.durability_session_id()
+                    )
+                })?;
             worker_config = worker_config
                 .with_durability(durability, repo_id, principal_id)
-                .with_durability_command_kind(HEADLESS_DIRECT_TURN_KIND);
+                .with_durability_command_kind(CODE_UI_WEB_TURN_KIND);
             if !recovered_mutations.is_empty() {
                 recovered_reconciliation = true;
                 worker_config = worker_config
@@ -731,24 +839,43 @@ where
             }
         }
         let (runtime_handle, runtime_worker_task) = AgentRuntimeWorker::spawn(worker_config);
+        let web_admission = WebCodeUiAdmission::new(
+            runtime_session_id.clone(),
+            persistence.clone(),
+            in_flight.clone(),
+            active_turn_mutations.clone(),
+            pending_intent_reviews.clone(),
+            shutting_down.clone(),
+        );
+        let runtime_bridge = AgentRuntimeCodeUiAdapter::new_with_web_admission(
+            session.clone(),
+            capabilities.clone(),
+            runtime_handle.clone(),
+            runtime_session_id.clone(),
+            execution_control.clone(),
+            None,
+            durability_for_adapter,
+            Some(web_admission),
+        );
         let runtime = Arc::new(Self {
             model_type: PhantomData,
             session,
-            capabilities,
             in_flight,
-            admitted_command_inputs,
-            next_turn_id: Arc::new(AtomicU64::new(1)),
             runtime_session_id,
             runtime: runtime_handle,
             runtime_worker_task: Mutex::new(Some(runtime_worker_task)),
-            active_turn_mutations,
-            shutting_down: AtomicBool::new(false),
+            shutting_down,
             shutdown_timed_out,
             interaction_persistence_failed,
             shutdown_result_tx,
             persistence,
-            execution_control,
+            runtime_bridge: runtime_bridge.clone(),
+            pending_intent_reviews,
+            pending_intent_revision,
         });
+        runtime_bridge
+            .attach_lifecycle_shutdown(runtime.clone() as Arc<dyn CodeUiLifecycleShutdown>)
+            .await;
 
         let weak_listener = Arc::downgrade(&runtime);
         let user_input_rx = user_input_rx;
@@ -779,14 +906,271 @@ where
                     "failed to persist recovered reconciliation fence for headless Code session"
                 );
             }
+        } else if let Err(error) = runtime.restore_pending_intent_review_gate().await {
+            tracing::error!(
+                error = %error,
+                "failed to restore pending IntentSpec review gate for headless Code session; fencing"
+            );
+            runtime
+                .session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+            if let Some(persistence) = runtime.persistence.as_ref()
+                && let Err(persist_error) = persistence
+                    .persist_snapshot(runtime.session.snapshot().await)
+                    .await
+            {
+                tracing::warn!(
+                    error = %persist_error,
+                    "failed to persist unrestorable IntentSpec review fence"
+                );
+            }
+        } else if let Err(error) = runtime.restore_pending_intent_revision_mode().await {
+            tracing::error!(
+                error = %error,
+                "failed to restore pending IntentSpec revision mode for headless Code session; fencing"
+            );
+            runtime
+                .session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+            if let Some(persistence) = runtime.persistence.as_ref()
+                && let Err(persist_error) = persistence
+                    .persist_snapshot(runtime.session.snapshot().await)
+                    .await
+            {
+                tracing::warn!(
+                    error = %persist_error,
+                    "failed to persist unrestorable IntentSpec revision fence"
+                );
+            }
         }
 
         Ok(runtime)
     }
+
+    /// Production write-path adapter mounted on [`CodeUiRuntimeHandle`].
+    pub fn command_adapter(&self) -> Arc<AgentRuntimeCodeUiAdapter> {
+        self.runtime_bridge.clone()
+    }
+
+    /// Rehydrate an unresolved IntentSpec review after process restart so
+    /// confirm/modify/cancel cannot disappear while a draft remains unconfirmed.
+    async fn restore_pending_intent_review_gate(&self) -> anyhow::Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        if !self.pending_intent_reviews.lock().await.is_empty() {
+            return Ok(());
+        }
+        let store = persistence.goal_event_store();
+        let replay = match store.load_code_workflow_replay() {
+            Ok(replay) => replay,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to load Code workflow replay while restoring IntentSpec review"
+                );
+                return Ok(());
+            }
+        };
+        let Some((interaction_id, intent_id, stored_turn_id, phase0_turn_id)) =
+            open_intent_review_from_workflow(replay.events.iter().map(|event| &event.event))
+        else {
+            return Ok(());
+        };
+
+        // Resolve browser-facing metadata before registering any review gate so
+        // a missing/corrupt intents/{intent_id}.json fences without opening a
+        // blind confirm/modify/cancel interaction.
+        let snapshot = self.session.snapshot().await;
+        let pending = snapshot.interactions.iter().find(|interaction| {
+            interaction.id == interaction_id
+                && interaction.kind == CodeUiInteractionKind::IntentReviewChoice
+                && interaction.status == CodeUiInteractionStatus::Pending
+        });
+        let projection_has_intent_spec = pending
+            .map(|interaction| interaction_metadata_has_intent_spec(&interaction.metadata))
+            .unwrap_or(false);
+        let restored_metadata = if pending.is_none() || !projection_has_intent_spec {
+            Some(restored_intent_review_metadata(
+                persistence,
+                &intent_id,
+                &phase0_turn_id,
+            )?)
+        } else {
+            None
+        };
+
+        let mut review_turn_id = if stored_turn_id.is_empty() {
+            format!("intent-review-restore-{}", uuid::Uuid::new_v4())
+        } else {
+            stored_turn_id
+        };
+        if let Err(error) = self
+            .runtime
+            .track_external_turn(
+                TurnRequest::new(
+                    self.runtime_session_id.clone(),
+                    review_turn_id.clone(),
+                    "IntentSpec review",
+                    false,
+                ),
+                CancellationToken::new(),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+        {
+            let retry_with_fresh_turn = matches!(
+                &error,
+                RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. }
+            );
+            if !retry_with_fresh_turn {
+                return Err(anyhow!(
+                    "An unresolved IntentSpec review ({interaction_id}) could not be restored ({error}). Mutation reconciliation is required before another turn can run."
+                ));
+            }
+            review_turn_id = format!("intent-review-restore-{}", uuid::Uuid::new_v4());
+            if let Err(error) =
+                store.append_code_workflow_durable(CodeWorkflowEventKind::IntentReviewRequested {
+                    interaction_id: interaction_id.clone(),
+                    // Preserve the durable IntentSpec id so a later needs_projection
+                    // rebuild can reload intents/{intent_id}.json instead of opening
+                    // a blind confirm/modify/cancel gate.
+                    intent_id: intent_id.clone(),
+                    turn_id: review_turn_id.clone(),
+                    phase0_turn_id: phase0_turn_id.clone(),
+                })
+            {
+                return Err(anyhow!(
+                    "An unresolved IntentSpec review could not record a replacement gate turn ({error}). Mutation reconciliation is required before another turn can run."
+                ));
+            }
+            if let Err(retry_error) = self
+                .runtime
+                .track_external_turn(
+                    TurnRequest::new(
+                        self.runtime_session_id.clone(),
+                        review_turn_id.clone(),
+                        "IntentSpec review",
+                        false,
+                    ),
+                    CancellationToken::new(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+            {
+                return Err(anyhow!(
+                    "An unresolved IntentSpec review could not be restored ({retry_error}). Mutation reconciliation is required before another turn can run."
+                ));
+            }
+        }
+
+        if let Err(error) = self
+            .runtime
+            .register_interaction_with_delivery(
+                self.runtime_session_id.clone(),
+                review_turn_id.clone(),
+                InteractionState::AwaitingIntentReview {
+                    interaction_id: interaction_id.clone(),
+                },
+                Box::new(HeadlessInteractionDelivery::IntentReview {
+                    session: self.session.clone(),
+                    expected_interaction_id: interaction_id.clone(),
+                    pending_intent_reviews: self.pending_intent_reviews.clone(),
+                    pending_intent_revision: self.pending_intent_revision.clone(),
+                    persistence: self.persistence.clone(),
+                    in_flight: self.in_flight.clone(),
+                    active_turn_mutations: Arc::new(Mutex::new(HashMap::new())),
+                }),
+            )
+            .await
+        {
+            let _ = self
+                .runtime
+                .finish_external_turn(
+                    self.runtime_session_id.clone(),
+                    review_turn_id,
+                    Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                        summary: "restored IntentSpec review gate registration failed".to_string(),
+                    }),
+                )
+                .await;
+            return Err(anyhow!(
+                "An unresolved IntentSpec review could not be re-registered ({error}). Mutation reconciliation is required before another turn can run."
+            ));
+        }
+
+        if let Some(restored_metadata) = restored_metadata {
+            self.session
+                .upsert_interaction(intent_review_choice_interaction(
+                    interaction_id.clone(),
+                    restored_metadata,
+                ))
+                .await;
+        }
+        self.session
+            .set_status(CodeUiSessionStatus::AwaitingInteraction)
+            .await;
+
+        {
+            let mut slot = self.in_flight.lock().await;
+            *slot = Some(InFlightTurn {
+                runtime_turn_id: review_turn_id.clone(),
+                input: "IntentSpec review".to_string(),
+                assistant_entry_id: format!("restored-intent-review-{interaction_id}"),
+                mode: WebTurnMode::PlanPhase0,
+                start_gate: Arc::new(tokio::sync::Notify::new()),
+                start_open: Arc::new(AtomicBool::new(true)),
+                completion: Arc::new(tokio::sync::Notify::new()),
+            });
+        }
+        self.pending_intent_reviews
+            .lock()
+            .await
+            .insert(review_turn_id, interaction_id);
+        Ok(())
+    }
+
+    /// Rehydrate IntentSpec Modify → next-message revision mode after restart.
+    async fn restore_pending_intent_revision_mode(&self) -> anyhow::Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        if !self.pending_intent_reviews.lock().await.is_empty() {
+            return Ok(());
+        }
+        if self.pending_intent_revision.lock().await.is_some() {
+            return Ok(());
+        }
+        let Some(pending) = load_pending_intent_revision(persistence)? else {
+            return Ok(());
+        };
+        *self.pending_intent_revision.lock().await = Some(pending);
+        let help = phase0_revision_help_message();
+        let entry_id = format!("intent-revision-help-restore-{}", uuid::Uuid::new_v4());
+        self.session
+            .upsert_transcript_entry(CodeUiTranscriptEntry {
+                id: entry_id,
+                kind: CodeUiTranscriptEntryKind::AssistantMessage,
+                title: Some("IntentSpec revision".to_string()),
+                content: Some(format!(
+                    "{help} Your next plain-text message will revise the current IntentSpec (restored after resume)."
+                )),
+                status: Some("completed".to_string()),
+                streaming: false,
+                metadata: serde_json::json!({ "intentRevisionMode": true, "restored": true }),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .await;
+        self.session.set_status(CodeUiSessionStatus::Idle).await;
+        Ok(())
+    }
 }
 
 #[async_trait]
-impl<M> RuntimeTurnExecutor for HeadlessDirectTurnExecutor<M>
+impl<M> RuntimeTurnExecutor for HeadlessTurnExecutor<M>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
     M::Response: CompletionUsage,
@@ -796,7 +1180,7 @@ where
         request: TurnRequest,
         context: RuntimeExecutionContext,
     ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
-        let (assistant_entry_id, start_gate, start_open) = {
+        let (assistant_entry_id, start_gate, start_open, turn_mode) = {
             let slot = self.in_flight.lock().await;
             let turn = slot
                 .as_ref()
@@ -811,11 +1195,12 @@ where
                 turn.assistant_entry_id.clone(),
                 turn.start_gate.clone(),
                 turn.start_open.clone(),
+                turn.mode,
             )
         };
 
-        if !wait_for_headless_turn_start(&start_gate, &start_open, context.cancellation()).await {
-            release_headless_turn(&self.in_flight, &request.turn_id).await;
+        if !wait_for_web_turn_start(&start_gate, &start_open, context.cancellation()).await {
+            release_web_turn(&self.in_flight, &request.turn_id).await;
             return Err(RuntimeWorkerError::Cancelled);
         }
 
@@ -825,21 +1210,62 @@ where
             active_turn_mutations.insert(request.turn_id.clone(), mutation_started.clone());
         }
 
+        let intent_draft_json = Arc::new(std::sync::Mutex::new(None));
+        let selected_risk = Arc::new(std::sync::Mutex::new(None));
         let mut observer = HeadlessTurnObserver {
             session: self.session.clone(),
             assistant_entry_id: assistant_entry_id.clone(),
             tool_arguments: Arc::new(std::sync::Mutex::new(HashMap::new())),
             start_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            intent_draft_json: intent_draft_json.clone(),
+            selected_risk: selected_risk.clone(),
         };
         let prior_history = self.history.lock().await.clone();
         let mut config = (self.config_factory)();
+        if turn_mode == WebTurnMode::PlanPhase0 {
+            // Default browser chat uses the TUI Phase 0 allowlist so apply_patch
+            // / shell cannot run before IntentSpec / plan confirmation.
+            config = phase0_plan_tool_loop_config(config);
+        }
+        if let Some(usage_context) = config.usage_context.as_mut() {
+            // The serialized runtime's request id is durable and replay-stable.
+            // It is the single turn/event identity shared by browser retries,
+            // rather than a UI-local counter.
+            usage_context.run_id = Some(request.turn_id.clone());
+            usage_context.turn_id = Some(request.turn_id.clone());
+            usage_context.event_id = Some(format!("runtime-turn:{}", request.turn_id));
+        }
+        if let Some(subagent_runtime) = config.subagent_runtime.as_mut() {
+            // Child usage stays on the parent's durable turn; the child run is
+            // identified separately by its agent_run_id/run_id.
+            subagent_runtime.parent_turn_id = Some(request.turn_id.clone());
+        }
         config.cancellation = Some(ToolLoopCancellation::new(
             context.cancellation(),
             mutation_started,
         ));
         let cancellation = context.cancellation();
-        let request_input = request.input.clone();
+        let request_input = if turn_mode == WebTurnMode::PlanPhase0 {
+            let pending_revision = self.pending_intent_revision.lock().await.take();
+            if let Some(pending) = pending_revision {
+                if let Some(persistence) = self.persistence.as_ref() {
+                    clear_pending_intent_revision(persistence).map_err(|error| {
+                        RuntimeWorkerError::IndeterminateSideEffect(format!(
+                            "failed to clear durable IntentSpec revision mode before starting the revision turn: {error}"
+                        ))
+                    })?;
+                }
+                phase0_revision_prompt(
+                    &pending.intent_spec,
+                    &pending.revision_request(&request.input),
+                )
+            } else {
+                phase0_planning_prompt(&request.input)
+            }
+        } else {
+            request.input.clone()
+        };
         let result = run_tool_loop_with_history_and_observer(
             self.model.as_ref(),
             prior_history,
@@ -888,6 +1314,45 @@ where
                         let mut history = self.history.lock().await;
                         *history = turn.history;
                     }
+                    let parked_intent_review = if turn_mode == WebTurnMode::PlanPhase0 {
+                        intent_draft_json
+                            .lock()
+                            .ok()
+                            .and_then(|mut slot| slot.take())
+                    } else {
+                        None
+                    };
+                    if let Some(draft_json) = parked_intent_review {
+                        let selected_risk = selected_risk.lock().ok().and_then(|slot| slot.clone());
+                        match self
+                            .park_plan_phase0_intent_review(
+                                &request.turn_id,
+                                &assistant_entry_id,
+                                &turn.final_text,
+                                &draft_json,
+                                selected_risk,
+                            )
+                            .await
+                        {
+                            Ok(waiting) => {
+                                self.active_turn_mutations
+                                    .lock()
+                                    .await
+                                    .remove(&request.turn_id);
+                                // Keep `in_flight` until the review settles via
+                                // `respond` so cancel/submit fencing stays live.
+                                return Ok(waiting);
+                            }
+                            Err(error) => {
+                                self.active_turn_mutations
+                                    .lock()
+                                    .await
+                                    .remove(&request.turn_id);
+                                release_web_turn(&self.in_flight, &request.turn_id).await;
+                                return Err(error);
+                            }
+                        }
+                    }
                     finalize_assistant_entry(
                         &self.session,
                         &assistant_entry_id,
@@ -910,13 +1375,25 @@ where
                             error,
                         )
                         .await;
+                        self.active_turn_mutations
+                            .lock()
+                            .await
+                            .remove(&request.turn_id);
+                        release_web_turn(&self.in_flight, &request.turn_id).await;
                         return Err(RuntimeWorkerError::IndeterminateSideEffect(
                             "failed to persist headless web assistant message after a successful mutating turn; session requires reconciliation"
                                 .to_string(),
                         ));
                     }
                     Ok(RuntimeTurnExecution::Completed {
-                        summary: "headless direct turn completed".to_string(),
+                        summary: match turn_mode {
+                            WebTurnMode::PlanPhase0 => {
+                                "web plan phase-0 turn completed".to_string()
+                            }
+                            WebTurnMode::ExplicitDirect => {
+                                "web explicit direct turn completed".to_string()
+                            }
+                        },
                     })
                 }
                 Err(_error) if cancellation.is_cancelled() => {
@@ -968,9 +1445,621 @@ where
             .lock()
             .await
             .remove(&request.turn_id);
-        release_headless_turn(&self.in_flight, &request.turn_id).await;
+        release_web_turn(&self.in_flight, &request.turn_id).await;
         terminal
     }
+
+    async fn respond(
+        &self,
+        request: TurnRequest,
+        interaction: InteractionResponse,
+        _context: RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        if self
+            .pending_intent_reviews
+            .lock()
+            .await
+            .contains_key(&request.turn_id)
+        {
+            return self
+                .settle_plan_phase0_intent_review(&request, interaction)
+                .await;
+        }
+        Err(RuntimeWorkerError::ExecutorDoesNotSupportResponses)
+    }
+}
+
+impl<M> HeadlessTurnExecutor<M>
+where
+    M: CompletionModel + Clone + Send + Sync + 'static,
+    M::Response: CompletionUsage,
+{
+    async fn park_plan_phase0_intent_review(
+        &self,
+        runtime_turn_id: &str,
+        assistant_entry_id: &str,
+        final_text: &str,
+        draft_json: &str,
+        selected_risk: Option<crate::internal::ai::intentspec::RiskLevel>,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let interaction_id = format!("intent-review-{}", uuid::Uuid::new_v4());
+        let review_turn_id = format!("intent-review-gate-{}", uuid::Uuid::new_v4());
+        let (intent_id, spec_json, spec) =
+            resolve_web_phase0_intent_draft(draft_json, self.registry.working_dir(), selected_risk)
+                .map_err(|error| {
+                    RuntimeWorkerError::ExecutionFailed(format!(
+                        "IntentSpec draft could not be resolved before review: {error}"
+                    ))
+                })?;
+
+        // Formal Phase 0 write before the review gate opens. Prefer MCP
+        // `write_intent` when a server is available; otherwise persist the
+        // resolved IntentSpec under the session root so resume/confirm can
+        // reload a durable artifact (not only an in-memory UUID).
+        let intent_id = persist_web_phase0_intent_before_review(
+            self.persistence.as_ref(),
+            self.mcp_server.as_ref(),
+            &spec,
+            intent_id,
+        )
+        .await
+        .map_err(|error| {
+            RuntimeWorkerError::IndeterminateSideEffect(format!(
+                "IntentSpec draft completed but could not be persisted before review; session requires reconciliation: {error}"
+            ))
+        })?;
+
+        if let Some(persistence) = self.persistence.as_ref() {
+            let store = persistence.goal_event_store();
+            if let Err(error) =
+                store.append_code_workflow_durable(CodeWorkflowEventKind::IntentReviewRequested {
+                    interaction_id: interaction_id.clone(),
+                    intent_id: intent_id.clone(),
+                    turn_id: review_turn_id,
+                    phase0_turn_id: runtime_turn_id.to_string(),
+                })
+            {
+                mark_persistence_failure(
+                    &self.session,
+                    "failed to persist IntentSpec review request marker",
+                    error,
+                )
+                .await;
+                return Err(RuntimeWorkerError::IndeterminateSideEffect(
+                    "IntentSpec draft completed but the review marker could not be persisted; session requires reconciliation"
+                        .to_string(),
+                ));
+            }
+            if let Err(error) = persistence
+                .record_assistant_message(self.session.snapshot().await, final_text)
+                .await
+            {
+                mark_persistence_failure(
+                    &self.session,
+                    "failed to persist IntentSpec draft before review gate",
+                    error,
+                )
+                .await;
+                return Err(RuntimeWorkerError::IndeterminateSideEffect(
+                    "failed to persist IntentSpec draft before review gate; session requires reconciliation"
+                        .to_string(),
+                ));
+            }
+        }
+
+        finalize_assistant_entry(
+            &self.session,
+            assistant_entry_id,
+            if final_text.trim().is_empty() {
+                "IntentSpec draft ready for review"
+            } else {
+                final_text
+            },
+            "completed",
+        )
+        .await;
+
+        let interaction = intent_review_choice_interaction(
+            interaction_id.clone(),
+            serde_json::json!({
+                "draft": draft_json,
+                "intentId": intent_id,
+                "intentSpec": spec_json,
+            }),
+        );
+        self.session.upsert_interaction(interaction).await;
+        self.session
+            .set_status(CodeUiSessionStatus::AwaitingInteraction)
+            .await;
+        if let Err(error) =
+            persist_headless_interaction_snapshot(self.persistence.as_ref(), &self.session).await
+        {
+            mark_persistence_failure(
+                &self.session,
+                "failed to persist pending IntentSpec review interaction",
+                error,
+            )
+            .await;
+            return Err(RuntimeWorkerError::IndeterminateSideEffect(
+                "failed to persist pending IntentSpec review interaction; session requires reconciliation"
+                    .to_string(),
+            ));
+        }
+
+        // Keep the gate on the live Phase 0 turn via `AwaitingInteraction` +
+        // `executor.respond`. Do not `register_interaction_with_delivery` from
+        // inside `execute` — that would deadlock the single-threaded worker
+        // actor waiting on this future. Durable `InteractionResolved` is
+        // appended by web admission after `respond` returns Ok (post-terminal).
+        self.pending_intent_reviews
+            .lock()
+            .await
+            .insert(runtime_turn_id.to_string(), interaction_id.clone());
+
+        Ok(RuntimeTurnExecution::AwaitingInteraction(
+            InteractionState::AwaitingIntentReview { interaction_id },
+        ))
+    }
+
+    async fn settle_plan_phase0_intent_review(
+        &self,
+        request: &TurnRequest,
+        interaction: InteractionResponse,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let expected_id = self
+            .pending_intent_reviews
+            .lock()
+            .await
+            .get(&request.turn_id)
+            .cloned();
+        let Some(expected_id) = expected_id else {
+            return Err(RuntimeWorkerError::ExecutionFailed(
+                "no pending IntentSpec review is registered for this web turn".to_string(),
+            ));
+        };
+        if interaction.interaction_id != expected_id {
+            return Err(RuntimeWorkerError::ExecutionFailed(format!(
+                "IntentSpec review response targeted '{}' but pending gate is '{expected_id}'",
+                interaction.interaction_id
+            )));
+        }
+
+        let decision = intent_review_decision_from_response(&interaction)?;
+
+        if decision == IntentReviewDecision::Revise {
+            enter_web_intent_revision_mode(
+                &self.session,
+                self.persistence.as_ref(),
+                &self.pending_intent_revision,
+                &interaction.interaction_id,
+                interaction_note_from_response(&interaction),
+            )
+            .await?;
+        }
+
+        // Live UI only. Durable Code UI snapshot + workflow InteractionResolved
+        // are written by web admission after the worker terminal succeeds and
+        // `respond` returns Ok — so a terminal durability failure cannot leave
+        // a resolved durable projection with nothing left to retry.
+        self.session
+            .resolve_interaction(&interaction.interaction_id)
+            .await;
+        self.session.set_status(CodeUiSessionStatus::Idle).await;
+
+        self.pending_intent_reviews
+            .lock()
+            .await
+            .remove(&request.turn_id);
+        self.active_turn_mutations
+            .lock()
+            .await
+            .remove(&request.turn_id);
+        release_web_turn(&self.in_flight, &request.turn_id).await;
+
+        match decision {
+            IntentReviewDecision::Confirm => Ok(RuntimeTurnExecution::Completed {
+                summary: "IntentSpec confirmed; Phase 1 plan generation remains GATE-WEB-PLAN"
+                    .to_string(),
+            }),
+            IntentReviewDecision::Revise => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary:
+                    "IntentSpec revision mode armed; send a plain message with requested changes"
+                        .to_string(),
+            }),
+            IntentReviewDecision::Cancel => Ok(RuntimeTurnExecution::CompletedDiscardQueued {
+                summary: "IntentSpec review cancelled".to_string(),
+            }),
+        }
+    }
+}
+
+fn interaction_note_from_response(
+    interaction: &crate::internal::ai::runtime::InteractionResponse,
+) -> Option<String> {
+    decode_headless_interaction_response(interaction)
+        .ok()
+        .and_then(|response| response.note)
+        .map(|note| note.trim().to_string())
+        .filter(|note| !note.is_empty())
+}
+
+async fn enter_web_intent_revision_mode(
+    session: &Arc<CodeUiSession>,
+    persistence: Option<&HeadlessSessionPersistence>,
+    pending_intent_revision: &Arc<Mutex<Option<PendingIntentRevision>>>,
+    interaction_id: &str,
+    note: Option<String>,
+) -> Result<(), RuntimeWorkerError> {
+    let snapshot = session.snapshot().await;
+    let spec_json = snapshot
+        .interactions
+        .iter()
+        .find(|interaction| interaction.id == interaction_id)
+        .and_then(|interaction| {
+            interaction
+                .metadata
+                .get("intentSpec")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    interaction
+                        .metadata
+                        .get("intentSpec")
+                        .filter(|value| value.is_object())
+                        .and_then(|value| serde_json::to_string_pretty(value).ok())
+                })
+        })
+        .ok_or_else(|| {
+            RuntimeWorkerError::ExecutionFailed(
+                "Modify was selected but the pending IntentSpec payload is missing from the review gate; cannot enter revision mode"
+                    .to_string(),
+            )
+        })?;
+
+    let pending = PendingIntentRevision {
+        intent_spec: spec_json,
+        note: note.clone(),
+    };
+    if let Some(persistence) = persistence {
+        persist_pending_intent_revision(persistence, &pending).map_err(|error| {
+            RuntimeWorkerError::IndeterminateSideEffect(format!(
+                "IntentSpec revision mode could not be persisted; session requires reconciliation: {error}"
+            ))
+        })?;
+    }
+    *pending_intent_revision.lock().await = Some(pending);
+
+    let mut help = phase0_revision_help_message();
+    if let Some(note) = note {
+        help = format!(
+            "{help}\n\nYour Modify note is retained for the next Phase 0 revision prompt:\n{note}"
+        );
+    } else {
+        help = format!("{help} Your next plain-text message will revise the current IntentSpec.");
+    }
+    let entry_id = format!("intent-revision-help-{}", uuid::Uuid::new_v4());
+    session
+        .upsert_transcript_entry(CodeUiTranscriptEntry {
+            id: entry_id,
+            kind: CodeUiTranscriptEntryKind::AssistantMessage,
+            title: Some("IntentSpec revision".to_string()),
+            content: Some(help),
+            status: Some("completed".to_string()),
+            streaming: false,
+            metadata: serde_json::json!({ "intentRevisionMode": true }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await;
+    Ok(())
+}
+
+fn pending_intent_revision_path(persistence: &HeadlessSessionPersistence) -> std::path::PathBuf {
+    persistence
+        .goal_event_store()
+        .session_root()
+        .join("intents")
+        .join(PENDING_INTENT_REVISION_FILE)
+}
+
+fn persist_pending_intent_revision(
+    persistence: &HeadlessSessionPersistence,
+    pending: &PendingIntentRevision,
+) -> anyhow::Result<()> {
+    let path = pending_intent_revision_path(persistence);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            anyhow!(
+                "failed to create session intents directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let body = serde_json::to_vec_pretty(pending).map_err(|error| {
+        anyhow!("failed to serialize pending IntentSpec revision state: {error}")
+    })?;
+    crate::utils::atomic_write::write_atomic(&path, &body, true).map_err(|error| {
+        anyhow!(
+            "failed to persist pending IntentSpec revision to {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn load_pending_intent_revision(
+    persistence: &HeadlessSessionPersistence,
+) -> anyhow::Result<Option<PendingIntentRevision>> {
+    let path = pending_intent_revision_path(persistence);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow!(
+            "failed to reload pending IntentSpec revision from {}: {error}",
+            path.display()
+        )
+    })?;
+    let pending: PendingIntentRevision = serde_json::from_str(&body).map_err(|error| {
+        anyhow!(
+            "pending IntentSpec revision at {} is invalid: {error}",
+            path.display()
+        )
+    })?;
+    if pending.intent_spec.trim().is_empty() {
+        return Err(anyhow!(
+            "pending IntentSpec revision at {} is missing intentSpec",
+            path.display()
+        ));
+    }
+    Ok(Some(pending))
+}
+
+fn clear_pending_intent_revision(persistence: &HeadlessSessionPersistence) -> anyhow::Result<()> {
+    let path = pending_intent_revision_path(persistence);
+    if path.is_file() {
+        std::fs::remove_file(&path).map_err(|error| {
+            anyhow!(
+                "failed to clear pending IntentSpec revision at {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn intent_review_choice_interaction(
+    interaction_id: String,
+    metadata: serde_json::Value,
+) -> CodeUiInteractionRequest {
+    CodeUiInteractionRequest {
+        id: interaction_id,
+        kind: CodeUiInteractionKind::IntentReviewChoice,
+        title: Some("Review IntentSpec".to_string()),
+        description: Some(
+            "Confirm this IntentSpec before Libra generates an execution plan.".to_string(),
+        ),
+        prompt: None,
+        options: vec![
+            CodeUiInteractionOption {
+                id: "confirm".to_string(),
+                label: "Confirm".to_string(),
+                description: Some(
+                    "Accept the IntentSpec draft (Phase 1 plan generation remains GATE-WEB-PLAN)"
+                        .to_string(),
+                ),
+            },
+            CodeUiInteractionOption {
+                id: "modify".to_string(),
+                label: "Modify".to_string(),
+                description: Some(
+                    "Enter revise mode — your next plain message updates this IntentSpec"
+                        .to_string(),
+                ),
+            },
+            CodeUiInteractionOption {
+                id: "cancel".to_string(),
+                label: "Cancel".to_string(),
+                description: Some("Leave the IntentSpec in place and stop".to_string()),
+            },
+        ],
+        status: CodeUiInteractionStatus::Pending,
+        metadata,
+        requested_at: Utc::now(),
+        resolved_at: None,
+    }
+}
+
+fn intent_review_decision_from_response(
+    interaction: &crate::internal::ai::runtime::InteractionResponse,
+) -> Result<IntentReviewDecision, RuntimeWorkerError> {
+    let code_ui_response = decode_headless_interaction_response(interaction)?;
+    code_ui_response
+        .selected_option
+        .as_deref()
+        .and_then(IntentReviewDecision::from_wire_id)
+        .or_else(|| IntentReviewDecision::from_wire_id(&interaction.response))
+        .ok_or_else(|| {
+            RuntimeWorkerError::ExecutionFailed(format!(
+                "unrecognized IntentSpec review response; expected confirm/modify/cancel (got selected_option={:?})",
+                code_ui_response.selected_option
+            ))
+        })
+}
+
+fn resolve_web_phase0_intent_draft(
+    draft_json: &str,
+    working_dir: &std::path::Path,
+    selected_risk: Option<crate::internal::ai::intentspec::RiskLevel>,
+) -> anyhow::Result<(String, String, crate::internal::ai::intentspec::IntentSpec)> {
+    use crate::internal::ai::{
+        intentspec::{ResolveContext, resolve_intentspec},
+        tools::handlers::submit_intent_draft::parse_submit_intent_draft_value,
+    };
+
+    let draft_value: serde_json::Value = serde_json::from_str(draft_json)
+        .map_err(|error| anyhow!("submitted IntentDraft JSON is invalid: {error}"))?;
+    let args = parse_submit_intent_draft_value(&draft_value)
+        .map_err(|error| anyhow!("submitted IntentDraft could not be parsed: {error}"))?;
+    let draft_risk = args.draft.risk.level.clone();
+    let risk_level = match (selected_risk, draft_risk) {
+        (Some(user_risk), Some(model_risk)) if user_risk != model_risk => {
+            return Err(anyhow!(
+                "risk_profile selection ({user_risk:?}) does not match IntentDraft.risk.level ({model_risk:?})"
+            ));
+        }
+        (Some(user_risk), _) => user_risk,
+        (None, _) => {
+            return Err(anyhow!(
+                "Phase 0 requires a completed risk_profile selection before IntentSpec review"
+            ));
+        }
+    };
+    let spec = resolve_intentspec(
+        args.draft,
+        risk_level,
+        ResolveContext {
+            working_dir: working_dir.display().to_string(),
+            base_ref: "HEAD".to_string(),
+            created_by_id: "web-headless".to_string(),
+        },
+    );
+    let intent_id = spec.metadata.id.clone();
+    let spec_json = serde_json::to_string_pretty(&spec)
+        .map_err(|error| anyhow!("resolved IntentSpec could not be serialized: {error}"))?;
+    Ok((intent_id, spec_json, spec))
+}
+
+async fn persist_web_phase0_intent_before_review(
+    persistence: Option<&HeadlessSessionPersistence>,
+    mcp_server: Option<&Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
+    spec: &crate::internal::ai::intentspec::IntentSpec,
+    fallback_intent_id: String,
+) -> anyhow::Result<String> {
+    let mut intent_id = fallback_intent_id;
+    if let Some(mcp_server) = mcp_server {
+        match crate::internal::ai::runtime::phase0::write_intent(spec, mcp_server).await {
+            Ok(outcome) => {
+                intent_id = outcome.intent_id;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "MCP write_intent failed for web Phase 0; falling back to session-root IntentSpec persistence"
+                );
+            }
+        }
+    }
+    // Always mirror a session-root copy when persistence is available so
+    // resume can reload Confirm/Modify/Cancel after a crash even when the
+    // formal MCP write succeeded (resume does not talk to MCP).
+    if let Some(persistence) = persistence {
+        let intents_dir = persistence
+            .goal_event_store()
+            .session_root()
+            .join("intents");
+        std::fs::create_dir_all(&intents_dir).map_err(|error| {
+            anyhow!(
+                "failed to create session intents directory {}: {error}",
+                intents_dir.display()
+            )
+        })?;
+        let path = intents_dir.join(format!("{intent_id}.json"));
+        let body = serde_json::to_vec_pretty(spec).map_err(|error| {
+            anyhow!("failed to serialize IntentSpec for durable web persistence: {error}")
+        })?;
+        // Recovery-critical: resume reloads this file for Confirm/Modify/Cancel.
+        crate::utils::atomic_write::write_atomic(&path, &body, true).map_err(|error| {
+            anyhow!(
+                "failed to persist IntentSpec to {}: {error}",
+                path.display()
+            )
+        })?;
+        return Ok(intent_id);
+    }
+    // Ephemeral unit tests without SessionStore still park an in-memory gate.
+    Ok(intent_id)
+}
+
+fn interaction_metadata_has_intent_spec(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("intentSpec")
+        .and_then(|value| value.as_str())
+        .is_some_and(|spec| !spec.trim().is_empty())
+        || metadata
+            .get("intentSpec")
+            .is_some_and(|value| value.is_object())
+}
+
+fn load_persisted_web_phase0_intent_spec(
+    persistence: &HeadlessSessionPersistence,
+    intent_id: &str,
+) -> anyhow::Result<String> {
+    if intent_id.trim().is_empty() {
+        return Err(anyhow!(
+            "unresolved IntentSpec review has no durable intent id; session requires reconciliation before confirm/modify/cancel"
+        ));
+    }
+    let path = persistence
+        .goal_event_store()
+        .session_root()
+        .join("intents")
+        .join(format!("{intent_id}.json"));
+    let body = std::fs::read_to_string(&path).map_err(|error| {
+        anyhow!(
+            "failed to reload durable IntentSpec from {}: {error}",
+            path.display()
+        )
+    })?;
+    let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
+        anyhow!(
+            "durable IntentSpec at {} is not valid JSON: {error}",
+            path.display()
+        )
+    })?;
+    // Round-trip through IntentSpec so a corrupt/truncated file cannot open a
+    // review gate with opaque JSON the user cannot meaningfully approve.
+    let _spec: crate::internal::ai::intentspec::IntentSpec = serde_json::from_value(parsed)
+        .map_err(|error| {
+            anyhow!(
+                "durable IntentSpec at {} failed schema validation: {error}",
+                path.display()
+            )
+        })?;
+    Ok(body)
+}
+
+fn restored_intent_review_metadata(
+    persistence: &HeadlessSessionPersistence,
+    intent_id: &str,
+    phase0_turn_id: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let spec_json = load_persisted_web_phase0_intent_spec(persistence, intent_id)?;
+    Ok(serde_json::json!({
+        "restored": true,
+        "phase0TurnId": phase0_turn_id,
+        "intentId": intent_id,
+        "intentSpec": spec_json,
+    }))
+}
+
+fn extract_risk_level_from_user_input(
+    resp: &UserInputResponse,
+) -> Option<crate::internal::ai::intentspec::RiskLevel> {
+    use crate::internal::ai::intentspec::RiskLevel;
+    // Only the Phase 0 risk_profile question is authoritative. Scanning every
+    // follow-up answer would let unrelated text (e.g. "medium priority")
+    // overwrite the user's earlier Low/Medium/High selection.
+    let answer = resp.answers.get("risk_profile")?;
+    for item in &answer.answers {
+        match item.trim().to_ascii_lowercase().as_str() {
+            "low" => return Some(RiskLevel::Low),
+            "medium" => return Some(RiskLevel::Medium),
+            "high" => return Some(RiskLevel::High),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn decode_headless_interaction_response(
@@ -1082,61 +2171,6 @@ async fn persist_headless_interaction_snapshot(
     Ok(())
 }
 
-fn headless_interaction_id(state: &InteractionState) -> Option<&str> {
-    match state {
-        InteractionState::AwaitingIntentReview { interaction_id }
-        | InteractionState::AwaitingPlanReview { interaction_id }
-        | InteractionState::AwaitingNetworkPolicy { interaction_id }
-        | InteractionState::AwaitingUserInput { interaction_id }
-        | InteractionState::AwaitingToolApproval { interaction_id, .. } => Some(interaction_id),
-        InteractionState::Idle
-        | InteractionState::Queued
-        | InteractionState::Running
-        | InteractionState::Cancelling
-        | InteractionState::Completed
-        | InteractionState::Failed { .. }
-        | InteractionState::Cancelled
-        | InteractionState::IndeterminateSideEffect { .. } => None,
-    }
-}
-
-async fn wait_for_headless_turn_start(
-    start_gate: &tokio::sync::Notify,
-    start_open: &AtomicBool,
-    cancellation: CancellationToken,
-) -> bool {
-    loop {
-        if start_open.load(Ordering::Acquire) {
-            return true;
-        }
-        let notified = start_gate.notified();
-        if start_open.load(Ordering::Acquire) {
-            return true;
-        }
-        tokio::select! {
-            _ = notified => {}
-            _ = cancellation.cancelled() => return false,
-        }
-    }
-}
-
-async fn release_headless_turn(in_flight: &Mutex<Option<InFlightTurn>>, runtime_turn_id: &str) {
-    let completion = {
-        let mut slot = in_flight.lock().await;
-        if slot
-            .as_ref()
-            .is_some_and(|turn| turn.runtime_turn_id == runtime_turn_id)
-        {
-            slot.take().map(|turn| turn.completion)
-        } else {
-            None
-        }
-    };
-    if let Some(completion) = completion {
-        completion.notify_waiters();
-    }
-}
-
 #[async_trait]
 impl<M> CodeUiReadModel for HeadlessCodeRuntime<M>
 where
@@ -1148,6 +2182,7 @@ where
     }
 }
 
+/// Thin test/lifecycle forwarder — production mounts [`Self::command_adapter`].
 #[async_trait]
 impl<M> CodeUiCommandAdapter for HeadlessCodeRuntime<M>
 where
@@ -1155,11 +2190,11 @@ where
     M::Response: CompletionUsage,
 {
     fn capabilities(&self) -> CodeUiCapabilities {
-        self.capabilities.clone()
+        self.runtime_bridge.capabilities()
     }
 
     async fn submit_message(&self, text: String) -> anyhow::Result<()> {
-        self.submit_message_with_command_id(text, None).await
+        self.runtime_bridge.submit_message(text).await
     }
 
     async fn submit_message_with_command_id(
@@ -1167,232 +2202,9 @@ where
         text: String,
         command_id: Option<String>,
     ) -> anyhow::Result<()> {
-        if text.trim().is_empty() {
-            return Err(anyhow!("Empty messages are not accepted by libra code"));
-        }
-        self.ensure_not_shutting_down()?;
-        self.ensure_session_is_recoverable().await?;
-        if command_id.is_some() && self.persistence.is_none() {
-            return Err(anyhow!(
-                "commandId requires a resumable headless session with durable command storage; omit commandId or enable session persistence"
-            ));
-        }
-
-        let runtime_turn_id = match command_id {
-            Some(raw) => {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    return Err(anyhow!(
-                        "commandId must be a non-empty string when provided"
-                    ));
-                }
-                if trimmed.chars().count() > 512 {
-                    return Err(anyhow!(
-                        "commandId must be at most 512 characters (got {})",
-                        trimmed.chars().count()
-                    ));
-                }
-                if trimmed
-                    .chars()
-                    .any(|ch| ch.is_control() || ch.is_whitespace())
-                {
-                    return Err(anyhow!(
-                        "commandId must not contain whitespace or control characters"
-                    ));
-                }
-                trimmed.to_string()
-            }
-            None => {
-                // Fresh UUID per submission so resume/restart cannot reuse a prior
-                // durable command identity (numeric counters restart at 1).
-                let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
-                format!("headless-{turn_id}-{}", uuid::Uuid::new_v4())
-            }
-        };
-
-        // Hold the in_flight lock continuously across the check + runtime
-        // admission + slot assignment. Two concurrent submits cannot both
-        // observe an empty slot because the second waiter blocks until the
-        // first has installed its worker request.
-        let mut slot = self.in_flight.lock().await;
-        self.ensure_not_shutting_down()?;
-        if let Some(existing) = slot.as_ref() {
-            // Same caller-stable command id while the turn is still live is an
-            // idempotent network/lease retry only when the payload matches.
-            if existing.runtime_turn_id == runtime_turn_id {
-                if existing.input == text {
-                    return Ok(());
-                }
-                return Err(RuntimeWorkerError::CommandPayloadConflict {
-                    session_id: self.runtime_session_id.clone(),
-                    turn_id: runtime_turn_id,
-                }
-                .into());
-            }
-            return Err(anyhow!(
-                "A turn is already running; cancel it or wait for the assistant to finish before sending another message"
-            ));
-        }
-
-        let user_entry_id = format!("user-{}", uuid::Uuid::new_v4());
-        let assistant_entry_id = format!("assistant-{}", uuid::Uuid::new_v4());
-        let now = Utc::now();
-        let user_entry = CodeUiTranscriptEntry {
-            id: user_entry_id,
-            kind: CodeUiTranscriptEntryKind::UserMessage,
-            title: None,
-            content: Some(text.clone()),
-            status: Some("submitted".to_string()),
-            streaming: false,
-            metadata: serde_json::json!({}),
-            created_at: now,
-            updated_at: now,
-        };
-        let assistant_entry = CodeUiTranscriptEntry {
-            id: assistant_entry_id.clone(),
-            kind: CodeUiTranscriptEntryKind::AssistantMessage,
-            title: None,
-            content: Some(String::new()),
-            status: Some("streaming".to_string()),
-            streaming: true,
-            metadata: serde_json::json!({}),
-            created_at: now,
-            updated_at: now,
-        };
-        let start_gate = Arc::new(tokio::sync::Notify::new());
-        let start_open = Arc::new(AtomicBool::new(false));
-        let completion = Arc::new(tokio::sync::Notify::new());
-        let completion_for_rollback = completion.clone();
-        *slot = Some(InFlightTurn {
-            runtime_turn_id: runtime_turn_id.clone(),
-            input: text.clone(),
-            assistant_entry_id: assistant_entry_id.clone(),
-            start_gate: start_gate.clone(),
-            start_open: start_open.clone(),
-            completion,
-        });
-
-        // Admission occurs before the browser-visible mutation, but the
-        // executor cannot pass its gate until the durable projection and live
-        // transcript below are both ready. This makes the worker the sole
-        // execution owner without weakening the no-untracked-side-effect
-        // persistence precondition above.
-        if let Err(error) = self
-            .runtime
-            .submit(TurnRequest::new(
-                self.runtime_session_id.clone(),
-                runtime_turn_id.clone(),
-                text.clone(),
-                true,
-            ))
+        self.runtime_bridge
+            .submit_message_with_command_id(text, command_id)
             .await
-        {
-            *slot = None;
-            match error {
-                RuntimeWorkerError::IdempotentCommand { ack_ok: true, .. } => {
-                    // Matching payload already pending or succeeded. Treat as a
-                    // successful retry acknowledgement without re-dispatch.
-                    return Ok(());
-                }
-                RuntimeWorkerError::DuplicateTurn { turn_id, .. } if turn_id == runtime_turn_id => {
-                    // Completion race: worker still has this turn active after the
-                    // executor released its slot. Compare against the admitted
-                    // payload so a conflicting retry cannot be silently ACK'd.
-                    let admitted = self
-                        .admitted_command_inputs
-                        .lock()
-                        .await
-                        .get(&runtime_turn_id)
-                        .cloned();
-                    debug_assert!(slot.is_none());
-                    match admitted.as_deref() {
-                        Some(prior) if prior == text => return Ok(()),
-                        _ => {
-                            return Err(RuntimeWorkerError::CommandPayloadConflict {
-                                session_id: self.runtime_session_id.clone(),
-                                turn_id: runtime_turn_id,
-                            }
-                            .into());
-                        }
-                    }
-                }
-                RuntimeWorkerError::IdempotentCommand {
-                    ack_ok: false,
-                    turn_id,
-                    status,
-                    ..
-                } => {
-                    return Err(CodeUiApiError::conflict(
-                        "COMMAND_ALREADY_TERMINAL",
-                        format!(
-                            "commandId '{turn_id}' already finished with state {status}; allocate a new commandId to retry"
-                        ),
-                    )
-                    .into());
-                }
-                RuntimeWorkerError::CommandPayloadConflict { .. }
-                | RuntimeWorkerError::ReconciliationRequired { .. } => {
-                    return Err(error.into());
-                }
-                other => {
-                    return Err(anyhow!(
-                        "Unable to admit the browser turn to the AgentRuntime queue; no turn was started: {}",
-                        runtime_worker_adapter_message(other)
-                    ));
-                }
-            }
-        }
-
-        {
-            // Bound retention for long-lived headless sessions: keep only the
-            // most recent admitted identities for completion-race compare.
-            let mut admitted = self.admitted_command_inputs.lock().await;
-            const ADMITTED_COMMAND_INPUT_LIMIT: usize = 64;
-            admitted.insert(runtime_turn_id.clone(), text.clone());
-            while admitted.len() > ADMITTED_COMMAND_INPUT_LIMIT {
-                if let Some(evict) = admitted.keys().next().cloned() {
-                    if evict == runtime_turn_id {
-                        break;
-                    }
-                    admitted.remove(&evict);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // The executor is gated, so release the local slot lock before the
-        // durable admission checks. A failure below can then cancel the
-        // waiting executor and let it release the slot without any tool call.
-        drop(slot);
-        // The worker has accepted the turn, but its executor is blocked on
-        // `start_gate`. Persist the complete initial projection before opening
-        // that gate or exposing the live transcript. This ordering prevents
-        // both a durable ghost message on rejected admission and an
-        // untracked tool dispatch when SessionStore is unavailable.
-        if let Some(persistence) = self.persistence.as_ref() {
-            let mut durable_snapshot = self.session.snapshot().await;
-            durable_snapshot.transcript.push(user_entry.clone());
-            durable_snapshot.transcript.push(assistant_entry.clone());
-            durable_snapshot.status = CodeUiSessionStatus::Thinking;
-            durable_snapshot.updated_at = now;
-            if let Err(error) = persistence
-                .record_user_message(durable_snapshot, &text)
-                .await
-            {
-                self.cancel_gated_runtime_turn(&runtime_turn_id, completion_for_rollback.clone())
-                    .await?;
-                return Err(anyhow!(
-                    "Unable to persist the headless web message; no turn was started. Verify session storage and retry: {error}"
-                ));
-            }
-        }
-        self.session.upsert_transcript_entry(user_entry).await;
-        self.session.upsert_transcript_entry(assistant_entry).await;
-        self.session.set_status(CodeUiSessionStatus::Thinking).await;
-        start_open.store(true, Ordering::Release);
-        start_gate.notify_waiters();
-        Ok(())
     }
 
     async fn respond_interaction(
@@ -1400,132 +2212,33 @@ where
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> anyhow::Result<()> {
-        self.ensure_not_shutting_down()?;
-        self.ensure_session_is_recoverable().await?;
-        let runtime_turn_id = {
-            let slot = self.in_flight.lock().await;
-            slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
-        };
-        let Some(runtime_turn_id) = runtime_turn_id else {
-            self.session.clear_interaction(interaction_id).await;
-            self.session.set_status(CodeUiSessionStatus::Error).await;
-            return Err(anyhow!(
-                "This interaction has no active AgentRuntime turn and was closed fail-closed"
-            ));
-        };
-        let response_payload = serde_json::to_string(&response).map_err(|error| {
-            anyhow!("Unable to encode the interaction response for AgentRuntime delivery: {error}")
-        })?;
-        self.runtime
-            .respond(
-                self.runtime_session_id.clone(),
-                runtime_turn_id,
-                crate::internal::ai::runtime::InteractionResponse::new(
-                    interaction_id,
-                    response_payload,
-                ),
-            )
+        self.runtime_bridge
+            .respond_interaction(interaction_id, response)
             .await
-            .map_err(|error| {
-                anyhow!("Unable to deliver the interaction response to AgentRuntime: {error}")
-            })
     }
 
     async fn cancel_turn(&self) -> anyhow::Result<()> {
-        self.ensure_not_shutting_down()?;
-        let runtime_turn_id = {
-            let slot = self.in_flight.lock().await;
-            slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
-        };
-        let Some(runtime_turn_id) = runtime_turn_id else {
-            return Ok(());
-        };
-        let runtime_interaction_id = self
-            .runtime
-            .snapshot(self.runtime_session_id.clone())
-            .await
-            .ok()
-            .and_then(|snapshot| {
-                headless_interaction_id(&snapshot.interaction).map(ToOwned::to_owned)
-            });
-
-        let mutation_in_progress = self
-            .active_turn_mutations
-            .lock()
-            .await
-            .get(&runtime_turn_id)
-            .is_some_and(|marker| marker.load(Ordering::Acquire));
-        match self
-            .runtime
-            .cancel(self.runtime_session_id.clone(), runtime_turn_id)
-            .await
-        {
-            Ok(()) | Err(RuntimeWorkerError::UnknownTurn { .. }) => {}
-            Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) => {
-                return Err(error.into());
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "Unable to request cancellation from the AgentRuntime: {}",
-                    runtime_worker_adapter_message(error)
-                ));
-            }
-        }
-        if let Some(interaction_id) = runtime_interaction_id {
-            self.session.clear_interaction(&interaction_id).await;
-        }
-        if mutation_in_progress {
-            return Err(anyhow!(
-                "A mutating tool is already running; cancellation waits for its determinate result and cannot safely abort it"
-            ));
-        }
-        Ok(())
+        self.runtime_bridge.cancel_turn().await
     }
 
     async fn task_dispatch(&self, agent: String, prompt: String) -> anyhow::Result<String> {
-        self.ensure_not_shutting_down()?;
-        self.ensure_session_is_recoverable().await?;
-        self.execution_control.task_dispatch(agent, prompt).await
+        self.runtime_bridge.task_dispatch(agent, prompt).await
     }
 
     async fn goal_start(&self, objective: String) -> anyhow::Result<String> {
-        self.ensure_not_shutting_down()?;
-        self.execution_control
-            .goal_start(objective)
-            .await
-            .map_err(Into::into)
+        self.runtime_bridge.goal_start(objective).await
     }
 
     async fn goal_status(&self) -> anyhow::Result<String> {
-        self.execution_control
-            .goal_status()
-            .await
-            .map_err(Into::into)
+        self.runtime_bridge.goal_status().await
     }
 
     async fn goal_cancel(&self, reason: String) -> anyhow::Result<String> {
-        self.ensure_not_shutting_down()?;
-        self.execution_control
-            .goal_cancel(reason)
-            .await
-            .map_err(Into::into)
+        self.runtime_bridge.goal_cancel(reason).await
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
-        if self
-            .shutting_down
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return self.wait_for_shutdown_result().await;
-        }
-
-        let result = self
-            .shutdown_once()
-            .await
-            .map_err(|error| error.to_string());
-        self.shutdown_result_tx.send_replace(Some(result.clone()));
-        result.map_err(anyhow::Error::msg)
+        CodeUiLifecycleShutdown::shutdown(self).await
     }
 }
 
@@ -1540,40 +2253,6 @@ where
     /// to verify that browser turns are owned by `AgentRuntimeWorker`.
     pub async fn runtime_snapshot(&self) -> Result<AgentSnapshot, RuntimeWorkerError> {
         self.runtime.snapshot(self.runtime_session_id.clone()).await
-    }
-
-    /// Cancel an accepted turn whose executor is still blocked on its durable
-    /// admission gate. The cancellation token wakes that executor before the
-    /// tool loop can run, then the executor releases the local slot.
-    async fn cancel_gated_runtime_turn(
-        &self,
-        runtime_turn_id: &str,
-        completion: Arc<tokio::sync::Notify>,
-    ) -> anyhow::Result<()> {
-        let cancellation_finished = completion.notified();
-        match self
-            .runtime
-            .cancel(self.runtime_session_id.clone(), runtime_turn_id.to_string())
-            .await
-        {
-            Ok(()) => cancellation_finished.await,
-            Err(RuntimeWorkerError::UnknownTurn { .. }) => {
-                // The worker cannot have crossed the closed gate. If it has
-                // already discarded this request, remove the adapter-side
-                // reservation as well so a storage repair can be retried.
-                release_headless_turn(&self.in_flight, runtime_turn_id).await;
-            }
-            Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) => {
-                return Err(error.into());
-            }
-            Err(error) => {
-                return Err(anyhow!(
-                    "The gated AgentRuntime turn could not be cancelled; no tool gate was opened. Verify runtime/session storage before retrying: {}",
-                    runtime_worker_adapter_message(error)
-                ));
-            }
-        }
-        Ok(())
     }
 
     async fn shutdown_once(&self) -> anyhow::Result<()> {
@@ -1617,6 +2296,31 @@ where
                 anyhow!("The headless web runtime stopped before it published the shutdown result")
             })?;
         }
+    }
+}
+
+impl<M> CodeUiLifecycleShutdown for HeadlessCodeRuntime<M>
+where
+    M: CompletionModel + Clone + Send + Sync + 'static,
+    M::Response: CompletionUsage,
+{
+    fn shutdown(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            if self
+                .shutting_down
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return self.wait_for_shutdown_result().await;
+            }
+
+            let result = self
+                .shutdown_once()
+                .await
+                .map_err(|error| error.to_string());
+            self.shutdown_result_tx.send_replace(Some(result.clone()));
+            result.map_err(anyhow::Error::msg)
+        })
     }
 }
 
@@ -1819,25 +2523,6 @@ where
         }
     }
 
-    async fn ensure_session_is_recoverable(&self) -> anyhow::Result<()> {
-        if self.session.snapshot().await.status == CodeUiSessionStatus::IndeterminateSideEffect {
-            return Err(CodeUiApiError::reconciliation_required(
-                "this headless web session has an indeterminate persistence state; restart and inspect its durable session data before sending another request",
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    fn ensure_not_shutting_down(&self) -> anyhow::Result<()> {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return Err(anyhow!(
-                "This headless web runtime is shutting down and cannot accept new commands"
-            ));
-        }
-        Ok(())
-    }
-
     async fn persist_current_snapshot(&self) -> io::Result<()> {
         if let Some(persistence) = self.persistence.as_ref() {
             persistence
@@ -1918,31 +2603,50 @@ fn sync_session_metadata_from_snapshot(
 }
 
 fn request_user_input_question_to_metadata(question: &UserInputQuestion) -> serde_json::Value {
-    let has_options = question
-        .options
-        .as_ref()
-        .is_some_and(|options| !options.is_empty());
-
+    let mut seen_labels = std::collections::HashSet::new();
     let options = question
         .options
         .as_ref()
         .map(|options| {
             options
                 .iter()
-                .map(|option| serde_json::json!({ "id": option.label, "label": option.label }))
+                .filter_map(|option| {
+                    let label = option.label.trim();
+                    if label.is_empty() || !seen_labels.insert(label.to_string()) {
+                        return None;
+                    }
+                    let mut mapped = serde_json::Map::new();
+                    mapped.insert(
+                        "id".to_string(),
+                        serde_json::Value::String(label.to_string()),
+                    );
+                    mapped.insert(
+                        "label".to_string(),
+                        serde_json::Value::String(label.to_string()),
+                    );
+                    if !option.description.trim().is_empty() {
+                        mapped.insert(
+                            "description".to_string(),
+                            serde_json::Value::String(option.description.clone()),
+                        );
+                    }
+                    Some(serde_json::Value::Object(mapped))
+                })
                 .collect::<Vec<_>>()
         })
         .filter(|options| !options.is_empty())
         .unwrap_or_default();
+    let has_options = !options.is_empty();
 
-    let metadata = serde_json::json!({
+    serde_json::json!({
         "id": question.id,
+        "header": question.header,
         "prompt": question.question,
         "kind": if has_options { "single" } else { "text" },
         "options": options,
-    });
-
-    metadata
+        "isOther": question.is_other,
+        "isSecret": question.is_secret,
+    })
 }
 
 fn interaction_request_for_exec_approval(
@@ -2173,6 +2877,10 @@ struct HeadlessTurnObserver {
     /// writes its terminal session status, or their final `Thinking` update
     /// can race with `Idle`/`Error`/`Cancelled`.
     completion_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Successful `submit_intent_draft` payload for PlanPhase0 review parking.
+    intent_draft_json: Arc<std::sync::Mutex<Option<String>>>,
+    /// Authoritative risk_profile answer from `request_user_input` (when asked).
+    selected_risk: Arc<std::sync::Mutex<Option<crate::internal::ai::intentspec::RiskLevel>>>,
 }
 
 impl HeadlessTurnObserver {
@@ -2294,6 +3002,22 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
             .lock()
             .ok()
             .and_then(|mut arguments_by_call| arguments_by_call.remove(call_id));
+        if tool_name == "submit_intent_draft"
+            && matches!(result, Ok(output) if output.is_success())
+            && let Some(arguments) = arguments.as_ref()
+            && let Ok(mut draft) = self.intent_draft_json.lock()
+        {
+            *draft = Some(arguments.to_string());
+        }
+        if tool_name == "request_user_input"
+            && let Ok(output) = result
+            && let Some(content) = output.as_text()
+            && let Ok(resp) = serde_json::from_str::<UserInputResponse>(content)
+            && let Some(level) = extract_risk_level_from_user_input(&resp)
+            && let Ok(mut selected) = self.selected_risk.lock()
+        {
+            *selected = Some(level);
+        }
         // Ordering barrier: take the matching `on_tool_call_begin` task so the
         // end task can await it before writing terminal state. Without this, a
         // late-scheduled start task would clobber "completed" back to "running"
@@ -2506,6 +3230,51 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn request_user_input_question_to_metadata_projects_browser_wire_fields() {
+        use crate::internal::ai::tools::context::UserInputOption;
+
+        let metadata = request_user_input_question_to_metadata(&UserInputQuestion {
+            id: "risk".to_string(),
+            header: "Risk".to_string(),
+            question: "Pick a profile".to_string(),
+            is_other: true,
+            is_secret: true,
+            options: Some(vec![
+                UserInputOption {
+                    label: "Low".to_string(),
+                    description: "Safer".to_string(),
+                },
+                UserInputOption {
+                    label: "   ".to_string(),
+                    description: "blank".to_string(),
+                },
+                UserInputOption {
+                    label: "Low".to_string(),
+                    description: "duplicate".to_string(),
+                },
+                UserInputOption {
+                    label: "High".to_string(),
+                    description: "Faster".to_string(),
+                },
+            ]),
+        });
+
+        assert_eq!(metadata["id"], "risk");
+        assert_eq!(metadata["header"], "Risk");
+        assert_eq!(metadata["prompt"], "Pick a profile");
+        assert_eq!(metadata["kind"], "single");
+        assert_eq!(metadata["isOther"], true);
+        assert_eq!(metadata["isSecret"], true);
+        assert_eq!(
+            metadata["options"],
+            json!([
+                {"id": "Low", "label": "Low", "description": "Safer"},
+                {"id": "High", "label": "High", "description": "Faster"},
+            ])
+        );
+    }
 
     #[test]
     fn headless_capabilities_advertise_projected_plan_and_patchset_surfaces() {
