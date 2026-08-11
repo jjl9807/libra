@@ -1693,7 +1693,7 @@ impl WebApiError {
 /// value are not immediately re-throttled by truncated `as_secs()`.
 fn retry_after_secs_ceil(retry_after: Duration) -> u64 {
     let millis = retry_after.as_millis();
-    let secs = ((millis + 999) / 1000) as u64;
+    let secs = millis.div_ceil(1000) as u64;
     secs.max(1)
 }
 
@@ -1756,10 +1756,10 @@ impl IntoResponse for WebApiError {
             })),
         )
             .into_response();
-        if let Some(secs) = self.retry_after_secs {
-            if let Ok(value) = header::HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, value);
-            }
+        if let Some(secs) = self.retry_after_secs
+            && let Ok(value) = header::HeaderValue::from_str(&secs.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
         }
         response
     }
