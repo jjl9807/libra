@@ -129,7 +129,9 @@ SSE resilience 面板展示 reconnecting / resync-required / resynced 状态，�
 
 Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。
 
-当服务器绑定到非 loopback host 时，非 loopback 浏览器的 HTML navigation 会收到静态 remote access notice，而不是 SPA。该 notice 零 JavaScript，只包含 bind/remote/version/commit 占位符；asset/API fallback 返回 404，使远程 clients 无法探测 session state。
+当服务器绑定到非 loopback host（`--host 0.0.0.0` 或局域网地址）时，非 loopback 浏览器的 HTML navigation 会收到静态 remote access notice，而不是 SPA。该 notice 零 JavaScript，只包含 bind/remote/version/commit 占位符；asset/API fallback 返回 404，使远程 clients 无法探测 session state。Snapshot、transcript、SSE、approval 以及所有 `/api/code/*` 读写 surface 仍保持 loopback-only（`LOOPBACK_REQUIRED`）。远程人工应通过 SSH port-forward 访问 loopback（`ssh -L 3000:127.0.0.1:3000 user@host`），不要期望远端浏览器直接可写；经认证的 TLS 反代属 DEFER-04，不是本计划默认面。
+
+默认监听端口为 `3000`。若该地址已被占用，启动会 fail-closed 并提示显式 `--port`，**不会**自动扫描下一个空闲端口。
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。
 
@@ -228,6 +230,10 @@ libra code --provider anthropic --model claude-sonnet-4-20250514
 
 # 只启动 Web 并绑定所有接口；远程浏览器会看到 loopback-only notice
 libra code --web-only --port 8080 --host 0.0.0.0
+
+# 远程人工应 SSH port-forward 到已绑定的端口，而不是直接开放写面
+# ssh -L 8080:127.0.0.1:8080 user@host
+# 然后在本地浏览 http://127.0.0.1:8080
 
 # 浏览器驱动的本地 Ollama 会话
 libra code --web-only --provider ollama --port 4400
@@ -361,7 +367,7 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 |------|------|------|
 | 同时指定 `--web-only` 和 `--stdio` | Clap 参数冲突错误 | non-zero |
 | 选中 provider 缺少 API key | 带 provider 名称和期望 env var 的 fatal error | non-zero |
-| 端口已被占用 | 带端口号的 fatal error | non-zero |
+| 端口已被占用 | fatal：指出 `host:port`，并要求显式 `--port`（不自动扫描） | non-zero |
 | TUI 模式下没有可用终端 | 回退或报告错误 | non-zero |
 | 恢复时找不到 Thread ID | 带规范 `thread_id` 的 fatal error | non-zero |
 | `--control write --stdio` | 用法错误；MCP stdio 和本地 TUI automation stdio 是不同模式 | non-zero |

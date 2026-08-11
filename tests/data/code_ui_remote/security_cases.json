@@ -145,6 +145,23 @@
       ]
     },
     {
+      "name": "security_host_posture_non_loopback_surfaces_fail_closed",
+      "priority": "P1",
+      "tags": ["host_posture"],
+      "testKind": "inline",
+      "target": "src/internal/ai/web/mod.rs::assert_host_posture_non_loopback_contract",
+      "steps": [
+        {
+          "name": "non-loopback API + remote notice contract",
+          "op": "hostPostureContract",
+          "expect": {
+            "apiErrorCode": "LOOPBACK_REQUIRED",
+            "noticeHasNoToken": true
+          }
+        }
+      ]
+    },
+    {
       "name": "security_non_loopback_session_route_is_inline_unit",
       "priority": "P1",
       "testKind": "inline",

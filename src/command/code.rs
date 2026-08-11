@@ -148,6 +148,7 @@ use crate::{
                     MAX_CODE_UI_PROJECTION_EVENTS, MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
                     rebuild_code_ui_read_model_from_events,
                 },
+                describe_web_bind_error,
                 headless::{
                     HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities,
                 },
@@ -1236,7 +1237,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             )
             .await
             .err();
-            let mut error = CliError::network(format!("failed to start web server: {err}"))
+            let mut error = CliError::network(describe_web_bind_error(&args.host, args.port, &err))
                 .with_detail("component", "web_server");
             if let Some(shutdown_error) = shutdown_error {
                 error = error.with_detail("shutdown", shutdown_error.to_string());
@@ -4033,17 +4034,40 @@ where
             )
             .await
             .err();
-            let mut error = CliError::network(format!("failed to start web server: {err}"))
-                .with_detail("component", "web_server");
+            let mut error =
+                CliError::network(describe_web_bind_error(&params.host, params.port, &err))
+                    .with_detail("component", "web_server");
             if let Some(shutdown_error) = shutdown_error {
                 error = error.with_detail("shutdown", shutdown_error.to_string());
             }
             return Err(error);
         }
-        Err(err) => (
-            None::<WebServerHandle>,
-            format!("Web: failed to start ({err})"),
-        ),
+        Err(err) => {
+            let message = describe_web_bind_error(&params.host, params.port, &err);
+            // W3-11: occupied ports are always fatal (no auto-scan), including the
+            // default TUI + observe path. Other bind failures remain soft so an
+            // optional browser surface does not abort an otherwise healthy TUI.
+            if message.contains("already in use") {
+                let shutdown_error = shutdown_code_lifecycle(
+                    Some(code_ui_runtime_for_app.clone()),
+                    local_turn_runtime
+                        .take()
+                        .map(|runtime| (runtime, local_turn_runtime_task.take())),
+                    None,
+                    None,
+                    managed_codex_for_lifecycle.take(),
+                    None,
+                )
+                .await
+                .err();
+                let mut error = CliError::network(message).with_detail("component", "web_server");
+                if let Some(shutdown_error) = shutdown_error {
+                    error = error.with_detail("shutdown", shutdown_error.to_string());
+                }
+                return Err(error);
+            }
+            (None::<WebServerHandle>, message)
+        }
     };
     if let Err(error) = check_process_terminate(&process_terminate) {
         let shutdown_error = shutdown_code_lifecycle(

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-11, 2026-08-12)
+
+- **W3-11 defines Code UI port/host posture.** Occupied listen ports fail
+  closed with an actionable `--port` hint (no auto-scan), including the default
+  TUI observe path. Non-loopback peers only get the static remote notice;
+  snapshot/SSE/approval/API surfaces stay `LOOPBACK_REQUIRED`. Docs cover SSH
+  port-forward remote access.
+
 ### Added (plan-20260715 W3-10, 2026-08-12)
 
 - **W3-10 hardens Code control sidecar file posture.** `control.json` is
