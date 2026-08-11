@@ -124,6 +124,8 @@ Execution/repair 面板从 live session snapshot 投影 `plans[]`、`toolCalls[]
 
 SSE resilience 面板展示 reconnecting / resync-required / resynced 状态，同时保留最后一次投影的 session snapshot 与 wire 提供的 cursor seq（浏览器从不自造序号）。显式 snapshot resync 走共享 store 的 `refresh()`，仅在 refresh 成功应用（或被更新的 live 更新 superseded）时报告成功；production v2 backlog/resync 事件在后续 wire 卡（W3-06/W3-08）落地，内置 SPA 切换归 W3-09。
 
+Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_choice`（network policy 同 kind，用 `metadata.phase = "networkPolicy"` 区分）。Confirm/modify/cancel（以及 execute / network-allow / network-deny / back）经 leased interaction endpoint 发送 `selectedOption`；当浏览器不能 write 时 turn cancel fail-closed。面板不保存第二套 workflow FSM，等待下一次 snapshot/SSE 更新。
+
 当服务器绑定到非 loopback host 时，非 loopback 浏览器的 HTML navigation 会收到静态 remote access notice，而不是 SPA。该 notice 零 JavaScript，只包含 bind/remote/version/commit 占位符；asset/API fallback 返回 404，使远程 clients 无法探测 session state。
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。

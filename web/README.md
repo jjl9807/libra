@@ -15,17 +15,17 @@ pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Current UI status (W2-07 … W2-15)
+## Current UI status (W2-07 … W2-16)
 
 The shipped page mounts the shared session/SSE store and browser-controller
-lease provider, domain panels through W2-14, and SSE resilience status
-(`SessionSseResilience`: reconnecting / resync-required / resynced banners with
-cursor retention; production v2 backlog wire still W3-06/W3-08). It does not
-yet ship a three-pane workspace, composer, terminal, or workflow tabs.
+lease provider, domain panels through W2-15, and workflow review
+(`SessionWorkflow`: IntentSpec confirm/modify/cancel, Plan execute/modify/cancel,
+and network-policy allow/deny/back as an explicit human gate). It does not yet
+ship a three-pane workspace, composer, or terminal.
 
-W2-15 owns SSE resilience under `web/src/lib/code-ui/sse-resilience/` and
-`web/src/components/workspace/sse-resilience/` without modifying W2-07
-`store.tsx`. Remaining frontend domain card: workflow review W2-16.
+W2-16 owns workflow under `web/src/lib/code-ui/workflow/` and
+`web/src/components/workspace/workflow/` without modifying W2-07 root adapter
+files. Phase 2 frontend domain cards are complete; real browser e2e is W3-15.
 
 ## Live API contract
 
@@ -66,7 +66,8 @@ web/src/
 │   ├── session-lifecycle/     # Thread list / resume / cancel (W2-10)
 │   ├── usage/                 # Usage cumulative / turn / sub-agent (W2-13)
 │   ├── execution-repair/      # Plan execution + repair projection (W2-14)
-│   └── sse-resilience/        # SSE reconnect / resync banners (W2-15)
+│   ├── sse-resilience/        # SSE reconnect / resync banners (W2-15)
+│   └── workflow/              # IntentSpec / Plan / network policy (W2-16)
 └── lib/
     └── code-ui/               # Shared wire types, client, store, controller (W2-07)
         ├── interactions/      # Approval/user-input helpers + fixtures (W2-08)
@@ -74,10 +75,11 @@ web/src/
         ├── session-lifecycle/ # Threads API + resume affordance (W2-10)
         ├── usage/             # W2-12 RuntimeUsageTotals mirror + fixtures (W2-13)
         ├── execution-repair/  # Repair view helpers + fixtures (W2-14)
-        └── sse-resilience/    # Fixture-driven SSE status reducer (W2-15)
+        ├── sse-resilience/    # Fixture-driven SSE status reducer (W2-15)
+        └── workflow/          # Workflow review helpers + fixtures (W2-16)
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders the domain Session* panels through W2-15.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders the domain Session* panels through W2-16.
 
 ## Browser write surface
 
