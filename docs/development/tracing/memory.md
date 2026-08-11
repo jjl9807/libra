@@ -509,7 +509,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 |---|---|---|
 | `schema_version` | `u32` | JSON schema 版本；第一版固定为 `1` |
 | `note_id` | `Uuid` | 同一事实的多个版本之间保持稳定的逻辑标识 |
-| `content_digest` | `String` | 对不含任何存储 OID 的 canonical note payload 计算的 `sha256:<hex>`；用于跨哈希算法比较与幂等校验 |
+| `content_digest` | `String` | 对 canonical note payload 中除 `content_digest` 自身与 `revision_oid` 之外的**内容字段**计算的 `sha256:<hex>`（内容字段的精确清单见 §4.1 规则）；用于跨哈希算法比较与幂等校验 |
 | `namespace` | `String` | 逻辑集合，例如 `default` 或 `codebase:onboard` |
 | `path` | `String` | 分类法路径，例如 `procedural.coding.tabs` |
 | `kind` | enum | `Procedural` / `Semantic` / `Episodic` |
@@ -541,6 +541,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 - `MemoryNote` JSON 必须使用稳定字段名与向后兼容的 serde 策略。新增字段只能 additive，旧 reader 必须忽略未知字段；删除或改变字段语义必须 bump `schema_version` 并提供迁移 / rebuild 逻辑。
 - `revision_oid` 是 `MemoryNote` blob 写入后得到的 Git OID，只存在于 tree path、`MemoryEvent`、返回 envelope 与投影中，**不得**序列化进 `MemoryNote` 正文。否则会出现“正文包含自身哈希”的不可解自引用。
 - canonical JSON 必须固定 UTF-8、字段序、数字与时间格式；`content_digest` 的输入排除该字段本身。读取时同时校验 blob OID 和 `content_digest`，任一不符均视为损坏。
+- **canonical payload 的字段清单（`content_digest` 的唯一规范来源）。** 为消除「digest 不含任何存储 OID」与 `parents` / `evidence_refs` 含 Git OID 之间的冲突，digest 输入被固定为一组**明确列出的内容字段**：`schema_version`、`note_id`、`namespace`、`path`、`kind`、`scope`、`visibility`、`acl_policy_id`、`lifecycle`、`body`、`rationale`、`links`（links 中仅取 `kind` + `target_note_id`，不含 `target_revision_oid`）、`entities`、`tags`、`confidence`、`trust`、`sensitivity`、`valid_from`、`valid_until`、`effective_from_commit`、`effective_until_commit`、`expires_at`、`author`、`created_at`、`compile_record`。**排除**：`content_digest` 自身、`revision_oid`、`evidence_refs`、`parents` 以及任何 Git OID——这些是存储布局 / 引用字段，与正文内容分离，由 blob OID 与事件引用承载完整性。字段清单本身纳入 `schema_version` 的版本化语义：清单变更必须 bump schema 并提供迁移 / rebuild。
 - 一个 `MemoryNote` 快照回答的是**「agent 在这一版本相信什么？」**，且永不被改写。
 - 撤销、取代或遗忘一条记忆都是一个**事件（Event）**，而非对快照的就地编辑；cache prune 不改变 note 生命周期。
 - 对同一 `note_id` 而言，`namespace`、`scope`、`path` 在逻辑上不可变。要移动一条记忆，应写一条新 note 并取代旧的（§10.2）。
@@ -548,7 +549,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 - `valid_from` / `valid_until` 是业务时间；`created_at` / event `at` 是 recorded time；`effective_*_commit` 是 Git DAG 有效性。召回必须先验证当前 code commit 与 anchor 的 ancestry，再考虑 wall-clock 时间。无法证明 ancestry 时标记 stale / not-applicable，不按时间戳猜测。
 - `SecretLike` 的 note 只能以已编辑（redacted）的正文加证据引用的形式存储；它们绝不会被注入 prompt。
 - `SecretLike` 原文及其未加盐普通哈希不得进入 `input_hashes`、事件 reason、receipt 或日志；需要去重时使用本地密钥派生的 HMAC，且 HMAC 不得进入团队 ref。`Confidential` 正文在加密-at-rest 与 publication policy 落地前也不得进入共享 ref 或远端 durable tier。
-- `body` 必须有硬大小上限。第一版建议默认拒绝超过 16 KiB 的正文；更大的内容应存为 `EvidenceRef` 或 onboarding artifact，并在 Memory 中只保留摘要与引用。召回侧的对应模式是「文件即上下文」：此类大体量证据以临时文件句柄交给 agent 按需 read / grep，而非整体注入 prompt（Cursor 的 A/B 实验自报该模式使 token 消耗下降 46.9%，见 §18 开放问题 4 所引分析文章）。
+- `body` 必须有硬大小上限。第一版建议默认拒绝超过 16 KiB 的正文；更大的内容默认存为 `EvidenceRef` 或 onboarding artifact，并在 Memory 中只保留摘要与引用；例外是经 §18.3 明确允许的 LFS 化大正文（内容寻址存储 + 注入预算豁免，见开放问题 3）。召回侧的对应模式是「文件即上下文」：此类大体量证据以临时文件句柄交给 agent 按需 read / grep，而非整体注入 prompt（Cursor 的 A/B 实验自报该模式使 token 消耗下降 46.9%，见 §18 开放问题 4 所引分析文章）。
 - `compile_record` 缺失或不完整的 note 必须在写入事务第 1 步被拒绝（§4.1.1、§4.2.1）；编译记录随正文一同内容寻址，事后不可补写。
 
 #### 4.1.1 `CompileRecord` —— 编译记录（Phase A 硬性门槛）
@@ -564,12 +565,13 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 | `model_id` | `Option<String>` | 参与生产的模型标识；纯确定性路径为 `None` |
 | `policy_version` | `String` | 当时生效的 namespace / promotion policy 版本 |
 | `input_hashes` | `Vec<String>` | 输入对象哈希（源 trace / anchor / frame / 用户文本的规范化哈希），不得为空 |
-| `idempotency_key` | `String` | 对 `origin ‖ scope ‖ namespace ‖ input_hashes ‖ producer 版本族` 计算的 repository-local keyed HMAC；创建时冻结，不进入团队 publication |
+| `idempotency_key` | `String` | 对 `origin ‖ scope ‖ namespace ‖ path ‖ input_hashes ‖ producer 版本族` 计算的 repository-local keyed HMAC；创建时冻结，不进入团队 publication |
+| `idempotency_scope` | enum | `Cell`（默认，去重限定在 `(scope, namespace, path)` 目标 cell 内）/ `Namespace`（显式跨路径去重，仅用于 consolidation / onboard 等聚合入口） |
 
 规则：
 
 - 写入事务（§4.2.1）第 1 步即校验编译记录完整性：`origin` 与调用入口不符、`input_hashes` 为空或幂等键缺失，一律 fail-closed 拒绝写入。
-- 幂等键去重只作用于**新建**（`Created`）：同一 `(scope, namespace)` 内同键重复摄入不产生新 note，直接返回既有 `note_id` 且不追加新事件（与 §4.2 的 event 幂等语义一致）。显式 `revise` / `move` 针对既有 `note_id`，不受其约束。
+- 幂等键去重只作用于**新建**（`Created`）：默认按 `idempotency_scope = Cell` 去重，即同一 `(scope, namespace, path)` cell 内同键重复摄入不产生新 note，直接返回既有 `note_id` 且不追加新事件（与 §4.2 的 event 幂等语义一致）；**不同 path 的目标互不干扰**，调用方显式指定的新路径绝不会被同内容去重静默丢弃（§7.4 纪律）。仅 consolidation / onboard 等聚合入口可显式使用 `idempotency_scope = Namespace`（键不含 path），且必须在编译记录中标注。显式 `revise` / `move` 针对既有 `note_id`，不受其约束。`memory_note_index` 的幂等唯一索引按 §5.2 相应区分两种 scope。
 - LLM 参与生产的 note（`prompt_version` / `model_id` 非空）默认最高只能进入 `Draft`；`trust` 上限沿 §7.3 规则，不因编译记录存在而放宽。
 - 发现某个 producer / prompt / model 版本产出系统性坏记忆时，必须能按编译记录批量定位受影响 note 并 quarantine 或重新编译——这是把编译记录设为硬门槛的直接回报。
 - 编译记录是 note 正文的一部分，随 blob 不可变、可随投影重建；`memory_note_index` 投影为此新增 `origin` 与 `idempotency_key` 列（§5.2），存储创建版本的键以支撑去重与批量召回。
@@ -622,7 +624,7 @@ Memory 遵循与 Libra 其余部分**相同的快照（Snapshot）/ 事件（Eve
 
 所有 mutating Adapter——CLI、hook、MCP、onboarding、consolidation、branch fork、merge 与 cherry-pick——必须调用同一个 `MemoryWriter` Module。其 Interface 接收已认证 principal、目标 scope、写入 proposal 与预期 source ref OID，返回已提交的 `MemoryRecord` envelope / rejection；Implementation 独占下面的 redaction、CompileRecord、schema / ACL / conflict validation、event sequencing、object persistence、CAS 与投影事务。不得暴露「prepare 返回工作目录 → 调用方直接编辑 → commit」的公共 seam，也不得让任何 Adapter 直接更新 memory ref、tree 或 SQLite live projection。
 
-1. 对输入执行 principal / owner filtering、来源标注、路径规范化、大小限制与本地 redaction；任何敏感原文在进入 LLM、hash、日志或对象存储前先移除。随后执行 worthiness，并校验 `CompileRecord` 完整性与幂等键：编译记录缺失即拒绝；同幂等键重复摄入直接返回既有 note，不进入后续步骤。
+1. 对输入执行 principal / owner filtering、来源标注、路径规范化、大小限制与本地 redaction；任何敏感原文在进入 LLM、hash、日志或对象存储前先移除。随后执行 worthiness，并校验 `CompileRecord` 完整性与幂等键：编译记录缺失即拒绝；同幂等键重复摄入按 §4.1.1 的 `idempotency_scope`（默认 Cell）去重——命中的返回既有 note，不进入后续步骤。
 2. 读取目标 ref 的 head、`last_event_seq` 与 policy snapshot；在内存中完成状态转移、冲突、ACL 和 branch-anchor 验证。为本批事件分配连续的 `event_seq`。
 3. 写入 canonical `MemoryNote` blob，取得 `revision_oid`；再写引用该 OID 的 `MemoryEvent` blob并构造**单父** memory commit。
 4. 使用 compare-and-swap 语义更新目标 memory ref：只有当当前 ref 仍等于读取时的旧 OID 时才推进；失败则丢弃未引用 commit，重新读取并从步骤 2 重做，最多重试配置的有界次数。
@@ -735,7 +737,7 @@ ContextReceipt (local ledger) --selected--> MemoryHead[L] / MemoryNote[S]
 
 ### 5.1 Git refs
 
-如 §4 开头所述，Memory 的字节是自定义 JSON blob，存活在自己的 `libra/memory*` ref 上，与内部 AgentRuntime 的对象历史分离。后者位于孤儿分支 `libra/intent`（常量 `AI_REF`，`src/internal/ai/history.rs:90`），承载 git-internal 的 typed AI 对象（Intent/Plan/...）；而外部 agent 捕获位于 `traces`（常量 `TRACES_BRANCH`，`src/internal/branch.rs:40`，文档中写作 `refs/libra/traces`）。Memory 自己的 ref 命名沿用同一约定：
+如 §4 开头所述，Memory 的字节是自定义 JSON blob，存活在自己的 `libra/memory*` ref 上，与内部 AgentRuntime 的对象历史分离。后者位于孤儿分支 `libra/intent`（常量 `AI_REF`，`src/internal/ai/history.rs:92`），承载 git-internal 的 typed AI 对象（Intent/Plan/...）；而外部 agent 捕获位于 `traces`（常量 `TRACES_BRANCH`，`src/internal/branch.rs:42`，文档中写作 `refs/libra/traces`）。Memory 自己的 ref 命名沿用同一约定：
 
 ```text
 refs/libra/intent                              # 现有 AI 工作流对象的孤儿分支（Intent/Plan/...，归 AgentRuntime）
@@ -843,11 +845,16 @@ CREATE TABLE memory_note_index (
     acl_policy_id         TEXT NOT NULL,
     origin                TEXT NOT NULL,
     idempotency_key       TEXT NOT NULL,
+    idempotency_scope     TEXT NOT NULL DEFAULT 'cell',
     created_at            TEXT NOT NULL
 );
--- 幂等键在 (scope, namespace) 内唯一；存储创建版本的键（§4.1.1）。
+-- 幂等键去重（§4.1.1）：默认 Cell scope 在 (scope, namespace, path) 内唯一；
+-- Namespace scope 的聚合入口（consolidation / onboard）在 (scope, namespace) 内唯一。
 CREATE UNIQUE INDEX idx_memory_note_idempotency
-    ON memory_note_index(scope_key, namespace, idempotency_key);
+    ON memory_note_index(scope_key, namespace, path, idempotency_key);
+CREATE UNIQUE INDEX idx_memory_note_idempotency_ns
+    ON memory_note_index(scope_key, namespace, idempotency_key)
+    WHERE idempotency_scope = 'namespace';
 
 -- revision 级 provenance / 影响面索引；可由每个 MemoryNote.compile_record 重建。
 CREATE TABLE memory_revision_index (
@@ -1010,7 +1017,7 @@ CREATE INDEX idx_memory_receipt_time
 - `Public` / `Internal` 仅在 repository storage policy 明确允许时进入远端 durable tier。
 - `Confidential` 默认 local-only；只有加密-at-rest、密钥轮换、删除/retention 和远端 ACL 均有实现与测试后才能 opt-in。
 - `SecretLike` 原文永不进入 ClientStorage；只能存脱敏摘要与受控引用。
-- `LIBRA_STORAGE_THRESHOLD` 只决定对象的存储层级 / cache 行为，不是 LFS 路由，也不能绕过 sensitivity policy。
+- `LIBRA_STORAGE_THRESHOLD` 只决定对象的存储层级 / cache 行为，不是 LFS 路由（LFS 路由规则见 §18.3），也不能绕过 sensitivity policy。
 
 因此 Memory writer 必须在 `ClientStorage::put` 之前完成 sensitivity gate，并验证所有新 OID 已按预期登记进 `object_index`。远端写入失败不得导致 ref 指向接收端无法读取的对象；commit/ref 更新只能在所需对象持久化成功后发生。
 
@@ -1197,7 +1204,7 @@ LLM provider 沿用 libra 既有的 provider 矩阵
 
 LLM 输出必须按 schema 校验：未知 enum、未知 namespace、非法 path、超过路径数量上限、非 JSON、重复 path 或 `propose_new` 与 `paths` 同时违反策略时，全部 fail closed 并记录分类失败事件。不得把 LLM 生成的 `trust` 直接当作事实；`trust` 的最高等级只能由本地证据检查、用户确认或 repo evidence 推导得出。
 
-分类器参与生产的每条 note，必须把本次调用的 prompt 模板版本、模型标识与 taxonomy version 写入 `CompileRecord`（§4.1.1）；`memory_classifier_cache` 的 `cache_key` 即幂等键的组成部分。缓存命中复用的建议同样要在编译记录中标注来源（cache hit），不得伪装成一次新的模型调用。
+分类器参与生产的每条 note，必须把本次调用的 prompt 模板版本、模型标识与 taxonomy version 写入 `CompileRecord`（§4.1.1）；`memory_classifier_cache` 的 `cache_key` 参与 `CompileRecord.input_hashes` 的派生。缓存命中复用的建议同样要在编译记录中标注来源（cache hit），不得伪装成一次新的模型调用。
 
 ### 7.4 阶段 3 —— 路径验证与回退
 
@@ -1279,7 +1286,7 @@ memory.list_prefix(scope, namespace, "procedural.coding.") -> Vec<MemoryPathSumm
 这比分层召回（tiered recall）延迟更低，但在大型分类树上鲁棒性较弱。
 它支撑 `memory recall --mode single`。
 
-### 8.3 分层下钻（引擎内，2–3 次 LLM 调用）
+### 8.3 分层下钻（引擎内，2 次 LLM 调用）
 
 适用于路径未知的自由文本查询：
 
@@ -1314,7 +1321,7 @@ memory.get(scope, namespace, path) -> Vec<MemoryRecord>
    `semantic.*` head，前提是其 scope 与当前分支 / worktree 匹配。「选定」
    意味着该 note 简短、足够新近，且未被取代、未过期、未被隔离、也非
    secret-like。
-3. 对于 `episodic.*`，默认 deterministic profile 按「有效 commit anchor / recorded time / confidence / trust / 与当前任务的标签重叠度」排序前 K 个 head，K 取较小值（5–10）。访问次数只可用于显式的 adaptive profile，且必须冻结统计快照并写入 receipt，否则无法承诺重放。
+3. 对于 `episodic.*`，默认 deterministic profile 按「有效 commit anchor / recorded time / confidence / trust / 与当前任务的标签重叠度」排序前 K 个 head，K 取较小值（5–10）。该排序分量必须满足 §8.6 的可重放边界：**「与当前任务的标签重叠度」所依据的任务上下文（当前 user message 的规范化标签、当前 Run 的 tag 集）必须与查询输入一起冻结进 `ContextReceipt`**，否则同一 view 快照下不同任务上下文会产生不可重放的选择。实现上，任务上下文不作为 `view_hash` 的输入（view 是 session 级冻结状态），而作为每次注入的调用输入写入 receipt 的 `query_hmac` 对应字段；若调用方不提供任务上下文，则该分量退化为常数（不参与排序）。访问次数只可用于显式的 adaptive profile，且必须冻结统计快照并写入 receipt，否则无法承诺重放。
 4. 作为有预算约束的 `ProjectMemory` 与 `MemoryAnchor` 上下文段注入 prompt，
    上限为可配置的 token 天花板（默认 1600 tokens，与既有 `ProjectMemory` 段预算一致，见 `src/internal/ai/context_budget/budget.rs`）。
 
@@ -1466,9 +1473,8 @@ cherry-pick 不能复制原事件序号或绕过目标 namespace policy；它会
 在同一 `note_id` 上写入新 revision，产生新的 immutable blob 与 `Revised` 事件。**修订默认回到 `Draft`**，旧 confirmed revision 在新 revision 获得 `Confirmed` 前继续作为 live head；只有明确 policy 允许且同一原子批次完成验证/确认时，才可直接切换。
 要写入一个应**替换**同一路径下既有 note 的新 note：
 
-1. 写入新的 `MemoryNote`（新的 `note_id`）。
-2. 先让新 note 通过 `Created -> Confirmed`；若未确认，不影响旧 live note。
-3. 在同一 CAS commit 中向旧 note 追加 `Superseded`（`next_note_id = new`），并把 replacement cell 的 `live_revision_oid` 原子切换到新 `revision_oid`。
+1. 写入新的 `MemoryNote`（新的 `note_id`），先通过 `Created -> Confirmed`；若未确认，不影响旧 live note。
+2. **确认新 note 与取代旧 note 必须在同一 CAS 批次内原子完成**：同一事务 / commit 中向旧 note 追加 `Superseded`（`next_note_id = new`）并把 replacement cell 的 `live_revision_oid` 原子切换到新 `revision_oid`。绝不允许「新 note 已 Confirmed、旧 note 仍 live」的中间状态被提交——那会同时出现两条 confirmed live note（§7.5 本应 quarantine 的冲突态），且会把新 note 的错误版本固化进历史。若原子批次失败，整体不提交：新 note 保持 Draft 或按 reason code quarantine，旧 note 继续作为 live head。
 
 旧 note 仍可通过 `libra memory log` 查询，绝不删除。
 
@@ -1724,6 +1730,8 @@ libra memory diff <rev1>..<rev2> [<path>]
 libra memory blame <path>
 libra memory branches                        # 列出 memory 的各个 ref
 libra memory fork --from <scope> --to <scope> [--all-confirmed|--select <id>...]
+libra memory merge <source-ref> [--dry-run]     # 语义三方合并（§9.3），目标 ref 保持单父线性
+libra memory cherry-pick <rev> [--to <scope>] [--dry-run]  # 跨分支提取单个 revision（§9.4）
 libra memory rebuild                         # 从 ref 重建 SQLite 投影
 libra memory materialize [--output <dir>] [--discard-view-edits]
 libra memory show-taxonomy [--root <r>]
@@ -1742,6 +1750,7 @@ libra memory inspect-injection [--last-run|--current]
 - `libra memory recall` 默认使用 `tiered` 模式。
 - `status`、`related` 与 `materialize` 是只读命令：它们可以写本地有界 audit / 可重建视图，但不得推进 memory ref。`materialize --discard-view-edits` 只允许删除 manifest 能证明属于同一 materializer 的投影目录，不能接受任意路径或越过 `.libra/views/memory/` 默认根。
 - `fork` 是 Phase D 的高影响语义写入，必须显式给出 source / target scope；source OID 在 dry-run 与实际执行之间发生变化时 CAS precondition 失败，要求重新预览，不能自动改用最新 source。
+- `merge` / `cherry-pick` 是 Phase D 的高影响语义写入（§9.3 / §9.4）：目标 ref 保持 first-parent 线性，重新分配 event id / seq 并重跑 schema、ACL、sensitivity、evidence 与冲突检查；`--dry-run` 必须报告冲突决议与 reason code，实际执行与 dry-run 之间 target head 变化时 CAS precondition 失败。
 
 ## 13. MCP 命令面
 
@@ -1838,6 +1847,8 @@ agent 捕获使用的 `2026050303_agent_capture.sql` 迁移属于同一模式，
 - `memory_context_receipt`（§8.6，账本类：append-only、豁免 rebuild、按保留策略有界修剪）
 
 只有 `memory_head`、`memory_path_summary`、`memory_note_index`、`memory_revision_index`、`memory_link_index`、`memory_entity_index`、`memory_taxonomy_node`、`memory_projection_state` 可由 `libra memory rebuild` 从 `refs/libra/memory/...` 重建。classifier cache 与 embedding cache 可直接丢弃；access stats 与 receipt 是本地账本，不参与 rebuild。
+
+协调 namespace（§19.3）的**路径占用索引**（§19.4 claim 跨 task 重叠检查）属于可重建投影：它由 `coordination.*` 活 claim 的规范化 `body` 路径范围派生，随 `refs/libra/memory/...` 事件重放重建，删除后可随 rebuild 恢复；其结构与实体索引同模式（见 §19.4 设计边界的索引规模与性能预算）。`CoordinationView`（§19.5）是读取时对该索引的投影视图，不新增独立存储。
 
 值得一提的是模式选择上的对比：Memory 的投影表用 SeaORM entity 建模（与同样可
 重建的 `ai_index_*` 投影同模式），而外部捕获的 `agent_session` /
@@ -2008,7 +2019,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 - 编译记录：各入口（显式 / anchor 提升 / frame 蒸馏 / 分类器 /
   consolidation / onboard / branch fork / import）写入的 note 均携带完整 `CompileRecord`；
   缺失、`origin` 与入口不符或 `input_hashes` 为空时 fail-closed；
-  同幂等键重复摄入返回既有 note 且不追加新事件；可按 producer /
+  同幂等键重复摄入返回既有 note 且不追加新事件（默认 Cell scope，不同 path 不互相去重）；可按 producer /
   prompt / model 版本批量检索受影响 note。
 - 分支污染：创建互相冲突的、分支作用域（branch-scoped）的 memory，
   切换分支，断言 prompt 注入随分支一同改变。
@@ -2066,9 +2077,17 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
    保护。后续可选方案：接入既有的 `LIBRA_STORAGE_*` 信封加密（envelope
    encryption）流水线。
 3. **大体量 memory 的 LFS。** 较长的情节性（episodic）发现（例如一份事故
-   复盘草稿）可能超出合理的内联大小。当某条 memory 正文超过
-   `LIBRA_STORAGE_THRESHOLD` 时，复用 Libra 既有的 LFS 管道
-   （`lfs_structs.rs`、`protocol/lfs_client.rs`）。
+   复盘草稿）可能超出合理的内联大小。§4.1 的正文硬上限（第一版 16 KiB）
+   与 §18.3 的关系按如下分工：**正文超过 16 KiB 的内容默认不进入
+   `MemoryNote.body`**，而存为 `EvidenceRef` 指向的外部 artifact 或
+   onboarding artifact，Memory 中只保留摘要与引用（§4.1，第一版行为）。
+   若某条 episodic 正文**需要**以内联方式保留且超过
+   `LIBRA_STORAGE_THRESHOLD`，才复用 Libra 既有的 LFS 管道
+   （`lfs_structs.rs`、`protocol/lfs_client.rs`）做内容寻址存储；
+   但 LFS 只解决对象寻址 / 存储分层，**不豁免 §4.1 的注入预算与正文
+   上限**——LFS 化的大正文仍不整体注入 prompt（§4.1「文件即上下文」模式）。
+   `LIBRA_STORAGE_THRESHOLD` 只决定对象的存储层级 / cache 行为，不是正文
+   大小的语义上限（§5.3）。
 4. **adaptive profile（向量通道已由 §8.7 收敛；触发已明确）。** 混合检索的「可选向量 + 确定性回退」已定为一等设计；基于 `memory_access_stats.use_count` / `last_used_at` 的**离线训练 / 显式 adaptive profile**（Cursor 实践：统计成功任务中被反复访问的内容，再由 LLM 反推「什么本该更早浮现」，见 [How Does Cursor Index Your Codebase?](https://manthanguptaa.in/posts/how_cursor_index_your_codebase/)，逆向分析博文，数字为 Cursor 自报口径）。**触发信号与硬约束（G15）**：adaptive 仅可在显式 opt-in / 离线训练时启用；触发后必须冻结统计快照 OID/hash 并写入 `ContextReceipt`，不得改写 canonical `MemoryHead.rank_hint`；关闭时默认 deterministic ranking 不受 access stats 影响（§8.7）。
 5. **跨仓库的 memory 联邦（federation）。** 当前不在范围内。一个在多个
    仓库间工作的用户，仍然是每个仓库一份独立的 memory 存储。
@@ -2081,7 +2100,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 
 ## 19. 并行多 Agent 协调 Memory（MEM-06）
 
-> 本节原为独立设计文档 `docs/development/tracing/memory-coordination.md`（2026-08-10 拆分），现合并回本文（2026-08-10）。与主 Memory 设计共享的所有原语、约束与验收口径以本文为准。
+> 本节曾于 2026-08-10 拆分为独立文档 `docs/development/tracing/memory-coordination.md`，现合并回本文（2026-08-10）。与主 Memory 设计共享的所有原语、约束与验收口径以本文为准。
 
 本设计为本文（主 Memory 设计）的**相邻但正交**扩展：多个 Agent 在同一仓库中**并行执行开发工作**时，通过 Memory 通道相互通信与协调。它与持久知识共享同一套基础设施（`MemoryWriter` seam、`refs/libra/memory/*`、事件系统、CAS、Working 缓冲），但语义、生命周期与授权目标不同。本设计**不新增存储层、不新增第二套并发机制**，完全构建在本文 §3（概念模型）/ §4（对象模型）/ §5（存储布局）之上：一个保留 namespace（`coordination`）+ 一个 `MemoryCoordinator` 入口 + 一个 `CoordinationView` 投影，并复用 Working 缓冲（§10.5）与 Trust Gate（§7.5.1）。`CompileRecord.origin` 相应新增 `Coordinator` 值（§4.1.1 的 additive 扩展）。
 
@@ -2104,7 +2123,7 @@ Memory 只有在配齐有针对性的回归覆盖后才发布：
 - 复用现有 Memory 三层模型与 `MemoryWriter` 单一 seam，不新建第二套存储或第二套并发机制。
 - 所有权声明用 CAS 保证**单写者赢**；协调条目带短 TTL 自动过期，防止陈旧声明毒化后续工作。
 - 每个 agent 在 SessionStart 注入当前 `CoordinationView`（活跃声明、待处理移交、未解冲突、同步点），并在 TurnEnd 把协调变更写回。
-- 协调变更默认进入 Working 缓冲（§10.5），仅在达到晋升门槛时巩固为持久 `episodic.*` 或 `procedural.*` note。
+- 协调条目直接写入共享 memory ref（短 TTL），保证跨进程可见与 CAS 单写者赢；Working 缓冲（§10.5）只承接巩固（consolidation）的输入 / 输出，不承载协调条目本身（§19.3）。
 
 **非目标：**
 
@@ -2122,8 +2141,10 @@ coordination.<task-id>.claims             # 任务所有权声明（replacement�
 coordination.<task-id>.handoff            # 移交记录（accretive，追加）
 coordination.<task-id>.progress           # 进度标记（replacement，覆盖）
 coordination.<task-id>.sync-point         # 同步点（accretive，追加）
-coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，追加）
+coordination.conflicts.<encoded-tag>      # 变更面冲突声明（accretive，追加）
 ```
+
+`<task-id>` 是合法动态段（`[A-Za-z0-9-]+`，§6.2）。冲突声明的键是**规范化标签**（如 `overlap-fix` / `api-touch` / `conflict-<n>`），不直接编码文件路径：`body` 中的文件 / 路径范围按 §5.1.1 编码规则规范化，供 §19.4 的路径交叉占用检查使用；路径原文只出现在 `body` 与 `evidence_refs`，绝不作为 taxonomy 段（§6.2 文法不支持 `/` 与 `.`）。
 
 协调条目复用 `MemoryNote` 快照 + `MemoryEvent` 生命周期，但字段语义有协调专属约定：
 
@@ -2136,20 +2157,37 @@ coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，
 | `body` | 有界正文：声明的文件/路径范围、移交的交付物摘要、进度的一行状态 |
 | `evidence_refs` | 移交/冲突可选引用 commit OID / Run / Evidence |
 
-协调条目**默认**是本地 Working 缓冲中的 ephemeral 状态，只有达到晋升门槛（§19.5）才写为持久 `MemoryNote`。为区分，协调写入走 `MemoryWriter` 的一个专门入口 `MemoryCoordinator`（见 §19.4），它复用 `CompileRecord.origin` 的 `Coordinator` 值（§4.1.1 的 additive 扩展）。
+**存储位置（与 §19.2 / §19.4 / §19.5 / §19.7 / §19.8 一致）。** 协调条目（claim / release / handoff / progress / conflict-declare / sync-point）**直接写入共享 memory ref**（`refs/libra/memory/...` 下 Repo scope 的 `coordination` namespace，经 `MemoryWriter.MemoryCoordinator` 与 ref CAS），**不是** Working 缓冲中的 ephemeral 状态：
+
+- 短 TTL 只控制 `CoordinationView` 的可见性与默认召回排除（§19.6）；历史事件与 note 保留在 ref 上可 `libra memory log` 审计（§10.7），这也满足 §19.8「从 refs 可重建」的验收。
+- Working 缓冲（§10.5）只承接**巩固（consolidation）**的输入与输出：归并作业读取近期协调条目 + 原始 observation 摘要，产出候选 semantic / procedural note 并经 Trust Gate 确认；协调条目本身不落 Working 缓冲。若 claim / handoff 只存在本地缓冲，跨进程不可见、`CoordinationView` 只能看到本地声明、单写者赢也无法跨进程由 CAS 保证——那将整体破坏 §19.1 的协调目标。
+
+为区分，协调写入走 `MemoryWriter` 的一个专门入口 `MemoryCoordinator`（见 §19.4），它复用 `CompileRecord.origin` 的 `Coordinator` 值（§4.1.1 的 additive 扩展）。
 
 ### 19.4 `MemoryCoordinator` Module 与并发语义
 
 协调写入**必须**经 `MemoryWriter` 内部的 `MemoryCoordinator` Module（不新增公共 seam，仍符合 §4.2.1「写入只有一个 seam」）：
 
-- **claim（所有权声明）**：`MemoryCoordinator::claim(scope, task_id, paths, principal)`。对 `coordination.<task>.claims` 执行 **CAS 单写者赢**——仅当该 cell 当前无活声明（或声明已过期）时才接受；否则返回 `OwnedBy{other_actor, claim_note_id}`。claim 写为 `Replacement` note，带短 TTL。
+- **claim（所有权声明）**：`MemoryCoordinator::claim(scope, task_id, paths, principal)`。两步校验，两步都通过才接受：
+  1. **cell 占用**：对 `coordination.<task>.claims` 执行 **CAS 单写者赢**——仅当该 cell 当前无活声明（或声明已过期）时才通过；否则返回 `OwnedBy{other_actor, claim_note_id}`。
+  2. **路径交叉占用（跨 task 检查）**：按 §19.3 的 body 路径范围，与其它 `task_id` 的活 claim 的路径范围做重叠检查；发现重叠即拒绝并返回 `PathOwnedBy{other_task_id, other_actor, overlapping_paths}`，**不能只按 task 键控**——§19.1 的问题场景是两个 agent 声称*不同* task、编辑*重叠*文件，若只检查同一 cell，两个 claim 会双双成功，把冲突推迟到 merge 时才暴露。实现上由 `MemoryCoordinator` 维护 / 查询路径占用索引（可复用 `memory_entity_index` 或 §14 新增协调专用投影），路径范围按 §5.1.1 编码规范化。显式 `--force` 或 `force: true` 可覆盖重叠检测（用于「我知道别人也在改」的显式接管），但必须在 claim body 与审计中记录被覆盖的 claim 引用；默认关闭。
+
+  claim 写为 `Replacement` note，带短 TTL。
 - **yield / release**：`release(task_id, claim_id)` 追加 `Revoked` 事件，释放所有权（同 §10.3 撤销，但只作用于协调 cell）。
-- **handoff**：`handoff(task_id, from, to, deliverable_summary, evidence_refs)` 追加 `Accretive` note，写移交记录；`to` 可以是 actor 或 `any`（表示"下一个空闲 agent"）。
+- **ack**：`ack(task_id, handoff_id, from_principal)` 向 `coordination.<task>.handoff` 中对应移交 note 追加 `Confirmed` 事件（Draft → Confirmed，§4.2 合法转移），标记该移交已被接收方确认；`CoordinationView` 据此把该移交移出「待处理」。ack 确认的是**移交记录**，与 claim 无关：所有权释放仍走 `release`，接收方不得直接对源 claim 追加 `Revoked` 或其它事件。
+- **handoff**：`handoff(task_id, from, to, deliverable_summary, evidence_refs)` 追加 `Accretive` note，写移交记录；`to` 可以是 actor 或 `any`（表示"下一个空闲 agent"）。接收方随后 `ack` 闭环（§19.8「移交闭环」）。
 - **progress**：`progress(task_id, status, detail)` 写 `Replacement` note，更新进度标记。
-- **conflict-declare**：`conflict_declare(paths_or_tag, mine, theirs, evidence_refs)` 追加 `Accretive` note 到 `coordination.conflicts.*`，触发 `contradicts` 链接，进入隔离/人工解决（§7.5）。
+- **conflict-declare**：`conflict_declare(paths_or_tag, mine, theirs, evidence_refs)` 追加 `Accretive` note 到 `coordination.conflicts.<encoded-tag>`，触发 `contradicts` 链接，进入隔离/人工解决（§7.5）。
 - **sync-point**：`sync_point(task_id, revision, description)` 追加 `Accretive` note，登记一个可被其他 agent 查询的同步点。
 
-并发语义与 §4.2.1 完全一致：所有协调写入都走 ref CAS + 有界重试；claim 的单写者赢在 `(scope, namespace, path)` cell 上由事件状态机 + CAS 共同保证，**不引入文件系统锁**（§4.2.1 明确 worktree checkout 状态不能充当 writer lock）。
+并发语义与 §4.2.1 完全一致：所有协调写入都走 ref CAS + 有界重试；claim 的单写者赢在 `(scope, namespace, path)` cell 上由事件状态机 + CAS 共同保证，路径交叉占用检查在同一 CAS 批次内完成（读-检查-写不可分），**不引入文件系统锁**（§4.2.1 明确 worktree checkout 状态不能充当 writer lock）。
+
+**设计边界（路径交叉占用的明确范围，实现不得静默扩张或收缩）。**
+
+- **路径范围的表达与粒度。** 第一版 claim 的 `paths` 只支持**精确文件路径列表**（每条按 §5.1.1 规范化后精确匹配）。目录前缀、glob、模糊模式**不支持**：`src/command/status.rs` 与 `src/command/` 目录级声明不视为程序化重叠（是否人工协商由 `conflict_declare` 兜底，见下）。扩展粒度（目录前缀 / glob 求交集）属未来增量，须先定义重叠判定算法与测试再启用；在算法未定义前，任何声称"我覆盖整个目录"的 claim 都必须逐条列出文件或退化为 tag 声明。
+- **索引规模与性能预算。** 每次 claim 的路径交叉占用检查查询所有活 claim 的路径集合。第一版要求 `MemoryCoordinator` 的路径占用索引（§19.4 上文）支持按规范化路径前缀的有界范围查询（keyset 分页 + 上限，沿用 §5.2 的查询纪律）；活 claim 总数与单 claim 路径数均有上限（建议活 claim ≤ 64、单 claim 路径 ≤ 128，超出拒绝并提示拆分）。索引缺失时退化为全量扫描必须显式声明，且仅允许在活 claim 数低于下限的仓库中启用，否则 fail-closed。
+- **非文件冲突维度。** 路径交叉占用只覆盖文件路径。概念区域冲突（API 契约、数据库 schema、共享常量、公共构建产物）路径检查覆盖不到，**不承诺自动检测**；这类冲突仍走 `conflict_declare`（§19.4 上文）这条**手动声明通道**。路径检查之外的重叠不属于缺陷，`conflict_declare` 是唯一受理口。
+- **release 后的索引一致性。** `release(task_id, claim_id)` 追加 `Revoked` 事件后，路径占用索引必须随同一投影事务移除对应路径条目；索引与 ref 历史不一致（如投影重建中断）时按 §5.2 的 watermark 纪律处理——stale 期间路径交叉占用检查 fail-closed，不得基于陈旧占用错误拒绝合法 claim。
 
 ### 19.5 `CoordinationView` 与注入
 
@@ -2157,10 +2195,10 @@ coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，
 
 - 活跃 claims（未过期的所有权声明，含持有者与路径范围）；
 - 待处理 handoff（`to = <me>` 或 `any` 且未 ack）；
-- 未解决 conflicts（`coordination.conflicts.*` 中非终态条目）；
+- 未解决 conflicts（`coordination.conflicts.<encoded-tag>` 中非终态条目，§19.3）；
 - 最近 sync-points（有界数量）。
 
-`CoordinationView` 作为有预算的 prompt 槽位注入（§11.7），**不进入默认持久 recall**；它回答 agent "现在谁在做什么、哪里撞了、我该接手什么"。协调变更在 TurnEnd 经 Working 缓冲回写；达到以下门槛才巩固为持久 note：
+`CoordinationView` 作为有预算的 prompt 槽位注入（§11.7），**不进入默认持久 recall**；它回答 agent "现在谁在做什么、哪里撞了、我该接手什么"。协调变更在 TurnEnd 经 `MemoryCoordinator` 直接写回共享 ref（§19.3，短 TTL）；达到以下门槛才巩固为持久 note：
 
 - claim 的持有者释放后，其历史由 `episodic.coordination.<task>.handoff` 承接（经 Trust Gate 确认）；
 - 一个 sync-point 被 ≥2 个 agent 复用且稳定，可经 consolidation（§10.5）提升为 `procedural.repo.coordination` 或 `semantic.repo.*` 持久 note。
@@ -2177,7 +2215,7 @@ coordination.conflicts.<path-or-tag>      # 变更面冲突声明（accretive，
 | 能力 | MEM-01..05 | MEM-06 协调 |
 |---|---|---|
 | 目的 | 持久知识（记住并召回可复用事实） | 并行工作协调（谁做、交给谁、哪里撞） |
-| 生命周期 | 长期，取代/累加 + 巩固 | 短 TTL ephemeral，默认 Working 缓冲 |
+| 生命周期 | 长期，取代/累加 + 巩固 | 短 TTL ephemeral（可见性 / 召回层面），历史仍在 ref 上可审计 |
 | 注入 | 默认持久 recall + 有界预算 | 独立 `CoordinationView` 槽位 |
 | 写入 | `MemoryWriter` | `MemoryWriter.MemoryCoordinator`（同一 seam） |
 | 晋升 | Trust Gate → Confirmed 持久 note | 仅 sync-point / handoff 稳定后经 consolidation 巩固 |
@@ -2188,11 +2226,15 @@ MEM-06 **不新增存储层、不新增第二套并发机制**，完全构建在
 ### 19.8 验收与验证（对应 plan-long MEM-06）
 
 - **单写者赢**：两个 agent 并发 `claim` 同一 `(task, paths)` cell，断言恰好一个成功、另一个收到 `OwnedBy{other}`；释放后可重新 claim。
-- **移交闭环**：A handoff → B（`to=<me>`）在 SessionStart 注入；B ack 后 A 的声明释放；`to=any` 时任一空闲 agent 可接手。
+- **路径交叉占用**：两个 agent 对**不同 task、重叠路径**并发 `claim`，断言后到者收到 `PathOwnedBy{other_task_id, other_actor, overlapping_paths}` 且不创建新声明；`--force` 接管时 claim 成功但记录被覆盖的 claim 引用；释放后重叠检查放行新 claim。
+- **路径粒度边界**：精确文件路径命中重叠（拒绝）；目录前缀 / glob 声明与精确路径**不**触发程序化拒绝（按 §19.4 设计边界），且该类声明必须能成功落为 tag 声明；单 claim 路径数 / 活 claim 总数超过上限时 claim 被拒绝并返回稳定 reason code。
+- **索引一致性（release 后）**：`release` 后同一路径可被新 claim 立即获取；人为制造投影与 ref 不一致（如跳过 rebuild）时，路径交叉占用检查 fail-closed 而非基于陈旧占用错误拒绝。
+- **非文件冲突兜底**：概念区域冲突（API 契约 / schema / 共享常量）在路径检查不命中时，`conflict_declare` 仍能登记冲突并进入隔离；`CoordinationView` 正常显示未解冲突。
+- **移交闭环**：A handoff → B（`to=<me>`）在 SessionStart 注入；B `ack` 后该移交移出「待处理」，A 经 `release` 释放声明；`to=any` 时任一空闲 agent 可接手。
 - **过期不毒化**：claim 的 TTL 过期后从 `CoordinationView` 排除，历史仍在 `log` 可审计；不因过期条目拒绝新 claim。
 - **冲突声明**：两个 agent 并行改重叠路径，`conflict_declare` 触发 `contradicts` 链接并进入隔离；`CoordinationView` 显示未解冲突。
 - **不越权**：`SecretLike` / `Confidential` 不进协调通道；`actor` 不信任自报。
-- **无第二真源**：协调条目仍从 `refs/libra/memory/*` 可重建；Working 缓冲可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
+- **无第二真源**：协调条目直接写入共享 memory ref、仍从 `refs/libra/memory/*` 可重建；Working 缓冲只承载 consolidation 输入/输出、可丢弃；`MemoryCoordinator` 不绕过 `MemoryWriter`。
 - **与并行工作区衔接**：跨 worktree（§9.1 / [`libra-worktree-architecture.md`](../libra-worktree-architecture.md)）的 agent 都能读到同一 repo 级协调（Repo scope 共享），worktree 级协调按需隔离。
 
 ### 19.9 分阶段与优先级
@@ -2202,8 +2244,8 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 | 阶段 | 内容 |
 |---|---|
 | 前置 | MEM-01（Phase A）、MEM-03（Phase B）先落地 |
-| MEM-06-a | `coordination` namespace + `MemoryCoordinator`（claim/release/handoff/progress）+ 单写者赢 CAS |
-| MEM-06-b | `CoordinationView` 注入（SessionStart）+ TurnEnd Working 回写 |
+| MEM-06-a | `coordination` namespace + `MemoryCoordinator`（claim/release/ack/handoff/progress）+ 单写者赢 CAS + 路径交叉占用检查 |
+| MEM-06-b | `CoordinationView` 注入（SessionStart）+ TurnEnd 协调变更回写共享 ref |
 | MEM-06-c | conflict-declare / sync-point + 经 consolidation 巩固为持久 note |
 
 协调 Memory 的价值在于：它把并行 agent 的隐式协调（靠猜、靠共享文件、靠 merge 后撞冲突）变成显式、可审计、可过期的仓库内通道，与 Libra 的 VCS-native + 事件历史 + 单一 writer 纪律完全同构。
@@ -2231,7 +2273,7 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 | G13 高信任 note 定期再验证 | §7.5 | MEM-03 | P2 | 已落地（§10.6 / §13.1） |
 | G14 `--debug-memory` 升 Phase C 硬交付 | §18 | 可观测性 | P1 | 已落地（§18） |
 | G15 adaptive profile 触发与验收 | §8.7 / §18 | MEM-02 | P2 | 已落地（§18） |
-| D1 MEM-06 拆分独立文档（2026-08-10 评审意见：范围蔓延） | §19 → 独立文档 | 治理 | P1 | 已落地（正文拆分）；2026-08-10 已合并回本文 §19，独立文档删除 |
+| D1 MEM-06 拆分独立文档（2026-08-10 评审意见：范围蔓延） | §19 → 独立文档 | 治理 | P1 | 已落地（正文拆分）；2026-08-10 已合并回本文 §19，独立文档删除；2026-08-10 曾再次拆分至 `memory-coordination.md` 后重新合并回本文 §19，独立文档删除（最终决定：MEM-06 内容保持在本文，避免双文档漂移） |
 
 ### 20.2 差距清单（G1–G11）
 
@@ -2259,7 +2301,7 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 
 ### 20.4 本地竞品语料与机制分析（第六次审计，revision 引脚）
 
-范围：`/Volumes/Data/competition/*/*` 30 个仓库中 Memory 类 11 个 + 相邻参考 3 个。所有 revision 为 2026-08-07 第六次同步后的本地 HEAD。
+范围：`/Volumes/Data/competition/*/*` 30 个仓库中 Memory 类 11 个 + 相邻参考 3 个。所有 revision 为 2026-08-07 第六次同步后的本地 HEAD；唯一例外是 `letta-ai/letta-code` 已按第七次审计（2026-08-09）更新为 `a75f4d93`（`ac359eeb`→`a75f4d93`，新增 worktree 工具，与 Memory 核心无关，见 §0.0.4）。
 
 | 项目 | revision | 承重机制（已验证入口） | 取舍 |
 |---|---|---|---|
@@ -2273,7 +2315,7 @@ MEM-06 依赖 MEM-01（存储/隐私）与 MEM-03（Trust Gate / 巩固），建
 | `ruvnet/agentic-flow` | `d3735a3` | 编排 + 自学习 hooks + 记忆/trajectory；66 agents / 213 MCP tools / QuantumDAG（README） | 宣传口径，不作证据 |
 | `letta-ai/trajectory` | `59c0db5` | 多 runtime transcript 归一化为验证记录；`diagnostics` 恒存在（README） | 采纳为外部 transcript 导入前置（A5，与 AG-ATTR 衔接） |
 | `letta-ai/agent-file` | `78212eb` | `.af` 开放格式：identity / memory blocks / skills / settings；可 checkpoint 与版本控制（README） | 采纳子集评估（A5）；完整云生态绑定不采纳 |
-| `letta-ai/letta-code` | `ac359eeb` | memory blocks（agent 自改写）；MemFS（全部上下文 git 跟踪）；`/sleeptime` dreaming；`/doctor` / `/palace`；三级 skills（README） | 采纳记忆块投影与排期巩固（A3/A5）；「自改 harness」哲学不采纳 |
+| `letta-ai/letta-code` | `a75f4d93` | memory blocks（agent 自改写）；MemFS（全部上下文 git 跟踪）；`/sleeptime` dreaming；`/doctor` / `/palace`；三级 skills（README） | 采纳记忆块投影与排期巩固（A3/A5）；「自改 harness」哲学不采纳 |
 | `letta-ai/skills` | `16352df` | 社区 skill 知识库 + peer review（README） | 参考 skill 投影（A5） |
 | 相邻：`facebook/sapling` | `119e6d1f75d` | Crewmate 私有目录授权钩子：默认 deny、有界授权扇出（commit 119e6d1f75d） | 参考团队 publication 的 fail-closed 授权（A6） |
 
