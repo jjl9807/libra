@@ -7,6 +7,7 @@ pub mod agent_runtime_adapter;
 pub mod code_ui;
 pub mod code_ui_projection;
 pub mod headless;
+pub mod web_admission;
 
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
@@ -28,6 +29,7 @@ use serde::Serialize;
 use tokio::{sync::oneshot, time::timeout};
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 use uuid::Uuid;
+pub use web_admission::{CODE_UI_WEB_TURN_KIND, WebTurnMode, should_route_plain_message_to_plan};
 
 use self::code_ui::{
     CodeUiApiError, CodeUiControllerDetachRequest, CodeUiControllerKind, CodeUiGoalCancelRequest,

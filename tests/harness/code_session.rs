@@ -84,6 +84,11 @@ pub struct CodeSessionOptions {
     /// matrix uses this for `--deepseek-thinking enabled
     /// --deepseek-reasoning-effort high`.
     pub extra_cli_args: Vec<String>,
+    /// W3-02 — when `true` (default), spawn `libra code --web-only` so
+    /// Code UI remote matrices drive a headless Web process over HTTP/SSE
+    /// rather than the default TUI. Set `false` only for scenarios that
+    /// intentionally exercise TUI reclaim / PTY lifecycle.
+    pub web_only: bool,
 }
 
 impl CodeSessionOptions {
@@ -104,7 +109,15 @@ impl CodeSessionOptions {
             model_override: None,
             env_file: None,
             extra_cli_args: Vec::new(),
+            web_only: true,
         }
+    }
+
+    /// Keep the historical PTY + default-TUI spawn for reclaim / SIGTERM
+    /// scenarios that still need a live terminal controller.
+    pub fn with_pty_tui(mut self) -> Self {
+        self.web_only = false;
+        self
     }
 
     /// Wave 11 / PR 11 — point the spawn at a live provider
@@ -222,6 +235,8 @@ pub struct CodeSession {
     /// sessions never get a control token file, so the harness should not
     /// look for one and authorized POSTs are limited to non-write routes.
     control_write: bool,
+    /// W3-02: when true, the child is `--web-only` (no TUI `/quit` path).
+    web_only: bool,
     child: Option<Box<dyn Child + Send + Sync>>,
     writer: Option<Box<dyn Write + Send>>,
     reader_thread: Option<thread::JoinHandle<()>>,
@@ -344,8 +359,12 @@ impl CodeSession {
         // wave's expected argv exactly.
         let provider_arg = options.provider_override.as_deref().unwrap_or("fake");
         let model_arg = options.model_override.as_deref().unwrap_or("fake-local");
+        cmd.args(["code"]);
+        if options.web_only {
+            // W3-02: Code UI matrices target the headless Web process.
+            cmd.arg("--web-only");
+        }
         cmd.args([
-            "code",
             "--provider",
             provider_arg,
             "--model",
@@ -420,6 +439,7 @@ impl CodeSession {
             control_token: String::new(),
             controller_token: None,
             control_write: options.control_write,
+            web_only: options.web_only,
             child: Some(child),
             writer: Some(writer),
             reader_thread: Some(reader_thread),
@@ -1250,6 +1270,11 @@ impl CodeSession {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
+        if self.web_only {
+            // Headless Web has no TUI `/quit` reader — SIGTERM the process so
+            // control-file cleanup still runs through the lifecycle owner.
+            return self.terminate_without_cleanup();
+        }
         if let Some(writer) = self.writer.as_mut() {
             let _ = writer.write_all(b"/quit\r");
             let _ = writer.flush();

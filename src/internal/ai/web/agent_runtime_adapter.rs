@@ -3,25 +3,33 @@
 //! The adapter deliberately owns no TUI state.  Its session is the event
 //! projection cache used by the HTTP/SSE surface; commands are admitted,
 //! responded to, and cancelled by the serialized runtime worker.
+//!
+//! For `--web-only` non-Codex launches, optional [`WebCodeUiAdmission`] supplies
+//! persist-before-gate transcript semantics and plan-vs-explicit routing while
+//! this adapter remains the mounted [`CodeUiCommandAdapter`] write-path owner.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::code_ui::{
-    CodeUiCapabilities, CodeUiCommandAdapter, CodeUiInteractionResponse, CodeUiReadModel,
-    CodeUiSession,
+use super::{
+    code_ui::{
+        CodeUiApiError, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiInteractionResponse,
+        CodeUiReadModel, CodeUiSession,
+    },
+    web_admission::WebCodeUiAdmission,
 };
 use crate::internal::ai::{
     agent::runtime::{RuntimeUsageService, RuntimeUsageTotals},
     observed_agents::{IndexedSkillEvent, SkillEventProjection},
     runtime::{
         AgentEventKind, AgentRuntimeHandle, CodeSkillActivation, CodeSkillSearch, EventCursor,
-        ExecutionControlService, InteractionResponse, RuntimeCommandDurability, RuntimeWorkerError,
-        TurnRequest, runtime_worker_adapter_message,
+        ExecutionControlService, InteractionResponse, InteractionState, RuntimeCommandDurability,
+        RuntimeWorkerError, TurnRequest, runtime_worker_adapter_message,
     },
     usage::UsageQueryFilter,
 };
@@ -30,6 +38,11 @@ use crate::internal::ai::{
 struct ActiveTurnSlot {
     turn_id: String,
     text: String,
+}
+
+/// Process-level shutdown hook for web-owned adapter mounts.
+pub trait CodeUiLifecycleShutdown: Send + Sync {
+    fn shutdown(&self) -> BoxFuture<'_, Result<()>>;
 }
 
 /// Production Code UI command bridge backed by the serialized Agent runtime.
@@ -46,6 +59,13 @@ pub struct AgentRuntimeCodeUiAdapter {
     usage: Option<RuntimeUsageService>,
     durability: Option<RuntimeCommandDurability>,
     active_turn: Arc<Mutex<Option<ActiveTurnSlot>>>,
+    /// When set, browser submit/cancel/respond use persist-before-gate web
+    /// admission (W3-03) instead of the lightweight managed-session path.
+    web_admission: Option<Arc<WebCodeUiAdmission>>,
+    /// Optional lifecycle shutdown for web-only mounts (worker join, fence).
+    /// Held as [`Weak`] so the adapter does not form a retain cycle with the
+    /// headless lifecycle host (`Headless` → adapter → host).
+    lifecycle_shutdown: Arc<Mutex<Option<Weak<dyn CodeUiLifecycleShutdown>>>>,
 }
 
 impl AgentRuntimeCodeUiAdapter {
@@ -59,6 +79,30 @@ impl AgentRuntimeCodeUiAdapter {
         usage: Option<RuntimeUsageService>,
         durability: Option<RuntimeCommandDurability>,
     ) -> Arc<Self> {
+        Self::new_with_web_admission(
+            session,
+            capabilities,
+            runtime,
+            runtime_session_id,
+            execution_control,
+            usage,
+            durability,
+            None,
+        )
+    }
+
+    /// Construct the production adapter with optional web admit semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_web_admission(
+        session: Arc<CodeUiSession>,
+        capabilities: CodeUiCapabilities,
+        runtime: AgentRuntimeHandle,
+        runtime_session_id: impl Into<String>,
+        execution_control: Arc<ExecutionControlService>,
+        usage: Option<RuntimeUsageService>,
+        durability: Option<RuntimeCommandDurability>,
+        web_admission: Option<Arc<WebCodeUiAdmission>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             session,
             capabilities,
@@ -68,14 +112,26 @@ impl AgentRuntimeCodeUiAdapter {
             usage,
             durability,
             active_turn: Arc::new(Mutex::new(None)),
+            web_admission,
+            lifecycle_shutdown: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Attach process shutdown for a web-only mount after the lifecycle host
+    /// `Arc` exists. Uses [`Weak`] so dropping the externally retained host
+    /// (or [`super::code_ui::CodeUiRuntimeHandle`]) can tear down the worker
+    /// without an adapter↔host retain cycle.
+    pub async fn attach_lifecycle_shutdown(&self, shutdown: Arc<dyn CodeUiLifecycleShutdown>) {
+        *self.lifecycle_shutdown.lock().await = Some(Arc::downgrade(&shutdown));
     }
 
     fn turn_id(&self, command_id: Option<String>) -> Result<String> {
         match command_id {
-            Some(_command_id) if self.durability.is_none() => Err(anyhow!(
-                "commandId requires durable AgentRuntime command storage; omit commandId or resume this Code session"
-            )),
+            Some(_command_id) if self.durability.is_none() && self.web_admission.is_none() => {
+                Err(anyhow!(
+                    "commandId requires durable AgentRuntime command storage; omit commandId or resume this Code session"
+                ))
+            }
             Some(command_id) if command_id.trim().is_empty() => Err(anyhow!(
                 "commandId must be a non-empty string when provided"
             )),
@@ -187,6 +243,11 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
         text: String,
         command_id: Option<String>,
     ) -> Result<()> {
+        if let Some(admission) = self.web_admission.as_ref() {
+            return admission
+                .submit_message_with_command_id(&self.runtime, &self.session, text, command_id)
+                .await;
+        }
         if text.trim().is_empty() {
             return Err(anyhow!("Empty messages are not accepted by libra code"));
         }
@@ -251,13 +312,25 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> Result<()> {
+        if let Some(admission) = self.web_admission.as_ref() {
+            return admission
+                .respond_interaction(&self.runtime, &self.session, interaction_id, response)
+                .await;
+        }
         let turn_id = self
             .active_turn
             .lock()
             .await
             .as_ref()
             .map(|slot| slot.turn_id.clone())
-            .ok_or_else(|| anyhow!("This interaction has no active AgentRuntime turn"))?;
+            .ok_or_else(|| {
+                anyhow!(CodeUiApiError::conflict(
+                    "INTERACTION_NOT_ACTIVE",
+                    format!(
+                        "interaction '{interaction_id}' has no active AgentRuntime turn to receive a response"
+                    )
+                ))
+            })?;
         let response = serde_json::to_string(&response)
             .map_err(|error| anyhow!("failed to encode interaction response: {error}"))?;
         self.runtime
@@ -271,6 +344,28 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
     }
 
     async fn cancel_turn(&self) -> Result<()> {
+        if let Some(admission) = self.web_admission.as_ref() {
+            return admission
+                .cancel_turn(&self.runtime, &self.session, |state| match state {
+                    InteractionState::AwaitingIntentReview { interaction_id }
+                    | InteractionState::AwaitingPlanReview { interaction_id }
+                    | InteractionState::AwaitingPlanRepair { interaction_id }
+                    | InteractionState::AwaitingNetworkPolicy { interaction_id }
+                    | InteractionState::AwaitingUserInput { interaction_id }
+                    | InteractionState::AwaitingToolApproval { interaction_id, .. } => {
+                        Some(interaction_id.as_str())
+                    }
+                    InteractionState::Idle
+                    | InteractionState::Queued
+                    | InteractionState::Running
+                    | InteractionState::Cancelling
+                    | InteractionState::Completed
+                    | InteractionState::Failed { .. }
+                    | InteractionState::Cancelled
+                    | InteractionState::IndeterminateSideEffect { .. } => None,
+                })
+                .await;
+        }
         let turn_id = self
             .active_turn
             .lock()
@@ -289,10 +384,19 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
     }
 
     async fn task_dispatch(&self, agent: String, prompt: String) -> Result<String> {
+        if let Some(admission) = self.web_admission.as_ref() {
+            admission.ensure_not_shutting_down()?;
+            admission
+                .ensure_session_is_recoverable(&self.session)
+                .await?;
+        }
         self.execution_control.task_dispatch(agent, prompt).await
     }
 
     async fn goal_start(&self, objective: String) -> Result<String> {
+        if let Some(admission) = self.web_admission.as_ref() {
+            admission.ensure_not_shutting_down()?;
+        }
         self.execution_control
             .goal_start(objective)
             .await
@@ -307,9 +411,25 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
     }
 
     async fn goal_cancel(&self, reason: String) -> Result<String> {
+        if let Some(admission) = self.web_admission.as_ref() {
+            admission.ensure_not_shutting_down()?;
+        }
         self.execution_control
             .goal_cancel(reason)
             .await
             .map_err(Into::into)
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let hook = self
+            .lifecycle_shutdown
+            .lock()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(hook) = hook {
+            return hook.shutdown().await;
+        }
+        Ok(())
     }
 }

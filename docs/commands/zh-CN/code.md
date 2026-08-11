@@ -131,7 +131,7 @@ Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_c
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。
 
-对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs)，浏览器 submit 会先进入串行的 `AgentRuntimeWorker`，再由其 executor 运行标准 agent tool loop，使浏览器可以驱动真实会话，无需终端。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
+对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走与 TUI 等价的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop。完整 IntentSpec → Phase 1 → repair 对等仍属 GATE-WEB-PLAN。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
 
 ### Code UI Wire Contract
 
@@ -171,6 +171,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |
 | `INVALID_CONTROLLER_KIND` | 400 | Controller attach 请求了不支持的 kind。 |
 | `CONTROLLER_CONFLICT` | 409 | 另一个 live controller 拥有 lease，或会话正忙。 |
+| `INTERACTION_NOT_ACTIVE` | 409 | respond 目标 interaction 没有活跃的 runtime turn。 |
 | `BROWSER_CONTROL_DISABLED` | 403 | 浏览器写控制已禁用。 |
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | 用非 automation lease 调用了 automation-only 路径。 |
 | `CODE_UI_UNAVAILABLE` | 404 | 没有 active `libra code` session 附加到 Web 服务器。 |

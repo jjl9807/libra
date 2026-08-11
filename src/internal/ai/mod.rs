@@ -154,6 +154,8 @@ pub mod util;
 pub mod web;
 // Persisted workflow object types (plans, executions, results).
 pub mod workflow_objects;
+// W0-02 frozen IntentSpec / Plan / network / repair baseline contracts.
+pub mod workflow_baseline;
 // Snapshot of the workspace consumed by tool calls and validators.
 pub mod workspace_snapshot;
 

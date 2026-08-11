@@ -13627,7 +13627,7 @@ fn parse_pending_plan_revision_command(args: &str) -> PendingPlanRevisionCommand
 }
 
 fn pending_plan_revision_help_message() -> String {
-    "IntentSpec revise mode is active. Describe changes in plain text, use `/intent modify <changes>` to keep revising, or `/intent cancel` to exit.".to_string()
+    crate::internal::ai::runtime::phase0::phase0_revision_help_message()
 }
 
 fn pending_execution_plan_revision_help_message() -> String {
@@ -16762,30 +16762,11 @@ fn summarize_tool_output(output: &ToolOutput) -> String {
 }
 
 fn build_plan_prompt(request: &str) -> String {
-    format!(
-        "You are running /plan mode.\n\
-First, you MUST call request_user_input with exactly one question id=risk_profile, header=Risk, and options Low/Medium/High.\n\
-After receiving user choice, analyze the repository and then call submit_intent_draft exactly once.\n\
-Use web_search when available before making version-sensitive external claims. Rust edition 2024 is stable in current Rust; do not reject Cargo.toml edition=\"2024\" unless local toolchain evidence proves it unsupported.\n\
-Default execution uses dependency-policy:no-new. If the user explicitly asks to add a new third-party dependency, make that intent unambiguous in the IntentDraft; Libra will derive dependency-policy:allow-with-review for that request. For simple Rust CLI argument handling without an explicit dependency request, prefer std::env over crates such as clap.\n\
-If required information is missing, call request_user_input again for focused follow-up questions.\n\
-Do not output a plain-text plan; finalize by submitting the draft tool call.\n\n\
-User request:\n{request}"
-    )
+    crate::internal::ai::runtime::phase0::phase0_planning_prompt(request)
 }
 
 fn build_plan_revision_prompt(spec_json: &str, request: &str) -> String {
-    format!(
-        "You are revising an existing IntentSpec.\n\
-First, you MUST call request_user_input with exactly one question id=risk_profile, header=Risk, and options Low/Medium/High.\n\
-Use the current IntentSpec as the baseline, apply only the user's requested changes, and then call submit_intent_draft exactly once.\n\
-Use web_search when available before making version-sensitive external claims. Rust edition 2024 is stable in current Rust; do not reject Cargo.toml edition=\"2024\" unless local toolchain evidence proves it unsupported.\n\
-Default execution uses dependency-policy:no-new. If the user explicitly asks to add a new third-party dependency, make that intent unambiguous in the IntentDraft; Libra will derive dependency-policy:allow-with-review for that request. For simple Rust CLI argument handling without an explicit dependency request, prefer std::env over crates such as clap.\n\
-If required information is missing, call request_user_input again for focused follow-up questions.\n\
-Do not output a plain-text plan; finalize by submitting the draft tool call.\n\n\
-Current IntentSpec:\n```json\n{spec_json}\n```\n\n\
-Requested changes:\n{request}"
-    )
+    crate::internal::ai::runtime::phase0::phase0_revision_prompt(spec_json, request)
 }
 
 fn build_execution_plan_prompt(spec_json: &str) -> String {
