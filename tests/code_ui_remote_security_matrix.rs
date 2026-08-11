@@ -313,6 +313,14 @@ fn security_automation_write_body_size_too_large_is_413_payload_too_large() -> R
     shutdown
 }
 
+/// W3-11 host posture: non-loopback peers only get the static remote notice;
+/// snapshot/SSE/approval/write API surfaces stay LOOPBACK_REQUIRED.
+#[cfg(feature = "test-provider")]
+#[tokio::test]
+async fn security_host_posture_non_loopback_surfaces_fail_closed() -> anyhow::Result<()> {
+    libra::internal::ai::web::assert_host_posture_non_loopback_contract().await
+}
+
 #[cfg(not(feature = "test-provider"))]
 #[test]
 fn security_matrix_requires_test_provider_feature() {

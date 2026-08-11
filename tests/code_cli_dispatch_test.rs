@@ -226,3 +226,40 @@ fn defaults_are_observe_control_and_deny_network() {
         "network_access default must be CodeNetworkAccess::Deny",
     );
 }
+
+/// W3-11: occupied listen port fail-closes with an actionable `--port` hint
+/// and never auto-increments to another free port.
+#[tokio::test]
+async fn default_port_conflict_fails_fast() {
+    use libra::internal::ai::web::{WebServerOptions, describe_web_bind_error, start};
+
+    let holder = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve a local port");
+    let port = holder.local_addr().expect("local addr").port();
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    let start_result = start(
+        "127.0.0.1",
+        port,
+        temp.path().to_path_buf(),
+        WebServerOptions::default(),
+    )
+    .await;
+    let Err(err) = start_result else {
+        panic!("second bind of the same port must fail closed");
+    };
+
+    let message = describe_web_bind_error("127.0.0.1", port, &err);
+    assert!(
+        message.contains("--port"),
+        "operator message must mention --port; got: {message}"
+    );
+    assert!(
+        message.contains("does not auto-scan") || message.contains("already in use"),
+        "operator message must state fail-fast / no auto-scan; got: {message}"
+    );
+
+    // Holding `holder` until here proves we did not silently bind another port.
+    drop(holder);
+}

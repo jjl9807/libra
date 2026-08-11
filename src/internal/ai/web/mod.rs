@@ -187,6 +187,10 @@ impl<T> Drop for AbortJoinOnDrop<T> {
 
 /// Binds an `axum` HTTP server to `host:port` and spawns it as a background
 /// tokio task. Returns a [`WebServerHandle`] for later graceful shutdown.
+///
+/// Bind failures are returned as-is (no automatic port scanning). Callers
+/// should map [`std::io::ErrorKind::AddrInUse`] through
+/// [`describe_web_bind_error`] so operators get an actionable `--port` hint.
 pub async fn start(
     host: &str,
     port: u16,
@@ -227,6 +231,146 @@ pub async fn start(
         shutdown_tx,
         join,
     })
+}
+
+/// Operator-facing bind failure text for Code UI (W3-11).
+///
+/// Occupied ports fail closed with an explicit `--port` hint; Libra never
+/// auto-increments away from the requested port.
+pub fn describe_web_bind_error(host: &str, port: u16, err: &anyhow::Error) -> String {
+    if web_bind_error_is_addr_in_use(err) {
+        format!(
+            "failed to bind Code UI on {host}:{port}: address already in use. \
+             Pass an explicit --port <free-port>; Libra does not auto-scan ports."
+        )
+    } else {
+        format!("failed to start web server on {host}:{port}: {err}")
+    }
+}
+
+fn web_bind_error_is_addr_in_use(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::AddrInUse
+        {
+            return true;
+        }
+    }
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("address already in use") || text.contains("addrinuse")
+}
+
+/// W3-11 host-posture contract for the security matrix filter `host_posture`.
+///
+/// Non-loopback peers only receive the static remote notice (HTML, no session
+/// data / tokens / control metadata). Snapshot / transcript / SSE / approval /
+/// write API surfaces stay loopback-gated with `LOOPBACK_REQUIRED`.
+///
+/// Compiled only with `--features test-provider` so release binaries never
+/// carry this assertion helper or its panic paths.
+#[cfg(feature = "test-provider")]
+pub async fn assert_host_posture_non_loopback_contract() -> anyhow::Result<()> {
+    use axum::{
+        body::{Body, to_bytes},
+        extract::connect_info::MockConnectInfo,
+        http::{Method, Request, StatusCode, Uri, header},
+    };
+    use tower::ServiceExt;
+
+    let remote = SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 10), 4000));
+    let state = WebAppState {
+        working_dir: Arc::new(PathBuf::from("/tmp/libra-host-posture")),
+        code_ui: None,
+        automation_control_token: Some(Arc::from("must-not-leak")),
+        audit_sink: Arc::new(TracingAuditSink),
+        control_trace_id: Uuid::new_v4(),
+        bound_addr: SocketAddr::from(([0, 0, 0, 0], 3020)),
+        write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+    };
+
+    let api = code_router()
+        .with_state(state.clone())
+        .layer(MockConnectInfo(remote));
+    for (method, uri) in [
+        (Method::GET, "/session"),
+        (Method::GET, "/events"),
+        (Method::GET, "/diagnostics"),
+        (Method::POST, "/controller/attach"),
+        (Method::POST, "/messages"),
+        (Method::POST, "/interactions/demo"),
+        (Method::POST, "/control/cancel"),
+    ] {
+        let request = Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .map_err(|error| anyhow::anyhow!("host posture request build failed: {error}"))?;
+        let response = api
+            .clone()
+            .oneshot(request)
+            .await
+            .map_err(|error| anyhow::anyhow!("host posture oneshot failed: {error}"))?;
+        if response.status() != StatusCode::FORBIDDEN {
+            anyhow::bail!(
+                "non-loopback {method} {uri} must be 403, got {}",
+                response.status()
+            );
+        }
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| anyhow::anyhow!("host posture body read failed: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|error| anyhow::anyhow!("host posture JSON parse failed: {error}"))?;
+        if value["error"]["code"] != "LOOPBACK_REQUIRED" {
+            anyhow::bail!("non-loopback {method} {uri} must stay LOOPBACK_REQUIRED: {value}");
+        }
+        let text = String::from_utf8_lossy(&body);
+        if text.contains("must-not-leak") {
+            anyhow::bail!("non-loopback API must not echo control tokens: {text}");
+        }
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ACCEPT,
+        "text/html"
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid Accept header: {error}"))?,
+    );
+    headers.insert(
+        header::HOST,
+        "0.0.0.0:3020"
+            .parse()
+            .map_err(|error| anyhow::anyhow!("invalid Host header: {error}"))?,
+    );
+    let notice = static_handler(ConnectInfo(remote), headers, Uri::from_static("/"))
+        .await
+        .into_response();
+    if notice.status() != StatusCode::OK {
+        anyhow::bail!(
+            "non-loopback HTML notice must be 200, got {}",
+            notice.status()
+        );
+    }
+    let notice_body = to_bytes(notice.into_body(), usize::MAX)
+        .await
+        .map_err(|error| anyhow::anyhow!("host posture notice body read failed: {error}"))?;
+    let html = String::from_utf8(notice_body.to_vec())
+        .map_err(|error| anyhow::anyhow!("host posture notice UTF-8 failed: {error}"))?;
+    if !(html.contains("loopback") || html.contains("本机")) {
+        anyhow::bail!("remote notice missing loopback guidance: {html}");
+    }
+    if html.contains("<script") {
+        anyhow::bail!("remote notice must be zero JS");
+    }
+    if html.contains("must-not-leak") {
+        anyhow::bail!("notice must not leak tokens");
+    }
+    if html.contains("controllerToken") || html.contains("control-token") {
+        anyhow::bail!("notice must not expose control metadata");
+    }
+    Ok(())
 }
 
 fn build_router(state: WebAppState) -> Router {

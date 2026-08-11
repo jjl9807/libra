@@ -15,6 +15,9 @@
 //! ignored when their PID is not live. On Unix the token file must be a regular
 //! non-symlink file with exact `0600` permissions; Windows currently treats the
 //! permission check as a no-op because ACL semantics need a separate design.
+//! Discovery `control.json` is written atomically (temp + rename) at `0600` so
+//! a crash never leaves a half-written final path and local scanners cannot
+//! read another user's endpoint metadata by default.
 //!
 //! ## Scope contract (plan-20260714 §C.8 W4)
 //!
@@ -780,18 +783,31 @@ fn writable_token_file(path: &Path, create_new: bool) -> Result<File> {
 }
 
 /// Write non-secret local-control discovery metadata.
+///
+/// Uses crash-safe temp+rename ([`crate::utils::atomic_write::write_atomic`]) so
+/// the final path never contains a truncated JSON document. On Unix the file is
+/// `0600` because tempfile staging creates private-state files at that mode and
+/// rename preserves it — we deliberately do **not** `chmod` the final path
+/// (that would follow a raced symlink). W3-10 / plan-20260714 §C.8 W4.
 pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create control info parent directory '{}'",
-                parent.display()
-            )
-        })?;
-    }
     let serialized =
         serde_json::to_string_pretty(info).context("failed to serialize local TUI control info")?;
-    fs::write(path, serialized)
+    // Bare filenames (`--control-info-file control.json`) have an empty parent
+    // path. `write_atomic` rejects that, while the historical `fs::write` wrote
+    // into the process cwd — normalize to `.` so custom relative paths keep
+    // working.
+    let owned;
+    let write_path = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => {
+            let name = path.file_name().unwrap_or_else(|| path.as_os_str());
+            owned = Path::new(".").join(name);
+            owned.as_path()
+        }
+        _ => path,
+    };
+    // tempfile-backed staging defaults to 0600; fsync is unnecessary for this
+    // discovery sidecar (atomicity alone closes the half-write window).
+    crate::utils::atomic_write::write_atomic(write_path, serialized.as_bytes(), false)
         .with_context(|| format!("failed to write control info file '{}'", path.display()))
 }
 
@@ -1027,6 +1043,55 @@ mod tests {
         assert!(!json.contains("control-token"));
         assert!(!json.contains("token"));
         assert!(!json.contains("tokenHash"));
+    }
+
+    #[test]
+    fn code_control_files_write_control_info_is_atomic_and_0600() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested").join("control.json");
+        let info = test_control_info(4242, "http://127.0.0.1:3000");
+
+        // Plant a truncated destination: atomic replace must never leave this
+        // half-written payload readable after a successful write.
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "{truncated").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&nested, Permissions::from_mode(0o644)).unwrap();
+
+        write_control_info(&nested, &info).unwrap();
+
+        let body = fs::read_to_string(&nested).unwrap();
+        assert!(
+            !body.contains("truncated"),
+            "final path must not keep a half write"
+        );
+        let parsed: ControlInfo = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.pid, 4242);
+        assert_eq!(parsed.base_url, "http://127.0.0.1:3000");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "control.json must be owner-only"
+        );
+    }
+
+    #[test]
+    fn code_control_files_write_control_info_accepts_bare_relative_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let _cwd = crate::utils::test::ChangeDirGuard::new(temp.path());
+        let info = test_control_info(7, "http://127.0.0.1:9");
+
+        write_control_info(Path::new("control.json"), &info).unwrap();
+
+        let body = fs::read_to_string("control.json").unwrap();
+        let parsed: ControlInfo = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed.pid, 7);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata("control.json").unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

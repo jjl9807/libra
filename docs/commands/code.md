@@ -36,7 +36,7 @@ When the TUI exits and Libra can derive the canonical thread ID, `libra code` pr
 | Env file | | `--env-file <PATH>` | none | Load provider environment variables from a dotenv-style file; explicit file values take precedence over Vault and the process environment. |
 | Control mode | | `--control <observe\|write>` | `observe` | Local automation control mode. `observe` preserves existing loopback read behavior; `write` enables local token discovery and process-level automation control auth. |
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | Path for the per-process local automation token. In `write` mode, Unix/macOS files must be regular files with `0600` permissions. |
-| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | Path for non-secret local endpoint discovery metadata. The file never contains token material. |
+| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | Path for non-secret local endpoint discovery metadata. Written atomically at `0600` on Unix/macOS. The file never contains token material. |
 | Provider | | `--provider` | `gemini` | AI provider backend (see Provider Backends below). |
 | Model | | `--model` | provider default | Provider-specific model ID. |
 | Agent profile | | `--agent <NAME>` | none | Select an agent profile by name. When the profile carries a structured `model: provider/model[@variant]` binding, that binding wins atomically -- provider, model ID, and variant all come from the profile, and a separately supplied `--model` is ignored to avoid hybrid pairs; profiles without a structured binding fall back to the CLI defaults. Profiles resolve through the three-tier hierarchy (project `.libra/agents/`, user `~/.config/libra/agents/`, embedded). Unknown or non-primary-eligible profiles are rejected. |
@@ -87,7 +87,7 @@ Ollama requests stream `/api/chat` responses by default and add a per-request `r
 
 `libra code --control observe` is the default and does not create local control files unless `--control-info-file` is explicitly supplied. Loopback clients can continue reading `/api/code/session` and `/api/code/events` without a token.
 
-`libra code --control write` enables the local automation security envelope. Libra creates a fresh 32-byte token in `.libra/code/control-token`, writes non-secret endpoint metadata to `.libra/code/control.json` after the web server binds, and holds `.libra/code/control.lock` for the process lifetime. `control.json` includes `version`, `mode`, `pid`, `baseUrl`, optional `mcpUrl`, `workingDir`, optional `threadId`, and `startedAt`; it never includes the token, token hash, token path, provider credentials, headers, or provider request/response bodies.
+`libra code --control write` enables the local automation security envelope. Libra creates a fresh 32-byte token in `.libra/code/control-token`, atomically writes non-secret endpoint metadata to `.libra/code/control.json` (Unix/macOS mode `0600`) after the web server binds, and holds `.libra/code/control.lock` for the process lifetime. Default paths are per worktree local-gitdir, so two worktrees never share a token/info/lock; a cross-worktree scope mismatch fail-closes rather than reclaiming another worktree's sidecar. `control.json` includes `version`, `mode`, `pid`, `baseUrl`, optional `mcpUrl`, `workingDir`, optional `threadId`, `startedAt`, and version-2 writer scope (`repoId`/`worktreeId`/optional `workspaceId`/`leaseFence`); it never includes the token, token hash, token path, provider credentials, headers, or provider request/response bodies.
 
 Write control is local-only. `--control write` is rejected with `--stdio`, and it requires `--host` to be loopback (`127.0.0.1`, `::1`, or `localhost`). A second write-control instance using the same default paths fails fast with `CONTROL_INSTANCE_CONFLICT`; use distinct `--control-token-file` and `--control-info-file` paths only when the caller intentionally manages multiple local instances.
 
@@ -129,7 +129,9 @@ The SSE resilience panel surfaces reconnecting / resync-required / resynced stat
 
 The workflow review panel projects pending `intent_review_choice` and `post_plan_choice` interactions (network policy is the same kind with `metadata.phase = "networkPolicy"`). Confirm/modify/cancel (and execute / network-allow / network-deny / back) post `selectedOption` through the leased interaction endpoint; turn cancel is fail-closed when the browser cannot write. The panel does not keep a second workflow FSM — it waits for the next snapshot/SSE update.
 
-When the server is bound to a non-loopback host, non-loopback browsers receive a static remote access notice for HTML navigation instead of the SPA. The notice is zero JavaScript, includes only bind/remote/version/commit placeholders, and asset/API fallbacks return 404 so remote clients cannot probe session state.
+When the server is bound to a non-loopback host (`--host 0.0.0.0` or a LAN address), non-loopback browsers receive a static remote access notice for HTML navigation instead of the SPA. The notice is zero JavaScript, includes only bind/remote/version/commit placeholders, and asset/API fallbacks return 404 so remote clients cannot probe session state. Snapshot, transcript, SSE, approval, and every `/api/code/*` read/write surface stay loopback-only (`LOOPBACK_REQUIRED`). Remote humans should SSH port-forward to loopback (`ssh -L 3000:127.0.0.1:3000 user@host`) rather than expecting a direct remote write UI; authenticated TLS reverse proxies are deferred (DEFER-04) and are not the default.
+
+Default listen port is `3000`. If that address is already bound, startup fail-closes with an actionable `--port` hint and never auto-scans the next free port.
 
 When `--browser-control loopback` is requested and the browser holds the active lease, the TUI initial controller is `LocalTui` (visible owner, can be reclaimed) instead of `Fixed { Tui }` (permanently blocking). If the TUI also wants to drive writes, `--control write` must be supplied alongside `--browser-control loopback`; the two writers serialize through the same `TuiControlCommand` channel.
 
@@ -238,6 +240,10 @@ libra code --provider anthropic --model claude-sonnet-4-20250514
 
 # Bind web-only on all interfaces; remote browsers see a loopback-only notice
 libra code --web-only --port 8080 --host 0.0.0.0
+
+# Remote humans should SSH port-forward to the bound loopback port
+# ssh -L 8080:127.0.0.1:8080 user@host
+# then browse http://127.0.0.1:8080 locally
 
 # Browser-driven session against a local Ollama
 libra code --web-only --provider ollama --port 4400
@@ -371,7 +377,7 @@ Note: Neither Git nor jj have an equivalent to `libra code`. This command repres
 |----------|----------|------|
 | `--web-only` and `--stdio` both specified | Clap argument conflict error | non-zero |
 | Missing API key for selected provider | Fatal error with provider name and expected env var | non-zero |
-| Port already in use | Fatal error with port number | non-zero |
+| Port already in use | Fatal error naming `host:port` and instructing an explicit `--port` (no auto-scan) | non-zero |
 | No terminal available in TUI mode | Falls back or reports error | non-zero |
 | Thread ID not found on resume | Fatal error with canonical `thread_id` | non-zero |
 | `--control write --stdio` | Usage error; MCP stdio and local TUI automation stdio are separate modes | non-zero |
