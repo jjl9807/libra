@@ -21,7 +21,13 @@ interface CodeUiStoreValue {
   client: CodeUiClient;
   snapshot?: CodeUiSessionSnapshot;
   error?: Error;
-  refresh(): Promise<void>;
+  /** Load `/api/code/session` into the shared store.
+   * - `applied`: this call wrote the snapshot
+   * - `superseded`: a live SSE update already owns newer data (store is fine)
+   * - `raced`: a newer refresh owns the outcome (caller should retry or fail closed)
+   * - `failed`: this call lost and set `error`
+   */
+  refresh(): Promise<"applied" | "superseded" | "raced" | "failed">;
   subscribe(type: string, handler: CodeUiEventHandler): () => void;
 }
 
@@ -61,7 +67,7 @@ export function CodeUiStoreProvider({
     return () => set.delete(handler);
   }, []);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<"applied" | "superseded" | "raced" | "failed"> => {
     const requestedAtGeneration = eventGeneration.current;
     const requestGeneration = ++refreshGeneration.current;
     try {
@@ -70,18 +76,32 @@ export function CodeUiStoreProvider({
       const receivedNewerSnapshot =
         nextSnapshotUpdatedAtMs > (latestSnapshotUpdatedAtMs.current ?? Number.NEGATIVE_INFINITY);
       const isCurrentRequest = requestGeneration === refreshGeneration.current;
-      if (isCurrentRequest && (eventGeneration.current === requestedAtGeneration || receivedNewerSnapshot)) {
+      if (!isCurrentRequest) {
+        // A later refresh() owns the outcome — do not treat this as a healthy supersession.
+        return "raced";
+      }
+      if (eventGeneration.current === requestedAtGeneration || receivedNewerSnapshot) {
         latestSnapshotUpdatedAtMs.current = nextSnapshotUpdatedAtMs;
         setSnapshot(nextSnapshot);
         setError(undefined);
+        return "applied";
       }
+      // Live SSE advanced while we fetched; the store already holds that update.
+      return "superseded";
     } catch (cause) {
-      const hasSnapshot = latestSnapshotUpdatedAtMs.current !== undefined;
-      const isCurrentRequest =
-        requestGeneration === refreshGeneration.current && eventGeneration.current === requestedAtGeneration;
-      if (isCurrentRequest || !hasSnapshot) {
-        setError(cause instanceof Error ? cause : new Error("Unable to load Code UI session"));
+      const isCurrentRequest = requestGeneration === refreshGeneration.current;
+      if (!isCurrentRequest) {
+        // A later refresh() owns the outcome — do not clobber its error/snapshot state.
+        return "raced";
       }
+      const hasSnapshot = latestSnapshotUpdatedAtMs.current !== undefined;
+      const sseUnchanged = eventGeneration.current === requestedAtGeneration;
+      if (sseUnchanged || !hasSnapshot) {
+        setError(cause instanceof Error ? cause : new Error("Unable to load Code UI session"));
+        return "failed";
+      }
+      // SSE advanced while this request failed; treat as raced against live updates.
+      return "raced";
     }
   }, [client]);
 

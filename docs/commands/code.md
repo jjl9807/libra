@@ -122,6 +122,10 @@ The usage panel mirrors the W2-12 `RuntimeUsageTotals` read model (cumulative, c
 
 The execution/repair panel projects `plans[]`, `toolCalls[]`, and `planExecutionRepair` from the live session snapshot. Continue/Cancel post through `POST /api/code/interactions/{id}` with `selectedOption` (`continue` / `cancel`); when projected `attempt >= max_attempts`, Continue also sends a raised `maxAttempts` (capped at 10) without reclassifying the failure on the client.
 
+The SSE resilience panel surfaces reconnecting / resync-required / resynced status while keeping the last projected session snapshot and the last wire-supplied cursor seq (the browser never invents sequence numbers). Explicit snapshot resync routes through the shared store `refresh()` path and only reports success when that refresh applies (or is superseded by a newer live update); production v2 backlog/resync events land in later wire cards (W3-06/W3-08), with the built-in SPA cutover in W3-09.
+
+The workflow review panel projects pending `intent_review_choice` and `post_plan_choice` interactions (network policy is the same kind with `metadata.phase = "networkPolicy"`). Confirm/modify/cancel (and execute / network-allow / network-deny / back) post `selectedOption` through the leased interaction endpoint; turn cancel is fail-closed when the browser cannot write. The panel does not keep a second workflow FSM — it waits for the next snapshot/SSE update.
+
 When the server is bound to a non-loopback host, non-loopback browsers receive a static remote access notice for HTML navigation instead of the SPA. The notice is zero JavaScript, includes only bind/remote/version/commit placeholders, and asset/API fallbacks return 404 so remote clients cannot probe session state.
 
 When `--browser-control loopback` is requested and the browser holds the active lease, the TUI initial controller is `LocalTui` (visible owner, can be reclaimed) instead of `Fixed { Tui }` (permanently blocking). If the TUI also wants to drive writes, `--control write` must be supplied alongside `--browser-control loopback`; the two writers serialize through the same `TuiControlCommand` channel.
