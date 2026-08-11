@@ -1299,8 +1299,11 @@ mod tests {
             "#!/bin/sh\nread _line\nprintf 'not-json\\n'\n",
         );
         let mut agent = RpcAgent::spawn(bin).unwrap();
+        // The assertion is about the parse error, not about latency — a 2s
+        // deadline turns a busy machine into a spurious "rpc timeout" failure
+        // before the malformed line is ever delivered.
         let err = agent
-            .invoke_with_timeout("capabilities", None, Duration::from_secs(2))
+            .invoke_with_timeout("capabilities", None, Duration::from_secs(30))
             .expect_err("must fail");
         assert!(
             format!("{err:#}").contains("parse RPC response line"),

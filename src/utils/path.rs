@@ -98,6 +98,10 @@ mod tests {
         let linked = root.path().join("linked");
         let linked_gitdir = linked.join(".libra");
         fs::create_dir_all(common.join("objects")).expect("create shared object store");
+        // The fail-closed pointer validation (`is_terminal_common_storage`)
+        // requires the target to look like real common storage — carry the
+        // repository database the way an actual main worktree does.
+        fs::write(common.join(util::DATABASE), b"").expect("create shared repository database");
         fs::create_dir_all(&linked_gitdir).expect("create linked worktree gitdir");
         fs::write(
             linked_gitdir.join("commondir"),

@@ -3712,6 +3712,13 @@ mod tests {
         run_builtin_migrations(&conn)
             .await
             .expect("run_builtin_migrations");
+        // Production repositories carry `libra.repoid` from `libra init`, and
+        // the ingest path resolves it through `CaptureScope` — so a fixture
+        // without it fails identity resolution before any behaviour under
+        // test runs. Mint it the way production does for a legacy repository.
+        crate::internal::workspace::RepoIdentity::resolve_or_init(&conn)
+            .await
+            .expect("seed libra.repoid for the test repository");
         (dir, conn)
     }
 

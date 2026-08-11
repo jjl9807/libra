@@ -2066,6 +2066,23 @@ impl AgentRuntimeWorker {
             session.set_state(InteractionState::Cancelling);
         }
         let resolution_audit = resolution.map(|value| (interaction_id, value));
+        if reply_result.is_ok() {
+            // The acknowledgement must precede any terminal event: a deferred
+            // executor result settled below emits `TurnCompleted`, and
+            // consumers rely on seeing the response acknowledged before the
+            // turn it answered is closed (invariant guarded by
+            // `response_acknowledgement_precedes_racing_terminal_event`).
+            // Post-settlement durability/fence errors still reach the caller:
+            // `finalize_response_acknowledgement` keeps its checks and runs
+            // after settlement — only the event moved.
+            self.emit(
+                session_id,
+                Some(turn_id.to_string()),
+                AgentEventKind::InteractionResponded {
+                    interaction_id: interaction_id.to_string(),
+                },
+            );
+        }
         if reply_result.is_ok() || response_failure_without_live_execution {
             self.finish_execution(session_id, turn_id, result, true, resolution_audit);
         }
@@ -2073,8 +2090,7 @@ impl AgentRuntimeWorker {
             self.finish_execution(session_id, turn_id, deferred_execution, true, None);
         }
         if reply_result.is_ok() {
-            reply_result =
-                self.finalize_response_acknowledgement(session_id, turn_id, interaction_id);
+            reply_result = self.finalize_response_acknowledgement(session_id);
         }
         let _ = reply.send(reply_result);
     }
@@ -2083,40 +2099,27 @@ impl AgentRuntimeWorker {
     fn finalize_response_acknowledgement(
         &mut self,
         session_id: &str,
-        turn_id: &str,
-        interaction_id: &str,
     ) -> Result<(), RuntimeWorkerError> {
-        enum TerminalAck {
-            Completed,
-            NonTerminal,
-        }
-        let ack = {
-            let Some(session) = self.sessions.get(session_id) else {
-                return Err(RuntimeWorkerError::UnknownSession {
+        let Some(session) = self.sessions.get(session_id) else {
+            return Err(RuntimeWorkerError::UnknownSession {
+                session_id: session_id.to_string(),
+            });
+        };
+        match &session.snapshot.interaction {
+            InteractionState::IndeterminateSideEffect { .. } => {
+                return Err(RuntimeWorkerError::ReconciliationRequired {
                     session_id: session_id.to_string(),
                 });
-            };
-            match &session.snapshot.interaction {
-                InteractionState::IndeterminateSideEffect { .. } => {
-                    return Err(RuntimeWorkerError::ReconciliationRequired {
-                        session_id: session_id.to_string(),
-                    });
-                }
-                InteractionState::Failed { reason } => {
-                    return Err(RuntimeWorkerError::ExecutionFailed(reason.clone()));
-                }
-                InteractionState::Completed => TerminalAck::Completed,
-                _ => TerminalAck::NonTerminal,
             }
-        };
-        let _ = ack;
-        self.emit(
-            session_id,
-            Some(turn_id.to_string()),
-            AgentEventKind::InteractionResponded {
-                interaction_id: interaction_id.to_string(),
-            },
-        );
+            InteractionState::Failed { reason } => {
+                return Err(RuntimeWorkerError::ExecutionFailed(reason.clone()));
+            }
+            _ => {}
+        }
+        // The `InteractionResponded` event is emitted by `finish_response`
+        // BEFORE settlement (ack precedes any terminal event); this function
+        // only surfaces post-settlement durability/fence failures on the
+        // `respond` reply channel.
         Ok(())
     }
 
