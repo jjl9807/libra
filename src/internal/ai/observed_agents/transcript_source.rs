@@ -414,6 +414,12 @@ pub(crate) fn open_provider_directory_for_discovery(
     if !path.is_absolute() {
         return Ok(None);
     }
+    // Mirror `securely_open_provider_file`: the roots below come back through
+    // `normalize_macos_var_alias`, so the query path must be normalized the
+    // same way or `strip_prefix` never matches on macOS (`/var` is a symlink
+    // to `/private/var`) — and a silent `Ok(None)` here means the no-follow /
+    // budget hardening below never runs at all.
+    let path = normalize_macos_var_alias(path);
     for root in configured_provider_roots(adapter) {
         let Ok(relative) = path.strip_prefix(&root) else {
             continue;

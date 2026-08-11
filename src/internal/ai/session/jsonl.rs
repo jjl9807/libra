@@ -2356,7 +2356,7 @@ fn process_appears_alive(
         let _ = (lock_path, recorded_starttime, recorded_boot_id);
         // SAFETY: kill(pid, 0) is a existence/permission probe and does not
         // deliver a signal.
-        return unsafe { libc::kill(pid as i32, 0) == 0 };
+        unsafe { libc::kill(pid as i32, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
