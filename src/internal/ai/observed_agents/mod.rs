@@ -96,7 +96,7 @@ pub use transcript_source::{
 };
 pub(crate) use transcript_source::{
     open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
-    pinned_provider_directory_path, resolve_import_transcript_source_until,
+    read_dir_pinned_provider_directory, resolve_import_transcript_source_until,
 };
 pub use trust::{
     DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY,

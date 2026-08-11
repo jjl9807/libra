@@ -10,8 +10,6 @@
 //! are kept (they're typically session-meta records that pre-date the
 //! first message, so dropping them would lose context).
 
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -679,29 +677,45 @@ pub fn resolve_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathB
     else {
         return Ok(None);
     };
-    #[cfg(target_os = "linux")]
-    let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    #[cfg(all(unix, not(target_os = "linux")))]
-    let pinned_path = PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()));
-    #[cfg(not(unix))]
-    let pinned_path = dir.clone();
     let expected_name = format!("{session_id}.jsonl");
-    for entry in fs::read_dir(pinned_path).context("read pinned Claude session directory")? {
-        let entry = entry.context("read pinned Claude session directory entry")?;
-        if entry.file_name() != std::ffi::OsStr::new(&expected_name) {
-            continue;
+    #[cfg(unix)]
+    {
+        for entry in super::super::transcript_source::read_dir_pinned_provider_directory(&directory)
+            .context("read pinned Claude session directory")?
+        {
+            let entry = entry.context("read pinned Claude session directory entry")?;
+            if entry.file_name != std::ffi::OsStr::new(&expected_name) {
+                continue;
+            }
+            if entry.file_type.is_symlink() || !entry.file_type.is_file() {
+                return Err(anyhow!(
+                    "refusing non-regular or symlinked Claude session file (fail-closed)"
+                ));
+            }
+            return Ok(Some(candidate));
         }
-        let file_type = entry
-            .file_type()
-            .context("inspect pinned Claude session source type")?;
-        if file_type.is_symlink() || !file_type.is_file() {
-            return Err(anyhow!(
-                "refusing non-regular or symlinked Claude session file (fail-closed)"
-            ));
-        }
-        return Ok(Some(candidate));
+        Ok(None)
     }
-    Ok(None)
+    #[cfg(not(unix))]
+    {
+        let _ = &directory;
+        for entry in fs::read_dir(&dir).context("read pinned Claude session directory")? {
+            let entry = entry.context("read pinned Claude session directory entry")?;
+            if entry.file_name() != std::ffi::OsStr::new(&expected_name) {
+                continue;
+            }
+            let file_type = entry
+                .file_type()
+                .context("inspect pinned Claude session source type")?;
+            if file_type.is_symlink() || !file_type.is_file() {
+                return Err(anyhow!(
+                    "refusing non-regular or symlinked Claude session file (fail-closed)"
+                ));
+            }
+            return Ok(Some(candidate));
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

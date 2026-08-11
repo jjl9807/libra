@@ -3822,8 +3822,12 @@ mod tests {
         )
         .await
         .expect_err("stale hook must not resurrect an erased session");
+        // The anti-resurrection guard now reports through the unified
+        // scope-claim wording; the erased-tombstone cause is folded into the
+        // "it was erased" branch of that message.
         assert!(
-            err.to_string().contains("anti-resurrection tombstone"),
+            err.to_string()
+                .contains("could not be claimed in this workspace scope"),
             "unexpected error: {err:#}"
         );
 
@@ -4253,6 +4257,33 @@ mod tests {
         opts.sqlx_logging(false);
         let conn = Database::connect(opts).await.expect("connect");
         // intentionally NOT calling run_builtin_migrations.
+        //
+        // Ingest resolves the `CaptureScope` identity (`libra.repoid` in
+        // `config_kv`) before it touches `agent_session`, so a truly bare
+        // database would fail identity resolution first. Seed just that one
+        // table — the way production `libra init` stamps it — so the loud
+        // "agent_session table does not exist" failure under test stays the
+        // first error.
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "CREATE TABLE config_kv (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                encrypted INTEGER NOT NULL DEFAULT 0
+            )"
+            .to_string(),
+        ))
+        .await
+        .expect("create bare config_kv");
+        conn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', ?, 0)",
+            ["test-repo-id".into()],
+        ))
+        .await
+        .expect("seed libra.repoid for identity resolution");
 
         let payload = ingest_envelope("SessionStart", "S-bare", json!({}));
         let err = ingest_agent_traces_payload(

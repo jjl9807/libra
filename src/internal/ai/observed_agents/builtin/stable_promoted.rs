@@ -27,7 +27,7 @@ use anyhow::{Context, Result, anyhow};
 
 use super::super::{
     adapter::{AgentKind, AgentSessionCtx, AgentStability, ObservedAgent},
-    agent_for, open_provider_directory_for_discovery, pinned_provider_directory_path,
+    agent_for, open_provider_directory_for_discovery, read_dir_pinned_provider_directory,
 };
 
 const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
@@ -391,8 +391,7 @@ fn sorted_desc_entries_at(
     budget: &mut RolloutScanBudget,
 ) -> Result<Vec<std::ffi::OsString>> {
     budget.check_time(logical_dir)?;
-    let pinned_dir = pinned_provider_directory_path(directory);
-    let read = fs::read_dir(&pinned_dir)
+    let read = read_dir_pinned_provider_directory(directory)
         .with_context(|| format!("read pinned rollout directory {}", logical_dir.display()))?;
     let mut names = Vec::new();
     for (scanned, entry) in read.enumerate() {
@@ -411,7 +410,7 @@ fn sorted_desc_entries_at(
                 logical_dir.display()
             )
         })?;
-        let name = entry.file_name();
+        let name = entry.file_name;
         if keep(&name.to_string_lossy()) {
             names.push(name);
         }

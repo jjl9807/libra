@@ -468,27 +468,211 @@ pub(crate) fn open_provider_directory_for_discovery(
     Ok(None)
 }
 
-/// Address a held directory descriptor for safe enumeration while retaining
-/// the descriptor for the entire walk. Every descendant lookup is therefore
-/// rooted at the object opened by [`open_provider_directory_for_discovery`],
-/// even if an attacker swaps the provider's pathname concurrently.
-#[cfg(target_os = "linux")]
-pub(crate) fn pinned_provider_directory_path(directory: &std::fs::File) -> PathBuf {
-    use std::os::fd::AsRawFd;
-
-    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+/// File type of one entry yielded by [`read_dir_pinned_provider_directory`],
+/// resolved relative to the pinned directory descriptor so it always refers
+/// to the opened directory object even when its pathname was swapped.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinnedEntryType {
+    File,
+    Directory,
+    Symlink,
+    Other,
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn pinned_provider_directory_path(directory: &std::fs::File) -> PathBuf {
-    use std::os::fd::AsRawFd;
+#[cfg(unix)]
+impl PinnedEntryType {
+    pub(crate) fn is_file(self) -> bool {
+        matches!(self, Self::File)
+    }
 
-    PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()))
+    pub(crate) fn is_symlink(self) -> bool {
+        matches!(self, Self::Symlink)
+    }
 }
 
-#[cfg(not(unix))]
-pub(crate) fn pinned_provider_directory_path(_directory: &std::fs::File) -> PathBuf {
-    PathBuf::new()
+/// One entry of a pinned provider directory: its name plus a
+/// descriptor-relative file type.
+#[cfg(unix)]
+pub(crate) struct PinnedDirEntry {
+    pub(crate) file_name: std::ffi::OsString,
+    pub(crate) file_type: PinnedEntryType,
+}
+
+/// Streaming iterator over a pinned provider directory, mirroring
+/// `std::fs::ReadDir` semantics: entries arrive in `readdir` order (unsorted,
+/// `.` and `..` skipped) and a mid-walk read failure surfaces as an `Err`
+/// item. Owns the `DIR*` — and with it the duplicated descriptor — so every
+/// exit path, including error paths, releases both exactly once.
+#[cfg(unix)]
+pub(crate) struct PinnedReadDir {
+    stream: *mut libc::DIR,
+}
+
+#[cfg(unix)]
+impl Iterator for PinnedReadDir {
+    type Item = Result<PinnedDirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::{
+            ffi::{CStr, OsStr},
+            os::unix::ffi::OsStrExt,
+        };
+
+        loop {
+            clear_errno();
+            // SAFETY: `self.stream` is a live directory stream owned by
+            // `self`; the returned pointer stays valid until the next
+            // `readdir`/`closedir` on this stream, and every field is copied
+            // out before the next call.
+            let entry = unsafe { libc::readdir(self.stream) };
+            if entry.is_null() {
+                let error = std::io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    // errno was cleared above: still zero means a clean EOF.
+                    Some(0) | None => None,
+                    _ => Some(Err(error).context("read pinned provider directory entry")),
+                };
+            }
+            // SAFETY: `entry` is non-null and points to a live `dirent`.
+            let entry = unsafe { &*entry };
+            // SAFETY: `d_name` is NUL-terminated within the live `dirent`.
+            let name = unsafe { CStr::from_ptr(entry.d_name.as_ptr()) };
+            let name_bytes = name.to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            let file_type = match pinned_entry_type(self.stream, name, entry.d_type.into()) {
+                Ok(Some(file_type)) => file_type,
+                // Vanished between `readdir` and the DT_UNKNOWN fallback.
+                Ok(None) => continue,
+                Err(error) => return Some(Err(error)),
+            };
+            return Some(Ok(PinnedDirEntry {
+                file_name: OsStr::from_bytes(name_bytes).to_os_string(),
+                file_type,
+            }));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PinnedReadDir {
+    fn drop(&mut self) {
+        // SAFETY: `self.stream` is a live stream from `fdopendir`, closed
+        // exactly once here; closing also releases the duplicated descriptor.
+        unsafe { libc::closedir(self.stream) };
+    }
+}
+
+/// Zero `errno` so a `readdir` EOF (NULL with `errno` unchanged) can be told
+/// apart from a real read error.
+#[cfg(unix)]
+fn clear_errno() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: `__errno_location` returns the writable thread-local slot.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    // SAFETY: `__error` returns the writable thread-local slot.
+    unsafe {
+        *libc::__error() = 0;
+    }
+}
+
+/// Map `readdir`'s `d_type` to a [`PinnedEntryType`].  A filesystem that
+/// reports `DT_UNKNOWN` is resolved via a descriptor-relative
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` — never by path, never by guessing.  An
+/// entry that vanishes between the two calls yields `Ok(None)`; any other
+/// inspection failure is loud.
+#[cfg(unix)]
+fn pinned_entry_type(
+    stream: *mut libc::DIR,
+    name: &std::ffi::CStr,
+    d_type: libc::c_int,
+) -> Result<Option<PinnedEntryType>> {
+    use std::mem::MaybeUninit;
+
+    if d_type == libc::DT_UNKNOWN as libc::c_int {
+        // SAFETY: `stream` is a live directory stream, so `dirfd` yields the
+        // pinned descriptor it owns.
+        let fd = unsafe { libc::dirfd(stream) };
+        let mut stat = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fd` is the live pinned directory descriptor and `name` is
+        // a NUL-terminated basename from the live dirent; AT_SYMLINK_NOFOLLOW
+        // makes the result describe the entry itself, not a link target.
+        let result = unsafe {
+            libc::fstatat(
+                fd,
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error).context("inspect pinned provider directory entry type");
+        }
+        // SAFETY: a successful fstatat initialized the stat structure.
+        let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+        return Ok(Some(if mode == libc::S_IFREG {
+            PinnedEntryType::File
+        } else if mode == libc::S_IFDIR {
+            PinnedEntryType::Directory
+        } else if mode == libc::S_IFLNK {
+            PinnedEntryType::Symlink
+        } else {
+            PinnedEntryType::Other
+        }));
+    }
+    Ok(Some(if d_type == libc::DT_REG as libc::c_int {
+        PinnedEntryType::File
+    } else if d_type == libc::DT_DIR as libc::c_int {
+        PinnedEntryType::Directory
+    } else if d_type == libc::DT_LNK as libc::c_int {
+        PinnedEntryType::Symlink
+    } else {
+        PinnedEntryType::Other
+    }))
+}
+
+/// Enumerate a held provider directory descriptor without ever re-resolving
+/// its pathname.  This replaces addressing the descriptor through a path
+/// (`/proc/self/fd/<fd>` on Linux, `/dev/fd/<fd>` elsewhere): on macOS a
+/// device-fd path for a directory descriptor fails `read_dir` with
+/// `ENOTDIR`.  `fdopendir` + `readdir` operate on a duplicated descriptor
+/// instead, so the walk is rooted at the exact directory object opened by
+/// [`open_provider_directory_for_discovery`] even if an attacker swaps the
+/// provider's pathname concurrently — with identical behaviour on Linux and
+/// macOS and no per-OS fork.
+#[cfg(unix)]
+pub(crate) fn read_dir_pinned_provider_directory(
+    directory: &std::fs::File,
+) -> Result<PinnedReadDir> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: duplicating a live owned descriptor yields another owned
+    // descriptor referring to the same pinned directory object.
+    let duplicated = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("duplicate pinned provider directory descriptor");
+    }
+    // SAFETY: `duplicated` is a fresh descriptor from `dup`; on success
+    // `fdopendir` takes ownership of it.
+    let stream = unsafe { libc::fdopendir(duplicated) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `duplicated` is still owned here
+        // and must be closed exactly once.
+        unsafe { libc::close(duplicated) };
+        return Err(error).context("open pinned provider directory stream");
+    }
+    Ok(PinnedReadDir { stream })
 }
 
 /// Open a regular file beneath an already-pinned provider directory without
@@ -1024,10 +1208,9 @@ mod tests {
 
         std::fs::rename(home.join(".claude"), home.join(".claude-original")).unwrap();
         std::os::unix::fs::symlink(outside.path(), home.join(".claude")).unwrap();
-        let pinned = pinned_provider_directory_path(&directory);
-        let names = std::fs::read_dir(pinned)
+        let names = read_dir_pinned_provider_directory(&directory)
             .unwrap()
-            .map(|entry| entry.unwrap().file_name())
+            .map(|entry| entry.unwrap().file_name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec![std::ffi::OsString::from("original.jsonl")]);
     }

@@ -36,7 +36,7 @@ use super::{
         claude_project_slug, claude_session_dir, claude_session_id_is_safe_path_component,
         normalize_claude_transcript, normalize_claude_transcript_until,
         open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
-        parse_canon_value, pinned_provider_directory_path, redact_turns_with_report,
+        parse_canon_value, read_dir_pinned_provider_directory, redact_turns_with_report,
         safe_turn_projection,
     },
 };
@@ -606,15 +606,10 @@ pub(crate) fn discover_claude_subagent_contents(
         else {
             return Ok(SubagentDiscovery::default());
         };
-        let pinned_path = pinned_provider_directory_path(&directory);
-        if pinned_path.as_os_str().is_empty() {
-            bail!("secure provider directory enumeration is unavailable on this platform");
-        }
-
         let mut names = Vec::new();
         let mut entry_count = 0usize;
-        for entry in
-            std::fs::read_dir(&pinned_path).context("enumerate pinned Claude subagent directory")?
+        for entry in read_dir_pinned_provider_directory(&directory)
+            .context("enumerate pinned Claude subagent directory")?
         {
             ensure_before_deadline(deadline)?;
             entry_count = entry_count.saturating_add(1);
@@ -625,13 +620,11 @@ pub(crate) fn discover_claude_subagent_contents(
                 );
             }
             let entry = entry.context("read pinned Claude subagent directory entry")?;
-            let file_type = entry
-                .file_type()
-                .context("inspect Claude subagent directory entry")?;
+            let file_type = entry.file_type;
             if file_type.is_symlink() {
                 bail!("refusing symlink in Claude subagent directory (fail-closed)");
             }
-            let name = entry.file_name();
+            let name = entry.file_name;
             if Path::new(&name)
                 .extension()
                 .and_then(|value| value.to_str())

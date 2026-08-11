@@ -6913,7 +6913,12 @@ no_cache_unknown_network = true
         .expect("build TUI runtime from projection bundle");
         let snapshot = runtime.snapshot().await;
 
-        assert_eq!(snapshot.session_id, thread_id.to_string());
+        // plan-20260715 W3-01 (74d3ab2): the bootstrap always stamps durable
+        // `SessionState.id` as session_id — mirroring the thread UUID into
+        // sessionId breaks SPA `/usage` filters that AND both IDs. The bundle
+        // identity only fills thread_id when the session has no canonical
+        // thread metadata (CHANGELOG "Added (plan-20260715 W3-01, 2026-08-11)").
+        assert_eq!(snapshot.session_id, "legacy-session");
         assert_eq!(snapshot.thread_id, Some(thread_id.to_string()));
     }
 

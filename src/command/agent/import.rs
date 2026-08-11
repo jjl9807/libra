@@ -34,7 +34,7 @@ use crate::{
                 opencode_export::{
                     ExportLimits, authorized_sandboxed_export, trusted_opencode_binary,
                 },
-                pinned_provider_directory_path, resolve_import_transcript_source_until,
+                read_dir_pinned_provider_directory, resolve_import_transcript_source_until,
                 resolve_session_file,
             },
         },
@@ -675,9 +675,8 @@ fn read_discovery_names(
     scanned: &mut usize,
 ) -> Result<Vec<std::ffi::OsString>> {
     ensure_before_deadline(deadline)?;
-    let path = pinned_provider_directory_path(directory);
-    let read = std::fs::read_dir(&path)
-        .with_context(|| format!("read pinned {label} directory {}", path.display()))?;
+    let read = read_dir_pinned_provider_directory(directory)
+        .with_context(|| format!("read pinned {label} directory"))?;
     let mut names = Vec::new();
     for entry in read {
         ensure_before_deadline(deadline)?;
@@ -690,7 +689,7 @@ fn read_discovery_names(
         names.push(
             entry
                 .context("read pinned provider directory entry")?
-                .file_name(),
+                .file_name,
         );
     }
     ensure_before_deadline(deadline)?;
@@ -711,12 +710,12 @@ fn discover_claude(
         return Ok(Vec::new());
     };
     #[cfg(unix)]
-    let pinned_path = pinned_provider_directory_path(&directory);
+    let entries = read_dir_pinned_provider_directory(&directory)
+        .context("read pinned Claude session directory")?;
     #[cfg(not(unix))]
-    let pinned_path = dir.clone();
-    let entries = match std::fs::read_dir(&pinned_path) {
-        Ok(entries) => entries,
-        Err(error) => return Err(error).context("read pinned Claude session directory"),
+    let entries = {
+        let _ = &directory;
+        std::fs::read_dir(&dir).context("read pinned Claude session directory")?
     };
     let mut candidates = Vec::new();
     for (index, entry) in entries.enumerate() {
@@ -725,6 +724,9 @@ fn discover_claude(
             anyhow::bail!("Claude discovery exceeded its 20000-entry safety bound");
         }
         let entry = entry.context("read Claude session directory entry")?;
+        #[cfg(unix)]
+        let file_name = entry.file_name;
+        #[cfg(not(unix))]
         let file_name = entry.file_name();
         #[cfg(unix)]
         let Some(opened) =

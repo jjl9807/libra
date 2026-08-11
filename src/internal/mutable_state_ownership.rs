@@ -448,6 +448,8 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "_agent_import_identity_down_guard",
     "_agent_subagent_content_down_guard",
     "_agent_subagent_replication_down_guard",
+    "_agent_usage_event_session_scope_down_guard",
+    "_agent_usage_runtime_attribution_down_guard",
     "_agent_tombstone_compat_down_guard",
     "_agent_tombstone_down_guard",
     "agent_capture_scope_down_guard",

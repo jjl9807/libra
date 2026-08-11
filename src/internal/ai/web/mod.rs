@@ -2416,8 +2416,18 @@ mod tests {
     async fn code_session_resume_requires_automation_control_token() {
         use axum::extract::connect_info::MockConnectInfo;
 
+        // The resume handler resolves the repository storage root before
+        // looking up the thread, so point the fixture at a minimal but
+        // resolvable repository: a missing thread must reach the NotFound
+        // branch rather than fail closed on storage-root resolution.
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".libra")).unwrap();
+        std::fs::write(repo.join(".libra").join("libra.db"), b"").unwrap();
+        let working_dir = repo.to_string_lossy().to_string();
+
         let session = CodeUiSession::new(initial_snapshot(
-            "/tmp/libra",
+            working_dir.clone(),
             CodeUiProviderInfo {
                 provider: "test".to_string(),
                 model: Some("test-model".to_string()),
@@ -2449,7 +2459,7 @@ mod tests {
 
         let app = code_router()
             .with_state(WebAppState {
-                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                working_dir: Arc::new(PathBuf::from(&working_dir)),
                 code_ui: Some(runtime),
                 automation_control_token: Some(Arc::from("control-token-secret")),
                 audit_sink: Arc::new(TracingAuditSink),
