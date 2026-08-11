@@ -1939,31 +1939,50 @@ fn sync_session_metadata_from_snapshot(
 }
 
 fn request_user_input_question_to_metadata(question: &UserInputQuestion) -> serde_json::Value {
-    let has_options = question
-        .options
-        .as_ref()
-        .is_some_and(|options| !options.is_empty());
-
+    let mut seen_labels = std::collections::HashSet::new();
     let options = question
         .options
         .as_ref()
         .map(|options| {
             options
                 .iter()
-                .map(|option| serde_json::json!({ "id": option.label, "label": option.label }))
+                .filter_map(|option| {
+                    let label = option.label.trim();
+                    if label.is_empty() || !seen_labels.insert(label.to_string()) {
+                        return None;
+                    }
+                    let mut mapped = serde_json::Map::new();
+                    mapped.insert(
+                        "id".to_string(),
+                        serde_json::Value::String(label.to_string()),
+                    );
+                    mapped.insert(
+                        "label".to_string(),
+                        serde_json::Value::String(label.to_string()),
+                    );
+                    if !option.description.trim().is_empty() {
+                        mapped.insert(
+                            "description".to_string(),
+                            serde_json::Value::String(option.description.clone()),
+                        );
+                    }
+                    Some(serde_json::Value::Object(mapped))
+                })
                 .collect::<Vec<_>>()
         })
         .filter(|options| !options.is_empty())
         .unwrap_or_default();
+    let has_options = !options.is_empty();
 
-    let metadata = serde_json::json!({
+    serde_json::json!({
         "id": question.id,
+        "header": question.header,
         "prompt": question.question,
         "kind": if has_options { "single" } else { "text" },
         "options": options,
-    });
-
-    metadata
+        "isOther": question.is_other,
+        "isSecret": question.is_secret,
+    })
 }
 
 fn interaction_request_for_exec_approval(
@@ -2527,6 +2546,51 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn request_user_input_question_to_metadata_projects_browser_wire_fields() {
+        use crate::internal::ai::tools::context::UserInputOption;
+
+        let metadata = request_user_input_question_to_metadata(&UserInputQuestion {
+            id: "risk".to_string(),
+            header: "Risk".to_string(),
+            question: "Pick a profile".to_string(),
+            is_other: true,
+            is_secret: true,
+            options: Some(vec![
+                UserInputOption {
+                    label: "Low".to_string(),
+                    description: "Safer".to_string(),
+                },
+                UserInputOption {
+                    label: "   ".to_string(),
+                    description: "blank".to_string(),
+                },
+                UserInputOption {
+                    label: "Low".to_string(),
+                    description: "duplicate".to_string(),
+                },
+                UserInputOption {
+                    label: "High".to_string(),
+                    description: "Faster".to_string(),
+                },
+            ]),
+        });
+
+        assert_eq!(metadata["id"], "risk");
+        assert_eq!(metadata["header"], "Risk");
+        assert_eq!(metadata["prompt"], "Pick a profile");
+        assert_eq!(metadata["kind"], "single");
+        assert_eq!(metadata["isOther"], true);
+        assert_eq!(metadata["isSecret"], true);
+        assert_eq!(
+            metadata["options"],
+            json!([
+                {"id": "Low", "label": "Low", "description": "Safer"},
+                {"id": "High", "label": "High", "description": "Faster"},
+            ])
+        );
+    }
 
     #[test]
     fn headless_capabilities_advertise_projected_plan_and_patchset_surfaces() {

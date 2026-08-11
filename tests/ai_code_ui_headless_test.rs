@@ -1526,6 +1526,26 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
         "request_user_input request should appear as pending interaction",
     );
 
+    let pending = runtime
+        .snapshot()
+        .await
+        .interactions
+        .into_iter()
+        .find(|interaction| interaction.id == interaction_id)
+        .expect("pending request_user_input interaction");
+    let questions = pending
+        .metadata
+        .get("questions")
+        .and_then(|value| value.as_array())
+        .expect("projected questions array");
+    assert_eq!(questions.len(), 1);
+    assert_eq!(questions[0]["id"], question_id);
+    assert_eq!(questions[0]["header"], "Approve");
+    assert_eq!(questions[0]["prompt"], "Choose approach");
+    assert_eq!(questions[0]["isOther"], false);
+    assert_eq!(questions[0]["isSecret"], false);
+    assert_eq!(questions[0]["kind"], "text");
+
     runtime
         .respond_interaction(
             &interaction_id,

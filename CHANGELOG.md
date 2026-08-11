@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-08, 2026-08-11)
+
+- **W2-08 delivers browser approval and `request_user_input` panels.** Domain
+  helpers/fixtures under `web/src/lib/code-ui/interactions/` drive
+  `ApprovalPanel` / `RequestUserInputForm` / `SessionInteractions`. Headless
+  projection now emits `header` / `isOther` / `isSecret` / option descriptions,
+  filters blank/duplicate option labels, and is covered by a Rust wire unit
+  test. Managed Codex sessions keep cancel but disable browser respond.
+
 ### Added (plan-20260715 W2-07, 2026-08-11)
 
 - **W2-07 delivers the Web Code UI wire adapter foundation.** Shared

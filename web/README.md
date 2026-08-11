@@ -15,19 +15,18 @@ pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Current UI status (W2-07)
+## Current UI status (W2-07 + W2-08)
 
-The shipped W2-07 page is deliberately a foundation-only placeholder. It mounts
-the shared session/SSE store and browser-controller lease provider, then shows
-the current session title and phase. It does not yet ship a three-pane
-workspace, composer, interaction panel, thread sidebar, terminal, or workflow
-tabs.
+The shipped page mounts the shared session/SSE store and browser-controller
+lease provider, shows the current session title and phase, and renders the
+pending approval / `request_user_input` panel when the snapshot has one
+(`SessionInteractions` → `InteractionsHost`). It does not yet ship a
+three-pane workspace, composer, thread sidebar, terminal, or workflow tabs.
 
-The shared API client, wire types, session store, controller lease handling,
-and Vitest coverage are the W2-07 deliverable. Domain panels are owned by later
-W2 cards: W2-08 and later add their respective interaction surfaces, while
-W2-16 adds the workflow review UI. Do not treat the API surface below as a
-claim that those panels are already rendered by the shipped page.
+W2-07 owns the shared wire foundation under `web/src/lib/code-ui/`. W2-08 owns
+approval and structured user-input under `web/src/lib/code-ui/interactions/`
+and `web/src/components/workspace/interactions/`. Later domain panels remain
+with later W2 cards (usage W2-13, workflow review W2-16, etc.).
 
 ## Live API contract
 
@@ -57,17 +56,26 @@ The wire types are pinned in two places — keep them in lock-step:
 
 ```
 web/src/
-├── app/                       # Next.js app router entry
+├── app/                       # Next.js app router entry (mounts SessionInteractions)
+├── components/workspace/
+│   └── interactions/          # Approval + request_user_input panels (W2-08)
 └── lib/
-    ├── code-ui/               # Wire types, HTTP client, store, controller hook
-    └── ...                    # Domain panels land in later W2 cards
+    └── code-ui/               # Shared wire types, client, store, controller (W2-07)
+        └── interactions/      # Approval/user-input helpers + fixtures (W2-08)
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once so future domain panels share one client id, one lease, and one snapshot.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions` so pending approval/user-input prompts resolve through the leased controller.
 
 ## Browser write surface
 
-Future composer, cancel, and interaction-panel writers will flow through `useBrowserController()` (provided by `<BrowserControllerProvider>`). The W2-07 placeholder does not render those controls. On the first write the hook calls `POST /api/code/controller/attach`, caches `controllerToken` + `leaseExpiresAt` in memory, and replays the original request. The browser `clientId` is persisted in `sessionStorage` so an unexpected reload can renew the same lease; an explicit detach still clears write access for a clean hand-off.
+Composer and other domain writers will continue to land in later W2 cards.
+Approval and `request_user_input` already flow through `useBrowserController()`
+via `SessionInteractions`: `respond` posts to `/api/code/interactions/{id}` and
+`cancel` posts to `/api/code/control/cancel`. On the first write the hook calls
+`POST /api/code/controller/attach`, caches `controllerToken` + `leaseExpiresAt`
+in memory, and replays the original request. The browser `clientId` is
+persisted in `sessionStorage` so an unexpected reload can renew the same
+lease; an explicit detach still clears write access for a clean hand-off.
 
 Recovery semantics in `controller.tsx`:
 

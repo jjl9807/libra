@@ -1,5 +1,6 @@
 "use client";
 
+import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
 import { BrowserControllerProvider } from "@/lib/code-ui/controller";
 import { CodeUiStoreProvider, useCodeUiStore } from "@/lib/code-ui/store";
 import { toShellViewModel } from "@/lib/code-ui/view-model";
@@ -12,8 +13,13 @@ function PlaceholderShell() {
       <h1>Libra Code</h1>
       <p>Shared browser foundation is ready.</p>
       <p aria-live="polite">
-        {error ? "Session unavailable" : snapshot ? `${view.title}: ${view.phase}` : "Loading session…"}
+        {error
+          ? "Session unavailable"
+          : snapshot
+            ? `${view.title}: ${view.phase}`
+            : "Loading session…"}
       </p>
+      <SessionInteractions />
     </main>
   );
 }
