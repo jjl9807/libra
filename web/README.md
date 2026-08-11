@@ -15,31 +15,17 @@ pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Current UI status (W2-07 + W2-08 + W2-09 + W2-10 + W2-13 + W2-14)
+## Current UI status (W2-07 … W2-15)
 
 The shipped page mounts the shared session/SSE store and browser-controller
-lease provider, shows the current session title and phase, renders the
-pending approval / `request_user_input` panel when the snapshot has one
-(`SessionInteractions` → `InteractionsHost`), mounts goal/task/skill
-controls (`SessionGoalTaskSkill`), mounts session lifecycle controls
-(`SessionLifecycle`), mounts usage controls (`SessionUsage`), and mounts
-execution/repair projection (`SessionExecutionRepair`: plan steps, failure
-evidence, Continue/Cancel via leased `respond` without a browser-side repair
-FSM). It does not yet ship a three-pane workspace, composer, terminal, or
-workflow tabs.
+lease provider, domain panels through W2-14, and SSE resilience status
+(`SessionSseResilience`: reconnecting / resync-required / resynced banners with
+cursor retention; production v2 backlog wire still W3-06/W3-08). It does not
+yet ship a three-pane workspace, composer, terminal, or workflow tabs.
 
-W2-07 owns the shared wire foundation under `web/src/lib/code-ui/`. W2-08 owns
-approval and structured user-input under `web/src/lib/code-ui/interactions/`
-and `web/src/components/workspace/interactions/`. W2-09 owns goal/task/skill
-under `web/src/lib/code-ui/goal-task-skill/` and
-`web/src/components/workspace/goal-task-skill/` (skills use the A0-07 curated
-registry until W3-01 exposes Code UI skill HTTP). W2-10 owns session
-lifecycle under `web/src/lib/code-ui/session-lifecycle/` and
-`web/src/components/workspace/session-lifecycle/`. W2-13 owns usage under
-`web/src/lib/code-ui/usage/` and `web/src/components/workspace/usage/`.
-W2-14 owns execution/repair under `web/src/lib/code-ui/execution-repair/` and
-`web/src/components/workspace/execution-repair/`. Later domain panels remain
-with later W2 cards (SSE reconnect W2-15, workflow review W2-16, etc.).
+W2-15 owns SSE resilience under `web/src/lib/code-ui/sse-resilience/` and
+`web/src/components/workspace/sse-resilience/` without modifying W2-07
+`store.tsx`. Remaining frontend domain card: workflow review W2-16.
 
 ## Live API contract
 
@@ -79,17 +65,19 @@ web/src/
 │   ├── goal-task-skill/       # Goal / task / skill panels (W2-09)
 │   ├── session-lifecycle/     # Thread list / resume / cancel (W2-10)
 │   ├── usage/                 # Usage cumulative / turn / sub-agent (W2-13)
-│   └── execution-repair/      # Plan execution + repair projection (W2-14)
+│   ├── execution-repair/      # Plan execution + repair projection (W2-14)
+│   └── sse-resilience/        # SSE reconnect / resync banners (W2-15)
 └── lib/
     └── code-ui/               # Shared wire types, client, store, controller (W2-07)
         ├── interactions/      # Approval/user-input helpers + fixtures (W2-08)
         ├── goal-task-skill/   # Goal/task API + A0-07 skill helpers (W2-09)
         ├── session-lifecycle/ # Threads API + resume affordance (W2-10)
         ├── usage/             # W2-12 RuntimeUsageTotals mirror + fixtures (W2-13)
-        └── execution-repair/  # Repair view helpers + fixtures (W2-14)
+        ├── execution-repair/  # Repair view helpers + fixtures (W2-14)
+        └── sse-resilience/    # Fixture-driven SSE status reducer (W2-15)
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions`, `SessionGoalTaskSkill`, `SessionLifecycle`, `SessionUsage`, and `SessionExecutionRepair`.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders the domain Session* panels through W2-15.
 
 ## Browser write surface
 

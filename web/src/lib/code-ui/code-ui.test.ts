@@ -326,16 +326,111 @@ describe("Code UI shared foundation", () => {
     );
     const olderRefresh = store?.refresh();
     const newerRefresh = store?.refresh();
+    let newerResult: Awaited<ReturnType<NonNullable<typeof store>["refresh"]>> | undefined;
+    let olderResult: Awaited<ReturnType<NonNullable<typeof store>["refresh"]>> | undefined;
     await act(async () => {
       resolveSnapshots[1]?.(sessionFixture({ status: "thinking" }));
-      await newerRefresh;
+      newerResult = await newerRefresh;
     });
     await act(async () => {
       resolveSnapshots[0]?.(sessionFixture({ status: "idle" }));
-      await olderRefresh;
+      olderResult = await olderRefresh;
     });
 
+    expect(newerResult).toBe("applied");
+    expect(olderResult).toBe("raced");
     expect(store?.snapshot?.status).toBe("thinking");
+    await unmount(root, container);
+  });
+
+  it("does not let an older refresh failure clobber a newer refresh before any snapshot exists", async () => {
+    vi.useFakeTimers();
+    const client = new ControllableCodeUiClient();
+    const settle: Array<{
+      resolve: (snapshot: CodeUiSessionSnapshot) => void;
+      reject: (cause: Error) => void;
+    }> = [];
+    client.snapshot.mockImplementation(
+      () =>
+        new Promise<CodeUiSessionSnapshot>((resolve, reject) => {
+          settle.push({ resolve, reject });
+        }),
+    );
+    let store: ReturnType<typeof useCodeUiStore> | undefined;
+    const { root, container } = await mount(
+      createElement(
+        CodeUiStoreProvider,
+        { client, reconnectDelayMs: 60_000 },
+        createElement(StoreProbe, { onStore: (value) => (store = value) }),
+      ),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(settle).toHaveLength(1);
+
+    const newerRefresh = store!.refresh();
+    expect(settle).toHaveLength(2);
+
+    let newerResult: Awaited<ReturnType<NonNullable<typeof store>["refresh"]>> | undefined;
+    // Reject the older (bootstrap) refresh after the newer one has started.
+    await act(async () => {
+      settle[0]!.reject(new Error("stale bootstrap failure"));
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      settle[1]!.resolve(sessionFixture({ status: "thinking" }));
+      newerResult = await newerRefresh;
+    });
+
+    expect(newerResult).toBe("applied");
+    expect(store?.error).toBeUndefined();
+    expect(store?.snapshot?.status).toBe("thinking");
+    await unmount(root, container);
+  });
+
+  it("returns superseded when a live SSE update owns newer data than the refresh", async () => {
+    vi.useFakeTimers();
+    const client = new ControllableCodeUiClient();
+    let store: ReturnType<typeof useCodeUiStore> | undefined;
+    const { root, container } = await mount(
+      createElement(
+        CodeUiStoreProvider,
+        { client },
+        createElement(StoreProbe, { onStore: (value) => (store = value) }),
+      ),
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(store?.snapshot?.status).toBe("idle");
+
+    let resolveSnapshot: ((snapshot: CodeUiSessionSnapshot) => void) | undefined;
+    client.snapshot.mockImplementation(
+      () =>
+        new Promise<CodeUiSessionSnapshot>((resolve) => {
+          resolveSnapshot = resolve;
+        }),
+    );
+    const pending = store?.refresh();
+    let result: Awaited<ReturnType<NonNullable<typeof store>["refresh"]>> | undefined;
+    await act(async () => {
+      client.emit(
+        sseFixture(sessionFixture({ status: "executing_tool", updatedAt: "2026-07-15T00:00:09.000Z" }), {
+          seq: 3,
+        }),
+      );
+      resolveSnapshot?.(
+        sessionFixture({ status: "idle", updatedAt: "2026-07-15T00:00:01.000Z" }),
+      );
+      result = await pending;
+    });
+
+    expect(result).toBe("superseded");
+    expect(store?.snapshot?.status).toBe("executing_tool");
     await unmount(root, container);
   });
 

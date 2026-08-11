@@ -1,11 +1,16 @@
 "use client";
 
+import { useMemo } from "react";
+
 import { SessionExecutionRepair } from "@/components/workspace/execution-repair/SessionExecutionRepair";
 import { SessionGoalTaskSkill } from "@/components/workspace/goal-task-skill/SessionGoalTaskSkill";
 import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
 import { SessionLifecycle } from "@/components/workspace/session-lifecycle/SessionLifecycle";
+import { SessionSseResilience } from "@/components/workspace/sse-resilience/SessionSseResilience";
 import { SessionUsage } from "@/components/workspace/usage/SessionUsage";
+import { createCodeUiClient } from "@/lib/code-ui/client";
 import { BrowserControllerProvider } from "@/lib/code-ui/controller";
+import { wrapClientForSseResilience } from "@/lib/code-ui/sse-resilience";
 import { CodeUiStoreProvider, useCodeUiStore } from "@/lib/code-ui/store";
 import { toShellViewModel } from "@/lib/code-ui/view-model";
 
@@ -28,13 +33,15 @@ function PlaceholderShell() {
       <SessionLifecycle />
       <SessionUsage />
       <SessionExecutionRepair />
+      <SessionSseResilience />
     </main>
   );
 }
 
 export default function Home() {
+  const client = useMemo(() => wrapClientForSseResilience(createCodeUiClient()), []);
   return (
-    <CodeUiStoreProvider>
+    <CodeUiStoreProvider client={client}>
       <BrowserControllerProvider>
         <PlaceholderShell />
       </BrowserControllerProvider>
