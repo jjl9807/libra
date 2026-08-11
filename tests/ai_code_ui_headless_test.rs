@@ -1471,10 +1471,9 @@ async fn respond_interaction_unknown_id() {
         .await;
     let error = result.expect_err("idle respond_interaction must fail closed");
     assert!(
-        error.to_string().contains(
-            "This interaction has no active AgentRuntime turn and was closed fail-closed"
-        ),
-        "idle respond must surface the fail-closed message, got {error}",
+        error.to_string().contains("INTERACTION_NOT_ACTIVE")
+            && error.to_string().contains("no active AgentRuntime turn"),
+        "idle respond must surface INTERACTION_NOT_ACTIVE, got {error}",
     );
 }
 

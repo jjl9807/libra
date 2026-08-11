@@ -12,8 +12,8 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::code_ui::{
-    CodeUiCapabilities, CodeUiCommandAdapter, CodeUiInteractionResponse, CodeUiReadModel,
-    CodeUiSession,
+    CodeUiApiError, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiInteractionResponse,
+    CodeUiReadModel, CodeUiSession,
 };
 use crate::internal::ai::{
     agent::runtime::{RuntimeUsageService, RuntimeUsageTotals},
@@ -257,7 +257,14 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
             .await
             .as_ref()
             .map(|slot| slot.turn_id.clone())
-            .ok_or_else(|| anyhow!("This interaction has no active AgentRuntime turn"))?;
+            .ok_or_else(|| {
+                anyhow!(CodeUiApiError::conflict(
+                    "INTERACTION_NOT_ACTIVE",
+                    format!(
+                        "interaction '{interaction_id}' has no active AgentRuntime turn to receive a response"
+                    )
+                ))
+            })?;
         let response = serde_json::to_string(&response)
             .map_err(|error| anyhow!("failed to encode interaction response: {error}"))?;
         self.runtime

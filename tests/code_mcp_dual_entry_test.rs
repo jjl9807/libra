@@ -312,10 +312,9 @@ fn wait_for_mcp_task(
 #[test]
 #[serial]
 fn libra_code_writes_mcp_url_into_control_info_file() -> Result<()> {
-    let session = CodeSession::spawn(CodeSessionOptions::new(
-        "code-mcp-control-info",
-        fixture_path(),
-    ))?;
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-mcp-control-info", fixture_path()).with_pty_tui(),
+    )?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| {
@@ -417,10 +416,9 @@ fn libra_code_stdio_web_only_combo_is_rejected_at_arg_parse() -> Result<()> {
 #[test]
 #[serial]
 fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()> {
-    let session = CodeSession::spawn(CodeSessionOptions::new(
-        "code-mcp-dual-reachability",
-        fixture_path(),
-    ))?;
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-mcp-dual-reachability", fixture_path()).with_pty_tui(),
+    )?;
 
     // 1. Web reachability — drive the existing snapshot accessor
     //    so the failure mode is identical to other tests that
@@ -499,10 +497,9 @@ fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()>
 #[test]
 #[serial]
 fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> {
-    let mut session = CodeSession::spawn(CodeSessionOptions::new(
-        "code-mcp-web-message-consistency",
-        fixture_path(),
-    ))?;
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("code-mcp-web-message-consistency", fixture_path()).with_pty_tui(),
+    )?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?
@@ -549,10 +546,9 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
 #[test]
 #[serial]
 fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
-    let session = CodeSession::spawn(CodeSessionOptions::new(
-        "code-mcp-write-web-sse",
-        fixture_path(),
-    ))?;
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-mcp-write-web-sse", fixture_path()).with_pty_tui(),
+    )?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?
@@ -944,10 +940,9 @@ fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Resul
 #[serial]
 fn mcp_http_and_stdio_expose_identical_tool_set() -> Result<()> {
     // HTTP side — reuse the harness-spawned `libra code` MCP HTTP transport.
-    let session = CodeSession::spawn(CodeSessionOptions::new(
-        "code-mcp-tool-set-parity",
-        fixture_path(),
-    ))?;
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-mcp-tool-set-parity", fixture_path()).with_pty_tui(),
+    )?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?

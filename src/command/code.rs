@@ -2924,9 +2924,10 @@ where
         ))
     })?;
 
+    let automation_write_enabled = args.control == ControlMode::Write;
     let mut runtime_options = CodeUiRuntimeOptions::new(
         browser_write_enabled,
-        false,
+        automation_write_enabled,
         CodeUiInitialController::Unclaimed,
     );
     runtime_options.lease_duration = code_ui_test_lease_duration_override()?;
@@ -5428,9 +5429,12 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 ///
 /// Flags that stay rejected in BOTH non-TUI modes (design / safety / deferred
 /// work): `--env-file` (its bootstrap source is shared with TUI, but accepting
-/// the public Web-only flag remains a later compatibility decision),
-/// `--network-access allow` (safety gate), plus `--context`,
-/// `--approval-policy`, and `--approval-ttl`.
+/// the public Web-only flag remains a later compatibility decision) and
+/// `--network-access allow` (safety gate).
+/// W3-02: `--context` and `--approval-policy` are accepted under Web-only so
+/// Code UI harness scenarios can drive the same plan/generation paths as TUI;
+/// they remain rejected for MCP `--stdio`. `--approval-ttl` stays rejected in
+/// both until a dedicated TTL surface lands.
 /// `--resume` is accepted only for the non-Codex Web headless path; it remains
 /// rejected for MCP stdio and managed Codex, which do not share that session
 /// protocol.
@@ -5461,6 +5465,12 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
         reject_mode_flag(args.deepseek_stream.is_some(), "--deepseek-stream", mode)?;
         reject_mode_flag(args.kimi_thinking.is_some(), "--kimi-thinking", mode)?;
         reject_mode_flag(args.kimi_stream.is_some(), "--kimi-stream", mode)?;
+        reject_mode_flag(args.context.is_some(), "--context", mode)?;
+        reject_mode_flag(
+            args.approval_policy != CodeApprovalPolicy::OnRequest,
+            "--approval-policy",
+            mode,
+        )?;
     }
 
     // Rejected in BOTH non-TUI modes.
@@ -5469,15 +5479,9 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     // later public-compatibility decision. Keep the flag rejected until that
     // compatibility work lands.
     reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
-    reject_mode_flag(args.context.is_some(), "--context", mode)?;
     if !web_only {
         reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
     }
-    reject_mode_flag(
-        args.approval_policy != CodeApprovalPolicy::OnRequest,
-        "--approval-policy",
-        mode,
-    )?;
     reject_mode_flag(args.approval_ttl.is_some(), "--approval-ttl", mode)?;
     reject_mode_flag(
         args.network_access != CodeNetworkAccess::Deny,

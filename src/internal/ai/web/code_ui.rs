@@ -1531,6 +1531,7 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("INVALID_CONTROLLER_TOKEN", 403),
         ("INVALID_CONTROLLER_KIND", 400),
         ("CONTROLLER_CONFLICT", 409),
+        ("INTERACTION_NOT_ACTIVE", 409),
         ("BROWSER_CONTROL_DISABLED", 403),
         ("AUTOMATION_CONTROLLER_REQUIRED", 403),
         // Tail: read-side and runtime-availability errors.

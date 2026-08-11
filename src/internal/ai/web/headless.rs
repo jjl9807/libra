@@ -1442,10 +1442,12 @@ where
         };
         let Some(runtime_turn_id) = runtime_turn_id else {
             self.session.clear_interaction(interaction_id).await;
-            self.session.set_status(CodeUiSessionStatus::Error).await;
-            return Err(anyhow!(
-                "This interaction has no active AgentRuntime turn and was closed fail-closed"
-            ));
+            return Err(anyhow!(super::code_ui::CodeUiApiError::conflict(
+                "INTERACTION_NOT_ACTIVE",
+                format!(
+                    "interaction '{interaction_id}' has no active AgentRuntime turn to receive a response"
+                )
+            )));
         };
         let response_payload = serde_json::to_string(&response).map_err(|error| {
             anyhow!("Unable to encode the interaction response for AgentRuntime delivery: {error}")

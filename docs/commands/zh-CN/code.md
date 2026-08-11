@@ -171,6 +171,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |
 | `INVALID_CONTROLLER_KIND` | 400 | Controller attach 请求了不支持的 kind。 |
 | `CONTROLLER_CONFLICT` | 409 | 另一个 live controller 拥有 lease，或会话正忙。 |
+| `INTERACTION_NOT_ACTIVE` | 409 | respond 目标 interaction 没有活跃的 runtime turn。 |
 | `BROWSER_CONTROL_DISABLED` | 403 | 浏览器写控制已禁用。 |
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | 用非 automation lease 调用了 automation-only 路径。 |
 | `CODE_UI_UNAVAILABLE` | 404 | 没有 active `libra code` session 附加到 Web 服务器。 |

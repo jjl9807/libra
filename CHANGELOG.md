@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-02, 2026-08-11)
+
+- **W3-02 migrates Code UI harness to `--web-only` by default.** Remote
+  matrices and scenarios drive HTTP/SSE against headless Web; workflow
+  baselines move to `internal/ai/workflow_baseline`; web-only shutdown uses
+  SIGTERM; plan/reclaim/MCP-TUI cases opt into `.with_pty_tui()`.
+
 ### Added (plan-20260715 W3-01, 2026-08-11)
 
 - **W3-01 delivers `AgentRuntimeCodeUiAdapter`.** Production Code UI HTTP bridges
