@@ -3,6 +3,7 @@
 import { SessionGoalTaskSkill } from "@/components/workspace/goal-task-skill/SessionGoalTaskSkill";
 import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
 import { SessionLifecycle } from "@/components/workspace/session-lifecycle/SessionLifecycle";
+import { SessionUsage } from "@/components/workspace/usage/SessionUsage";
 import { BrowserControllerProvider } from "@/lib/code-ui/controller";
 import { CodeUiStoreProvider, useCodeUiStore } from "@/lib/code-ui/store";
 import { toShellViewModel } from "@/lib/code-ui/view-model";
@@ -24,6 +25,7 @@ function PlaceholderShell() {
       <SessionInteractions />
       <SessionGoalTaskSkill />
       <SessionLifecycle />
+      <SessionUsage />
     </main>
   );
 }

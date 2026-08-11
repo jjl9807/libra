@@ -15,17 +15,19 @@ pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Current UI status (W2-07 + W2-08 + W2-09 + W2-10)
+## Current UI status (W2-07 + W2-08 + W2-09 + W2-10 + W2-13)
 
 The shipped page mounts the shared session/SSE store and browser-controller
 lease provider, shows the current session title and phase, renders the
 pending approval / `request_user_input` panel when the snapshot has one
 (`SessionInteractions` → `InteractionsHost`), mounts goal/task/skill
-controls (`SessionGoalTaskSkill`), and mounts session lifecycle controls
+controls (`SessionGoalTaskSkill`), mounts session lifecycle controls
 (`SessionLifecycle`: thread list via `GET /api/code/threads`, cancel via
 `POST /api/code/control/cancel`, resume affordance that explains process
-`libra code --resume <thread_id>` until W3-01 lands browser resume HTTP).
-It does not yet ship a three-pane workspace, composer, terminal, or
+`libra code --resume <thread_id>` until W3-01 lands browser resume HTTP),
+and mounts usage controls (`SessionUsage`: W2-12 `RuntimeUsageTotals` read
+model for cumulative / turn / sub-agent; live `/api/code/usage` deferred to
+W3-01). It does not yet ship a three-pane workspace, composer, terminal, or
 workflow tabs.
 
 W2-07 owns the shared wire foundation under `web/src/lib/code-ui/`. W2-08 owns
@@ -35,9 +37,10 @@ under `web/src/lib/code-ui/goal-task-skill/` and
 `web/src/components/workspace/goal-task-skill/` (skills use the A0-07 curated
 registry until W3-01 exposes Code UI skill HTTP). W2-10 owns session
 lifecycle under `web/src/lib/code-ui/session-lifecycle/` and
-`web/src/components/workspace/session-lifecycle/`. Later domain panels remain
-with later W2 cards (usage W2-13, execution/repair W2-14, SSE reconnect
-W2-15, workflow review W2-16, etc.).
+`web/src/components/workspace/session-lifecycle/`. W2-13 owns usage under
+`web/src/lib/code-ui/usage/` and `web/src/components/workspace/usage/`.
+Later domain panels remain with later W2 cards (execution/repair W2-14, SSE
+reconnect W2-15, workflow review W2-16, etc.).
 
 ## Live API contract
 
@@ -75,15 +78,17 @@ web/src/
 ├── components/workspace/
 │   ├── interactions/          # Approval + request_user_input panels (W2-08)
 │   ├── goal-task-skill/       # Goal / task / skill panels (W2-09)
-│   └── session-lifecycle/     # Thread list / resume / cancel (W2-10)
+│   ├── session-lifecycle/     # Thread list / resume / cancel (W2-10)
+│   └── usage/                 # Usage cumulative / turn / sub-agent (W2-13)
 └── lib/
     └── code-ui/               # Shared wire types, client, store, controller (W2-07)
         ├── interactions/      # Approval/user-input helpers + fixtures (W2-08)
         ├── goal-task-skill/   # Goal/task API + A0-07 skill helpers (W2-09)
-        └── session-lifecycle/ # Threads API + resume affordance (W2-10)
+        ├── session-lifecycle/ # Threads API + resume affordance (W2-10)
+        └── usage/             # W2-12 RuntimeUsageTotals mirror + fixtures (W2-13)
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions`, `SessionGoalTaskSkill`, and `SessionLifecycle` so pending prompts, goal/task/skill controls, and thread resume/cancel resolve through the leased controller.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions`, `SessionGoalTaskSkill`, `SessionLifecycle`, and `SessionUsage` so pending prompts, goal/task/skill controls, thread resume/cancel, and usage totals resolve through the shared store (usage HTTP deferred to W3-01).
 
 ## Browser write surface
 
