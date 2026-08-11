@@ -1,11 +1,9 @@
 //! Headless web-only runtime smoke tests.
 //!
-//! Exercises [`HeadlessCodeRuntime`] end-to-end against the deterministic
-//! `test-provider` fixture: submitting a prompt should drive a tool-loop turn
-//! whose final assistant text lands in the live `CodeUiSession`. Used as the
-//! L1 verification anchor for Phase 3 of `docs/development/commands/_general.md` (the
-//! `--web-only --provider <non-codex>` path that previously fell back to a
-//! read-only placeholder).
+//! Exercises [`HeadlessCodeRuntime`] lifecycle + the mounted
+//! [`AgentRuntimeCodeUiAdapter`] write path against the deterministic
+//! `test-provider` fixture. Explicit direct-chat turns use a leading `/`
+//! (W3-03); plain messages default to Phase 0 plan routing.
 
 #![cfg(feature = "test-provider")]
 
@@ -26,14 +24,17 @@ use libra::internal::{
             ToolHandler, ToolInvocation, ToolKind, ToolOutput, ToolRegistry, ToolRegistryBuilder,
             ToolResult, ToolSpec,
             context::{UserInputQuestion, UserInputRequest, UserInputResponse},
-            handlers::{PlanHandler, ReadFileHandler, SubmitPlanDraftHandler},
+            handlers::{
+                PlanHandler, ReadFileHandler, RequestUserInputHandler, SubmitIntentDraftHandler,
+                SubmitPlanDraftHandler,
+            },
         },
         usage::{UsageContext, UsageQueryFilter, UsageRecorder},
         web::{
             code_ui::{
-                CodeUiApplyToFuture, CodeUiCommandAdapter, CodeUiInteractionResponse,
-                CodeUiInteractionStatus, CodeUiProviderInfo, CodeUiReadModel, CodeUiSession,
-                CodeUiSessionStatus, initial_snapshot,
+                CodeUiApplyToFuture, CodeUiCommandAdapter, CodeUiInteractionKind,
+                CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiProviderInfo,
+                CodeUiReadModel, CodeUiSession, CodeUiSessionStatus, initial_snapshot,
             },
             headless::{HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities},
         },
@@ -72,6 +73,8 @@ async fn build_runtime_with_persistence(
     mpsc::UnboundedSender<UserInputRequest>,
     mpsc::UnboundedSender<ExecApprovalRequest>,
 ) {
+    let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
+    let (exec_approval_tx, exec_approval_rx) = mpsc::unbounded_channel::<ExecApprovalRequest>();
     let registry = Arc::new(
         ToolRegistryBuilder::with_working_dir(working_dir.clone())
             .hardening(ToolBoundaryRuntime::system(
@@ -81,29 +84,25 @@ async fn build_runtime_with_persistence(
             .register("read_file", Arc::new(ReadFileHandler))
             .register("update_plan", Arc::new(PlanHandler))
             .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
+            .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
+            .register(
+                "request_user_input",
+                Arc::new(RequestUserInputHandler::new(user_input_tx.clone())),
+            )
             .build(),
     );
-    build_runtime_with_registry(fixture, working_dir, initial_history, persistence, registry).await
-}
-
-async fn build_runtime_with_registry(
-    fixture: &str,
-    working_dir: PathBuf,
-    initial_history: Vec<Message>,
-    persistence: Option<HeadlessSessionPersistence>,
-    registry: Arc<ToolRegistry>,
-) -> (
-    Arc<HeadlessCodeRuntime<fake::CompletionModel>>,
-    mpsc::UnboundedSender<UserInputRequest>,
-    mpsc::UnboundedSender<ExecApprovalRequest>,
-) {
-    build_runtime_with_registry_and_config(
+    build_runtime_with_registry_channels(
         fixture,
         working_dir,
         initial_history,
         persistence,
         registry,
         Arc::new(ToolLoopConfig::default),
+        None,
+        user_input_tx,
+        user_input_rx,
+        exec_approval_tx,
+        exec_approval_rx,
     )
     .await
 }
@@ -145,6 +144,42 @@ async fn build_runtime_with_registry_and_config_and_shutdown_timeout(
     mpsc::UnboundedSender<UserInputRequest>,
     mpsc::UnboundedSender<ExecApprovalRequest>,
 ) {
+    let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
+    let (exec_approval_tx, exec_approval_rx) = mpsc::unbounded_channel::<ExecApprovalRequest>();
+    build_runtime_with_registry_channels(
+        fixture,
+        working_dir,
+        initial_history,
+        persistence,
+        registry,
+        config_factory,
+        shutdown_timeout,
+        user_input_tx,
+        user_input_rx,
+        exec_approval_tx,
+        exec_approval_rx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_runtime_with_registry_channels(
+    fixture: &str,
+    working_dir: PathBuf,
+    initial_history: Vec<Message>,
+    persistence: Option<HeadlessSessionPersistence>,
+    registry: Arc<ToolRegistry>,
+    config_factory: Arc<dyn Fn() -> ToolLoopConfig + Send + Sync>,
+    shutdown_timeout: Option<Duration>,
+    user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
+    user_input_rx: mpsc::UnboundedReceiver<UserInputRequest>,
+    exec_approval_tx: mpsc::UnboundedSender<ExecApprovalRequest>,
+    exec_approval_rx: mpsc::UnboundedReceiver<ExecApprovalRequest>,
+) -> (
+    Arc<HeadlessCodeRuntime<fake::CompletionModel>>,
+    mpsc::UnboundedSender<UserInputRequest>,
+    mpsc::UnboundedSender<ExecApprovalRequest>,
+) {
     let fake_client = fake::Client::from_fixture_path(&fixture_path(fixture))
         .expect("fake provider fixture must load");
     let model = fake_client.completion_model("fake");
@@ -160,8 +195,6 @@ async fn build_runtime_with_registry_and_config_and_shutdown_timeout(
         provider,
         capabilities.clone(),
     ));
-    let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
-    let (exec_approval_tx, exec_approval_rx) = mpsc::unbounded_channel::<ExecApprovalRequest>();
 
     let runtime = match shutdown_timeout {
         Some(shutdown_timeout) => HeadlessCodeRuntime::new_with_persistence_and_shutdown_timeout(
@@ -174,6 +207,7 @@ async fn build_runtime_with_registry_and_config_and_shutdown_timeout(
             config_factory,
             initial_history,
             persistence,
+            None,
             shutdown_timeout,
         )
         .await
@@ -188,6 +222,7 @@ async fn build_runtime_with_registry_and_config_and_shutdown_timeout(
             config_factory,
             initial_history,
             persistence,
+            None,
         )
         .await
         .expect("test registry must retain the shared tool boundary"),
@@ -213,6 +248,24 @@ async fn await_worker_running(runtime: &HeadlessCodeRuntime<fake::CompletionMode
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("worker did not reach InteractionState::Running within deadline");
+}
+
+async fn await_pending_interaction(
+    runtime: &HeadlessCodeRuntime<fake::CompletionModel>,
+    kind: CodeUiInteractionKind,
+    message: &str,
+) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let snapshot = runtime.snapshot().await;
+        if let Some(interaction) = snapshot.interactions.iter().find(|interaction| {
+            interaction.kind == kind && interaction.status == CodeUiInteractionStatus::Pending
+        }) {
+            return interaction.id.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{message}");
 }
 
 /// Deterministic mutating handler used to prove a cancellation request never
@@ -270,18 +323,662 @@ async fn initial_snapshot_is_writable_non_placeholder_runtime() {
     );
 }
 
-/// Submitting a plain message must produce an assistant transcript entry that
-/// matches the fake provider's deterministic response, with the snapshot
-/// returning to `Idle` once the turn settles. This is the single anchor that
-/// proves the headless runtime actually drives a model turn — every other
-/// scenario (cancel, reject-on-empty, capability flags) builds on it.
+/// Plain (non-`/`) browser chat must admit as Phase 0 plan routing so the
+/// default path cannot open the full mutating tool allowlist.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_message_admits_as_plan_phase0_turn_mode() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("Add docs to README".to_string())
+        .await
+        .expect("plain message must still admit");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let snapshot = runtime.snapshot().await;
+        if let Some(user) = snapshot.transcript.iter().find(|entry| {
+            entry.kind == libra::internal::ai::web::code_ui::CodeUiTranscriptEntryKind::UserMessage
+        }) {
+            assert_eq!(
+                user.metadata.get("webTurnMode").and_then(|v| v.as_str()),
+                Some("PlanPhase0"),
+                "plain chat must record PlanPhase0 admission metadata"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("plain message did not project a user transcript entry with plan mode");
+}
+
+/// Plain Phase 0 admission must actually fence mutating tools — metadata alone
+/// is not enough. The model fixture asks for `blocking_mutation`; Phase 0's
+/// allowlist must reject execution so the mutating handler never starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_message_phase0_blocks_mutating_tool_execution() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let registry = Arc::new(
+        ToolRegistryBuilder::with_working_dir(workdir.path().to_path_buf())
+            .hardening(ToolBoundaryRuntime::system(
+                Uuid::new_v4(),
+                Arc::new(TracingAuditSink),
+            ))
+            .register("read_file", Arc::new(ReadFileHandler))
+            .register("update_plan", Arc::new(PlanHandler))
+            .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
+            .register(
+                "blocking_mutation",
+                Arc::new(BlockingMutationHandler {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .build(),
+    );
+    // Full allowlist in the factory must not leak into PlanPhase0 turns —
+    // HeadlessTurnExecutor wraps plain chat with phase0_plan_tool_loop_config.
+    let config_factory: Arc<dyn Fn() -> ToolLoopConfig + Send + Sync> =
+        Arc::new(|| ToolLoopConfig {
+            terminal_tools: Some(vec!["blocking_mutation".to_string()]),
+            allowed_tools: Some(vec![
+                "read_file".to_string(),
+                "blocking_mutation".to_string(),
+            ]),
+            ..ToolLoopConfig::default()
+        });
+    let (runtime, _, _) = build_runtime_with_registry_and_config(
+        "phase0_blocks_mutation",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        None,
+        registry,
+        config_factory,
+    )
+    .await;
+
+    runtime
+        .submit_message("please mutate the workspace now".to_string())
+        .await
+        .expect("plain Phase 0 message must still admit");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if runtime.snapshot().await.status == CodeUiSessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        runtime.snapshot().await.status,
+        CodeUiSessionStatus::Idle,
+        "Phase 0 turn must settle after rejecting the mutating tool",
+    );
+
+    // If Phase 0 failed to apply the allowlist, the handler would notify and
+    // leave the turn blocked on `release`. Prove it never started.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), started.notified())
+            .await
+            .is_err(),
+        "Phase 0 must not execute blocking_mutation for plain browser chat",
+    );
+    let snapshot = runtime.snapshot().await;
+    assert!(
+        snapshot
+            .tool_calls
+            .iter()
+            .all(|call| call.id != "phase0-blocked-mutation-1" || call.status != "completed"),
+        "mutating tool must not complete under PlanPhase0: {:?}",
+        snapshot.tool_calls,
+    );
+    let user = snapshot
+        .transcript
+        .iter()
+        .find(|entry| {
+            entry.kind == libra::internal::ai::web::code_ui::CodeUiTranscriptEntryKind::UserMessage
+        })
+        .expect("user transcript row");
+    assert_eq!(
+        user.metadata.get("webTurnMode").and_then(|v| v.as_str()),
+        Some("PlanPhase0"),
+    );
+}
+
+/// After Phase 0 risk selection + `submit_intent_draft`, the browser must see
+/// a pending IntentSpec review gate (confirm/modify/cancel) rather than Idle.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_message_phase0_parks_intent_review_until_confirm() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let (runtime, _, _) = build_runtime("phase0_intent_review", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("please draft an IntentSpec for README docs".to_string())
+        .await
+        .expect("plain Phase 0 message must admit");
+
+    let risk_interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "Phase 0 must ask for risk_profile before drafting",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &risk_interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("risk_profile Low must be accepted");
+
+    let interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "Phase 0 submit_intent_draft must park IntentReviewChoice",
+    )
+    .await;
+    assert_eq!(
+        runtime.snapshot().await.status,
+        CodeUiSessionStatus::AwaitingInteraction
+    );
+
+    runtime
+        .respond_interaction(
+            &interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("confirm".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("confirm must settle the IntentSpec review gate");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if runtime.snapshot().await.status == CodeUiSessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.status, CodeUiSessionStatus::Idle);
+    assert!(
+        snapshot
+            .interactions
+            .iter()
+            .all(|interaction| interaction.id != interaction_id
+                || interaction.status != CodeUiInteractionStatus::Pending),
+        "confirmed IntentSpec review must leave the pending gate",
+    );
+}
+
+/// Modify must arm TUI-parity revise mode so the next plain message revises
+/// the parked IntentSpec instead of silently abandoning the draft.
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_message_phase0_modify_enters_revision_mode_for_next_turn() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let (runtime, _, _) = build_runtime("phase0_intent_review", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("please draft an IntentSpec for README docs".to_string())
+        .await
+        .expect("plain Phase 0 message must admit");
+
+    let risk_interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "Phase 0 must ask for risk_profile before drafting",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &risk_interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("risk_profile Low must be accepted");
+
+    let interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "Phase 0 submit_intent_draft must park IntentReviewChoice",
+    )
+    .await;
+
+    runtime
+        .respond_interaction(
+            &interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("modify".to_string()),
+                note: Some("keep docs only".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("modify must settle into revision mode");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if runtime.snapshot().await.status == CodeUiSessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.status, CodeUiSessionStatus::Idle);
+    assert!(
+        snapshot.transcript.iter().any(|entry| {
+            entry
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("IntentSpec revise mode is active"))
+        }),
+        "modify must project revise-mode help into the transcript",
+    );
+
+    runtime
+        .submit_message("tighten scope to README only".to_string())
+        .await
+        .expect("revision plain message must admit as PlanPhase0");
+
+    let revise_risk_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "revision Phase 0 must ask for risk_profile again",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &revise_risk_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("revision risk_profile Low must be accepted");
+
+    let _revised_review = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "revision submit_intent_draft must park a new IntentReviewChoice",
+    )
+    .await;
+}
+
+/// Modify then process restart must restore revision mode so the next plain
+/// message revises the same IntentSpec instead of drafting a fresh one.
+#[tokio::test(flavor = "multi_thread")]
+async fn resumed_runtime_restores_pending_intent_revision_mode() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let mut state = SessionState::new(&workdir.path().to_string_lossy());
+    let thread_id = state.id.clone();
+    state.metadata.insert(
+        "thread_id".to_string(),
+        serde_json::json!(thread_id.clone()),
+    );
+    let persistence = HeadlessSessionPersistence::new(store.clone(), state.clone());
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "phase0_intent_review",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    runtime
+        .submit_message("please draft an IntentSpec for README docs".to_string())
+        .await
+        .expect("plain Phase 0 message must admit");
+
+    let risk_interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "Phase 0 must ask for risk_profile before drafting",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &risk_interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("risk_profile Low must be accepted");
+
+    let interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "Phase 0 submit_intent_draft must park IntentReviewChoice",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("modify".to_string()),
+                note: Some("keep docs only".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("modify must arm durable revision mode");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if runtime.snapshot().await.status == CodeUiSessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        store
+            .session_root(&thread_id)
+            .join("intents")
+            .join("pending_revision.json")
+            .is_file(),
+        "modify must persist intents/pending_revision.json for resume",
+    );
+
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let restored_state = store
+        .load(&thread_id)
+        .expect("parked session must remain loadable");
+    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state);
+    let (restored, _, _) = build_runtime_with_persistence(
+        "phase0_intent_review",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    assert!(
+        restored.snapshot().await.transcript.iter().any(|entry| {
+            entry
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("revise the current IntentSpec (restored"))
+        }),
+        "resume must re-project revise-mode help",
+    );
+
+    restored
+        .submit_message("continue".to_string())
+        .await
+        .expect("restored revision follow-up must admit");
+
+    let revise_risk_id = await_pending_interaction(
+        &restored,
+        CodeUiInteractionKind::RequestUserInput,
+        "restored revision Phase 0 must ask for risk_profile",
+    )
+    .await;
+    restored
+        .respond_interaction(
+            &revise_risk_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("restored revision risk_profile Low must be accepted");
+
+    let _revised_review = await_pending_interaction(
+        &restored,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "restored revision must park a new IntentReviewChoice",
+    )
+    .await;
+}
+
+/// Crash/resume must rehydrate a parked IntentSpec review so confirm works
+/// after process restart (Codex W3-03 P1: restore pending Phase 0 reviews).
+#[tokio::test(flavor = "multi_thread")]
+async fn resumed_runtime_restores_pending_intent_review_gate() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let mut state = SessionState::new(&workdir.path().to_string_lossy());
+    let thread_id = state.id.clone();
+    state.metadata.insert(
+        "thread_id".to_string(),
+        serde_json::json!(thread_id.clone()),
+    );
+    let persistence = HeadlessSessionPersistence::new(store.clone(), state.clone());
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "phase0_intent_review",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    runtime
+        .submit_message("please draft an IntentSpec for README docs".to_string())
+        .await
+        .expect("plain Phase 0 message must admit");
+
+    let risk_interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "Phase 0 must ask for risk_profile before drafting",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &risk_interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("risk_profile Low must be accepted");
+
+    let interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "Phase 0 submit_intent_draft must park IntentReviewChoice",
+    )
+    .await;
+
+    // Simulate process exit without settling the review: drop the live runtime
+    // after the durable IntentReviewRequested + pending snapshot are on disk.
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let restored_state = store
+        .load(&thread_id)
+        .expect("parked session must remain loadable");
+    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state);
+    let (restored, _, _) = build_runtime_with_persistence(
+        "phase0_intent_review",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    let snapshot = restored.snapshot().await;
+    assert_eq!(
+        snapshot.status,
+        CodeUiSessionStatus::AwaitingInteraction,
+        "resume must re-project AwaitingInteraction for an open IntentSpec review",
+    );
+    let restored_gate = snapshot
+        .interactions
+        .iter()
+        .find(|interaction| {
+            interaction.id == interaction_id
+                && interaction.kind == CodeUiInteractionKind::IntentReviewChoice
+                && interaction.status == CodeUiInteractionStatus::Pending
+        })
+        .expect("resume must keep the pending IntentReviewChoice gate visible");
+    let intent_id = restored_gate
+        .metadata
+        .get("intentId")
+        .and_then(|value| value.as_str())
+        .expect("restored review must expose durable intentId");
+    assert!(
+        !intent_id.trim().is_empty(),
+        "restored intentId must be non-empty"
+    );
+    let intent_spec = restored_gate
+        .metadata
+        .get("intentSpec")
+        .and_then(|value| value.as_str())
+        .expect("restored review must reload IntentSpec JSON for confirm/modify/cancel");
+    assert!(
+        intent_spec.contains('"') || intent_spec.contains('{'),
+        "restored IntentSpec payload must be non-empty JSON text"
+    );
+    assert!(
+        store
+            .session_root(&thread_id)
+            .join("intents")
+            .join(format!("{intent_id}.json"))
+            .is_file(),
+        "durable intents/{{intent_id}}.json must remain after resume rebuild"
+    );
+
+    restored
+        .respond_interaction(
+            &interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("confirm".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("confirm must settle the restored IntentSpec review gate");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if restored.snapshot().await.status == CodeUiSessionStatus::Idle {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        restored.snapshot().await.status,
+        CodeUiSessionStatus::Idle,
+        "restored IntentSpec confirm must reach Idle",
+    );
+}
+
+/// Crash between IntentReviewRequested and pending-interaction snapshot must not
+/// open a blind review gate when the durable IntentSpec file is missing — fence.
+#[tokio::test(flavor = "multi_thread")]
+async fn resumed_runtime_fences_intent_review_when_durable_spec_missing() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let mut state = SessionState::new(&workdir.path().to_string_lossy());
+    let thread_id = state.id.clone();
+    state.metadata.insert(
+        "thread_id".to_string(),
+        serde_json::json!(thread_id.clone()),
+    );
+    let persistence = HeadlessSessionPersistence::new(store.clone(), state.clone());
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "phase0_intent_review",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    runtime
+        .submit_message("please draft an IntentSpec for README docs".to_string())
+        .await
+        .expect("plain Phase 0 message must admit");
+
+    let risk_interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::RequestUserInput,
+        "Phase 0 must ask for risk_profile before drafting",
+    )
+    .await;
+    runtime
+        .respond_interaction(
+            &risk_interaction_id,
+            CodeUiInteractionResponse {
+                selected_option: Some("Low".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("risk_profile Low must be accepted");
+
+    let _interaction_id = await_pending_interaction(
+        &runtime,
+        CodeUiInteractionKind::IntentReviewChoice,
+        "Phase 0 submit_intent_draft must park IntentReviewChoice",
+    )
+    .await;
+
+    let intents_dir = store.session_root(&thread_id).join("intents");
+    assert!(
+        intents_dir.is_dir(),
+        "park path must create session intents/ before review"
+    );
+    for entry in std::fs::read_dir(&intents_dir).expect("read intents dir") {
+        let entry = entry.expect("intent dir entry");
+        if entry.path().extension().and_then(|ext| ext.to_str()) == Some("json") {
+            std::fs::remove_file(entry.path()).expect("delete durable IntentSpec to force fence");
+        }
+    }
+
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let restored_state = store
+        .load(&thread_id)
+        .expect("parked session must remain loadable");
+    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state);
+    let (restored, _, _) = build_runtime_with_persistence(
+        "phase0_intent_review",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    assert_eq!(
+        restored.snapshot().await.status,
+        CodeUiSessionStatus::IndeterminateSideEffect,
+        "missing durable IntentSpec must fence resume instead of opening a blind review gate",
+    );
+}
+
+/// Submitting an explicit direct-chat message (leading `/`) must produce an
+/// assistant transcript entry that matches the fake provider's deterministic
+/// response, with the snapshot returning to `Idle` once the turn settles.
+/// Plain (non-`/`) messages default to Phase 0 plan routing after W3-03.
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_message_streams_assistant_reply_into_snapshot() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, _, _) = build_runtime("basic_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("hello headless".to_string())
+        .submit_message("/hello headless".to_string())
         .await
         .expect("headless submit_message accepts non-empty text");
 
@@ -340,7 +1037,7 @@ async fn submit_message_is_owned_by_agent_runtime_worker() {
     let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("runtime-owned turn".to_string())
+        .submit_message("/runtime-owned turn".to_string())
         .await
         .expect("headless submit should enter AgentRuntime");
 
@@ -395,12 +1092,10 @@ async fn empty_message_is_rejected_before_any_transcript_mutation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_rejects_unpersistable_turn_before_live_session_mutation() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
-    let storage_parent = tempfile::tempdir().expect("tempdir for session storage parent");
-    let storage_file = storage_parent.path().join("not-a-directory");
-    std::fs::write(&storage_file, b"not a directory")
-        .expect("create a file where session storage would require a directory");
-    let store = Arc::new(SessionStore::from_storage_path(&storage_file));
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
     let state = SessionState::new(&workdir.path().to_string_lossy());
+    let session_id = state.id.clone();
     let persistence = HeadlessSessionPersistence::new(store.clone(), state);
     let (runtime, _, _) = build_runtime_with_persistence(
         "basic_chat",
@@ -409,6 +1104,20 @@ async fn submit_rejects_unpersistable_turn_before_live_session_mutation() {
         Some(persistence),
     )
     .await;
+
+    // Construction may create the session root for Goal/command durability.
+    // Break the durable event log *after* launch so submit's persist-before-gate
+    // fails without a live transcript mutation (same pattern as approval tests).
+    let session_root = store.session_root(&session_id);
+    std::fs::create_dir_all(&session_root).expect("ensure session root exists");
+    let events_path = session_root.join("events.jsonl");
+    if events_path.is_file() {
+        std::fs::remove_file(&events_path).expect("remove existing event log");
+    } else if events_path.exists() {
+        std::fs::remove_dir_all(&events_path).expect("remove unexpected events path");
+    }
+    std::fs::create_dir(&events_path)
+        .expect("replace the durable event file with a directory to force append failure");
 
     let error = runtime
         .submit_message("must not start".to_string())
@@ -454,7 +1163,7 @@ async fn submit_message_persists_resumable_session_snapshot() {
     .await;
 
     runtime
-        .submit_message("persist this turn".to_string())
+        .submit_message("/persist this turn".to_string())
         .await
         .expect("headless submit should accept non-empty text");
 
@@ -577,7 +1286,7 @@ async fn caller_supplied_command_id_is_durable_and_idempotent() {
 
     runtime
         .submit_message_with_command_id(
-            "persist with stable id".to_string(),
+            "/persist with stable id".to_string(),
             Some(command_id.clone()),
         )
         .await
@@ -626,7 +1335,7 @@ async fn caller_supplied_command_id_is_durable_and_idempotent() {
     // Same commandId + same payload is an idempotent retry (no second dispatch).
     runtime
         .submit_message_with_command_id(
-            "persist with stable id".to_string(),
+            "/persist with stable id".to_string(),
             Some(command_id.clone()),
         )
         .await
@@ -634,7 +1343,7 @@ async fn caller_supplied_command_id_is_durable_and_idempotent() {
 
     let conflict = runtime
         .submit_message_with_command_id(
-            "different payload for same command id".to_string(),
+            "/different payload for same command id".to_string(),
             Some(command_id.clone()),
         )
         .await;
@@ -741,7 +1450,7 @@ async fn durable_command_retry_does_not_double_count_executor_usage() {
 
     runtime
         .submit_message_with_command_id(
-            "record provider usage".to_string(),
+            "/record provider usage".to_string(),
             Some(command_id.clone()),
         )
         .await
@@ -769,7 +1478,7 @@ async fn durable_command_retry_does_not_double_count_executor_usage() {
 
     runtime
         .submit_message_with_command_id(
-            "record provider usage".to_string(),
+            "/record provider usage".to_string(),
             Some(command_id.clone()),
         )
         .await
@@ -822,7 +1531,7 @@ async fn in_flight_command_id_rejects_payload_mismatch() {
     let command_id = "browser-cmd-inflight-1".to_string();
 
     runtime
-        .submit_message_with_command_id("slow".to_string(), Some(command_id.clone()))
+        .submit_message_with_command_id("/slow".to_string(), Some(command_id.clone()))
         .await
         .expect("first submit must admit before the delayed reply finishes");
 
@@ -846,7 +1555,7 @@ async fn in_flight_command_id_rejects_payload_mismatch() {
     );
 
     let matching = runtime
-        .submit_message_with_command_id("slow".to_string(), Some(command_id.clone()))
+        .submit_message_with_command_id("/slow".to_string(), Some(command_id.clone()))
         .await;
     assert!(
         matching.is_ok(),
@@ -854,7 +1563,10 @@ async fn in_flight_command_id_rejects_payload_mismatch() {
     );
 
     let conflict = runtime
-        .submit_message_with_command_id("different slow text".to_string(), Some(command_id.clone()))
+        .submit_message_with_command_id(
+            "/different slow text".to_string(),
+            Some(command_id.clone()),
+        )
         .await;
     let conflict_err = conflict.expect_err("same commandId with different text must fail closed");
     assert!(
@@ -895,7 +1607,7 @@ async fn update_plan_tool_call_projects_plan_into_snapshot() {
     let (runtime, _, _) = build_runtime("plan_update", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("please update the plan".to_string())
+        .submit_message("/please update the plan".to_string())
         .await
         .expect("headless submit should accept a prompt that triggers update_plan");
 
@@ -932,7 +1644,7 @@ async fn submit_plan_draft_tool_call_projects_draft_plan_into_snapshot() {
     let (runtime, _, _) = build_runtime("plan_draft", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("please draft an execution plan".to_string())
+        .submit_message("/please draft an execution plan".to_string())
         .await
         .expect("headless submit should accept a prompt that triggers submit_plan_draft");
 
@@ -1010,7 +1722,7 @@ async fn cancel_turn_finalizes_streaming_assistant_entry() {
     let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow".to_string())
+        .submit_message("/slow".to_string())
         .await
         .expect("submit must accept the prompt before delay fires");
 
@@ -1077,7 +1789,7 @@ async fn shutdown_waits_for_cooperative_turn_finalization() {
     let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow shutdown".to_string())
+        .submit_message("/slow shutdown".to_string())
         .await
         .expect("submit must start a cancellable turn");
 
@@ -1098,7 +1810,7 @@ async fn shutdown_waits_for_cooperative_turn_finalization() {
             && !entry.streaming
     }));
     let submit_error = runtime
-        .submit_message("must not restart during shutdown".to_string())
+        .submit_message("/must not restart during shutdown".to_string())
         .await
         .expect_err("shutdown must close admission before waiting for the active turn");
     assert!(submit_error.to_string().contains("shutting down"));
@@ -1112,7 +1824,7 @@ async fn repeated_shutdown_joins_the_same_terminal_result() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, _, _) = build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
     runtime
-        .submit_message("slow repeated shutdown".to_string())
+        .submit_message("/slow repeated shutdown".to_string())
         .await
         .expect("submit must start a cancellable turn");
 
@@ -1172,7 +1884,7 @@ async fn shutdown_timeout_persists_indeterminate_state() {
     .await;
 
     runtime
-        .submit_message("start blocking mutation".to_string())
+        .submit_message("/start blocking mutation".to_string())
         .await
         .expect("the mutation fixture should start a headless turn");
     tokio::time::timeout(Duration::from_secs(3), started.notified())
@@ -1289,7 +2001,7 @@ async fn cancel_does_not_abort_started_mutating_headless_tool() {
     .await;
 
     runtime
-        .submit_message("start blocking mutation".to_string())
+        .submit_message("/start blocking mutation".to_string())
         .await
         .expect("the mutation fixture should start a headless turn");
     tokio::time::timeout(Duration::from_secs(3), started.notified())
@@ -1305,7 +2017,7 @@ async fn cancel_does_not_abort_started_mutating_headless_tool() {
         "the error must make the indeterminate-side-effect boundary explicit: {error:#}",
     );
     let second_submit = runtime
-        .submit_message("must wait for mutation".to_string())
+        .submit_message("/must wait for mutation".to_string())
         .await
         .expect_err("the still-running mutation must retain the turn slot");
     assert!(
@@ -1484,7 +2196,7 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow turn with input".to_string())
+        .submit_message("/slow turn with input".to_string())
         .await
         .expect("delayed turn starts");
     await_worker_running(&runtime).await;
@@ -1599,7 +2311,7 @@ async fn request_user_input_validates_and_delivers_all_requested_answers() {
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow turn with input".to_string())
+        .submit_message("/slow turn with input".to_string())
         .await
         .expect("delayed turn starts");
     await_worker_running(&runtime).await;
@@ -1727,7 +2439,7 @@ async fn live_user_input_interaction_is_registered_with_agent_runtime() {
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow turn with input".to_string())
+        .submit_message("/slow turn with input".to_string())
         .await
         .expect("delayed turn starts");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1829,7 +2541,7 @@ async fn cancelling_live_user_input_closes_worker_owned_continuation() {
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow turn with input".to_string())
+        .submit_message("/slow turn with input".to_string())
         .await
         .expect("delayed turn starts");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1934,7 +2646,7 @@ async fn live_exec_approval_interaction_is_registered_with_agent_runtime() {
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow turn with approval".to_string())
+        .submit_message("/slow turn with approval".to_string())
         .await
         .expect("delayed turn starts");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -2049,7 +2761,7 @@ async fn exec_approval_request_is_reflected_in_snapshot_and_responded_to() {
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
 
     runtime
-        .submit_message("slow turn with approval".to_string())
+        .submit_message("/slow turn with approval".to_string())
         .await
         .expect("delayed turn starts");
     await_worker_running(&runtime).await;
@@ -2229,7 +2941,7 @@ async fn unpersistable_approval_response_does_not_release_the_tool_loop() {
     .await;
 
     runtime
-        .submit_message("slow turn with approval".to_string())
+        .submit_message("/slow turn with approval".to_string())
         .await
         .expect("delayed turn starts");
     await_worker_running(&runtime).await;
@@ -2315,7 +3027,7 @@ async fn unpersistable_approval_response_does_not_release_the_tool_loop() {
         ),
     }
     let submit_error = runtime
-        .submit_message("blocked after failed approval persistence".to_string())
+        .submit_message("/blocked after failed approval persistence".to_string())
         .await
         .expect_err("indeterminate sessions must reject follow-up turns");
     assert!(
@@ -2346,7 +3058,7 @@ async fn persisted_approval_response_records_durable_interaction_audit_event() {
     .await;
 
     runtime
-        .submit_message("slow turn with approval".to_string())
+        .submit_message("/slow turn with approval".to_string())
         .await
         .expect("delayed turn starts");
     await_worker_running(&runtime).await;
@@ -2471,7 +3183,7 @@ async fn live_unpersistable_approval_preserves_indeterminate_state_after_executo
     .await;
 
     runtime
-        .submit_message("slow interaction persistence failure".to_string())
+        .submit_message("/slow interaction persistence failure".to_string())
         .await
         .expect("delayed turn starts");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);

@@ -1179,6 +1179,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
                 session_store,
                 session_state,
                 browser_control == BrowserControlMode::Loopback,
+                mcp_server.clone(),
             )
             .await?
             {
@@ -2745,11 +2746,11 @@ pub fn resume_code_ui_session_to_thread(
 
 /// Build a headless Code UI runtime for `--web-only` non-Codex providers.
 ///
-/// Constructs a minimal local-read-only [`ToolRegistry`]
-/// and wires it into a [`HeadlessCodeRuntime`] so the browser composer can
-/// drive a real agent turn against the supplied `model`. The result is
-/// exposed through [`CodeUiRuntimeHandle`] just like the TUI flow, so the
-/// rest of `start_web_server` can use it without per-mode special cases.
+/// Constructs a minimal local-read-only [`ToolRegistry`] and a
+/// [`HeadlessCodeRuntime`] lifecycle host, then mounts the production
+/// [`AgentRuntimeCodeUiAdapter`] write path on [`CodeUiRuntimeHandle`].
+/// Plain browser chat enters Phase 0 plan routing; slash/`/` messages keep an
+/// explicit direct tool loop.
 ///
 /// `browser_write_enabled` should mirror the resolved
 /// [`BrowserControlMode::Loopback`] so the runtime advertises browser writes
@@ -2763,6 +2764,7 @@ async fn build_headless_web_code_ui_runtime<M>(
     model_name: String,
     approval_channels: HeadlessApprovalChannels,
     browser_write_enabled: bool,
+    mcp_server: Arc<LibraMcpServer>,
 ) -> CliResult<Arc<CodeUiRuntimeHandle>>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
@@ -2906,7 +2908,7 @@ where
         projection_sequence,
     );
 
-    let adapter = HeadlessCodeRuntime::new_with_persistence(
+    let lifecycle = HeadlessCodeRuntime::new_with_persistence(
         session,
         capabilities,
         model,
@@ -2916,6 +2918,7 @@ where
         config_factory,
         initial_history,
         Some(persistence),
+        Some(mcp_server),
     )
     .await
     .map_err(|error| {
@@ -2924,6 +2927,10 @@ where
         ))
     })?;
 
+    // W3-03: mount AgentRuntimeCodeUiAdapter as the production write-path owner.
+    // HeadlessCodeRuntime remains lifecycle-only (worker, listeners, shutdown).
+    let adapter = lifecycle.command_adapter();
+
     let automation_write_enabled = args.control == ControlMode::Write;
     let mut runtime_options = CodeUiRuntimeOptions::new(
         browser_write_enabled,
@@ -2931,7 +2938,14 @@ where
         CodeUiInitialController::Unclaimed,
     );
     runtime_options.lease_duration = code_ui_test_lease_duration_override()?;
-    Ok(CodeUiRuntimeHandle::build_with_options(adapter, runtime_options).await)
+    // Retain the lifecycle host on the handle; the adapter only holds a Weak
+    // shutdown hook so drop cannot form an adapter↔host retain cycle.
+    Ok(CodeUiRuntimeHandle::build_with_options_and_lifecycle(
+        adapter,
+        runtime_options,
+        Some(lifecycle),
+    )
+    .await)
 }
 
 fn build_headless_tool_registry(
@@ -2961,6 +2975,7 @@ async fn build_non_codex_headless_runtime(
     session_store: Arc<SessionStore>,
     session_state: SessionState,
     browser_write_enabled: bool,
+    mcp_server: Arc<LibraMcpServer>,
 ) -> CliResult<Option<Arc<CodeUiRuntimeHandle>>> {
     let (exec_approval_tx, exec_approval_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
@@ -2990,6 +3005,7 @@ async fn build_non_codex_headless_runtime(
                         exec_approval_rx,
                     },
                     browser_write_enabled,
+                    mcp_server,
                 )
                 .await?,
             ))
@@ -3016,6 +3032,7 @@ async fn build_non_codex_headless_runtime(
                         exec_approval_rx,
                     },
                     browser_write_enabled,
+                    mcp_server,
                 )
                 .await?,
             ))
@@ -7459,6 +7476,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("headless Ollama should build through ProviderFactory")
@@ -7490,6 +7508,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("headless OpenAI should use the shared provider factory")
@@ -7525,6 +7544,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("headless Fake should build through ProviderFactory")
@@ -7593,6 +7613,7 @@ no_cache_unknown_network = true
             session_store,
             session_state,
             false,
+            init_mcp_server(tmp.path()).await,
         )
         .await
         .expect("Codex arm must return Ok(None), not an error");

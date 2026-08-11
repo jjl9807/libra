@@ -1,0 +1,20 @@
+{
+  "responses": [
+    {
+      "match": { "contains": "mutate the workspace" },
+      "type": "tool_call",
+      "id": "phase0-blocked-mutation-1",
+      "name": "blocking_mutation",
+      "arguments": {}
+    },
+    {
+      "match": { "equals": "" },
+      "type": "text",
+      "text": "fake assistant: should not reach after blocked mutation"
+    }
+  ],
+  "fallback": {
+    "type": "text",
+    "text": "fake assistant: phase0 mutation fallback"
+  }
+}

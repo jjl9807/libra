@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-03, 2026-08-11)
+
+- **W3-03 merges headless under `AgentRuntimeCodeUiAdapter`.** Production Web
+  writes go through `web_admission` + the adapter; `HeadlessCodeRuntime` is
+  lifecycle-only. Plain browser messages enter PlanPhase0 (risk gate, formal
+  IntentSpec persist, IntentReview confirm/modify/cancel with TUI-parity revise
+  mode); slash/`/` messages keep explicit direct turns. Resume reloads
+  `intents/{id}.json` or fences; Modify persists `pending_revision.json`.
+
 ### Added (plan-20260715 W3-02, 2026-08-11)
 
 - **W3-02 migrates Code UI harness to `--web-only` by default.** Remote

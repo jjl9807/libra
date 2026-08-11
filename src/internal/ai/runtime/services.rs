@@ -147,7 +147,9 @@ impl CodeAgentServicesBuilder {
                 }
             }
             CodeAgentServicesLaunch::WebHeadless => {
-                builder = builder.register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler));
+                builder = builder
+                    .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
+                    .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler));
             }
         }
 
@@ -238,7 +240,7 @@ mod tests {
         assert!(registry.hardening().is_some());
         assert!(registry.handler("apply_patch").is_some());
         assert!(registry.handler("submit_plan_draft").is_some());
-        assert!(registry.handler("submit_intent_draft").is_none());
+        assert!(registry.handler("submit_intent_draft").is_some());
     }
 
     #[tokio::test]

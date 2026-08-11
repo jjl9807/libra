@@ -855,6 +855,12 @@ pub use crate::internal::ai::runtime::ControllerInitial as CodeUiInitialControll
 pub struct CodeUiRuntimeHandle {
     adapter: Arc<dyn CodeUiProviderAdapter>,
     controller_service: ControllerService,
+    /// Retains the web-only lifecycle host (worker / listeners) while this
+    /// handle is alive. The production adapter only holds a [`std::sync::Weak`]
+    /// shutdown hook so drop without an adapter↔host retain cycle.
+    #[allow(dead_code)]
+    lifecycle_host:
+        Option<Arc<dyn crate::internal::ai::web::agent_runtime_adapter::CodeUiLifecycleShutdown>>,
 }
 
 /// Bag of constructor options for [`CodeUiRuntimeHandle::build_with_options`].
@@ -863,7 +869,12 @@ pub struct CodeUiRuntimeHandle {
 /// [`CodeUiRuntimeHandle::build_with_control`] with the default 120 s lease
 /// TTL. Tests that need to exercise lease expiry without sleeping for two
 /// minutes pass a custom `lease_duration` through this struct.
-#[derive(Debug, Clone)]
+///
+/// Web-only lifecycle retention is intentionally **not** part of this public
+/// options bag — pass it via
+/// [`CodeUiRuntimeHandle::build_with_options_and_lifecycle`] so adding the
+/// W3-03 host retain path does not break external struct-literal callers.
+#[derive(Clone, Debug)]
 pub struct CodeUiRuntimeOptions {
     pub browser_write_enabled: bool,
     pub automation_write_enabled: bool,
@@ -960,6 +971,18 @@ impl CodeUiRuntimeHandle {
         adapter: Arc<dyn CodeUiProviderAdapter>,
         options: CodeUiRuntimeOptions,
     ) -> Arc<Self> {
+        Self::build_with_options_and_lifecycle(adapter, options, None).await
+    }
+
+    /// Like [`Self::build_with_options`], but retains an optional web-only
+    /// lifecycle host (worker / approval listeners) for the handle's lifetime.
+    pub async fn build_with_options_and_lifecycle(
+        adapter: Arc<dyn CodeUiProviderAdapter>,
+        options: CodeUiRuntimeOptions,
+        lifecycle_host: Option<
+            Arc<dyn crate::internal::ai::web::agent_runtime_adapter::CodeUiLifecycleShutdown>,
+        >,
+    ) -> Arc<Self> {
         let mut controller_options = ControllerServiceOptions::new(
             options.browser_write_enabled,
             options.automation_write_enabled,
@@ -971,6 +994,7 @@ impl CodeUiRuntimeHandle {
         let handle = Arc::new(Self {
             adapter,
             controller_service: ControllerService::new(controller_options),
+            lifecycle_host,
         });
         handle.sync_controller_snapshot().await;
         handle
