@@ -79,7 +79,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 DeepSeek 请求可以通过 `--deepseek-thinking enabled --deepseek-reasoning-effort high --deepseek-stream true` 选择加入 provider 专用字段；这些标志会对非 DeepSeek provider 拒绝。
 Kimi 请求默认使用所选 model 的 thinking 行为；对于需要更低延迟或官方 Web 搜索兼容性的 K2.6/K2.5 run，使用 `--kimi-thinking disabled`。当 provider 返回 Kimi `reasoning_content` 时，Libra 会在 tool-call turns 中保留它。
-常规运行时，将 provider keys 存在 `vault.env.<NAME>` 中；Libra 先检查 repo-local Vault，再检查 global Vault，最后检查进程环境。对需要显式 dotenv 覆盖的 live tests，使用 `--env-file .env.test`。
+常规运行时，将 provider keys 存在 `vault.env.<NAME>` 中；Libra 先检查 repo-local Vault，再检查 global Vault，最后检查进程环境。对需要显式 dotenv 覆盖的 live tests，使用 `--env-file .env.test`。在 `--web`/`--web-only` 下，非 Codex provider 的 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl` 与 TUI 语义一致（env-file 值仍优先于进程环境/Vault）。Managed `--provider codex` 仍拒绝 `--env-file`、`--approval-ttl` 与 `--resume`（未接入 Codex app-server 路径）；MCP `--stdio` 继续拒绝这些 TUI-only flag。
 
 Ollama 请求默认流式读取 `/api/chat` 响应，并向 debug logs 添加每请求 `request_id`。它们也默认使用 `think:false`，避免具备 reasoning 能力的本地模型在 tool calls 前花数分钟生成隐藏 reasoning。单次运行使用 `--ollama-thinking high`，或将 `OLLAMA_THINK=true`、`low`、`medium`、`high` 或 `auto` 设为环境默认值。`auto` 会省略 `think` 字段并让 Ollama 决定。当远程/云 Ollama endpoint 接受简单 tools 但对 Libra 完整 tool schema payload 返回 503 时，使用 `--ollama-compact-tools` 或 `OLLAMA_COMPACT_TOOLS=true`。
 

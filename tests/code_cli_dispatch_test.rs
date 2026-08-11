@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use libra::command::code::{CodeArgs, CodeNetworkAccess, CodeProvider, ControlMode};
+use libra::command::code::{CodeArgs, CodeContext, CodeNetworkAccess, CodeProvider, ControlMode};
 
 /// Helper: parse `argv0 + args` with a fixed binary name. Strip the
 /// `--web`/`--stdio` from the spelling caller passed since clap
@@ -176,6 +176,31 @@ fn web_only_with_provider_tuning_flags_parse() {
     );
     assert_eq!(parsed.temperature, Some(0.2));
     assert!(parsed.ollama_thinking.is_some());
+}
+
+#[test]
+fn web_only_env_file_context_and_approval_flags_parse() {
+    // W3-13: public TUI flags that feed headless bootstrap must parse under
+    // `--web-only` (mode validation is covered in `code.rs` unit tests).
+    let parsed = parse(&[
+        "--web-only",
+        "--env-file",
+        "/tmp/.env.web-test",
+        "--context",
+        "dev",
+        "--approval-policy",
+        "on-request",
+        "--approval-ttl",
+        "42",
+    ])
+    .expect("--web-only must parse env-file/context/approval flags");
+    assert!(parsed.web_only);
+    assert_eq!(
+        parsed.env_file.as_deref(),
+        Some(std::path::Path::new("/tmp/.env.web-test"))
+    );
+    assert_eq!(parsed.context, Some(CodeContext::Dev));
+    assert_eq!(parsed.approval_ttl, Some(42));
 }
 
 #[test]

@@ -187,6 +187,7 @@ fn docs_consistency_covers_code_command_router_contracts() {
     let integration_plan = read_repo_file("docs/development/integration/integration-test-plan.md");
     let agent_doc = read_repo_file("docs/development/tracing/agent.md");
     let workflow = read_repo_file(".github/workflows/base.yml");
+    let compatibility = read_repo_file("COMPATIBILITY.md");
     let source_and_docs = [
         web_mod.as_str(),
         read_repo_file("src/internal/ai/web/code_ui.rs").as_str(),
@@ -227,6 +228,26 @@ fn docs_consistency_covers_code_command_router_contracts() {
 
     for flag in ["--control", "--control-token-file", "--control-info-file"] {
         assert_contains(&code_doc, flag, "docs/commands/code.md");
+    }
+
+    // W3-13: keep the public mode/provider split for env-file/approval-ttl
+    // pinned in the compatibility matrix (non-Codex web accept; Codex/--stdio reject).
+    let code_row = compatibility
+        .lines()
+        .find(|line| line.starts_with("| code |"))
+        .expect("COMPATIBILITY.md must include a `code` row");
+    for needle in [
+        "--env-file",
+        "--approval-ttl",
+        "non-Codex",
+        "--web",
+        "codex",
+        "--stdio",
+    ] {
+        assert!(
+            code_row.contains(needle),
+            "COMPATIBILITY.md code row must document W3-13 web flag parity ({needle}); row={code_row}"
+        );
     }
 
     for (body, needle, context) in [
