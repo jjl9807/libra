@@ -133,6 +133,8 @@ Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_c
 
 对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走与 TUI 等价的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop。完整 IntentSpec → Phase 1 → repair 对等仍属 GATE-WEB-PLAN。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
 
+对于 `--web-only --provider codex`，managed app-server 的 websocket 通知归一到共享 runtime `AgentEvent` 信封（与其他 provider 同一 projection 路径）。未知 Codex method 走显式可诊断的 `ProviderNotification` fallback，不 silent drop、也不 panic。Ask-mode approvals 仍等待浏览器 `respond_interaction`，直到 W3-07 界定共享交互所有权。
+
 ### Code UI Wire Contract
 
 Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 事实来源是 `src/internal/ai/web/code_ui.rs`；浏览器镜像是 `web/src/lib/code-ui/types.ts`；`tests/ai_code_ui_wire_test.rs` 固定 wire shape。

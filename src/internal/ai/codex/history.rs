@@ -649,7 +649,7 @@ impl HistoryReader {
             if event.status == "in_progress" {
                 scheduler.active_task_id = Some(event.task_id.clone());
             }
-            if (event.status == "completed" || event.status == "failed")
+            if is_terminal_scheduler_status(&event.status)
                 && scheduler.active_task_id.as_deref() == Some(&event.task_id)
             {
                 scheduler.active_task_id = None;
@@ -662,7 +662,7 @@ impl HistoryReader {
             if event.status == "in_progress" {
                 scheduler.active_run_id = Some(event.run_id.clone());
             }
-            if (event.status == "completed" || event.status == "failed")
+            if is_terminal_scheduler_status(&event.status)
                 && scheduler.active_run_id.as_deref() == Some(&event.run_id)
             {
                 scheduler.active_run_id = None;
@@ -758,4 +758,13 @@ fn tool_status_from_str(status: &str) -> ToolStatus {
         "in_progress" | "started" => ToolStatus::InProgress,
         _ => ToolStatus::Pending,
     }
+}
+
+/// Terminal run/task statuses that clear `SchedulerView` active IDs on rebuild.
+/// Includes `cancelled` so a cancelled Codex turn does not reopen as Running.
+fn is_terminal_scheduler_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "canceled" | "aborted" | "interrupted"
+    )
 }

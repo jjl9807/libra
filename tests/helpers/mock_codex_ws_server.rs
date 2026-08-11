@@ -48,6 +48,13 @@ pub struct MockCodexWsConfig {
     /// execution gate: Libra must surface the request to the user before it
     /// replies with a resolve request.
     pub emit_turn_command_approval: bool,
+    /// When set, emit `turn/started` + `turn/completed` (with this status)
+    /// immediately after the first `turn/start` response (W3-04).
+    pub emit_turn_completed_status: Option<String>,
+    /// When true, emit an unrecognized notification after `turn/start` so the
+    /// Code UI reader must take the diagnosable ProviderNotification fallback
+    /// (W3-04).
+    pub emit_unknown_notification: bool,
 }
 
 /// Test-only WebSocket server mimicking the Codex app-server handshake.
@@ -87,6 +94,8 @@ impl MockCodexWsServer {
             .unwrap_or_else(|| "libra-mock-thread".to_string());
         let emit_thread_started = config.emit_thread_started;
         let emit_turn_command_approval = config.emit_turn_command_approval;
+        let emit_turn_completed_status = config.emit_turn_completed_status.clone();
+        let emit_unknown_notification = config.emit_unknown_notification;
         let handle = tokio::spawn(async move {
             loop {
                 let (tcp_stream, _peer) = match listener.accept().await {
@@ -96,6 +105,7 @@ impl MockCodexWsServer {
                 connections_for_task.fetch_add(1, Ordering::SeqCst);
                 let requests = requests_for_task.clone();
                 let thread_id = thread_id.clone();
+                let emit_turn_completed_status = emit_turn_completed_status.clone();
                 tokio::spawn(async move {
                     let ws_stream = match tokio_tungstenite::accept_async(tcp_stream).await {
                         Ok(stream) => stream,
@@ -174,6 +184,56 @@ impl MockCodexWsServer {
                                 .is_err()
                             {
                                 break;
+                            }
+                        }
+                        if method == "turn/start" {
+                            if let Some(status) = emit_turn_completed_status.as_deref() {
+                                let turn_id = "codex-w3-04-terminal-turn";
+                                let started = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "turn/started",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turn": { "id": turn_id },
+                                    },
+                                });
+                                if write
+                                    .send(Message::Text(started.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                let completed = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "turn/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turn": { "id": turn_id },
+                                        "status": status,
+                                    },
+                                });
+                                if write
+                                    .send(Message::Text(completed.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            if emit_unknown_notification {
+                                let unknown = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "codex/future/notYetClassified",
+                                    "params": { "threadId": thread_id },
+                                });
+                                if write
+                                    .send(Message::Text(unknown.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                     }

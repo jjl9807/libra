@@ -2756,6 +2756,7 @@ pub fn resume_code_ui_session_to_thread(
 /// [`BrowserControlMode::Loopback`] so the runtime advertises browser writes
 /// in the snapshot capabilities. The initial controller is `Unclaimed` —
 /// the browser is the only writer in headless mode, no TUI to hand off from.
+#[allow(clippy::too_many_arguments)]
 async fn build_headless_web_code_ui_runtime<M>(
     args: &CodeArgs,
     working_dir: &Path,

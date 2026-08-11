@@ -6,8 +6,10 @@
 //! "buckets" the rest of the runtime cares about.
 //!
 //! Method strings come from the `method` field of incoming notifications. We treat
-//! anything we do not recognize as `Unknown` and let the caller decide whether to log
-//! or drop it — schema additions in newer Codex builds therefore degrade gracefully.
+//! anything we do not recognize as `Unknown`. Callers must feed the classification
+//! through [`crate::internal::ai::codex::envelope::normalize_codex_notification`] so
+//! unknown methods become a diagnosable runtime envelope fallback rather than a
+//! silent drop — schema additions in newer Codex builds therefore degrade gracefully.
 
 /// Known notification methods we care about (app-server schema v2 subset).
 ///

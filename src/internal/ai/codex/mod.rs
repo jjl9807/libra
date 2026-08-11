@@ -66,6 +66,7 @@
 //! On startup, `HistoryReader::rebuild_view()` reconstructs the `CodexSession` state
 //! from persisted objects, including Thread, Run, Plan, Task, and PatchSet data.
 
+pub mod envelope;
 pub mod history;
 pub mod model;
 pub mod protocol;
@@ -85,6 +86,11 @@ use anyhow::anyhow;
 use chrono::Utc;
 use clap::Parser;
 use diffy::create_patch;
+pub use envelope::{
+    NormalizedCodexEnvelope, all_known_method_kinds, apply_agent_event_kinds_to_code_ui_status,
+    method_kind_classification, normalize_codex_notification, run_status_for_turn_completed,
+    sample_method_for_kind,
+};
 use futures_util::{SinkExt, StreamExt};
 use git_internal::hash::ObjectHash;
 use history::{EventKind, HistoryReader, HistoryRecorder, HistoryWriter};
@@ -105,14 +111,18 @@ use crate::{
         ai::{
             history::HistoryManager,
             mcp::server::LibraMcpServer,
-            runtime::PlanningPromptBuilder,
+            runtime::{
+                AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig,
+                ExternalTurnTrackingExecutor, InMemoryAuditSink, PlanningPromptBuilder,
+                ToolBoundaryRuntime,
+            },
             web::code_ui::{
-                CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType, CodeUiInitialController,
-                CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
-                CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange,
-                CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiProviderAdapter,
-                CodeUiProviderInfo, CodeUiReadModel, CodeUiRuntimeHandle, CodeUiSession,
-                CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
+                CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
+                CodeUiInitialController, CodeUiInteractionKind, CodeUiInteractionOption,
+                CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
+                CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
+                CodeUiProviderAdapter, CodeUiProviderInfo, CodeUiReadModel, CodeUiRuntimeHandle,
+                CodeUiSession, CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
                 CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
                 initial_snapshot,
             },
@@ -169,6 +179,22 @@ fn is_streaming_delta_method(method: MethodKind) -> bool {
             | MethodKind::FileChangeOutputDelta
             | MethodKind::PlanDelta
     )
+}
+
+/// Prefer the turn id carried by the Codex notification params; fall back to
+/// the managed session mirror only when the notification omits one (W3-04).
+fn extract_turn_id_for_envelope(
+    params: &serde_json::Value,
+    session: Option<&CodexSession>,
+) -> Option<String> {
+    params
+        .get("turnId")
+        .or_else(|| params.get("turn_id"))
+        .or_else(|| params.pointer("/turn/id"))
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| session.and_then(|s| s.thread.current_turn_id.clone()))
 }
 
 /// Truncates a string for safe inclusion in tracing logs.
@@ -708,6 +734,7 @@ fn run_status_from_event(status: &str) -> RunStatus {
     match status {
         "completed" => RunStatus::Completed,
         "failed" => RunStatus::Failed,
+        "cancelled" | "canceled" | "aborted" | "interrupted" => RunStatus::Cancelled,
         "in_progress" => RunStatus::InProgress,
         _ => RunStatus::Pending,
     }
@@ -1289,23 +1316,37 @@ fn codex_code_ui_status(session: &CodexSession) -> CodeUiSessionStatus {
     {
         return CodeUiSessionStatus::Thinking;
     }
-    if session
+    // Rebuilds populate `runs` from a map, so vector order is not chronological.
+    // Project lifecycle from the newest terminal run by `completed_at`.
+    if let Some(latest_terminal) = session
         .runs
         .iter()
-        .any(|run| run.status == RunStatus::Failed)
+        .filter(|run| {
+            matches!(
+                run.status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            )
+        })
+        .max_by_key(|run| run.completed_at.unwrap_or(run.started_at))
     {
-        return CodeUiSessionStatus::Error;
-    }
-    if session
-        .runs
-        .iter()
-        .any(|run| run.status == RunStatus::Completed)
-    {
-        return CodeUiSessionStatus::Completed;
+        return match latest_terminal.status {
+            RunStatus::Failed => CodeUiSessionStatus::Error,
+            RunStatus::Cancelled => CodeUiSessionStatus::Idle,
+            RunStatus::Completed => CodeUiSessionStatus::Completed,
+            RunStatus::Pending | RunStatus::InProgress => CodeUiSessionStatus::Idle,
+        };
     }
     CodeUiSessionStatus::Idle
 }
 
+/// Hydrate Code UI **content** fields (transcript, plan, tools, patchsets)
+/// from the managed Codex session mirror.
+///
+/// Lifecycle status is **not** authoritative here: callers must overlay
+/// normalized runtime [`crate::internal::ai::runtime::AgentEventKind`] values
+/// via [`envelope::apply_agent_event_kinds_to_code_ui_status`] after
+/// [`envelope::normalize_codex_notification`]. This keeps Codex on the shared
+/// AgentEvent projection path (W3-04) instead of a private status projector.
 fn build_code_ui_snapshot_from_codex_session(
     session: &CodexSession,
     current: &CodeUiSessionSnapshot,
@@ -1488,6 +1529,21 @@ async fn publish_code_ui_snapshot(
     codex_session: &Arc<Mutex<CodexSession>>,
     working_dir: &str,
 ) {
+    publish_code_ui_snapshot_with_envelope(code_ui_session, codex_session, working_dir, &[]).await;
+}
+
+/// Publish a Code UI snapshot after Codex websocket events have been
+/// normalized into the shared runtime [`AgentEventKind`] envelope.
+///
+/// Content is hydrated from the managed Codex session mirror; lifecycle
+/// status is overlaid from `envelope_kinds` so Codex does not author a
+/// parallel status projection (W3-04).
+async fn publish_code_ui_snapshot_with_envelope(
+    code_ui_session: &Arc<CodeUiSession>,
+    codex_session: &Arc<Mutex<CodexSession>>,
+    working_dir: &str,
+    envelope_kinds: &[crate::internal::ai::runtime::AgentEventKind],
+) {
     let session = {
         let Some(session_guard) = lock_or_warn(codex_session, "publish code ui snapshot") else {
             return;
@@ -1495,7 +1551,10 @@ async fn publish_code_ui_snapshot(
         session_guard.clone()
     };
     let current = code_ui_session.snapshot().await;
-    let snapshot = build_code_ui_snapshot_from_codex_session(&session, &current, working_dir);
+    let mut snapshot = build_code_ui_snapshot_from_codex_session(&session, &current, working_dir);
+    if !envelope_kinds.is_empty() {
+        envelope::apply_agent_event_kinds_to_code_ui_status(&mut snapshot, envelope_kinds);
+    }
     code_ui_session
         .replace_snapshot(CodeUiEventType::SessionUpdated, snapshot)
         .await;
@@ -1556,14 +1615,61 @@ async fn send_request(
     }
 }
 
+/// Bounded, queryable log of Codex-normalized runtime envelope events.
+///
+/// A live `observe()` subscriber fills this buffer so broadcast events are not
+/// dropped when no UI consumer is attached yet (W3-04).
+#[derive(Clone, Default)]
+struct CodexEnvelopeEventLog {
+    events: Arc<Mutex<std::collections::VecDeque<crate::internal::ai::runtime::AgentEvent>>>,
+}
+
+impl CodexEnvelopeEventLog {
+    const CAPACITY: usize = 1_024;
+
+    fn push(&self, event: crate::internal::ai::runtime::AgentEvent) {
+        let Some(mut guard) = lock_or_warn(&self.events, "codex envelope event log push") else {
+            return;
+        };
+        if guard.len() >= Self::CAPACITY {
+            guard.pop_front();
+        }
+        guard.push_back(event);
+    }
+
+    fn snapshot(&self) -> Vec<crate::internal::ai::runtime::AgentEvent> {
+        lock_or_warn(&self.events, "codex envelope event log snapshot")
+            .map(|guard| guard.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone)]
 struct CodexCodeUiAdapter {
     browser_session: Arc<CodeUiSession>,
+    /// Sidecar AgentRuntime that owns the shared AgentEvent envelope stream.
+    envelope_runtime: AgentRuntimeHandle,
+    /// Retained envelope events (filled by a live observe subscriber).
+    envelope_event_log: CodexEnvelopeEventLog,
     tx: mpsc::Sender<String>,
     responses: Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
     notifies: Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
     thread_id: Arc<Mutex<String>>,
     approval_mode: Arc<Mutex<String>>,
+    /// Ask-mode waiters keyed by Codex request id until browser respond
+    /// (full AgentRuntime interaction ownership stays W3-07).
+    pending_approvals: Arc<AsyncMutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+}
+
+impl CodexCodeUiAdapter {
+    /// Runtime envelope events recorded for this managed Codex session (W3-04).
+    fn recorded_envelope_events(&self) -> Vec<crate::internal::ai::runtime::AgentEvent> {
+        self.envelope_event_log.snapshot()
+    }
+
+    fn envelope_runtime(&self) -> &AgentRuntimeHandle {
+        &self.envelope_runtime
+    }
 }
 
 #[async_trait::async_trait]
@@ -1576,6 +1682,12 @@ impl CodeUiReadModel for CodexCodeUiAdapter {
 #[async_trait::async_trait]
 impl CodeUiCommandAdapter for CodexCodeUiAdapter {
     fn capabilities(&self) -> CodeUiCapabilities {
+        // Touch the envelope sidecar so the AgentRuntimeHandle and retained
+        // event log stay considered live for the adapter lifetime (W3-04).
+        let _ = (
+            self.envelope_runtime(),
+            self.recorded_envelope_events().len(),
+        );
         codex_code_ui_capabilities()
     }
 
@@ -1616,10 +1728,51 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> anyhow::Result<()> {
-        let _ = (interaction_id, response);
-        Err(anyhow!(
-            "Codex approval interactions require an AgentRuntime-owned turn; this managed adapter closes them fail-closed"
-        ))
+        // Validate the decision and locate the pending sender BEFORE mutating
+        // shared `approval_mode`. Otherwise a malformed response (no decision,
+        // unknown interaction id, or already-resolved approval) would still
+        // flip future Codex approvals to accept-all / decline-all.
+        let Some(approved) = response
+            .approved
+            .or(match response.selected_option.as_deref() {
+                Some("approve") | Some("approve_all") => Some(true),
+                Some("decline") | Some("decline_all") => Some(false),
+                _ => None,
+            })
+        else {
+            return Err(anyhow!("Codex approvals require an explicit decision"));
+        };
+
+        let sender = {
+            let mut pending = self.pending_approvals.lock().await;
+            pending.remove(interaction_id)
+        }
+        .ok_or_else(|| anyhow!("Unknown pending approval: {interaction_id}"))?;
+        sender
+            .send(approved)
+            .map_err(|_| anyhow!("The pending approval is no longer awaiting a response"))?;
+
+        if let Some(apply_to_future) = response.apply_to_future.as_ref()
+            && let Some(mut approval_mode) =
+                lock_or_warn(&self.approval_mode, "codex code ui approval mode write")
+        {
+            *approval_mode = match apply_to_future {
+                CodeUiApplyToFuture::No => "ask".to_string(),
+                CodeUiApplyToFuture::AcceptAll => "accept".to_string(),
+                CodeUiApplyToFuture::DeclineAll => "decline".to_string(),
+            };
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> anyhow::Result<()> {
+        // Stop the envelope sidecar so the detached worker does not outlive
+        // the Code UI session (W3-04).
+        self.envelope_runtime
+            .shutdown()
+            .await
+            .map_err(|error| anyhow!("failed to shut down Codex envelope AgentRuntime: {error}"))?;
+        Ok(())
     }
 }
 
@@ -1657,6 +1810,10 @@ pub async fn start_code_ui_runtime(
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let thread_id = Arc::new(Mutex::new(String::new()));
     let approval_mode = Arc::new(Mutex::new(args.approval.clone()));
+    let pending_approvals = Arc::new(AsyncMutex::new(HashMap::<
+        String,
+        tokio::sync::oneshot::Sender<bool>,
+    >::new()));
 
     let browser_session = CodeUiSession::new(initial_snapshot(
         args.cwd.clone(),
@@ -1730,6 +1887,29 @@ pub async fn start_code_ui_runtime(
                 created_at: task.created_at,
             })
             .collect();
+        // Fold durable run_events so failed/cancelled terminals survive Code UI
+        // runtime restart instead of reopening as Pending (W3-04).
+        let mut latest_run_status: std::collections::HashMap<
+            String,
+            (chrono::DateTime<Utc>, RunStatus),
+        > = std::collections::HashMap::new();
+        let mut latest_run_terminal_at: std::collections::HashMap<String, chrono::DateTime<Utc>> =
+            std::collections::HashMap::new();
+        for event in &rebuild.run_events {
+            let status = run_status_from_event(&event.status);
+            let entry = latest_run_status
+                .entry(event.run_id.clone())
+                .or_insert((event.at, status.clone()));
+            if event.at >= entry.0 {
+                *entry = (event.at, status.clone());
+            }
+            if matches!(
+                status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            ) {
+                latest_run_terminal_at.insert(event.run_id.clone(), event.at);
+            }
+        }
         session_guard.runs = rebuild
             .thread
             .runs
@@ -1737,11 +1917,37 @@ pub async fn start_code_ui_runtime(
             .map(|run| Run {
                 id: run.id.clone(),
                 thread_id: run.thread_id.clone(),
-                status: RunStatus::Pending,
+                status: latest_run_status
+                    .get(&run.id)
+                    .map(|(_, status)| status.clone())
+                    .unwrap_or(RunStatus::Pending),
                 started_at: run.started_at,
-                completed_at: None,
+                completed_at: latest_run_terminal_at.get(&run.id).copied(),
             })
             .collect();
+        // Also surface orphan terminal run_events whose Run snapshot row was
+        // never stored (still recoverable for Code UI status).
+        let thread_id_for_orphan = session_guard.thread.id.clone();
+        for (run_id, (_, status)) in &latest_run_status {
+            if session_guard.runs.iter().any(|run| run.id == *run_id) {
+                continue;
+            }
+            if matches!(
+                status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            ) {
+                session_guard.runs.push(Run {
+                    id: run_id.clone(),
+                    thread_id: thread_id_for_orphan.clone(),
+                    status: status.clone(),
+                    started_at: latest_run_terminal_at
+                        .get(run_id)
+                        .copied()
+                        .unwrap_or_else(Utc::now),
+                    completed_at: latest_run_terminal_at.get(run_id).copied(),
+                });
+            }
+        }
         session_guard.tool_invocations = rebuild.tool_invocations.clone();
         session_guard.patchsets = rebuild
             .thread
@@ -1759,6 +1965,78 @@ pub async fn start_code_ui_runtime(
     }
 
     publish_code_ui_snapshot(&browser_session, &codex_session, &args.cwd).await;
+
+    // Sidecar AgentRuntime owns the shared AgentEvent envelope stream for
+    // managed Codex (W3-04). Turn execution stays on the app-server; this
+    // worker only records normalized notifications for observe/projection.
+    let (envelope_runtime, envelope_worker) =
+        AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(
+            Arc::new(ExternalTurnTrackingExecutor),
+            ToolBoundaryRuntime::system(
+                uuid::Uuid::new_v4(),
+                Arc::new(InMemoryAuditSink::default()),
+            ),
+        ));
+    // Detach the worker task; the AgentRuntimeHandle kept on the adapter
+    // (and cloned into the WS reader) holds the command channel open.
+    tokio::spawn(async move {
+        let _ = envelope_worker.await;
+    });
+    let runtime_session_id = browser_session.snapshot().await.session_id.clone();
+    let envelope_event_log = CodexEnvelopeEventLog::default();
+    // Subscribe before the WS reader records events so live consumers (and
+    // any future UI adapters) can attach to the shared AgentEvent stream.
+    match envelope_runtime
+        .observe(crate::internal::ai::runtime::EventCursor::new(
+            runtime_session_id.clone(),
+            0,
+        ))
+        .await
+    {
+        Ok(mut stream) => {
+            tokio::spawn(async move {
+                // Keep the subscription alive; retention is handled by the
+                // direct push after record_envelope_event returns.
+                while stream.recv().await.is_ok() {}
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "libra::internal::ai::codex",
+                %error,
+                "failed to observe Codex envelope AgentRuntime stream"
+            );
+        }
+    }
+    // Single bounded recorder so streaming deltas cannot spawn unbounded tasks.
+    let (envelope_record_tx, mut envelope_record_rx) = mpsc::channel::<(
+        String,
+        Option<String>,
+        crate::internal::ai::runtime::AgentEventKind,
+        String,
+    )>(256);
+    {
+        let runtime = envelope_runtime.clone();
+        let log = envelope_event_log.clone();
+        tokio::spawn(async move {
+            while let Some((session_id, turn_id, kind, method)) = envelope_record_rx.recv().await {
+                match runtime
+                    .record_envelope_event(session_id, turn_id, kind)
+                    .await
+                {
+                    Ok(event) => log.push(event),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "libra::internal::ai::codex",
+                            %error,
+                            method = %method,
+                            "failed to record Codex envelope event on AgentRuntime stream"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     tokio::spawn(async move {
         // Drain the outbound channel as fast as it fills. Earlier code wrapped
@@ -1785,6 +2063,7 @@ pub async fn start_code_ui_runtime(
     let notifies_clone = notifies.clone();
     let tx_clone = tx.clone();
     let approval_mode_clone = approval_mode.clone();
+    let pending_approvals_clone = pending_approvals.clone();
     let debug_mode = args.debug;
     let codex_session_clone = codex_session.clone();
     let browser_session_clone = browser_session.clone();
@@ -1855,11 +2134,58 @@ pub async fn start_code_ui_runtime(
                     .get("params")
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
-                tracing::trace!(
-                    target: "libra::internal::ai::codex",
-                    method,
-                    "code-ui notification dispatch"
+                // W3-04: every notification enters the shared AgentEvent envelope
+                // before Code UI projection. Unknown methods become a diagnosable
+                // ProviderNotification fallback — never silent drop.
+                let normalized = envelope::normalize_codex_notification(method, &params);
+                if normalized.used_fallback {
+                    tracing::warn!(
+                        target: "libra::internal::ai::codex",
+                        method = %normalized.method,
+                        classification = %normalized.classification,
+                        kind = ?normalized.primary_kind(),
+                        "unrecognized Codex notification; recorded ProviderNotification fallback"
+                    );
+                } else {
+                    tracing::trace!(
+                        target: "libra::internal::ai::codex",
+                        method,
+                        classification = %normalized.classification,
+                        "code-ui notification dispatch (normalized)"
+                    );
+                }
+                let envelope_kinds = normalized.kinds().to_vec();
+                let turn_id_for_envelope = extract_turn_id_for_envelope(
+                    &params,
+                    lock_or_warn(&codex_session_clone, "envelope turn id").as_deref(),
                 );
+                for kind in envelope_kinds.iter().cloned() {
+                    let payload = (
+                        runtime_session_id.clone(),
+                        turn_id_for_envelope.clone(),
+                        kind,
+                        normalized.method.clone(),
+                    );
+                    if is_streaming_delta_method(mk) {
+                        // Drop-newest when the recorder is saturated so the WS
+                        // reader keeps pace; TCP backpressure remains via
+                        // coalesced snapshot publishes.
+                        if envelope_record_tx.try_send(payload).is_err() {
+                            tracing::trace!(
+                                target: "libra::internal::ai::codex",
+                                method = %normalized.method,
+                                "Codex streaming envelope recorder saturated; dropping delta"
+                            );
+                        }
+                    } else if let Err(error) = envelope_record_tx.send(payload).await {
+                        tracing::warn!(
+                            target: "libra::internal::ai::codex",
+                            %error,
+                            method = %normalized.method,
+                            "Codex envelope recorder closed"
+                        );
+                    }
+                }
 
                 match mk {
                     MethodKind::ThreadStarted => {
@@ -1944,23 +2270,101 @@ pub async fn start_code_ui_runtime(
                         }
                     }
                     MethodKind::TurnCompleted => {
+                        let turn_id_from_params = extract_turn_id_for_envelope(&params, None);
                         if let Some(mut session) =
                             lock_or_warn(&codex_session_clone, "code ui turn completed update")
-                            && let Some(run_id) = session.thread.current_turn_id.clone()
                         {
-                            tracing::info!(
-                                target: "libra::internal::ai::codex",
-                                turn_id = %run_id,
-                                "Codex turn completed"
-                            );
-                            let thread_id = session.thread.id.clone();
-                            session.add_run(Run {
-                                id: run_id,
-                                thread_id,
-                                status: RunStatus::Completed,
-                                started_at: Utc::now(),
-                                completed_at: Some(Utc::now()),
-                            });
+                            let run_id = turn_id_from_params
+                                .or_else(|| session.thread.current_turn_id.clone())
+                                .unwrap_or_default();
+                            if run_id.is_empty() {
+                                // No turn id available; skip durable terminal write.
+                            } else {
+                                let run_status = envelope::run_status_for_turn_completed(&params);
+                                let status_label = match run_status {
+                                    RunStatus::Completed => "completed",
+                                    RunStatus::Failed => "failed",
+                                    RunStatus::Cancelled => "cancelled",
+                                    RunStatus::Pending | RunStatus::InProgress => "completed",
+                                };
+                                tracing::info!(
+                                    target: "libra::internal::ai::codex",
+                                    turn_id = %run_id,
+                                    ?run_status,
+                                    "Codex turn completed"
+                                );
+                                let thread_id = session.thread.id.clone();
+                                let completed_at = Utc::now();
+                                let run = Run {
+                                    id: run_id.clone(),
+                                    thread_id: thread_id.clone(),
+                                    status: run_status.clone(),
+                                    started_at: session
+                                        .runs
+                                        .iter()
+                                        .find(|run| run.id == run_id)
+                                        .map(|run| run.started_at)
+                                        .unwrap_or(completed_at),
+                                    completed_at: Some(completed_at),
+                                };
+                                session.add_run(run.clone());
+                                session.thread.current_turn_id = None;
+                                session.thread.status = ThreadStatus::Pending;
+                                session.thread.updated_at = completed_at;
+
+                                let mcp_server_for_run = mcp_server_clone.clone();
+                                let history = history_recorder_clone.clone();
+                                let history_writer = history_writer_clone.clone();
+                                let failure_reason = envelope_kinds.iter().find_map(|kind| {
+                                    match kind {
+                                        crate::internal::ai::runtime::AgentEventKind::TurnFailed {
+                                            reason,
+                                        } => Some(reason.clone()),
+                                        _ => None,
+                                    }
+                                });
+                                // HistoryReader only retains run_events whose run_id
+                                // appears in run_snapshot; write the snapshot first so
+                                // failed/cancelled terminals survive Code UI restart.
+                                let run_snapshot = RunSnapshot {
+                                    id: run_id.clone(),
+                                    thread_id: thread_id.clone(),
+                                    plan_id: None,
+                                    task_id: None,
+                                    started_at: run.started_at,
+                                };
+                                let run_event = RunEvent {
+                                    id: format!("run_event_{run_id}_{status_label}"),
+                                    run_id: run_id.clone(),
+                                    status: status_label.to_string(),
+                                    at: completed_at,
+                                    error: failure_reason,
+                                };
+                                ClientStorage::spawn_background_index_work(async move {
+                                    store_to_mcp(
+                                        &mcp_server_for_run,
+                                        "run",
+                                        &run_id,
+                                        &run,
+                                        debug_mode,
+                                    )
+                                    .await;
+                                    history
+                                        .event(
+                                            history::EventKind::RunStatus,
+                                            &run_id,
+                                            status_label,
+                                            serde_json::json!({"thread_id": thread_id}),
+                                        )
+                                        .await;
+                                    history_writer
+                                        .write("run_snapshot", &run_id, &run_snapshot)
+                                        .await;
+                                    history_writer
+                                        .write("run_event", &run_event.id, &run_event)
+                                        .await;
+                                });
+                            }
                         }
                     }
                     MethodKind::ItemStarted => {
@@ -2244,17 +2648,37 @@ pub async fn start_code_ui_runtime(
                         } else if current_mode == "decline" {
                             false
                         } else {
-                            // Managed Codex turns do not yet expose an
-                            // AgentRuntime continuation. Do not retain an
-                            // adapter-private approval oneshot: deny until
-                            // the provider can register the interaction with
-                            // the shared runtime owner.
-                            tracing::warn!(
-                                target: "libra::internal::ai::codex",
-                                request_id = %request_id,
-                                "managed Codex approval denied because no AgentRuntime turn owns it"
-                            );
-                            false
+                            // Ask mode: park a oneshot under the request id and
+                            // wait for browser respond_interaction. Full shared
+                            // AgentRuntime interaction ownership remains W3-07.
+                            let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel();
+                            pending_approvals_clone
+                                .lock()
+                                .await
+                                .insert(request_id.clone(), oneshot_tx);
+                            publish_code_ui_snapshot_with_envelope(
+                                &browser_session_clone,
+                                &codex_session_clone,
+                                &working_dir_clone,
+                                &envelope_kinds,
+                            )
+                            .await;
+                            // Default to deny when the approval channel is
+                            // dropped (runtime teardown). Auto-approving on
+                            // cancellation could let a command run after the
+                            // operator already closed the session.
+                            match oneshot_rx.await {
+                                Ok(decision) => decision,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        target: "libra::internal::ai::codex",
+                                        request_id = %request_id,
+                                        "approval channel closed before user response; \
+                                         defaulting to DECLINE"
+                                    );
+                                    false
+                                }
+                            }
                         };
 
                         if let Some(mut session) =
@@ -2291,7 +2715,22 @@ pub async fn start_code_ui_runtime(
                         );
                         let _ = tx_clone.send(approval_msg.to_json()).await;
                     }
-                    _ => {}
+                    // Remaining MethodKinds (ItemCompleted, Task*, TokenUsage,
+                    // Thread*, Initialized, Unknown, …) have no CodexSession
+                    // mutation on this path; the normalized AgentEvent envelope
+                    // above is the diagnosable record (W3-04).
+                    MethodKind::ItemCompleted
+                    | MethodKind::TaskStarted
+                    | MethodKind::TaskCompleted
+                    | MethodKind::TokenUsageUpdated
+                    | MethodKind::ThreadNameUpdated
+                    | MethodKind::ThreadArchived
+                    | MethodKind::ThreadCompacted
+                    | MethodKind::ThreadClosed
+                    | MethodKind::CommandExecutionOutputDelta
+                    | MethodKind::FileChangeOutputDelta
+                    | MethodKind::Initialized
+                    | MethodKind::Unknown => {}
                 }
 
                 // Coalesce broadcast: streaming-delta methods (AgentMessageDelta,
@@ -2303,10 +2742,11 @@ pub async fn start_code_ui_runtime(
                 if is_streaming_delta_method(mk) {
                     delta_skipped_since_publish = true;
                 } else {
-                    publish_code_ui_snapshot(
+                    publish_code_ui_snapshot_with_envelope(
                         &browser_session_clone,
                         &codex_session_clone,
                         &working_dir_clone,
+                        &envelope_kinds,
                     )
                     .await;
                     delta_skipped_since_publish = false;
@@ -2406,11 +2846,14 @@ pub async fn start_code_ui_runtime(
 
     let adapter: Arc<dyn CodeUiProviderAdapter> = Arc::new(CodexCodeUiAdapter {
         browser_session,
+        envelope_runtime,
+        envelope_event_log,
         tx,
         responses,
         notifies,
         thread_id,
         approval_mode,
+        pending_approvals,
     });
     let mut runtime_options = crate::internal::ai::web::code_ui::CodeUiRuntimeOptions::new(
         browser_write_enabled,
@@ -2606,7 +3049,10 @@ pub async fn execute(
             if event.at >= entry.0 {
                 *entry = (event.at, status.clone());
             }
-            if matches!(status, RunStatus::Completed | RunStatus::Failed) {
+            if matches!(
+                status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            ) {
                 latest_run_terminal_at.insert(event.run_id.clone(), event.at);
             }
         }

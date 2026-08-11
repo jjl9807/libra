@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-04, 2026-08-11)
+
+- **W3-04 normalizes Codex websocket events into the shared `AgentEvent`
+  envelope.** Managed `--web-only --provider codex` notifications map through
+  `normalize_codex_notification` onto the same projection path as other
+  providers; unknown methods become diagnosable `ProviderNotification`
+  fallbacks. Terminal failed/cancelled turns persist `RunSnapshot` +
+  `run_event` for restart recovery; ask-mode approvals still wait on browser
+  `respond_interaction` until W3-07.
+
 ### Added (plan-20260715 W3-03, 2026-08-11)
 
 - **W3-03 merges headless under `AgentRuntimeCodeUiAdapter`.** Production Web
