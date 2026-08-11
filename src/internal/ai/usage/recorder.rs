@@ -9,10 +9,19 @@ use crate::internal::ai::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsageContext {
+    /// Repository identity. This is deliberately opaque: callers use the
+    /// canonical `config_kv.libra.repoid`, never a mutable storage path or
+    /// UI-only id.
+    pub repo_id: Option<String>,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub agent_run_id: Option<String>,
     pub run_id: Option<String>,
+    /// Runtime turn identity. It scopes current-turn usage queries.
+    pub turn_id: Option<String>,
+    /// Stable identity for the provider event. Replaying an event with this
+    /// key is a no-op instead of charging tokens twice.
+    pub event_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub request_kind: String,
@@ -23,6 +32,35 @@ pub struct UsageContext {
     /// NULL in that case so existing aggregation continues to match
     /// the original (provider, model) grain. See OC-Phase 5 P5.2.
     pub agent_name: Option<String>,
+}
+
+impl UsageContext {
+    /// Bind a usage context to a durable runtime turn.
+    ///
+    /// The tool loop derives distinct per-model-request event IDs from this
+    /// stable turn event ID, so retries of the same admitted runtime turn are
+    /// idempotent while requests within that turn remain separately recorded.
+    pub fn for_runtime_turn(&self, runtime_turn_id: &str) -> Self {
+        let mut context = self.clone();
+        context.turn_id = Some(runtime_turn_id.to_string());
+        context.event_id = Some(format!("runtime-turn:{runtime_turn_id}"));
+        context
+    }
+
+    /// Bind a cancellation to the active model request's event identity.
+    ///
+    /// A cancellation is only a synthetic fallback when the tool loop has
+    /// not already persisted terminal usage. Sharing the active model-turn
+    /// key makes the database's idempotency constraint choose one winner:
+    /// either the cancellation fallback or the in-flight model request.
+    pub fn for_runtime_turn_cancellation(&self, runtime_turn_id: &str, model_turn: usize) -> Self {
+        let mut context = self.for_runtime_turn(runtime_turn_id);
+        context.event_id = context
+            .event_id
+            .as_ref()
+            .map(|event_id| format!("{event_id}:model-turn:{model_turn}"));
+        context
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,12 +85,38 @@ impl UsageRecorder {
         UsageQuery::new(self.conn.clone())
     }
 
+    /// Return the repository's durable identity from its local configuration.
+    ///
+    /// The storage path is deliberately not a fallback: it changes when a
+    /// repository moves and would split usage attribution across locations.
+    pub async fn canonical_repo_id(&self) -> Result<Option<String>, DbErr> {
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_string(
+                backend,
+                "SELECT value FROM config_kv \
+                 WHERE key = 'libra.repoid' \
+                 ORDER BY id DESC LIMIT 1"
+                    .to_string(),
+            ))
+            .await?;
+        match row {
+            Some(row) => {
+                let repo_id = row.try_get_by::<String, _>("value")?;
+                Ok((!repo_id.trim().is_empty()).then_some(repo_id))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub async fn record_optional_summary(
         &self,
         context: &UsageContext,
         summary: Option<&CompletionUsageSummary>,
         wall_clock_ms: Option<u64>,
     ) -> Result<(), DbErr> {
+        validate_idempotency_context(context)?;
         let Some(summary) = summary else {
             return Ok(());
         };
@@ -76,6 +140,7 @@ impl UsageRecorder {
         wall_clock_ms: Option<u64>,
         tool_call_count: u64,
     ) -> Result<(), DbErr> {
+        validate_idempotency_context(context)?;
         if summary.is_zero() {
             return Ok(());
         }
@@ -97,6 +162,7 @@ impl UsageRecorder {
         wall_clock_ms: Option<u64>,
         tool_call_count: u64,
     ) -> Result<(), DbErr> {
+        validate_idempotency_context(context)?;
         self.insert_row(UsageInsert {
             context,
             summary: None,
@@ -115,6 +181,7 @@ impl UsageRecorder {
         error_kind: &str,
         wall_clock_ms: Option<u64>,
     ) -> Result<(), DbErr> {
+        validate_idempotency_context(context)?;
         self.insert_row(UsageInsert {
             context,
             summary: None,
@@ -150,26 +217,58 @@ impl UsageRecorder {
                 .saturating_add(summary.output_tokens)
                 .saturating_add(summary.reasoning_tokens.unwrap_or(0))
         });
-        let cost_micro_dollars = cost_micro_dollars(summary.cost_usd).or_else(|| {
-            self.pricing.estimate_micro_dollars(
-                &input.context.provider,
-                &input.context.model,
-                &summary,
-            )
+        // A missing provider usage payload is not a zero-token request. Do
+        // not manufacture a `$0` estimate from the default summary; callers
+        // must receive an explicit unknown cost state.
+        let cost_micro_dollars = input.summary.and_then(|summary| {
+            if summary.cost_usd.is_some() {
+                None
+            } else {
+                self.pricing.estimate_micro_dollars(
+                    &input.context.provider,
+                    &input.context.model,
+                    summary,
+                )
+            }
         });
         let backend = self.conn.get_database_backend();
         self.conn
             .execute_raw(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_usage_stats \
-                 (id, session_id, thread_id, agent_run_id, run_id, provider, model, agent_name, request_kind, intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, repo_id, session_id, thread_id, agent_run_id, run_id, turn_id, event_id, provider, model, agent_name, request_kind, intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, tool_call_count, wall_clock_ms, provider_latency_ms, cost_estimate_micro_dollars, cost_usd, usage_estimated, started_at, finished_at, success, error_kind, schema_version, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT(session_id, event_id) DO UPDATE SET \
+                    prompt_tokens = excluded.prompt_tokens, \
+                    completion_tokens = excluded.completion_tokens, \
+                    cached_tokens = excluded.cached_tokens, \
+                    reasoning_tokens = excluded.reasoning_tokens, \
+                    total_tokens = excluded.total_tokens, \
+                    tool_call_count = excluded.tool_call_count, \
+                    wall_clock_ms = excluded.wall_clock_ms, \
+                    provider_latency_ms = excluded.provider_latency_ms, \
+                    cost_estimate_micro_dollars = excluded.cost_estimate_micro_dollars, \
+                    cost_usd = excluded.cost_usd, \
+                    usage_estimated = excluded.usage_estimated, \
+                    started_at = excluded.started_at, \
+                    finished_at = excluded.finished_at, \
+                    success = excluded.success, \
+                    error_kind = excluded.error_kind, \
+                    schema_version = excluded.schema_version, \
+                    created_at = excluded.created_at \
+                 WHERE excluded.success = 1 \
+                   AND excluded.usage_estimated = 0 \
+                   AND agent_usage_stats.success = 0 \
+                   AND agent_usage_stats.usage_estimated = 0",
                 vec![
                     Uuid::new_v4().to_string().into(),
+                    input.context.repo_id.clone().into(),
                     input.context.session_id.clone().into(),
                     input.context.thread_id.clone().into(),
                     input.context.agent_run_id.clone().into(),
                     input.context.run_id.clone().into(),
+                    input.context.turn_id.clone().into(),
+                    input.context.event_id.clone().into(),
                     input.context.provider.clone().into(),
                     input.context.model.clone().into(),
                     input.context.agent_name.clone().into(),
@@ -221,17 +320,18 @@ fn bool_to_i64_value(value: bool) -> Value {
     i64::from(value).into()
 }
 
-fn cost_micro_dollars(cost_usd: Option<f64>) -> Option<i64> {
-    let cost = cost_usd?;
-    if !cost.is_finite() || cost < 0.0 {
-        return None;
+fn validate_idempotency_context(context: &UsageContext) -> Result<(), DbErr> {
+    if context.event_id.is_some()
+        && context
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id.trim().is_empty())
+    {
+        return Err(DbErr::Custom(
+            "usage event_id requires a non-empty session_id for idempotency".to_string(),
+        ));
     }
-    let micro_dollars = cost * 1_000_000.0;
-    if micro_dollars > i64::MAX as f64 {
-        None
-    } else {
-        Some(micro_dollars.round() as i64)
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -292,52 +392,18 @@ mod tests {
         }
     }
 
-    /// `cost_micro_dollars` happy path: USD * 1e6 rounded to i64
-    /// using `f64::round()` (round-half-away-from-zero).
-    #[test]
-    fn cost_micro_dollars_converts_usd_to_micro_dollars() {
-        assert_eq!(cost_micro_dollars(Some(0.0)), Some(0));
-        assert_eq!(cost_micro_dollars(Some(1.0)), Some(1_000_000));
-        // 0.0012345 USD = 1234.5 micro-dollars → 1235 via round-
-        // half-away-from-zero. Pin the rounding direction.
-        assert_eq!(cost_micro_dollars(Some(0.0012345)), Some(1235));
-        // 0.0000005 USD = 0.5 → rounds to 1; 0.0000004 → 0.
-        assert_eq!(cost_micro_dollars(Some(0.0000005)), Some(1));
-        assert_eq!(cost_micro_dollars(Some(0.0000004)), Some(0));
-    }
-
-    /// `cost_micro_dollars` rejects negative / NaN / ±Inf inputs.
-    /// Pin so a future "saturate to 0" refactor catches a wider net.
-    #[test]
-    fn cost_micro_dollars_rejects_invalid_inputs() {
-        assert_eq!(cost_micro_dollars(None), None);
-        assert_eq!(cost_micro_dollars(Some(-0.01)), None);
-        assert_eq!(cost_micro_dollars(Some(f64::NAN)), None);
-        assert_eq!(cost_micro_dollars(Some(f64::INFINITY)), None);
-        assert_eq!(cost_micro_dollars(Some(f64::NEG_INFINITY)), None);
-    }
-
-    /// `cost_micro_dollars` rejects values that would overflow i64
-    /// after the 1e6 multiplication. Pin so a future "saturate at
-    /// MAX" refactor breaks this test loudly (i.e. the caller would
-    /// see Some(MAX) instead of None — a behaviour change).
-    #[test]
-    fn cost_micro_dollars_returns_none_on_i64_overflow() {
-        // i64::MAX micros ≈ 9.22e12 USD. A USD value 100x larger
-        // overflows.
-        let huge = (i64::MAX as f64 / 1_000_000.0) * 10.0;
-        assert_eq!(cost_micro_dollars(Some(huge)), None);
-    }
-
     /// `UsageContext` clones cleanly (the recorder clones the context
     /// per insert to thread fields into the SQL statement).
     #[test]
     fn usage_context_derives_clone_and_eq() {
         let ctx = UsageContext {
+            repo_id: Some("repo-1".to_string()),
             session_id: Some("s1".to_string()),
             thread_id: Some("t1".to_string()),
             agent_run_id: Some("r1".to_string()),
             run_id: Some("run1".to_string()),
+            turn_id: Some("turn1".to_string()),
+            event_id: Some("event1".to_string()),
             provider: "openai".to_string(),
             model: "gpt-4".to_string(),
             request_kind: "chat".to_string(),
@@ -355,5 +421,58 @@ mod tests {
         empty.agent_name = Some(String::new());
         assert_ne!(empty, ctx);
         assert_ne!(empty.agent_name, anon.agent_name);
+    }
+
+    #[test]
+    fn usage_context_binds_durable_runtime_turn_ids() {
+        let context = UsageContext {
+            repo_id: Some("repo-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            thread_id: None,
+            agent_run_id: None,
+            run_id: None,
+            turn_id: None,
+            event_id: None,
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            request_kind: "completion".to_string(),
+            intent: None,
+            agent_name: None,
+        };
+
+        let bound = context.for_runtime_turn("tui-local-123");
+        assert_eq!(bound.turn_id.as_deref(), Some("tui-local-123"));
+        assert_eq!(
+            bound.event_id.as_deref(),
+            Some("runtime-turn:tui-local-123")
+        );
+        assert_eq!(context.turn_id, None);
+        assert_eq!(context.event_id, None);
+    }
+
+    #[test]
+    fn event_id_requires_non_empty_session_id() {
+        let context = UsageContext {
+            repo_id: None,
+            session_id: None,
+            thread_id: None,
+            agent_run_id: None,
+            run_id: None,
+            turn_id: None,
+            event_id: Some("event-1".to_string()),
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            request_kind: "completion".to_string(),
+            intent: None,
+            agent_name: None,
+        };
+
+        assert!(
+            validate_idempotency_context(&context)
+                .expect_err("event ids require a session")
+                .to_string()
+                .contains("usage event_id requires a non-empty session_id"),
+            "the recorder must reject event IDs without an idempotency scope"
+        );
     }
 }

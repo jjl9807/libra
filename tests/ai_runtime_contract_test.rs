@@ -2745,6 +2745,1205 @@ async fn runtime_shutdown_on_signal_and_startup_failure() {
     ));
 }
 
+/// W2-11: failure classification, retry bounds, repair interaction, and
+/// wire-safe evidence are runtime-owned. Re-admission remains covered by the
+/// adjacent W2-04 queue/gate contract.
+#[test]
+fn plan_execution_repair_loop() {
+    use libra::internal::ai::{
+        runtime::{
+            ExecutionFailureRevision, InteractionState, MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            PlanExecutionRepairService, PlanExecutionRepairState,
+            open_plan_execution_repair_from_workflow,
+        },
+        session::{CodeWorkflowEventKind, jsonl::SessionJsonlStore},
+    };
+
+    let service = PlanExecutionRepairService;
+    assert_eq!(
+        PlanExecutionRepairService::classify_failure_signals(true, false, false),
+        ExecutionFailureRevision::PlanRevision
+    );
+    assert_eq!(
+        PlanExecutionRepairService::classify_failure_signals(true, true, false),
+        ExecutionFailureRevision::IntentSpecRevision
+    );
+    assert_eq!(
+        PlanExecutionRepairService::classify_failure_signals(false, false, false),
+        ExecutionFailureRevision::ManualAction
+    );
+
+    let waiting = service.after_failure("repair-1", None, Some("orchestrator unavailable"), 2, 2);
+    assert!(matches!(
+        waiting,
+        PlanExecutionRepairState::ManualAction { .. }
+    ));
+
+    // The plan route starts automatically while it remains below the requested
+    // limit, then exposes a runtime interaction that can be continued or
+    // cancelled without an adapter-owned transition.
+    let automatic = PlanExecutionRepairState::AutomaticRepair {
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: libra::internal::ai::runtime::ExecutionFailureEvidence {
+            output: "Decision: Abandon.".to_string(),
+            diagnostics: vec!["test failed".to_string()],
+            attempt: 1,
+            max_attempts: 2,
+        },
+    };
+    assert_eq!(automatic.evidence().diagnostics, ["test failed"]);
+    let waiting = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-1".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: libra::internal::ai::runtime::ExecutionFailureEvidence {
+            output: "Decision: Abandon.".to_string(),
+            diagnostics: vec!["test failed".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    assert!(matches!(
+        waiting.interaction_state(),
+        Some(InteractionState::AwaitingPlanRepair { .. })
+    ));
+    let configured_limit_continue = service.respond(waiting.clone(), "continue", None);
+    assert!(
+        matches!(
+            configured_limit_continue,
+            PlanExecutionRepairState::AwaitingUser {
+                evidence,
+                ..
+            } if evidence.attempt == 2 && evidence.max_attempts == 2
+        ),
+        "Continue without an explicit higher limit must preserve the configured retry cap"
+    );
+    assert!(matches!(
+        service.respond(waiting.clone(), "continue", Some(3)),
+        PlanExecutionRepairState::AutomaticRepair { .. }
+    ));
+    assert!(matches!(
+        service.respond(waiting, "cancel", None),
+        PlanExecutionRepairState::Cancelled { .. }
+    ));
+    assert!(!PlanExecutionRepairService::should_auto_repair(
+        ExecutionFailureRevision::PlanRevision,
+        MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+        MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS
+    ));
+    let hard_cap_waiting = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-hard-cap".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: libra::internal::ai::runtime::ExecutionFailureEvidence {
+            output: "Decision: Abandon.".to_string(),
+            diagnostics: vec!["verification failed".to_string()],
+            attempt: MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            max_attempts: MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+        },
+    };
+    let hard_cap_continue = service.respond(
+        hard_cap_waiting,
+        "continue",
+        Some(MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS),
+    );
+    assert!(
+        matches!(
+            hard_cap_continue.interaction_state(),
+            Some(InteractionState::AwaitingPlanRepair { interaction_id })
+                if interaction_id == "repair-hard-cap"
+        ),
+        "a Continue rejected at the hard cap must leave its repair gate actionable"
+    );
+
+    let evidence = PlanExecutionRepairService::failure_evidence(
+        None,
+        Some("Orchestrator failed: token: top-secret"),
+        1,
+        2,
+    );
+    assert!(
+        !evidence.output.contains("top-secret"),
+        "remote repair evidence must use the runtime redactor"
+    );
+
+    // The worker snapshot is intentionally ephemeral. A replacement
+    // SessionQueue must recover this durable marker and re-park the same
+    // Continue/Cancel interaction before admitting any repaired execution.
+    let temp = tempfile::tempdir().expect("temp session root");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanExecutionRepairRequested {
+            interaction_id: "repair-after-restart".to_string(),
+            turn_id: "plan-repair-gate-1".to_string(),
+            predecessor_interaction_id: String::new(),
+            supersedes_predecessor: false,
+            repair: PlanExecutionRepairState::AwaitingUser {
+                interaction_id: "repair-after-restart".to_string(),
+                route: ExecutionFailureRevision::PlanRevision,
+                evidence: libra::internal::ai::runtime::ExecutionFailureEvidence {
+                    output: "Decision: Abandon.".to_string(),
+                    diagnostics: vec!["verification failed".to_string()],
+                    attempt: 2,
+                    max_attempts: 2,
+                },
+            },
+        })
+        .expect("persist repair gate");
+    assert!(
+        temp.path().exists(),
+        "temporary session root must remain alive"
+    );
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload repair gate after restart");
+    let recovered =
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event));
+    assert!(
+        matches!(
+            &recovered,
+            Some((
+                PlanExecutionRepairState::AwaitingUser {
+                    interaction_id,
+                    evidence,
+                    ..
+                },
+                turn_id
+            )) if interaction_id == "repair-after-restart"
+                && turn_id == "plan-repair-gate-1"
+                && evidence.output == "Decision: Abandon."
+                && evidence.diagnostics == ["verification failed"]
+        ),
+        "recovered repair gate must preserve its complete redacted evidence: {recovered:?}"
+    );
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "repair-after-restart".to_string(),
+            resolution: "continue".to_string(),
+        })
+        .expect("resolve repair gate");
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload resolved repair gate");
+    assert!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .is_none(),
+        "a resolved repair gate must not be restored"
+    );
+}
+
+/// W2-11 r18: an authorized retry-limit increase must be part of the
+/// pre-ack continuation marker so a crash before repaired-execution admission
+/// can still resume through Continue.
+#[test]
+fn plan_execution_repair_continuation_preserves_authorized_retry_cap() {
+    use libra::internal::ai::{
+        runtime::{
+            ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairService,
+            PlanExecutionRepairState, open_plan_execution_repair_from_workflow,
+            persist_plan_execution_repair_gate,
+        },
+        session::SessionJsonlStore,
+    };
+
+    let exhausted_repair = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-exhausted".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "verification failed".to_string(),
+            diagnostics: vec!["test failure".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let PlanExecutionRepairState::AutomaticRepair { route, evidence } =
+        PlanExecutionRepairService.respond(exhausted_repair, "continue", Some(3))
+    else {
+        panic!("an explicit higher retry limit must authorize another repair");
+    };
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-raised-cap-continuation".to_string(),
+        route,
+        evidence,
+    };
+
+    let temp = tempfile::tempdir().expect("temp session root");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+    persist_plan_execution_repair_gate(&store, &continuation, "repair-raised-cap-turn")
+        .expect("persist pre-ack continuation with raised retry cap");
+
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload continuation after crash");
+    let (recovered, turn_id) =
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .expect("crash recovery retains the continuation");
+    assert_eq!(turn_id, "repair-raised-cap-turn");
+    assert_eq!(recovered.evidence().max_attempts, 3);
+    assert!(
+        matches!(
+            recovered,
+            PlanExecutionRepairState::AwaitingUser {
+                interaction_id,
+                evidence,
+                ..
+            } if interaction_id == "repair-raised-cap-continuation"
+                && evidence.attempt == 3
+                && evidence.max_attempts == 3
+        ),
+        "recovery must preserve the authorized retry cap"
+    );
+}
+
+/// W2-11 r22: local manual revision guidance must retain its replacement
+/// repair gate until repaired execution is admitted. A crash after Phase 1
+/// has produced a revised plan but before execution enters the queue must
+/// therefore restore Continue/Cancel rather than require reconciliation only.
+#[test]
+fn plan_execution_repair_manual_revision_continuation_survives_phase1_admit_crash() {
+    use libra::internal::ai::{
+        runtime::{
+            ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState,
+            open_plan_execution_repair_from_workflow, persist_plan_execution_repair_gate,
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+
+    let original = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-manual-guidance".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "verification failed".to_string(),
+            diagnostics: vec!["test failure".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-manual-guidance-continuation".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: original.evidence().clone(),
+    };
+    let temp = tempfile::tempdir().expect("temp session root");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+
+    persist_plan_execution_repair_gate(&store, &original, "repair-manual-guidance-turn")
+        .expect("persist original repair gate");
+    persist_plan_execution_repair_gate(
+        &store,
+        &continuation,
+        "repair-manual-guidance-continuation-turn",
+    )
+    .expect("persist continuation before local acknowledgement");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "repair-manual-guidance".to_string(),
+            resolution: "continue".to_string(),
+        })
+        .expect("acknowledge original gate");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "revised-plan-review".to_string(),
+            plan_id: "revised-plan".to_string(),
+            turn_id: "revised-plan-review-turn".to_string(),
+            phase1_turn_id: "revised-phase1-turn".to_string(),
+        })
+        .expect("record revised plan review after Phase 1 admission");
+
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload after Phase 1 admission crash");
+    assert_eq!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event)),
+        Some((
+            continuation,
+            "repair-manual-guidance-continuation-turn".to_string()
+        )),
+        "manual guidance must leave Continue/Cancel recoverable until repaired execution is admitted"
+    );
+}
+
+/// W2-11 r25: cancelling a regenerated plan must retire the continuation that
+/// was created when manual guidance acknowledged the original repair gate.
+/// Otherwise restart reopens a repair interaction for a plan the user already
+/// declined.
+#[test]
+fn plan_execution_repair_manual_revision_cancel_retires_continuation() {
+    use libra::internal::ai::{
+        runtime::{
+            ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState,
+            open_plan_execution_repair_from_workflow, persist_plan_execution_repair_gate,
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+
+    let original = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-manual-guidance".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "verification failed".to_string(),
+            diagnostics: vec!["test failure".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-manual-guidance-continuation".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: original.evidence().clone(),
+    };
+    let temp = tempfile::tempdir().expect("temp session root");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+
+    persist_plan_execution_repair_gate(&store, &original, "repair-manual-guidance-turn")
+        .expect("persist original repair gate");
+    persist_plan_execution_repair_gate(
+        &store,
+        &continuation,
+        "repair-manual-guidance-continuation-turn",
+    )
+    .expect("persist continuation before local acknowledgement");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "repair-manual-guidance".to_string(),
+            resolution: "continue".to_string(),
+        })
+        .expect("acknowledge original gate");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanReviewRequested {
+            interaction_id: "revised-plan-review".to_string(),
+            plan_id: "revised-plan".to_string(),
+            turn_id: "revised-plan-review-turn".to_string(),
+            phase1_turn_id: "revised-phase1-turn".to_string(),
+        })
+        .expect("record regenerated plan review");
+
+    // This is the durable write made by both explicit Cancel and Esc before
+    // discarding the regenerated-plan review.
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "repair-manual-guidance-continuation".to_string(),
+            resolution: "repaired execution plan cancelled".to_string(),
+        })
+        .expect("retire continuation on regenerated plan cancellation");
+
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload after regenerated plan cancellation");
+    assert!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .is_none(),
+        "restart must not reopen the repair gate after cancelling the regenerated plan"
+    );
+}
+
+/// W2-11 r23b: cancelling Phase 1 after manual revision guidance must
+/// immediately re-park the already-durable continuation. The live runtime may
+/// not become Idle while restart recovery would still restore Continue/Cancel.
+#[tokio::test]
+async fn plan_execution_repair_phase1_cancellation_reparks_manual_continuation() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExecutionFailureEvidence,
+            ExecutionFailureRevision, InMemoryAuditSink, InteractionResponse, InteractionState,
+            PlanExecutionRepairState, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime,
+            open_plan_execution_repair_from_workflow, park_plan_execution_repair_gate,
+            persist_plan_execution_repair_gate,
+        },
+        session::SessionJsonlStore,
+    };
+
+    let temp = tempfile::tempdir().expect("temp session root");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "repair-phase1-cancel".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(libra::internal::ai::runtime::ExternalTurnTrackingExecutor),
+            boundary,
+        )
+        .with_durability(
+            RuntimeCommandDurability::new(SessionJsonlStore::new(session_root)),
+            "repo",
+            "principal",
+        )
+        .with_durability_command_kind("tui_local_turn"),
+    );
+    let original = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-manual-guidance".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "verification failed".to_string(),
+            diagnostics: vec!["test failure".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-manual-guidance-continuation".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: original.evidence().clone(),
+    };
+    persist_plan_execution_repair_gate(&store, &original, "repair-original-turn")
+        .expect("persist original repair gate");
+    park_plan_execution_repair_gate(
+        &handle,
+        "session".to_string(),
+        "repair-manual-guidance",
+        "repair-original-turn".to_string(),
+    )
+    .await
+    .expect("park original repair gate");
+    persist_plan_execution_repair_gate(&store, &continuation, "repair-continuation-turn")
+        .expect("persist continuation before manual guidance acknowledges original");
+    handle
+        .respond(
+            "session",
+            "repair-original-turn",
+            InteractionResponse::new("repair-manual-guidance", "continue"),
+        )
+        .await
+        .expect("manual guidance acknowledges original repair gate");
+
+    // Phase 1 is cancelled before repaired execution admission. Re-parking
+    // must put the durable continuation back into the live runtime, not Idle.
+    park_plan_execution_repair_gate(
+        &handle,
+        "session".to_string(),
+        "repair-manual-guidance-continuation",
+        "repair-continuation-turn".to_string(),
+    )
+    .await
+    .expect("Phase 1 cancellation re-parks continuation");
+    assert!(matches!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("snapshot after Phase 1 cancellation")
+            .interaction,
+        InteractionState::AwaitingPlanRepair { ref interaction_id }
+            if interaction_id == "repair-manual-guidance-continuation"
+    ));
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload continuation after Phase 1 cancellation");
+    assert_eq!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event)),
+        Some((continuation, "repair-continuation-turn".to_string())),
+        "the live repair gate and durable marker must agree after cancellation"
+    );
+
+    worker.abort();
+}
+
+/// W2-11 r29: automatic repair Continue writes a durable continuation before
+/// acknowledging the prior gate. Phase 1 admission failures must receive that
+/// ID so their caller can re-park it, rather than clearing only the automatic
+/// pending state and leaving the runtime Idle until restart.
+#[test]
+fn plan_execution_repair_automatic_continuation_reaches_phase1_admission_recovery() {
+    let app_source = include_str!("../src/internal/tui/app.rs");
+    let automatic_repair_start = app_source
+        .find("async fn begin_automatic_execution_plan_repair")
+        .expect("automatic repair entry point");
+    let phase1_start = app_source
+        .find("async fn begin_llm_execution_plan_workflow")
+        .expect("Phase 1 workflow entry point");
+    let automatic_repair = &app_source[automatic_repair_start..phase1_start];
+
+    assert!(
+        automatic_repair.contains(
+            "pending.repair_continuation_interaction_id = continuation_interaction_id.clone();"
+        ),
+        "automatic repair must carry its durable continuation into Phase 1's repair context"
+    );
+    assert!(
+        automatic_repair.contains(
+            "repair_continuation_interaction_id: repair_continuation_interaction_id.clone(),"
+        ),
+        "a rejected Phase 1 admission must retain the continuation ID for re-parking"
+    );
+    assert!(
+        automatic_repair.contains("restore_rejected_repaired_execution_admission("),
+        "Phase 1 admission rejection must re-park the automatic repair continuation"
+    );
+}
+
+/// W2-11 r21: if recovery sees a raised-limit continuation persisted before
+/// its predecessor was acknowledged, it restores the predecessor and retires
+/// the explicitly linked speculative copy. A later successful repair must not
+/// leave that stale continuation to fence the next restart.
+#[test]
+fn plan_execution_repair_recovery_retires_raised_limit_pre_ack_continuation() {
+    use libra::internal::ai::{
+        runtime::{
+            ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairService,
+            PlanExecutionRepairState, open_plan_execution_repair_from_workflow,
+            persist_plan_execution_repair_gate,
+            persist_plan_execution_repair_gate_with_predecessor,
+            speculative_plan_execution_repair_continuations_from_workflow,
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+
+    let predecessor = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-crash-predecessor".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "verification failed".to_string(),
+            diagnostics: vec!["test failure".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let PlanExecutionRepairState::AutomaticRepair { route, evidence } =
+        PlanExecutionRepairService.respond(predecessor.clone(), "continue", Some(3))
+    else {
+        panic!("raised retry limit must authorize another automatic repair");
+    };
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-crash-continuation".to_string(),
+        route,
+        evidence,
+    };
+    let temp = tempfile::tempdir().expect("temp session root");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+    persist_plan_execution_repair_gate(&store, &predecessor, "repair-crash-predecessor-turn")
+        .expect("persist predecessor repair gate");
+    persist_plan_execution_repair_gate_with_predecessor(
+        &store,
+        &continuation,
+        "repair-crash-continuation-turn",
+        Some("repair-crash-predecessor"),
+    )
+    .expect("persist raised-limit pre-ack continuation");
+
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload dual unresolved repair markers");
+    assert_eq!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event)),
+        Some((
+            predecessor.clone(),
+            "repair-crash-predecessor-turn".to_string()
+        )),
+        "recovery restores the original unresolved repair gate"
+    );
+    assert_eq!(
+        speculative_plan_execution_repair_continuations_from_workflow(
+            replay.events.iter().map(|event| &event.event)
+        ),
+        vec!["repair-crash-continuation".to_string()],
+        "the raised-limit pre-ack continuation is retired before re-parking the predecessor"
+    );
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "repair-crash-continuation".to_string(),
+            resolution: "repair continuation retired while restoring its unresolved predecessor"
+                .to_string(),
+        })
+        .expect("retire speculative continuation");
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+            interaction_id: "repair-crash-predecessor".to_string(),
+            resolution: "continue".to_string(),
+        })
+        .expect("resolve restored predecessor");
+
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload after recovery resolves predecessor");
+    assert!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .is_none(),
+        "resolving the restored predecessor must not revive its stale continuation"
+    );
+}
+
+/// W2-11 r25: a re-plan failure replacement supersedes its continuation before
+/// the continuation can be retired. Restart must preserve the new failure
+/// evidence rather than restoring the stale continuation.
+#[test]
+fn plan_execution_repair_recovery_prefers_replan_failure_replacement_before_retirement() {
+    use libra::internal::ai::{
+        runtime::{
+            ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState,
+            open_plan_execution_repair_from_workflow, persist_plan_execution_repair_gate,
+            persist_plan_execution_repair_gate_superseding,
+        },
+        session::SessionJsonlStore,
+    };
+
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-stale-continuation".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "initial execution verification failed".to_string(),
+            diagnostics: vec!["initial failure".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let replacement = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-replan-failure".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "Phase 1 re-planning failed".to_string(),
+            diagnostics: vec!["new re-plan failure evidence".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    let temp = tempfile::tempdir().expect("temp session root");
+    let store = SessionJsonlStore::new(temp.path().to_path_buf());
+    persist_plan_execution_repair_gate(&store, &continuation, "repair-stale-continuation-turn")
+        .expect("persist stale continuation");
+    persist_plan_execution_repair_gate_superseding(
+        &store,
+        &replacement,
+        "repair-replan-failure-turn",
+        "repair-stale-continuation",
+    )
+    .expect("persist replacement before retiring predecessor");
+
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("restart reloads dual unresolved repair gates");
+    assert_eq!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event)),
+        Some((replacement, "repair-replan-failure-turn".to_string())),
+        "restart must select the replacement gate after a crash before stale continuation retirement"
+    );
+}
+
+/// W2-11: the TUI/control adapter parks this delivery on the runtime handle.
+/// A public interaction response must settle the worker gate and its durable
+/// marker together; otherwise resume would strand the session at the repair
+/// prompt even after Cancel was acknowledged.
+#[tokio::test]
+async fn plan_execution_repair_cancel_resolves_runtime_gate_and_durable_marker() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExecutionFailureEvidence,
+            ExecutionFailureRevision, InMemoryAuditSink, InteractionResponse, InteractionState,
+            PlanExecutionRepairAckDelivery, PlanExecutionRepairState, PrincipalContext,
+            PrincipalRole, RuntimeCommandDurability, SecretRedactor, ToolBoundaryPolicy,
+            ToolBoundaryRuntime, TurnRequest, open_plan_execution_repair_from_workflow,
+        },
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let temp = tempfile::tempdir().expect("temp session root");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let repair = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-control-cancel".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "Decision: Abandon.".to_string(),
+            diagnostics: vec!["verification failed".to_string()],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    store
+        .append_code_workflow_durable(CodeWorkflowEventKind::PlanExecutionRepairRequested {
+            interaction_id: "repair-control-cancel".to_string(),
+            turn_id: "repair-control-turn".to_string(),
+            predecessor_interaction_id: String::new(),
+            supersedes_predecessor: false,
+            repair,
+        })
+        .expect("persist repair gate before parking it");
+
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "repair-control".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(libra::internal::ai::runtime::ExternalTurnTrackingExecutor),
+            boundary,
+        )
+        .with_durability(
+            RuntimeCommandDurability::new(SessionJsonlStore::new(session_root)),
+            "repo",
+            "principal",
+        )
+        .with_durability_command_kind("tui_local_turn"),
+    );
+
+    handle
+        .track_external_turn(
+            TurnRequest::new("session", "repair-control-turn", "Plan repair", false),
+            CancellationToken::new(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("repair gate turn tracked");
+    handle
+        .register_interaction_with_delivery(
+            "session",
+            "repair-control-turn",
+            InteractionState::AwaitingPlanRepair {
+                interaction_id: "repair-control-cancel".to_string(),
+            },
+            Box::new(PlanExecutionRepairAckDelivery),
+        )
+        .await
+        .expect("repair gate registered through runtime handle");
+    assert!(matches!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("snapshot while repair gate is pending")
+            .interaction,
+        InteractionState::AwaitingPlanRepair { ref interaction_id }
+            if interaction_id == "repair-control-cancel"
+    ));
+
+    handle
+        .respond(
+            "session",
+            "repair-control-turn",
+            InteractionResponse::new("repair-control-cancel", "cancel"),
+        )
+        .await
+        .expect("control response cancels repair gate");
+
+    let snapshot = handle
+        .snapshot("session")
+        .await
+        .expect("snapshot after repair cancellation");
+    assert_eq!(snapshot.active_turn_id, None);
+    assert_eq!(snapshot.interaction, InteractionState::Completed);
+    let events: Vec<_> = store
+        .load_code_workflow_replay()
+        .expect("replay resolved repair gate")
+        .events
+        .into_iter()
+        .map(|event| event.event)
+        .collect();
+    assert!(
+        open_plan_execution_repair_from_workflow(events.iter()).is_none(),
+        "a Cancel response must close the durable repair marker: {events:?}"
+    );
+
+    worker.abort();
+}
+
+/// W2-11: exercise the same durable registration sequence used after
+/// `ExecuteWorkflowComplete` sees an exhausted failed execution. A restarted
+/// runtime must re-park the marker before Continue can re-admit repair.
+#[tokio::test]
+async fn plan_execution_repair_failure_registration_recovers_and_continues() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        orchestrator::{
+            run_state::RunStateSnapshot,
+            types::{
+                DecisionOutcome, ExecutionPlanSpec, GateReport, OrchestratorResult, SystemReport,
+            },
+        },
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExecutionFailureRevision,
+            InMemoryAuditSink, InteractionResponse, InteractionState, PlanExecutionRepairService,
+            PlanExecutionRepairState, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime,
+            open_plan_execution_repair_from_workflow, park_plan_execution_repair_gate,
+            persist_and_park_plan_execution_repair_gate,
+        },
+        session::SessionJsonlStore,
+    };
+
+    let temp = tempfile::tempdir().expect("temp session root");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let failed_execution = OrchestratorResult {
+        decision: DecisionOutcome::Abandon,
+        execution_plan_spec: ExecutionPlanSpec {
+            intent_spec_id: "repair-intent".to_string(),
+            revision: 1,
+            parent_revision: None,
+            replan_reason: None,
+            tasks: Vec::new(),
+            max_parallel: 1,
+            checkpoints: Vec::new(),
+        },
+        plan_revision_specs: Vec::new(),
+        run_state: RunStateSnapshot::default(),
+        task_results: Vec::new(),
+        system_report: SystemReport {
+            integration: GateReport::empty(),
+            security: GateReport::empty(),
+            release: GateReport::empty(),
+            review_passed: false,
+            review_findings: Vec::new(),
+            artifacts_complete: true,
+            missing_artifacts: Vec::new(),
+            overall_passed: false,
+        },
+        intent_spec_id: "repair-intent".to_string(),
+        lifecycle_change_log: Vec::new(),
+        replan_count: 0,
+        persistence: None,
+    };
+    let first_automatic_repair = PlanExecutionRepairService.after_failure(
+        "repair-first-automatic-attempt",
+        Some(&failed_execution),
+        Some("orchestrator exhausted the execution plan"),
+        0,
+        1,
+    );
+    assert!(
+        matches!(
+            first_automatic_repair,
+            PlanExecutionRepairState::AutomaticRepair { evidence, .. }
+                if evidence.attempt == 1 && evidence.max_attempts == 1
+        ),
+        "entering AutomaticRepair must advance the runtime-owned evidence counter"
+    );
+    let repair = PlanExecutionRepairService.after_failure(
+        "repair-after-execute-failure",
+        Some(&failed_execution),
+        Some("orchestrator exhausted the execution plan"),
+        1,
+        1,
+    );
+    let PlanExecutionRepairState::AwaitingUser { interaction_id, .. } = &repair else {
+        panic!("exhausted abandoned execution must require a repair gate: {repair:?}");
+    };
+    assert_eq!(
+        repair.interaction_state(),
+        Some(InteractionState::AwaitingPlanRepair {
+            interaction_id: interaction_id.clone()
+        })
+    );
+
+    let boundary = || {
+        ToolBoundaryRuntime::new(
+            Uuid::new_v4(),
+            PrincipalContext {
+                principal_id: "repair-restart".to_string(),
+                role: PrincipalRole::Contributor,
+            },
+            ToolBoundaryPolicy::default_runtime(),
+            SecretRedactor::default_runtime(),
+            Arc::new(InMemoryAuditSink::default()),
+        )
+    };
+    let spawn_runtime = |boundary| {
+        AgentRuntimeWorker::spawn(
+            AgentRuntimeWorkerConfig::new(
+                Arc::new(libra::internal::ai::runtime::ExternalTurnTrackingExecutor),
+                boundary,
+            )
+            .with_durability(
+                RuntimeCommandDurability::new(SessionJsonlStore::new(session_root.clone())),
+                "repo",
+                "principal",
+            )
+            .with_durability_command_kind("tui_local_turn"),
+        )
+    };
+
+    // This is the production restart adapter sequence: persist the durable
+    // marker, then park the runtime interaction before projecting the repaired
+    // state back to the TUI/Code UI.
+    let first_gate_turn = "plan-repair-after-execute-failure";
+    let (first_handle, first_worker) = spawn_runtime(boundary());
+    persist_and_park_plan_execution_repair_gate(
+        &store,
+        &first_handle,
+        "session".to_string(),
+        &repair,
+        first_gate_turn.to_string(),
+    )
+    .await
+    .expect("failed execution registers the durable repair interaction");
+    assert!(matches!(
+        first_handle.snapshot("session").await.expect("pending snapshot").interaction,
+        InteractionState::AwaitingPlanRepair { ref interaction_id }
+            if interaction_id == "repair-after-execute-failure"
+    ));
+
+    // Simulate a process restart before the developer has answered.
+    first_worker.abort();
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("restart reloads repair marker");
+    let (recovered, _) =
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .expect("restart must retain unresolved repair marker");
+    assert_eq!(recovered, repair);
+
+    let (restored_handle, restored_worker) = spawn_runtime(boundary());
+    park_plan_execution_repair_gate(
+        &restored_handle,
+        "session".to_string(),
+        interaction_id,
+        first_gate_turn.to_string(),
+    )
+    .await
+    .expect("restart reattaches the durable repair interaction without a new turn");
+    assert!(matches!(
+        restored_handle
+            .snapshot("session")
+            .await
+            .expect("reattached repair snapshot")
+            .interaction,
+        InteractionState::AwaitingPlanRepair { ref interaction_id }
+            if interaction_id == "repair-after-execute-failure"
+    ));
+    restored_handle
+        .respond(
+            "session",
+            first_gate_turn,
+            InteractionResponse::new(interaction_id, "continue"),
+        )
+        .await
+        .expect("Continue settles the recovered runtime gate");
+
+    assert!(matches!(
+        PlanExecutionRepairService.respond(recovered, "continue", Some(2)),
+        PlanExecutionRepairState::AutomaticRepair {
+            route: ExecutionFailureRevision::PlanRevision,
+            ..
+        }
+    ));
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("Continue persists repair resolution");
+    assert!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .is_none(),
+        "Continue must clear every durable repair marker after restart"
+    );
+
+    restored_worker.abort();
+}
+
+/// W2-11 r13: Continue resolves its current marker before Phase 1 re-planning
+/// begins. If that re-plan fails, the adapter must open a fresh durable repair
+/// interaction so restart and Code UI still have an actionable gate.
+#[tokio::test]
+async fn plan_execution_repair_reopens_gate_when_phase1_replan_fails() {
+    use std::sync::Arc;
+
+    use libra::internal::ai::{
+        runtime::{
+            AgentRuntimeWorker, AgentRuntimeWorkerConfig, ExecutionFailureEvidence,
+            ExecutionFailureRevision, InMemoryAuditSink, InteractionResponse, InteractionState,
+            PlanExecutionRepairState, PrincipalContext, PrincipalRole, RuntimeCommandDurability,
+            SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime,
+            open_plan_execution_repair_from_workflow, park_plan_execution_repair_gate,
+            persist_and_park_plan_execution_repair_gate, persist_plan_execution_repair_gate,
+            redacted_failure_summary,
+        },
+        session::SessionJsonlStore,
+    };
+
+    let temp = tempfile::tempdir().expect("temp session root");
+    let session_root = temp.path().join("session");
+    let store = SessionJsonlStore::new(session_root.clone());
+    let boundary = ToolBoundaryRuntime::new(
+        Uuid::new_v4(),
+        PrincipalContext {
+            principal_id: "repair-replan-failure".to_string(),
+            role: PrincipalRole::Contributor,
+        },
+        ToolBoundaryPolicy::default_runtime(),
+        SecretRedactor::default_runtime(),
+        Arc::new(InMemoryAuditSink::default()),
+    );
+    let (handle, worker) = AgentRuntimeWorker::spawn(
+        AgentRuntimeWorkerConfig::new(
+            Arc::new(libra::internal::ai::runtime::ExternalTurnTrackingExecutor),
+            boundary,
+        )
+        .with_durability(
+            RuntimeCommandDurability::new(SessionJsonlStore::new(session_root)),
+            "repo",
+            "principal",
+        )
+        .with_durability_command_kind("tui_local_turn"),
+    );
+
+    let initial_repair = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-before-replan".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "execution verification failed".to_string(),
+            diagnostics: vec!["test failure".to_string()],
+            attempt: 1,
+            max_attempts: 2,
+        },
+    };
+    persist_and_park_plan_execution_repair_gate(
+        &store,
+        &handle,
+        "session".to_string(),
+        &initial_repair,
+        "repair-before-replan-turn".to_string(),
+    )
+    .await
+    .expect("initial repair gate is parked");
+    // Production writes this handoff before acknowledging Continue. A
+    // successfully replanned repair must retain it through execute setup and
+    // queue submission: a rejected repaired execution is still recoverable
+    // through Continue/Cancel after restart.
+    let continuation = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-continuation-after-ack".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: initial_repair.evidence().clone(),
+    };
+    persist_plan_execution_repair_gate(&store, &continuation, "repair-continuation-turn")
+        .expect("continuation handoff persists before Continue acknowledgement");
+    handle
+        .respond(
+            "session",
+            "repair-before-replan-turn",
+            InteractionResponse::new("repair-before-replan", "continue"),
+        )
+        .await
+        .expect("Continue resolves the initial repair gate");
+    // Simulate a successful replan followed by `start_execute_workflow`
+    // rejecting setup or queue submission. Neither pre-admission failure path
+    // records `InteractionResolved` for the continuation.
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("restart reloads continuation handoff");
+    assert_eq!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event)),
+        Some((continuation, "repair-continuation-turn".to_string())),
+        "failed repaired-execution admission must retain the repair continuation"
+    );
+    // The live adapter must immediately re-park the retained continuation
+    // rather than becoming Idle and waiting for a restart to recover it.
+    park_plan_execution_repair_gate(
+        &handle,
+        "session".to_string(),
+        "repair-continuation-after-ack",
+        "repair-continuation-turn".to_string(),
+    )
+    .await
+    .expect("rejected repaired execution re-parks its continuation gate");
+    assert!(matches!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("repaired execution rejection snapshot")
+            .interaction,
+        InteractionState::AwaitingPlanRepair { ref interaction_id }
+            if interaction_id == "repair-continuation-after-ack"
+    ));
+    handle
+        .respond(
+            "session",
+            "repair-continuation-turn",
+            InteractionResponse::new("repair-continuation-after-ack", "continue"),
+        )
+        .await
+        .expect("re-parked continuation remains actionable");
+    // Simulate Phase 1 rejecting the revised plan. Re-plan failures are
+    // supplemental runtime evidence, so they must be redacted and bounded
+    // before landing in the restart-recoverable marker.
+    let raw_replan_error = format!(
+        "provider rejected token: top-secret {}",
+        "revised plan detail ".repeat(40)
+    );
+    let redacted_replan_error = redacted_failure_summary(&raw_replan_error);
+    assert!(!redacted_replan_error.contains("top-secret"));
+    assert!(redacted_replan_error.chars().count() <= 513);
+    let reopened_repair = PlanExecutionRepairState::AwaitingUser {
+        interaction_id: "repair-after-replan-failure".to_string(),
+        route: ExecutionFailureRevision::PlanRevision,
+        evidence: ExecutionFailureEvidence {
+            output: "Phase 1 re-planning failed: invalid IntentSpec".to_string(),
+            diagnostics: vec![format!(
+                "Automatic plan repair re-planning failed: {redacted_replan_error}"
+            )],
+            attempt: 2,
+            max_attempts: 2,
+        },
+    };
+    persist_and_park_plan_execution_repair_gate(
+        &store,
+        &handle,
+        "session".to_string(),
+        &reopened_repair,
+        "repair-after-replan-failure-turn".to_string(),
+    )
+    .await
+    .expect("re-plan failure reopens a repair gate");
+    // The replacement must be durable before the pre-ack continuation is
+    // retired. Otherwise a crash could lose all actionable repair evidence;
+    // leaving it open afterward would make recovery select stale evidence.
+    store
+        .append_code_workflow_durable(
+            libra::internal::ai::session::CodeWorkflowEventKind::InteractionResolved {
+                interaction_id: "repair-continuation-after-ack".to_string(),
+                resolution: "repair continuation superseded by replan failure".to_string(),
+            },
+        )
+        .expect("retire continuation after replacement gate persists");
+
+    assert!(matches!(
+        handle
+            .snapshot("session")
+            .await
+            .expect("snapshot after re-plan failure")
+            .interaction,
+        InteractionState::AwaitingPlanRepair { ref interaction_id }
+            if interaction_id == "repair-after-replan-failure"
+    ));
+    let replay = store
+        .load_code_workflow_replay()
+        .expect("reload reopened repair marker");
+    assert_eq!(
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event)),
+        Some((
+            reopened_repair,
+            "repair-after-replan-failure-turn".to_string()
+        )),
+        "restart must select the replacement re-plan failure evidence, not the stale continuation"
+    );
+    let recovered =
+        open_plan_execution_repair_from_workflow(replay.events.iter().map(|event| &event.event))
+            .expect("reopen retains redacted re-plan evidence");
+    assert!(
+        recovered
+            .0
+            .evidence()
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("[REDACTED]") && diagnostic.contains('…')),
+        "restart recovery must receive bounded redacted re-plan evidence"
+    );
+
+    worker.abort();
+}
+
 /// W2-04: confirmed plan execution enters the serialized worker queue, and a
 /// mutating tool is refused when the shared hardening boundary denies it.
 #[tokio::test]

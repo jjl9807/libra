@@ -11,7 +11,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -97,8 +97,8 @@ use crate::{
             types::{
                 DecisionOutcome, ExecutionPlanSpec, GateReport, OrchestratorPhaseConfirmer,
                 OrchestratorResult, PersistedPlanReviewBundle, PhaseConfirmationDecision,
-                PhaseConfirmationPrompt, PolicyViolation, SystemReport, TaskKind, TaskNodeStatus,
-                TaskRuntimeEvent, TaskRuntimeNoteLevel, TaskRuntimePhase, TaskWorkspaceBackend,
+                PhaseConfirmationPrompt, SystemReport, TaskKind, TaskNodeStatus, TaskRuntimeEvent,
+                TaskRuntimeNoteLevel, TaskRuntimePhase, TaskWorkspaceBackend,
             },
         },
         projection::ProjectionRebuilder,
@@ -106,9 +106,13 @@ use crate::{
         runtime::{
             AgentEventKind, AgentEventStream, AgentRuntimeHandle, AgentRuntimeWorker,
             AgentRuntimeWorkerConfig, DeferredPlanExecutionExecutor, EventCursor,
-            InMemoryAuditSink, InteractionResponse, InteractionState, RuntimeCommandDurability,
-            RuntimeExecutionContext, RuntimeInteractionDelivery, RuntimeTurnExecution,
-            RuntimeWorkerError, ToolBoundaryRuntime, TurnRequest,
+            ExecutionFailureRevision, InMemoryAuditSink, InteractionResponse, InteractionState,
+            PlanExecutionRepairService, RuntimeCommandDurability, RuntimeExecutionContext,
+            RuntimeInteractionDelivery, RuntimeTurnExecution, RuntimeWorkerError,
+            ToolBoundaryRuntime, TurnRequest, open_plan_execution_repair_from_workflow,
+            park_plan_execution_repair_gate, persist_and_park_plan_execution_repair_gate,
+            persist_plan_execution_repair_gate_superseding,
+            persist_plan_execution_repair_gate_with_predecessor,
             phase0::{
                 ContextSnapshotItem, ContextSnapshotRequest, IntentReviewAckDelivery,
                 IntentReviewDecision, open_intent_review_from_workflow,
@@ -120,7 +124,9 @@ use crate::{
                 open_network_policy_from_workflow, open_plan_review_from_workflow,
                 open_review_gate_phase_turn_id, phase1_plan_tool_loop_config,
             },
-            runtime_worker_adapter_message, submit_confirmed_plan_execution,
+            redacted_failure_summary, runtime_worker_adapter_message,
+            speculative_plan_execution_repair_continuations_from_workflow,
+            submit_confirmed_plan_execution, submit_repaired_plan_execution,
         },
         sandbox::{
             ApprovalMemo, ExecApprovalRequest, FileHistoryRuntimeContext, NetworkAccess,
@@ -228,6 +234,20 @@ const DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS: u8 = 0;
 const MCP_WRITE_TIMEOUT: Duration = Duration::from_secs(8);
 const MCP_TURN_TRACKING_TIMEOUT: Duration = Duration::from_secs(3);
 const GRAPH_THREAD_ID_METADATA_KEYS: &[&str] = &["thread_id", "threadId", "canonical_thread_id"];
+
+/// Resolve a retryable post-admission repair continuation and clear it only
+/// after its durable `InteractionResolved` append succeeds.
+fn resolve_pending_plan_execution_repair_continuation(
+    pending_continuation: &mut Option<String>,
+    resolve: impl FnOnce(&str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let Some(interaction_id) = pending_continuation.clone() else {
+        return Ok(());
+    };
+    resolve(&interaction_id)?;
+    *pending_continuation = None;
+    Ok(())
+}
 
 fn session_graph_thread_id(session: &SessionState) -> Option<String> {
     GRAPH_THREAD_ID_METADATA_KEYS
@@ -359,6 +379,8 @@ struct PendingPostPlan {
     network_access: bool,
     automatic_repair_attempts: u8,
     automatic_repair_max_attempts: u8,
+    /// Durable repair handoff retained until repaired execution is admitted.
+    repair_continuation_interaction_id: Option<String>,
     selected: usize, // 0=Execute, 1=Modify, 2=Cancel
 }
 
@@ -390,6 +412,7 @@ enum RestoredPlanContextError {
 }
 
 /// Execution-plan revision state after the user chooses Modify on the plan review.
+#[derive(Clone, Debug)]
 struct PendingExecutionPlanRevision {
     spec_json: String,
     intent_id: Option<String>,
@@ -399,13 +422,9 @@ struct PendingExecutionPlanRevision {
     automatic_repair_max_attempts: u8,
     network_access: bool,
     failure_report: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecutionFailureRevision {
-    PlanRevision,
-    IntentSpecRevision,
-    ManualAction,
+    repair_state: Option<crate::internal::ai::runtime::PlanExecutionRepairState>,
+    /// Durable repair handoff retained until repaired execution is admitted.
+    repair_continuation_interaction_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -413,6 +432,17 @@ struct PendingAutoPlanRepairExecution {
     attempt: u8,
     max_attempts: u8,
     network_access: bool,
+    /// Durable handoff written before Continue settles the prior gate.
+    /// Resolve it only once repaired execution enters the runtime queue.
+    continuation_interaction_id: Option<String>,
+    pending_revision: PendingExecutionPlanRevision,
+}
+
+/// Repair metadata carried from Phase 1 planning through execution admission.
+struct PlanWorkflowRepairContext {
+    automatic_repair_attempts: u8,
+    automatic_repair_max_attempts: u8,
+    repair_continuation_interaction_id: Option<String>,
 }
 
 struct ExecuteWorkflowRequest {
@@ -426,6 +456,8 @@ struct ExecuteWorkflowRequest {
     network_access_override: Option<bool>,
     automatic_repair_attempts: u8,
     automatic_repair_max_attempts: u8,
+    /// Repair handoff to resolve only after execution queue admission.
+    repair_continuation_interaction_id: Option<String>,
 }
 
 /// IntentSpec review dialog state: stores the spec and user selection.
@@ -864,6 +896,8 @@ pub struct App<M: CompletionModel> {
     /// [`Self::interrupt_agent_task`]; never hard-aborts a started
     /// mutation dispatch (ADR-CODE-05).
     current_turn_cancellation: Option<CancellationToken>,
+    /// Active model-request sequence for cancellation usage attribution.
+    current_model_turn: Option<Arc<AtomicUsize>>,
     /// Shared with [`ToolLoopCancellation`] for the active turn. When
     /// set, [`Self::interrupt_agent_task`] must not
     /// [`JoinHandle::abort`] the background agent task.
@@ -912,6 +946,15 @@ pub struct App<M: CompletionModel> {
     pending_execution_plan_revision: Option<PendingExecutionPlanRevision>,
     /// Auto-execute the next generated plan as an execution-failure repair attempt.
     pending_auto_plan_repair_execution: Option<PendingAutoPlanRepairExecution>,
+    /// Durable repair handoff owned by an in-flight Phase 1 plan workflow.
+    ///
+    /// It must be re-parked if Phase 1 is cancelled before execution admission.
+    pending_plan_workflow_repair_continuation: Option<String>,
+    /// Repair continuation whose post-admission resolution append failed.
+    ///
+    /// The execution has already entered the runtime queue, so retain this
+    /// until its terminal path can durably retire the stale restart gate.
+    pending_admitted_plan_execution_repair_continuation: Option<String>,
     /// Display name of the active model.
     model_name: String,
     /// Provider identifier.
@@ -1112,6 +1155,7 @@ where
             agent_task: None,
             current_turn_abort_token: None,
             current_turn_cancellation: None,
+            current_model_turn: None,
             current_turn_mutation_started: None,
             scheduled_draw_task: None,
             welcome_message: app_config.welcome_message,
@@ -1135,6 +1179,8 @@ where
             pending_plan_revision: None,
             pending_execution_plan_revision: None,
             pending_auto_plan_repair_execution: None,
+            pending_plan_workflow_repair_continuation: None,
+            pending_admitted_plan_execution_repair_continuation: None,
             model_name: app_config.model_name,
             provider_name: app_config.provider_name,
             usage_snapshot,
@@ -1402,13 +1448,17 @@ where
     fn attach_turn_cancellation(&mut self, config: &mut ToolLoopConfig) {
         let token = CancellationToken::new();
         let mutation_started = Arc::new(AtomicBool::new(false));
+        let active_model_turn = Arc::new(AtomicUsize::new(0));
         self.current_turn_cancellation = Some(token.clone());
+        self.current_model_turn = Some(active_model_turn.clone());
         self.current_turn_mutation_started = Some(Arc::clone(&mutation_started));
         config.cancellation = Some(ToolLoopCancellation::new(token, mutation_started));
+        config.active_model_turn = Some(active_model_turn);
     }
 
     fn clear_turn_cancellation(&mut self) {
         self.current_turn_cancellation = None;
+        self.current_model_turn = None;
         self.current_turn_mutation_started = None;
     }
 
@@ -2028,6 +2078,123 @@ where
             .map(|_| ())
     }
 
+    /// Append the durable plan-execution repair marker before parking its
+    /// Continue/Cancel interaction. The marker is resolved by the runtime's
+    /// post-terminal `InteractionResolved` append.
+    fn append_plan_execution_repair_marker(
+        &self,
+        repair: &crate::internal::ai::runtime::PlanExecutionRepairState,
+        gate_turn_id: &str,
+        predecessor_interaction_id: Option<&str>,
+    ) -> std::io::Result<()> {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        persist_plan_execution_repair_gate_with_predecessor(
+            &store,
+            repair,
+            gate_turn_id,
+            predecessor_interaction_id,
+        )
+    }
+
+    /// Persist a replacement repair marker before retiring its predecessor.
+    /// Recovery follows this linkage if a crash splits those durable writes.
+    fn append_superseding_plan_execution_repair_marker(
+        &self,
+        repair: &crate::internal::ai::runtime::PlanExecutionRepairState,
+        gate_turn_id: &str,
+        predecessor_interaction_id: &str,
+    ) -> std::io::Result<()> {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        persist_plan_execution_repair_gate_superseding(
+            &store,
+            repair,
+            gate_turn_id,
+            predecessor_interaction_id,
+        )
+    }
+
+    /// Resolve a pre-ack repair continuation once repaired execution is admitted.
+    fn resolve_plan_execution_repair_continuation(
+        &self,
+        interaction_id: &str,
+    ) -> std::io::Result<()> {
+        self.resolve_plan_execution_repair_marker(interaction_id, "repaired execution admitted")
+    }
+
+    /// Flush a continuation whose immediate post-admission retirement failed.
+    ///
+    /// A worker-owned execution can continue after queue admission, but an
+    /// unresolved continuation would otherwise restore an obsolete repair gate
+    /// after restart. Terminal paths retry the append before settling Idle.
+    fn flush_admitted_plan_execution_repair_continuation(&mut self) -> std::io::Result<()> {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        resolve_pending_plan_execution_repair_continuation(
+            &mut self.pending_admitted_plan_execution_repair_continuation,
+            |interaction_id| {
+                store
+                    .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+                        interaction_id: interaction_id.to_string(),
+                        resolution: "repaired execution admitted".to_string(),
+                    })
+                    .map(|_| ())
+            },
+        )
+    }
+
+    /// Retry post-admission continuation cleanup after the worker has reached a
+    /// terminal state. The UI remains fenced if durable storage stays
+    /// unavailable, so restart can never reopen a completed repair silently.
+    async fn retry_admitted_plan_execution_repair_continuation_cleanup(
+        &mut self,
+    ) -> std::io::Result<()> {
+        const ATTEMPTS: u8 = 3;
+        let mut delay = Duration::from_millis(25);
+        for attempt in 1..=ATTEMPTS {
+            match self.flush_admitted_plan_execution_repair_continuation() {
+                Ok(()) => return Ok(()),
+                Err(error) if attempt == ATTEMPTS => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        attempt,
+                        "retrying repaired-execution continuation cleanup after terminalization"
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire the durable continuation when its regenerated plan is explicitly
+    /// cancelled before repaired execution reaches queue admission.
+    fn cancel_plan_execution_repair_continuation(
+        &self,
+        interaction_id: &str,
+    ) -> std::io::Result<()> {
+        self.resolve_plan_execution_repair_marker(
+            interaction_id,
+            "repaired execution plan cancelled",
+        )
+    }
+
+    /// Resolve a durable repair marker once a replacement gate makes the
+    /// predecessor obsolete.
+    fn resolve_plan_execution_repair_marker(
+        &self,
+        interaction_id: &str,
+        resolution: &str,
+    ) -> std::io::Result<()> {
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        store
+            .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+                interaction_id: interaction_id.to_string(),
+                resolution: resolution.to_string(),
+            })
+            .map(|_| ())
+    }
+
     /// Best-effort rollback of a network-policy marker that was written in
     /// advance but whose gate never opened (for example the Plan `Execute`
     /// delivery failed afterwards). Leaving the marker would re-open the
@@ -2136,6 +2303,33 @@ where
                 .await;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Park a worker-owned repair gate after plan execution exhausts its
+    /// automatic retries. The Code UI request uses the same id, so browser and
+    /// automation responses address the runtime interaction rather than a
+    /// UI-only pending state.
+    async fn park_plan_execution_repair_gate(
+        &mut self,
+        interaction_id: &str,
+        ui_turn_id: TurnId,
+        runtime_turn_id: String,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            return Err(RuntimeWorkerError::ExecutionFailed(
+                "Plan repair requires a local AgentRuntime to keep the session fenced until it is resolved."
+                    .to_string(),
+            ));
+        };
+        park_plan_execution_repair_gate(
+            &runtime,
+            self.session.id.clone(),
+            interaction_id,
+            runtime_turn_id.clone(),
+        )
+        .await?;
+        self.active_local_runtime_turn = Some((ui_turn_id, runtime_turn_id));
         Ok(())
     }
 
@@ -2579,6 +2773,7 @@ where
             network_access,
             automatic_repair_attempts: 0,
             automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            repair_continuation_interaction_id: None,
             selected: 0,
         });
         self.widget.bottom_pane.reset_post_plan_selection();
@@ -2626,6 +2821,292 @@ where
         }
         self.sync_mux_input_context();
         self.schedule_draw();
+    }
+
+    /// Re-park a durable continuation when its Phase 1 workflow aborts before
+    /// the repaired execution enters the runtime queue.
+    async fn repark_plan_workflow_repair_after_abort(&mut self) -> bool {
+        let continuation_interaction_id = self
+            .pending_plan_workflow_repair_continuation
+            .take()
+            .or_else(|| {
+                self.pending_auto_plan_repair_execution
+                    .as_ref()
+                    .and_then(|pending| pending.continuation_interaction_id.clone())
+            });
+        let Some(continuation_interaction_id) = continuation_interaction_id else {
+            return false;
+        };
+
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        let replay = match store.load_code_workflow_replay() {
+            Ok(replay) => replay,
+            Err(error) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "Phase 1 was cancelled, but its plan-repair continuation could not be loaded ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return true;
+            }
+        };
+        let recovered_continuation = open_plan_execution_repair_from_workflow(
+            replay.events.iter().map(|event| &event.event),
+        )
+        .is_some_and(|(state, _)| {
+            matches!(
+                state,
+                crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                    interaction_id,
+                    ..
+                } if interaction_id == continuation_interaction_id
+            )
+        });
+        if !recovered_continuation {
+            self.fence_for_unrestorable_review_gate(format!(
+                "Phase 1 was cancelled, but its plan-repair continuation ({continuation_interaction_id}) is no longer recoverable. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return true;
+        }
+
+        // Phase 1 has terminalized, so its runtime command cannot own the
+        // continuation gate. The durable marker becomes the source of truth
+        // again and is restored below as a fresh AwaitingPlanRepair command.
+        self.pending_auto_plan_repair_execution = None;
+        self.active_local_runtime_turn = None;
+        self.restore_pending_plan_execution_repair_gate().await;
+        tracing::debug!(
+            %continuation_interaction_id,
+            "re-parked plan repair continuation after Phase 1 abort"
+        );
+        true
+    }
+
+    /// Rehydrate an unresolved plan-execution repair gate after restart. Unlike
+    /// the live runtime snapshot, the workflow marker survives worker/session
+    /// recreation, so plan submission remains fenced until Continue or Cancel
+    /// is durably resolved.
+    /// Returns whether startup may continue to a pending execution handoff.
+    /// An unresolved repair must keep that handoff blocked until the developer
+    /// explicitly continues or cancels it.
+    pub async fn restore_pending_plan_execution_repair_gate(&mut self) -> bool {
+        if self.pending_execution_plan_revision.is_some() {
+            return false;
+        }
+        if self.pending_post_plan.is_some()
+            || self.pending_network_policy.is_some()
+            || self.pending_intent_review.is_some()
+        {
+            return true;
+        }
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        let replay = match store.load_code_workflow_replay() {
+            Ok(replay) => replay,
+            Err(error) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "The plan-execution repair record could not be loaded ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return false;
+            }
+        };
+        let Some((repair_state, stored_turn_id)) = open_plan_execution_repair_from_workflow(
+            replay.events.iter().map(|event| &event.event),
+        ) else {
+            return true;
+        };
+        let speculative_continuations =
+            speculative_plan_execution_repair_continuations_from_workflow(
+                replay.events.iter().map(|event| &event.event),
+            );
+        for continuation_interaction_id in speculative_continuations {
+            if let Err(error) = self.resolve_plan_execution_repair_marker(
+                &continuation_interaction_id,
+                "repair continuation retired while restoring its unresolved predecessor",
+            ) {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved plan-execution repair was found, but its speculative continuation ({continuation_interaction_id}) could not be retired ({error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return false;
+            }
+        }
+        let crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+            interaction_id,
+            evidence,
+            ..
+        } = &repair_state
+        else {
+            return false;
+        };
+        let context = match self.rebuild_restored_plan_context("").await {
+            Ok(context) => context,
+            Err(_) => {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "An unresolved plan-execution repair ({interaction_id}) was found, but its plan context could not be restored. Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return false;
+            }
+        };
+        if self.local_turn_runtime.is_none() || self.active_local_runtime_turn.is_some() {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unresolved plan-execution repair ({interaction_id}) was found, but the runtime gate cannot be re-established. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return false;
+        }
+
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unresolved plan-execution repair ({interaction_id}) was found, but the runtime gate cannot be re-established. Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return false;
+        };
+        let store = SessionJsonlStore::new(self.session_store.session_root(&self.session.id));
+        // Reattach the original non-mutating gate command whenever possible.
+        // Persisting a fresh marker on every restart would orphan the old
+        // Pending command in the durable runtime journal.
+        let repair_gate_turn_id = if stored_turn_id.is_empty() {
+            let replacement_turn_id = format!("plan-repair-restore-{}", uuid::Uuid::new_v4());
+            match persist_and_park_plan_execution_repair_gate(
+                &store,
+                &runtime,
+                self.session.id.clone(),
+                &repair_state,
+                replacement_turn_id.clone(),
+            )
+            .await
+            {
+                Ok(()) => replacement_turn_id,
+                Err(error) => {
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "An unresolved plan-execution repair could not be restored ({}). Mutation reconciliation is required before another turn can run.",
+                        runtime_worker_adapter_message(error)
+                    ))
+                    .await;
+                    return false;
+                }
+            }
+        } else {
+            match park_plan_execution_repair_gate(
+                &runtime,
+                self.session.id.clone(),
+                interaction_id,
+                stored_turn_id.clone(),
+            )
+            .await
+            {
+                Ok(()) => stored_turn_id,
+                // A terminal command identity cannot be re-opened. Record and
+                // park a replacement so the old command remains terminal and
+                // recovery has exactly one actionable repair marker.
+                Err(RuntimeWorkerError::IdempotentCommand { .. }) => {
+                    let replacement_turn_id =
+                        format!("plan-repair-restore-{}", uuid::Uuid::new_v4());
+                    match persist_and_park_plan_execution_repair_gate(
+                        &store,
+                        &runtime,
+                        self.session.id.clone(),
+                        &repair_state,
+                        replacement_turn_id.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => replacement_turn_id,
+                        Err(error) => {
+                            self.fence_for_unrestorable_review_gate(format!(
+                                "An unresolved plan-execution repair could not record a replacement runtime gate ({}). Mutation reconciliation is required before another turn can run.",
+                                runtime_worker_adapter_message(error)
+                            ))
+                            .await;
+                            return false;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "An unresolved plan-execution repair could not be restored ({}). Mutation reconciliation is required before another turn can run.",
+                        runtime_worker_adapter_message(error)
+                    ))
+                    .await;
+                    return false;
+                }
+            }
+        };
+        self.active_local_runtime_turn = Some((0, repair_gate_turn_id));
+        if let Some(runtime) = self.local_turn_runtime.clone()
+            && let Err(error) = runtime
+                .set_plan_execution_repair(self.session.id.clone(), Some(repair_state.clone()))
+                .await
+        {
+            self.fence_for_unrestorable_review_gate(format!(
+                "An unresolved plan-execution repair could not restore its runtime state ({error}). Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return false;
+        }
+
+        self.pending_execution_plan_revision = Some(PendingExecutionPlanRevision {
+            spec_json: context.spec_json,
+            intent_id: context.intent_id,
+            current_plan: context.plan_draft,
+            warnings: Vec::new(),
+            automatic_repair_attempts: evidence.attempt,
+            automatic_repair_max_attempts: evidence.max_attempts,
+            network_access: context.network_access,
+            failure_report: Some(plan_execution_repair_failure_report(&repair_state)),
+            repair_state: Some(repair_state.clone()),
+            repair_continuation_interaction_id: None,
+        });
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            code_ui_session
+                .set_plan_execution_repair(Some(repair_state.clone()))
+                .await;
+            code_ui_session
+                .upsert_interaction(CodeUiInteractionRequest {
+                    id: interaction_id.clone(),
+                    kind: CodeUiInteractionKind::PlanExecutionRepair,
+                    title: Some("Plan repair required".to_string()),
+                    description: Some(
+                        "Automatic repair attempts are exhausted. Continue only with a higher retry limit, provide manual plan revisions, or cancel this repair."
+                            .to_string(),
+                    ),
+                    prompt: Some(evidence.output.clone()),
+                    options: vec![
+                        CodeUiInteractionOption {
+                            id: "continue".to_string(),
+                            label: "Continue repair".to_string(),
+                            description: Some(
+                                "Raise maxAttempts, revise the plan, and attempt execution again."
+                                    .to_string(),
+                            ),
+                        },
+                        CodeUiInteractionOption {
+                            id: "cancel".to_string(),
+                            label: "Cancel repair".to_string(),
+                            description: Some("Stop the repair loop without retrying.".to_string()),
+                        },
+                    ],
+                    status: CodeUiInteractionStatus::Pending,
+                    metadata: serde_json::json!({
+                        "attempt": evidence.attempt,
+                        "maxAttempts": evidence.max_attempts,
+                        "restored": true,
+                    }),
+                    requested_at: Utc::now(),
+                    resolved_at: None,
+                })
+                .await;
+            code_ui_session
+                .set_status(CodeUiSessionStatus::AwaitingInteraction)
+                .await;
+        }
+        self.widget.bottom_pane.set_status(AgentStatus::Idle);
+        self.sync_mux_input_context();
+        self.schedule_draw();
+        false
     }
 
     /// Rebuild the durable Phase 1 review context (IntentSpec snapshot,
@@ -2906,6 +3387,7 @@ where
             network_access: default_allow,
             automatic_repair_attempts: 0,
             automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            repair_continuation_interaction_id: None,
             selected: 0,
         });
         self.schedule_draw();
@@ -3104,6 +3586,7 @@ where
             network_access,
             automatic_repair_attempts: 0,
             automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            repair_continuation_interaction_id: None,
             selected: 0,
         };
         let request = Self::execute_request_from_post_plan(pending, network_access);
@@ -3587,7 +4070,10 @@ where
     }
 
     async fn submit_message_from_code_ui(&mut self, text: String) -> Result<(), TuiControlError> {
-        if !self.can_accept_code_ui_submit() {
+        // A repair at the hard retry cap intentionally keeps the runtime gate
+        // open. Its manual revision guidance must still reach the established
+        // gated revision flow; all other busy states continue to reject input.
+        if self.pending_execution_plan_revision.is_none() && !self.can_accept_code_ui_submit() {
             return Err(TuiControlError::Busy);
         }
         self.submit_message_from_source_for_control(text).await
@@ -3618,7 +4104,7 @@ where
             if let PendingPlanRevisionCommand::ContinueAutoRepair { max_attempts } =
                 parse_pending_plan_revision_command(&text)
             {
-                self.continue_automatic_execution_plan_repair(pending, max_attempts)
+                self.continue_automatic_execution_plan_repair(pending, max_attempts, false, None)
                     .await;
                 return Ok(());
             }
@@ -3900,6 +4386,153 @@ where
         }
 
         if self
+            .pending_execution_plan_revision
+            .as_ref()
+            .and_then(|pending| pending.repair_state.as_ref())
+            .is_some_and(|state| {
+                matches!(
+                    state,
+                    crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                        interaction_id: pending_id,
+                        ..
+                    } if pending_id == interaction_id
+                )
+            })
+        {
+            let selected =
+                selection_from_response(&["continue", "cancel"], &response, Some(0), Some(1))
+                    .ok_or(TuiControlError::UnsupportedInteractionKind)?;
+            let response_id = if selected == 0 { "continue" } else { "cancel" };
+            let requested_max_attempts = plan_execution_repair_requested_max_attempts(&response);
+            let mut continuation_interaction_id = None;
+            if selected == 0 {
+                let next_repair_state = self
+                    .pending_execution_plan_revision
+                    .as_ref()
+                    .and_then(|pending| pending.repair_state.clone())
+                    .map(|repair_state| {
+                        PlanExecutionRepairService.respond(
+                            repair_state,
+                            "continue",
+                            requested_max_attempts,
+                        )
+                    });
+                let Some(crate::internal::ai::runtime::PlanExecutionRepairState::AutomaticRepair {
+                    route,
+                    evidence,
+                }) = next_repair_state
+                else {
+                    // Do not resolve the worker-owned gate: the retry cap means
+                    // Continue cannot start another automatic repair, so Cancel
+                    // must remain actionable in both TUI and Code UI.
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                        "Plan repair has reached its automatic retry limit. Continue is unavailable; cancel the repair or provide manual revision guidance."
+                            .to_string(),
+                    )));
+                    self.sync_mux_input_context();
+                    self.schedule_draw();
+                    return Err(TuiControlError::PlanRepairRetryLimitReached);
+                };
+                // Record the next actionable repair gate before the runtime
+                // durably resolves this one. A process failure after the ack
+                // but before Phase 1 starts can then restore Continue/Cancel.
+                let Some(crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                    interaction_id: predecessor_interaction_id,
+                    ..
+                }) = self
+                    .pending_execution_plan_revision
+                    .as_ref()
+                    .and_then(|pending| pending.repair_state.clone())
+                else {
+                    return Err(TuiControlError::InteractionNotActive);
+                };
+                let continuation_id =
+                    format!("tui-plan-repair-continuation-{}", uuid::Uuid::new_v4());
+                let continuation =
+                    crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                        interaction_id: continuation_id.clone(),
+                        route,
+                        evidence,
+                    };
+                let continuation_turn_id =
+                    format!("plan-repair-continuation-{}", uuid::Uuid::new_v4());
+                self.append_plan_execution_repair_marker(
+                    &continuation,
+                    &continuation_turn_id,
+                    Some(&predecessor_interaction_id),
+                )
+                .map_err(|error| {
+                    TuiControlError::Internal(format!(
+                        "failed to persist plan repair continuation before acknowledgement: {error}"
+                    ))
+                })?;
+                continuation_interaction_id = Some(continuation_id);
+            }
+            let Some(runtime) = self.local_turn_runtime.clone() else {
+                return Err(TuiControlError::InteractionNotActive);
+            };
+            let Some((_, runtime_turn_id)) = self.active_local_runtime_turn.clone() else {
+                return Err(TuiControlError::InteractionNotActive);
+            };
+            runtime
+                .respond(
+                    self.session.id.clone(),
+                    runtime_turn_id,
+                    InteractionResponse::new(interaction_id, response_id),
+                )
+                .await
+                .map_err(|error| {
+                    TuiControlError::Internal(runtime_worker_adapter_message(error))
+                })?;
+            self.active_local_runtime_turn = None;
+
+            if selected == 0 {
+                let pending = self
+                    .pending_execution_plan_revision
+                    .take()
+                    .ok_or(TuiControlError::InteractionNotActive)?;
+                if let Some(code_ui_session) = self.code_ui_session.clone() {
+                    code_ui_session.resolve_interaction(interaction_id).await;
+                    code_ui_session
+                        .set_status(CodeUiSessionStatus::Thinking)
+                        .await;
+                }
+                self.continue_automatic_execution_plan_repair(
+                    pending,
+                    requested_max_attempts,
+                    true,
+                    continuation_interaction_id,
+                )
+                .await;
+            } else {
+                let pending = self
+                    .pending_execution_plan_revision
+                    .take()
+                    .ok_or(TuiControlError::InteractionNotActive)?;
+                let Some(repair_state) = pending.repair_state else {
+                    return Err(TuiControlError::InteractionNotActive);
+                };
+                let cancelled = PlanExecutionRepairService.respond(repair_state, "cancel", None);
+                if let Some(runtime) = self.local_turn_runtime.clone() {
+                    let _ = runtime
+                        .set_plan_execution_repair(self.session.id.clone(), Some(cancelled.clone()))
+                        .await;
+                }
+                if let Some(code_ui_session) = self.code_ui_session.clone() {
+                    code_ui_session.resolve_interaction(interaction_id).await;
+                    code_ui_session
+                        .set_plan_execution_repair(Some(cancelled))
+                        .await;
+                    code_ui_session.set_status(CodeUiSessionStatus::Idle).await;
+                }
+                self.widget.bottom_pane.set_status(AgentStatus::Idle);
+                self.sync_mux_input_context();
+                self.schedule_draw();
+            }
+            return Ok(());
+        }
+
+        if self
             .pending_intent_review
             .as_ref()
             .is_some_and(|pending| pending.interaction_id == interaction_id)
@@ -4014,7 +4647,20 @@ where
     }
 
     async fn cancel_current_turn(&mut self, source: CancelSource) -> Result<(), TuiControlError> {
-        if !self.has_local_active_turn() && !self.has_code_ui_active_turn().await {
+        let has_pending_plan_execution_repair = self
+            .pending_execution_plan_revision
+            .as_ref()
+            .and_then(|pending| pending.repair_state.as_ref())
+            .is_some_and(|repair_state| {
+                matches!(
+                    repair_state,
+                    crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser { .. }
+                )
+            });
+        if !has_pending_plan_execution_repair
+            && !self.has_local_active_turn()
+            && !self.has_code_ui_active_turn().await
+        {
             return Err(TuiControlError::Busy);
         }
 
@@ -4103,6 +4749,9 @@ where
             }
             self.set_idle_and_draw();
         }
+        if self.cancel_pending_plan_execution_repair_gate().await? {
+            return Ok(());
+        }
         let local_runtime_turn_id = self
             .active_local_runtime_turn
             .as_ref()
@@ -4180,25 +4829,37 @@ where
         self.clear_pending_code_ui_dialogs().await;
         // OC-Phase 5 P5.4 usage-row backfill (v0.17.797): when a
         // turn is cancelled, the tool_loop's `record_summary` /
-        // `record_failure` path never fires (the future tree is
+        // `record_failure` path may never fire (the future tree is
         // dropped). Record the cancellation as a failure row so
         // the `agent_usage_stats` audit reflects the abandoned
         // turn — error_kind carries the CancelSource so an
         // operator can distinguish Esc / SlashQuit / Automation /
-        // Budget abandons in the rollup.
+        // Budget abandons in the rollup. Runtime cancellations share the
+        // active model turn's event ID, so the database records either the
+        // in-flight request's terminal outcome or this fallback, never both.
         if !mutation_in_progress
             && let (Some(recorder), Some(context)) = (
                 self.config.usage_recorder.as_ref(),
                 self.config.usage_context.as_ref(),
             )
         {
+            let active_model_turn = self
+                .current_model_turn
+                .as_ref()
+                .map(|turn| turn.load(Ordering::Acquire))
+                .filter(|turn| *turn > 0)
+                .unwrap_or(1);
+            let context = local_runtime_turn_id.as_deref().map_or_else(
+                || context.clone(),
+                |turn_id| context.for_runtime_turn_cancellation(turn_id, active_model_turn),
+            );
             let error_kind = match source {
                 CancelSource::Esc => "cancelled_esc",
                 CancelSource::SlashQuit => "cancelled_quit",
                 CancelSource::Automation => "cancelled_automation",
                 CancelSource::Budget => "cancelled_budget",
             };
-            if let Err(err) = recorder.record_failure(context, error_kind, None).await {
+            if let Err(err) = recorder.record_failure(&context, error_kind, None).await {
                 tracing::warn!(
                     %err,
                     error_kind,
@@ -4252,6 +4913,13 @@ where
                 self.schedule_draw();
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     code_ui_session.cancel_active_turn("Interrupted.").await;
+                }
+                // A Phase 1 repair continuation remains durable until its
+                // repaired execution is admitted. Re-open it after a cancelled
+                // drafting turn so this live session cannot accept new work
+                // while restart recovery would still require Continue/Cancel.
+                if self.repark_plan_workflow_repair_after_abort().await {
+                    return Ok(());
                 }
             }
         } else {
@@ -4843,6 +5511,7 @@ where
                 approved: None,
                 apply_to_future: None,
                 selected_option: None,
+                max_attempts: None,
                 note: None,
                 answers: pending
                     .answers
@@ -5456,6 +6125,7 @@ where
                         approved: Some(false),
                         apply_to_future: None,
                         selected_option: None,
+                        max_attempts: None,
                         note: None,
                         answers: HashMap::new(),
                     },
@@ -5683,6 +6353,7 @@ where
                             ),
                         );
                     }
+                    config.active_model_turn = self.current_model_turn.clone();
                     if let Some(abort) = self.current_turn_abort_token.clone()
                         && let Some(rt) = config.subagent_runtime.clone()
                     {
@@ -5748,6 +6419,12 @@ where
                         }
                         self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
                     }
+                }
+                if let Some((active_ui_turn, runtime_turn_id)) =
+                    self.active_local_runtime_turn.as_ref()
+                    && *active_ui_turn == turn_id
+                {
+                    bind_usage_context_to_runtime_turn(&mut config, runtime_turn_id);
                 }
 
                 let browser_user_entry = CodeUiTranscriptEntry {
@@ -6492,7 +7169,6 @@ where
                                 Err(RuntimeWorkerError::ExecutionFailed(message.clone())),
                             )
                             .await;
-                        self.pending_auto_plan_repair_execution = None;
                         if let Err(error @ RuntimeWorkerError::ReconciliationRequired { .. }) =
                             finalization
                         {
@@ -6517,6 +7193,21 @@ where
                         self.finish_turn_state();
 
                         self.complete_streaming_assistant_cell(format!("Error: {}", message));
+                        // Manual repair guidance settles the original gate
+                        // before Phase 1 starts. If that drafting turn fails,
+                        // restore its continuation instead of publishing Idle
+                        // with a latent durable marker.
+                        if self.pending_auto_plan_repair_execution.is_none()
+                            && self.repark_plan_workflow_repair_after_abort().await
+                        {
+                            return Ok(());
+                        }
+                        if self
+                            .reopen_plan_execution_repair_after_replan_failure(&message)
+                            .await
+                        {
+                            return Ok(());
+                        }
                         if let Some(code_ui_session) = self.code_ui_session.clone() {
                             code_ui_session
                                 .upsert_transcript_entry(CodeUiTranscriptEntry {
@@ -6631,7 +7322,11 @@ where
                 warnings,
                 automatic_repair_attempts,
                 automatic_repair_max_attempts,
+                repair_continuation_interaction_id,
             } => {
+                // The continuation is now carried by the completed plan's
+                // repair context instead of the in-flight Phase 1 task.
+                self.pending_plan_workflow_repair_continuation = None;
                 // Interaction id shared by the Code UI `post_plan_choice`
                 // request and the runtime-owned `AwaitingPlanReview` gate.
                 let interaction_id = plan_id.clone().unwrap_or_else(|| format!("plan-{turn_id}"));
@@ -6824,6 +7519,7 @@ where
                         network_access_override: Some(auto_repair.network_access),
                         automatic_repair_attempts: auto_repair.attempt,
                         automatic_repair_max_attempts: auto_repair.max_attempts,
+                        repair_continuation_interaction_id: auto_repair.continuation_interaction_id,
                     })
                     .await;
                     return Ok(());
@@ -6892,6 +7588,7 @@ where
                     network_access,
                     automatic_repair_attempts,
                     automatic_repair_max_attempts,
+                    repair_continuation_interaction_id,
                     selected: 0,
                 });
                 self.widget.bottom_pane.reset_post_plan_selection();
@@ -7545,6 +8242,20 @@ where
                 {
                     return Ok(());
                 }
+                if let Err(error) = self
+                    .retry_admitted_plan_execution_repair_continuation_cleanup()
+                    .await
+                {
+                    self.active_local_runtime_turn = None;
+                    self.finish_turn_state();
+                    self.widget.clear_task_mux();
+                    self.sync_mux_input_context();
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "Plan execution terminalized, but its repaired-execution crash handoff could not be cleared ({error}). Mutation reconciliation is required before another turn can run."
+                    ))
+                    .await;
+                    return Ok(());
+                }
                 let _ = self.clear_pending_plan_execution_handoff();
                 self.active_local_runtime_turn = None;
                 self.finish_turn_state();
@@ -7577,6 +8288,79 @@ where
                 {
                     return Ok(());
                 }
+                // An admitted repaired execution may have failed its immediate
+                // continuation resolution append. Retry before recording any
+                // successor repair state or publishing Idle, so restart cannot
+                // restore the obsolete pre-admission gate.
+                if let Err(error) = self
+                    .retry_admitted_plan_execution_repair_continuation_cleanup()
+                    .await
+                {
+                    self.active_local_runtime_turn = None;
+                    self.finish_turn_state();
+                    self.widget.clear_task_mux();
+                    self.sync_mux_input_context();
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "Plan execution finished, but its repaired-execution crash handoff could not be cleared ({error}). Mutation reconciliation is required before another turn can run."
+                    ))
+                    .await;
+                    return Ok(());
+                }
+                let repair_required =
+                    !cancelled && execution_requires_plan_repair(result.as_deref());
+                let mut repair_plan = result
+                    .as_deref()
+                    .map(|result| provider_plan_draft_from_plan(&result.execution_plan_spec))
+                    .unwrap_or_else(|| plan_draft.clone());
+                if repair_plan.steps.is_empty() {
+                    repair_plan = plan_draft.clone();
+                }
+                let failure_report = repair_required
+                    .then(|| execution_failure_report(result.as_deref(), Some(text.as_str())));
+                let runtime_repair = repair_required.then(|| {
+                    PlanExecutionRepairService.after_failure(
+                        format!("tui-plan-repair-{turn_id}"),
+                        result.as_deref(),
+                        Some(text.as_str()),
+                        automatic_repair_attempts,
+                        automatic_repair_max_attempts,
+                    )
+                });
+                let runtime_repair_attempts = runtime_repair
+                    .as_ref()
+                    .map_or(automatic_repair_attempts, |state| state.evidence().attempt);
+                let runtime_repair_max_attempts = runtime_repair
+                    .as_ref()
+                    .map_or(automatic_repair_max_attempts, |state| {
+                        state.evidence().max_attempts
+                    });
+                // Persist the repair gate before clearing the execution handoff.
+                // Otherwise a crash after the clear could admit new work without
+                // restoring the mandatory Continue/Cancel decision.
+                let repair_gate_turn_id = if let Some(
+                    state @ crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                        ..
+                    },
+                ) = runtime_repair.as_ref()
+                {
+                    let repair_gate_turn_id = format!("plan-repair-{}", uuid::Uuid::new_v4());
+                    if let Err(error) =
+                        self.append_plan_execution_repair_marker(state, &repair_gate_turn_id, None)
+                    {
+                        self.active_local_runtime_turn = None;
+                        self.finish_turn_state();
+                        self.widget.clear_task_mux();
+                        self.sync_mux_input_context();
+                        self.fence_for_unrestorable_review_gate(format!(
+                            "Plan execution failed, but its repair decision could not be persisted ({error}). Mutation reconciliation is required before another turn can run."
+                        ))
+                        .await;
+                        return Ok(());
+                    }
+                    Some(repair_gate_turn_id)
+                } else {
+                    None
+                };
                 // Retry durable handoff clear after the worker has terminalized
                 // (Complete is only emitted post-terminalization for plan-exec).
                 if let Err(error) = self.clear_pending_plan_execution_handoff() {
@@ -7618,33 +8402,51 @@ where
                     self.set_idle_and_draw();
                     return Ok(());
                 }
-                let repair_required = execution_requires_plan_repair(result.as_deref());
-                let mut repair_plan = result
-                    .as_deref()
-                    .map(|result| provider_plan_draft_from_plan(&result.execution_plan_spec))
-                    .unwrap_or_else(|| plan_draft.clone());
-                if repair_plan.steps.is_empty() {
-                    repair_plan = plan_draft;
+                // The runtime is the authority for repair evidence and route;
+                // adapters only project the already-classified state.
+                if let Some(runtime) = self.local_turn_runtime.clone()
+                    && let Err(error) = runtime
+                        .set_plan_execution_repair(self.session.id.clone(), runtime_repair.clone())
+                        .await
+                {
+                    tracing::warn!(
+                        %error,
+                        "failed to publish plan-execution repair state to runtime snapshot"
+                    );
                 }
-                let failure_report = repair_required
-                    .then(|| execution_failure_report(result.as_deref(), Some(text.as_str())));
-                let repair_route = repair_required.then(|| {
-                    classify_execution_failure_revision(result.as_deref(), Some(text.as_str()))
-                });
-                let can_auto_repair = repair_route.is_some_and(|route| {
-                    should_auto_repair_execution_failure(
+                let repair_route = runtime_repair.as_ref().and_then(|state| match state {
+                    crate::internal::ai::runtime::PlanExecutionRepairState::AutomaticRepair {
                         route,
-                        automatic_repair_attempts,
-                        automatic_repair_max_attempts,
-                    )
+                        ..
+                    }
+                    | crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                        route,
+                        ..
+                    } => Some(*route),
+                    crate::internal::ai::runtime::PlanExecutionRepairState::IntentSpecRevision {
+                        ..
+                    } => Some(ExecutionFailureRevision::IntentSpecRevision),
+                    crate::internal::ai::runtime::PlanExecutionRepairState::ManualAction { .. } => {
+                        Some(ExecutionFailureRevision::ManualAction)
+                    }
+                    crate::internal::ai::runtime::PlanExecutionRepairState::Cancelled { .. } => None,
                 });
+                let can_auto_repair =
+                    runtime_repair.as_ref().is_some_and(|state| {
+                        matches!(
+                        state,
+                        crate::internal::ai::runtime::PlanExecutionRepairState::AutomaticRepair {
+                            ..
+                        }
+                    )
+                    });
                 let repair_message = repair_route.map(|route| {
                     repair_message_for_execution_failure(
                         route,
                         failure_report.as_deref().unwrap_or_default(),
                         can_auto_repair,
-                        automatic_repair_attempts,
-                        automatic_repair_max_attempts,
+                        runtime_repair_attempts,
+                        runtime_repair_max_attempts,
                     )
                 });
                 if let Some(result) = result {
@@ -7654,6 +8456,39 @@ where
                     ));
                 } else {
                     self.complete_streaming_assistant_cell(text);
+                }
+                if let Some(
+                    crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                        interaction_id,
+                        ..
+                    },
+                ) = runtime_repair.as_ref()
+                {
+                    let Some(repair_gate_turn_id) = repair_gate_turn_id.clone() else {
+                        self.report_local_runtime_finalization_fence(
+                            RuntimeWorkerError::DurabilityFailure(
+                                "plan-execution repair marker was not allocated".to_string(),
+                            ),
+                            "Plan execution failed, but its repair decision could not be persisted",
+                        )
+                        .await;
+                        return Ok(());
+                    };
+                    if let Err(error) = self
+                        .park_plan_execution_repair_gate(
+                            interaction_id,
+                            turn_id,
+                            repair_gate_turn_id,
+                        )
+                        .await
+                    {
+                        self.report_local_runtime_finalization_fence(
+                            error,
+                            "Plan execution failed, but the repair interaction could not be registered",
+                        )
+                        .await;
+                        return Ok(());
+                    }
                 }
                 if let Some(code_ui_session) = self.code_ui_session.clone() {
                     code_ui_session
@@ -7675,7 +8510,58 @@ where
                             updated_at: Utc::now(),
                         })
                         .await;
-                    code_ui_session.set_status(CodeUiSessionStatus::Idle).await;
+                    code_ui_session
+                        .set_plan_execution_repair(runtime_repair.clone())
+                        .await;
+                    if let Some(
+                        state @ crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                            interaction_id, ..
+                        },
+                    ) = runtime_repair.as_ref()
+                    {
+                        code_ui_session
+                            .upsert_interaction(CodeUiInteractionRequest {
+                                id: interaction_id.clone(),
+                                kind: CodeUiInteractionKind::PlanExecutionRepair,
+                                title: Some("Plan repair required".to_string()),
+                                description: Some(
+                                    "Automatic repair attempts are exhausted. Continue only with a higher retry limit, provide manual plan revisions, or cancel this repair."
+                                        .to_string(),
+                                ),
+                                prompt: Some(state.evidence().output.clone()),
+                                options: vec![
+                                    CodeUiInteractionOption {
+                                        id: "continue".to_string(),
+                                        label: "Continue repair".to_string(),
+                                        description: Some(
+                                            "Raise maxAttempts, revise the plan, and attempt execution again."
+                                                .to_string(),
+                                        ),
+                                    },
+                                    CodeUiInteractionOption {
+                                        id: "cancel".to_string(),
+                                        label: "Cancel repair".to_string(),
+                                        description: Some(
+                                            "Stop the repair loop without retrying."
+                                                .to_string(),
+                                        ),
+                                    },
+                                ],
+                                status: CodeUiInteractionStatus::Pending,
+                                metadata: serde_json::json!({
+                                    "attempt": state.evidence().attempt,
+                                    "maxAttempts": state.evidence().max_attempts,
+                                }),
+                                requested_at: Utc::now(),
+                                resolved_at: None,
+                            })
+                            .await;
+                        code_ui_session
+                            .set_status(CodeUiSessionStatus::AwaitingInteraction)
+                            .await;
+                    } else {
+                        code_ui_session.set_status(CodeUiSessionStatus::Idle).await;
+                    }
                 }
                 if let Some(message) = repair_message {
                     self.widget
@@ -7689,23 +8575,25 @@ where
                                 intent_id,
                                 current_plan: repair_plan,
                                 warnings,
-                                automatic_repair_attempts,
-                                automatic_repair_max_attempts,
+                                automatic_repair_attempts: runtime_repair_attempts,
+                                automatic_repair_max_attempts: runtime_repair_max_attempts,
                                 network_access,
                                 failure_report: failure_report.clone(),
+                                repair_state: runtime_repair.clone(),
+                                repair_continuation_interaction_id: None,
                             };
                             if can_auto_repair {
-                                let next_attempt = automatic_repair_attempts.saturating_add(1);
                                 let request = automatic_plan_repair_request_from_report(
                                     failure_report.as_deref().unwrap_or_default(),
-                                    next_attempt,
-                                    automatic_repair_max_attempts,
+                                    runtime_repair_attempts,
+                                    runtime_repair_max_attempts,
                                 );
                                 self.begin_automatic_execution_plan_repair(
                                     pending,
                                     request,
-                                    next_attempt,
-                                    automatic_repair_max_attempts,
+                                    runtime_repair_attempts,
+                                    runtime_repair_max_attempts,
+                                    None,
                                 )
                                 .await;
                                 return Ok(());
@@ -7960,7 +8848,7 @@ where
             if let PendingPlanRevisionCommand::ContinueAutoRepair { max_attempts } =
                 parse_pending_plan_revision_command(&text)
             {
-                self.continue_automatic_execution_plan_repair(pending, max_attempts)
+                self.continue_automatic_execution_plan_repair(pending, max_attempts, false, None)
                     .await;
                 return;
             }
@@ -8154,20 +9042,20 @@ where
                 if let Some(pending) = self.pending_execution_plan_revision.take() {
                     match parse_pending_plan_revision_command(args) {
                         PendingPlanRevisionCommand::ContinueAutoRepair { max_attempts } => {
-                            self.continue_automatic_execution_plan_repair(pending, max_attempts)
-                                .await;
+                            self.continue_automatic_execution_plan_repair(
+                                pending,
+                                max_attempts,
+                                false,
+                                None,
+                            )
+                            .await;
                         }
                         PendingPlanRevisionCommand::Modify(request) => {
                             self.begin_execution_plan_revision_flow(pending, request)
                                 .await;
                         }
                         PendingPlanRevisionCommand::Cancel => {
-                            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                                "Execution plan revision canceled.".to_string(),
-                            )));
-                            self.widget.bottom_pane.set_status(AgentStatus::Idle);
-                            self.sync_mux_input_context();
-                            self.schedule_draw();
+                            self.cancel_execution_plan_revision(pending).await;
                         }
                         PendingPlanRevisionCommand::Invalid => {
                             self.pending_execution_plan_revision = Some(pending);
@@ -9217,8 +10105,11 @@ where
             intent_id,
             warnings,
             prompt,
-            0,
-            DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+            PlanWorkflowRepairContext {
+                automatic_repair_attempts: 0,
+                automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+                repair_continuation_interaction_id: None,
+            },
         )
         .await;
     }
@@ -9229,23 +10120,366 @@ where
         request: String,
         attempt: u8,
         max_attempts: u8,
-    ) {
+        continuation_interaction_id: Option<String>,
+    ) -> bool {
         pending.automatic_repair_attempts = pending.automatic_repair_attempts.max(attempt);
         pending.automatic_repair_max_attempts = max_attempts;
+        // Phase 1 admission can fail before it records the continuation on the
+        // App. Keep the durable handoff on the revision too, so the caller can
+        // re-park it instead of leaving the live runtime Idle until restart.
+        pending.repair_continuation_interaction_id = continuation_interaction_id.clone();
         self.pending_auto_plan_repair_execution = Some(PendingAutoPlanRepairExecution {
             attempt,
             max_attempts,
             network_access: pending.network_access,
+            continuation_interaction_id,
+            pending_revision: pending.clone(),
         });
         self.begin_execution_plan_revision_flow(pending, &request)
+            .await
+    }
+
+    /// Re-open the mandatory repair gate when Phase 1 re-planning fails after
+    /// Continue has already settled its previous gate. The old marker is
+    /// intentionally resolved by Continue, so recovery must allocate and
+    /// durably persist a new interaction before returning control to the user.
+    async fn reopen_plan_execution_repair_after_replan_failure(
+        &mut self,
+        replan_error: &str,
+    ) -> bool {
+        let Some(auto_repair) = self.pending_auto_plan_repair_execution.take() else {
+            return false;
+        };
+        self.pending_plan_workflow_repair_continuation = None;
+        let mut pending = auto_repair.pending_revision;
+        let mut evidence = pending
+            .repair_state
+            .as_ref()
+            .map(|state| state.evidence().clone())
+            .unwrap_or_else(|| crate::internal::ai::runtime::ExecutionFailureEvidence {
+                output: "Automatic plan repair could not produce a revised plan.".to_string(),
+                diagnostics: Vec::new(),
+                attempt: auto_repair.attempt,
+                max_attempts: auto_repair.max_attempts,
+            });
+        let redacted_replan_error = redacted_failure_summary(replan_error);
+        let replan_failure_evidence =
+            format!("Automatic plan repair re-planning failed: {redacted_replan_error}");
+        evidence.diagnostics.push(replan_failure_evidence.clone());
+        let interaction_id = format!("tui-plan-repair-replan-{}", uuid::Uuid::new_v4());
+        let repair_state = crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+            interaction_id: interaction_id.clone(),
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence,
+        };
+        let prior_report = pending.failure_report.take().unwrap_or_default();
+        pending.failure_report = Some(if prior_report.is_empty() {
+            replan_failure_evidence.clone()
+        } else {
+            format!("{prior_report}\n\n{replan_failure_evidence}")
+        });
+        pending.automatic_repair_attempts = auto_repair.attempt;
+        pending.automatic_repair_max_attempts = auto_repair.max_attempts;
+        pending.repair_state = Some(repair_state.clone());
+
+        let gate_turn_id = format!("plan-repair-replan-{}", uuid::Uuid::new_v4());
+        let predecessor_interaction_id = auto_repair.continuation_interaction_id.as_deref();
+        let persist_result = match predecessor_interaction_id {
+            Some(predecessor_interaction_id) => self
+                .append_superseding_plan_execution_repair_marker(
+                    &repair_state,
+                    &gate_turn_id,
+                    predecessor_interaction_id,
+                ),
+            None => self.append_plan_execution_repair_marker(&repair_state, &gate_turn_id, None),
+        };
+        if let Err(error) = persist_result {
+            self.fence_for_unrestorable_review_gate(format!(
+                "Automatic plan repair failed, and its Continue/Cancel decision could not be persisted ({error}). Mutation reconciliation is required before another turn can run."
+            ))
             .await;
+            return true;
+        }
+        if let Some(predecessor_interaction_id) = auto_repair.continuation_interaction_id.as_deref()
+            && let Err(error) = self.resolve_plan_execution_repair_marker(
+                predecessor_interaction_id,
+                "repair continuation superseded by replan failure",
+            )
+        {
+            self.fence_for_unrestorable_review_gate(format!(
+                "Automatic plan repair failed, and its previous crash handoff could not be retired ({error}). Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return true;
+        }
+        let Some(runtime) = self.local_turn_runtime.clone() else {
+            self.fence_for_unrestorable_review_gate(
+                "Automatic plan repair failed, but its Continue/Cancel gate cannot be re-established without a local runtime. Mutation reconciliation is required before another turn can run."
+                    .to_string(),
+            )
+            .await;
+            return true;
+        };
+        if let Err(error) = self
+            .park_plan_execution_repair_gate(&interaction_id, 0, gate_turn_id)
+            .await
+        {
+            self.fence_for_unrestorable_review_gate(format!(
+                "Automatic plan repair failed, but its Continue/Cancel gate could not be re-established ({}). Mutation reconciliation is required before another turn can run.",
+                runtime_worker_adapter_message(error)
+            ))
+            .await;
+            return true;
+        }
+        if let Err(error) = runtime
+            .set_plan_execution_repair(self.session.id.clone(), Some(repair_state.clone()))
+            .await
+        {
+            self.fence_for_unrestorable_review_gate(format!(
+                "Automatic plan repair failed, but its recovery state could not be published ({error}). Mutation reconciliation is required before another turn can run."
+            ))
+            .await;
+            return true;
+        }
+
+        self.pending_execution_plan_revision = Some(pending);
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            code_ui_session
+                .set_plan_execution_repair(Some(repair_state.clone()))
+                .await;
+            code_ui_session
+                .upsert_interaction(CodeUiInteractionRequest {
+                    id: interaction_id,
+                    kind: CodeUiInteractionKind::PlanExecutionRepair,
+                    title: Some("Plan repair required".to_string()),
+                    description: Some(
+                        "Re-planning failed. Continue to retry the plan repair, revise it manually, or cancel this repair."
+                            .to_string(),
+                    ),
+                    prompt: Some(redacted_replan_error.clone()),
+                    options: vec![
+                        CodeUiInteractionOption {
+                            id: "continue".to_string(),
+                            label: "Continue repair".to_string(),
+                            description: Some(
+                                "Retry automatic plan repair with the current revision.".to_string(),
+                            ),
+                        },
+                        CodeUiInteractionOption {
+                            id: "cancel".to_string(),
+                            label: "Cancel repair".to_string(),
+                            description: Some("Stop the repair loop without retrying.".to_string()),
+                        },
+                    ],
+                    status: CodeUiInteractionStatus::Pending,
+                    metadata: serde_json::json!({
+                        "attempt": auto_repair.attempt,
+                        "maxAttempts": auto_repair.max_attempts,
+                        "replanFailed": true,
+                    }),
+                    requested_at: Utc::now(),
+                    resolved_at: None,
+                })
+                .await;
+            code_ui_session
+                .set_status(CodeUiSessionStatus::AwaitingInteraction)
+                .await;
+        }
+        self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+            "Automatic plan repair could not produce a revised plan: {redacted_replan_error}. The repair is still pending — continue, revise it manually, or cancel."
+        ))));
+        self.widget.bottom_pane.set_status(AgentStatus::Idle);
+        self.sync_mux_input_context();
+        self.schedule_draw();
+        true
+    }
+
+    /// Resolve a parked plan-repair interaction before the local TUI accepts a
+    /// revision or queues a repaired execution.  The runtime owns the gate, so
+    /// clearing only the TUI's pending revision would otherwise strand the
+    /// worker in `AwaitingPlanRepair`.
+    async fn resolve_local_plan_execution_repair_gate(
+        &mut self,
+        repair_state: &crate::internal::ai::runtime::PlanExecutionRepairState,
+        response: &str,
+    ) -> Result<(), RuntimeWorkerError> {
+        let crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+            interaction_id,
+            ..
+        } = repair_state
+        else {
+            return Ok(());
+        };
+        let runtime = self.local_turn_runtime.clone().ok_or_else(|| {
+            RuntimeWorkerError::ExecutionFailed(
+                "Plan repair cannot be resolved because its local runtime is unavailable."
+                    .to_string(),
+            )
+        })?;
+        let (_, runtime_turn_id) = self.active_local_runtime_turn.clone().ok_or_else(|| {
+            RuntimeWorkerError::ExecutionFailed(
+                "Plan repair cannot be resolved because its runtime gate is no longer active."
+                    .to_string(),
+            )
+        })?;
+        runtime
+            .respond(
+                self.session.id.clone(),
+                runtime_turn_id,
+                InteractionResponse::new(interaction_id, response),
+            )
+            .await?;
+        self.active_local_runtime_turn = None;
+        Ok(())
+    }
+
+    /// Cancel an awaiting repair through its runtime-owned acknowledgement.
+    ///
+    /// Unlike a live executor turn, a parked repair gate has no task that can
+    /// observe `runtime.cancel()`. Its response must be delivered so the
+    /// durable workflow marker is resolved before clearing the local projection.
+    async fn cancel_pending_plan_execution_repair_gate(&mut self) -> Result<bool, TuiControlError> {
+        let Some(pending) = self.pending_execution_plan_revision.take() else {
+            return Ok(false);
+        };
+        let Some(repair_state) = pending.repair_state.clone() else {
+            self.pending_execution_plan_revision = Some(pending);
+            return Ok(false);
+        };
+        let crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+            interaction_id,
+            ..
+        } = &repair_state
+        else {
+            self.pending_execution_plan_revision = Some(pending);
+            return Ok(false);
+        };
+        let interaction_id = interaction_id.clone();
+        if let Err(error) = self
+            .resolve_local_plan_execution_repair_gate(&repair_state, "cancel")
+            .await
+        {
+            self.pending_execution_plan_revision = Some(pending);
+            return Err(TuiControlError::Internal(format!(
+                "failed to cancel the pending plan repair: {}",
+                runtime_worker_adapter_message(error)
+            )));
+        }
+
+        let cancelled = PlanExecutionRepairService.respond(repair_state, "cancel", None);
+        if let Some(runtime) = self.local_turn_runtime.clone()
+            && let Err(error) = runtime
+                .set_plan_execution_repair(self.session.id.clone(), Some(cancelled.clone()))
+                .await
+        {
+            tracing::warn!(%error, "failed to publish cancelled plan repair state");
+        }
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            code_ui_session.resolve_interaction(&interaction_id).await;
+            code_ui_session
+                .set_plan_execution_repair(Some(cancelled))
+                .await;
+            code_ui_session.set_status(CodeUiSessionStatus::Idle).await;
+        }
+        self.set_idle_and_draw();
+        Ok(true)
+    }
+
+    async fn cancel_execution_plan_revision(&mut self, pending: PendingExecutionPlanRevision) {
+        if let Some(interaction_id) = pending.repair_continuation_interaction_id.as_deref()
+            && let Err(error) = self.cancel_plan_execution_repair_continuation(interaction_id)
+        {
+            self.pending_execution_plan_revision = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "Execution plan revision cancellation was not applied because its repair continuation could not be recorded: {error}. The revision is still pending — try again."
+            ))));
+            self.sync_mux_input_context();
+            self.schedule_draw();
+            return;
+        }
+        let repair_state = pending.repair_state.clone();
+        if let Some(repair_state) = repair_state.as_ref()
+            && let Err(error) = self
+                .resolve_local_plan_execution_repair_gate(repair_state, "cancel")
+                .await
+        {
+            self.pending_execution_plan_revision = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "Plan repair cancellation was not applied: {}. The repair is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
+            self.sync_mux_input_context();
+            self.schedule_draw();
+            return;
+        }
+        if let Some(repair_state) = repair_state {
+            let cancelled = PlanExecutionRepairService.respond(repair_state, "cancel", None);
+            if let Some(runtime) = self.local_turn_runtime.clone()
+                && let Err(error) = runtime
+                    .set_plan_execution_repair(self.session.id.clone(), Some(cancelled.clone()))
+                    .await
+            {
+                tracing::warn!(%error, "failed to publish cancelled plan repair state");
+            }
+            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                if let Some(
+                    crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                        interaction_id,
+                        ..
+                    },
+                ) = pending.repair_state.as_ref()
+                {
+                    code_ui_session.resolve_interaction(interaction_id).await;
+                }
+                code_ui_session
+                    .set_plan_execution_repair(Some(cancelled))
+                    .await;
+                code_ui_session.set_status(CodeUiSessionStatus::Idle).await;
+            }
+        }
+        self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+            "Execution plan revision canceled.".to_string(),
+        )));
+        self.widget.bottom_pane.set_status(AgentStatus::Idle);
+        self.sync_mux_input_context();
+        self.schedule_draw();
     }
 
     async fn continue_automatic_execution_plan_repair(
         &mut self,
         pending: PendingExecutionPlanRevision,
         requested_max_attempts: Option<u8>,
+        gate_already_resolved: bool,
+        mut continuation_interaction_id: Option<String>,
     ) {
+        let Some(repair_state) = pending.repair_state.clone() else {
+            self.pending_execution_plan_revision = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                pending_execution_plan_revision_help_message(),
+            )));
+            self.sync_mux_input_context();
+            self.schedule_draw();
+            return;
+        };
+        let next_state = PlanExecutionRepairService.respond(
+            repair_state.clone(),
+            "continue",
+            requested_max_attempts,
+        );
+        let crate::internal::ai::runtime::PlanExecutionRepairState::AutomaticRepair {
+            route,
+            evidence,
+        } = next_state.clone()
+        else {
+            self.pending_execution_plan_revision = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                "Plan repair cannot continue automatically. Provide specific revision guidance or use `/plan cancel`."
+                    .to_string(),
+            )));
+            self.sync_mux_input_context();
+            self.schedule_draw();
+            return;
+        };
         let Some(failure_report) = pending.failure_report.clone() else {
             self.pending_execution_plan_revision = Some(pending);
             self.widget.add_cell(Box::new(AssistantHistoryCell::new(
@@ -9255,28 +10489,75 @@ where
             self.schedule_draw();
             return;
         };
-
-        let next_attempt = pending.automatic_repair_attempts.saturating_add(1);
-        if next_attempt > MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS {
+        if !gate_already_resolved && continuation_interaction_id.is_none() {
+            let continuation_id = format!("tui-plan-repair-continuation-{}", uuid::Uuid::new_v4());
+            let continuation =
+                crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                    interaction_id: continuation_id.clone(),
+                    route,
+                    evidence: evidence.clone(),
+                };
+            let continuation_turn_id = format!("plan-repair-continuation-{}", uuid::Uuid::new_v4());
+            let predecessor_interaction_id = match &repair_state {
+                crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                    interaction_id,
+                    ..
+                } => interaction_id,
+                _ => unreachable!("automatic repair continuation requires an awaiting repair"),
+            };
+            if let Err(error) = self.append_plan_execution_repair_marker(
+                &continuation,
+                &continuation_turn_id,
+                Some(predecessor_interaction_id),
+            ) {
+                self.pending_execution_plan_revision = Some(pending);
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Plan repair continuation was not applied: failed to persist its crash recovery handoff ({error}). The repair is still pending — try again."
+                ))));
+                self.sync_mux_input_context();
+                self.schedule_draw();
+                return;
+            }
+            continuation_interaction_id = Some(continuation_id);
+        }
+        if !gate_already_resolved
+            && let Err(error) = self
+                .resolve_local_plan_execution_repair_gate(&repair_state, "continue")
+                .await
+        {
+            if let Some(interaction_id) = continuation_interaction_id.as_deref()
+                && let Err(cleanup_error) = self.resolve_plan_execution_repair_marker(
+                    interaction_id,
+                    "repair continuation was not acknowledged",
+                )
+            {
+                self.fence_for_unrestorable_review_gate(format!(
+                    "Plan repair continuation was not applied ({error}), and its crash recovery handoff could not be cleared ({cleanup_error}). Mutation reconciliation is required before another turn can run."
+                ))
+                .await;
+                return;
+            }
             self.pending_execution_plan_revision = Some(pending);
-            let message = format!(
-                "Automatic plan repair is capped at {} attempts. Describe specific Plan repair guidance, use `/plan modify <changes>`, or use `/plan cancel` to stop.",
-                MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS
-            );
-            self.widget
-                .add_cell(Box::new(AssistantHistoryCell::new(message.clone())));
-            self.history.push(Message::assistant(message.clone()));
-            self.session.add_assistant_message(&message);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "Plan repair continuation was not applied: {}. The repair is still pending — try again.",
+                runtime_worker_adapter_message(error)
+            ))));
             self.sync_mux_input_context();
             self.schedule_draw();
             return;
         }
-        let max_attempts = requested_max_attempts
-            .unwrap_or(pending.automatic_repair_max_attempts)
-            .max(next_attempt)
-            .min(MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS);
+
+        let next_attempt = evidence.attempt;
+        let max_attempts = evidence.max_attempts;
         let request =
             automatic_plan_repair_request_from_report(&failure_report, next_attempt, max_attempts);
+        let code_ui_repair_interaction_id = match &repair_state {
+            crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                interaction_id,
+                ..
+            } => Some(interaction_id.clone()),
+            _ => None,
+        };
         let mut note = String::new();
         if requested_max_attempts.is_some() && max_attempts != pending.automatic_repair_max_attempts
         {
@@ -9292,15 +10573,43 @@ where
             .add_cell(Box::new(AssistantHistoryCell::new(note.clone())));
         self.history.push(Message::assistant(note.clone()));
         self.session.add_assistant_message(&note);
-        self.begin_automatic_execution_plan_repair(pending, request, next_attempt, max_attempts)
-            .await;
+        let mut pending = pending;
+        pending.repair_state = Some(next_state.clone());
+        if let Some(runtime) = self.local_turn_runtime.clone()
+            && let Err(error) = runtime
+                .set_plan_execution_repair(self.session.id.clone(), Some(next_state.clone()))
+                .await
+        {
+            tracing::warn!(%error, "failed to publish continued plan repair state");
+        }
+        if let Some(code_ui_session) = self.code_ui_session.clone() {
+            if !gate_already_resolved
+                && let Some(interaction_id) = code_ui_repair_interaction_id.as_deref()
+            {
+                code_ui_session.resolve_interaction(interaction_id).await;
+            }
+            code_ui_session
+                .set_plan_execution_repair(Some(next_state))
+                .await;
+            code_ui_session
+                .set_status(CodeUiSessionStatus::Thinking)
+                .await;
+        }
+        self.begin_automatic_execution_plan_repair(
+            pending,
+            request,
+            next_attempt,
+            max_attempts,
+            continuation_interaction_id,
+        )
+        .await;
     }
 
     async fn begin_execution_plan_revision_flow(
         &mut self,
-        pending: PendingExecutionPlanRevision,
+        mut pending: PendingExecutionPlanRevision,
         request: &str,
-    ) {
+    ) -> bool {
         let request = request.trim();
         if request.is_empty() {
             self.widget.add_cell(Box::new(AssistantHistoryCell::new(
@@ -9309,7 +10618,79 @@ where
             self.pending_execution_plan_revision = Some(pending);
             self.sync_mux_input_context();
             self.schedule_draw();
-            return;
+            return false;
+        }
+        let mut repair_continuation_interaction_id =
+            pending.repair_continuation_interaction_id.take();
+        if let Some(
+            repair_state @ crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                interaction_id,
+                route,
+                ..
+            },
+        ) = pending.repair_state.as_ref()
+        {
+            let repair_interaction_id = interaction_id.clone();
+            let continuation_interaction_id =
+                format!("tui-plan-repair-continuation-{}", uuid::Uuid::new_v4());
+            let continuation =
+                crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                    interaction_id: continuation_interaction_id.clone(),
+                    route: *route,
+                    evidence: repair_state.evidence().clone(),
+                };
+            let continuation_turn_id = format!("plan-repair-continuation-{}", uuid::Uuid::new_v4());
+            if let Err(error) = self.append_plan_execution_repair_marker(
+                &continuation,
+                &continuation_turn_id,
+                Some(&repair_interaction_id),
+            ) {
+                self.pending_execution_plan_revision = Some(pending);
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Plan revision was not accepted: failed to persist its crash recovery handoff ({error}). The repair is still pending — try again."
+                ))));
+                self.sync_mux_input_context();
+                self.schedule_draw();
+                return false;
+            }
+            if let Err(error) = self
+                .resolve_local_plan_execution_repair_gate(repair_state, "continue")
+                .await
+            {
+                if let Err(cleanup_error) = self.resolve_plan_execution_repair_marker(
+                    &continuation_interaction_id,
+                    "repair continuation was not acknowledged",
+                ) {
+                    self.fence_for_unrestorable_review_gate(format!(
+                        "Plan revision was not accepted ({error}), and its crash recovery handoff could not be cleared ({cleanup_error}). Mutation reconciliation is required before another turn can run."
+                    ))
+                    .await;
+                    return false;
+                }
+                self.pending_execution_plan_revision = Some(pending);
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                    "Plan revision was not accepted: {}. The repair is still pending — try again.",
+                    runtime_worker_adapter_message(error)
+                ))));
+                self.sync_mux_input_context();
+                self.schedule_draw();
+                return false;
+            }
+            pending.repair_state = None;
+            if let Some(runtime) = self.local_turn_runtime.clone()
+                && let Err(error) = runtime
+                    .set_plan_execution_repair(self.session.id.clone(), None)
+                    .await
+            {
+                tracing::warn!(%error, "failed to clear resolved plan repair state");
+            }
+            if let Some(code_ui_session) = self.code_ui_session.clone() {
+                code_ui_session
+                    .resolve_interaction(&repair_interaction_id)
+                    .await;
+                code_ui_session.set_plan_execution_repair(None).await;
+            }
+            repair_continuation_interaction_id = Some(continuation_interaction_id);
         }
 
         let prompt = build_execution_plan_revision_prompt(
@@ -9318,15 +10699,29 @@ where
             request,
             pending.failure_report.as_deref(),
         );
-        self.begin_llm_execution_plan_workflow(
-            pending.spec_json,
-            pending.intent_id,
-            pending.warnings,
-            prompt,
-            pending.automatic_repair_attempts,
-            pending.automatic_repair_max_attempts,
-        )
-        .await;
+        let phase1_admitted = self
+            .begin_llm_execution_plan_workflow(
+                pending.spec_json,
+                pending.intent_id,
+                pending.warnings,
+                prompt,
+                PlanWorkflowRepairContext {
+                    automatic_repair_attempts: pending.automatic_repair_attempts,
+                    automatic_repair_max_attempts: pending.automatic_repair_max_attempts,
+                    repair_continuation_interaction_id: repair_continuation_interaction_id.clone(),
+                },
+            )
+            .await;
+        if !phase1_admitted
+            && self
+                .restore_rejected_repaired_execution_admission(
+                    repair_continuation_interaction_id.as_deref(),
+                )
+                .await
+        {
+            return false;
+        }
+        phase1_admitted
     }
 
     async fn begin_llm_execution_plan_workflow(
@@ -9335,20 +10730,29 @@ where
         intent_id: Option<String>,
         mut warnings: Vec<String>,
         prompt: String,
-        automatic_repair_attempts: u8,
-        automatic_repair_max_attempts: u8,
-    ) {
+        repair_context: PlanWorkflowRepairContext,
+    ) -> bool {
+        let PlanWorkflowRepairContext {
+            automatic_repair_attempts,
+            automatic_repair_max_attempts,
+            repair_continuation_interaction_id,
+        } = repair_context;
         let spec = match serde_json::from_str::<IntentSpec>(&spec_json) {
             Ok(spec) => spec,
             Err(error) => {
-                self.pending_auto_plan_repair_execution = None;
                 let msg = format!("Plan failed: stored IntentSpec JSON is invalid: {error}");
                 self.widget
                     .add_cell(Box::new(AssistantHistoryCell::new(msg.clone())));
                 self.history.push(Message::assistant(msg.clone()));
                 self.session.add_assistant_message(&msg);
+                if self
+                    .reopen_plan_execution_repair_after_replan_failure(&msg)
+                    .await
+                {
+                    return false;
+                }
                 self.set_idle_and_draw();
-                return;
+                return false;
             }
         };
 
@@ -9359,7 +10763,7 @@ where
                     .to_string(),
             )));
             self.set_idle_and_draw();
-            return;
+            return false;
         }
         if self.local_turn_runtime.is_none() {
             self.pending_auto_plan_repair_execution = None;
@@ -9368,7 +10772,7 @@ where
                     .to_string(),
             )));
             self.set_idle_and_draw();
-            return;
+            return false;
         }
 
         let turn_id = self.begin_turn();
@@ -9404,7 +10808,7 @@ where
                             .to_string(),
                     )));
                     self.set_idle_and_draw();
-                    return;
+                    return false;
                 }
             };
             let mutation_started = match self.current_turn_mutation_started.as_ref().cloned() {
@@ -9417,7 +10821,7 @@ where
                             .to_string(),
                     )));
                     self.set_idle_and_draw();
-                    return;
+                    return false;
                 }
             };
             if let Err(error) = self.ensure_session_snapshot_before_admission() {
@@ -9428,7 +10832,7 @@ where
                         "Plan workflow was not admitted: {error}"
                     ))));
                 self.set_idle_and_draw();
-                return;
+                return false;
             }
             let runtime_turn_id = format!("tui-local-{}", uuid::Uuid::new_v4());
             if let Err(error) = runtime
@@ -9452,9 +10856,12 @@ where
                         runtime_worker_adapter_message(error)
                     ))));
                 self.set_idle_and_draw();
-                return;
+                return false;
             }
+            bind_usage_context_to_runtime_turn(&mut config, &runtime_turn_id);
             self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
+            self.pending_plan_workflow_repair_continuation =
+                repair_continuation_interaction_id.clone();
         }
 
         let tx = self.app_event_tx.clone();
@@ -9717,10 +11124,12 @@ where
                 warnings,
                 automatic_repair_attempts,
                 automatic_repair_max_attempts,
+                repair_continuation_interaction_id,
             });
         });
 
         self.agent_task = Some(handle);
+        true
     }
 
     // ── Post-plan dialog ────────────────────────────────────────────
@@ -9748,6 +11157,23 @@ where
                 format!("network-policy-{}", uuid::Uuid::new_v4()),
             )
         });
+        // A repaired plan retains its continuation until execution reaches the
+        // queue. Cancelling the regenerated plan is terminal, so make that
+        // retirement durable before releasing the plan-review gate.
+        if selected == 2
+            && let Some(interaction_id) = pending.repair_continuation_interaction_id.as_deref()
+            && let Err(error) = self.cancel_plan_execution_repair_continuation(interaction_id)
+        {
+            self.pending_post_plan = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The plan review cancel was not applied because its repair continuation could not be recorded: {error}. The review is still pending — try again."
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingPostPlanChoice);
+            self.schedule_draw();
+            return;
+        }
         if let Some((network_interaction_id, gate_turn_id)) = network_gate.as_ref()
             && let Err(error) = self.append_network_policy_marker(
                 network_interaction_id,
@@ -9840,6 +11266,9 @@ where
                         automatic_repair_max_attempts: pending.automatic_repair_max_attempts,
                         network_access: pending.network_access,
                         failure_report: None,
+                        repair_state: None,
+                        repair_continuation_interaction_id: pending
+                            .repair_continuation_interaction_id,
                     });
                     let msg = format!(
                         "{} Your next plain-text message will revise the current execution plan.",
@@ -10194,6 +11623,19 @@ where
             self.set_idle_and_draw();
             return;
         };
+        if let Some(interaction_id) = pending.repair_continuation_interaction_id.as_deref()
+            && let Err(error) = self.cancel_plan_execution_repair_continuation(interaction_id)
+        {
+            self.pending_post_plan = Some(pending);
+            self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                "The plan review cancel was not applied because its repair continuation could not be recorded: {error}. The review is still pending — try again."
+            ))));
+            self.widget
+                .bottom_pane
+                .set_status(AgentStatus::AwaitingPostPlanChoice);
+            self.schedule_draw();
+            return;
+        }
         // Esc is an explicit Cancel: release the worker-owned gate so the
         // session is not left fenced behind an interaction nobody can answer.
         if let Err(error) = self
@@ -10264,7 +11706,23 @@ where
             network_access_override: Some(network_access),
             automatic_repair_attempts: pending.automatic_repair_attempts,
             automatic_repair_max_attempts: pending.automatic_repair_max_attempts,
+            repair_continuation_interaction_id: pending.repair_continuation_interaction_id,
         }
+    }
+
+    /// A repaired execution has a durable continuation marker until queue
+    /// admission succeeds. Re-park that marker after any pre-admission
+    /// failure; otherwise the UI could become Idle while the marker still
+    /// requires Continue/Cancel after a restart.
+    async fn restore_rejected_repaired_execution_admission(
+        &mut self,
+        repair_continuation_interaction_id: Option<&str>,
+    ) -> bool {
+        if repair_continuation_interaction_id.is_none() {
+            return false;
+        }
+        self.restore_pending_plan_execution_repair_gate().await;
+        true
     }
 
     async fn start_execute_workflow(&mut self, request: ExecuteWorkflowRequest) {
@@ -10287,16 +11745,25 @@ where
             network_access_override,
             automatic_repair_attempts,
             automatic_repair_max_attempts,
+            repair_continuation_interaction_id,
         } = request;
 
         let mut spec: IntentSpec = match serde_json::from_str(&spec_json) {
             Ok(s) => s,
             Err(e) => {
-                let _ = self.clear_pending_plan_execution_handoff();
                 self.widget
                     .add_cell(Box::new(AssistantHistoryCell::new(format!(
                         "Failed to parse IntentSpec: {e}"
                     ))));
+                if self
+                    .restore_rejected_repaired_execution_admission(
+                        repair_continuation_interaction_id.as_deref(),
+                    )
+                    .await
+                {
+                    return;
+                }
+                let _ = self.clear_pending_plan_execution_handoff();
                 self.set_idle_and_draw();
                 return;
             }
@@ -10325,6 +11792,14 @@ where
                 "Confirmed plan execution requires a local AgentRuntime so mutating work stays on the serialized queue. This managed Code UI session has none — use a non-managed TUI provider."
                     .to_string(),
             )));
+            if self
+                .restore_rejected_repaired_execution_admission(
+                    repair_continuation_interaction_id.as_deref(),
+                )
+                .await
+            {
+                return;
+            }
             self.set_idle_and_draw();
             return;
         };
@@ -10334,6 +11809,14 @@ where
                 "Confirmed plan execution requires a DeferredPlanExecutionExecutor so the worker can own Orchestrator::run."
                     .to_string(),
             )));
+            if self
+                .restore_rejected_repaired_execution_admission(
+                    repair_continuation_interaction_id.as_deref(),
+                )
+                .await
+            {
+                return;
+            }
             self.set_idle_and_draw();
             return;
         };
@@ -10343,6 +11826,14 @@ where
                 .add_cell(Box::new(AssistantHistoryCell::new(format!(
                     "Execute workflow was not admitted: {error}"
                 ))));
+            if self
+                .restore_rejected_repaired_execution_admission(
+                    repair_continuation_interaction_id.as_deref(),
+                )
+                .await
+            {
+                return;
+            }
             self.set_idle_and_draw();
             return;
         }
@@ -10378,6 +11869,7 @@ where
         );
 
         let runtime_turn_id = format!("plan-exec-{}", uuid::Uuid::new_v4());
+        bind_usage_context_to_runtime_turn(&mut tool_loop_config, &runtime_turn_id);
         let session_id = self.session.id.clone();
         let runtime_turn_id_for_wait = runtime_turn_id.clone();
         let runner_turn_id = turn_id;
@@ -10392,6 +11884,14 @@ where
                         .add_cell(Box::new(AssistantHistoryCell::new(format!(
                             "Execute workflow was not admitted: {error}"
                         ))));
+                    if self
+                        .restore_rejected_repaired_execution_admission(
+                            repair_continuation_interaction_id.as_deref(),
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     self.set_idle_and_draw();
                     return;
                 }
@@ -10902,21 +12402,59 @@ where
                 .add_cell(Box::new(AssistantHistoryCell::new(format!(
                     "Execute workflow was not admitted: {error}"
                 ))));
+            if self
+                .restore_rejected_repaired_execution_admission(
+                    repair_continuation_interaction_id.as_deref(),
+                )
+                .await
+            {
+                return;
+            }
             self.set_idle_and_draw();
             return;
         }
 
-        match submit_confirmed_plan_execution(
-            &runtime,
-            plan_execution_executor.as_ref(),
-            session_id,
-            runtime_turn_id.clone(),
-            runner,
-        )
-        .await
-        {
+        let admission = if automatic_repair_attempts > 0 {
+            submit_repaired_plan_execution(
+                &runtime,
+                plan_execution_executor.as_ref(),
+                session_id,
+                runtime_turn_id.clone(),
+                runner,
+            )
+            .await
+        } else {
+            submit_confirmed_plan_execution(
+                &runtime,
+                plan_execution_executor.as_ref(),
+                session_id,
+                runtime_turn_id.clone(),
+                runner,
+            )
+            .await
+        };
+        match admission {
             Ok(_) => {
                 self.active_local_runtime_turn = Some((turn_id, runtime_turn_id.clone()));
+                if let Some(interaction_id) = repair_continuation_interaction_id
+                    && let Err(error) =
+                        self.resolve_plan_execution_repair_continuation(&interaction_id)
+                {
+                    // Queue admission already succeeded, so do not abandon the
+                    // worker-owned execution. Keep its continuation pending and
+                    // retry the durable resolution from its terminal path before
+                    // the UI may become Idle.
+                    self.pending_admitted_plan_execution_repair_continuation =
+                        Some(interaction_id.clone());
+                    tracing::warn!(
+                        %error,
+                        interaction_id,
+                        "failed to retire repaired-execution continuation after admission; will retry at terminalization"
+                    );
+                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(format!(
+                        "Warning: repaired plan execution was admitted but its crash handoff could not be cleared ({error}). Cleanup will retry when execution finishes."
+                    ))));
+                }
                 if let Err(error) = self.mark_plan_execution_admitted(&runtime_turn_id) {
                     // Submit already succeeded — keep tracking. In-memory
                     // admitted/submitting state remains so this process will
@@ -10969,6 +12507,14 @@ where
                         "Execute workflow was not admitted: {}",
                         runtime_worker_adapter_message(error)
                     ))));
+                if self
+                    .restore_rejected_repaired_execution_admission(
+                        repair_continuation_interaction_id.as_deref(),
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.set_idle_and_draw();
             }
         }
@@ -11113,6 +12659,7 @@ where
                 self.set_idle_and_draw();
                 return;
             }
+            bind_usage_context_to_runtime_turn(&mut config, &runtime_turn_id);
             self.active_local_runtime_turn = Some((turn_id, runtime_turn_id));
         }
 
@@ -11523,6 +13070,7 @@ where
                         network_access_override: Some(self.default_network_access),
                         automatic_repair_attempts: 0,
                         automatic_repair_max_attempts: DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS,
+                        repair_continuation_interaction_id: None,
                     })
                     .await;
                 }
@@ -12084,7 +13632,7 @@ fn pending_plan_revision_help_message() -> String {
 
 fn pending_execution_plan_revision_help_message() -> String {
     format!(
-        "Plan revise mode is active. Describe execution-plan changes in plain text, use `continue` or `/plan continue <max-attempts>` to allow more automatic repair attempts (max {}), use `/plan modify <changes>` to keep revising, or `/plan cancel` to exit.",
+        "Plan revise mode is active. Describe execution-plan changes in plain text, use `/plan continue <higher-limit>` to raise the automatic repair limit (max {}), use `/plan modify <changes>` to keep revising, or `/plan cancel` to exit.",
         MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS
     )
 }
@@ -13051,12 +14599,15 @@ mod tests {
         parse_task_command_args, parse_usage_grouping,
         pending_execution_plan_revision_help_message, pending_plan_revision_help_message,
         phase0_context_snapshot_request_from_changed_files, phase0_plan_tool_loop_config,
-        phase1_plan_tool_loop_config, provider_plan_draft_from_args, provider_plan_draft_from_plan,
-        record_orchestrator_thread_metadata, review_scroll_action, session_graph_thread_id,
-        should_auto_classify_first_user_message, should_auto_repair_execution_failure,
-        should_forward_phase0_model_text_delta, should_forward_phase1_model_text_delta,
-        should_route_plain_message_to_plan, task_description_from_prompt,
-        undo_should_prefer_vcs_rollback, usage_detail_popup_enabled_from_toml,
+        phase1_plan_tool_loop_config, plan_execution_repair_failure_report,
+        plan_execution_repair_requested_max_attempts, provider_plan_draft_from_args,
+        provider_plan_draft_from_plan, record_orchestrator_thread_metadata,
+        repair_message_for_execution_failure, resolve_pending_plan_execution_repair_continuation,
+        review_scroll_action, session_graph_thread_id, should_auto_classify_first_user_message,
+        should_auto_repair_execution_failure, should_forward_phase0_model_text_delta,
+        should_forward_phase1_model_text_delta, should_route_plain_message_to_plan,
+        task_description_from_prompt, undo_should_prefer_vcs_rollback,
+        usage_detail_popup_enabled_from_toml,
     };
     use crate::internal::{
         ai::{
@@ -13090,13 +14641,88 @@ mod tests {
             usage::{UsageDisplaySnapshot, UsageGrouping, format_usage_badge},
             web::code_ui::{
                 CodeUiApplyToFuture, CodeUiCapabilities, CodeUiInteractionKind,
-                CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionStatus,
-                CodeUiProviderInfo, CodeUiSessionStatus, CodeUiTranscriptEntry,
-                CodeUiTranscriptEntryKind, initial_snapshot,
+                CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionResponse,
+                CodeUiInteractionStatus, CodeUiProviderInfo, CodeUiSessionStatus,
+                CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, initial_snapshot,
             },
         },
         tui::history_cell::{AssistantHistoryCell, HistoryCell, ToolCallHistoryCell},
     };
+
+    /// W2-11 r27: admission may succeed even when the first continuation
+    /// resolution append fails. Terminal settlement must retain the retry until
+    /// it lands so restart does not resurrect the already-admitted repair gate.
+    #[test]
+    fn terminal_retries_failed_admitted_repair_continuation_cleanup() {
+        use crate::internal::ai::{
+            runtime::open_plan_execution_repair_from_workflow,
+            session::{CodeWorkflowEventKind, SessionJsonlStore},
+        };
+
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = SessionJsonlStore::new(temp.path().to_path_buf());
+        let interaction_id = "repair-continuation-after-admission";
+        store
+            .append_code_workflow_durable(CodeWorkflowEventKind::PlanExecutionRepairRequested {
+                interaction_id: interaction_id.to_string(),
+                turn_id: "repair-continuation-turn".to_string(),
+                predecessor_interaction_id: String::new(),
+                supersedes_predecessor: false,
+                repair: crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+                    interaction_id: interaction_id.to_string(),
+                    route: ExecutionFailureRevision::PlanRevision,
+                    evidence: crate::internal::ai::runtime::ExecutionFailureEvidence {
+                        output: "verification failed".to_string(),
+                        diagnostics: Vec::new(),
+                        attempt: 1,
+                        max_attempts: 1,
+                    },
+                },
+            })
+            .expect("persist continuation before repaired execution admission");
+
+        // `submit_repaired_plan_execution` has accepted the turn, but its
+        // immediate JSONL cleanup append fails.
+        let mut pending = Some(interaction_id.to_string());
+        let error = resolve_pending_plan_execution_repair_continuation(&mut pending, |_| {
+            Err(std::io::Error::other("injected append failure"))
+        })
+        .expect_err("post-admission cleanup failure remains retryable");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(pending.as_deref(), Some(interaction_id));
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("restart sees the unresolved continuation before settle");
+        assert!(
+            open_plan_execution_repair_from_workflow(
+                replay.events.iter().map(|event| &event.event)
+            )
+            .is_some(),
+            "the injected pre-terminal append failure must leave cleanup pending"
+        );
+
+        // The terminal/Idle path retries the same durable resolution.
+        resolve_pending_plan_execution_repair_continuation(&mut pending, |id| {
+            store
+                .append_code_workflow_durable(CodeWorkflowEventKind::InteractionResolved {
+                    interaction_id: id.to_string(),
+                    resolution: "repaired execution admitted".to_string(),
+                })
+                .map(|_| ())
+        })
+        .expect("terminal retry clears admitted continuation");
+        assert!(pending.is_none());
+        let replay = store
+            .load_code_workflow_replay()
+            .expect("restart reloads terminal cleanup");
+        assert!(
+            open_plan_execution_repair_from_workflow(
+                replay.events.iter().map(|event| &event.event)
+            )
+            .is_none(),
+            "restart must not reopen a repair gate after terminal cleanup"
+        );
+    }
 
     fn make_task(title: &str, kind: TaskKind) -> TaskSpec {
         let actor = ActorRef::agent("format-orchestrator-result").unwrap();
@@ -13860,7 +15486,8 @@ mod tests {
         let help = pending_execution_plan_revision_help_message();
 
         assert!(help.contains("Plan revise mode"));
-        assert!(help.contains("/plan continue"));
+        assert!(help.contains("/plan continue <higher-limit>"));
+        assert!(!help.contains("use `continue`"));
         assert!(help.contains("/plan modify <changes>"));
     }
 
@@ -13899,6 +15526,46 @@ mod tests {
     }
 
     #[test]
+    fn automatic_repair_message_reports_runtime_owned_attempt() {
+        let message = repair_message_for_execution_failure(
+            ExecutionFailureRevision::PlanRevision,
+            "",
+            true,
+            1,
+            2,
+        );
+
+        assert!(
+            message.contains("attempt 1/2"),
+            "the message must display the already-incremented runtime evidence: {message}"
+        );
+        assert!(!message.contains("attempt 2/2"));
+    }
+
+    #[test]
+    fn restored_plan_repair_report_preserves_diagnostics() {
+        let repair = crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+            interaction_id: "repair-after-restart".to_string(),
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence: crate::internal::ai::runtime::ExecutionFailureEvidence {
+                output: "Decision: Abandon.".to_string(),
+                diagnostics: vec![
+                    "cargo test failed: error[E0425]".to_string(),
+                    "missing generated artifact".to_string(),
+                ],
+                attempt: 2,
+                max_attempts: 2,
+            },
+        };
+
+        let report = plan_execution_repair_failure_report(&repair);
+
+        assert!(report.contains("Decision: Abandon."));
+        assert!(report.contains("cargo test failed: error[E0425]"));
+        assert!(report.contains("missing generated artifact"));
+    }
+
+    #[test]
     fn automatic_plan_repair_default_threshold_is_ten() {
         assert_eq!(MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS, 10);
         assert_eq!(DEFAULT_AUTOMATIC_PLAN_REPAIR_ATTEMPTS, 0);
@@ -13920,6 +15587,61 @@ mod tests {
         assert!(message.contains("Developer confirmation"));
         assert!(message.contains("/plan continue"));
         assert!(message.contains("Plan repair guidance"));
+    }
+
+    #[test]
+    fn code_ui_repair_continue_honors_higher_bounded_max_attempts() {
+        let waiting = crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser {
+            interaction_id: "repair-control".to_string(),
+            route: ExecutionFailureRevision::PlanRevision,
+            evidence: crate::internal::ai::runtime::ExecutionFailureEvidence {
+                output: "Decision: Abandon.".to_string(),
+                diagnostics: vec!["verification failed".to_string()],
+                attempt: 2,
+                max_attempts: 2,
+            },
+        };
+        let higher_limit = CodeUiInteractionResponse {
+            selected_option: Some("continue".to_string()),
+            max_attempts: Some(3),
+            ..CodeUiInteractionResponse::default()
+        };
+        let plain_continue = CodeUiInteractionResponse {
+            selected_option: Some("continue".to_string()),
+            ..CodeUiInteractionResponse::default()
+        };
+
+        assert!(matches!(
+            crate::internal::ai::runtime::PlanExecutionRepairService.respond(
+                waiting.clone(),
+                "continue",
+                plan_execution_repair_requested_max_attempts(&higher_limit),
+            ),
+            crate::internal::ai::runtime::PlanExecutionRepairState::AutomaticRepair { evidence, .. }
+                if evidence.attempt == 3 && evidence.max_attempts == 3
+        ));
+        assert!(matches!(
+            crate::internal::ai::runtime::PlanExecutionRepairService.respond(
+                waiting,
+                "continue",
+                plan_execution_repair_requested_max_attempts(&plain_continue),
+            ),
+            crate::internal::ai::runtime::PlanExecutionRepairState::AwaitingUser { evidence, .. }
+                if evidence.attempt == 2 && evidence.max_attempts == 2
+        ));
+        assert_eq!(
+            crate::internal::tui::control::TuiControlError::PlanRepairRetryLimitReached.status(),
+            409,
+            "plain exhausted Code UI Continue must retain its stable conflict status"
+        );
+        assert_eq!(
+            plan_execution_repair_requested_max_attempts(&CodeUiInteractionResponse {
+                max_attempts: Some(MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS + 1),
+                ..CodeUiInteractionResponse::default()
+            }),
+            None,
+            "a Code UI request cannot exceed the automatic repair hard cap"
+        );
     }
 
     #[test]
@@ -14032,6 +15754,8 @@ mod tests {
         assert!(message.contains("Decision: Abandon"));
         assert!(message.contains("Inspect sources"));
         assert!(message.contains("/plan cancel"));
+        assert!(message.contains("/plan continue <higher-limit>"));
+        assert!(!message.contains("Reply `continue`"));
     }
 
     #[test]
@@ -14792,6 +16516,17 @@ fn selection_from_response(
     }
 }
 
+/// Accept only retry caps representable by the runtime's bounded repair loop.
+/// Values at or below the current cap are handled by the repair service, which
+/// keeps the interaction pending and returns the stable retry-limit conflict.
+fn plan_execution_repair_requested_max_attempts(
+    response: &CodeUiInteractionResponse,
+) -> Option<u8> {
+    response
+        .max_attempts
+        .filter(|limit| *limit <= MAX_AUTOMATIC_PLAN_REPAIR_ATTEMPTS)
+}
+
 fn decode_tui_interaction_response(
     interaction: &InteractionResponse,
 ) -> Result<CodeUiInteractionResponse, RuntimeWorkerError> {
@@ -14938,6 +16673,7 @@ fn code_ui_response_from_exec_selection(
         approved: None,
         apply_to_future: None,
         selected_option: option_ids.get(selected).map(|id| (*id).to_string()),
+        max_attempts: None,
         note: None,
         answers: HashMap::new(),
     }
@@ -15169,7 +16905,7 @@ fn execution_failure_revision_message_from_report(report: &str) -> String {
             .map(str::to_string),
     );
     lines.push(
-        "Reply `continue` or `/plan continue <max-attempts>` to allow automatic repair attempts, send plan changes as plain text or `/plan modify <changes>`, or use `/plan cancel` to stop."
+        "Reply `/plan continue <higher-limit>` to raise the automatic repair limit, send plan changes as plain text or `/plan modify <changes>`, or use `/plan cancel` to stop."
             .to_string(),
     );
     lines.join("\n")
@@ -15218,7 +16954,7 @@ fn repair_message_for_execution_failure(
     match route {
         ExecutionFailureRevision::PlanRevision if can_auto_repair => {
             automatic_plan_repair_started_message(
-                automatic_repair_attempts.saturating_add(1),
+                automatic_repair_attempts,
                 automatic_repair_max_attempts,
             )
         }
@@ -15300,74 +17036,51 @@ fn execution_failure_report(
     lines.join("\n")
 }
 
+/// Rebuild the planner-facing report from durable, redacted runtime evidence.
+/// The decision summary alone is insufficient after resume: task diagnostics
+/// contain the concrete failure details required to produce a useful repair.
+fn plan_execution_repair_failure_report(
+    repair: &crate::internal::ai::runtime::PlanExecutionRepairState,
+) -> String {
+    let evidence = repair.evidence();
+    let mut lines = vec![evidence.output.trim().to_string()];
+    let diagnostics = evidence
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.trim())
+        .filter(|diagnostic| !diagnostic.is_empty())
+        .collect::<Vec<_>>();
+    if !diagnostics.is_empty() {
+        lines.push("Failure details:".to_string());
+        lines.extend(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| format!("- {diagnostic}")),
+        );
+    }
+    lines.retain(|line| !line.is_empty());
+    lines.join("\n")
+}
+
+#[cfg(test)]
 fn should_auto_repair_execution_failure(
     route: ExecutionFailureRevision,
     automatic_repair_attempts: u8,
     automatic_repair_max_attempts: u8,
 ) -> bool {
-    automatic_repair_attempts < automatic_repair_max_attempts
-        && route == ExecutionFailureRevision::PlanRevision
+    PlanExecutionRepairService::should_auto_repair(
+        route,
+        automatic_repair_attempts,
+        automatic_repair_max_attempts,
+    )
 }
 
+#[cfg(test)]
 fn classify_execution_failure_revision(
     result: Option<&OrchestratorResult>,
     execution_summary: Option<&str>,
 ) -> ExecutionFailureRevision {
-    if let Some(result) = result {
-        if execution_failure_requires_intentspec_revision(result) {
-            return ExecutionFailureRevision::IntentSpecRevision;
-        }
-        return if result.decision == DecisionOutcome::Abandon {
-            ExecutionFailureRevision::PlanRevision
-        } else {
-            ExecutionFailureRevision::ManualAction
-        };
-    }
-
-    if let Some(detail) = orchestrator_failure_detail(execution_summary)
-        && orchestrator_failure_requires_manual_action(&detail)
-    {
-        return ExecutionFailureRevision::ManualAction;
-    }
-
-    ExecutionFailureRevision::ManualAction
-}
-
-fn execution_failure_requires_intentspec_revision(result: &OrchestratorResult) -> bool {
-    !result.system_report.missing_artifacts.is_empty()
-        || result.task_results.iter().any(|task_result| {
-            task_result
-                .policy_violations
-                .iter()
-                .any(policy_violation_requires_intentspec_revision)
-        })
-}
-
-fn policy_violation_requires_intentspec_revision(violation: &PolicyViolation) -> bool {
-    matches!(
-        violation.code.as_str(),
-        "scope-creep"
-            | "network-policy-deny"
-            | "tool-acl-deny"
-            | "sandbox-escalation-deny"
-            | "git-version-control-deny"
-    )
-}
-
-fn orchestrator_failure_requires_manual_action(detail: &str) -> bool {
-    let detail = detail.to_ascii_lowercase();
-    [
-        "config error",
-        "configuration",
-        "mcp",
-        "persisted plan",
-        "persistence",
-        "database",
-        "sqlite",
-        "store",
-    ]
-    .iter()
-    .any(|needle| detail.contains(needle))
+    PlanExecutionRepairService::classify_execution_failure(result, execution_summary)
 }
 
 fn orchestrator_failure_detail(execution_summary: Option<&str>) -> Option<String> {
@@ -16361,6 +18074,20 @@ fn apply_automation_approval_scope(config: &mut ToolLoopConfig, turn_id: TurnId)
         return;
     };
     approval.scope_key_prefix = Some(format!("automation:{turn_id}"));
+}
+
+/// Attribute all model requests in a TUI loop to its durable runtime turn.
+///
+/// `UsageContext::for_runtime_turn` supplies a stable event prefix; the tool
+/// loop appends its model-turn sequence so retries dedupe without coalescing
+/// multiple model requests from the same turn.
+fn bind_usage_context_to_runtime_turn(config: &mut ToolLoopConfig, runtime_turn_id: &str) {
+    if let Some(context) = config.usage_context.as_mut() {
+        *context = context.for_runtime_turn(runtime_turn_id);
+    }
+    if let Some(runtime) = config.subagent_runtime.as_mut() {
+        runtime.parent_turn_id = Some(runtime_turn_id.to_string());
+    }
 }
 
 fn attach_file_history_context(

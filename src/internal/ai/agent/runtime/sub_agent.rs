@@ -726,6 +726,9 @@ impl std::error::Error for TaskFailure {}
 pub struct DispatchContext<'a> {
     /// Stable thread id under which both parent and child events live.
     pub parent_thread_id: &'a str,
+    /// Durable runtime turn that owns this child provider usage. Child rows
+    /// retain this turn while `agent_run_id` distinguishes the child run.
+    pub parent_turn_id: Option<&'a str>,
     /// Parent session id (the [`SessionId`] alias is `String` today).
     pub parent_session_id: &'a SessionId,
     /// The parent agent's resolved spec — drives permission inheritance
@@ -1221,9 +1224,37 @@ impl SubAgentChildRunner for DefaultSubAgentChildRunner {
                 .into_iter()
                 .map(|spec| spec.function.name)
                 .collect();
+            let usage_repo_id = match request.ctx.usage_recorder.canonical_repo_id().await {
+                Ok(repo_id) => repo_id,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "sub-agent usage stats will omit repository attribution because libra.repoid could not be read"
+                    );
+                    None
+                }
+            };
 
             let tool_loop_config = ToolLoopConfig {
                 allowed_tools: Some(allowed_tools),
+                // Child provider events share the parent's session/thread but
+                // receive their own durable agent-run and event identity.
+                // This keeps child spend out of the anonymous parent bucket.
+                usage_recorder: Some(request.ctx.usage_recorder.clone()),
+                usage_context: Some(crate::internal::ai::usage::UsageContext {
+                    repo_id: usage_repo_id,
+                    session_id: Some(request.ctx.parent_session_id.to_string()),
+                    thread_id: Some(request.ctx.parent_thread_id.to_string()),
+                    agent_run_id: Some(request.agent_run_id.0.to_string()),
+                    run_id: Some(request.agent_run_id.0.to_string()),
+                    turn_id: request.ctx.parent_turn_id.map(str::to_string),
+                    event_id: Some(format!("sub-agent:{}", request.agent_run_id.0)),
+                    provider: provider_id.clone(),
+                    model: model_id.clone(),
+                    request_kind: "completion".to_string(),
+                    intent: None,
+                    agent_name: Some(request.sub_spec.name.clone()),
+                }),
                 // S2-INV-13 hook dispatch (v0.17.806): forward the
                 // parent's `HookRunner` so PreToolUse / PostToolUse
                 // hooks fire on the child's tool calls — sub-agents
@@ -1499,6 +1530,8 @@ pub trait SubAgentDispatcher: Send + Sync {
 pub struct SubAgentToolLoopRuntime {
     pub dispatcher: Arc<dyn SubAgentDispatcher>,
     pub parent_thread_id: String,
+    /// Bound from the parent's usage context for each admitted runtime turn.
+    pub parent_turn_id: Option<String>,
     pub parent_session_id: SessionId,
     pub parent_agent: AgentExecutionSpec,
     pub parent_ruleset: PermissionRuleset,
@@ -1539,6 +1572,7 @@ impl std::fmt::Debug for SubAgentToolLoopRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubAgentToolLoopRuntime")
             .field("parent_thread_id", &self.parent_thread_id)
+            .field("parent_turn_id", &self.parent_turn_id)
             .field("parent_session_id", &self.parent_session_id)
             .field("parent_agent", &self.parent_agent.name)
             .field("parent_model_binding", &self.parent_model_binding)
@@ -1568,6 +1602,7 @@ impl SubAgentToolLoopRuntime {
     ) -> DispatchContext<'_> {
         DispatchContext {
             parent_thread_id: &self.parent_thread_id,
+            parent_turn_id: self.parent_turn_id.as_deref(),
             parent_session_id: &self.parent_session_id,
             parent_agent: &self.parent_agent,
             parent_ruleset: &self.parent_ruleset,
@@ -2045,6 +2080,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: "thread",
+            parent_turn_id: None,
             parent_session_id: &session_id,
             parent_agent: &parent_spec,
             parent_ruleset: &parent_ruleset,
@@ -2127,6 +2163,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: "thread",
+            parent_turn_id: None,
             parent_session_id: &session_id,
             parent_agent: &parent_spec,
             parent_ruleset: &parent_ruleset,
@@ -2209,6 +2246,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: "thread",
+            parent_turn_id: None,
             parent_session_id: &session_id,
             parent_agent: &parent_spec,
             parent_ruleset: &parent_ruleset,
@@ -2305,6 +2343,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: "thread",
+            parent_turn_id: None,
             parent_session_id: &session_id,
             parent_agent: &parent_spec,
             parent_ruleset: &parent_ruleset,

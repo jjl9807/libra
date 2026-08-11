@@ -1265,6 +1265,7 @@ mod tests {
     ) -> DispatchContext<'a> {
         DispatchContext {
             parent_thread_id,
+            parent_turn_id: None,
             parent_session_id,
             parent_agent,
             parent_ruleset,
@@ -1631,6 +1632,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: &parent_thread,
+            parent_turn_id: None,
             parent_session_id: &parent_session,
             parent_agent: &parent,
             parent_ruleset: &parent_ruleset,
@@ -2011,6 +2013,7 @@ mod tests {
         pre_cancelled.cancel();
         let context = DispatchContext {
             parent_thread_id: &parent_thread,
+            parent_turn_id: None,
             parent_session_id: &parent_session,
             parent_agent: &parent,
             parent_ruleset: &parent_ruleset,
@@ -2697,6 +2700,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: &parent_thread,
+            parent_turn_id: None,
             parent_session_id: &parent_session,
             parent_agent: &parent,
             parent_ruleset: &parent_ruleset,
@@ -2906,6 +2910,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: &parent_thread,
+            parent_turn_id: None,
             parent_session_id: &parent_session,
             parent_agent: &parent,
             parent_ruleset: &parent_ruleset,
@@ -3191,6 +3196,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: &parent_thread,
+            parent_turn_id: None,
             parent_session_id: &parent_session,
             parent_agent: &parent,
             parent_ruleset: &parent_ruleset,
@@ -3281,6 +3287,7 @@ mod tests {
 
         let context = DispatchContext {
             parent_thread_id: &parent_thread,
+            parent_turn_id: None,
             parent_session_id: &parent_session,
             parent_agent: &parent,
             parent_ruleset: &parent_ruleset,

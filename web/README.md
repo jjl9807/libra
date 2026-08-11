@@ -11,10 +11,37 @@ This directory holds the Next.js source for the embedded `libra code` browser UI
 pnpm install        # install deps (uses pnpm-lock.yaml)
 pnpm dev            # local dev server with HMR
 pnpm lint           # eslint, no warnings allowed
+pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Live API contract (Phase 0–4)
+## Current UI status (W2-07 + W2-08 + W2-09 + W2-10 + W2-13 + W2-14)
+
+The shipped page mounts the shared session/SSE store and browser-controller
+lease provider, shows the current session title and phase, renders the
+pending approval / `request_user_input` panel when the snapshot has one
+(`SessionInteractions` → `InteractionsHost`), mounts goal/task/skill
+controls (`SessionGoalTaskSkill`), mounts session lifecycle controls
+(`SessionLifecycle`), mounts usage controls (`SessionUsage`), and mounts
+execution/repair projection (`SessionExecutionRepair`: plan steps, failure
+evidence, Continue/Cancel via leased `respond` without a browser-side repair
+FSM). It does not yet ship a three-pane workspace, composer, terminal, or
+workflow tabs.
+
+W2-07 owns the shared wire foundation under `web/src/lib/code-ui/`. W2-08 owns
+approval and structured user-input under `web/src/lib/code-ui/interactions/`
+and `web/src/components/workspace/interactions/`. W2-09 owns goal/task/skill
+under `web/src/lib/code-ui/goal-task-skill/` and
+`web/src/components/workspace/goal-task-skill/` (skills use the A0-07 curated
+registry until W3-01 exposes Code UI skill HTTP). W2-10 owns session
+lifecycle under `web/src/lib/code-ui/session-lifecycle/` and
+`web/src/components/workspace/session-lifecycle/`. W2-13 owns usage under
+`web/src/lib/code-ui/usage/` and `web/src/components/workspace/usage/`.
+W2-14 owns execution/repair under `web/src/lib/code-ui/execution-repair/` and
+`web/src/components/workspace/execution-repair/`. Later domain panels remain
+with later W2 cards (SSE reconnect W2-15, workflow review W2-16, etc.).
+
+## Live API contract
 
 The browser only talks to its same-origin server. The Rust side enforces loopback at every `/api/*` route, so this client does not host-check. Non-loopback HTML navigation receives the embedded `remote-notice/` static page instead of the SPA, and non-loopback asset/API fallbacks return 404. Source of truth: `src/internal/ai/web/mod.rs`.
 
@@ -32,6 +59,10 @@ The browser only talks to its same-origin server. The Rust side enforces loopbac
 | `/api/code/messages` | POST | Submit a user message (header `X-Code-Controller-Token`, body ≤256 KiB). |
 | `/api/code/interactions/{id}` | POST | Resolve a pending `CodeUiInteractionRequest`. |
 | `/api/code/control/cancel` | POST | Cancel the active turn. Browser leases need only the controller token; automation leases additionally require `X-Libra-Control-Token`. |
+| `/api/code/goal/start` | POST | Start a Goal (`{ objective }`, header `X-Code-Controller-Token`) → `{ accepted, status }`. |
+| `/api/code/goal/status` | GET | Observe the active Goal status text (`{ status }`). No controller token; empty sessions return a no-active-Goal error treated as empty UI state. |
+| `/api/code/goal/cancel` | POST | Cancel the active Goal (`{ reason }`, header `X-Code-Controller-Token`) → `{ accepted, status }`. |
+| `/api/code/task/dispatch` | POST | Dispatch a user-initiated sub-agent task (`{ agent, prompt }`, header `X-Code-Controller-Token`) → `{ accepted, result }`. |
 
 The wire types are pinned in two places — keep them in lock-step:
 
@@ -42,24 +73,38 @@ The wire types are pinned in two places — keep them in lock-step:
 
 ```
 web/src/
-├── app/                       # Next.js app router entry
-├── components/icons/          # Inline SVG icon set
-├── components/workspace/      # Main three-pane layout
-│   ├── chat/                  # Chat pane + composer + InteractionPanel
-│   ├── sidebar/               # Thread list + repo state
-│   ├── terminal/              # Read-only event log derived from snapshot
-│   └── workflow/              # Pipeline / Summary / Diff / Settings tabs
+├── app/                       # Next.js app router entry (mounts domain panels)
+├── components/workspace/
+│   ├── interactions/          # Approval + request_user_input panels (W2-08)
+│   ├── goal-task-skill/       # Goal / task / skill panels (W2-09)
+│   ├── session-lifecycle/     # Thread list / resume / cancel (W2-10)
+│   ├── usage/                 # Usage cumulative / turn / sub-agent (W2-13)
+│   └── execution-repair/      # Plan execution + repair projection (W2-14)
 └── lib/
-    ├── code-ui/               # Wire types, HTTP client, store, controller hook
-    ├── persisted-state.ts     # Splitter widths persisted to localStorage
-    └── storage.ts / utils.ts  # Small UI helpers
+    └── code-ui/               # Shared wire types, client, store, controller (W2-07)
+        ├── interactions/      # Approval/user-input helpers + fixtures (W2-08)
+        ├── goal-task-skill/   # Goal/task API + A0-07 skill helpers (W2-09)
+        ├── session-lifecycle/ # Threads API + resume affordance (W2-10)
+        ├── usage/             # W2-12 RuntimeUsageTotals mirror + fixtures (W2-13)
+        └── execution-repair/  # Repair view helpers + fixtures (W2-14)
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. Both expose React context providers; `workspace.tsx` mounts them once at the top of the tree so every pane shares one client id, one lease, and one snapshot.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once and renders `SessionInteractions`, `SessionGoalTaskSkill`, `SessionLifecycle`, `SessionUsage`, and `SessionExecutionRepair`.
 
 ## Browser write surface
 
-The composer / cancel / interaction-panel writers all flow through `useBrowserController()` (provided by `<BrowserControllerProvider>`). On the first write the hook calls `POST /api/code/controller/attach`, caches `controllerToken` + `leaseExpiresAt` in memory, and replays the original request. Reloading the page drops the lease so the next browser session can attach cleanly.
+Composer and other domain writers will continue to land in later W2 cards.
+Approval, `request_user_input`, Goal start/cancel, task dispatch, and turn
+cancel already flow through `useBrowserController()` via `SessionInteractions` /
+`SessionGoalTaskSkill` / `SessionLifecycle`: writes post with
+`X-Code-Controller-Token` after `withLease` recovery. Skill buttons only
+validate the A0-07 curated registry until W3-01 exposes skill HTTP. Thread
+resume remains process-level (`libra code --resume`) until W3-01. On the first
+write the hook calls `POST /api/code/controller/attach`, caches
+`controllerToken` + `leaseExpiresAt` in memory, and replays the original
+request. The browser `clientId` is persisted in `sessionStorage` so an
+unexpected reload can renew the same lease; an explicit detach still clears
+write access for a clean hand-off.
 
 Recovery semantics in `controller.tsx`:
 

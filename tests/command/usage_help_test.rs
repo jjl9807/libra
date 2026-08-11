@@ -57,16 +57,78 @@ async fn seed_usage_report_rows(repo: &std::path::Path) {
 
 fn usage_context(agent_name: Option<&str>, provider: &str, model: &str) -> UsageContext {
     UsageContext {
+        repo_id: Some("usage-test-repo".to_string()),
         session_id: Some("usage-test-session".to_string()),
         thread_id: None,
         agent_run_id: None,
         run_id: None,
+        turn_id: None,
+        event_id: None,
         provider: provider.to_string(),
         model: model.to_string(),
         request_kind: "chat".to_string(),
         intent: None,
         agent_name: agent_name.map(str::to_string),
     }
+}
+
+/// A mixed session is explicitly partial: known SQLite subtotals must never
+/// be rendered as complete token or cost totals when another request omitted
+/// both dimensions.
+#[tokio::test]
+async fn test_usage_report_marks_mixed_known_and_unknown_rows_partial() {
+    let repo = tempdir().expect("tempdir for partial usage report");
+    let init = run_libra_command(&["init"], repo.path());
+    assert_cli_success(&init, "init repo for partial usage report");
+    let conn = get_db_conn_instance_for_path(&repo.path().join(".libra").join(DATABASE))
+        .await
+        .expect("open repo db");
+    let recorder = UsageRecorder::new(conn);
+    let context = usage_context(Some("planner"), "openai", "gpt-4o");
+
+    recorder
+        .record_summary(
+            &context,
+            &CompletionUsageSummary {
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: Some(150),
+                cost_usd: Some(0.1),
+            },
+            Some(100),
+        )
+        .await
+        .expect("record known usage");
+    recorder
+        .record_missing_usage(&context, Some(50), 0)
+        .await
+        .expect("record unknown usage");
+
+    let human = run_libra_command(&["usage", "report"], repo.path());
+    assert_cli_success(&human, "partial human usage report");
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        human_stdout.contains("tokens=150 (partial; unknown_usage=1)"),
+        "human output must label token subtotal partial: {human_stdout}"
+    );
+    assert!(
+        human_stdout.contains("$0.1000 (partial; unknown_cost=1)"),
+        "human output must label cost subtotal partial: {human_stdout}"
+    );
+
+    let csv = run_libra_command(&["usage", "report", "--format", "csv"], repo.path());
+    assert_cli_success(&csv, "partial csv usage report");
+    let csv_stdout = String::from_utf8_lossy(&csv.stdout);
+    assert!(
+        csv_stdout.contains("usage_status,unknown_usage_count,cost_status,unknown_cost_count"),
+        "CSV must expose uncertainty columns: {csv_stdout}"
+    );
+    assert!(
+        csv_stdout.contains(",partial,1,partial,1"),
+        "CSV must label subtotal values partial and include counts: {csv_stdout}"
+    );
 }
 
 /// `libra usage --help` surfaces the EXAMPLES banner so users see the

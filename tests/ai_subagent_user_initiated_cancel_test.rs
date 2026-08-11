@@ -175,6 +175,7 @@ async fn pre_cancelled_user_initiated_dispatch_short_circuits_with_parent_abort(
 
     let context = DispatchContext {
         parent_thread_id: "thread-cancel",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,
@@ -302,6 +303,7 @@ async fn mid_flight_cancel_during_child_run_writes_cancelled_event() {
     let abort_canceller = abort_token.clone();
     let context = DispatchContext {
         parent_thread_id: "thread-midflight",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,

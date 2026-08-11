@@ -167,6 +167,7 @@ async fn user_initiated_bypass_skips_ask_and_runs_child_against_fake_provider() 
     let abort_token = AbortToken::new();
     let context = DispatchContext {
         parent_thread_id: "thread-user-init",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,

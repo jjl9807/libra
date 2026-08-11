@@ -2779,6 +2779,26 @@ where
     let thinking = completion_thinking_for_args(args);
     let reasoning_effort = completion_reasoning_effort_for_args(args);
     let stream = completion_stream_for_args(args);
+    let usage_storage_root = resolve_storage_root(working_dir);
+    let usage_recorder = match usage_storage_root.as_ref() {
+        Some(storage_root) => build_usage_recorder(storage_root).await,
+        None => None,
+    };
+    let usage_repo_id = canonical_usage_repo_id(usage_recorder.as_ref()).await;
+    let usage_context = usage_recorder.as_ref().map(|_| UsageContext {
+        repo_id: usage_repo_id.clone(),
+        session_id: Some(session_state.id.clone()),
+        thread_id: session_canonical_thread_id(&session_state),
+        agent_run_id: None,
+        run_id: None,
+        turn_id: None,
+        event_id: None,
+        provider: provider_name.clone(),
+        model: model_name.clone(),
+        request_kind: "completion".to_string(),
+        intent: None,
+        agent_name: None,
+    });
 
     let config_factory: Arc<dyn Fn() -> ToolLoopConfig + Send + Sync> =
         Arc::new(move || ToolLoopConfig {
@@ -2790,6 +2810,8 @@ where
             preserve_reasoning_content,
             runtime_context: runtime_context.clone(),
             subagent_runtime: subagent_runtime.clone(),
+            usage_recorder: usage_recorder.clone(),
+            usage_context: usage_context.clone(),
             ..Default::default()
         });
 
@@ -3743,12 +3765,16 @@ where
     check_process_terminate(&process_terminate)?;
 
     if let Some(usage_recorder) = build_usage_recorder(&storage_root).await {
+        let usage_repo_id = canonical_usage_repo_id(Some(&usage_recorder)).await;
         config.usage_recorder = Some(usage_recorder);
         config.usage_context = Some(UsageContext {
+            repo_id: usage_repo_id,
             session_id: Some(session.id.clone()),
             thread_id: session_canonical_thread_id(&session),
             agent_run_id: None,
             run_id: None,
+            turn_id: None,
+            event_id: None,
             provider: provider_name.clone(),
             model: model_name.clone(),
             request_kind: "completion".to_string(),
@@ -4209,9 +4235,16 @@ where
     // restored first because an open IntentSpec gate means no plan was ever
     // approved; the plan restore then no-ops on the already-parked gate.
     app.restore_pending_plan_review_gate().await;
+    // W2-11: restore a durable Continue/Cancel repair gate before considering
+    // any execution handoff. A corrupt/unreadable repair replay fences the
+    // session and must never fall through to replay approved mutations.
+    let repair_gate_allows_handoff = app.restore_pending_plan_execution_repair_gate().await;
     // W2-03 r18: network Allow/Deny may have settled while execute admission
-    // never ran — resume that handoff after the review gates no-op.
-    app.restore_pending_plan_execution_handoff().await;
+    // never ran — resume that handoff only after repair recovery confirms that
+    // no unresolved Continue/Cancel decision is owed.
+    if should_restore_plan_execution_handoff(repair_gate_allows_handoff) {
+        app.restore_pending_plan_execution_handoff().await;
+    }
 
     let run_result = app.run().await;
     // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI
@@ -4943,6 +4976,7 @@ async fn build_subagent_runtime_for_session(
         dispatcher: std::sync::Arc::new(dispatcher),
         parent_thread_id: session_canonical_thread_id(session)
             .unwrap_or_else(|| session.id.clone()),
+        parent_turn_id: None,
         parent_session_id: session.id.clone(),
         parent_agent,
         parent_ruleset: Vec::new(),
@@ -4996,6 +5030,20 @@ async fn build_usage_recorder(storage_root: &Path) -> Option<UsageRecorder> {
         }
         Err(error) => {
             tracing::warn!("usage stats disabled because database open failed: {error}");
+            None
+        }
+    }
+}
+
+async fn canonical_usage_repo_id(usage_recorder: Option<&UsageRecorder>) -> Option<String> {
+    let usage_recorder = usage_recorder?;
+    match usage_recorder.canonical_repo_id().await {
+        Ok(repo_id) => repo_id,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "usage stats will omit repository attribution because libra.repoid could not be read"
+            );
             None
         }
     }
@@ -5352,6 +5400,12 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     Ok(())
 }
 
+/// A repair replay failure is a fail-closed startup condition: the execution
+/// handoff may be replayed only when the repair restore explicitly permits it.
+fn should_restore_plan_execution_handoff(repair_gate_allows_handoff: bool) -> bool {
+    repair_gate_allows_handoff
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5373,6 +5427,26 @@ mod tests {
 
     use super::*;
     use crate::internal::ai::sandbox::SandboxPolicy;
+
+    #[test]
+    fn corrupt_repair_replay_blocks_pending_execution_handoff() {
+        use crate::internal::ai::session::SessionJsonlStore;
+
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let store = SessionJsonlStore::new(temp.path().to_path_buf());
+        std::fs::write(store.events_path(), "{not valid JSONL}\n")
+            .expect("write corrupt workflow replay");
+
+        let repair_gate_allows_handoff = store.load_code_workflow_replay().is_ok();
+        assert!(
+            !repair_gate_allows_handoff,
+            "a corrupt repair replay must be treated as unrecoverable"
+        );
+        assert!(
+            !should_restore_plan_execution_handoff(repair_gate_allows_handoff),
+            "startup must not replay a pending mutating execution handoff when repair recovery fails"
+        );
+    }
 
     /// CEX-S2-12 "single sub-agent behind flag": the dispatcher
     /// concurrency cap is forced to 1 for every configured value —

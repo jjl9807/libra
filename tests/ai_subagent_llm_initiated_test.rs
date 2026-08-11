@@ -156,6 +156,7 @@ async fn llm_initiated_dispatch_with_fake_provider_returns_fixture_response_and_
     let abort_token = AbortToken::new();
     let context = DispatchContext {
         parent_thread_id: "thread-e2e",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,

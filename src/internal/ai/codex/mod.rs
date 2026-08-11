@@ -1478,6 +1478,7 @@ fn build_code_ui_snapshot_from_codex_session(
                 resolved_at: request.resolved_at,
             })
             .collect(),
+        plan_execution_repair: current.plan_execution_repair.clone(),
         updated_at: Utc::now(),
     }
 }

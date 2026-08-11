@@ -55,10 +55,13 @@ fn fake_usage(input: u64, output: u64, cost_usd: f64) -> CompletionUsageSummary 
 
 fn agent_context(agent: &str, provider: &str, model: &str) -> UsageContext {
     UsageContext {
+        repo_id: Some("repo-s7".to_string()),
         session_id: Some("session-s7".to_string()),
         thread_id: Some("thread-s7".to_string()),
         agent_run_id: None,
         run_id: Some(format!("run-{agent}")),
+        turn_id: Some(format!("turn-{agent}")),
+        event_id: None,
         provider: provider.to_string(),
         model: model.to_string(),
         request_kind: "completion".to_string(),

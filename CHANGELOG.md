@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-09, 2026-08-11)
+
+- **W2-09 delivers browser Goal/task/skill controls.** Domain helpers under
+  `web/src/lib/code-ui/goal-task-skill/` drive `SessionGoalTaskSkill` panels for
+  Goal start/status/cancel, task dispatch (active controller lease), and A0-07
+  curated skill discovery validation (runtime skill HTTP remains W3-01).
+  `BrowserController.withLease` is exposed for domain writes; command docs
+  clarify browser-capable `/task/dispatch`.
+
+### Added (plan-20260715 W2-08, 2026-08-11)
+
+- **W2-08 delivers browser approval and `request_user_input` panels.** Domain
+  helpers/fixtures under `web/src/lib/code-ui/interactions/` drive
+  `ApprovalPanel` / `RequestUserInputForm` / `SessionInteractions`. Headless
+  projection now emits `header` / `isOther` / `isSecret` / option descriptions,
+  filters blank/duplicate option labels, and is covered by a Rust wire unit
+  test. Managed Codex sessions keep cancel but disable browser respond.
+
+### Added (plan-20260715 W2-07, 2026-08-11)
+
+- **W2-07 delivers the Web Code UI wire adapter foundation.** Shared
+  TypeScript types, HTTP/SSE client (with loopback wire smoke), session store,
+  browser controller lease (stable `sessionStorage` client id), phases,
+  view-model helpers, and Vitest fixtures land under `web/src/lib/code-ui/`.
+  The shipped page is a foundation-only placeholder; domain panels remain
+  W2-08+. CI `compat-web-check` runs `pnpm --dir web test`, and Next
+  `generateBuildId` is pinned so committed `web/out/` stays reproducible.
+
+### Added (plan-20260715 W2-12, 2026-08-11)
+
+- **W2-12 delivers UI-neutral runtime usage attribution and query.**
+  `RuntimeUsageService` attributes spend at repo/session/turn/sub-agent,
+  reuses `internal/ai/usage` with session-scoped event idempotency, and
+  exposes Known/Partial/Unknown (plus mixed `$exact + ~$estimate`) on CLI,
+  CSV/JSON, and TUI formatters. Headless and TUI bind durable turn IDs;
+  cancel races prefer completed provider usage over placeholders.
+
+### Added (plan-20260715 W2-11, 2026-08-11)
+
+- **W2-11 migrates plan-execution failure classification and repair loops into
+  the runtime.** Runtime-owned repair state classifies plan, IntentSpec, and
+  manual-action failures; persists Continue/Cancel gates for crash recovery;
+  projects bounded redacted failure evidence to Code UI; and requires a higher
+  `maxAttempts` to extend an exhausted automatic-repair limit. English and
+  zh-CN Code/control documentation describe the wire contract.
+
 ### Added (plan-20260729 CT3-02, 2026-08-10)
 
 - **First clean-room wave of upstream Git compatibility tests (t4).** 77

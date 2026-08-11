@@ -175,6 +175,7 @@ async fn fake_sub_agent_run_does_not_write_entire_io_observed_agent_tables() {
     let abort_token = AbortToken::new();
     let context = DispatchContext {
         parent_thread_id: "thread-entire-compat",
+        parent_turn_id: None,
         parent_session_id: &session_id,
         parent_agent: &parent,
         parent_ruleset: &parent_ruleset,

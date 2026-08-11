@@ -54,7 +54,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
-            2026073005, 2026073101, 2026080401
+            2026073005, 2026073101, 2026080401, 2026080402, 2026080403
         ]
     );
     assert_eq!(
@@ -112,13 +112,15 @@ fn builtin_migrations_register_current_schema_migrations() {
             "worktree_registry_v3_capability",
             "stash_generation_fence",
             "agent_capture_workspace_scope",
+            "agent_usage_runtime_attribution",
+            "agent_usage_event_session_scope",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 52);
-    assert_eq!(runner.max_registered_version(), Some(2026080401));
+    assert_eq!(runner.len(), 54);
+    assert_eq!(runner.max_registered_version(), Some(2026080403));
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +159,88 @@ async fn run_pending_applies_all_registered_migrations_on_fresh_db() {
     assert!(index_exists(&conn, "idx_widgets_name").await);
     // The runner created its own bookkeeping table.
     assert!(table_exists(&conn, "schema_versions").await);
+}
+
+#[tokio::test]
+async fn usage_event_session_scope_rollback_refuses_duplicate_event_ids() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply session-scoped event migration");
+
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_usage_stats \
+         (id, session_id, event_id, provider, model, created_at) VALUES \
+         ('usage-a', 'session-a', 'reused-command-id', 'test', 'test-model', '2026-08-04T00:00:00Z'), \
+         ('usage-b', 'session-b', 'reused-command-id', 'test', 'test-model', '2026-08-04T00:00:00Z')"
+            .to_string(),
+    ))
+    .await
+    .expect("seed valid session-scoped duplicate event IDs");
+
+    let error = runner
+        .rollback_to(&conn, 2026080402)
+        .await
+        .expect_err("rollback must preserve session-scoped usage event identities");
+    assert!(
+        format!("{error:#}").contains(
+            "cannot roll back session-scoped usage event IDs while duplicate event_id values exist"
+        ),
+        "rollback error must provide collision remediation: {error:#}"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("read schema version"),
+        Some(2026080403),
+        "failed rollback must preserve the applied migration"
+    );
+}
+
+#[tokio::test]
+async fn runtime_usage_attribution_rollback_refuses_populated_dimensions() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply runtime attribution migration");
+
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_usage_stats \
+         (id, repo_id, session_id, turn_id, event_id, provider, model, created_at) VALUES \
+         ('attributed-usage', 'repo-123', 'session-a', 'tui-local-123', \
+          'runtime-turn:tui-local-123', 'test', 'test-model', '2026-08-04T00:00:00Z')"
+            .to_string(),
+    ))
+    .await
+    .expect("seed runtime-attributed usage");
+
+    let error = runner
+        .rollback_to(&conn, 2026080401)
+        .await
+        .expect_err("rollback must preserve runtime usage identities");
+    assert!(
+        format!("{error:#}").contains(
+            "cannot roll back runtime usage attribution while repo_id, turn_id, or event_id values exist"
+        ),
+        "rollback error must provide attribution remediation: {error:#}"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("read schema version"),
+        Some(2026080402),
+        "the 2026080403 rollback succeeds, but the attribution guard preserves 2026080402"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1112,7 +1196,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301,
             2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501,
             2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004,
-            2026073005, 2026073101, 2026080401
+            2026073005, 2026073101, 2026080401, 2026080402, 2026080403
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1306,7 +1390,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401
+            2026080401, 2026080402, 2026080403
         ]
     );
     conn.execute_raw(Statement::from_string(
@@ -1371,7 +1455,7 @@ async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
             2026071406, 2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302,
             2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502,
             2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005,
-            2026073101, 2026080401
+            2026073101, 2026080401, 2026080402, 2026080403
         ]
     );
     assert!(table_exists(&conn, "agent_subagent_content_claim").await);
@@ -1475,7 +1559,7 @@ async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401
+            2026080401, 2026080402, 2026080403
         ]
     );
     let claim = conn
@@ -1609,7 +1693,7 @@ async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
             2026071407, 2026071901, 2026072101, 2026072201, 2026072301, 2026072302, 2026072303,
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401
+            2026080401, 2026080402, 2026080403
         ]
     );
     let cursor = conn
@@ -1653,10 +1737,11 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
-            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
-            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
+            2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1674,7 +1759,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
             2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
             2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
-            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
+            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401, 2026080402,
+            2026080403
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1705,10 +1791,10 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
     assert_eq!(
         rolled,
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
-            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
-            2026071407, 2026071406, 2026071405, 2026071404
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
         ]
     );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
@@ -1726,7 +1812,7 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
             2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101, 2026072201,
             2026072301, 2026072302, 2026072303, 2026072304, 2026072401, 2026072402, 2026072403,
             2026072501, 2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003,
-            2026073004, 2026073005, 2026073101, 2026080401
+            2026073004, 2026073005, 2026073101, 2026080401, 2026080402, 2026080403
         ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
@@ -2071,13 +2157,14 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
-            2026072304, 2026072303, 2026072302, 2026072301, 2026072201, 2026072101, 2026071901,
-            2026071407, 2026071406, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
-            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
-            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
-            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401, 2026072304, 2026072303, 2026072302, 2026072301, 2026072201,
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
+            2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701,
+            2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301,
+            2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801,
+            2026050601
         ]
     );
     assert!(
@@ -2107,7 +2194,8 @@ async fn approved_permission_up_down_up_round_trip() {
             2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
             2026072101, 2026072201, 2026072301, 2026072302, 2026072303, 2026072304, 2026072401,
             2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
-            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
+            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401, 2026080402,
+            2026080403
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -2979,9 +3067,9 @@ async fn legacy_layer_rows_with_linked_fail_migration() {
             .await
             .expect("rollback layer scope"),
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
-            2026072304, 2026072303
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401, 2026072304, 2026072303
         ]
     );
     conn.execute_raw(Statement::from_string(
@@ -3034,7 +3122,7 @@ async fn legacy_layer_rows_with_linked_fail_migration() {
         vec![
             2026072303, 2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502,
             2026072901, 2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005,
-            2026073101, 2026080401
+            2026073101, 2026080401, 2026080402, 2026080403
         ]
     );
     let row = conn
@@ -3311,9 +3399,9 @@ async fn sparse_migration_projects_last_wins_toggle() {
             .await
             .expect("rollback sparse scope"),
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
-            2026072304
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401, 2026072304
         ]
     );
     // Duplicate legacy rows: stale `true` (lower id) then effective `false`
@@ -3349,7 +3437,7 @@ async fn sparse_migration_projects_last_wins_toggle() {
         vec![
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401
+            2026080401, 2026080402, 2026080403
         ]
     );
     let row = conn
@@ -3384,9 +3472,9 @@ async fn legacy_sparse_state_with_linked_requires_adopt_or_clear() {
             .await
             .expect("rollback sparse scope"),
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401,
-            2026072304
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401, 2026072304
         ]
     );
     conn.execute_raw(Statement::from_string(
@@ -3429,7 +3517,7 @@ async fn legacy_sparse_state_with_linked_requires_adopt_or_clear() {
         vec![
             2026072304, 2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901,
             2026072902, 2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101,
-            2026080401
+            2026080401, 2026080402, 2026080403
         ]
     );
     assert!(column_exists(&conn, "sparse_view", "worktree_id").await);
@@ -3650,8 +3738,9 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
             .await
             .expect("rollback capability marker"),
         vec![
-            2026080401, 2026073101, 2026073005, 2026073004, 2026073003, 2026073002, 2026073001,
-            2026072902, 2026072901, 2026072502, 2026072501, 2026072403, 2026072402, 2026072401
+            2026080403, 2026080402, 2026080401, 2026073101, 2026073005, 2026073004, 2026073003,
+            2026073002, 2026073001, 2026072902, 2026072901, 2026072502, 2026072501, 2026072403,
+            2026072402, 2026072401
         ]
     );
     assert!(!table_exists(&conn, "worktree_registry_capability").await);
@@ -3661,7 +3750,8 @@ async fn worktree_registry_v2_capability_marker_round_trip() {
         runner.run_pending(&conn).await.expect("re-apply"),
         vec![
             2026072401, 2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902,
-            2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
+            2026073001, 2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401,
+            2026080402, 2026080403
         ]
     );
     assert!(table_exists(&conn, "worktree_registry_capability").await);
@@ -3783,7 +3873,8 @@ async fn registry_v2_down_migration_rejects_nonterminal_state() {
         runner.run_pending(&conn).await.expect("re-apply"),
         vec![
             2026072402, 2026072403, 2026072501, 2026072502, 2026072901, 2026072902, 2026073001,
-            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401
+            2026073002, 2026073003, 2026073004, 2026073005, 2026073101, 2026080401, 2026080402,
+            2026080403
         ]
     );
 }
@@ -3865,7 +3956,7 @@ async fn workspace_record_down_migration_rejects_nonterminal_state() {
         runner.run_pending(&conn).await.expect("re-apply"),
         vec![
             2026072501, 2026072502, 2026072901, 2026072902, 2026073001, 2026073002, 2026073003,
-            2026073004, 2026073005, 2026073101, 2026080401
+            2026073004, 2026073005, 2026073101, 2026080401, 2026080402, 2026080403
         ]
     );
 
@@ -4347,7 +4438,7 @@ async fn registry_v3_rollback_refuses_live_generations() {
             .current_version(&conn)
             .await
             .expect("current version"),
-        Some(2026080401),
+        Some(2026080403),
         "and the schema is untouched"
     );
 }
@@ -4393,7 +4484,7 @@ async fn registry_v3_rollback_allows_absent_generations() {
             .unwrap_or_else(|error| panic!("{label} must roll back: {error:?}"));
         assert_eq!(
             rolled,
-            vec![2026080401, 2026073101, 2026073005],
+            vec![2026080403, 2026080402, 2026080401, 2026073101, 2026073005],
             "{label}: exactly v3 rolled back"
         );
         assert!(
@@ -4420,7 +4511,7 @@ async fn registry_v3_rollback_allows_unreadable_registry() {
             .rollback_to(&conn, 2026073004)
             .await
             .expect("an unparseable registry does not block the rollback"),
-        vec![2026080401, 2026073101, 2026073005]
+        vec![2026080403, 2026080402, 2026080401, 2026073101, 2026073005]
     );
 }
 
@@ -4715,8 +4806,8 @@ async fn stash_generation_fence_up_down_up_round_trip() {
     );
     assert_eq!(
         runner.current_version(&conn).await.expect("version"),
-        Some(2026080401),
-        "the capture-scope migration is the newest migration — retarget this test when a newer one lands"
+        Some(2026080403),
+        "the runtime usage migrations are the newest migrations — retarget this test when a newer one lands"
     );
 
     let rolled = runner
@@ -4725,8 +4816,8 @@ async fn stash_generation_fence_up_down_up_round_trip() {
         .expect("down to the previous version");
     assert_eq!(
         rolled,
-        vec![2026080401, 2026073101],
-        "the scope migration and fence roll back in order"
+        vec![2026080403, 2026080402, 2026080401, 2026073101],
+        "the runtime attribution, scope, and fence migrations roll back in order"
     );
     assert!(
         !fence_marker_present(&conn).await,

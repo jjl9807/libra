@@ -12,7 +12,7 @@ libra usage prune [--retention-days <days>]
 ## 说明
 
 `libra usage` 读取由 Libra 的 AI provider runtime 记录的用量行，并按 provider/model、agent 或 agent/provider/model 聚合。报告可按时间范围、session id、thread id，以及是否包含失败的 provider 请求进行过滤。
-当 provider 报告精确 `cost_usd` 时，Libra 会存储并显示该值。否则，它会从内置模型能力定价表或 `.libra/config.toml` 中的仓库覆盖项估算 `cost_estimate_micro_dollars`。
+当 provider 报告精确 `cost_usd` 时，Libra 会存储并显示该值。否则，它会从内置模型能力定价表或 `.libra/config.toml` 中的仓库覆盖项估算 `cost_estimate_micro_dollars`。一个聚合可以同时包含两种费用；人类可读和 TUI 输出会显示 `$<actual> + ~$<estimate>`，不会让精确小计隐藏估算部分。
 
 ## 子命令
 
@@ -48,22 +48,24 @@ libra usage prune [--retention-days <days>]
 默认 provider/model 分组：
 
 ```text
-<provider>	<model>	requests=<n>	failed=<n>	tokens=<n>	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>]
+<provider>	<model>	requests=<n>	failed=<n>	tokens=<n> [ (partial|unknown; unknown_usage=<n>) ]	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>| $<actual> + ~$<estimate>| unknown ] [ (partial|unknown; unknown_cost=<n>) ]
 ```
 
 Agent 分组：
 
 ```text
-<agent_name>	requests=<n>	failed=<n>	tokens=<n>	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>]
+<agent_name>	requests=<n>	failed=<n>	tokens=<n> [ (partial|unknown; unknown_usage=<n>) ]	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>| $<actual> + ~$<estimate>| unknown ] [ (partial|unknown; unknown_cost=<n>) ]
 ```
 
 Agent/provider/model 分组：
 
 ```text
-<agent_name>	<provider>	<model>	requests=<n>	failed=<n>	tokens=<n>	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>]
+<agent_name>	<provider>	<model>	requests=<n>	failed=<n>	tokens=<n> [ (partial|unknown; unknown_usage=<n>) ]	cached=<n>	reasoning=<n>	tool_calls=<n>	wall_ms=<n> [ $<actual>| ~$<estimate>| $<actual> + ~$<estimate>| unknown ] [ (partial|unknown; unknown_cost=<n>) ]
 ```
 
-CSV 模式打印一个表头行，后面跟适合导入电子表格的逗号分隔行。CSV 前导列匹配所选分组，指标列同时包含 `cost_usd` 和 `cost_estimate_micro_dollars`；估算的人类可读输出以 `~$` 为前缀。
+CSV 模式打印一个表头行，后面跟适合导入电子表格的逗号分隔行。CSV 前导列匹配所选分组，指标列同时包含 `cost_usd` 和 `cost_estimate_micro_dollars`；估算的人类可读输出以 `~$` 为前缀。其末尾新增四列：`usage_status`、`unknown_usage_count`、`cost_status` 和 `unknown_cost_count`。当所有请求都有对应数据时状态为 `known`；只有部分请求有数据时为 `partial`；没有任何请求有数据时为 `unknown`。这四列追加在既有 CSV 指标之后；需要固定表头的消费者必须接受追加字段，或只选择其支持的列。
+
+人类可读输出遵循相同契约：token 小计和费用会标注 `partial` 或 `unknown`，并附带相应的未知行计数。`partial` 行中的数值 token 和费用只是已知的小计，并非完整总额；未知费用显示为 `unknown`，绝不会显示为 `$0`。CSV 和 JSON 保留独立的 `cost_usd` 与 `cost_estimate_micro_dollars` 字段，供消费者保留相同的精确加估算区分。
 
 ## 定价覆盖
 
@@ -107,6 +109,9 @@ reasoning_micro_dollars_per_mtok = 600000
 ```
 
 `prune` 使用 `usage.prune`，并报告保留窗口、cutoff 时间戳和删除行数。
+
+`data.rows` 中的每个对象都包含 `unknown_usage_count` 和
+`unknown_cost_count`。按上文的定义，将这些计数与 `request_count` 对比即可推导出相同的 `known`/`partial`/`unknown` 状态。未知计数非零的行中，数值总计只是已知的小计。
 
 ## 示例
 

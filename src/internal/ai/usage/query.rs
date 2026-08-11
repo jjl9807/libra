@@ -62,8 +62,10 @@ impl UsageQuery {
                         COALESCE(SUM(tool_call_count), 0), \
                         COALESCE(SUM(wall_clock_ms), 0), \
                         SUM(cost_usd), \
-                        SUM(cost_estimate_micro_dollars), \
-                        COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) \
+                        SUM(CASE WHEN cost_usd IS NULL THEN cost_estimate_micro_dollars END), \
+                        COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0), \
+                        COALESCE(SUM(CASE WHEN usage_estimated = 1 OR success = 0 THEN 1 ELSE 0 END), 0), \
+                        COALESCE(SUM(CASE WHEN cost_usd IS NULL AND cost_estimate_micro_dollars IS NULL THEN 1 ELSE 0 END), 0) \
                  FROM agent_usage_stats \
                  {where_sql} \
                  GROUP BY {group_cols} \
@@ -129,6 +131,10 @@ pub struct UsageQueryFilter {
     pub until: Option<String>,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub agent_run_id: Option<String>,
+    pub agent_name: Option<String>,
     pub include_failed: bool,
 }
 
@@ -139,6 +145,10 @@ impl Default for UsageQueryFilter {
             until: None,
             session_id: None,
             thread_id: None,
+            run_id: None,
+            turn_id: None,
+            agent_run_id: None,
+            agent_name: None,
             include_failed: true,
         }
     }
@@ -168,6 +178,13 @@ pub struct UsageAggregate {
     pub cost_usd: Option<f64>,
     pub cost_estimate_micro_dollars: Option<u64>,
     pub failed_count: u64,
+    /// Rows whose provider response omitted token usage or failed before
+    /// reporting it. Their numeric token columns are intentionally not
+    /// evidence of known zero usage.
+    pub unknown_usage_count: u64,
+    /// Rows for which neither provider pricing nor the price table supplied a
+    /// cost. Consumers must expose this as partial/unknown, never `$0`.
+    pub unknown_cost_count: u64,
 }
 
 fn decode_aggregate(
@@ -191,6 +208,8 @@ fn decode_aggregate(
     let cost_usd: Option<f64> = row.try_get_by_index(11)?;
     let cost_estimate_micro_dollars: Option<i64> = row.try_get_by_index(12)?;
     let failed_count: i64 = row.try_get_by_index(13)?;
+    let unknown_usage_count: i64 = row.try_get_by_index(14)?;
+    let unknown_cost_count: i64 = row.try_get_by_index(15)?;
 
     // Reify the SELECT-prefix shape into the documented public form
     // so a caller using `aggregate_by_model_filtered` (the back-compat
@@ -225,6 +244,8 @@ fn decode_aggregate(
         cost_usd,
         cost_estimate_micro_dollars: cost_estimate_micro_dollars.map(non_negative_u64),
         failed_count: non_negative_u64(failed_count),
+        unknown_usage_count: non_negative_u64(unknown_usage_count),
+        unknown_cost_count: non_negative_u64(unknown_cost_count),
     })
 }
 
@@ -251,6 +272,22 @@ fn usage_where_clause(filter: &UsageQueryFilter) -> (String, Vec<Value>) {
     if let Some(thread_id) = filter.thread_id.as_ref() {
         clauses.push("thread_id = ?");
         values.push(thread_id.clone().into());
+    }
+    if let Some(run_id) = filter.run_id.as_ref() {
+        clauses.push("run_id = ?");
+        values.push(run_id.clone().into());
+    }
+    if let Some(turn_id) = filter.turn_id.as_ref() {
+        clauses.push("turn_id = ?");
+        values.push(turn_id.clone().into());
+    }
+    if let Some(agent_run_id) = filter.agent_run_id.as_ref() {
+        clauses.push("agent_run_id = ?");
+        values.push(agent_run_id.clone().into());
+    }
+    if let Some(agent_name) = filter.agent_name.as_ref() {
+        clauses.push("agent_name = ?");
+        values.push(agent_name.clone().into());
     }
     if !filter.include_failed {
         clauses.push("success = 1");
@@ -338,6 +375,10 @@ mod tests {
         assert!(filter.until.is_none());
         assert!(filter.session_id.is_none());
         assert!(filter.thread_id.is_none());
+        assert!(filter.run_id.is_none());
+        assert!(filter.turn_id.is_none());
+        assert!(filter.agent_run_id.is_none());
+        assert!(filter.agent_name.is_none());
     }
 
     /// `non_negative_u64` clamps negatives to 0, passes non-negatives
@@ -373,6 +414,7 @@ mod tests {
             session_id: Some("s1".to_string()),
             thread_id: Some("t1".to_string()),
             include_failed: false,
+            ..Default::default()
         };
         let (sql, values) = usage_where_clause(&filter);
         // Should be 4 bound values; `include_failed=false` adds a

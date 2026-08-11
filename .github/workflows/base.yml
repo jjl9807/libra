@@ -97,6 +97,9 @@ jobs:
       - name: Lint web
         run: pnpm --dir web lint
 
+      - name: Test web
+        run: pnpm --dir web test
+
       - name: Build web (static export → web/out/)
         run: pnpm --dir web build
 
