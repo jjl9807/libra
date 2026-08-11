@@ -111,7 +111,7 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 - `POST /api/code/controller/attach` — loopback。`kind: "automation"` 请求还要求 `X-Libra-Control-Token`。handler **签发** lease 的 `controllerToken`（不期待调用方发送它）。
 - `POST /api/code/controller/detach`、`POST /api/code/messages`、`POST /api/code/interactions/{id}` — loopback + `X-Code-Controller-Token`；`Automation` leases 还要求 `X-Libra-Control-Token`。
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`。`Automation` leases 也要求 `X-Libra-Control-Token`；这是与 TUI `Esc` cancel 路径的唯一区别。
-- `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`；用户发起的 sub-agent dispatch 需要 automation lease。
+- `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`；用户发起的 sub-agent dispatch 需要 active controller write lease（browser 或 automation）。Automation lease 额外要求 `X-Libra-Control-Token`。
 - `POST /api/code/goal/start`、`POST /api/code/goal/cancel` — loopback + `X-Code-Controller-Token`；goal mutation 需要 active controller lease。
 
 浏览器写请求共享与自动化控制相同的 256 KiB body limit 和 audit-sink wiring。浏览器只在内存中持久化 lease；重新加载页面会丢弃 lease，下一次写入会重新 attach。

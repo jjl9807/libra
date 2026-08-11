@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-09, 2026-08-11)
+
+- **W2-09 delivers browser Goal/task/skill controls.** Domain helpers under
+  `web/src/lib/code-ui/goal-task-skill/` drive `SessionGoalTaskSkill` panels for
+  Goal start/status/cancel, task dispatch (active controller lease), and A0-07
+  curated skill discovery validation (runtime skill HTTP remains W3-01).
+  `BrowserController.withLease` is exposed for domain writes; command docs
+  clarify browser-capable `/task/dispatch`.
+
 ### Added (plan-20260715 W2-08, 2026-08-11)
 
 - **W2-08 delivers browser approval and `request_user_input` panels.** Domain

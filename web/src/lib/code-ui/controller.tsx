@@ -17,6 +17,8 @@ export interface BrowserController {
   clientId: string;
   token?: string;
   ensureLease(): Promise<string>;
+  /** Run a write with the same stale-lease recovery as submit/respond/cancel. */
+  withLease<T>(operation: (lease: string) => Promise<T>): Promise<T>;
   submit(text: string, commandId?: string): Promise<void>;
   respond(interactionId: string, response: CodeUiInteractionResponse): Promise<void>;
   cancel(): Promise<void>;
@@ -108,6 +110,7 @@ export function BrowserControllerProvider({
         return token.current;
       },
       ensureLease,
+      withLease,
       submit: async (text, commandId) => {
         await withLease((lease) => client.submit(text, lease, commandId));
       },

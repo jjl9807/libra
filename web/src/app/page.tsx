@@ -1,5 +1,6 @@
 "use client";
 
+import { SessionGoalTaskSkill } from "@/components/workspace/goal-task-skill/SessionGoalTaskSkill";
 import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
 import { BrowserControllerProvider } from "@/lib/code-ui/controller";
 import { CodeUiStoreProvider, useCodeUiStore } from "@/lib/code-ui/store";
@@ -20,6 +21,7 @@ function PlaceholderShell() {
             : "Loading session…"}
       </p>
       <SessionInteractions />
+      <SessionGoalTaskSkill />
     </main>
   );
 }
