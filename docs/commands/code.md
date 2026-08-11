@@ -107,18 +107,19 @@ Automation clients attach with `POST /api/code/controller/attach`, body `{ "clie
 
 Selecting `loopback` is rejected when `--host` is not a loopback address, and the flag conflicts with `--stdio`. The browser server-side endpoints are tagged in the `code_router()` audit matrix (`src/internal/ai/web/mod.rs`):
 
-- `GET /api/code/session`, `GET /api/code/events`, `GET /api/code/diagnostics`, `GET /api/code/threads`, `GET /api/code/goal/status` — loopback-only observe.
+- `GET /api/code/session`, `GET /api/code/events`, `GET /api/code/diagnostics`, `GET /api/code/threads`, `GET /api/code/usage`, `GET /api/code/skills`, `GET /api/code/goal/status` — loopback-only observe.
 - `POST /api/code/controller/attach` — loopback. `kind: "automation"` requests additionally require `X-Libra-Control-Token`. The handler **issues** the lease's `controllerToken` (it does not expect the caller to send one).
 - `POST /api/code/controller/detach`, `POST /api/code/messages`, `POST /api/code/interactions/{id}` — loopback + `X-Code-Controller-Token`; `Automation` leases additionally require `X-Libra-Control-Token`.
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`. `Automation` leases also require `X-Libra-Control-Token`; this is the only difference from the TUI `Esc` cancel path.
 - `POST /api/code/task/dispatch` — loopback + `X-Code-Controller-Token`; user-initiated sub-agent dispatch requires an active controller write lease (browser or automation). Automation leases additionally require `X-Libra-Control-Token`.
 - `POST /api/code/goal/start`, `POST /api/code/goal/cancel` — loopback + `X-Code-Controller-Token`; goal mutation requires the active controller lease.
+- `POST /api/code/skills/activate`, `POST /api/code/session/resume` — loopback + `X-Code-Controller-Token` on the write router (256 KiB body limit); both require an active controller write lease. Automation leases additionally require `X-Libra-Control-Token`. Resume refuses busy and indeterminate snapshots, and currently fail-closes with `SESSION_RESUME_REQUIRES_RESTART` after proving the target thread is loadable (in-process AgentRuntime swap is not available yet). Skill activate fail-closes with `SKILL_ACTIVATION_UNSUPPORTED` after discoverability validation until a provider-consumed activation path exists.
 
 Browser write requests share the same 256 KiB body limit and audit-sink wiring as automation control. The browser persists the lease only in memory; reloading the page drops the lease and the next write reattaches.
 
-The embedded SPA session-lifecycle panels list threads via `GET /api/code/threads`, cancel the active turn through `POST /api/code/control/cancel` (fail-closed when `controller.canWrite` is false), and classify resume targets from the live snapshot (`capabilities.providerSessionResume` plus terminal/awaiting phases). Browser resume HTTP is deferred to a later wire card; until then the UI explains restarting with `libra code --resume <thread_id>` from the session's original working directory. Thread list is repository-storage-scoped (shared across linked worktrees), while CLI `--resume` is working-directory scoped — a foreign-worktree thread fails if started from the wrong cwd.
+The embedded SPA session-lifecycle panels list threads via `GET /api/code/threads`, cancel the active turn through `POST /api/code/control/cancel` (fail-closed when `controller.canWrite` is false), and post resume selection through `POST /api/code/session/resume` with `{ "threadId": "..." }`. Thread list is repository-storage-scoped (shared across linked worktrees), while resume is working-directory scoped; listed items omit `workingDir` until ThreadProjection persists a per-thread cwd.
 
-The usage panel mirrors the W2-12 `RuntimeUsageTotals` read model (cumulative, current-turn delta, sub-agent attribution) and keeps `partial`/`unknown`/`error` visible instead of pretending zero spend. Live `GET /api/code/usage` is deferred to a later wire card; until then the panel stays empty unless a fixture or injected transport supplies totals.
+The usage panel mirrors the W2-12 `RuntimeUsageTotals` read model (cumulative, current-turn delta, sub-agent attribution) and keeps `partial`/`unknown`/`error` visible instead of pretending zero spend. `GET /api/code/usage` reads durable totals and returns an error rather than fabricated zeroes. When durable sub-agent enumeration is unavailable, the response omits `subAgents` and sets `subAgentsStatus: "unavailable"` instead of an empty array.
 
 The execution/repair panel projects `plans[]`, `toolCalls[]`, and `planExecutionRepair` from the live session snapshot. Continue/Cancel post through `POST /api/code/interactions/{id}` with `selectedOption` (`continue` / `cancel`); when projected `attempt >= max_attempts`, Continue also sends a raised `maxAttempts` (capped at 10) without reclassifying the failure on the client.
 
@@ -155,7 +156,9 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 
 `GET /api/code/events` streams `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and `data`. Event `type` is `session_updated`, `status_changed`, or `controller_changed`; `session_updated` carries a full `CodeUiSessionSnapshot`.
 
-`GET /api/code/threads` returns `{ items, nextOffset? }`. Each item has `id`, optional `title`, `archived`, optional `currentIntentId`, `createdAt`, and `updatedAt`. `limit` defaults to 50 and clamps to 200; malformed `limit` or `offset` returns `INVALID_QUERY_PARAM`.
+`GET /api/code/threads` returns `{ items, nextOffset? }`. Each item has `id`, optional `title`, `archived`, optional `currentIntentId`, optional `workingDir`, `createdAt`, and `updatedAt`. `workingDir` is omitted until ThreadProjection persists a per-thread cwd (do not invent the server cwd for linked-worktree threads). `limit` defaults to 50 and clamps to 200; malformed `limit` or `offset` returns `INVALID_QUERY_PARAM`.
+
+`GET /api/code/skills?provider=<slug>&skill=<name>` returns curated A0-07 `{ items: [{ name, provider }] }`. An unknown `provider` slug returns `INVALID_SKILL_PROVIDER` (same contract as activate); omit `provider` to list all curated providers. `POST /api/code/skills/activate` accepts `{ provider, name }`; after discoverability validation it currently returns `SKILL_ACTIVATION_UNSUPPORTED` until an in-process provider activation path exists.
 
 Code UI API errors use `{ error: { code, message } }`:
 
@@ -176,9 +179,18 @@ Code UI API errors use `{ error: { code, message } }`:
 | `INVALID_QUERY_PARAM` | 400 | Query parsing failed, currently for `/threads` pagination. |
 | `INVALID_COMMAND_ID` | 400 | `commandId` was empty, too long, or contained whitespace/control characters. |
 | `STORAGE_PATH_INVALID` | 500 | Storage-root resolution failed. |
+| `STORAGE_ROOT_UNRESOLVED` | 500 | Repository storage root could not be resolved. |
 | `STATUS_UNAVAILABLE` | 500 | Runtime status snapshot is unavailable. |
 | `THREAD_LIST_FAILED` | 500 | Thread projection enumeration failed. |
 | `DB_UNAVAILABLE` | 500 | Session database is offline. |
+| `USAGE_UNAVAILABLE` | 500 | Durable runtime usage could not be queried. |
+| `INVALID_SKILL_PROVIDER` | 400 | The requested skill provider is not an A0-07 agent slug. |
+| `SKILL_NOT_DISCOVERABLE` | 400 | The requested skill is not curated for that provider. |
+| `SKILL_ACTIVATION_UNSUPPORTED` | 422 | Skill is discoverable, but in-process activation is not available yet. |
+| `SESSION_RESUME_BUSY` | 409 | A thinking or tool-running session cannot be replaced. |
+| `SESSION_RESUME_NOT_FOUND` | 404 | No matching session exists under this working directory. |
+| `SESSION_RESUME_REQUIRES_RESTART` | 422 | Target thread is loadable, but in-process AgentRuntime swap is not available; restart with `libra code --resume <threadId>`. |
+| `SESSION_RESUME_LOAD_FAILED` | 500 | Target thread exists but session storage/checkpoint could not be loaded or folded. |
 | `RECONCILIATION_REQUIRED` | 409 | A mutating turn needs manual reconciliation before another turn can run. |
 | `COMMAND_PAYLOAD_CONFLICT` | 409 | The same `commandId` was reused with a different message payload. |
 | `COMMAND_ALREADY_TERMINAL` | 409 | The same `commandId` already finished failed/cancelled/indeterminate; allocate a new `commandId` to retry. |

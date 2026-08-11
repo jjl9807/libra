@@ -53,12 +53,16 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::code_ui::{
-    CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
-    CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
-    CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot,
-    CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiReadModel, CodeUiSession, CodeUiSessionSnapshot,
-    CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
+use super::{
+    agent_runtime_adapter::AgentRuntimeCodeUiAdapter,
+    code_ui::{
+        CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter,
+        CodeUiEventType, CodeUiInteractionKind, CodeUiInteractionOption, CodeUiInteractionRequest,
+        CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiPatchChange,
+        CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep, CodeUiReadModel, CodeUiSession,
+        CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+        CodeUiTranscriptEntryKind,
+    },
 };
 use crate::internal::ai::{
     agent::runtime::{ToolLoopCancellation, run_tool_loop_with_history_and_observer},
@@ -573,9 +577,9 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// Optional on-disk session persistence used by `libra code --web-only
     /// --resume <thread_id>` for non-Codex providers.
     persistence: Option<HeadlessSessionPersistence>,
-    /// Runtime-owned Goal/task controls. This is deliberately separate from
-    /// the Code UI adapter so browser control never needs a TUI App hop.
-    execution_control: Arc<ExecutionControlService>,
+    /// Bridge used by headless goal/task controls so they follow the same
+    /// AgentRuntime adapter contract as managed Code sessions.
+    runtime_bridge: Arc<AgentRuntimeCodeUiAdapter>,
 }
 
 impl<M> HeadlessCodeRuntime<M>
@@ -738,6 +742,15 @@ where
             }
         }
         let (runtime_handle, runtime_worker_task) = AgentRuntimeWorker::spawn(worker_config);
+        let runtime_bridge = AgentRuntimeCodeUiAdapter::new(
+            session.clone(),
+            capabilities.clone(),
+            runtime_handle.clone(),
+            runtime_session_id.clone(),
+            execution_control.clone(),
+            None,
+            None,
+        );
         let runtime = Arc::new(Self {
             model_type: PhantomData,
             session,
@@ -754,7 +767,7 @@ where
             interaction_persistence_failed,
             shutdown_result_tx,
             persistence,
-            execution_control,
+            runtime_bridge,
         });
 
         let weak_listener = Arc::downgrade(&runtime);
@@ -1506,30 +1519,21 @@ where
     async fn task_dispatch(&self, agent: String, prompt: String) -> anyhow::Result<String> {
         self.ensure_not_shutting_down()?;
         self.ensure_session_is_recoverable().await?;
-        self.execution_control.task_dispatch(agent, prompt).await
+        self.runtime_bridge.task_dispatch(agent, prompt).await
     }
 
     async fn goal_start(&self, objective: String) -> anyhow::Result<String> {
         self.ensure_not_shutting_down()?;
-        self.execution_control
-            .goal_start(objective)
-            .await
-            .map_err(Into::into)
+        self.runtime_bridge.goal_start(objective).await
     }
 
     async fn goal_status(&self) -> anyhow::Result<String> {
-        self.execution_control
-            .goal_status()
-            .await
-            .map_err(Into::into)
+        self.runtime_bridge.goal_status().await
     }
 
     async fn goal_cancel(&self, reason: String) -> anyhow::Result<String> {
         self.ensure_not_shutting_down()?;
-        self.execution_control
-            .goal_cancel(reason)
-            .await
-            .map_err(Into::into)
+        self.runtime_bridge.goal_cancel(reason).await
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {

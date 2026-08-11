@@ -5,6 +5,11 @@ export interface ThreadListItem {
   title?: string;
   archived: boolean;
   currentIntentId?: string;
+  /**
+   * Omitted until ThreadProjection persists a per-thread cwd. Clients must not
+   * invent the live session cwd for foreign threads.
+   */
+  workingDir?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -12,6 +17,10 @@ export interface ThreadListItem {
 export interface ThreadListResponse {
   items: ThreadListItem[];
   nextOffset?: number;
+}
+
+export interface SessionResumeRequest {
+  threadId: string;
 }
 
 export interface SessionLifecycleTransport {
@@ -52,6 +61,21 @@ export function createSessionLifecycleApi(
         offset: String(offset),
       });
       return transport.request(`/api/code/threads?${params.toString()}`);
+    },
+    /**
+     * Leased browser resume. Production currently fail-closes with
+     * `SESSION_RESUME_REQUIRES_RESTART` after proving the thread is loadable —
+     * callers should surface the server message (CLI restart hint).
+     */
+    resumeSession(threadId: string, controllerToken: string): Promise<unknown> {
+      return transport.request("/api/code/session/resume", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Code-Controller-Token": controllerToken,
+        },
+        body: JSON.stringify({ threadId } satisfies SessionResumeRequest),
+      });
     },
   };
 }

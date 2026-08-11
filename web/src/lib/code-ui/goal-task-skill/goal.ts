@@ -123,6 +123,16 @@ export function createGoalTaskSkillApi(
         body: JSON.stringify({ agent, prompt }),
       });
     },
+    activateSkill(
+      activation: { provider: string; name: string },
+      token: string,
+    ): Promise<{ accepted: true; effect?: string; activated?: boolean; message?: string }> {
+      return transport.request("/api/code/skills/activate", {
+        method: "POST",
+        headers: headers(token),
+        body: JSON.stringify(activation),
+      });
+    },
   };
 }
 

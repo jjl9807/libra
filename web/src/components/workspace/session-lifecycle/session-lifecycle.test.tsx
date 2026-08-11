@@ -122,7 +122,7 @@ describe("workspace session-lifecycle", () => {
     await unmount(root, container);
   });
 
-  it("cancels through SessionLifecycle and explains process-level resume", async () => {
+  it("cancels through SessionLifecycle and posts leased resume", async () => {
     const client = new MockCodeUiClient(
       terminalSessionFixture({
         threadId: "thread-fixture",
@@ -131,11 +131,24 @@ describe("workspace session-lifecycle", () => {
     );
     const cancel = vi.fn(async () => ({ accepted: true }));
     client.cancel = cancel;
-    const api = createSessionLifecycleApi({
-      async request<T>(): Promise<T> {
-        return threadListFixture() as T;
-      },
+    const resume = vi.fn(async () => {
+      throw {
+        status: 422,
+        code: "SESSION_RESUME_REQUIRES_RESTART",
+        message: "restart with `libra code --resume thread-fixture-2`",
+      };
     });
+    const api = {
+      ...createSessionLifecycleApi({
+        async request<T>(path: string): Promise<T> {
+          if (path.startsWith("/api/code/threads")) {
+            return threadListFixture() as T;
+          }
+          throw new Error(`unexpected path ${path}`);
+        },
+      }),
+      resumeSession: resume,
+    };
 
     const { root, container } = await mount(
       createElement(
@@ -167,8 +180,11 @@ describe("workspace session-lifecycle", () => {
         button.textContent === "Prepare resume",
       ) as HTMLButtonElement).click();
     });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(resume).toHaveBeenCalledWith("thread-fixture-2", expect.any(String));
     expect(container.textContent).toMatch(/libra code --resume thread-fixture-2/);
-    expect(container.textContent).toMatch(/working directory/i);
 
     const cancelButton = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "Cancel turn",

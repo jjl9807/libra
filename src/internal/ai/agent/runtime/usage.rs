@@ -8,7 +8,8 @@ use sea_orm::DbErr;
 use crate::internal::ai::usage::{UsageAggregate, UsageQueryFilter, UsageRecorder};
 
 /// Whether a displayed usage dimension is complete.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum UsageStatus {
     Known,
     Partial,
@@ -26,11 +27,14 @@ impl UsageStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeUsageTotals {
     pub request_count: u64,
     pub total_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_estimate_micro_dollars: Option<u64>,
     pub usage_status: UsageStatus,
     pub cost_status: UsageStatus,

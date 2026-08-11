@@ -5,10 +5,20 @@ import type { SubAgentUsageRow } from "../../../lib/code-ui/usage";
 import { UsageTotalsPanel } from "./UsageTotalsPanel";
 
 export interface SubAgentUsageListProps {
-  rows: SubAgentUsageRow[];
+  rows?: SubAgentUsageRow[];
+  status?: "unavailable" | "ready";
 }
 
-export function SubAgentUsageList({ rows }: SubAgentUsageListProps) {
+export function SubAgentUsageList({ rows, status }: SubAgentUsageListProps) {
+  if (status === "unavailable" || rows === undefined) {
+    return (
+      <section aria-label="Sub-agent usage">
+        <h3>Sub-agent attribution</h3>
+        <p>Sub-agent attribution is unavailable.</p>
+      </section>
+    );
+  }
+
   if (rows.length === 0) {
     return (
       <section aria-label="Sub-agent usage">

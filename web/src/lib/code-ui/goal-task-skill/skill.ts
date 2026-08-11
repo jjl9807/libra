@@ -23,6 +23,10 @@ export interface SkillActivation {
   name: string;
 }
 
+export interface SkillTransport {
+  request<T>(path: string, init?: RequestInit): Promise<T>;
+}
+
 /** Curated A0-07 discovery rows pinned from `skill_registry_for`. */
 export const A0_07_DISCOVERED_SKILLS: readonly DiscoveredSkill[] = [
   { name: "/review", provider: "claude-code" },
@@ -60,10 +64,36 @@ export function validateSkillActivation(activation: SkillActivation): string | u
   return undefined;
 }
 
+/** Live skill discovery and leased activation endpoints. */
+export function createSkillApi(transport: SkillTransport) {
+  return {
+    list(query: SkillSearchQuery = {}): Promise<{ items: DiscoveredSkill[] }> {
+      const params = new URLSearchParams();
+      if (query.provider) params.set("provider", query.provider);
+      if (query.skill) params.set("skill", query.skill);
+      const suffix = params.toString();
+      return transport.request(`/api/code/skills${suffix ? `?${suffix}` : ""}`);
+    },
+    activate(
+      activation: SkillActivation,
+      controllerToken: string,
+    ): Promise<{ accepted: true; effect?: string; activated?: boolean; message?: string }> {
+      return transport.request("/api/code/skills/activate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Code-Controller-Token": controllerToken,
+        },
+        body: JSON.stringify(activation),
+      });
+    },
+  };
+}
+
 /**
  * Fixture-backed discovery check mirroring
  * `ExecutionControlService::skill_activate` validation.
- * Runtime invocation / SkillEvent projection remains W3-01 HTTP.
+ * Live activation posts through `createSkillApi` / goal-task-skill API.
  */
 export function validateDiscoveredSkill(activation: SkillActivation): {
   accepted: boolean;
@@ -73,7 +103,7 @@ export function validateDiscoveredSkill(activation: SkillActivation): {
   if (error) throw new Error(error);
   return {
     accepted: true,
-    message: `Discoverable: ${activation.name} for ${activation.provider} (runtime activation awaits Code UI skill HTTP)`,
+    message: `Discoverable: ${activation.name} for ${activation.provider} (in-process activation is unsupported until the provider emits SkillEvent)`,
   };
 }
 

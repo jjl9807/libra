@@ -137,7 +137,12 @@ fn code_ui_snapshot_uses_projection_thread_identity_and_scheduler_state() {
         &bundle,
     );
 
-    assert_eq!(snapshot.session_id, bundle.thread.thread_id.to_string());
+    assert_ne!(
+        snapshot.session_id,
+        bundle.thread.thread_id.to_string(),
+        "bundle projection must not overwrite session_id with the thread UUID \
+         (usage attribution keys off SessionState.id; resume stamps it)"
+    );
     assert_eq!(
         snapshot.thread_id,
         Some(bundle.thread.thread_id.to_string())

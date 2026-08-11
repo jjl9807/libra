@@ -66,7 +66,7 @@ describe("goal-task-skill helpers", () => {
     expect(activateDiscoveredSkill({ provider: "opencode", name: "/review" })).toEqual({
       accepted: true,
       message:
-        "Discoverable: /review for opencode (runtime activation awaits Code UI skill HTTP)",
+        "Discoverable: /review for opencode (in-process activation is unsupported until the provider emits SkillEvent)",
     });
   });
 
@@ -84,6 +84,13 @@ describe("goal-task-skill helpers", () => {
         }
         if (path === "/api/code/task/dispatch") {
           return { accepted: true, result: "dispatched" } as T;
+        }
+        if (path === "/api/code/skills/activate") {
+          throw {
+            status: 422,
+            code: "SKILL_ACTIVATION_UNSUPPORTED",
+            message: "discoverable but unsupported",
+          };
         }
         throw new Error(`unexpected ${path}`);
       },
@@ -103,6 +110,9 @@ describe("goal-task-skill helpers", () => {
     await expect(api.dispatchTask("helper", "inspect", "lease")).resolves.toEqual({
       accepted: true,
       result: "dispatched",
+    });
+    await expect(api.activateSkill({ provider: "codex", name: "/review" }, "lease")).rejects.toMatchObject({
+      code: "SKILL_ACTIVATION_UNSUPPORTED",
     });
   });
 });

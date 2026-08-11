@@ -27,12 +27,12 @@ export interface SessionUsageProps {
 }
 
 /**
- * Displays W2-12 usage read model totals. Live `/api/code/usage` is W3-01;
- * until then absent HTTP surfaces an explicit empty/deferred state (not zeros).
+ * Displays W2-12 usage read model totals via `GET /api/code/usage`.
+ * Absent HTTP surfaces an explicit empty/deferred state (not zeros).
  *
  * Snapshot has sessionId/threadId but no runtime turnId yet — never pass
  * threadId as turnId. Current-turn delta arrives in the read model body when
- * the future wire includes it.
+ * the wire includes it.
  */
 export function SessionUsage({ api: injectedApi, initialModel }: SessionUsageProps) {
   const { snapshot } = useCodeUiStore();
@@ -66,7 +66,7 @@ export function SessionUsage({ api: injectedApi, initialModel }: SessionUsagePro
       if (isAbsentUsageError(cause)) {
         setModel(undefined);
         setDeferredHint(
-          "Usage query HTTP lands in W3-01. Until then this panel stays empty unless a fixture/injected transport supplies the W2-12 read model.",
+          "Usage query is unavailable for this session. Totals stay empty unless a fixture/injected transport supplies the W2-12 read model.",
         );
         return;
       }

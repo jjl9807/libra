@@ -39,14 +39,13 @@ export class FetchUsageTransport implements UsageTransport {
 }
 
 /**
- * Usage query HTTP is W3-01. The path is reserved so fixture/injected transports
- * and the future wire share one client surface.
+ * Usage query HTTP for the W2-12 read model (`GET /api/code/usage`).
  */
 export function createUsageApi(transport: UsageTransport = new FetchUsageTransport()) {
   return {
     /**
-     * Observe usage for the active session. Production returns 404 until W3-01
-     * registers the route; SessionUsage treats that as empty state.
+     * Observe usage for the active session. Absent HTTP (404) is treated as
+     * empty/deferred by SessionUsage.
      */
     fetchReadModel(scope: UsageQueryScope = {}): Promise<UsageReadModel> {
       const params = new URLSearchParams();

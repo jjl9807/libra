@@ -56,9 +56,9 @@ describe("usage helpers", () => {
 
   it("keeps sub-agent rows distinct from cumulative", () => {
     const model = usageReadModelFixture();
-    expect(model.subAgents[0]?.totals.usageStatus).toBe("unknown");
+    expect(model.subAgents?.[0]?.totals.usageStatus).toBe("unknown");
     expect(model.cumulative.usageStatus).toBe("partial");
-    expect(model.subAgents[0]?.agentName).toBe("reviewer");
+    expect(model.subAgents?.[0]?.agentName).toBe("reviewer");
   });
 
   it("lists usage through the domain API", async () => {

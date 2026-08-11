@@ -35,7 +35,10 @@ export function UsageHost({
         totals={model?.turnDelta}
         emptyLabel="No current-turn delta loaded."
       />
-      <SubAgentUsageList rows={model?.subAgents ?? []} />
+      <SubAgentUsageList
+        rows={model?.subAgents}
+        status={model?.subAgentsStatus}
+      />
       {error ? <p role="alert">{error}</p> : null}
     </div>
   );

@@ -2578,7 +2578,6 @@ fn build_code_ui_resume_bootstrap_snapshot(
         },
         None => None,
     };
-    let used_checkpoint = checkpoint.is_some();
     let mut snapshot = match (checkpoint, projection_bundle) {
         (Some(checkpoint), _) => checkpoint,
         (None, Some(bundle)) => snapshot_from_thread_bundle(
@@ -2592,11 +2591,15 @@ fn build_code_ui_resume_bootstrap_snapshot(
         }
     };
 
-    if used_checkpoint || projection_bundle.is_none() {
-        snapshot.session_id = session.id.clone();
-        snapshot.thread_id =
-            Some(session_canonical_thread_id(session).unwrap_or_else(|| session.id.clone()));
-    }
+    // Always stamp durable session/thread identity — including the
+    // ThreadBundle bootstrap path. `snapshot_from_thread_bundle` only sets
+    // thread_id; leaving session_id as a random placeholder (or historically
+    // as the thread UUID) breaks SPA `/usage` filters that AND both IDs
+    // against rows recorded under SessionState.id + canonical thread_id.
+    snapshot.session_id = session.id.clone();
+    snapshot.thread_id = session_canonical_thread_id(session)
+        .or_else(|| projection_bundle.map(|bundle| bundle.thread.thread_id.to_string()))
+        .or_else(|| Some(session.id.clone()));
     snapshot.working_dir = working_dir;
     snapshot.provider = provider;
     snapshot.capabilities = capabilities;
@@ -2657,6 +2660,87 @@ fn fold_code_ui_resume_from_session(
         snapshot: folded.snapshot,
         projection_sequence: folded.last_sequence.unwrap_or(projection_cursor),
     })
+}
+
+/// Rebuild a browser Code UI snapshot for a selected durable thread.
+///
+/// Session stores are scoped to the current working directory until
+/// `ThreadProjection` records per-thread paths, so callers must provide the
+/// server working directory rather than infer it from the repository-wide
+/// thread list.
+pub enum ResumeCodeUiSessionError {
+    NotFound {
+        thread_id: String,
+        working_dir: String,
+    },
+    LoadFailed {
+        thread_id: String,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for ResumeCodeUiSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound {
+                thread_id,
+                working_dir,
+            } => write!(
+                f,
+                "no Code session for thread '{thread_id}' exists under '{working_dir}'; resume from that thread's original working directory"
+            ),
+            Self::LoadFailed { thread_id, message } => write!(
+                f,
+                "failed to load Code session for thread '{thread_id}': {message}"
+            ),
+        }
+    }
+}
+
+pub fn resume_code_ui_session_to_thread(
+    working_dir: &Path,
+    thread_id: &str,
+    provider: CodeUiProviderInfo,
+    capabilities: CodeUiCapabilities,
+) -> Result<CodeUiSessionSnapshot, ResumeCodeUiSessionError> {
+    let storage_root =
+        resolve_storage_root(working_dir).ok_or_else(|| ResumeCodeUiSessionError::LoadFailed {
+            thread_id: thread_id.to_string(),
+            message: "cannot resolve the repository storage root; if this is a linked worktree, \
+                      run `libra worktree repair --confirm <worktree-path>`"
+                .to_string(),
+        })?;
+    // Match the CLI `--resume` path: sessions live on the shared repository
+    // storage root, not under a linked worktree's local `.libra/`.
+    let session_store = SessionStore::from_storage_path(&storage_root);
+    let working_dir_string = working_dir.to_string_lossy().to_string();
+    let session = session_store
+        .load_for_thread_id(thread_id, &working_dir_string)
+        .map_err(|error| ResumeCodeUiSessionError::LoadFailed {
+            thread_id: thread_id.to_string(),
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| ResumeCodeUiSessionError::NotFound {
+            thread_id: thread_id.to_string(),
+            working_dir: working_dir.display().to_string(),
+        })?;
+    let bootstrap = build_code_ui_resume_bootstrap_snapshot(
+        working_dir_string,
+        &session,
+        provider,
+        capabilities,
+        None,
+    )
+    .map_err(|message| ResumeCodeUiSessionError::LoadFailed {
+        thread_id: thread_id.to_string(),
+        message,
+    })?;
+    fold_code_ui_resume_from_session(&session_store, &session, bootstrap)
+        .map(|fold| fold.snapshot)
+        .map_err(|message| ResumeCodeUiSessionError::LoadFailed {
+            thread_id: thread_id.to_string(),
+            message,
+        })
 }
 
 /// Build a headless Code UI runtime for `--web-only` non-Codex providers.
@@ -3801,6 +3885,9 @@ where
     };
     let code_ui_runtime = if let Some(runtime) = managed_code_ui_runtime.clone() {
         if let Some(control_tx) = code_control_tx {
+            // Managed Codex owns the AgentRuntime, but HTTP writes for the
+            // TUI+browser path still need TuiCodeUiAdapter so cancel / interact /
+            // goal / task / automation-lease route through the TUI control channel.
             let adapter = runtime.adapter();
             let code_ui_session = adapter.session();
             let capabilities = adapter.capabilities();

@@ -35,14 +35,29 @@ describe("session-lifecycle helpers", () => {
     expect(canSelectThreadForResume(ready, "thread-fixture-2", "thread-fixture")).toBeUndefined();
   });
 
-  it("lists threads through the domain API", async () => {
+  it("lists threads and posts resume through the domain API", async () => {
     const response = threadListFixture();
     const api = createSessionLifecycleApi({
-      async request<T>(path: string): Promise<T> {
-        expect(path).toBe("/api/code/threads?limit=50&offset=0");
-        return response as T;
+      async request<T>(path: string, init?: RequestInit): Promise<T> {
+        if (path.startsWith("/api/code/threads")) {
+          expect(path).toBe("/api/code/threads?limit=50&offset=0");
+          return response as T;
+        }
+        expect(path).toBe("/api/code/session/resume");
+        expect(init?.method).toBe("POST");
+        expect(init?.headers).toMatchObject({
+          "X-Code-Controller-Token": "lease-token",
+        });
+        throw {
+          status: 422,
+          code: "SESSION_RESUME_REQUIRES_RESTART",
+          message: "restart required",
+        };
       },
     });
     await expect(api.listThreads()).resolves.toEqual(response);
+    await expect(api.resumeSession("thread-fixture-2", "lease-token")).rejects.toMatchObject({
+      code: "SESSION_RESUME_REQUIRES_RESTART",
+    });
   });
 });

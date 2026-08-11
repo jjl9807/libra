@@ -9,16 +9,21 @@
 
 use chrono::{DateTime, Utc};
 use libra::internal::ai::{
+    agent::runtime::{RuntimeUsageTotals, UsageStatus},
     runtime::{ExecutionFailureEvidence, ExecutionFailureRevision, PlanExecutionRepairState},
-    web::code_ui::{
-        CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiControllerAttachRequest,
-        CodeUiControllerAttachResponse, CodeUiControllerKind, CodeUiControllerState,
-        CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind, CodeUiInteractionOption,
-        CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
-        CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
-        CodeUiProviderInfo, CodeUiSession, CodeUiSessionSnapshot, CodeUiSessionStatus,
-        CodeUiTaskSnapshot, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
-        CodeUiTranscriptEntryKind,
+    web::{
+        ThreadListItem,
+        code_ui::{
+            CodeUiAckResponse, CodeUiApplyToFuture, CodeUiCapabilities,
+            CodeUiControllerAttachRequest, CodeUiControllerAttachResponse, CodeUiControllerKind,
+            CodeUiControllerState, CodeUiEventEnvelope, CodeUiEventType, CodeUiInteractionKind,
+            CodeUiInteractionOption, CodeUiInteractionRequest, CodeUiInteractionResponse,
+            CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot,
+            CodeUiPlanStep, CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest,
+            CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiSkillActivateRequest,
+            CodeUiTaskSnapshot, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
+            CodeUiTranscriptEntryKind,
+        },
     },
 };
 use serde_json::{Value, json};
@@ -482,5 +487,94 @@ async fn local_repair_continuation_resolves_code_ui_prompt_before_retry() {
             .map(|interaction| &interaction.status),
         Some(&CodeUiInteractionStatus::Resolved),
         "the old repair prompt must not remain selectable after local continuation"
+    );
+}
+
+/// W3-01: usage is a separate camelCase read model rather than fabricated
+/// fields on the session snapshot. This pins the browser's `UsageReadModel`
+/// totals contract used by `GET /api/code/usage`, including the fail-closed
+/// `subAgentsStatus` when durable child attribution is unavailable.
+#[test]
+fn code_ui_command_surface_full() {
+    let totals = RuntimeUsageTotals {
+        request_count: 3,
+        total_tokens: 120,
+        cost_usd: Some(0.01),
+        cost_estimate_micro_dollars: Some(10_000),
+        usage_status: UsageStatus::Partial,
+        cost_status: UsageStatus::Known,
+        error_status: UsageStatus::Known,
+        failed_count: 0,
+        unknown_usage_count: 1,
+        unknown_cost_count: 0,
+    };
+    let value = serde_json::to_value(totals).expect("usage totals serialize");
+    assert_eq!(value["requestCount"], Value::from(3));
+    assert_eq!(value["totalTokens"], Value::from(120));
+    assert_eq!(value["usageStatus"], Value::String("partial".to_string()));
+    assert_eq!(value["costStatus"], Value::String("known".to_string()));
+    assert_eq!(value["unknownUsageCount"], Value::from(1));
+
+    let activation = CodeUiSkillActivateRequest {
+        provider: "claude-code".to_string(),
+        name: "/review".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(activation).expect("skill activation serializes"),
+        json!({ "provider": "claude-code", "name": "/review" })
+    );
+
+    let usage_envelope = json!({
+        "cumulative": value,
+        "subAgentsStatus": "unavailable",
+    });
+    assert!(
+        usage_envelope.get("subAgents").is_none(),
+        "omit empty subAgents when attribution is unavailable"
+    );
+}
+
+/// W3-01: resume selection retains the original working directory and refuses
+/// to reinterpret an indeterminate session as a resumable idle snapshot.
+/// Thread list items omit workingDir until projections persist per-thread cwd.
+#[test]
+fn code_ui_browser_resume_contract() {
+    let snapshot = fully_populated_snapshot();
+    let value = serde_json::to_value(snapshot).expect("resume snapshot serializes");
+    assert_eq!(value["threadId"], Value::String("thread-1".to_string()));
+    assert_eq!(value["workingDir"], Value::String("/repo".to_string()));
+    assert_eq!(
+        value["status"],
+        Value::String("awaiting_interaction".to_string()),
+        "the browser must receive the live projected state before selecting resume"
+    );
+    let thread = ThreadListItem {
+        id: "thread-1".to_string(),
+        title: None,
+        archived: false,
+        current_intent_id: None,
+        working_dir: None,
+        created_at: fixed_ts(),
+        updated_at: fixed_ts(),
+    };
+    let thread_value = serde_json::to_value(thread).expect("thread list item serializes");
+    assert!(
+        thread_value.get("workingDir").is_none(),
+        "do not stamp server cwd onto repository-shared threads: {thread_value}"
+    );
+    let request = CodeUiSessionResumeRequest {
+        thread_id: "thread-1".to_string(),
+    };
+    assert_eq!(
+        serde_json::to_value(request).expect("resume request serializes"),
+        json!({ "threadId": "thread-1" })
+    );
+    assert!(matches!(
+        CodeUiSessionStatus::Thinking,
+        CodeUiSessionStatus::Thinking | CodeUiSessionStatus::ExecutingTool
+    ));
+    assert_eq!(
+        CodeUiSessionStatus::IndeterminateSideEffect,
+        CodeUiSessionStatus::IndeterminateSideEffect
     );
 }

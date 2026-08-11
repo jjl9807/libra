@@ -7,7 +7,6 @@ import {
   createGoalTaskSkillApi,
   isAbsentGoalError,
   parseGoalStatus,
-  validateDiscoveredSkill,
   validateObjective,
   validateSkillActivation,
   validateTaskDispatch,
@@ -165,9 +164,20 @@ export function SessionGoalTaskSkill({ api: injectedApi }: SessionGoalTaskSkillP
             return;
           }
           try {
-            const result = validateDiscoveredSkill(activation);
-            setLastSkillActivation(result.message);
+            await controller.withLease((token) => api.activateSkill(activation, token));
+            setLastSkillActivation(
+              `Activated ${activation.name} for ${activation.provider}.`,
+            );
           } catch (cause) {
+            const code =
+              cause && typeof cause === "object" && "code" in cause
+                ? String((cause as { code?: string }).code ?? "")
+                : "";
+            // Discoverable-but-not-activated is the honest W3-01 contract.
+            if (code === "SKILL_ACTIVATION_UNSUPPORTED") {
+              setLastSkillActivation(errorMessage(cause));
+              return;
+            }
             setSkillError(errorMessage(cause));
           }
         })

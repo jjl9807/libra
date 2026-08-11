@@ -60,13 +60,13 @@ describe("workspace usage", () => {
   it("keeps empty state explicit instead of fake zeros", async () => {
     const { root, container } = await mount(
       createElement(UsageHost, {
-        deferredHint: "Usage query HTTP lands in W3-01.",
+        deferredHint: "Usage query is unavailable for this session.",
         onRefresh: vi.fn(),
       }),
     );
     expect(container.textContent).toContain("No usage totals loaded.");
     expect(container.textContent).toContain("No current-turn delta loaded.");
-    expect(container.textContent).toContain("No sub-agent usage rows.");
+    expect(container.textContent).toContain("Sub-agent attribution is unavailable.");
     expect(container.textContent).not.toMatch(/Requests\s*0/);
     await unmount(root, container);
   });
@@ -135,8 +135,9 @@ describe("workspace usage", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(container.textContent).toMatch(/W3-01/);
+    expect(container.textContent).toMatch(/unavailable for this session/i);
     expect(container.textContent).toContain("No usage totals loaded.");
+    expect(container.textContent).toContain("Sub-agent attribution is unavailable.");
     await unmount(root, container);
   });
 

@@ -411,6 +411,21 @@ pub struct CodeUiGoalCancelRequest {
     pub reason: String,
 }
 
+/// `POST /api/code/skills/activate` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiSkillActivateRequest {
+    pub provider: String,
+    pub name: String,
+}
+
+/// `POST /api/code/session/resume` body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiSessionResumeRequest {
+    pub thread_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeUiDiagnosticsPorts {
@@ -1523,12 +1538,22 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("INVALID_QUERY_PARAM", 400),
         ("INVALID_COMMAND_ID", 400),
         ("STORAGE_PATH_INVALID", 500),
+        ("STORAGE_ROOT_UNRESOLVED", 500),
         ("STATUS_UNAVAILABLE", 500),
         ("THREAD_LIST_FAILED", 500),
         ("DB_UNAVAILABLE", 500),
+        ("USAGE_UNAVAILABLE", 500),
+        ("INVALID_SKILL_PROVIDER", 400),
+        ("SKILL_NOT_DISCOVERABLE", 400),
+        ("SKILL_ACTIVATION_UNSUPPORTED", 422),
+        ("SESSION_RESUME_BUSY", 409),
+        ("SESSION_RESUME_NOT_FOUND", 404),
+        ("SESSION_RESUME_REQUIRES_RESTART", 422),
+        ("SESSION_RESUME_LOAD_FAILED", 500),
         ("RECONCILIATION_REQUIRED", 409),
         ("COMMAND_PAYLOAD_CONFLICT", 409),
         ("COMMAND_ALREADY_TERMINAL", 409),
+        ("PLAN_REPAIR_RETRY_LIMIT_REACHED", 409),
         ("INTERNAL_ERROR", 500),
         ("UNSUPPORTED_OPERATION", 422),
     ]
@@ -1634,7 +1659,11 @@ pub fn apply_thread_bundle_to_snapshot(
     bundle: &ThreadBundle,
 ) {
     let thread_id = bundle.thread.thread_id.to_string();
-    snapshot.session_id = thread_id.clone();
+    // Keep snapshot.session_id intact. Durable usage rows key on
+    // SessionState.id; projecting the thread UUID into sessionId makes the
+    // SPA AND `/usage?sessionId=&threadId=` against the wrong session scope.
+    // Callers that own a SessionState must stamp session_id explicitly
+    // (see `build_code_ui_resume_bootstrap_snapshot`).
     snapshot.thread_id = Some(thread_id);
     snapshot.status = if bundle.scheduler.active_run_id.is_some() {
         CodeUiSessionStatus::ExecutingTool

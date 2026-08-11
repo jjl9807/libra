@@ -22,15 +22,20 @@ export interface SubAgentUsageRow {
 }
 
 /**
- * Composite read model for the usage panel. Live HTTP lands in W3-01;
- * until then SessionUsage consumes fixtures / injected transport.
+ * Composite read model for the usage panel.
  */
 export interface UsageReadModel {
   turnId?: string;
   sessionId?: string;
   cumulative: RuntimeUsageTotals;
   turnDelta?: RuntimeUsageTotals;
-  subAgents: SubAgentUsageRow[];
+  /**
+   * Absent when durable per-sub-agent enumeration is unavailable. An empty
+   * array would falsely mean "known zero sub-agents".
+   */
+  subAgents?: SubAgentUsageRow[];
+  /** `unavailable` until RuntimeUsageService can enumerate child agents. */
+  subAgentsStatus?: "unavailable" | "ready";
   /** Event ids already folded into the read model (presentation / dedupe demos). */
   foldedEventIds?: string[];
 }

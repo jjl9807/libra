@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-01, 2026-08-11)
+
+- **W3-01 delivers `AgentRuntimeCodeUiAdapter`.** Production Code UI HTTP bridges
+  usage/skills/resume through `AgentRuntimeHandle`; skill activate and in-process
+  resume fail closed; `/usage` prefers thread scope and ThreadBundle bootstrap
+  stamps durable `SessionState.id` (no longer mirrors thread UUID into sessionId).
+
 ### Added (plan-20260715 W2-09, 2026-08-11)
 
 - **W2-09 delivers browser Goal/task/skill controls.** Domain helpers under

@@ -9,7 +9,6 @@ import {
   createSessionLifecycleApi,
   phaseLabel,
   resumeAffordance,
-  resumeLaunchHint,
   type SessionLifecycleApi,
   type ThreadListItem,
 } from "@/lib/code-ui/session-lifecycle";
@@ -32,8 +31,9 @@ export interface SessionLifecycleProps {
 }
 
 /**
- * Session thread list + cancel/resume affordances for W2-10.
- * Browser resume HTTP is deferred to W3-01; cancel uses the shared controller.
+ * Session thread list + cancel/resume affordances for W2-10 / W3-01.
+ * Resume posts `POST /api/code/session/resume` under the controller lease;
+ * cancel uses the shared controller.
  */
 export function SessionLifecycle({ api: injectedApi }: SessionLifecycleProps) {
   const { snapshot } = useCodeUiStore();
@@ -162,15 +162,31 @@ export function SessionLifecycle({ api: injectedApi }: SessionLifecycleProps) {
       onResumeIntent={() =>
         void run(async () => {
           setResumeHint(undefined);
+          setSelectionError(undefined);
           const threadId = selectedThreadId?.trim() ?? "";
           const blocked = canSelectThreadForResume(affordance, threadId, currentThreadId);
           setSelectionError(blocked);
           if (blocked) return;
-          // Fail-closed until W3-01 exposes browser resume HTTP.
-          // Only the live session's cwd is known; never attribute it to another thread.
-          const knownCwd =
-            currentThreadId && threadId === currentThreadId ? snapshot?.workingDir : undefined;
-          setResumeHint(resumeLaunchHint(threadId, knownCwd));
+          try {
+            await controller.withLease((token) => api.resumeSession(threadId, token));
+            // In-process swap is not available yet; a 200 would mean the
+            // server swapped projection+runtime atomically.
+            setResumeHint(`Resumed thread ${threadId}.`);
+          } catch (cause) {
+            const code =
+              cause && typeof cause === "object" && "code" in cause
+                ? String((cause as { code?: string }).code ?? "")
+                : "";
+            const message = errorMessage(cause);
+            // Fail-closed restart hint is the expected production path today.
+            if (code === "SESSION_RESUME_REQUIRES_RESTART") {
+              setResumeHint(message);
+              return;
+            }
+            setSelectionError(message);
+            // Keep the server error actionable — do not claim the target is
+            // ready after SESSION_RESUME_NOT_FOUND / LOAD_FAILED.
+          }
         })
       }
     />
