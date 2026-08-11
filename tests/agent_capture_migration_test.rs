@@ -202,7 +202,10 @@ async fn capture_workspace_scope_migration_preserves_legacy_unknown_and_fences_d
             .rollback_to(&conn, 2026073101)
             .await
             .expect("roll back W4 scope migration on an empty capture catalog"),
-        vec![2026080401]
+        // Rollback returns every rolled-back version, newest first; the two
+        // agent-usage migrations (2026080402/2026080403) sit on top of the W4
+        // scope migration and ride along without touching agent_session.
+        vec![2026080403, 2026080402, 2026080401]
     );
 
     // This focused migration fixture intentionally does not install the
@@ -232,7 +235,9 @@ async fn capture_workspace_scope_migration_preserves_legacy_unknown_and_fences_d
             .run_pending(&conn)
             .await
             .expect("upgrade legacy capture row to W4 scope schema"),
-        vec![2026080401]
+        // Ascending application order: W4 scope first, then the two
+        // agent-usage migrations re-applied on top of it.
+        vec![2026080401, 2026080402, 2026080403]
     );
     let row = conn
         .query_one_raw(Statement::from_string(
