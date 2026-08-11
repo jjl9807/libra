@@ -1,5 +1,6 @@
 "use client";
 
+import { SessionExecutionRepair } from "@/components/workspace/execution-repair/SessionExecutionRepair";
 import { SessionGoalTaskSkill } from "@/components/workspace/goal-task-skill/SessionGoalTaskSkill";
 import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
 import { SessionLifecycle } from "@/components/workspace/session-lifecycle/SessionLifecycle";
@@ -26,6 +27,7 @@ function PlaceholderShell() {
       <SessionGoalTaskSkill />
       <SessionLifecycle />
       <SessionUsage />
+      <SessionExecutionRepair />
     </main>
   );
 }
