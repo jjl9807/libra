@@ -122,7 +122,7 @@ use crate::{
                 AgentRuntimeWorker, AgentRuntimeWorkerConfig, CodeAgentApprovalConfig,
                 CodeAgentSandboxProfile, CodeAgentServicesBuilder, DeferredPlanExecutionExecutor,
                 InMemoryAuditSink, LifecycleShutdownError, LifecycleShutdownOwner,
-                LifecycleStepError, RuntimeCommandDurability, ToolBoundaryRuntime,
+                LifecycleStepError, RuntimeCommandDurability, SecretRedactor, ToolBoundaryRuntime,
                 lifecycle_resource, tool_runtime_context,
             },
             sandbox::{
@@ -1221,6 +1221,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             code_ui: Some(code_ui_runtime.clone()),
             automation_control_token: control_runtime.token.clone(),
             audit_sink: None,
+            secret_redactor: Some(projection_secret_redactor(&env_file)),
         },
     )
     .await
@@ -1358,6 +1359,20 @@ fn load_code_env_file(path: Option<&Path>) -> CliResult<CodeEnvFile> {
         ))
     })?;
     parse_code_env_file(&contents, path).map_err(CliError::command_usage)
+}
+
+/// Build the Code UI wire-projection redactor, registering A0-08-forbidden
+/// `--env-file` values so provider keys cannot leak into snapshot/SSE/
+/// diagnostics even if they appear as raw substrings.
+fn projection_secret_redactor(env_file: &CodeEnvFile) -> Arc<SecretRedactor> {
+    Arc::new(
+        SecretRedactor::default_runtime().with_forbidden_env_values(
+            env_file
+                .values
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())),
+        ),
+    )
 }
 
 fn parse_code_env_file(contents: &str, path: &Path) -> Result<CodeEnvFile, String> {
@@ -1921,11 +1936,12 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
 
     // Runtime-owned services build the single hardened registry for both
     // launch profiles.  The TUI merely selects the baseline capability set.
-    let registry = CodeAgentServicesBuilder::tui_baseline(
+    let registry = CodeAgentServicesBuilder::tui_baseline_with_redactor(
         working_dir.clone(),
         trace_id,
         user_input_tx.clone(),
         mcp_server.clone(),
+        (*projection_secret_redactor(&env_file)).clone(),
     )
     .build()
     .registry();
@@ -1964,6 +1980,7 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
         initial_goal: args.goal.clone(),
         managed_codex_server: None,
         process_terminate,
+        secret_redactor: projection_secret_redactor(&env_file),
     };
 
     // Create agent based on provider. Every non-Codex provider funnels
@@ -2814,7 +2831,12 @@ where
         exec_approval_tx,
     ));
 
-    let registry = build_headless_tool_registry(working_dir, user_input_tx);
+    let env_file = load_code_env_file(args.env_file.as_deref())?;
+    let registry = build_headless_tool_registry(
+        working_dir,
+        user_input_tx,
+        (*projection_secret_redactor(&env_file)).clone(),
+    );
     // Headless Web explicit `task.dispatch` uses the same dispatcher bundle as
     // the TUI. Keep its construction here, before the per-turn config factory,
     // so both model `task` calls and Web controls observe the same budget,
@@ -2953,10 +2975,16 @@ where
 fn build_headless_tool_registry(
     working_dir: &Path,
     user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
+    redactor: SecretRedactor,
 ) -> Arc<ToolRegistry> {
-    CodeAgentServicesBuilder::web_headless(working_dir, Uuid::new_v4(), user_input_tx)
-        .build()
-        .registry()
+    CodeAgentServicesBuilder::web_headless_with_redactor(
+        working_dir,
+        Uuid::new_v4(),
+        user_input_tx,
+        redactor,
+    )
+    .build()
+    .registry()
 }
 
 /// Construct the appropriate provider client and wrap it in
@@ -3425,6 +3453,8 @@ struct TuiLaunchConfig {
     managed_codex_server: Option<ManagedCodexServer>,
     /// Process terminate gate installed before provider/child startup.
     process_terminate: ProcessTerminateGate,
+    /// Code UI wire-projection redactor (includes `--env-file` forbidden values).
+    secret_redactor: Arc<SecretRedactor>,
 }
 
 #[derive(Clone)]
@@ -3989,6 +4019,7 @@ where
             code_ui: Some(code_ui_runtime),
             automation_control_token: control_runtime.token.clone(),
             audit_sink: None,
+            secret_redactor: Some(params.secret_redactor.clone()),
         },
     )
     .await
@@ -6545,6 +6576,64 @@ mod tests {
     }
 
     #[test]
+    fn projection_redactor_scrubs_forbidden_env_file_values_only() {
+        let env_file = parse_code_env_file(
+            "OPENAI_API_KEY=sk-envfile-must-not-leak\nLIBRA_MODEL=gpt-test\n",
+            Path::new(".env.test"),
+        )
+        .unwrap();
+        let redactor = projection_secret_redactor(&env_file);
+        let scrubbed =
+            redactor.redact("bootstrap used sk-envfile-must-not-leak with model gpt-test");
+        assert!(
+            !scrubbed.contains("sk-envfile-must-not-leak"),
+            "forbidden env-file values must be scrubbed: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("gpt-test"),
+            "non-forbidden env-file values must not become secrets: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn control_info_schema_excludes_env_file_and_token_fields() {
+        let info = ControlInfo {
+            version: CONTROL_INFO_VERSION,
+            mode: "web-only".to_string(),
+            pid: 1,
+            base_url: "http://127.0.0.1:3000".to_string(),
+            mcp_url: None,
+            working_dir: PathBuf::from("/tmp/repo"),
+            thread_id: None,
+            started_at: Utc::now(),
+            repo_id: Some("repo".to_string()),
+            worktree_id: None,
+            workspace_id: None,
+            lease_fence: None,
+        };
+        let value = serde_json::to_value(&info).expect("control info serializes");
+        let object = value.as_object().expect("object");
+        for forbidden in [
+            "envFile",
+            "env_file",
+            "env",
+            "apiKey",
+            "api_key",
+            "token",
+            "controlToken",
+            "values",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "ControlInfo must not expose `{forbidden}`"
+            );
+        }
+        let rendered = value.to_string();
+        assert!(!rendered.contains("OPENAI_API_KEY"));
+        assert!(!rendered.contains("sk-"));
+    }
+
+    #[test]
     fn provider_env_file_value_overrides_process_lookup() {
         let env_file =
             parse_code_env_file("DEEPSEEK_API_KEY=file-key", Path::new(".env.test")).unwrap();
@@ -7383,7 +7472,8 @@ no_cache_unknown_network = true
     fn build_headless_tool_registry_omits_task_tool_in_flag_off_default() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let registry = build_headless_tool_registry(tmp.path(), tx);
+        let registry =
+            build_headless_tool_registry(tmp.path(), tx, SecretRedactor::default_runtime());
         let names = registry.tool_names();
         assert!(
             !names.contains(&"task".to_string()),
@@ -7402,7 +7492,8 @@ no_cache_unknown_network = true
     fn build_headless_tool_registry_exposes_runtime_guarded_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let registry = build_headless_tool_registry(tmp.path(), tx);
+        let registry =
+            build_headless_tool_registry(tmp.path(), tx, SecretRedactor::default_runtime());
         let names = registry.tool_names();
 
         for tool in [

@@ -25,9 +25,20 @@
 
 use std::sync::Arc;
 
-use libra::internal::ai::runtime::hardening::{
-    AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,
-    SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, ToolOperation,
+use libra::{
+    command::code_control_files::{CONTROL_INFO_VERSION, ControlInfo},
+    internal::ai::{
+        observed_agents::trust::env_name_is_forbidden,
+        runtime::hardening::{
+            AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext,
+            PrincipalRole, SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, ToolOperation,
+            project_json_for_wire,
+        },
+        web::code_ui::{
+            CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTranscriptEntry,
+            CodeUiTranscriptEntryKind,
+        },
+    },
 };
 use uuid::Uuid;
 
@@ -326,4 +337,107 @@ fn tool_boundary_policy_default_runtime_classifies_canonical_tools() {
     );
 
     assert_eq!(policy.policy_version(), "tool-boundary:v1");
+}
+
+/// W3-12: `--env-file` provider secrets stay out of every Code projection
+/// surface. Pins (1) A0-08 `env_name_is_forbidden` as the sole name table,
+/// (2) literal scrubbing via `SecretRedactor::with_forbidden_env_values`,
+/// (3) snapshot/SSE-shaped JSON projection, (4) ControlInfo schema (no
+/// env/token dump), and (5) fail-closed empty redactor.
+#[test]
+fn env_file_secrets_never_projected() {
+    let secret = "sk-w312-envfile-must-never-project";
+    assert!(
+        env_name_is_forbidden("OPENAI_API_KEY"),
+        "A0-08 must classify provider API key names as forbidden"
+    );
+    assert!(
+        !env_name_is_forbidden("LIBRA_MODEL"),
+        "non-credential env names must stay outside the secret table"
+    );
+
+    let redactor = SecretRedactor::default_runtime().with_forbidden_env_values([
+        ("OPENAI_API_KEY", secret),
+        ("LIBRA_MODEL", "gpt-safe-model"),
+    ]);
+    redactor
+        .ensure_configured()
+        .expect("default redactor must be configured");
+
+    let mut snapshot = CodeUiSessionSnapshot {
+        status: CodeUiSessionStatus::Error,
+        ..Default::default()
+    };
+    snapshot.transcript.push(CodeUiTranscriptEntry {
+        id: "t1".to_string(),
+        kind: CodeUiTranscriptEntryKind::InfoNote,
+        title: Some("bootstrap".to_string()),
+        content: Some(format!("provider rejected key {secret}")),
+        status: Some(format!("api_key: {secret}")),
+        streaming: false,
+        metadata: serde_json::json!({"hint": format!("retry with {secret}")}),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    });
+
+    let projected = project_json_for_wire(&snapshot, &redactor).expect("project snapshot");
+    let rendered = projected.to_string();
+    assert!(
+        !rendered.contains(secret),
+        "env-file secret leaked into projected snapshot/SSE payload: {rendered}"
+    );
+    assert!(
+        rendered.contains("[REDACTED]"),
+        "projected snapshot must replace secrets with [REDACTED]: {rendered}"
+    );
+    let with_model = redactor.redact(&format!("model=gpt-safe-model key={secret}"));
+    assert!(
+        with_model.contains("gpt-safe-model"),
+        "non-forbidden env values must not be scrubbed: {with_model}"
+    );
+    assert!(!with_model.contains(secret));
+
+    let info = ControlInfo {
+        version: CONTROL_INFO_VERSION,
+        mode: "web-only".to_string(),
+        pid: std::process::id(),
+        base_url: "http://127.0.0.1:3000".to_string(),
+        mcp_url: None,
+        working_dir: std::path::PathBuf::from("/tmp/libra-w312"),
+        thread_id: None,
+        started_at: chrono::Utc::now(),
+        repo_id: Some("repo".to_string()),
+        worktree_id: None,
+        workspace_id: None,
+        lease_fence: None,
+    };
+    let info_json = serde_json::to_value(&info).expect("control info");
+    let info_obj = info_json.as_object().expect("object");
+    for key in [
+        "envFile",
+        "env",
+        "values",
+        "apiKey",
+        "token",
+        "controlToken",
+    ] {
+        assert!(
+            !info_obj.contains_key(key),
+            "ControlInfo must not serialize `{key}`"
+        );
+    }
+    let info_rendered = info_json.to_string();
+    assert!(!info_rendered.contains(secret));
+    assert!(!info_rendered.contains("OPENAI_API_KEY"));
+
+    // CodeEnvFile is a private CLI loader type and intentionally has no
+    // Serialize derive — projection uses SecretRedactor, never the map.
+    // Fail closed when a caller clears every redaction rule.
+    let empty = SecretRedactor::default();
+    assert!(
+        project_json_for_wire(&snapshot, &empty).is_err(),
+        "empty redactor must fail closed rather than emit unredacted JSON"
+    );
+
+    let _ = Arc::new(redactor);
 }

@@ -55,7 +55,9 @@ use crate::{
             projection::ThreadProjection,
             runtime::{
                 RuntimeWorkerError,
-                hardening::{AuditEvent, AuditSink, SecretRedactor, TracingAuditSink},
+                hardening::{
+                    AuditEvent, AuditSink, SecretRedactor, TracingAuditSink, project_json_for_wire,
+                },
                 runtime_worker_adapter_message,
             },
             usage::{UsageQueryFilter, UsageRecorder},
@@ -80,6 +82,10 @@ struct WebAppState {
     bound_addr: SocketAddr,
     /// Per Code UI session write rate limiter (browser + automation, W3-05).
     write_rate_limiter: Arc<SessionWriteRateLimiter>,
+    /// Wire-projection redactor (W3-12). Defaults to
+    /// [`SecretRedactor::default_runtime`]; callers may attach `--env-file`
+    /// forbidden values via [`WebServerOptions::secret_redactor`].
+    secret_redactor: Arc<SecretRedactor>,
 }
 
 #[derive(Clone, Default)]
@@ -87,6 +93,9 @@ pub struct WebServerOptions {
     pub code_ui: Option<Arc<CodeUiRuntimeHandle>>,
     pub automation_control_token: Option<Arc<str>>,
     pub audit_sink: Option<Arc<dyn AuditSink>>,
+    /// Optional projection redactor. When `None`, the server uses
+    /// [`SecretRedactor::default_runtime`].
+    pub secret_redactor: Option<Arc<SecretRedactor>>,
 }
 
 /// Handle to a running web server, providing its bound address and a
@@ -211,6 +220,9 @@ pub async fn start(
         control_trace_id: Uuid::new_v4(),
         bound_addr,
         write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+        secret_redactor: options
+            .secret_redactor
+            .unwrap_or_else(|| Arc::new(SecretRedactor::default_runtime())),
     });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -286,6 +298,7 @@ pub async fn assert_host_posture_non_loopback_contract() -> anyhow::Result<()> {
         control_trace_id: Uuid::new_v4(),
         bound_addr: SocketAddr::from(([0, 0, 0, 0], 3020)),
         write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+        secret_redactor: Arc::new(SecretRedactor::default_runtime()),
     };
 
     let api = code_router()
@@ -641,7 +654,16 @@ async fn code_session_handler(
 ) -> Result<Json<serde_json::Value>, WebApiError> {
     ensure_loopback_api_request(remote_addr)?;
     let runtime = code_ui_runtime(&state)?;
-    Ok(Json(serde_json::to_value(runtime.snapshot().await)?))
+    let projected =
+        project_json_for_wire(&runtime.snapshot().await, state.secret_redactor.as_ref()).map_err(
+            |error| WebApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "REDACTION_FAILED".to_string(),
+                message: format!("failed to redact session snapshot for wire projection: {error}"),
+                retry_after_secs: None,
+            },
+        )?;
+    Ok(Json(projected))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -789,17 +811,25 @@ async fn code_events_handler(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, WebApiError> {
     ensure_loopback_api_request(remote_addr)?;
     let runtime = code_ui_runtime(&state)?;
+    let redactor = state.secret_redactor.clone();
     let current_snapshot = runtime.snapshot().await;
     let initial_event = ensure_session_updated_event(&current_snapshot)?;
     let receiver = runtime.subscribe();
 
-    let initial_stream = stream::once(async move { Ok(code_ui_event_to_sse(initial_event)) });
+    let initial_redactor = redactor.clone();
+    let initial_stream = stream::once(async move {
+        Ok(code_ui_event_to_sse(
+            initial_event,
+            initial_redactor.as_ref(),
+        ))
+    });
     let updates = BroadcastStream::new(receiver).filter_map(move |message| {
         let runtime = runtime.clone();
+        let redactor = redactor.clone();
         async move {
             code_ui_broadcast_event_or_recovery(&runtime, message)
                 .await
-                .map(|event| Ok(code_ui_event_to_sse(event)))
+                .map(|event| Ok(code_ui_event_to_sse(event, redactor.as_ref())))
         }
     });
 
@@ -824,16 +854,23 @@ async fn code_diagnostics_handler(
 ) -> Result<Json<serde_json::Value>, WebApiError> {
     ensure_loopback_api_request(remote_addr)?;
     let runtime = code_ui_runtime(&state)?;
-    // Wave 7 / PR 7 — pass diagnostics through `SecretRedactor` so
-    // automation clients never observe the harness control token,
-    // controller token, or secret-like path components from
-    // `LIBRA_LOG_FILE`. The redactor's marker set is the source of
-    // truth (see `SecretRedactor::default_runtime()`); this handler
-    // is only responsible for applying it before serialisation.
-    let redactor = SecretRedactor::default_runtime();
-    Ok(Json(serde_json::to_value(
-        runtime.diagnostics().await.redact(&redactor),
-    )?))
+    // Wave 7 / PR 7 + W3-12 — diagnostics go through the shared
+    // `SecretRedactor` (optionally enriched with `--env-file` forbidden
+    // values). Fail closed if projection/redaction cannot run.
+    let projected = project_json_for_wire(
+        &runtime
+            .diagnostics()
+            .await
+            .redact(state.secret_redactor.as_ref()),
+        state.secret_redactor.as_ref(),
+    )
+    .map_err(|error| WebApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "REDACTION_FAILED".to_string(),
+        message: format!("failed to redact diagnostics for wire projection: {error}"),
+        retry_after_secs: None,
+    })?;
+    Ok(Json(projected))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1658,13 +1695,28 @@ async fn enforce_code_write_identity_gates(
     ensure_session_write_rate_limit(state, runtime).await
 }
 
-fn code_ui_event_to_sse(event: code_ui::CodeUiEventEnvelope) -> Event {
+fn code_ui_event_to_sse(event: code_ui::CodeUiEventEnvelope, redactor: &SecretRedactor) -> Event {
+    // W3-12: never emit an unredacted snapshot on the SSE wire. If
+    // redaction/serialization fails, drop payload data (fail closed).
+    match project_json_for_wire(&event, redactor) {
+        Ok(projected) => Event::default()
+            .event(event.event_type.as_str())
+            .json_data(projected)
+            .unwrap_or_else(|_| code_ui_redaction_failed_sse(event.event_type)),
+        Err(_) => code_ui_redaction_failed_sse(event.event_type),
+    }
+}
+
+fn code_ui_redaction_failed_sse(event_type: code_ui::CodeUiEventType) -> Event {
     Event::default()
-        .event(event.event_type.as_str())
-        .json_data(event)
-        .unwrap_or_else(|_| {
-            Event::default().event(code_ui::CodeUiEventType::SessionUpdated.as_str())
-        })
+        .event(event_type.as_str())
+        .json_data(serde_json::json!({
+            "error": {
+                "code": "REDACTION_FAILED",
+                "message": "session event omitted because secret redaction failed"
+            }
+        }))
+        .unwrap_or_else(|_| Event::default().event(event_type.as_str()))
 }
 
 fn ensure_loopback_api_request(remote_addr: SocketAddr) -> Result<(), WebApiError> {
@@ -1743,8 +1795,8 @@ async fn append_control_audit(
     outcome: ControlAuditOutcome<'_>,
 ) {
     let snapshot = runtime.snapshot().await;
-    let redactor = SecretRedactor::default_runtime();
-    let client_id = sanitized_audit_client_id(&redactor, client_id);
+    let redactor = state.secret_redactor.as_ref();
+    let client_id = sanitized_audit_client_id(redactor, client_id);
     let (result, error_code) = match outcome {
         ControlAuditOutcome::Accepted => ("accepted", None),
         ControlAuditOutcome::Error(code) => ("error", Some(code)),
@@ -1836,9 +1888,7 @@ impl WebApiError {
 /// Ceil a retry delay to whole seconds so clients waiting the advertised
 /// value are not immediately re-throttled by truncated `as_secs()`.
 fn retry_after_secs_ceil(retry_after: Duration) -> u64 {
-    let millis = retry_after.as_millis();
-    let secs = ((millis + 999) / 1000) as u64;
-    secs.max(1)
+    retry_after.as_millis().div_ceil(1000).max(1) as u64
 }
 
 impl From<CodeUiApiError> for WebApiError {
@@ -1900,10 +1950,10 @@ impl IntoResponse for WebApiError {
             })),
         )
             .into_response();
-        if let Some(secs) = self.retry_after_secs {
-            if let Ok(value) = header::HeaderValue::from_str(&secs.to_string()) {
-                response.headers_mut().insert(header::RETRY_AFTER, value);
-            }
+        if let Some(secs) = self.retry_after_secs
+            && let Ok(value) = header::HeaderValue::from_str(&secs.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
         }
         response
     }
@@ -1928,7 +1978,8 @@ mod tests {
         runtime::hardening::InMemoryAuditSink,
         web::code_ui::{
             CodeUiCapabilities, CodeUiInitialController, CodeUiProviderInfo, CodeUiSession,
-            ReadOnlyCodeUiAdapter, initial_snapshot,
+            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, ReadOnlyCodeUiAdapter,
+            initial_snapshot,
         },
     };
 
@@ -1953,6 +2004,93 @@ mod tests {
             },
         )
         .await
+    }
+
+    /// W3-12: `/session` and `/diagnostics` must scrub configured env-file
+    /// literals via `WebAppState.secret_redactor`, not only the marker-only
+    /// default. Pins the startup wiring that unit-level
+    /// `project_json_for_wire` tests cannot see.
+    #[tokio::test]
+    async fn code_session_and_diagnostics_scrub_configured_env_file_literals() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let secret = "sk-w312-live-wire-envfile-literal";
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra-w312",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        session
+            .upsert_transcript_entry(CodeUiTranscriptEntry {
+                id: "leak".to_string(),
+                kind: CodeUiTranscriptEntryKind::InfoNote,
+                title: Some("bootstrap".to_string()),
+                content: Some(format!("provider key {secret}")),
+                status: None,
+                streaming: false,
+                metadata: serde_json::json!({}),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await;
+        let runtime = CodeUiRuntimeHandle::build_with_control(
+            ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
+            false,
+            true,
+            CodeUiInitialController::LocalTui {
+                owner_label: "Terminal UI".to_string(),
+                reason: None,
+            },
+        )
+        .await;
+        let redactor = Arc::new(
+            SecretRedactor::default_runtime()
+                .with_forbidden_env_values([("OPENAI_API_KEY", secret)]),
+        );
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra-w312")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: redactor,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        for uri in ["/session", "/diagnostics"] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{uri} should succeed, got {}",
+                response.status()
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains(secret),
+                "{uri} leaked env-file secret: {text}"
+            );
+            if uri == "/session" {
+                assert!(
+                    text.contains("[REDACTED]"),
+                    "{uri} should replace the secret with [REDACTED]: {text}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2052,6 +2190,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2097,6 +2236,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2149,6 +2289,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2182,6 +2323,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2210,6 +2352,7 @@ mod tests {
             control_trace_id: Uuid::new_v4(),
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
             write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+            secret_redactor: Arc::new(SecretRedactor::default_runtime()),
         });
         let oversized_text = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
         let body = format!(r#"{{"text":"{oversized_text}"}}"#);
@@ -2318,6 +2461,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2395,6 +2539,7 @@ mod tests {
             control_trace_id: Uuid::new_v4(),
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
             write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+            secret_redactor: Arc::new(SecretRedactor::default_runtime()),
         });
         let request = Request::builder()
             .method(Method::POST)
@@ -2606,6 +2751,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitized_audit_client_id_scrubs_configured_env_file_literals() {
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", "sk-audit-envfile-literal")]);
+        let sanitized =
+            sanitized_audit_client_id(&redactor, "browser-sk-audit-envfile-literal-client");
+        assert!(
+            !sanitized.contains("sk-audit-envfile-literal"),
+            "audit client id must use the configured env-file redactor: {sanitized}"
+        );
+    }
+
     /// Companion regression for the documented gap above: a bare
     /// secret-shaped client_id without a marker prefix DOES survive
     /// the redactor. This is intentional given the marker-only
@@ -2684,6 +2841,7 @@ mod tests {
             control_trace_id: Uuid::new_v4(),
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
             write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+            secret_redactor: Arc::new(SecretRedactor::default_runtime()),
         });
         let oversized = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
         for uri in ["/skills/activate", "/session/resume"] {
@@ -2755,6 +2913,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2807,6 +2966,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2856,6 +3016,7 @@ mod tests {
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -3008,6 +3169,7 @@ mod tests {
                     control_trace_id: Uuid::new_v4(),
                     bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                     write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                    secret_redactor: Arc::new(SecretRedactor::default_runtime()),
                 })
                 .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
         };

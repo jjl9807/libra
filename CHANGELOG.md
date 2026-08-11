@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-12, 2026-08-12, v0.19.135)
+
+- **W3-12 closes Code UI sensitive projection redaction.** Session / SSE /
+  diagnostics wire paths run through `SecretRedactor` + A0-08
+  `env_name_is_forbidden` (env-file provider values registered as literals);
+  empty rules fail closed (`REDACTION_FAILED`). Headless stream deltas are
+  serialized so SSE transcript growth stays monotonic.
+  `env_file_secrets_never_projected` pins ControlInfo schema and projection.
+
 ### Added (plan-20260715 W3-11, 2026-08-12)
 
 - **W3-11 defines Code UI port/host posture.** Occupied listen ports fail

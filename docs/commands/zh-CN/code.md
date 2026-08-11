@@ -174,6 +174,7 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `PAYLOAD_TOO_LARGE` | 413 | 写请求体超过 256 KiB。 |
 | `ORIGIN_REQUIRED` | 403 | 浏览器写/attach 缺少可信 loopback `Origin`（或同源 `Referer`），或提交了跨站 Origin。 |
 | `RATE_LIMITED` | 429 | 当前 session 写配额耗尽；等待速率窗口恢复后重试（见 `Retry-After`）。 |
+| `REDACTION_FAILED` | 500 | Session / diagnostics / SSE 投影无法应用 secret redactor（规则为空或序列化失败）。Fail-closed：响应不包含未脱敏 payload；重启 `libra code` 或修复 redactor 配置后重试。 |
 | `CONTROL_DISABLED` | 403 | 当前进程未启用 automation control。 |
 | `MISSING_CONTROL_TOKEN` / `INVALID_CONTROL_TOKEN` | 403 | Automation control token 缺失或无效。 |
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |

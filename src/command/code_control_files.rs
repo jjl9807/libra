@@ -799,7 +799,7 @@ pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
     let owned;
     let write_path = match path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => {
-            let name = path.file_name().unwrap_or_else(|| path.as_os_str());
+            let name = path.file_name().unwrap_or(path.as_os_str());
             owned = Path::new(".").join(name);
             owned.as_path()
         }

@@ -174,6 +174,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `PAYLOAD_TOO_LARGE` | 413 | Write request body exceeded 256 KiB. |
 | `ORIGIN_REQUIRED` | 403 | Browser write/attach lacked a trusted loopback `Origin` (or same-origin `Referer`), or presented a cross-site Origin. |
 | `RATE_LIMITED` | 429 | Per-session write budget exhausted; retry after the rate-limit window (see `Retry-After` / wait for window recovery). |
+| `REDACTION_FAILED` | 500 | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the response omits unredacted payload; restart `libra code` or retry after fixing redactor configuration. |
 | `CONTROL_DISABLED` | 403 | Automation control is not enabled for this process. |
 | `MISSING_CONTROL_TOKEN` | 403 | Automation control token is absent. |
 | `INVALID_CONTROL_TOKEN` | 403 | Automation control token is invalid. |
