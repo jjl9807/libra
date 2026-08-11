@@ -287,6 +287,10 @@ jobs:
           fi
 
           if git diff --quiet -- Formula/libra.rb; then
+            # D-02 reads the released formula ref from this artifact and nowhere
+            # else, so it has to be produced on BOTH paths. Here the formula
+            # already matches, so the ref is simply the tap's current HEAD.
+            git rev-parse HEAD > "$GITHUB_WORKSPACE/formula-commit-sha.txt"
             {
               echo "### Homebrew tap update"
               echo
@@ -300,11 +304,25 @@ jobs:
           run_step "Commit Homebrew formula update" git commit -am "Update libra formula to ${GITHUB_REF_NAME}"
           run_step "Push Homebrew formula update" git push origin HEAD
 
+          # Same artifact on the update path: the commit this run just pushed.
+          git rev-parse HEAD > "$GITHUB_WORKSPACE/formula-commit-sha.txt"
+
           {
             echo "### Homebrew tap update"
             echo
             echo "Updated Formula/libra.rb for ${GITHUB_REF_NAME}."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Run-scoped artifact bound to THIS release run — D-02's only source for
+      # the formula ref. `if: always()` because both the update and the
+      # already-up-to-date paths must publish it, and the latter exits early.
+      - name: Upload the formula commit sha
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formula-commit-sha
+          path: formula-commit-sha.txt
+          if-no-files-found: error
 
   verify-homebrew-formula:
     needs: update-homebrew-tap
