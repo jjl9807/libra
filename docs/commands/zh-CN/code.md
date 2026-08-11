@@ -36,7 +36,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 | Env file | | `--env-file <PATH>` | 无 | 从 dotenv 风格文件加载 provider 环境变量；显式文件值优先于 Vault 和进程环境。 |
 | Control mode | | `--control <observe\|write>` | `observe` | 本地自动化控制模式。`observe` 保留现有 loopback 读行为；`write` 启用本地 token discovery 和进程级自动化控制认证。 |
 | Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | 每进程本地自动化 token 路径。在 `write` 模式下，Unix/macOS 文件必须是权限 `0600` 的普通文件。 |
-| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。该文件永不包含 token 材料。 |
+| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。在 Unix/macOS 上以原子写 + `0600` 落盘。该文件永不包含 token 材料。 |
 | Provider | | `--provider` | `gemini` | AI provider 后端（见下方 Provider Backends）。 |
 | Model | | `--model` | provider 默认值 | Provider 专用 model ID。 |
 | Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
@@ -87,7 +87,7 @@ Ollama 请求默认流式读取 `/api/chat` 响应，并向 debug logs 添加每
 
 `libra code --control observe` 是默认值，除非显式提供 `--control-info-file`，否则不会创建本地控制文件。Loopback clients 可以继续无 token 读取 `/api/code/session` 和 `/api/code/events`。
 
-`libra code --control write` 启用本地自动化安全信封。Libra 会在 `.libra/code/control-token` 中创建新的 32-byte token，在 Web 服务器绑定后将非 secret endpoint 元数据写入 `.libra/code/control.json`，并在进程生命周期内持有 `.libra/code/control.lock`。`control.json` 包含 `version`、`mode`、`pid`、`baseUrl`、可选 `mcpUrl`、`workingDir`、可选 `threadId` 和 `startedAt`；它永不包含 token、token hash、token path、provider credentials、headers 或 provider request/response bodies。
+`libra code --control write` 启用本地自动化安全信封。Libra 会在 `.libra/code/control-token` 中创建新的 32-byte token，在 Web 服务器绑定后以原子写（Unix/macOS 模式 `0600`）将非 secret endpoint 元数据写入 `.libra/code/control.json`，并在进程生命周期内持有 `.libra/code/control.lock`。默认路径按 worktree 本地 gitdir 隔离，两个 worktree 不会共享 token/info/lock；跨 worktree 的 scope mismatch 会 fail-closed，而不是回收另一 worktree 的 sidecar。`control.json` 包含 `version`、`mode`、`pid`、`baseUrl`、可选 `mcpUrl`、`workingDir`、可选 `threadId`、`startedAt`，以及 version-2 writer scope（`repoId`/`worktreeId`/可选 `workspaceId`/`leaseFence`）；它永不包含 token、token hash、token path、provider credentials、headers 或 provider request/response bodies。
 
 Write control 仅限本地。`--control write` 与 `--stdio` 组合会被拒绝，并要求 `--host` 是 loopback（`127.0.0.1`、`::1` 或 `localhost`）。使用相同默认路径启动第二个 write-control 实例会以 `CONTROL_INSTANCE_CONFLICT` 快速失败；只有调用方有意管理多个本地实例时，才使用不同的 `--control-token-file` 和 `--control-info-file` 路径。
 

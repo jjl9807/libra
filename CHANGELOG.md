@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-10, 2026-08-12)
+
+- **W3-10 hardens Code control sidecar file posture.** `control.json` is
+  written atomically (temp+rename) at Unix `0600` without a post-rename chmod
+  symlink race; bare relative `--control-info-file` paths still resolve to the
+  process cwd. Cross-worktree scope mismatch fail-closes
+  (`code_control_info_scope_mismatch_rejected`); lease fence continues to reuse
+  workspace lease fields rather than a second implementation.
+
 ### Added (plan-20260715 W3-13, 2026-08-12)
 
 - **W3-13 opens Web launch flag parity for non-Codex providers.**
