@@ -43,6 +43,12 @@ struct ActiveTurnSlot {
 /// Process-level shutdown hook for web-owned adapter mounts.
 pub trait CodeUiLifecycleShutdown: Send + Sync {
     fn shutdown(&self) -> BoxFuture<'_, Result<()>>;
+
+    /// Durable workflow fan-out for SSE wire v2 when this host owns a session
+    /// JSONL store (W3-06). Default is unavailable.
+    fn workflow_hub(&self) -> Option<std::sync::Arc<super::sse_wire::CodeUiWorkflowHub>> {
+        None
+    }
 }
 
 /// Production Code UI command bridge backed by the serialized Agent runtime.

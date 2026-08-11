@@ -7,6 +7,7 @@ pub mod agent_runtime_adapter;
 pub mod code_ui;
 pub mod code_ui_projection;
 pub mod headless;
+pub mod sse_wire;
 pub mod web_admission;
 pub mod write_guards;
 
@@ -86,6 +87,9 @@ struct WebAppState {
     /// [`SecretRedactor::default_runtime`]; callers may attach `--env-file`
     /// forbidden values via [`WebServerOptions::secret_redactor`].
     secret_redactor: Arc<SecretRedactor>,
+    /// Durable workflow fan-out for SSE wire v2 (W3-06). When `None`,
+    /// `?wire=2` fail-closes with `WIRE_V2_REQUIRES_DURABLE_SESSION`.
+    workflow_hub: Option<Arc<sse_wire::CodeUiWorkflowHub>>,
 }
 
 #[derive(Clone, Default)]
@@ -96,6 +100,9 @@ pub struct WebServerOptions {
     /// Optional projection redactor. When `None`, the server uses
     /// [`SecretRedactor::default_runtime`].
     pub secret_redactor: Option<Arc<SecretRedactor>>,
+    /// Optional durable workflow hub for SSE wire v2. When `None`, the server
+    /// tries [`CodeUiRuntimeHandle::workflow_hub`].
+    pub workflow_hub: Option<Arc<sse_wire::CodeUiWorkflowHub>>,
 }
 
 /// Handle to a running web server, providing its bound address and a
@@ -210,6 +217,12 @@ pub async fn start(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
 
+    let workflow_hub = options.workflow_hub.or_else(|| {
+        options
+            .code_ui
+            .as_ref()
+            .and_then(|runtime| runtime.workflow_hub())
+    });
     let app = build_router(WebAppState {
         working_dir: Arc::new(working_dir),
         code_ui: options.code_ui,
@@ -223,6 +236,7 @@ pub async fn start(
         secret_redactor: options
             .secret_redactor
             .unwrap_or_else(|| Arc::new(SecretRedactor::default_runtime())),
+        workflow_hub,
     });
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -299,6 +313,7 @@ pub async fn assert_host_posture_non_loopback_contract() -> anyhow::Result<()> {
         bound_addr: SocketAddr::from(([0, 0, 0, 0], 3020)),
         write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
         secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+        workflow_hub: None,
     };
 
     let api = code_router()
@@ -808,32 +823,229 @@ async fn code_usage_handler(
 async fn code_events_handler(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<WebAppState>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, WebApiError> {
+    Query(query): Query<sse_wire::CodeEventsQuery>,
+    headers: HeaderMap,
+) -> Result<Response, WebApiError> {
     ensure_loopback_api_request(remote_addr)?;
-    let runtime = code_ui_runtime(&state)?;
-    let redactor = state.secret_redactor.clone();
-    let current_snapshot = runtime.snapshot().await;
-    let initial_event = ensure_session_updated_event(&current_snapshot)?;
-    let receiver = runtime.subscribe();
-
-    let initial_redactor = redactor.clone();
-    let initial_stream = stream::once(async move {
-        Ok(code_ui_event_to_sse(
-            initial_event,
-            initial_redactor.as_ref(),
-        ))
-    });
-    let updates = BroadcastStream::new(receiver).filter_map(move |message| {
-        let runtime = runtime.clone();
-        let redactor = redactor.clone();
-        async move {
-            code_ui_broadcast_event_or_recovery(&runtime, message)
-                .await
-                .map(|event| Ok(code_ui_event_to_sse(event, redactor.as_ref())))
+    let wire = sse_wire::parse_code_events_wire_version(&query, &headers).map_err(|message| {
+        WebApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "INVALID_WIRE_VERSION".to_string(),
+            message,
+            retry_after_secs: None,
         }
-    });
+    })?;
 
-    Ok(Sse::new(initial_stream.chain(updates)).keep_alive(KeepAlive::new()))
+    match wire {
+        sse_wire::CodeUiSseWireVersion::V1 => {
+            let runtime = code_ui_runtime(&state)?;
+            let redactor = state.secret_redactor.clone();
+            let current_snapshot = runtime.snapshot().await;
+            let initial_event = ensure_session_updated_event(&current_snapshot)?;
+            let receiver = runtime.subscribe();
+
+            let initial_redactor = redactor.clone();
+            let initial_stream = stream::once(async move {
+                Ok::<Event, Infallible>(code_ui_event_to_sse(
+                    initial_event,
+                    initial_redactor.as_ref(),
+                ))
+            });
+            let updates = BroadcastStream::new(receiver).filter_map(move |message| {
+                let runtime = runtime.clone();
+                let redactor = redactor.clone();
+                async move {
+                    code_ui_broadcast_event_or_recovery(&runtime, message)
+                        .await
+                        .map(|event| {
+                            Ok::<Event, Infallible>(code_ui_event_to_sse(event, redactor.as_ref()))
+                        })
+                }
+            });
+            Ok(Sse::new(initial_stream.chain(updates))
+                .keep_alive(KeepAlive::new())
+                .into_response())
+        }
+        sse_wire::CodeUiSseWireVersion::V2 => {
+            // `cursor` is v2-only; ignore it on v1 so legacy clients with stray
+            // query params keep working.
+            let cursor =
+                sse_wire::parse_code_events_cursor(&query).map_err(|message| WebApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "INVALID_QUERY_PARAM".to_string(),
+                    message,
+                    retry_after_secs: None,
+                })?;
+            let _runtime = code_ui_runtime(&state)?;
+            let hub = state.workflow_hub.clone().ok_or_else(|| WebApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "WIRE_V2_REQUIRES_DURABLE_SESSION".to_string(),
+                message: "SSE wire v2 requires a durable Code UI session store (use --web/--web-only with session persistence)".to_string(),
+                retry_after_secs: None,
+            })?;
+            let redactor = state.secret_redactor.clone();
+            let receiver = hub.subscribe();
+            let durable_tail = hub.durable_tail_sequence();
+            if cursor > durable_tail {
+                return Err(WebApiError {
+                    status: StatusCode::CONFLICT,
+                    code: "WIRE_V2_CURSOR_AHEAD".to_string(),
+                    message: format!(
+                        "SSE wire v2 cursor {cursor} is ahead of durable workflow tail {durable_tail}; drop the cursor and resync from 0 or the last acknowledged sequence"
+                    ),
+                    retry_after_secs: None,
+                });
+            }
+            let replayed = hub.replay_after(cursor).map_err(|error| WebApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "WIRE_V2_REPLAY_FAILED".to_string(),
+                message: format!(
+                    "failed to replay Code UI workflow events after cursor {cursor}: {error}"
+                ),
+                retry_after_secs: None,
+            })?;
+            let last_replayed = replayed
+                .last()
+                .map(|event| event.sequence)
+                .unwrap_or(cursor);
+            let last_delivered =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(last_replayed));
+            let initial_events: Vec<Result<Event, std::io::Error>> = {
+                let mut out = Vec::with_capacity(replayed.len());
+                for event in replayed {
+                    match try_code_ui_wire_v2_to_sse(
+                        &sse_wire::CodeUiWireV2Event::from_workflow_event(&event),
+                        redactor.as_ref(),
+                    ) {
+                        Ok(frame) => out.push(Ok(frame)),
+                        Err(error_event) => {
+                            out.push(Ok(error_event));
+                            out.push(Err(std::io::Error::other(
+                                "WIRE_V2_REPLAY_FAILED: secret redaction failed during durable replay",
+                            )));
+                            break;
+                        }
+                    }
+                }
+                out
+            };
+            let initial_stream = stream::iter(initial_events);
+            let live = BroadcastStream::new(receiver).flat_map(move |message| {
+                let hub = hub.clone();
+                let redactor = redactor.clone();
+                let last_delivered = last_delivered.clone();
+                let events: Vec<Result<Event, std::io::Error>> = match message {
+                    Ok(event) => {
+                        let prev = last_delivered.load(std::sync::atomic::Ordering::Relaxed);
+                        if event.sequence <= prev {
+                            Vec::new()
+                        } else {
+                            match try_code_ui_wire_v2_to_sse(
+                                &sse_wire::CodeUiWireV2Event::from_workflow_event(&event),
+                                redactor.as_ref(),
+                            ) {
+                                Ok(frame) => {
+                                    last_delivered.store(
+                                        event.sequence,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    vec![Ok(frame)]
+                                }
+                                Err(error_event) => vec![
+                                    Ok(error_event),
+                                    Err(std::io::Error::other(
+                                        "WIRE_V2_REPLAY_FAILED: secret redaction failed on live event",
+                                    )),
+                                ],
+                            }
+                        }
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(_)) => {
+                        let prev = last_delivered.load(std::sync::atomic::Ordering::Relaxed);
+                        match hub.replay_after(prev) {
+                            Ok(catch_up) => {
+                                let mut frames = Vec::with_capacity(catch_up.len());
+                                for event in catch_up {
+                                    match try_code_ui_wire_v2_to_sse(
+                                        &sse_wire::CodeUiWireV2Event::from_workflow_event(&event),
+                                        redactor.as_ref(),
+                                    ) {
+                                        Ok(frame) => {
+                                            last_delivered.store(
+                                                event.sequence,
+                                                std::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            frames.push(Ok(frame));
+                                        }
+                                        Err(error_event) => {
+                                            frames.push(Ok(error_event));
+                                            frames.push(Err(std::io::Error::other(
+                                                "WIRE_V2_REPLAY_FAILED: secret redaction failed during lag catch-up",
+                                            )));
+                                            break;
+                                        }
+                                    }
+                                }
+                                frames
+                            }
+                            Err(error) => {
+                                // Fail closed: emit the error frame then end the
+                                // stream so clients cannot advance past a gap via
+                                // a later live SSE id.
+                                vec![
+                                    Ok(code_ui_wire_v2_error_sse(
+                                        "WIRE_V2_REPLAY_FAILED",
+                                        "lagged SSE consumer could not catch up from the durable workflow log; reconnect from the last acknowledged cursor",
+                                    )),
+                                    Err(std::io::Error::other(format!(
+                                        "WIRE_V2_REPLAY_FAILED: lagged catch-up failed: {error}"
+                                    ))),
+                                ]
+                            }
+                        }
+                    }
+                };
+                stream::iter(events)
+            });
+            Ok(Sse::new(initial_stream.chain(live))
+                .keep_alive(KeepAlive::new())
+                .into_response())
+        }
+    }
+}
+
+fn try_code_ui_wire_v2_to_sse(
+    event: &sse_wire::CodeUiWireV2Event,
+    redactor: &SecretRedactor,
+) -> Result<Event, Event> {
+    match project_json_for_wire(event, redactor) {
+        Ok(projected) => Event::default()
+            .event("code_workflow")
+            .id(event.cursor.to_string())
+            .json_data(projected)
+            .map_err(|_| {
+                code_ui_wire_v2_error_sse(
+                    "REDACTION_FAILED",
+                    "workflow event omitted because secret redaction failed",
+                )
+            }),
+        Err(_) => Err(code_ui_wire_v2_error_sse(
+            "REDACTION_FAILED",
+            "workflow event omitted because secret redaction failed",
+        )),
+    }
+}
+
+fn code_ui_wire_v2_error_sse(code: &str, message: &str) -> Event {
+    Event::default()
+        .event("error")
+        .json_data(serde_json::json!({
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }))
+        .unwrap_or_else(|_| Event::default().event("error"))
 }
 
 async fn code_ui_broadcast_event_or_recovery(
@@ -2062,6 +2274,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: redactor,
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2191,6 +2404,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2237,6 +2451,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2290,6 +2505,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2324,6 +2540,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from((
                 Ipv4Addr::new(192, 0, 2, 10),
@@ -2353,6 +2570,7 @@ mod tests {
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
             write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+            workflow_hub: None,
         });
         let oversized_text = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
         let body = format!(r#"{{"text":"{oversized_text}"}}"#);
@@ -2462,6 +2680,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2540,6 +2759,7 @@ mod tests {
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
             write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+            workflow_hub: None,
         });
         let request = Request::builder()
             .method(Method::POST)
@@ -2842,6 +3062,7 @@ mod tests {
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
             write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
             secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+            workflow_hub: None,
         });
         let oversized = "x".repeat(CODE_CONTROL_BODY_LIMIT_BYTES + 1);
         for uri in ["/skills/activate", "/session/resume"] {
@@ -2914,6 +3135,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -2967,6 +3189,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -3017,6 +3240,7 @@ mod tests {
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                 write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                 secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
             })
             .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
 
@@ -3170,6 +3394,7 @@ mod tests {
                     bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
                     write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
                     secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                    workflow_hub: None,
                 })
                 .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
         };
@@ -3205,5 +3430,402 @@ mod tests {
         assert_eq!(mismatched_value["sessionId"], "not-the-durable-session");
         assert_eq!(mismatched_value["cumulative"]["requestCount"], 1);
         assert_eq!(mismatched_value["cumulative"]["totalTokens"], 18);
+    }
+
+    /// W3-06: `/events?wire=2` streams durable workflow envelopes; illegal wire
+    /// and missing hub fail closed; cursor reconnect skips already-seen rows.
+    #[tokio::test]
+    async fn code_events_wire_v2_http_contract() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use tempfile::tempdir;
+
+        use crate::internal::ai::{
+            session::{CodeWorkflowEventKind, SessionJsonlStore},
+            web::sse_wire::CodeUiWorkflowHub,
+        };
+
+        let runtime = test_code_ui_runtime().await;
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = Arc::new(CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub"));
+        let secret = "sk-w306-wire-v2-secret-literal";
+        for (idx, projection) in ["status", "transcript_upsert"].into_iter().enumerate() {
+            store
+                .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                    projection: projection.to_string(),
+                    summary: format!("delta-{idx}"),
+                    payload: serde_json::json!({
+                        "n": idx,
+                        "note": format!("provider key {secret}"),
+                    }),
+                })
+                .expect("append");
+        }
+        let redactor = Arc::new(
+            SecretRedactor::default_runtime()
+                .with_forbidden_env_values([("OPENAI_API_KEY", secret)]),
+        );
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime.clone()),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4318)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: redactor,
+                workflow_hub: Some(hub.clone()),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let illegal = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=9")
+            .body(Body::empty())
+            .unwrap();
+        let illegal_response = app.clone().oneshot(illegal).await.unwrap();
+        assert_eq!(illegal_response.status(), StatusCode::BAD_REQUEST);
+        let illegal_body = to_bytes(illegal_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let illegal_value: serde_json::Value = serde_json::from_slice(&illegal_body).unwrap();
+        assert_eq!(illegal_value["error"]["code"], "INVALID_WIRE_VERSION");
+
+        // v1 must ignore stray/non-numeric cursor query params (v2-only field).
+        let v1_stray_cursor = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=1&cursor=not-a-number")
+            .body(Body::empty())
+            .unwrap();
+        let v1_response = app.clone().oneshot(v1_stray_cursor).await.unwrap();
+        assert_eq!(
+            v1_response.status(),
+            StatusCode::OK,
+            "v1 must ignore invalid cursor query values"
+        );
+
+        let no_hub = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime.clone()),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4318)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+        let missing = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2")
+            .body(Body::empty())
+            .unwrap();
+        let missing_response = no_hub.oneshot(missing).await.unwrap();
+        assert_eq!(missing_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let missing_body = to_bytes(missing_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let missing_value: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+        assert_eq!(
+            missing_value["error"]["code"],
+            "WIRE_V2_REQUIRES_DURABLE_SESSION"
+        );
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The SSE response stays open for live updates; take frames until the
+        // durable replay prefix is observed (or the budget expires).
+        let body = {
+            use futures_util::StreamExt;
+            let mut stream = response.into_body().into_data_stream();
+            let mut collected = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                match timeout(Duration::from_millis(200), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        collected.extend_from_slice(&chunk);
+                        let text = String::from_utf8_lossy(&collected);
+                        if text.contains("\"cursor\":2") && text.contains("id: 2") {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(error))) => panic!("SSE body error: {error}"),
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            String::from_utf8(collected).expect("utf8 SSE body")
+        };
+        assert!(
+            body.contains("event: code_workflow"),
+            "v2 stream must use code_workflow events: {body}"
+        );
+        assert!(
+            body.contains("\"cursor\":1") && body.contains("\"cursor\":2"),
+            "v2 connect must replay durable cursors: {body}"
+        );
+        assert!(
+            body.contains("id: 1") && body.contains("id: 2"),
+            "v2 SSE id must mirror durable cursor: {body}"
+        );
+        assert!(
+            !body.contains(secret),
+            "v2 durable replay must redact forbidden secrets: {body}"
+        );
+        assert!(
+            body.contains("[REDACTED]"),
+            "v2 durable replay must retain the redaction marker: {body}"
+        );
+
+        let reconnect = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2&cursor=1")
+            .body(Body::empty())
+            .unwrap();
+        let reconnect_response = app.clone().oneshot(reconnect).await.unwrap();
+        assert_eq!(reconnect_response.status(), StatusCode::OK);
+        let reconnect_body = {
+            use futures_util::StreamExt;
+            let mut stream = reconnect_response.into_body().into_data_stream();
+            let mut collected = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                match timeout(Duration::from_millis(200), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        collected.extend_from_slice(&chunk);
+                        let text = String::from_utf8_lossy(&collected);
+                        if text.contains("\"cursor\":2") {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(error))) => panic!("SSE reconnect body error: {error}"),
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            String::from_utf8(collected).expect("utf8 reconnect body")
+        };
+        assert!(
+            reconnect_body.contains("\"cursor\":2"),
+            "cursor reconnect must include later events: {reconnect_body}"
+        );
+        assert!(
+            !reconnect_body.contains("\"cursor\":1"),
+            "cursor reconnect must not duplicate cursor=1: {reconnect_body}"
+        );
+
+        let ahead = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2&cursor=99")
+            .body(Body::empty())
+            .unwrap();
+        let ahead_response = app.oneshot(ahead).await.unwrap();
+        assert_eq!(ahead_response.status(), StatusCode::CONFLICT);
+        let ahead_body = to_bytes(ahead_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ahead_value: serde_json::Value = serde_json::from_slice(&ahead_body).unwrap();
+        assert_eq!(ahead_value["error"]["code"], "WIRE_V2_CURSOR_AHEAD");
+    }
+
+    /// W3-06: production `start()` resolves the hub from the lifecycle host
+    /// when `WebServerOptions.workflow_hub` is unset — pin that fallback so a
+    /// headless runtime regression cannot silently 503 wire v2.
+    #[tokio::test]
+    async fn code_events_wire_v2_resolves_hub_from_lifecycle() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use futures_util::future::BoxFuture;
+        use tempfile::tempdir;
+
+        use crate::internal::ai::{
+            session::{CodeWorkflowEventKind, SessionJsonlStore},
+            web::{
+                agent_runtime_adapter::CodeUiLifecycleShutdown, code_ui::CodeUiRuntimeOptions,
+                sse_wire::CodeUiWorkflowHub,
+            },
+        };
+
+        struct LifecycleHub(Arc<CodeUiWorkflowHub>);
+        impl CodeUiLifecycleShutdown for LifecycleHub {
+            fn shutdown(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn workflow_hub(&self) -> Option<Arc<CodeUiWorkflowHub>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = Arc::new(CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub"));
+        store
+            .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: "lifecycle-hub".to_string(),
+                payload: serde_json::json!({ "ok": true }),
+            })
+            .expect("append");
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra-w306-lifecycle",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        let runtime = CodeUiRuntimeHandle::build_with_options_and_lifecycle(
+            ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
+            CodeUiRuntimeOptions::new(
+                true,
+                false,
+                CodeUiInitialController::LocalTui {
+                    owner_label: "Terminal UI".to_string(),
+                    reason: None,
+                },
+            ),
+            Some(Arc::new(LifecycleHub(hub))),
+        )
+        .await;
+
+        // Mirror `start()`: options.workflow_hub is None, fall back to runtime.
+        let workflow_hub = None.or_else(|| runtime.workflow_hub());
+        assert!(
+            workflow_hub.is_some(),
+            "lifecycle host must expose the durable workflow hub"
+        );
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra-w306-lifecycle")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4319)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = {
+            use futures_util::StreamExt;
+            let mut stream = response.into_body().into_data_stream();
+            let mut collected = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline {
+                match timeout(Duration::from_millis(200), stream.next()).await {
+                    Ok(Some(Ok(chunk))) => {
+                        collected.extend_from_slice(&chunk);
+                        let text = String::from_utf8_lossy(&collected);
+                        if text.contains("\"cursor\":1") {
+                            break;
+                        }
+                    }
+                    Ok(Some(Err(error))) => panic!("SSE body error: {error}"),
+                    Ok(None) => break,
+                    Err(_) => continue,
+                }
+            }
+            String::from_utf8(collected).expect("utf8 SSE body")
+        };
+        assert!(
+            body.contains("event: code_workflow") && body.contains("\"cursor\":1"),
+            "lifecycle-derived hub must serve wire v2 replay: {body}"
+        );
+    }
+
+    /// W3-06: live fan-out must reach an already-subscribed v2 client after a
+    /// post-connect durable append (not only pre-connect replay).
+    #[tokio::test]
+    async fn code_events_wire_v2_live_fanout_after_subscribe() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use futures_util::StreamExt;
+        use tempfile::tempdir;
+
+        use crate::internal::ai::{
+            session::{CodeWorkflowEventKind, SessionJsonlStore},
+            web::sse_wire::CodeUiWorkflowHub,
+        };
+
+        let runtime = test_code_ui_runtime().await;
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = Arc::new(CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub"));
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra-w306-live")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4320)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: Some(hub),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+
+        // Subscribe first, then append so the frame must come from live fan-out.
+        store
+            .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: "live-after-subscribe".to_string(),
+                payload: serde_json::json!({ "live": true }),
+            })
+            .expect("post-subscribe append");
+
+        let mut collected = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    collected.extend_from_slice(&chunk);
+                    let text = String::from_utf8_lossy(&collected);
+                    if text.contains("live-after-subscribe") && text.contains("\"cursor\":1") {
+                        break;
+                    }
+                }
+                Ok(Some(Err(error))) => panic!("SSE body error: {error}"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        let body = String::from_utf8(collected).expect("utf8 SSE body");
+        assert!(
+            body.contains("event: code_workflow")
+                && body.contains("live-after-subscribe")
+                && body.contains("\"cursor\":1"),
+            "subscribed v2 client must receive live durable appends: {body}"
+        );
     }
 }

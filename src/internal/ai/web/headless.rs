@@ -43,6 +43,7 @@ use super::{
         CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
         CodeUiTranscriptEntryKind,
     },
+    sse_wire::CodeUiWorkflowHub,
     web_admission::{
         CODE_UI_WEB_TURN_KIND, InFlightTurn, WebCodeUiAdmission, WebTurnMode, release_web_turn,
         wait_for_web_turn_start,
@@ -137,6 +138,8 @@ pub struct HeadlessSessionPersistence {
     projection_checkpoint: Arc<Mutex<HeadlessProjectionCheckpoint>>,
     durability_repo_id: String,
     durability_session_id: String,
+    /// Fan-out for SSE wire v2 (same durable sequence as projection appends).
+    workflow_hub: Arc<CodeUiWorkflowHub>,
 }
 
 struct HeadlessProjectionCheckpoint {
@@ -148,7 +151,7 @@ impl HeadlessSessionPersistence {
     /// Construct persistence for callers that do not yet have a restored
     /// projection checkpoint. The first persisted snapshot becomes the
     /// checkpoint through normal fine-grained delta emission.
-    pub fn new(store: Arc<SessionStore>, state: SessionState) -> Self {
+    pub fn new(store: Arc<SessionStore>, state: SessionState) -> io::Result<Self> {
         Self::with_projection_checkpoint(store, state, CodeUiSessionSnapshot::default(), 0)
     }
 
@@ -159,9 +162,10 @@ impl HeadlessSessionPersistence {
         state: SessionState,
         initial_projection_snapshot: CodeUiSessionSnapshot,
         initial_projection_sequence: u64,
-    ) -> Self {
-        let projection_store = SessionJsonlStore::new(store.session_root(&state.id));
-        Self {
+    ) -> io::Result<Self> {
+        let mut projection_store = SessionJsonlStore::new(store.session_root(&state.id));
+        let workflow_hub = Arc::new(CodeUiWorkflowHub::attach(&mut projection_store)?);
+        Ok(Self {
             store,
             state: Arc::new(Mutex::new(state.clone())),
             projection_store,
@@ -171,7 +175,13 @@ impl HeadlessSessionPersistence {
             })),
             durability_repo_id: state.working_dir.clone(),
             durability_session_id: state.id.clone(),
-        }
+            workflow_hub,
+        })
+    }
+
+    /// SSE wire v2 durable fan-out for this session.
+    pub fn workflow_hub(&self) -> Arc<CodeUiWorkflowHub> {
+        self.workflow_hub.clone()
     }
 
     /// Stable durable identity fields used by the runtime worker.
@@ -231,9 +241,11 @@ impl HeadlessSessionPersistence {
     async fn persist_projection_deltas(&self, snapshot: &CodeUiSessionSnapshot) -> io::Result<u64> {
         let mut checkpoint = self.projection_checkpoint.lock().await;
         let deltas = code_ui_projection_deltas(&checkpoint.snapshot, snapshot)?;
-        for delta in deltas {
-            let event = self.projection_store.append_code_workflow(delta)?;
-            checkpoint.sequence = event.sequence;
+        if !deltas.is_empty() {
+            let events = self.projection_store.append_code_workflow_batch(&deltas)?;
+            if let Some(last) = events.last() {
+                checkpoint.sequence = last.sequence;
+            }
         }
         checkpoint.snapshot = snapshot.clone();
         Ok(checkpoint.sequence)
@@ -2325,6 +2337,12 @@ where
             self.shutdown_result_tx.send_replace(Some(result.clone()));
             result.map_err(anyhow::Error::msg)
         })
+    }
+
+    fn workflow_hub(&self) -> Option<Arc<CodeUiWorkflowHub>> {
+        self.persistence
+            .as_ref()
+            .map(HeadlessSessionPersistence::workflow_hub)
     }
 }
 

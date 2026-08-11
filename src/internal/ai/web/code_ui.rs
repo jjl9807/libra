@@ -862,6 +862,18 @@ pub struct CodeUiRuntimeHandle {
         Option<Arc<dyn crate::internal::ai::web::agent_runtime_adapter::CodeUiLifecycleShutdown>>,
 }
 
+impl CodeUiRuntimeHandle {
+    /// Durable workflow hub for SSE wire v2 when the retained lifecycle host
+    /// exposes one (headless SessionStore path).
+    pub fn workflow_hub(
+        &self,
+    ) -> Option<Arc<crate::internal::ai::web::sse_wire::CodeUiWorkflowHub>> {
+        self.lifecycle_host
+            .as_ref()
+            .and_then(|host| host.workflow_hub())
+    }
+}
+
 /// Bag of constructor options for [`CodeUiRuntimeHandle::build_with_options`].
 ///
 /// Existing call sites continue to use [`CodeUiRuntimeHandle::build`] /

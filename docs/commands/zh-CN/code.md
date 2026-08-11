@@ -160,7 +160,30 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | `planExecutionRepair` | object, optional | Runtime-owned plan-execution repair 状态。它含 snake_case 的 `state`、有界且经 runtime 脱敏的 failure `evidence`（`output`、`diagnostics`、`attempt`、`max_attempts`），并在 `awaiting_user` 时含 `interaction_id`。`automatic_repair` 表示进行中的重试；`awaiting_user` 只会在配置的重试次数耗尽后出现：Code UI Continue 必须提供更高的 `maxAttempts`（例如当前上限为 2 时发送 `{ "selectedOption": "continue", "maxAttempts": 3 }`），否则返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`；也可以提供手动修订指导。Cancel 为终态。`intent_spec_revision` 和 `manual_action` 需要新的用户定向 workflow。 |
 | `updatedAt` | string | ISO 8601 更新时间戳。 |
 
-`GET /api/code/events` 流式传输 `CodeUiEventEnvelope` 记录，包含 `seq`、`type`、`at` 和 `data`。事件 `type` 是 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
+`GET /api/code/events` 流式传输会话更新。Wire 版本协商如下（W3-06 / plan-20260715）：
+
+| 选择 | 机制 |
+|---|---|
+| 显式 v1 | `?wire=1` 或 `?wire=v1` |
+| 显式 v2 | `?wire=2` 或 `?wire=v2` |
+| Accept 提示 | `Accept: text/event-stream;libra-wire=2`（若同时给出 query `wire=`，以 query 为准） |
+| 未指定默认 | **v1**，直到内置 SPA 在 W3-09 迁移 |
+| 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
+
+**SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
+
+**SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在有界 fold 窗口内无重复、无丢事件。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的 `--web-only` headless（非 Codex `HeadlessCodeRuntime`）；默认 TUI + 后台 web 以及 managed `--web-only --provider codex` 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
+
+### SSE v1 兼容窗口（DEFER-08）
+
+在 wire v2 成为默认、且内置前端/automation 客户端完成迁移之后，v1 snapshot SSE 仍至少保留一个成功的公开 patch release。v1 的物理移除**不属于** plan-20260715；见 DEFER-08 / ADR-CODE-08。移除前置条件清单（须全部满足）：
+
+1. 内置前端已迁移到 v2（W3-09 证据）。
+2. 内置 automation 客户端已迁移到 v2。
+3. Compat / matrix 测试默认消费 v2。
+4. Release notes 写明最后支持 v1 的版本与升级路径。
+5. 在 (1)–(4) 之后、v1 仍可用时，至少有一次成功的公开 patch release。
+
 
 `GET /api/code/threads` 返回 `{ items, nextOffset? }`。每个 item 有 `id`、可选 `title`、`archived`、可选 `currentIntentId`、可选 `workingDir`、`createdAt` 和 `updatedAt`。在 ThreadProjection 持久化 per-thread cwd 之前省略 `workingDir`（不要用 server cwd 冒充 linked-worktree thread）。`limit` 默认 50 并 clamp 到 200；格式错误的 `limit` 或 `offset` 返回 `INVALID_QUERY_PARAM`。
 
@@ -175,6 +198,10 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `ORIGIN_REQUIRED` | 403 | 浏览器写/attach 缺少可信 loopback `Origin`（或同源 `Referer`），或提交了跨站 Origin。 |
 | `RATE_LIMITED` | 429 | 当前 session 写配额耗尽；等待速率窗口恢复后重试（见 `Retry-After`）。 |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE 投影无法应用 secret redactor（规则为空或序列化失败）。Fail-closed：响应不包含未脱敏 payload；重启 `libra code` 或修复 redactor 配置后重试。 |
+| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `1`/`v1` 与 `2`/`v2`）。 |
+| `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 需要 SessionStore-backed workflow hub（当前挂在 `--web-only` headless persistence；TUI 后台 web 与 managed Codex web-only 尚未暴露）。 |
+| `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` 超过 durable workflow 尾部；丢弃 cursor 并 resync（超前 cursor 会导致后续 live 事件永久跳过）。 |
+| `WIRE_V2_REPLAY_FAILED` | 500 | Wire v2 无法从指定 cursor 回放 durable workflow 事件（缺口、窗口上限或 I/O）。 |
 | `CONTROL_DISABLED` | 403 | 当前进程未启用 automation control。 |
 | `MISSING_CONTROL_TOKEN` / `INVALID_CONTROL_TOKEN` | 403 | Automation control token 缺失或无效。 |
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |

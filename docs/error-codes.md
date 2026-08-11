@@ -276,6 +276,10 @@ failures as `-32000` with `data.status` and `data.code`.
 | --- | --- | --- |
 | `PLAN_REPAIR_RETRY_LIMIT_REACHED` | `409` | A plan-repair Continue request did not raise the exhausted automatic retry cap. For Code UI/control, retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |
 | `REDACTION_FAILED` | `500` | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the HTTP body or SSE payload omits unredacted content. Restart `libra code` or fix redactor configuration, then retry. |
+| `INVALID_WIRE_VERSION` | `400` | `GET /api/code/events` `wire` query / `Accept;libra-wire=` value was not `1`/`v1` or `2`/`v2`. |
+| `WIRE_V2_REQUIRES_DURABLE_SESSION` | `503` | SSE wire v2 was requested but no SessionStore-backed workflow hub is mounted (today: `--web-only` headless persistence; TUI background web and managed Codex web-only do not yet expose one). |
+| `WIRE_V2_CURSOR_AHEAD` | `409` | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (reconnecting with an ahead cursor would permanently skip live events). |
+| `WIRE_V2_REPLAY_FAILED` | `500` | Durable workflow replay for wire v2 failed (gap, bound exceeded, or I/O). Create a projection checkpoint or retry from a known-good cursor. |
 
 ## How To Use Codes
 

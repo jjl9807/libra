@@ -583,3 +583,65 @@ fn code_ui_browser_resume_contract() {
         CodeUiSessionStatus::IndeterminateSideEffect
     );
 }
+
+/// W3-06: negotiate SSE wire v1/v2 (explicit, default, illegal fail-closed).
+#[test]
+fn sse_wire_version_negotiation() {
+    use axum::http::{HeaderMap, HeaderValue, header};
+    use libra::internal::ai::web::sse_wire::{
+        CodeEventsQuery, CodeUiSseWireVersion, parse_code_events_wire_version,
+    };
+
+    let headers = HeaderMap::new();
+    assert_eq!(
+        parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
+        CodeUiSseWireVersion::V1
+    );
+    for (raw, expected) in [
+        ("1", CodeUiSseWireVersion::V1),
+        ("v1", CodeUiSseWireVersion::V1),
+        ("2", CodeUiSseWireVersion::V2),
+        ("v2", CodeUiSseWireVersion::V2),
+    ] {
+        let query = CodeEventsQuery {
+            wire: Some(raw.into()),
+            cursor: None,
+        };
+        assert_eq!(
+            parse_code_events_wire_version(&query, &headers).unwrap(),
+            expected
+        );
+    }
+    assert!(
+        parse_code_events_wire_version(
+            &CodeEventsQuery {
+                wire: Some("3".into()),
+                cursor: None,
+            },
+            &headers
+        )
+        .is_err()
+    );
+
+    let mut accept = HeaderMap::new();
+    accept.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream;libra-wire=2"),
+    );
+    assert_eq!(
+        parse_code_events_wire_version(&CodeEventsQuery::default(), &accept).unwrap(),
+        CodeUiSseWireVersion::V2
+    );
+    assert_eq!(
+        parse_code_events_wire_version(
+            &CodeEventsQuery {
+                wire: Some("1".into()),
+                cursor: None,
+            },
+            &accept
+        )
+        .unwrap(),
+        CodeUiSseWireVersion::V1,
+        "query wire must win over Accept"
+    );
+}

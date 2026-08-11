@@ -1222,6 +1222,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             automation_control_token: control_runtime.token.clone(),
             audit_sink: None,
             secret_redactor: Some(projection_secret_redactor(&env_file)),
+            workflow_hub: None,
         },
     )
     .await
@@ -2930,7 +2931,12 @@ where
         session_state,
         snapshot,
         projection_sequence,
-    );
+    )
+    .map_err(|error| {
+        CliError::fatal(format!(
+            "failed to attach Code UI workflow hub for session persistence: {error}"
+        ))
+    })?;
 
     let lifecycle = HeadlessCodeRuntime::new_with_persistence(
         session,
@@ -4020,6 +4026,7 @@ where
             automation_control_token: control_runtime.token.clone(),
             audit_sink: None,
             secret_redactor: Some(params.secret_redactor.clone()),
+            workflow_hub: None,
         },
     )
     .await

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-06, 2026-08-12, v0.19.136)
+
+- **W3-06 adds Code UI SSE wire v2 negotiation.** `GET /api/code/events`
+  accepts `?wire=1|2` (or `Accept;libra-wire=`), defaults to v1, and fail-closes
+  illegal versions. Wire v2 streams durable W1-06 workflow deltas with
+  `cursor`/`eventId`/`kind`/`payload` and cursor reconnect; v1 full-snapshot
+  remains the compatibility default until W3-09 (DEFER-08 checklist documented).
+
 ### Added (plan-20260715 W3-12, 2026-08-12, v0.19.135)
 
 - **W3-12 closes Code UI sensitive projection redaction.** Session / SSE /
