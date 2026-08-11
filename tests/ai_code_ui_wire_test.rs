@@ -372,7 +372,12 @@ fn controller_attach_request_round_trip_pins_camel_case() {
     let request: CodeUiControllerAttachRequest =
         serde_json::from_value(json!({ "clientId": "browser-a" })).unwrap();
     assert_eq!(request.client_id, "browser-a");
-    assert_eq!(request.kind, CodeUiControllerKind::Browser);
+    // Omitted `kind` stays None; HTTP handler resolves browser vs automation.
+    assert_eq!(request.kind, None);
+
+    let explicit: CodeUiControllerAttachRequest =
+        serde_json::from_value(json!({ "clientId": "browser-b", "kind": "browser" })).unwrap();
+    assert_eq!(explicit.kind, Some(CodeUiControllerKind::Browser));
 
     let response = CodeUiControllerAttachResponse {
         controller_token: "tok".to_string(),

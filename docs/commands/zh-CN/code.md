@@ -117,6 +117,8 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 浏览器写请求共享与自动化控制相同的 256 KiB body limit 和 audit-sink wiring。浏览器只在内存中持久化 lease；重新加载页面会丢弃 lease，下一次写入会重新 attach。
 
+浏览器写入（含 `kind: "browser"` 的 `POST /controller/attach`）还要求可信的 loopback `Origin`（或同源 `Referer` 回退），且必须匹配 Code UI bind 地址（精确的 `http://<bound-ip>:<port>`；绑定到经典 loopback 时额外接受 `localhost` / `127.0.0.1` / `[::1]` 别名）。缺失或跨站 Origin 以 `ORIGIN_REQUIRED` fail-closed。Automation 写入走 `X-Libra-Control-Token` / controller lease，**不得**用 Origin 代替身份校验。浏览器与 automation 生产者共用按 session 的写速率限制（`LIBRA_CODE_SESSION_WRITE_RATE_LIMIT` / `LIBRA_CODE_SESSION_WRITE_RATE_WINDOW_SECS`，默认 120 次 / 60s），超限返回 `429 RATE_LIMITED`，窗口恢复后可继续。
+
 嵌入式 SPA 的 session-lifecycle 面板通过 `GET /api/code/threads` 列出 threads，经 `POST /api/code/control/cancel` 取消当前 turn（当 `controller.canWrite` 为 false 时 fail-closed），并经 `POST /api/code/session/resume` 以 `{ "threadId": "..." }` 发起 resume。Thread 列表按仓库存储根共享（跨 linked worktree）；列表项在 ThreadProjection 持久化 per-thread cwd 之前省略 `workingDir`。
 
 Usage 面板镜像 W2-12 `RuntimeUsageTotals` read model（累计、本 turn 增量、sub-agent 归因），并保持 `partial`/`unknown`/`error` 可见，而不是伪装成零花费。`GET /api/code/usage` 从 durable totals 读取，失败时返回错误而不伪造零值。当 durable sub-agent 枚举不可用时，响应省略 `subAgents` 并设置 `subAgentsStatus: "unavailable"`，而不是返回空数组。
@@ -168,6 +170,8 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 |------|------|------|
 | `LOOPBACK_REQUIRED` | 403 | 非 loopback client 试图访问 API route。 |
 | `PAYLOAD_TOO_LARGE` | 413 | 写请求体超过 256 KiB。 |
+| `ORIGIN_REQUIRED` | 403 | 浏览器写/attach 缺少可信 loopback `Origin`（或同源 `Referer`），或提交了跨站 Origin。 |
+| `RATE_LIMITED` | 429 | 当前 session 写配额耗尽；等待速率窗口恢复后重试（见 `Retry-After`）。 |
 | `CONTROL_DISABLED` | 403 | 当前进程未启用 automation control。 |
 | `MISSING_CONTROL_TOKEN` / `INVALID_CONTROL_TOKEN` | 403 | Automation control token 缺失或无效。 |
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |
