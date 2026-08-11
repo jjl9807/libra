@@ -5231,10 +5231,10 @@ async fn execute_stdio(args: &CodeArgs) -> CliResult<()> {
 /// - `--stdio` (MCP transport) rejects provider/model/api-base/temperature and
 ///   the provider-specific tuning flags — it has no provider surface.
 /// - `--web`/`--web-only` relaxes provider/model/api-base/temperature, the
-///   provider-specific tuning flags, and `--resume` for non-Codex providers;
-///   they feed the headless web runtime. It still rejects `--env-file`,
-///   `--network-access allow`, `--context`, `--approval-policy`, and
-///   `--approval-ttl` (see [`reject_non_tui_flags`]).
+///   provider-specific tuning flags, `--resume` (non-Codex), `--env-file`,
+///   `--context`, `--approval-policy`, and `--approval-ttl` so they feed the
+///   headless web runtime. It still rejects `--network-access allow` (safety
+///   gate; see [`reject_non_tui_flags`]).
 /// - Provider-specific flags are only accepted for their respective providers.
 fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), String> {
     if !args.stdio && args.port == args.mcp_port && args.port != 0 {
@@ -5276,6 +5276,21 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         if args.provider == CodeProvider::Codex && args.resume.is_some() {
             return Err(
                 "--resume is not supported with --web and --provider=codex; remove --resume or use a non-Codex headless provider"
+                    .to_string(),
+            );
+        }
+        // Managed Codex web owns its own credential/approval surface; these
+        // TUI/headless flags are accepted for non-Codex web but must not be
+        // silently ignored under Codex.
+        if args.provider == CodeProvider::Codex && args.env_file.is_some() {
+            return Err(
+                "--env-file is not supported with --web and --provider=codex; remove --env-file or use a non-Codex headless provider"
+                    .to_string(),
+            );
+        }
+        if args.provider == CodeProvider::Codex && args.approval_ttl.is_some() {
+            return Err(
+                "--approval-ttl is not supported with --web and --provider=codex; remove --approval-ttl or use a non-Codex headless provider"
                     .to_string(),
             );
         }
@@ -5445,14 +5460,11 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 ///   which still rejects a provider-specific flag that does not match the
 ///   selected provider and still rejects `--api-base` under `--provider=codex`.
 ///
-/// Flags that stay rejected in BOTH non-TUI modes (design / safety / deferred
-/// work): `--env-file` (its bootstrap source is shared with TUI, but accepting
-/// the public Web-only flag remains a later compatibility decision) and
-/// `--network-access allow` (safety gate).
-/// W3-02: `--context` and `--approval-policy` are accepted under Web-only so
-/// Code UI harness scenarios can drive the same plan/generation paths as TUI;
-/// they remain rejected for MCP `--stdio`. `--approval-ttl` stays rejected in
-/// both until a dedicated TTL surface lands.
+/// Flags that stay rejected in BOTH non-TUI modes (safety):
+/// `--network-access allow`.
+/// W3-13: `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl`
+/// are accepted under Web-only (same semantics as TUI) and remain rejected for
+/// MCP `--stdio`.
 /// `--resume` is accepted only for the non-Codex Web headless path; it remains
 /// rejected for MCP stdio and managed Codex, which do not share that session
 /// protocol.
@@ -5489,18 +5501,13 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
             "--approval-policy",
             mode,
         )?;
+        reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
+        reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
+        reject_mode_flag(args.approval_ttl.is_some(), "--approval-ttl", mode)?;
     }
 
-    // Rejected in BOTH non-TUI modes.
-    // NOTE (C2): Web-only uses the same env-file → process → Vault provider
-    // bootstrap as TUI, but accepting a user-supplied `--env-file` remains a
-    // later public-compatibility decision. Keep the flag rejected until that
-    // compatibility work lands.
-    reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
-    if !web_only {
-        reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
-    }
-    reject_mode_flag(args.approval_ttl.is_some(), "--approval-ttl", mode)?;
+    // Safety gate retained for both non-TUI modes (not part of W5 deletion list;
+    // keep fail-closed until a dedicated Web network-policy surface exists).
     reject_mode_flag(
         args.network_access != CodeNetworkAccess::Deny,
         "--network-access",
@@ -5767,6 +5774,29 @@ mod tests {
         assert!(
             err.contains("--resume") && err.contains("--web") && err.contains("codex"),
             "managed Codex resume rejection must name the flag, mode, and provider; got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_env_file_and_approval_ttl_for_managed_codex_web() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Codex;
+        args.env_file = Some(PathBuf::from(".env.test"));
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--env-file") && err.contains("--web") && err.contains("codex"),
+            "managed Codex must fail-closed on --env-file; got: {err}"
+        );
+
+        let mut ttl_args = base_args();
+        ttl_args.web_only = true;
+        ttl_args.provider = CodeProvider::Codex;
+        ttl_args.approval_ttl = Some(42);
+        let err = validate_mode_args(&ttl_args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--approval-ttl") && err.contains("--web") && err.contains("codex"),
+            "managed Codex must fail-closed on --approval-ttl; got: {err}"
         );
     }
 
@@ -6189,15 +6219,25 @@ mod tests {
         );
     }
 
-    /// C2 (R3): `--env-file` and `--network-access allow` stay rejected under
-    /// web-only (env-file support deferred; network-access is a safety gate).
+    /// W3-13: `--env-file` / `--approval-ttl` are accepted under web-only;
+    /// `--network-access allow` stays rejected (safety gate).
     #[test]
-    fn rejects_deferred_and_safety_flags_in_web_only_mode() {
+    fn accepts_env_file_and_approval_ttl_in_web_only_mode_but_rejects_network_allow() {
         let mut env_file_args = base_args();
         env_file_args.web_only = true;
         env_file_args.env_file = Some(PathBuf::from(".env.test"));
-        let err = validate_mode_args(&env_file_args, &OutputConfig::default()).unwrap_err();
-        assert!(err.contains("--env-file") && err.contains("--web"));
+        assert!(
+            validate_mode_args(&env_file_args, &OutputConfig::default()).is_ok(),
+            "web-only must accept --env-file"
+        );
+
+        let mut ttl_args = base_args();
+        ttl_args.web_only = true;
+        ttl_args.approval_ttl = Some(42);
+        assert!(
+            validate_mode_args(&ttl_args, &OutputConfig::default()).is_ok(),
+            "web-only must accept --approval-ttl"
+        );
 
         let mut net_args = base_args();
         net_args.web_only = true;
@@ -6427,13 +6467,36 @@ mod tests {
     }
 
     #[test]
-    fn rejects_env_file_in_web_mode() {
+    fn accepts_env_file_in_web_mode() {
         let mut args = base_args();
         args.web_only = true;
         args.env_file = Some(PathBuf::from(".env.test"));
 
-        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
-        assert!(err.contains("--env-file"));
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn accepts_approval_ttl_in_web_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.approval_ttl = Some(42);
+
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn rejects_env_file_and_approval_ttl_in_stdio_mode() {
+        let mut env_args = base_args();
+        env_args.stdio = true;
+        env_args.env_file = Some(PathBuf::from(".env.test"));
+        let err = validate_mode_args(&env_args, &OutputConfig::default()).unwrap_err();
+        assert!(err.contains("--env-file") && err.contains("--stdio"));
+
+        let mut ttl_args = base_args();
+        ttl_args.stdio = true;
+        ttl_args.approval_ttl = Some(42);
+        let err = validate_mode_args(&ttl_args, &OutputConfig::default()).unwrap_err();
+        assert!(err.contains("--approval-ttl") && err.contains("--stdio"));
     }
 
     #[test]

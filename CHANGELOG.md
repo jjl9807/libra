@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-13, 2026-08-12)
+
+- **W3-13 opens Web launch flag parity for non-Codex providers.**
+  `--web`/`--web-only` accept `--env-file`, `--context`, `--approval-policy`,
+  and `--approval-ttl` with TUI-equivalent semantics (env-file still overrides
+  process env/Vault). Managed `--provider codex` and MCP `--stdio` continue to
+  fail-closed on surfaces they do not wire. Default `libra code` routing stays
+  TUI until W4-01.
+
 ### Added (plan-20260715 W3-05, 2026-08-12)
 
 - **W3-05 hardens Code UI write identity/request boundaries.** Browser
