@@ -232,13 +232,33 @@ pub struct AgentSnapshot {
 pub enum AgentEventKind {
     TurnQueued,
     TurnStarted,
-    InteractionRequested { state: InteractionState },
-    InteractionResponded { interaction_id: String },
+    InteractionRequested {
+        state: InteractionState,
+    },
+    InteractionResponded {
+        interaction_id: String,
+    },
     CancelRequested,
-    TurnCompleted { summary: String },
-    TurnFailed { reason: String },
+    TurnCompleted {
+        summary: String,
+    },
+    TurnFailed {
+        reason: String,
+    },
     TurnCancelled,
-    TurnIndeterminateSideEffect { reason: String },
+    TurnIndeterminateSideEffect {
+        reason: String,
+    },
+    /// Diagnosable provider-native notification folded into the shared
+    /// runtime envelope (W3-04). Unknown / unmapped Codex (and future
+    /// provider) methods MUST emit this rather than being dropped.
+    /// Payloads stay summary-only — no raw prompts, tool args, or secrets.
+    ProviderNotification {
+        provider: String,
+        method: String,
+        classification: String,
+        detail: String,
+    },
 }
 
 /// A single observable runtime event.
@@ -641,6 +661,14 @@ pub enum RuntimeCommand {
         cursor: EventCursor,
         reply: oneshot::Sender<AgentEventStream>,
     },
+    /// Record a provider-normalized envelope kind onto the shared runtime
+    /// event stream without admitting or finishing a turn (W3-04 Codex).
+    RecordEnvelopeEvent {
+        session_id: String,
+        turn_id: Option<String>,
+        kind: AgentEventKind,
+        reply: oneshot::Sender<Result<AgentEvent, RuntimeWorkerError>>,
+    },
     Shutdown {
         reply: Option<oneshot::Sender<Result<(), RuntimeShutdownError>>>,
     },
@@ -969,6 +997,30 @@ impl AgentRuntimeHandle {
             .map_err(|_| RuntimeWorkerError::ResponseDropped)
     }
 
+    /// Append a provider-normalized [`AgentEventKind`] to the shared runtime
+    /// event stream (W3-04). Does not admit, cancel, or finish a turn.
+    pub async fn record_envelope_event(
+        &self,
+        session_id: impl Into<String>,
+        turn_id: Option<String>,
+        kind: AgentEventKind,
+    ) -> Result<AgentEvent, RuntimeWorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::RecordEnvelopeEvent {
+                session_id: session_id.into(),
+                turn_id,
+                kind,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
     /// Stop the worker through its structured lifecycle path. Repeated calls
     /// join the same in-progress shutdown and receive the same terminal
     /// outcome rather than racing to abort executor tasks.
@@ -1193,6 +1245,14 @@ impl AgentRuntimeWorker {
                     }
                     RuntimeCommand::Observe { cursor, reply } => {
                         let _ = reply.send(self.observe(cursor));
+                    }
+                    RuntimeCommand::RecordEnvelopeEvent {
+                        session_id,
+                        turn_id,
+                        kind,
+                        reply,
+                    } => {
+                        let _ = reply.send(self.record_envelope_event(session_id, turn_id, kind));
                     }
                     RuntimeCommand::Shutdown { reply } => self.begin_shutdown(reply),
                     RuntimeCommand::ExecutionFinished {
@@ -2769,6 +2829,34 @@ impl AgentRuntimeWorker {
             Some(turn_id.to_string()),
             AgentEventKind::TurnIndeterminateSideEffect { reason },
         );
+    }
+
+    fn record_envelope_event(
+        &mut self,
+        session_id: String,
+        turn_id: Option<String>,
+        kind: AgentEventKind,
+    ) -> Result<AgentEvent, RuntimeWorkerError> {
+        if self.shutdown.is_some() {
+            return Err(RuntimeWorkerError::ShuttingDown);
+        }
+        if session_id.is_empty() {
+            return Err(RuntimeWorkerError::InvalidTurnIdentifier);
+        }
+        let event_buffer = self.config.event_buffer.max(1);
+        let session = self
+            .sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionQueue::new(session_id.clone(), event_buffer));
+        session.snapshot.cursor.sequence = session.snapshot.cursor.sequence.saturating_add(1);
+        let event = AgentEvent {
+            cursor: session.snapshot.cursor.clone(),
+            session_id,
+            turn_id,
+            kind,
+        };
+        let _ = session.event_tx.send(event.clone());
+        Ok(event)
     }
 
     fn emit(&mut self, session_id: &str, turn_id: Option<String>, kind: AgentEventKind) {

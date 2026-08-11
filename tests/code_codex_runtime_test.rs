@@ -675,6 +675,161 @@ fn libra_code_provider_codex_waits_for_user_before_execution_approval_resolve() 
     Ok(())
 }
 
+/// W3-04: every Codex MethodKind (plus unknown) maps into the shared runtime
+/// `AgentEvent` envelope; unknown methods take an explicit diagnosable fallback.
+#[test]
+fn codex_events_normalized_into_runtime_envelope() {
+    use libra::internal::ai::{
+        codex::{
+            all_known_method_kinds, method_kind_classification, normalize_codex_notification,
+            protocol::MethodKind, sample_method_for_kind,
+        },
+        runtime::AgentEventKind,
+    };
+    use serde_json::json;
+
+    for kind in all_known_method_kinds() {
+        let method = sample_method_for_kind(*kind);
+        assert_eq!(
+            MethodKind::from(method),
+            *kind,
+            "sample_method_for_kind({kind:?}) must classify back to the same MethodKind"
+        );
+        let params = match kind {
+            MethodKind::RequestApproval
+            | MethodKind::RequestApprovalCommandExecution
+            | MethodKind::RequestApprovalFileChange
+            | MethodKind::RequestApprovalApplyPatch
+            | MethodKind::RequestApprovalExec => json!({"requestId": "req-table"}),
+            MethodKind::TurnCompleted => json!({"status": "completed"}),
+            _ => json!({}),
+        };
+        let envelope = normalize_codex_notification(method, &params);
+        assert!(
+            !envelope.used_fallback,
+            "known MethodKind {kind:?} must not use unknown fallback"
+        );
+        assert_eq!(
+            envelope.classification,
+            method_kind_classification(*kind),
+            "classification must match MethodKind discriminant"
+        );
+        assert!(
+            !envelope.kinds().is_empty(),
+            "known MethodKind {kind:?} must emit ≥1 AgentEventKind"
+        );
+        match kind {
+            MethodKind::TurnStarted => {
+                assert!(matches!(
+                    envelope.primary_kind(),
+                    Some(AgentEventKind::TurnStarted)
+                ));
+            }
+            MethodKind::TurnCompleted => {
+                assert!(matches!(
+                    envelope.primary_kind(),
+                    Some(AgentEventKind::TurnCompleted { .. })
+                ));
+            }
+            MethodKind::RequestApproval
+            | MethodKind::RequestApprovalCommandExecution
+            | MethodKind::RequestApprovalFileChange
+            | MethodKind::RequestApprovalApplyPatch
+            | MethodKind::RequestApprovalExec => {
+                assert!(matches!(
+                    envelope.primary_kind(),
+                    Some(AgentEventKind::InteractionRequested { .. })
+                ));
+            }
+            _ => match envelope.primary_kind() {
+                Some(AgentEventKind::ProviderNotification {
+                    provider,
+                    method: recorded_method,
+                    classification,
+                    ..
+                }) => {
+                    assert_eq!(provider, "codex");
+                    assert_eq!(recorded_method, method);
+                    assert_eq!(classification, &method_kind_classification(*kind));
+                }
+                other => panic!("expected ProviderNotification for {kind:?}, got {other:?}"),
+            },
+        }
+    }
+
+    let unknown =
+        normalize_codex_notification("codex/future/notYetClassified", &json!({"ignored": true}));
+    assert!(unknown.used_fallback);
+    assert_eq!(unknown.classification, "unknown");
+    match unknown.primary_kind() {
+        Some(AgentEventKind::ProviderNotification {
+            provider,
+            method,
+            classification,
+            detail,
+        }) => {
+            assert_eq!(provider, "codex");
+            assert_eq!(method, "codex/future/notYetClassified");
+            assert_eq!(classification, "unknown");
+            assert!(
+                detail.contains("unrecognized"),
+                "fallback detail must be diagnosable; got {detail}"
+            );
+        }
+        other => panic!("unknown Codex method must not silent-drop; got {other:?}"),
+    }
+}
+
+/// W3-04: mock Codex `turn/completed` (failed) + unknown notification must
+/// normalize through the Code UI WebSocket reader into a terminal Error
+/// snapshot without panicking on the unknown method.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn libra_code_provider_codex_normalizes_failed_turn_and_unknown_notification() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
+        thread_id: Some("wave-w3-04-codex-envelope-thread".to_string()),
+        emit_turn_completed_status: Some("failed".to_string()),
+        emit_unknown_notification: true,
+        ..Default::default()
+    }))?;
+    let port = server.port().to_string();
+    let fake_codex_bin = fake_codex_bin_path()?;
+
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-codex-envelope-normalize", fixture_path())
+            .with_live_provider("codex", "codex-test")
+            .with_browser_control_loopback()
+            .push_extra_cli_arg("--codex-port")
+            .push_extra_cli_arg(port)
+            .push_extra_cli_arg("--codex-bin")
+            .push_extra_cli_arg(fake_codex_bin),
+    )?;
+    let _captured = wait_for_codex_methods(
+        &server,
+        &["initialize", "thread/start"],
+        Duration::from_secs(10),
+    )?;
+
+    let browser_token = session.attach_browser("codex-envelope-browser")?;
+    let (status, body) =
+        session.browser_submit_message(&browser_token, "trigger failed turn envelope")?;
+    assert!(
+        status.is_success(),
+        "browser submit must succeed before envelope assertion; got {status}: {body}",
+    );
+    let _captured = wait_for_codex_methods(&server, &["turn/start"], Duration::from_secs(10))?;
+
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("error")
+    })?;
+    Ok(())
+}
+
 #[cfg(feature = "test-provider")]
 fn wait_for_codex_methods(
     server: &MockCodexWsServer,

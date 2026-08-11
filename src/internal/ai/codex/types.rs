@@ -62,6 +62,9 @@ pub enum RunStatus {
     InProgress,
     Completed,
     Failed,
+    /// Turn ended by cancel/abort; distinct from Failed so Code UI can idle
+    /// instead of surfacing an error after snapshot rebuild (W3-04).
+    Cancelled,
 }
 
 /// Task status
