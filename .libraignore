@@ -42,7 +42,6 @@ target-codex-review/
 # Frontend
 web/node_modules/
 web/.next/
-web/out/
 web/.pnpm-store/
 
 # Publish Worker (Phase 6/7)

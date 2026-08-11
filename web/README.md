@@ -11,10 +11,25 @@ This directory holds the Next.js source for the embedded `libra code` browser UI
 pnpm install        # install deps (uses pnpm-lock.yaml)
 pnpm dev            # local dev server with HMR
 pnpm lint           # eslint, no warnings allowed
+pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Live API contract (Phase 0–4)
+## Current UI status (W2-07)
+
+The shipped W2-07 page is deliberately a foundation-only placeholder. It mounts
+the shared session/SSE store and browser-controller lease provider, then shows
+the current session title and phase. It does not yet ship a three-pane
+workspace, composer, interaction panel, thread sidebar, terminal, or workflow
+tabs.
+
+The shared API client, wire types, session store, controller lease handling,
+and Vitest coverage are the W2-07 deliverable. Domain panels are owned by later
+W2 cards: W2-08 and later add their respective interaction surfaces, while
+W2-16 adds the workflow review UI. Do not treat the API surface below as a
+claim that those panels are already rendered by the shipped page.
+
+## Live API contract
 
 The browser only talks to its same-origin server. The Rust side enforces loopback at every `/api/*` route, so this client does not host-check. Non-loopback HTML navigation receives the embedded `remote-notice/` static page instead of the SPA, and non-loopback asset/API fallbacks return 404. Source of truth: `src/internal/ai/web/mod.rs`.
 
@@ -43,23 +58,16 @@ The wire types are pinned in two places — keep them in lock-step:
 ```
 web/src/
 ├── app/                       # Next.js app router entry
-├── components/icons/          # Inline SVG icon set
-├── components/workspace/      # Main three-pane layout
-│   ├── chat/                  # Chat pane + composer + InteractionPanel
-│   ├── sidebar/               # Thread list + repo state
-│   ├── terminal/              # Read-only event log derived from snapshot
-│   └── workflow/              # Pipeline / Summary / Diff / Settings tabs
 └── lib/
     ├── code-ui/               # Wire types, HTTP client, store, controller hook
-    ├── persisted-state.ts     # Splitter widths persisted to localStorage
-    └── storage.ts / utils.ts  # Small UI helpers
+    └── ...                    # Domain panels land in later W2 cards
 ```
 
-`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. Both expose React context providers; `workspace.tsx` mounts them once at the top of the tree so every pane shares one client id, one lease, and one snapshot.
+`web/src/lib/code-ui/store.tsx` owns the `CodeUiSessionSnapshot` and the SSE reconnect loop. `web/src/lib/code-ui/controller.tsx` owns the browser controller lease. `app/page.tsx` mounts both providers once so future domain panels share one client id, one lease, and one snapshot.
 
 ## Browser write surface
 
-The composer / cancel / interaction-panel writers all flow through `useBrowserController()` (provided by `<BrowserControllerProvider>`). On the first write the hook calls `POST /api/code/controller/attach`, caches `controllerToken` + `leaseExpiresAt` in memory, and replays the original request. Reloading the page drops the lease so the next browser session can attach cleanly.
+Future composer, cancel, and interaction-panel writers will flow through `useBrowserController()` (provided by `<BrowserControllerProvider>`). The W2-07 placeholder does not render those controls. On the first write the hook calls `POST /api/code/controller/attach`, caches `controllerToken` + `leaseExpiresAt` in memory, and replays the original request. The browser `clientId` is persisted in `sessionStorage` so an unexpected reload can renew the same lease; an explicit detach still clears write access for a clean hand-off.
 
 Recovery semantics in `controller.tsx`:
 

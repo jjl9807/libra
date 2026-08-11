@@ -10,13 +10,19 @@
  * - `trailingSlash: true` ensures every route resolves to `path/index.html`,
  *   which is required by most static file servers (including the embedded
  *   `axum` server used by `libra code`).
+ * - `generateBuildId` is pinned to the package version so CI's
+ *   `web/out` drift check stays deterministic (Next's default nanoid
+ *   would rewrite `_next/static/<buildId>/` on every clean build).
  */
 import type { NextConfig } from "next";
+
+import packageJson from "./package.json";
 
 const nextConfig: NextConfig = {
   output: "export",
   images: { unoptimized: true },
   trailingSlash: true,
+  generateBuildId: async () => `libra-web-${packageJson.version}`,
 };
 
 export default nextConfig;

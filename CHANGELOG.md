@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W2-07, 2026-08-11)
+
+- **W2-07 delivers the Web Code UI wire adapter foundation.** Shared
+  TypeScript types, HTTP/SSE client (with loopback wire smoke), session store,
+  browser controller lease (stable `sessionStorage` client id), phases,
+  view-model helpers, and Vitest fixtures land under `web/src/lib/code-ui/`.
+  The shipped page is a foundation-only placeholder; domain panels remain
+  W2-08+. CI `compat-web-check` runs `pnpm --dir web test`, and Next
+  `generateBuildId` is pinned so committed `web/out/` stays reproducible.
+
 ### Added (plan-20260715 W2-12, 2026-08-11)
 
 - **W2-12 delivers UI-neutral runtime usage attribution and query.**
