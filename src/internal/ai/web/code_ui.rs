@@ -1561,6 +1561,13 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("ORIGIN_REQUIRED", 403),
         // Per-session write rate limit (browser + automation, W3-05).
         ("RATE_LIMITED", 429),
+        // Secret-redactor failure on session/diagnostics/SSE projections (W3-12).
+        ("REDACTION_FAILED", 500),
+        // SSE wire v2 negotiation and durable cursor replay (W3-06).
+        ("INVALID_WIRE_VERSION", 400),
+        ("WIRE_V2_REQUIRES_DURABLE_SESSION", 503),
+        ("WIRE_V2_CURSOR_AHEAD", 409),
+        ("WIRE_V2_REPLAY_FAILED", 500),
         // Then automation control-token gate.
         ("CONTROL_DISABLED", 403),
         ("MISSING_CONTROL_TOKEN", 403),
