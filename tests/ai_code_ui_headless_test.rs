@@ -628,7 +628,8 @@ async fn resumed_runtime_restores_pending_intent_revision_mode() {
         "thread_id".to_string(),
         serde_json::json!(thread_id.clone()),
     );
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state.clone());
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state.clone()).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "phase0_intent_review",
         workdir.path().to_path_buf(),
@@ -699,7 +700,8 @@ async fn resumed_runtime_restores_pending_intent_revision_mode() {
     let restored_state = store
         .load(&thread_id)
         .expect("parked session must remain loadable");
-    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state);
+    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state)
+        .expect("attach workflow hub");
     let (restored, _, _) = build_runtime_with_persistence(
         "phase0_intent_review",
         workdir.path().to_path_buf(),
@@ -761,7 +763,8 @@ async fn resumed_runtime_restores_pending_intent_review_gate() {
         "thread_id".to_string(),
         serde_json::json!(thread_id.clone()),
     );
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state.clone());
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state.clone()).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "phase0_intent_review",
         workdir.path().to_path_buf(),
@@ -807,7 +810,8 @@ async fn resumed_runtime_restores_pending_intent_review_gate() {
     let restored_state = store
         .load(&thread_id)
         .expect("parked session must remain loadable");
-    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state);
+    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state)
+        .expect("attach workflow hub");
     let (restored, _, _) = build_runtime_with_persistence(
         "phase0_intent_review",
         workdir.path().to_path_buf(),
@@ -896,7 +900,8 @@ async fn resumed_runtime_fences_intent_review_when_durable_spec_missing() {
         "thread_id".to_string(),
         serde_json::json!(thread_id.clone()),
     );
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state.clone());
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state.clone()).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "phase0_intent_review",
         workdir.path().to_path_buf(),
@@ -952,7 +957,8 @@ async fn resumed_runtime_fences_intent_review_when_durable_spec_missing() {
     let restored_state = store
         .load(&thread_id)
         .expect("parked session must remain loadable");
-    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state);
+    let persistence = HeadlessSessionPersistence::new(store.clone(), restored_state)
+        .expect("attach workflow hub");
     let (restored, _, _) = build_runtime_with_persistence(
         "phase0_intent_review",
         workdir.path().to_path_buf(),
@@ -1096,7 +1102,8 @@ async fn submit_rejects_unpersistable_turn_before_live_session_mutation() {
     let store = Arc::new(SessionStore::from_storage_path(storage.path()));
     let state = SessionState::new(&workdir.path().to_string_lossy());
     let session_id = state.id.clone();
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "basic_chat",
         workdir.path().to_path_buf(),
@@ -1153,7 +1160,8 @@ async fn submit_message_persists_resumable_session_snapshot() {
         "thread_id".to_string(),
         serde_json::json!(thread_id.clone()),
     );
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "basic_chat",
         workdir.path().to_path_buf(),
@@ -1274,7 +1282,8 @@ async fn caller_supplied_command_id_is_durable_and_idempotent() {
         "thread_id".to_string(),
         serde_json::json!(thread_id.clone()),
     );
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "basic_chat",
         workdir.path().to_path_buf(),
@@ -1400,7 +1409,7 @@ async fn durable_command_retry_does_not_double_count_executor_usage() {
     state
         .metadata
         .insert("thread_id".to_string(), serde_json::json!(thread_id));
-    let persistence = HeadlessSessionPersistence::new(store, state);
+    let persistence = HeadlessSessionPersistence::new(store, state).expect("attach workflow hub");
 
     let conn = Database::connect("sqlite::memory:")
         .await
@@ -1520,7 +1529,8 @@ async fn in_flight_command_id_rejects_payload_mismatch() {
         "thread_id".to_string(),
         serde_json::json!(thread_id.clone()),
     );
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let (runtime, _, _) = build_runtime_with_persistence(
         "delayed_chat",
         workdir.path().to_path_buf(),
@@ -1846,7 +1856,8 @@ async fn shutdown_timeout_persists_indeterminate_state() {
     let store = Arc::new(SessionStore::from_storage_path(storage.path()));
     let state = SessionState::new(&workdir.path().to_string_lossy());
     let session_id = state.id.clone();
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let registry = Arc::new(
@@ -2931,7 +2942,8 @@ async fn unpersistable_approval_response_does_not_release_the_tool_loop() {
     let store = Arc::new(SessionStore::from_storage_path(storage.path()));
     let state = SessionState::new(&workdir.path().to_string_lossy());
     let session_id = state.id.clone();
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let (runtime, _, exec_approval_tx) = build_runtime_with_persistence(
         "delayed_chat",
         workdir.path().to_path_buf(),
@@ -3046,7 +3058,8 @@ async fn persisted_approval_response_records_durable_interaction_audit_event() {
     let store = Arc::new(SessionStore::from_storage_path(storage.path()));
     let state = SessionState::new(&workdir.path().to_string_lossy());
     let session_id = state.id.clone();
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     // brief_delayed_chat keeps a live turn long enough to register approval,
     // then completes quickly so post-terminal InteractionResolved is visible.
     let (runtime, _, exec_approval_tx) = build_runtime_with_persistence(
@@ -3173,7 +3186,8 @@ async fn live_unpersistable_approval_preserves_indeterminate_state_after_executo
     let store = Arc::new(SessionStore::from_storage_path(storage.path()));
     let state = SessionState::new(&workdir.path().to_string_lossy());
     let session_id = state.id.clone();
-    let persistence = HeadlessSessionPersistence::new(store.clone(), state);
+    let persistence =
+        HeadlessSessionPersistence::new(store.clone(), state).expect("attach workflow hub");
     let (runtime, _, exec_approval_tx) = build_runtime_with_persistence(
         "brief_delayed_chat",
         workdir.path().to_path_buf(),

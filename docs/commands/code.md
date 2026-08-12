@@ -160,7 +160,43 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 | `planExecutionRepair` | object, optional | Runtime-owned plan-execution repair state. It contains a snake_case `state`, bounded and runtime-redacted failure `evidence` (`output`, `diagnostics`, `attempt`, `max_attempts`), and an `interaction_id` while `awaiting_user`. `automatic_repair` records an in-progress retry. `awaiting_user` is projected only after the configured retries are exhausted: a Code UI Continue must send a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }`), otherwise it returns `PLAN_REPAIR_RETRY_LIMIT_REACHED`; alternatively, provide manual revision guidance. Cancel is terminal. `intent_spec_revision` and `manual_action` require a new user-directed workflow. |
 | `updatedAt` | string | ISO 8601 update timestamp. |
 
-`GET /api/code/events` streams `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and `data`. Event `type` is `session_updated`, `status_changed`, or `controller_changed`; `session_updated` carries a full `CodeUiSessionSnapshot`.
+`GET /api/code/events` streams session updates. Wire version is negotiated as follows
+(W3-06 / plan-20260715):
+
+| Selection | Mechanism |
+|---|---|
+| Explicit v1 | `?wire=1` or `?wire=v1` |
+| Explicit v2 | `?wire=2` or `?wire=v2` |
+| Accept hint | `Accept: text/event-stream;libra-wire=2` (query `wire=` wins if both are set) |
+| Default (unspecified) | **v1** until the built-in SPA migrates in W3-09 |
+| Illegal values | fail-closed `400 INVALID_WIRE_VERSION` |
+
+**SSE v1** (default): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and
+`data`. Event `type` is `session_updated`, `status_changed`, or
+`controller_changed`; `session_updated` carries a full `CodeUiSessionSnapshot`.
+
+**SSE wire v2**: `code_workflow` events with camelCase `cursor` (durable W1-06
+workflow sequence), `eventId`, `kind`, `at`, and minimal `payload`. Reconnect with
+`?wire=2&cursor=<lastCursor>` to replay without duplicates or gaps inside the
+bounded fold window. Wire v2 requires a SessionStore-backed workflow hub. Today
+that hub is mounted for `--web-only` headless runs with session persistence
+(non-Codex `HeadlessCodeRuntime`). Default TUI + background web and managed
+`--web-only --provider codex` currently return
+`503 WIRE_V2_REQUIRES_DURABLE_SESSION` until those runtimes expose a hub.
+
+### SSE v1 compatibility window (DEFER-08)
+
+v1 snapshot SSE remains supported through at least one successful public patch
+release after wire v2 becomes the default and the built-in frontend/automation
+clients have migrated. Physical removal of v1 is **not** part of plan-20260715;
+see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
+
+1. Built-in frontend migrated to v2 (W3-09 evidence).
+2. Built-in automation clients migrated to v2.
+3. Compat / matrix tests consume v2 by default.
+4. Release notes name the last v1-supporting version and the upgrade path.
+5. At least one successful public patch release after (1)–(4) while v1 still works.
+
 
 `GET /api/code/threads` returns `{ items, nextOffset? }`. Each item has `id`, optional `title`, `archived`, optional `currentIntentId`, optional `workingDir`, `createdAt`, and `updatedAt`. `workingDir` is omitted until ThreadProjection persists a per-thread cwd (do not invent the server cwd for linked-worktree threads). `limit` defaults to 50 and clamps to 200; malformed `limit` or `offset` returns `INVALID_QUERY_PARAM`.
 
@@ -174,6 +210,11 @@ Code UI API errors use `{ error: { code, message } }`:
 | `PAYLOAD_TOO_LARGE` | 413 | Write request body exceeded 256 KiB. |
 | `ORIGIN_REQUIRED` | 403 | Browser write/attach lacked a trusted loopback `Origin` (or same-origin `Referer`), or presented a cross-site Origin. |
 | `RATE_LIMITED` | 429 | Per-session write budget exhausted; retry after the rate-limit window (see `Retry-After` / wait for window recovery). |
+| `REDACTION_FAILED` | 500 | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the response omits unredacted payload; restart `libra code` or retry after fixing redactor configuration. |
+| `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `1`/`v1` and `2`/`v2` are accepted). |
+| `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 requires a SessionStore-backed workflow hub (mounted today for `--web-only` headless persistence; TUI background web and managed Codex web-only do not yet expose one). |
+| `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (an ahead cursor would permanently skip live events). |
+| `WIRE_V2_REPLAY_FAILED` | 500 | Wire v2 could not replay durable workflow events after the requested cursor (gap, bound, or I/O). |
 | `CONTROL_DISABLED` | 403 | Automation control is not enabled for this process. |
 | `MISSING_CONTROL_TOKEN` | 403 | Automation control token is absent. |
 | `INVALID_CONTROL_TOKEN` | 403 | Automation control token is invalid. |

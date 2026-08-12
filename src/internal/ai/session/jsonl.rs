@@ -815,13 +815,31 @@ pub struct SessionContextReplay {
     pub compactions: Vec<CompactionEvent>,
 }
 
-#[derive(Debug, Clone)]
+/// Fan-out after a successful Code workflow JSONL append (SSE wire v2 hub).
+pub type CodeWorkflowAppendHook = Arc<dyn Fn(&CodeWorkflowEvent) + Send + Sync>;
+
+#[derive(Clone)]
 pub struct SessionJsonlStore {
     session_root: PathBuf,
     /// Lazily populated from the workflow log, then updated by each durable
     /// command transition. This avoids replaying the entire session log for
     /// every command admission or completion in one running session.
     command_status_cache: Arc<Mutex<Option<HashMap<CodeCommandIdentity, CachedCodeCommand>>>>,
+    /// Optional fan-out after a successful Code workflow append (SSE wire v2).
+    /// Shared across clones so every writer of this session log publishes once.
+    on_code_workflow_append: Option<CodeWorkflowAppendHook>,
+}
+
+impl std::fmt::Debug for SessionJsonlStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionJsonlStore")
+            .field("session_root", &self.session_root)
+            .field(
+                "on_code_workflow_append",
+                &self.on_code_workflow_append.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -860,7 +878,15 @@ impl SessionJsonlStore {
         Self {
             session_root,
             command_status_cache: Arc::new(Mutex::new(None)),
+            on_code_workflow_append: None,
         }
+    }
+
+    /// Register a callback invoked after each successful Code workflow append.
+    /// Used by the SSE wire v2 hub so projection deltas, goal envelopes, and
+    /// durable command transitions all fan out on the same sequence space.
+    pub fn set_on_code_workflow_append(&mut self, hook: Option<CodeWorkflowAppendHook>) {
+        self.on_code_workflow_append = hook;
     }
 
     pub fn session_root(&self) -> &Path {
@@ -901,6 +927,30 @@ impl SessionJsonlStore {
         event: CodeWorkflowEventKind,
     ) -> io::Result<CodeWorkflowEvent> {
         self.append_code_workflow_with_durability(event, true)
+    }
+
+    /// Append a batch of Code workflow rows under one sequence lock.
+    ///
+    /// Prefer this over a loop of [`Self::append_code_workflow`] when an SSE
+    /// hub is attached so fan-out can fsync once per batch.
+    pub fn append_code_workflow_batch(
+        &self,
+        events: &[CodeWorkflowEventKind],
+    ) -> io::Result<Vec<CodeWorkflowEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        fs::create_dir_all(&self.session_root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to create session directory '{}': {error}",
+                    self.session_root.display()
+                ),
+            )
+        })?;
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        self.append_code_workflow_kinds_while_locked(events, false)
     }
 
     fn append_code_workflow_with_durability(
@@ -987,7 +1037,40 @@ impl SessionJsonlStore {
         for workflow_event in &workflow_events {
             self.update_command_status_cache(&workflow_event.event);
         }
+        if let Some(hook) = self.on_code_workflow_append.as_ref() {
+            // One fsync for the whole batch before fan-out so SSE cursors cannot
+            // outrun crash-safe durability, without forcing every non-hub
+            // append onto the durable path.
+            if !durable {
+                self.sync_events_log()?;
+            }
+            for workflow_event in &workflow_events {
+                hook(workflow_event);
+            }
+        }
         Ok(workflow_events)
+    }
+
+    fn sync_events_log(&self) -> io::Result<()> {
+        let path = self.events_path();
+        let file = OpenOptions::new().write(true).open(&path).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to open session event log '{}' for fsync: {err}",
+                    path.display()
+                ),
+            )
+        })?;
+        file.sync_data().map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to fsync session event log '{}': {err}",
+                    path.display()
+                ),
+            )
+        })
     }
 
     fn append_unchecked(&self, event: &SessionEvent, durable: bool) -> io::Result<()> {
@@ -1143,6 +1226,28 @@ impl SessionJsonlStore {
         max_events: usize,
         max_bytes: u64,
     ) -> io::Result<CodeWorkflowReplay> {
+        self.load_code_workflow_replay_since_unlocked(after_sequence, max_events, max_bytes)
+    }
+
+    /// Same as [`Self::load_code_workflow_replay_since`], but holds the Code
+    /// workflow append lock so readers cannot observe a trailing JSONL record
+    /// that has been written but not yet fsynced/published.
+    pub fn load_code_workflow_replay_since_committed(
+        &self,
+        after_sequence: u64,
+        max_events: usize,
+        max_bytes: u64,
+    ) -> io::Result<CodeWorkflowReplay> {
+        let _lock = self.acquire_code_workflow_append_lock()?;
+        self.load_code_workflow_replay_since_unlocked(after_sequence, max_events, max_bytes)
+    }
+
+    fn load_code_workflow_replay_since_unlocked(
+        &self,
+        after_sequence: u64,
+        max_events: usize,
+        max_bytes: u64,
+    ) -> io::Result<CodeWorkflowReplay> {
         if max_events == 0 || max_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1193,18 +1298,27 @@ impl SessionJsonlStore {
             content.drain(..=first_newline);
         }
 
-        let replay = code_workflow_replay_from_events(
-            parse_session_events_content(&path, &content)?,
-            after_sequence,
-        )?;
+        let events = parse_session_events_content(&path, &content)?;
+        let window_tip_sequence = events.iter().rev().find_map(|event| match event {
+            SessionEvent::CodeWorkflow(workflow) => Some(workflow.sequence),
+            _ => None,
+        });
+        let replay = code_workflow_replay_from_events(events, after_sequence)?;
         if start > 0 && replay.events.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "bounded Code workflow replay after sequence {after_sequence} cannot prove the retained tail of '{}' contains no omitted workflow events; create a projection checkpoint before resuming",
-                    path.display()
-                ),
-            ));
+            match window_tip_sequence {
+                // Client is already at the tip of the retained suffix: idle
+                // reconnect with no new durable rows is success, not a gap.
+                Some(tip) if tip == after_sequence => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "bounded Code workflow replay after sequence {after_sequence} cannot prove the retained tail of '{}' contains no omitted workflow events; create a projection checkpoint before resuming",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
         }
         if replay.events.len() > max_events {
             return Err(io::Error::new(

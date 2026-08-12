@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::{ToolBoundaryRuntime, TracingAuditSink};
+use super::{SecretRedactor, ToolBoundaryRuntime, TracingAuditSink};
 use crate::internal::ai::{
     mcp::server::LibraMcpServer,
     sandbox::{
@@ -74,8 +74,13 @@ pub struct CodeAgentServicesBuilder {
 }
 
 enum CodeAgentServicesLaunch {
-    TuiBaseline { mcp_server: Arc<LibraMcpServer> },
-    WebHeadless,
+    TuiBaseline {
+        mcp_server: Arc<LibraMcpServer>,
+        redactor: SecretRedactor,
+    },
+    WebHeadless {
+        redactor: SecretRedactor,
+    },
 }
 
 impl CodeAgentServicesBuilder {
@@ -85,8 +90,28 @@ impl CodeAgentServicesBuilder {
         user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
         mcp_server: Arc<LibraMcpServer>,
     ) -> Self {
+        Self::tui_baseline_with_redactor(
+            working_dir,
+            trace_id,
+            user_input_tx,
+            mcp_server,
+            SecretRedactor::default_runtime(),
+        )
+    }
+
+    /// TUI registry with an explicit audit/projection redactor (W3-12).
+    pub fn tui_baseline_with_redactor(
+        working_dir: impl Into<PathBuf>,
+        trace_id: Uuid,
+        user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
+        mcp_server: Arc<LibraMcpServer>,
+        redactor: SecretRedactor,
+    ) -> Self {
         Self {
-            launch: CodeAgentServicesLaunch::TuiBaseline { mcp_server },
+            launch: CodeAgentServicesLaunch::TuiBaseline {
+                mcp_server,
+                redactor,
+            },
             working_dir: working_dir.into(),
             trace_id,
             user_input_tx,
@@ -98,8 +123,24 @@ impl CodeAgentServicesBuilder {
         trace_id: Uuid,
         user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
     ) -> Self {
+        Self::web_headless_with_redactor(
+            working_dir,
+            trace_id,
+            user_input_tx,
+            SecretRedactor::default_runtime(),
+        )
+    }
+
+    /// Headless Code UI registry with an explicit audit/projection redactor
+    /// (W3-12: pass `--env-file` forbidden values through tool-boundary audits).
+    pub fn web_headless_with_redactor(
+        working_dir: impl Into<PathBuf>,
+        trace_id: Uuid,
+        user_input_tx: mpsc::UnboundedSender<UserInputRequest>,
+        redactor: SecretRedactor,
+    ) -> Self {
         Self {
-            launch: CodeAgentServicesLaunch::WebHeadless,
+            launch: CodeAgentServicesLaunch::WebHeadless { redactor },
             working_dir: working_dir.into(),
             trace_id,
             user_input_tx,
@@ -114,14 +155,19 @@ impl CodeAgentServicesBuilder {
             trace_id,
             user_input_tx,
         } = self;
-        let profile = match &launch {
-            CodeAgentServicesLaunch::TuiBaseline { .. } => CodeAgentLaunchProfile::TuiBaseline,
-            CodeAgentServicesLaunch::WebHeadless => CodeAgentLaunchProfile::WebHeadless,
+        let (profile, redactor) = match &launch {
+            CodeAgentServicesLaunch::TuiBaseline { redactor, .. } => {
+                (CodeAgentLaunchProfile::TuiBaseline, redactor.clone())
+            }
+            CodeAgentServicesLaunch::WebHeadless { redactor } => {
+                (CodeAgentLaunchProfile::WebHeadless, redactor.clone())
+            }
         };
         let mut builder = ToolRegistryBuilder::with_working_dir(working_dir)
-            .hardening(ToolBoundaryRuntime::system(
+            .hardening(ToolBoundaryRuntime::system_with_redactor(
                 trace_id,
                 Arc::new(TracingAuditSink),
+                redactor,
             ))
             .register("read_file", Arc::new(ReadFileHandler))
             .register("list_dir", Arc::new(ListDirHandler))
@@ -137,7 +183,7 @@ impl CodeAgentServicesBuilder {
             );
 
         match launch {
-            CodeAgentServicesLaunch::TuiBaseline { mcp_server } => {
+            CodeAgentServicesLaunch::TuiBaseline { mcp_server, .. } => {
                 builder = builder
                     .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
                     .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler))
@@ -146,7 +192,7 @@ impl CodeAgentServicesBuilder {
                     builder = builder.register(name, handler);
                 }
             }
-            CodeAgentServicesLaunch::WebHeadless => {
+            CodeAgentServicesLaunch::WebHeadless { .. } => {
                 builder = builder
                     .register("submit_intent_draft", Arc::new(SubmitIntentDraftHandler))
                     .register("submit_plan_draft", Arc::new(SubmitPlanDraftHandler));

@@ -43,6 +43,7 @@ use super::{
         CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
         CodeUiTranscriptEntryKind,
     },
+    sse_wire::CodeUiWorkflowHub,
     web_admission::{
         CODE_UI_WEB_TURN_KIND, InFlightTurn, WebCodeUiAdmission, WebTurnMode, release_web_turn,
         wait_for_web_turn_start,
@@ -137,6 +138,8 @@ pub struct HeadlessSessionPersistence {
     projection_checkpoint: Arc<Mutex<HeadlessProjectionCheckpoint>>,
     durability_repo_id: String,
     durability_session_id: String,
+    /// Fan-out for SSE wire v2 (same durable sequence as projection appends).
+    workflow_hub: Arc<CodeUiWorkflowHub>,
 }
 
 struct HeadlessProjectionCheckpoint {
@@ -148,7 +151,7 @@ impl HeadlessSessionPersistence {
     /// Construct persistence for callers that do not yet have a restored
     /// projection checkpoint. The first persisted snapshot becomes the
     /// checkpoint through normal fine-grained delta emission.
-    pub fn new(store: Arc<SessionStore>, state: SessionState) -> Self {
+    pub fn new(store: Arc<SessionStore>, state: SessionState) -> io::Result<Self> {
         Self::with_projection_checkpoint(store, state, CodeUiSessionSnapshot::default(), 0)
     }
 
@@ -159,9 +162,10 @@ impl HeadlessSessionPersistence {
         state: SessionState,
         initial_projection_snapshot: CodeUiSessionSnapshot,
         initial_projection_sequence: u64,
-    ) -> Self {
-        let projection_store = SessionJsonlStore::new(store.session_root(&state.id));
-        Self {
+    ) -> io::Result<Self> {
+        let mut projection_store = SessionJsonlStore::new(store.session_root(&state.id));
+        let workflow_hub = Arc::new(CodeUiWorkflowHub::attach(&mut projection_store)?);
+        Ok(Self {
             store,
             state: Arc::new(Mutex::new(state.clone())),
             projection_store,
@@ -171,7 +175,13 @@ impl HeadlessSessionPersistence {
             })),
             durability_repo_id: state.working_dir.clone(),
             durability_session_id: state.id.clone(),
-        }
+            workflow_hub,
+        })
+    }
+
+    /// SSE wire v2 durable fan-out for this session.
+    pub fn workflow_hub(&self) -> Arc<CodeUiWorkflowHub> {
+        self.workflow_hub.clone()
     }
 
     /// Stable durable identity fields used by the runtime worker.
@@ -231,9 +241,11 @@ impl HeadlessSessionPersistence {
     async fn persist_projection_deltas(&self, snapshot: &CodeUiSessionSnapshot) -> io::Result<u64> {
         let mut checkpoint = self.projection_checkpoint.lock().await;
         let deltas = code_ui_projection_deltas(&checkpoint.snapshot, snapshot)?;
-        for delta in deltas {
-            let event = self.projection_store.append_code_workflow(delta)?;
-            checkpoint.sequence = event.sequence;
+        if !deltas.is_empty() {
+            let events = self.projection_store.append_code_workflow_batch(&deltas)?;
+            if let Some(last) = events.last() {
+                checkpoint.sequence = last.sequence;
+            }
         }
         checkpoint.snapshot = snapshot.clone();
         Ok(checkpoint.sequence)
@@ -1218,6 +1230,10 @@ where
             tool_arguments: Arc::new(std::sync::Mutex::new(HashMap::new())),
             start_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            stream_delta_pending: Arc::new(std::sync::Mutex::new(String::new())),
+            stream_delta_notify: Arc::new(tokio::sync::Notify::new()),
+            stream_delta_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stream_delta_task: None,
             intent_draft_json: intent_draft_json.clone(),
             selected_risk: selected_risk.clone(),
         };
@@ -2322,6 +2338,12 @@ where
             result.map_err(anyhow::Error::msg)
         })
     }
+
+    fn workflow_hub(&self) -> Option<Arc<CodeUiWorkflowHub>> {
+        self.persistence
+            .as_ref()
+            .map(HeadlessSessionPersistence::workflow_hub)
+    }
 }
 
 impl<M> HeadlessCodeRuntime<M>
@@ -2877,6 +2899,14 @@ struct HeadlessTurnObserver {
     /// writes its terminal session status, or their final `Thinking` update
     /// can race with `Idle`/`Error`/`Cancelled`.
     completion_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Coalescing buffer + single worker for assistant text deltas.
+    /// Unordered per-delta tasks reordered appends; an unbounded mpsc of
+    /// every delta retained heap proportional to delta count. Coalescing
+    /// keeps O(transcript) memory with one task (W3-12 Codex r7/r9).
+    stream_delta_pending: Arc<std::sync::Mutex<String>>,
+    stream_delta_notify: Arc<tokio::sync::Notify>,
+    stream_delta_closed: Arc<std::sync::atomic::AtomicBool>,
+    stream_delta_task: Option<tokio::task::JoinHandle<()>>,
     /// Successful `submit_intent_draft` payload for PlanPhase0 review parking.
     intent_draft_json: Arc<std::sync::Mutex<Option<String>>>,
     /// Authoritative risk_profile answer from `request_user_input` (when asked).
@@ -2888,7 +2918,13 @@ impl HeadlessTurnObserver {
     /// invocation is single-threaded inside the tool loop, so by the time the
     /// loop returns no new handles can be added; the loop only handles the
     /// handoff where an end task has taken a start task between the two drains.
-    async fn flush_projection_tasks(&self) {
+    async fn flush_projection_tasks(&mut self) {
+        self.stream_delta_closed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stream_delta_notify.notify_one();
+        if let Some(handle) = self.stream_delta_task.take() {
+            let _ = handle.await;
+        }
         loop {
             let mut handles = self
                 .start_tasks
@@ -2917,12 +2953,33 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
             if delta.is_empty() {
                 return;
             }
-            let session = self.session.clone();
-            let entry_id = self.assistant_entry_id.clone();
-            let delta = delta.clone();
-            tokio::spawn(async move {
-                session.append_assistant_delta(&entry_id, &delta).await;
-            });
+            if self.stream_delta_task.is_none() {
+                let session = self.session.clone();
+                let entry_id = self.assistant_entry_id.clone();
+                let pending = self.stream_delta_pending.clone();
+                let notify = self.stream_delta_notify.clone();
+                let closed = self.stream_delta_closed.clone();
+                self.stream_delta_task = Some(tokio::spawn(async move {
+                    loop {
+                        let chunk = pending
+                            .lock()
+                            .map(|mut buf| std::mem::take(&mut *buf))
+                            .unwrap_or_default();
+                        if !chunk.is_empty() {
+                            session.append_assistant_delta(&entry_id, &chunk).await;
+                            continue;
+                        }
+                        if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        notify.notified().await;
+                    }
+                }));
+            }
+            if let Ok(mut buf) = self.stream_delta_pending.lock() {
+                buf.push_str(delta);
+            }
+            self.stream_delta_notify.notify_one();
         }
     }
 

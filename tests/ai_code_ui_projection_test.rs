@@ -437,3 +437,61 @@ fn workflow_event(sequence: u64, event: CodeWorkflowEventKind) -> CodeWorkflowEv
         event,
     }
 }
+
+/// W3-06: reconnecting from a durable workflow cursor must not duplicate or
+/// drop events relative to the fold source of truth.
+#[test]
+fn sse_delta_cursor_replay() {
+    use libra::internal::ai::web::sse_wire::{CodeUiWireV2Event, CodeUiWorkflowHub};
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let mut store = libra::internal::ai::session::SessionJsonlStore::new(dir.path().to_path_buf());
+    let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub");
+
+    let suffix = sample_event_fold_suffix();
+    for event_kind in suffix.iter().map(|event| event.event.clone()) {
+        store
+            .append_code_workflow(event_kind)
+            .expect("append workflow");
+    }
+
+    let full = hub.replay_after(0).expect("full replay");
+    assert_eq!(full.len(), suffix.len());
+    let mid = full[2].sequence;
+    let tail = hub.replay_after(mid).expect("cursor replay");
+    assert_eq!(
+        tail.len(),
+        full.len() - 3,
+        "replay after cursor {mid} must skip sequences 1..={mid}"
+    );
+    assert_eq!(tail[0].sequence, mid + 1);
+
+    let wire: Vec<_> = tail
+        .iter()
+        .map(CodeUiWireV2Event::from_workflow_event)
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for event in &wire {
+        assert!(
+            seen.insert(event.cursor),
+            "wire v2 cursor must be unique: {}",
+            event.cursor
+        );
+        assert!(!event.kind.is_empty());
+        assert_eq!(event.cursor, event.cursor); // pin camelCase serialization separately
+    }
+    let serialized = serde_json::to_value(&wire[0]).expect("v2 event serializes");
+    assert!(serialized.get("cursor").is_some());
+    assert!(serialized.get("eventId").is_some());
+    assert!(serialized.get("kind").is_some());
+
+    // Fold from the same cursor window must remain contiguous (no second sequencer).
+    let replay = CodeWorkflowReplay {
+        events: tail.clone(),
+        gaps: Vec::new(),
+    };
+    let folded = rebuild_code_ui_read_model_from_events(sample_event_fold_bootstrap(), &replay)
+        .expect("fold after cursor");
+    assert_eq!(folded.last_sequence, Some(full.last().unwrap().sequence));
+}

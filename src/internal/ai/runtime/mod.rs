@@ -42,7 +42,7 @@ pub use execution_control::{
 pub use hardening::{
     AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,
     SecretRedactor, ToolBoundaryPolicy, ToolBoundaryRuntime, ToolOperation, ToolOperationDetails,
-    TracingAuditSink,
+    TracingAuditSink, project_json_for_wire, redact_json_value,
 };
 pub use lifecycle::{
     LifecycleShutdownError, LifecycleShutdownOwner, LifecycleShutdownStep, LifecycleStepError,

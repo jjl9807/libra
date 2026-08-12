@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, fmt, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -391,6 +391,11 @@ impl ToolBoundaryPolicy {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SecretRedactor {
     markers: Vec<String>,
+    /// Exact secret values (e.g. `--env-file` provider keys) scrubbed
+    /// wherever they appear in projected strings. Built via
+    /// [`SecretRedactor::with_forbidden_env_values`] using A0-08
+    /// [`crate::internal::ai::observed_agents::trust::env_name_is_forbidden`].
+    literals: Vec<String>,
 }
 
 impl SecretRedactor {
@@ -427,16 +432,157 @@ impl SecretRedactor {
             .into_iter()
             .map(str::to_string)
             .collect(),
+            literals: Vec::new(),
         }
+    }
+
+    /// Register exact values from env entries whose names are forbidden by
+    /// A0-08 (`env_name_is_forbidden`). Non-forbidden keys (e.g. model names)
+    /// are ignored so Code Web does not invent a second secret-name table.
+    pub fn with_forbidden_env_values<I, K, V>(mut self, entries: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        use crate::internal::ai::observed_agents::trust::env_name_is_forbidden;
+
+        for (name, value) in entries {
+            if !env_name_is_forbidden(name.as_ref()) {
+                continue;
+            }
+            let value = value.as_ref().trim();
+            if value.is_empty() {
+                continue;
+            }
+            if !self.literals.iter().any(|existing| existing == value) {
+                self.literals.push(value.to_string());
+            }
+        }
+        self
+    }
+
+    /// Fail closed when this redactor has no rules (GC-07): never project
+    /// unredacted content through an empty rule set.
+    pub fn ensure_configured(&self) -> Result<()> {
+        if self.markers.is_empty() && self.literals.is_empty() {
+            bail!(
+                "secret redactor has no markers or literal secrets; \
+                 refusing to project unredacted content"
+            );
+        }
+        Ok(())
     }
 
     pub fn redact(&self, input: &str) -> String {
         let mut output = input.to_string();
+        // Longest literals first so a short suffix of a longer key cannot
+        // leave a partial secret behind after replacement.
+        let mut literals: Vec<&str> = self.literals.iter().map(String::as_str).collect();
+        literals.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        for literal in &literals {
+            if !literal.is_empty() {
+                output = output.replace(literal, "[REDACTED]");
+            }
+        }
         for marker in &self.markers {
             output = redact_marker(&output, marker);
         }
         output
     }
+
+    /// Redact streaming / free-text surfaces where a secret may arrive across
+    /// multiple deltas. Omit trailing proper prefixes first, then apply full
+    /// literal/marker redaction. Ordering matters: skipping omit whenever
+    /// `[REDACTED]` already appears would leave partial secrets next to
+    /// unrelated marker hits (W3-12 Codex r12).
+    pub fn redact_streaming_text(&self, input: &str) -> String {
+        let mut literals: Vec<&str> = self.literals.iter().map(String::as_str).collect();
+        literals.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        let withheld = redact_trailing_literal_prefixes(input, &literals);
+        self.redact(&withheld)
+    }
+}
+
+/// Recursively scrub string leaves (and object keys) in a JSON value.
+/// Returns `Err` when two keys redact to the same name (fail closed).
+pub fn redact_json_value(value: &mut serde_json::Value, redactor: &SecretRedactor) -> Result<()> {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = redactor.redact(text);
+            Ok(())
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_value(item, redactor)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            // Rebuild so object keys that embed registered secrets (or
+            // marker-shaped prefixes) are scrubbed too — walking only values
+            // would leave secret-bearing keys on the wire (W3-12 Codex r1).
+            // Keys use `redact` (no 1-char trailing prefixes) so wire field
+            // names like `status` / `plans` stay intact when env secrets
+            // start with common letters (W3-12 Codex r4).
+            let original = std::mem::take(map);
+            for (key, mut child) in original {
+                redact_json_value(&mut child, redactor)?;
+                let redacted_key = redactor.redact(&key);
+                if map.contains_key(&redacted_key) {
+                    bail!(
+                        "redacted JSON object key collision for `{redacted_key}`; \
+                         refusing to project ambiguous metadata"
+                    );
+                }
+                map.insert(redacted_key, child);
+            }
+            // Free-text projection fields may grow mid-secret across SSE
+            // deltas. Only apply trailing-prefix withholding while the entry
+            // is still `streaming: true`; finalized text uses full-literal
+            // redaction only so ordinary endings like `yes` survive.
+            let is_streaming = map
+                .get("streaming")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if is_streaming {
+                for field in [
+                    "content",
+                    "status",
+                    "details",
+                    "title",
+                    "summary",
+                    "description",
+                    "prompt",
+                    "note",
+                    "lastError",
+                    "logFile",
+                ] {
+                    if let Some(serde_json::Value::String(text)) = map.get_mut(field) {
+                        *text = redactor.redact_streaming_text(text);
+                    }
+                }
+            }
+            Ok(())
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(())
+        }
+    }
+}
+
+/// Serialize `value` then redact every string leaf. Returns `Err` when the
+/// redactor is unconfigured (fail closed), serialization fails, or redacted
+/// object keys collide.
+pub fn project_json_for_wire<T: serde::Serialize>(
+    value: &T,
+    redactor: &SecretRedactor,
+) -> Result<serde_json::Value> {
+    redactor.ensure_configured()?;
+    let mut projected = serde_json::to_value(value)
+        .context("failed to serialize value for redacted wire projection")?;
+    redact_json_value(&mut projected, redactor).context("failed to redact wire projection")?;
+    Ok(projected)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -569,11 +715,22 @@ impl ToolBoundaryRuntime {
     }
 
     pub fn system(trace_id: Uuid, audit_sink: Arc<dyn AuditSink>) -> Self {
+        Self::system_with_redactor(trace_id, audit_sink, SecretRedactor::default_runtime())
+    }
+
+    /// System principal with an explicit projection redactor (W3-12: attach
+    /// `--env-file` forbidden values so tool-boundary audit summaries cannot
+    /// leak bare provider keys).
+    pub fn system_with_redactor(
+        trace_id: Uuid,
+        audit_sink: Arc<dyn AuditSink>,
+        redactor: SecretRedactor,
+    ) -> Self {
         Self::new(
             trace_id,
             PrincipalContext::system(),
             ToolBoundaryPolicy::default_runtime(),
-            SecretRedactor::default_runtime(),
+            redactor,
             audit_sink,
         )
     }
@@ -668,12 +825,91 @@ impl AuditSink for InMemoryAuditSink {
     }
 }
 
+fn redact_trailing_literal_prefixes(input: &str, literals: &[&str]) -> String {
+    // Omit at most one trailing proper prefix of any length ≥1. Used only for
+    // `streaming: true` free-text fields so finalized copy (e.g. `yes`) is not
+    // clipped when an `sk-...` env secret is registered (W3-12 Codex r8/r10).
+    // If the full literal is already a suffix, leave it for `redact()` rather
+    // than omitting a near-complete proper prefix that would leave one char.
+    let mut best_prefix: Option<String> = None;
+    for literal in literals {
+        if literal.is_empty() || input.ends_with(literal) {
+            continue;
+        }
+        let literal_chars: Vec<char> = literal.chars().collect();
+        if literal_chars.len() < 2 {
+            continue;
+        }
+        let max_prefix = literal_chars.len() - 1;
+        for prefix_len in (1..=max_prefix).rev() {
+            let prefix: String = literal_chars[..prefix_len].iter().collect();
+            if prefix == "[REDACTED]" {
+                continue;
+            }
+            if !input.ends_with(&prefix) {
+                continue;
+            }
+            let take = best_prefix
+                .as_ref()
+                .is_none_or(|current| prefix.len() > current.len());
+            if take {
+                best_prefix = Some(prefix);
+            }
+            break;
+        }
+    }
+    let Some(prefix) = best_prefix else {
+        return input.to_string();
+    };
+    let mut output = input.to_string();
+    output.truncate(output.len() - prefix.len());
+    output
+}
+
+fn find_ascii_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    if needle_bytes.is_empty() {
+        return Some(0);
+    }
+    let hay_bytes = haystack.as_bytes();
+    if hay_bytes.len() < needle_bytes.len() {
+        return None;
+    }
+    let last_start = hay_bytes.len() - needle_bytes.len();
+    let mut start = 0;
+    while start <= last_start {
+        if !haystack.is_char_boundary(start) {
+            start += 1;
+            continue;
+        }
+        let end = start + needle_bytes.len();
+        if !haystack.is_char_boundary(end) {
+            start += 1;
+            continue;
+        }
+        let mut matched = true;
+        for (offset, needle_byte) in needle_bytes.iter().enumerate() {
+            if !hay_bytes[start + offset].eq_ignore_ascii_case(needle_byte) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            return Some(start);
+        }
+        start += 1;
+    }
+    None
+}
+
 fn redact_marker(input: &str, marker: &str) -> String {
-    let lower = input.to_lowercase();
+    // Markers are ASCII. Search with ASCII case-folding on the original
+    // bytes so Unicode characters whose lowercase form changes length
+    // (e.g. `İ`) cannot shift offsets into the secret tail (W3-12 Codex r3).
     let mut cursor = 0;
     let mut output = String::with_capacity(input.len());
 
-    while let Some(relative_start) = lower[cursor..].find(marker) {
+    while let Some(relative_start) = find_ascii_ignore_case(&input[cursor..], marker) {
         let marker_start = cursor + relative_start;
         let value_start = marker_start + marker.len();
         output.push_str(&input[cursor..value_start]);
@@ -723,6 +959,152 @@ mod tests {
         assert!(!output.contains(" raw"));
         assert!(output.contains("X-Libra-Control-Token: [REDACTED]"));
         assert!(output.contains("X-Code-Controller-Token=[REDACTED]"));
+    }
+
+    #[test]
+    fn with_forbidden_env_values_registers_only_a0_08_forbidden_names() {
+        let redactor = SecretRedactor::default_runtime().with_forbidden_env_values([
+            ("OPENAI_API_KEY", "sk-live-envfile-secret-value"),
+            ("LIBRA_MODEL", "should-not-be-redacted"),
+            ("MOONSHOT_API_KEY", ""),
+        ]);
+
+        let output = redactor.redact(
+            "provider failed with sk-live-envfile-secret-value while model=should-not-be-redacted",
+        );
+        assert!(
+            !output.contains("sk-live-envfile-secret-value"),
+            "forbidden env value must be scrubbed: {output}"
+        );
+        assert!(
+            output.contains("should-not-be-redacted"),
+            "non-forbidden env values must not invent a second secret table: {output}"
+        );
+        assert!(redactor.ensure_configured().is_ok());
+    }
+
+    #[test]
+    fn ensure_configured_fails_closed_when_empty() {
+        let empty = SecretRedactor::default();
+        assert!(empty.ensure_configured().is_err());
+    }
+
+    #[test]
+    fn project_json_for_wire_scrubs_nested_strings() {
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", "sk-nested-secret-999")]);
+        let value = serde_json::json!({
+            "transcript": [{"content": "leak sk-nested-secret-999 here"}],
+            "meta": {"token:": "ignored-prefix-shape api_key: visible-key"}
+        });
+        let projected = project_json_for_wire(&value, &redactor).expect("project");
+        let rendered = projected.to_string();
+        assert!(!rendered.contains("sk-nested-secret-999"));
+        assert!(!rendered.contains("visible-key"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn project_json_for_wire_scrubs_object_keys() {
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", "sk-as-object-key")]);
+        let value = serde_json::json!({
+            "metadata": {
+                "sk-as-object-key": "nested-ok",
+                "safe": "sk-as-object-key"
+            }
+        });
+        let projected = project_json_for_wire(&value, &redactor).expect("project");
+        let rendered = projected.to_string();
+        assert!(
+            !rendered.contains("sk-as-object-key"),
+            "secret must not survive as a JSON key or value: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_scrubs_trailing_partial_literal_prefixes() {
+        let secret = "sk-stream-partial-abcdef";
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", secret)]);
+        // Mid-stream omit (any length ≥1), including after alphanumeric text.
+        assert_eq!(redactor.redact_streaming_text("prefixsk-st"), "prefix");
+        // Full secret still marker-replaces.
+        let full = redactor.redact_streaming_text(&format!("prefix{secret}"));
+        assert!(!full.contains(secret));
+        assert!(full.contains("[REDACTED]"));
+        // Finalized path does not use streaming omit — `yes` / keys survive.
+        assert_eq!(redactor.redact("yes"), "yes");
+        assert_eq!(redactor.redact("status"), "status");
+    }
+
+    #[test]
+    fn project_json_preserves_wire_field_names_with_sk_env_secret() {
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", "sk-live-common-prefix")]);
+        let value = serde_json::json!({
+            "status": "idle",
+            "plans": [],
+            "transcript": [
+                {"content": "yes", "kind": "assistant_message", "streaming": false},
+                {"content": "hello sk-li", "kind": "assistant_message", "streaming": true}
+            ]
+        });
+        let projected = project_json_for_wire(&value, &redactor).expect("project");
+        assert!(projected.get("status").is_some(), "status key must survive");
+        assert!(projected.get("plans").is_some(), "plans key must survive");
+        assert_eq!(projected["transcript"][0]["content"], "yes");
+        assert_eq!(projected["transcript"][1]["content"], "hello ");
+    }
+
+    #[test]
+    fn redact_streaming_text_terminates_when_literal_starts_with_redacted_token() {
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", "[REDACTED]x-extra")]);
+        let scrubbed = redactor.redact_streaming_text("leak [REDACTED]x-extra here");
+        assert!(scrubbed.contains("[REDACTED]"));
+        assert!(!scrubbed.contains("x-extra"));
+    }
+
+    #[test]
+    fn redact_streaming_text_masks_partial_secret_next_to_unrelated_marker() {
+        let redactor = SecretRedactor::default_runtime()
+            .with_forbidden_env_values([("OPENAI_API_KEY", "sk-live-secret-value")]);
+        let scrubbed = redactor.redact_streaming_text("token: dummy sk-liv");
+        assert!(
+            !scrubbed.contains("sk-liv"),
+            "partial env-file secret must be omitted even beside another marker: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn redact_marker_preserves_offsets_around_unicode_casefold_expanders() {
+        let redactor = SecretRedactor::default_runtime();
+        // U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE lowercases to two
+        // bytes (`i` + combining dot) in Unicode casefold; ASCII-offset
+        // search must still redact the full secret tail.
+        let input = "İ api_key:secret-tail-xyz";
+        let output = redactor.redact(input);
+        assert!(
+            !output.contains("secret-tail-xyz"),
+            "unicode-prefixed marker must not leak secret bytes: {output}"
+        );
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn project_json_for_wire_fails_closed_on_redacted_key_collision() {
+        let redactor = SecretRedactor::default_runtime();
+        let value = serde_json::json!({
+            "api_key: first": 1,
+            "api_key: second": 2
+        });
+        let err = project_json_for_wire(&value, &redactor).expect_err("collision");
+        assert!(
+            err.to_string().contains("collision") || err.to_string().contains("redact"),
+            "expected collision failure, got {err}"
+        );
     }
 
     /// `PrincipalContext::from_actor` must map every `ActorKind` variant
