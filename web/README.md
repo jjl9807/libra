@@ -12,8 +12,33 @@ pnpm install        # install deps (uses pnpm-lock.yaml)
 pnpm dev            # local dev server with HMR
 pnpm lint           # eslint, no warnings allowed
 pnpm test           # vitest unit tests for the browser foundation
+pnpm test:e2e       # Playwright real-browser suite (W3-15; needs live runtime)
 pnpm build          # static export → web/out/
 ```
+
+### Playwright e2e (W3-15)
+
+Specs live under `web/e2e/` and assert only through user-visible DOM against an
+**already-started** deterministic `libra code --web-only` process (they do not
+spawn the runtime and must not import frontend stores).
+
+```bash
+# Terminal A — deterministic fake-provider Web runtime
+./web/e2e/scripts/start-deterministic-runtime.sh
+# prints LIBRA_E2E_BASE_URL=http://127.0.0.1:4410
+
+# Terminal B — browsers + suite (fail-closed for completion evidence)
+pnpm --dir web exec playwright install chromium
+export LIBRA_E2E_BASE_URL=http://127.0.0.1:4410
+export LIBRA_E2E_REQUIRE=1
+pnpm --dir web test:e2e
+```
+
+Without `LIBRA_E2E_REQUIRE=1`, a missing Chromium or unreachable `/api/health`
+prints `skip: …` and exits 0 for local diagnosis only — that soft-skip is **not**
+Checkpoint C / W3-15 completion evidence. Artifacts on failure:
+`web/test-results/` (screenshots/traces/videos) and `web/playwright-report/`
+(HTML). Both are gitignored; delete them after triage.
 
 ## Current UI status (W2-07 … W2-16 / W3-07)
 

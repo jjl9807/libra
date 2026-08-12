@@ -157,6 +157,48 @@ cases. Always run Code UI harness targets with
 | `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
 | `ai_code_ui_projection_test` | 2 | Projection snapshot replication; W3-14 10k-event fold bound + release p95 (`large_session_projection_smoke`) | `src/internal/ai/history.rs`, `src/internal/ai/web/code_ui_projection.rs` |
 | `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events | `src/internal/ai/web/`, `src/internal/ai/agent/` |
+
+### plan-20260715 W3-15 — Playwright real-browser e2e
+
+Not a cargo `--test` target. Owner suite is `pnpm --dir web test:e2e`
+(`web/playwright.config.ts` + `web/e2e/**`). Specs assert only through
+user-visible DOM/HTTP against an **already-started** deterministic Web runtime
+(`libra code --web-only --browser-control loopback --provider fake` with
+`--features test-provider` + `LIBRA_ENABLE_TEST_PROVIDER=1`).
+
+**Startup**
+
+```bash
+./web/e2e/scripts/start-deterministic-runtime.sh   # Terminal A; prints LIBRA_E2E_BASE_URL
+pnpm --dir web exec playwright install chromium    # once per machine
+export LIBRA_E2E_BASE_URL=http://127.0.0.1:4410
+export LIBRA_E2E_REQUIRE=1                         # fail-closed (completion evidence)
+pnpm --dir web test:e2e
+```
+
+CI job `compat-web-e2e` (`.github/workflows/base.yml`) builds `--features test-provider`,
+starts the deterministic runtime, installs Chromium, and runs `test:e2e` with
+`LIBRA_E2E_REQUIRE=1`. Soft-skip is refused there.
+
+Without `LIBRA_E2E_REQUIRE=1` / `CI=true`, missing Chromium or unreachable
+`/api/health` prints `skip: …` and exits 0 for local diagnosis only — soft-skip
+is **not** W3-15 / Checkpoint C completion evidence.
+
+**Artifacts / cleanup**
+
+| path | contents |
+|---|---|
+| `web/test-results/` | per-test screenshots, traces, videos (`retain-on-failure`) |
+| `web/playwright-report/` | HTML report (`playwright show-report`) |
+
+Both dirs are gitignored. On failure: inspect report/trace, then
+`rm -rf web/test-results web/playwright-report`. Stop the runtime with Ctrl-C
+on the start script (or kill its printed pid); the script removes the temp
+workdir on exit.
+
+| suite | wave | one-line purpose | relevant src |
+|---|---|---|---|
+| `pnpm --dir web test:e2e` | 2 | Playwright main-chain: submit → approval/user-input → goal/task/skill → usage → execution/repair → resume/cancel → SSE reconnect | `web/e2e/`, `web/playwright.config.ts`, `web/e2e/scripts/start-deterministic-runtime.sh` |
 | `intent_flow_test` | 2 | IntentSpec → Plan → Run pipeline (no live LLM) | `src/internal/ai/intentspec/`, `src/internal/ai/orchestrator/` |
 | `e2e_mcp_flow` | 2 | End-to-end MCP server flow | `src/internal/ai/mcp/` |
 | `mcp_integration_test` | 2 | MCP integration tests | `src/internal/ai/mcp/` |

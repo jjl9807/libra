@@ -199,5 +199,6 @@ export function browserInteractionRespondSupported(_provider: {
   provider: string;
   managed: boolean;
 }): boolean {
+  void _provider;
   return true;
 }

@@ -1,10 +1,16 @@
 //! Completion implementation for the test-only fake provider.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use tokio::time::sleep;
 
-use super::fixture::{FakeFixture, FakeFixtureError, FakeResponseAction, FakeStreamDelta};
+use super::fixture::{
+    FakeFixture, FakeFixtureError, FakeMatchContext, FakeResponseAction, FakeStreamDelta,
+};
 use crate::internal::ai::completion::{
     AssistantContent, CompletionError, CompletionModel as CompletionModelTrait, CompletionRequest,
     CompletionResponse, CompletionStreamEvent, CompletionUsage, Function, Message, OneOrMany, Text,
@@ -14,18 +20,21 @@ use crate::internal::ai::completion::{
 #[derive(Clone, Debug)]
 pub struct Client {
     fixture: Arc<FakeFixture>,
+    consumed: Arc<Mutex<HashSet<usize>>>,
 }
 
 impl Client {
     pub fn from_fixture_path(path: &Path) -> Result<Self, FakeFixtureError> {
         Ok(Self {
             fixture: Arc::new(FakeFixture::from_path(path)?),
+            consumed: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     pub fn completion_model(&self, model: &str) -> CompletionModel {
         CompletionModel {
             fixture: self.fixture.clone(),
+            consumed: self.consumed.clone(),
             model: model.to_string(),
         }
     }
@@ -34,6 +43,7 @@ impl Client {
 #[derive(Clone, Debug)]
 pub struct CompletionModel {
     fixture: Arc<FakeFixture>,
+    consumed: Arc<Mutex<HashSet<usize>>>,
     model: String,
 }
 
@@ -67,10 +77,29 @@ impl CompletionModelTrait for CompletionModel {
         request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let latest_user_text = latest_user_text(&request).unwrap_or_default();
-        let (matched_response_index, action) =
-            self.fixture.select(&latest_user_text).ok_or_else(|| {
+        let ctx = FakeMatchContext {
+            latest_user_text: &latest_user_text,
+            after_tool_result: last_user_is_tool_result(&request),
+        };
+        let (matched_response_index, action) = {
+            let mut consumed = match self.consumed.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (index, action) = self.fixture.select_ctx(&ctx, &consumed).ok_or_else(|| {
                 CompletionError::ProviderError("no fake provider response matched".to_string())
             })?;
+            if let Some(matched) = index
+                && self
+                    .fixture
+                    .responses
+                    .get(matched)
+                    .is_some_and(|rule| rule.once)
+            {
+                consumed.insert(matched);
+            }
+            (index, action.clone())
+        };
 
         if !action.delay().is_zero() {
             sleep(action.delay()).await;
@@ -92,9 +121,10 @@ impl CompletionModelTrait for CompletionModel {
             }
         }
 
+        let usage = action.usage();
         let content = match action {
             FakeResponseAction::Text { text, .. } => {
-                vec![AssistantContent::Text(Text { text: text.clone() })]
+                vec![AssistantContent::Text(Text { text })]
             }
             FakeResponseAction::ToolCall {
                 id,
@@ -102,18 +132,14 @@ impl CompletionModelTrait for CompletionModel {
                 arguments,
                 ..
             } => vec![AssistantContent::ToolCall(ToolCall {
-                id: id.clone(),
+                id,
                 name: name.clone(),
-                function: Function {
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                },
+                function: Function { name, arguments },
             })],
             FakeResponseAction::Error { message, .. } => {
-                return Err(CompletionError::ProviderError(message.clone()));
+                return Err(CompletionError::ProviderError(message));
             }
         };
-        let usage = action.usage();
 
         Ok(CompletionResponse {
             content,
@@ -125,6 +151,22 @@ impl CompletionModelTrait for CompletionModel {
             },
         })
     }
+}
+
+fn last_user_is_tool_result(request: &CompletionRequest) -> bool {
+    request
+        .chat_history
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::User { content } => Some(
+                content
+                    .iter()
+                    .any(|item| matches!(item, UserContent::ToolResult(_))),
+            ),
+            Message::Assistant { .. } | Message::System { .. } => None,
+        })
+        .unwrap_or(false)
 }
 
 fn latest_user_text(request: &CompletionRequest) -> Option<String> {
@@ -164,7 +206,9 @@ mod tests {
                 matcher: super::super::fixture::FakeMatcher {
                     contains: Some("hello".to_string()),
                     equals: None,
+                    after_tool_result: None,
                 },
+                once: false,
                 action: FakeResponseAction::Text {
                     text: "fake hello".to_string(),
                     delay_ms: 0,
@@ -179,6 +223,7 @@ mod tests {
         };
         let model = CompletionModel {
             fixture: Arc::new(fixture),
+            consumed: Arc::new(Mutex::new(HashSet::new())),
             model: "fake".to_string(),
         };
 
@@ -199,6 +244,7 @@ mod tests {
         let fixture = FakeFixture {
             responses: vec![super::super::fixture::FakeResponseRule {
                 matcher: Default::default(),
+                once: false,
                 action: FakeResponseAction::ToolCall {
                     id: "call-1".to_string(),
                     name: "request_user_input".to_string(),
@@ -212,6 +258,7 @@ mod tests {
         };
         let model = CompletionModel {
             fixture: Arc::new(fixture),
+            consumed: Arc::new(Mutex::new(HashSet::new())),
             model: "fake".to_string(),
         };
 

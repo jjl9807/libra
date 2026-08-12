@@ -114,6 +114,95 @@ jobs:
             exit 1
           fi
 
+  # plan-20260715 W3-15: Playwright real-browser main-chain against a
+  # deterministic --web-only fake-provider runtime. Soft-skip is refused via
+  # LIBRA_E2E_REQUIRE=1 (Checkpoint C completion evidence).
+  compat-web-e2e:
+    name: compat-web-e2e
+    runs-on: [self-hosted]
+    needs: []
+    env:
+      LIBRA_SKIP_WEB_BUILD: "1"
+      LIBRA_E2E_REQUIRE: "1"
+      LIBRA_E2E_PORT: "4410"
+      LIBRA_E2E_BASE_URL: "http://127.0.0.1:4410"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.10.0 --activate
+
+      - name: Install web dependencies
+        run: pnpm --dir web install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --dir web exec playwright install --with-deps chromium
+
+      - name: Build test-provider libra
+        run: cargo build --features test-provider
+
+      - name: Start deterministic Web runtime
+        shell: bash
+        run: |
+          LIBRA_E2E_BIN="${GITHUB_WORKSPACE}/target/debug/libra" \
+            ./web/e2e/scripts/start-deterministic-runtime.sh \
+            >"${RUNNER_TEMP}/libra-e2e-runtime.log" 2>&1 &
+          echo $! >"${RUNNER_TEMP}/libra-e2e-runtime.pid"
+          for _ in $(seq 1 120); do
+            if curl -fsS "${LIBRA_E2E_BASE_URL}/api/health" 2>/dev/null | grep -qx 'ok'; then
+              echo "runtime ready"
+              exit 0
+            fi
+            if ! kill -0 "$(cat "${RUNNER_TEMP}/libra-e2e-runtime.pid")" 2>/dev/null; then
+              echo "runtime exited early:" >&2
+              cat "${RUNNER_TEMP}/libra-e2e-runtime.log" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "timed out waiting for /api/health" >&2
+          cat "${RUNNER_TEMP}/libra-e2e-runtime.log" >&2 || true
+          exit 1
+
+      - name: Run Playwright e2e
+        run: pnpm --dir web test:e2e
+
+      - name: Stop deterministic Web runtime
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f "${RUNNER_TEMP}/libra-e2e-runtime.pid" ]]; then
+            kill "$(cat "${RUNNER_TEMP}/libra-e2e-runtime.pid")" 2>/dev/null || true
+          fi
+
+      - name: Upload Playwright artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-e2e-playwright
+          path: |
+            web/test-results/
+            web/playwright-report/
+            ${{ runner.temp }}/libra-e2e-runtime.log
+          if-no-files-found: ignore
+
+      - name: Clean Playwright local artifacts
+        if: always()
+        shell: bash
+        run: rm -rf web/test-results web/playwright-report || true
+
   owner-liveness-macos:
     # plan-20260714 W1 (§C.9): the operation claim decides whether a control
     # action's owner is dead by proving it — boot id + PID namespace on Linux,

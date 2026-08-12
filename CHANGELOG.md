@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-15, 2026-08-12, v0.19.140)
+
+- **W3-15 adds Playwright real-browser e2e for Code UI.** `pnpm --dir web
+  test:e2e` runs `web/e2e/**` against an already-started deterministic
+  `--web-only` fake-provider runtime (`e2e/scripts/start-deterministic-runtime.sh`).
+  Soft-skip when Chromium or `/api/health` is missing (local diagnosis only);
+  `LIBRA_E2E_REQUIRE=1` / `CI=true` fail closed. Main chain covers submit →
+  approval/user-input → goal/task/skill → usage → execution/repair →
+  resume/cancel → SSE reconnect via user-visible DOM only. Startup, artifact
+  paths (`web/test-results/`, `web/playwright-report/`), and cleanup are
+  registered in `tests/INDEX.md` and `web/README.md`. Also restores missing
+  `web/out/_next` static chunks so the embedded UI can load JS again.
+
 ### Added (plan-20260715 W3-07, 2026-08-12, v0.19.139)
 
 - **W3-07 pins managed Codex interaction ownership.** App-server keeps the

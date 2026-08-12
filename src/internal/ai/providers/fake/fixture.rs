@@ -49,10 +49,30 @@ impl FakeFixture {
         &'a self,
         latest_user_text: &str,
     ) -> Option<(Option<usize>, &'a FakeResponseAction)> {
+        self.select_ctx(
+            &FakeMatchContext {
+                latest_user_text,
+                after_tool_result: false,
+            },
+            &std::collections::HashSet::new(),
+        )
+    }
+
+    /// First matching rule, skipping `once` rules already consumed.
+    pub fn select_ctx<'a>(
+        &'a self,
+        ctx: &FakeMatchContext<'_>,
+        consumed: &std::collections::HashSet<usize>,
+    ) -> Option<(Option<usize>, &'a FakeResponseAction)> {
         self.responses
             .iter()
             .enumerate()
-            .find(|(_, rule)| rule.matcher.matches(latest_user_text))
+            .find(|(index, rule)| {
+                if rule.once && consumed.contains(index) {
+                    return false;
+                }
+                rule.matcher.matches(ctx)
+            })
             .map(|(index, rule)| (Some(index), &rule.action))
             .or_else(|| self.fallback.as_ref().map(|action| (None, action)))
     }
@@ -63,8 +83,19 @@ impl FakeFixture {
 pub struct FakeResponseRule {
     #[serde(default, rename = "match")]
     pub matcher: FakeMatcher,
+    /// When true, this rule is consumed after the first match so a later
+    /// tool-loop invocation with the same user text cannot replay the tool.
+    #[serde(default)]
+    pub once: bool,
     #[serde(flatten)]
     pub action: FakeResponseAction,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FakeMatchContext<'a> {
+    pub latest_user_text: &'a str,
+    /// True when the latest user message is a tool result (same-turn follow-up).
+    pub after_tool_result: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -74,19 +105,27 @@ pub struct FakeMatcher {
     pub contains: Option<String>,
     #[serde(default)]
     pub equals: Option<String>,
+    /// When set, the rule only matches if the latest user message is (or is
+    /// not) a tool-result follow-up. Distinguishes the first model call from
+    /// the post-tool invocation that still carries the original prompt text.
+    #[serde(default, rename = "afterToolResult")]
+    pub after_tool_result: Option<bool>,
 }
 
 impl FakeMatcher {
-    fn matches(&self, latest_user_text: &str) -> bool {
+    fn matches(&self, ctx: &FakeMatchContext<'_>) -> bool {
         let contains = self
             .contains
             .as_ref()
-            .is_none_or(|needle| latest_user_text.contains(needle));
+            .is_none_or(|needle| ctx.latest_user_text.contains(needle));
         let equals = self
             .equals
             .as_ref()
-            .is_none_or(|expected| latest_user_text == expected);
-        contains && equals
+            .is_none_or(|expected| ctx.latest_user_text == expected);
+        let after_tool_result = self
+            .after_tool_result
+            .is_none_or(|expected| expected == ctx.after_tool_result);
+        contains && equals && after_tool_result
     }
 }
 
@@ -175,7 +214,9 @@ mod tests {
                 matcher: FakeMatcher {
                     contains: Some("hello".to_string()),
                     equals: None,
+                    after_tool_result: None,
                 },
+                once: false,
                 action: FakeResponseAction::Text {
                     text: "hi".to_string(),
                     delay_ms: 0,
@@ -208,6 +249,56 @@ mod tests {
         let (_, action) = fixture.select("slow request").expect("match should exist");
 
         assert_eq!(action.delay(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn fixture_skips_consumed_once_rules_then_matches_after_tool_result() {
+        let fixture: FakeFixture = serde_json::from_value(serde_json::json!({
+            "responses": [
+                {
+                    "match": { "contains": "approval-shell-test", "afterToolResult": false },
+                    "once": true,
+                    "type": "tool_call",
+                    "id": "shell-1",
+                    "name": "shell",
+                    "arguments": { "command": "true" }
+                },
+                {
+                    "match": { "afterToolResult": true },
+                    "type": "text",
+                    "text": "turn complete"
+                }
+            ]
+        }))
+        .expect("fixture should parse");
+
+        let first = fixture
+            .select_ctx(
+                &FakeMatchContext {
+                    latest_user_text: "/run approval-shell-test",
+                    after_tool_result: false,
+                },
+                &std::collections::HashSet::new(),
+            )
+            .expect("first match");
+        assert_eq!(first.0, Some(0));
+        assert!(matches!(first.1, FakeResponseAction::ToolCall { .. }));
+
+        let mut consumed = std::collections::HashSet::new();
+        consumed.insert(0);
+        let follow_up = fixture
+            .select_ctx(
+                &FakeMatchContext {
+                    latest_user_text: "/run approval-shell-test",
+                    after_tool_result: true,
+                },
+                &consumed,
+            )
+            .expect("follow-up match");
+        assert_eq!(follow_up.0, Some(1));
+        assert!(
+            matches!(follow_up.1, FakeResponseAction::Text { text, .. } if text == "turn complete")
+        );
     }
 
     #[test]
