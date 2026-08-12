@@ -456,7 +456,7 @@ EXAMPLES:
     libra code --resume <thread-uuid>                Resume a prior canonical thread
     libra code --plan-mode                           Start in plan-only mode (no apply)
     libra code --env-file .env.test                  Load provider keys from a dotenv-style file
-    libra code --stdio                               MCP stdio transport (not turn control; use --control stdio for automation)";
+    libra code --stdio                               Deprecated MCP-only legacy (tools/resources; not turn control). Prefer --control stdio for automation; dedicated `libra mcp --stdio` is planned after W5";
 
 /// Command-line arguments for `libra code`.
 ///
@@ -622,7 +622,9 @@ pub struct CodeArgs {
     #[arg(long, value_name = "PORT", default_value_t = DEFAULT_MCP_PORT)]
     pub mcp_port: u16,
 
-    /// Run the MCP server over Stdio (for Claude Desktop integration)
+    /// Deprecated MCP-only legacy stdio transport (tools/resources; not turn control).
+    /// Prefer `libra code --control stdio` for automation; a dedicated
+    /// `libra mcp --stdio` is planned after W5 (DEFER-02).
     #[arg(long, alias = "mcp-stdio", conflicts_with = "web_only")]
     pub stdio: bool,
 
@@ -736,6 +738,14 @@ fn warn_deprecated_web_alias() {
     eprintln!(
         "warning: `--web` / `--web-only` is deprecated; `libra code` already defaults to the Web Code UI (remove the flag; rollback via {LIBRA_CODE_LEGACY_TUI_ENV}=1 until W5-07)"
     );
+}
+
+/// Stderr pin for W4-03: MCP `--stdio` is legacy tools/resources only (C6), not
+/// live turn control. Dedicated `libra mcp --stdio` is DEFER-02 (after W5).
+pub const MCP_STDIO_DEPRECATION_WARNING: &str = "warning: `libra code --stdio` is a deprecated MCP-only legacy entry (tools/resources only; not live turn control). Prefer `libra code --control stdio` for automation; a dedicated `libra mcp --stdio` is planned after W5";
+
+fn warn_deprecated_mcp_stdio() {
+    eprintln!("{MCP_STDIO_DEPRECATION_WARNING}");
 }
 
 /// Entry point for the `libra code` subcommand.
@@ -5507,6 +5517,7 @@ fn usage_price_table_from_project_config(storage_root: &Path) -> UsagePriceTable
 /// Returns [`CliError`] when working-dir resolution fails, the MCP server cannot
 /// start on stdio, or the running MCP session reports an unrecoverable error.
 async fn execute_stdio(args: &CodeArgs) -> CliResult<()> {
+    warn_deprecated_mcp_stdio();
     let working_dir = resolve_code_working_dir(args)?;
 
     let mcp_server = init_mcp_server(&working_dir).await;
@@ -5625,7 +5636,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // Web launch, or provider/host boot flags (W4-02 conflict matrix).
         if args.stdio {
             return Err(
-                "`libra code --stdio` is the MCP stdio transport, not turn control; use `libra code --control stdio` for the JSON-RPC automation client"
+                "`libra code --stdio` is the deprecated MCP-only legacy transport (tools/resources; not turn control); use `libra code --control stdio` for the JSON-RPC automation client (a dedicated `libra mcp --stdio` is planned after W5)"
                     .to_string(),
             );
         }
@@ -5672,7 +5683,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
     if args.stdio {
         if args.control == ControlMode::Write {
             return Err(
-                "--control write is not supported with `libra code --stdio` because --stdio is the MCP stdio transport, not turn control; use `libra code --control stdio` for the JSON-RPC automation client"
+                "--control write is not supported with `libra code --stdio` because --stdio is the deprecated MCP-only legacy transport (tools/resources; not turn control); use `libra code --control stdio` for the JSON-RPC automation client (a dedicated `libra mcp --stdio` is planned after W5)"
                     .to_string(),
             );
         }
@@ -5820,7 +5831,7 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 /// and they receive DIFFERENT relaxations (plan.md Task C2). The `web_only`
 /// argument selects which set applies; `--stdio` passes `web_only = false`.
 ///
-/// * `--stdio` is the MCP stdio transport and has no provider / model / browser
+/// * `--stdio` is the deprecated MCP-only legacy transport and has no provider / model / browser
 ///   surface, so it stays fully locked: `--provider != gemini`, `--model`,
 ///   `--api-base`, `--temperature`, and every provider-specific tuning flag are
 ///   rejected here.
@@ -6930,7 +6941,9 @@ mod tests {
 
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
-            err.contains("MCP stdio transport") && err.contains("--control stdio"),
+            err.contains("deprecated MCP-only legacy")
+                && err.contains("--control stdio")
+                && err.contains("libra mcp --stdio"),
             "expected MCP vs --control stdio guidance; got: {err}"
         );
     }
@@ -6960,7 +6973,9 @@ mod tests {
         args.control_token_file = Some(PathBuf::from("token"));
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
-            err.contains("MCP stdio transport") && err.contains("--control stdio"),
+            err.contains("deprecated MCP-only legacy")
+                && err.contains("--control stdio")
+                && err.contains("libra mcp --stdio"),
             "expected MCP vs control-stdio conflict; got: {err}"
         );
     }

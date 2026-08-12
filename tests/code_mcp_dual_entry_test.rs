@@ -880,6 +880,15 @@ fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Resul
         run.stderr,
     );
 
+    // W4-03: MCP-only legacy deprecation must reach stderr on the real stdio path
+    // (not only via the exported constant pin in code_cli_dispatch_test).
+    assert!(
+        run.stderr
+            .contains(libra::command::code::MCP_STDIO_DEPRECATION_WARNING),
+        "libra code --stdio must emit MCP_STDIO_DEPRECATION_WARNING on stderr; stderr:\n{}",
+        run.stderr,
+    );
+
     // (a) Tool set: tools/list must expose the shared MCP tool surface.
     let tools_list = run
         .response_with_id(2)

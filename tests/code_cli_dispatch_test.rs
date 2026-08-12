@@ -485,3 +485,49 @@ async fn default_web_no_tty_and_sigterm_clean_shutdown() {
         "web port must be released after SIGTERM"
     );
 }
+
+#[test]
+fn mcp_stdio_deprecation_warning_pins_legacy_boundary() {
+    use libra::command::code::MCP_STDIO_DEPRECATION_WARNING;
+
+    assert!(
+        MCP_STDIO_DEPRECATION_WARNING.contains("deprecated MCP-only legacy"),
+        "W4-03 must mark --stdio as MCP-only legacy: {MCP_STDIO_DEPRECATION_WARNING}"
+    );
+    assert!(
+        MCP_STDIO_DEPRECATION_WARNING.contains("not live turn control"),
+        "W4-03 must exclude turn control: {MCP_STDIO_DEPRECATION_WARNING}"
+    );
+    assert!(
+        MCP_STDIO_DEPRECATION_WARNING.contains("libra code --control stdio"),
+        "W4-03 must point automation at --control stdio: {MCP_STDIO_DEPRECATION_WARNING}"
+    );
+    assert!(
+        MCP_STDIO_DEPRECATION_WARNING.contains("libra mcp --stdio"),
+        "W4-03 must point to future libra mcp --stdio (DEFER-02): {MCP_STDIO_DEPRECATION_WARNING}"
+    );
+}
+
+#[test]
+fn code_help_documents_mcp_stdio_legacy_and_control_client() {
+    use clap::CommandFactory;
+    use libra::command::code::{CODE_EXAMPLES, CodeArgs};
+
+    let help = CodeArgs::command().render_long_help().to_string();
+    assert!(
+        help.contains("Deprecated MCP-only legacy") || help.contains("deprecated MCP-only legacy"),
+        "clap --stdio help must document MCP-only legacy; got:\n{help}"
+    );
+    assert!(
+        help.contains("libra mcp --stdio") || CODE_EXAMPLES.contains("libra mcp --stdio"),
+        "help/examples must mention future libra mcp --stdio"
+    );
+    assert!(
+        CODE_EXAMPLES.contains("--control stdio"),
+        "EXAMPLES must keep canonical automation client"
+    );
+    assert!(
+        CODE_EXAMPLES.contains("Deprecated MCP-only legacy"),
+        "EXAMPLES must mark --stdio as deprecated MCP-only legacy"
+    );
+}

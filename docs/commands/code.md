@@ -15,7 +15,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## Description
 
-`libra code` starts an interactive coding session that pairs a human developer with an AI agent. The default mode launches the Web Code UI (embedded HTTP server + AgentRuntime) and prints the URL / control details; it stays in the foreground until `Ctrl-C` / SIGTERM. `--web` / `--web-only` remain accepted as deprecated no-op aliases for that default during the W4 bake window (removed in W5-07). Hidden `LIBRA_CODE_LEGACY_TUI=1` restores the previous terminal UI for emergency rollback only (not a public compatibility surface). `--stdio` runs an MCP server over standard input/output for integration with AI clients like Claude Desktop.
+`libra code` starts an interactive coding session that pairs a human developer with an AI agent. The default mode launches the Web Code UI (embedded HTTP server + AgentRuntime) and prints the URL / control details; it stays in the foreground until `Ctrl-C` / SIGTERM. `--web` / `--web-only` remain accepted as deprecated no-op aliases for that default during the W4 bake window (removed in W5-07). Hidden `LIBRA_CODE_LEGACY_TUI=1` restores the previous terminal UI for emergency rollback only (not a public compatibility surface). `--stdio` is a **deprecated MCP-only legacy** entry: it exposes MCP tools/resources over standard input/output for clients like Claude Desktop, and is **not** live turn control. Prefer `libra code --control stdio` for local automation; a dedicated `libra mcp --stdio` is planned after W5 (DEFER-02).
 
 The command supports eight AI provider backends (Gemini, OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, Ollama, Codex) and three operating contexts (dev, review, research) that tune the agent's behavior for different workflows. Sessions can be persisted and resumed with Libra's canonical `--resume <thread_id>` flow. Passing `--goal "<objective>"` boots the session directly in goal mode, where a supervisor drives the tool loop toward the stated objective until a verifier accepts completion.
 
@@ -55,7 +55,7 @@ When the legacy TUI exits and Libra can derive the canonical thread ID, `libra c
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | Seconds that a granted approval stays reusable for matching commands before the agent is prompted again. Overrides the project config `[approval] ttl_seconds` in `.libra/config.toml`; relevant to the prompting policies. |
 | Network access | | `--network-access <allow\|deny>` | `deny` | Default network policy for shell/gate under legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`). Default Web and MCP `--stdio` reject `--network-access allow` until the Plan network-policy gate owns per-execution sandbox network (approve network in Plan review instead). |
 | MCP port | | `--mcp-port` | `6789` | MCP server listen port. |
-| Stdio | | `--stdio` / `--mcp-stdio` | off | Run MCP over stdio. Conflicts with `--web-only`. |
+| Stdio | | `--stdio` / `--mcp-stdio` | off | Deprecated MCP-only legacy: tools/resources over stdio (not turn control). Prefer `--control stdio` for automation; dedicated `libra mcp --stdio` planned after W5. Conflicts with `--web-only`. |
 | API base | | `--api-base` | provider default | Provider API base URL override. |
 | Codex binary | | `--codex-bin` | `codex` | Codex executable path. |
 | Codex port | | `--codex-port` | random | Override Codex app-server port. |
@@ -94,7 +94,7 @@ Write control is local-only. `--control write` is rejected with `--stdio`, and i
 
 Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB. A plan-repair Continue that raises an exhausted retry limit sends `{ "selectedOption": "continue", "maxAttempts": 3 }`; `maxAttempts` must exceed the current limit and not exceed 10. When the session advertises `capabilities.commandIdempotency` (headless web-only today), `POST /api/code/messages` accepts `{ "text": "...", "commandId": "..." }` for retry de-duplication (same id + same text is idempotent; same id + different text returns `COMMAND_PAYLOAD_CONFLICT`). The runtime namespaces each `commandId` under a SHA-256 fence of the active controller `clientId` before durable admission (the raw clientId is never written into the command log). `commandIdempotency` is advertised only when durable SessionStore command admission is configured.
 
-`GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, prefer the canonical `libra code --control stdio` JSON-RPC NDJSON client: it discovers the endpoint from `.libra/code/control.json` by default (override with `--control-url` / `--control-token-file` / `--control-info-file`). Discovery fails closed with stable codes (`CONTROL_INFO_MISSING`, `CONTROL_INFO_PERMS`, `CONTROL_TOKEN_MISSING`, `CONTROL_TOKEN_PERMS`, `CONTROL_SCOPE_CONFLICT`, `CONTROL_SERVER_MISSING`); attach lease/ownership conflicts surface as JSON-RPC `-32000` with Libra codes such as `CONTROLLER_CONFLICT`. The legacy [`libra code-control --stdio`](code-control.md) shim remains available until W4-09. `libra code --stdio` remains the **MCP** stdio server and must not be confused with `--control stdio`.
+`GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, prefer the canonical `libra code --control stdio` JSON-RPC NDJSON client: it discovers the endpoint from `.libra/code/control.json` by default (override with `--control-url` / `--control-token-file` / `--control-info-file`). Discovery fails closed with stable codes (`CONTROL_INFO_MISSING`, `CONTROL_INFO_PERMS`, `CONTROL_TOKEN_MISSING`, `CONTROL_TOKEN_PERMS`, `CONTROL_SCOPE_CONFLICT`, `CONTROL_SERVER_MISSING`); attach lease/ownership conflicts surface as JSON-RPC `-32000` with Libra codes such as `CONTROLLER_CONFLICT`. The legacy [`libra code-control --stdio`](code-control.md) shim remains available until W4-09. Deprecated `libra code --stdio` remains the **MCP-only** tools/resources transport (stderr deprecation warning; not turn control) and must not be confused with `--control stdio`; a dedicated `libra mcp --stdio` is planned after W5.
 
 ### Web Browser Control
 
@@ -329,7 +329,8 @@ libra code --control stdio \
 # Load provider keys from a dotenv-style file (overrides stale shell env vars)
 libra code --env-file .env.test
 
-# Run MCP over stdio for Claude Desktop integration
+# Deprecated MCP-only legacy (tools/resources; not turn control).
+# Prefer --control stdio for automation; dedicated `libra mcp --stdio` after W5.
 libra code --stdio
 
 # Use DeepSeek with reasoning enabled
@@ -408,7 +409,7 @@ Different providers excel at different tasks and have different cost/latency pro
 
 ### Why MCP integration?
 
-The Model Context Protocol (MCP) is an open standard for connecting AI clients to tool servers. By supporting `--stdio` mode, Libra can act as a tool server for any MCP-compatible client (e.g., Claude Desktop). Libra exposes an allowlisted `run_libra_vcs` tool for version-control operations -- `status`, `diff`, `branch`, `log`, `show`, `show-ref`, `ls-files`, `add`, `commit`, and `switch` -- so external AI agents use Libra directly instead of invoking Git. `run_libra_vcs` only accepts those Libra subcommands; it is not a Git-compatible shell. For repository state inspection, prefer `status --json` or `status --porcelain v2 --untracked-files=all`, and use `ls-files` for tracked and untracked repository path inspection (for example `ls-files --others --exclude-standard` for ignore-aware untracked files). Libra-managed execution also rejects direct `git` shell commands.
+The Model Context Protocol (MCP) is an open standard for connecting AI clients to tool servers. Deprecated `libra code --stdio` still lets Libra act as an MCP tool/resource server for clients like Claude Desktop (tools/resources only — not live Code turn control). A dedicated `libra mcp --stdio` is planned after W5 (DEFER-02); until then this legacy entry prints a deprecation warning. Prefer `libra code --control stdio` for local automation against a write-control Web session. Libra exposes an allowlisted `run_libra_vcs` tool for version-control operations -- `status`, `diff`, `branch`, `log`, `show`, `show-ref`, `ls-files`, `add`, `commit`, and `switch` -- so external AI agents use Libra directly instead of invoking Git. `run_libra_vcs` only accepts those Libra subcommands; it is not a Git-compatible shell. For repository state inspection, prefer `status --json` or `status --porcelain v2 --untracked-files=all`, and use `ls-files` for tracked and untracked repository path inspection (for example `ls-files --others --exclude-standard` for ignore-aware untracked files). Libra-managed execution also rejects direct `git` shell commands.
 
 ### Why approval policies?
 
@@ -452,7 +453,7 @@ Note: Neither Git nor jj have an equivalent to `libra code`. This command repres
 | Port already in use | Fatal error naming `host:port` and instructing an explicit `--port` (no auto-scan) | non-zero |
 | No terminal available in TUI mode | Falls back or reports error | non-zero |
 | Thread ID not found on resume | Fatal error with canonical `thread_id` | non-zero |
-| `--control write --stdio` | Usage error; MCP stdio and local TUI automation stdio are separate modes | non-zero |
+| `--control write --stdio` | Usage error; MCP `--stdio` (tools/resources) and `--control stdio` automation are separate modes | non-zero |
 | `--control write --host 0.0.0.0` or other non-loopback host | Usage error; write control is loopback-only | non-zero |
 | Another live `--control write` owns the same control lock | `CONTROL_INSTANCE_CONFLICT` with existing PID/URL when available | non-zero |
 | Control token file is a symlink, non-regular file, or not `0600` on Unix/macOS | Fatal setup error before the web server starts | non-zero |

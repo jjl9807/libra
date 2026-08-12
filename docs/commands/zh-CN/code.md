@@ -15,7 +15,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## 说明
 
-`libra code` 启动一个交互式编码会话，让人类开发者与 AI agent 协作。默认模式启动 Web Code UI（嵌入式 HTTP + AgentRuntime），打印 URL / control 信息并前台常驻，直到 `Ctrl-C` / SIGTERM。`--web` / `--web-only` 在 W4 烘焙窗口内仍是该默认路径的弃用 no-op 别名（W5-07 删除）。隐藏的 `LIBRA_CODE_LEGACY_TUI=1` 仅用于紧急回滚到旧终端 TUI（非公开兼容面）。`--stdio` 通过标准输入/输出运行 MCP server，用于与 Claude Desktop 等 AI clients 集成。
+`libra code` 启动一个交互式编码会话，让人类开发者与 AI agent 协作。默认模式启动 Web Code UI（嵌入式 HTTP + AgentRuntime），打印 URL / control 信息并前台常驻，直到 `Ctrl-C` / SIGTERM。`--web` / `--web-only` 在 W4 烘焙窗口内仍是该默认路径的弃用 no-op 别名（W5-07 删除）。隐藏的 `LIBRA_CODE_LEGACY_TUI=1` 仅用于紧急回滚到旧终端 TUI（非公开兼容面）。`--stdio` 是 **弃用的 MCP-only legacy** 入口：仅通过标准输入/输出暴露 MCP tools/resources（例如 Claude Desktop），**不是** live turn control。本地自动化请优先使用 `libra code --control stdio`；独立的 `libra mcp --stdio` 计划在 W5 之后（DEFER-02）。
 
 该命令支持八种 AI provider 后端（Gemini、OpenAI、Anthropic、DeepSeek、Kimi、Zhipu、Ollama、Codex），以及三种运行上下文（dev、review、research），用于针对不同工作流调节 agent 行为。会话可以通过 Libra 规范的 `--resume <thread_id>` 流程持久化和恢复。传入 `--goal "<objective>"` 会直接以 goal 模式启动会话，由 supervisor 驱动 tool loop 朝既定 objective 前进，直到 verifier 接受完成。
 
@@ -55,7 +55,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | 已授予的审批在再次提示前对匹配命令保持可复用的秒数。覆盖 `.libra/config.toml` 中的项目配置 `[approval] ttl_seconds`；与会提示的策略相关。 |
 | Network access | | `--network-access <allow\|deny>` | `deny` | legacy TUI（`LIBRA_CODE_LEGACY_TUI=1`）下 shell/gate 默认网络策略。默认 Web 与 MCP `--stdio` 拒绝 `--network-access allow`，直到 Plan network-policy gate 接管每次执行的 sandbox 网络（请在 Plan review 中批准网络）。 |
 | MCP port | | `--mcp-port` | `6789` | MCP server 监听端口。 |
-| Stdio | | `--stdio` / `--mcp-stdio` | off | 通过 stdio 运行 MCP。与 `--web-only` 冲突。 |
+| Stdio | | `--stdio` / `--mcp-stdio` | off | 弃用的 MCP-only legacy：通过 stdio 暴露 tools/resources（非 turn control）。自动化请用 `--control stdio`；独立 `libra mcp --stdio` 计划在 W5 之后。与 `--web-only` 冲突。 |
 | API base | | `--api-base` | provider 默认值 | Provider API base URL 覆盖。 |
 | Codex binary | | `--codex-bin` | `codex` | Codex 可执行文件路径。 |
 | Codex port | | `--codex-port` | 随机 | 覆盖 Codex app-server 端口。 |
@@ -94,7 +94,7 @@ Write control 仅限本地。`--control write` 与 `--stdio` 组合会被拒绝�
 
 Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 `{ "clientId": "...", "kind": "automation" }`，header `X-Libra-Control-Token`，然后使用返回的 `X-Code-Controller-Token` 写入。Automation-held leases 对 `/api/code/messages`、`/api/code/interactions/{id}`、`/api/code/controller/detach` 和 `/api/code/control/cancel` 同时要求两个 tokens。本地 TUI 可以用 `/control reclaim` 重新取得控制权，这会使 automation lease 失效。Code UI 写请求体上限为 256KiB。当会话广告 `capabilities.commandIdempotency`（当前仅 headless web-only）时，`POST /api/code/messages` 接受 `{ "text": "...", "commandId": "..." }` 以支持重试去重（相同 id + 相同 text 幂等；相同 id + 不同 text 返回 `COMMAND_PAYLOAD_CONFLICT`）。运行时会用活动 controller `clientId` 的 SHA-256 fence 命名空间化 `commandId`（原始 clientId 不会写入 durable command log）。`commandIdempotency` 仅在配置了 durable SessionStore command admission 时广告。其他 runtime 若收到 `commandId` 会显式拒绝，而不会静默忽略。
 
-`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。遗留 [`libra code-control --stdio`](code-control.md) shim 在 W4-09 前仍可用。`libra code --stdio` 仍是 **MCP** stdio server，不得与 `--control stdio` 混同。
+`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。遗留 [`libra code-control --stdio`](code-control.md) shim 在 W4-09 前仍可用。弃用的 `libra code --stdio` 仍是 **MCP-only** tools/resources 传输（stderr 弃用警告；非 turn control），不得与 `--control stdio` 混同；独立的 `libra mcp --stdio` 计划在 W5 之后。
 
 ### Web Browser Control
 
@@ -295,7 +295,8 @@ libra code --control stdio \
 # 从 dotenv 风格文件加载 provider keys（覆盖陈旧 shell env vars）
 libra code --env-file .env.test
 
-# 为 Claude Desktop 集成通过 stdio 运行 MCP
+# 弃用的 MCP-only legacy（tools/resources；非 turn control）。
+# 自动化请用 --control stdio；独立 `libra mcp --stdio` 计划在 W5 之后。
 libra code --stdio
 
 # 使用启用 reasoning 的 DeepSeek
@@ -374,7 +375,7 @@ ollama list >> /tmp/libra-logs/libra-code-ollama.log
 
 ### 为什么集成 MCP？
 
-Model Context Protocol（MCP）是连接 AI clients 与 tool servers 的开放标准。通过支持 `--stdio` 模式，Libra 可以作为任意 MCP 兼容 client（例如 Claude Desktop）的 tool server。Libra 暴露 allowlisted `run_libra_vcs` tool，用于 `status`、`diff`、`branch`、`log`、`show`、`show-ref`、`ls-files`、`add`、`commit` 和 `switch` 等版本控制操作，因此外部 AI agents 直接使用 Libra，而不是调用 Git。`run_libra_vcs` 只接受这些 Libra 子命令；它不是 Git 兼容 shell。检查仓库状态时，优先使用 `status --json` 或 `status --porcelain v2 --untracked-files=all`，并使用 `ls-files` 检查 tracked 与 untracked 仓库路径（例如 `ls-files --others --exclude-standard` 列出忽略感知的 untracked 文件）。Libra-managed execution 也会拒绝直接的 `git` shell 命令。
+Model Context Protocol（MCP）是连接 AI clients 与 tool servers 的开放标准。弃用的 `libra code --stdio` 仍可让 Libra 作为 Claude Desktop 等 client 的 MCP tool/resource server（仅 tools/resources——不是 live Code turn control）。独立的 `libra mcp --stdio` 计划在 W5 之后（DEFER-02）；在此之前该 legacy 入口会打印弃用警告。本地自动化请优先使用 `libra code --control stdio` 驱动 write-control Web 会话。Libra 暴露 allowlisted `run_libra_vcs` tool，用于 `status`、`diff`、`branch`、`log`、`show`、`show-ref`、`ls-files`、`add`、`commit` 和 `switch` 等版本控制操作，因此外部 AI agents 直接使用 Libra，而不是调用 Git。`run_libra_vcs` 只接受这些 Libra 子命令；它不是 Git 兼容 shell。检查仓库状态时，优先使用 `status --json` 或 `status --porcelain v2 --untracked-files=all`，并使用 `ls-files` 检查 tracked 与 untracked 仓库路径（例如 `ls-files --others --exclude-standard` 列出忽略感知的 untracked 文件）。Libra-managed execution 也会拒绝直接的 `git` shell 命令。
 
 ### 为什么需要 approval policies？
 
@@ -418,7 +419,7 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 | 端口已被占用 | fatal：指出 `host:port`，并要求显式 `--port`（不自动扫描） | non-zero |
 | TUI 模式下没有可用终端 | 回退或报告错误 | non-zero |
 | 恢复时找不到 Thread ID | 带规范 `thread_id` 的 fatal error | non-zero |
-| `--control write --stdio` | 用法错误；MCP stdio 和本地 TUI automation stdio 是不同模式 | non-zero |
+| `--control write --stdio` | 用法错误；MCP `--stdio`（tools/resources）与 `--control stdio` 自动化是不同模式 | non-zero |
 | `--control write --host 0.0.0.0` 或其他非 loopback host | 用法错误；write control 仅限 loopback | non-zero |
 | 另一个 live `--control write` 拥有相同 control lock | 可用时带已有 PID/URL 的 `CONTROL_INSTANCE_CONFLICT` | non-zero |
 | Control token file 是 symlink、非普通文件，或在 Unix/macOS 上不是 `0600` | Web 服务器启动前 fatal setup error | non-zero |
