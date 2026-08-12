@@ -219,6 +219,7 @@ fn snapshot_rebuilt_from_event_fold() {
     let replay = CodeWorkflowReplay {
         events: events.clone(),
         gaps: Vec::new(),
+        window_cut_mid_record: false,
     };
 
     let folded = rebuild_code_ui_read_model_from_events(bootstrap.clone(), &replay)
@@ -249,6 +250,7 @@ fn snapshot_rebuilt_from_event_fold() {
             &CodeWorkflowReplay {
                 events: vec![event.clone()],
                 gaps: Vec::new(),
+                window_cut_mid_record: false,
             },
         )
         .expect("single-event fold must succeed")
@@ -278,6 +280,7 @@ fn graph_read_model_uses_same_event_fold() {
     let replay = CodeWorkflowReplay {
         events: sample_event_fold_suffix(),
         gaps: Vec::new(),
+        window_cut_mid_record: false,
     };
 
     let code_ui = rebuild_code_ui_read_model_from_events(bootstrap.clone(), &replay)
@@ -490,8 +493,121 @@ fn sse_delta_cursor_replay() {
     let replay = CodeWorkflowReplay {
         events: tail.clone(),
         gaps: Vec::new(),
+        window_cut_mid_record: false,
     };
     let folded = rebuild_code_ui_read_model_from_events(sample_event_fold_bootstrap(), &replay)
         .expect("fold after cursor");
     assert_eq!(folded.last_sequence, Some(full.last().unwrap().sequence));
+}
+
+/// W3-08: transport backlog over-limit must surface a recoverable resync
+/// (never silent drop); after snapshot-style tip cursor resume, live delivery
+/// continues without duplicates.
+#[test]
+fn sse_backlog_resync_no_silent_drop() {
+    use libra::internal::ai::web::sse_wire::{
+        CodeUiWireV2ResyncEvent, CodeUiWorkflowHub, MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS,
+        WIRE_V2_RESYNC_REQUIRED, transport_backlog_exceeded,
+    };
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let mut store = libra::internal::ai::session::SessionJsonlStore::new(dir.path().to_path_buf());
+    let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub");
+
+    let over = MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS + 1;
+    let kinds: Vec<_> = (0..over)
+        .map(|i| CodeWorkflowEventKind::CodeUiProjectionDelta {
+            projection: "status".to_string(),
+            summary: format!("backlog-{i}"),
+            payload: json!({}),
+        })
+        .collect();
+    store
+        .append_code_workflow_batch(&kinds)
+        .expect("append over transport backlog");
+
+    let err = hub
+        .replay_after(0)
+        .expect_err("bootstrap past transport backlog must fail closed");
+    assert!(
+        transport_backlog_exceeded(&err),
+        "over-limit must classify as transport backlog, got: {err}"
+    );
+
+    let durable_tail = hub.durable_tail_sequence();
+    assert_eq!(durable_tail, over as u64);
+    let resync =
+        CodeUiWireV2ResyncEvent::transport_backlog("bootstrap_window_exceeded", 0, durable_tail);
+    assert_eq!(resync.code, WIRE_V2_RESYNC_REQUIRED);
+    assert_eq!(resync.action, "fetch_snapshot");
+    let wire = serde_json::to_value(&resync).expect("resync serializes");
+    assert_eq!(wire["code"], WIRE_V2_RESYNC_REQUIRED);
+    assert_eq!(wire["lastCursor"], 0);
+    assert_eq!(wire["durableTail"], durable_tail);
+    assert_eq!(wire["action"], "fetch_snapshot");
+
+    // After resync: tip cursor continues live without replaying the over-budget window.
+    let tip_replay = hub
+        .replay_after(durable_tail)
+        .expect("tip cursor must not require the over-budget window");
+    assert!(tip_replay.is_empty());
+
+    let mut live = hub.subscribe();
+    store
+        .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+            projection: "status".to_string(),
+            summary: "post-resync".to_string(),
+            payload: json!({ "ok": true }),
+        })
+        .expect("append after resync");
+    let next_seq = match live.try_recv().expect("live fan-out after tip resume") {
+        libra::internal::ai::web::sse_wire::CodeUiWorkflowLiveNotify::Event(event) => {
+            event.sequence
+        }
+        libra::internal::ai::web::sse_wire::CodeUiWorkflowLiveNotify::Tip { sequence } => sequence,
+    };
+    assert_eq!(next_seq, durable_tail + 1);
+    assert!(
+        hub.replay_after(durable_tail)
+            .expect("post-resync cursor window")
+            .iter()
+            .map(|e| e.sequence)
+            .eq(std::iter::once(durable_tail + 1)),
+        "post-resync cursor resume must deliver the new event exactly once"
+    );
+}
+
+/// W3-08: oversized payload rows that overflow the 8 MiB transport window
+/// must resync (gap/truncation), never silent-drop or opaque 500-class gaps.
+#[test]
+fn sse_backlog_resync_no_silent_drop_byte_window() {
+    use libra::internal::ai::web::sse_wire::{CodeUiWorkflowHub, transport_backlog_exceeded};
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    let mut store = libra::internal::ai::session::SessionJsonlStore::new(dir.path().to_path_buf());
+    let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub");
+    let big = "y".repeat(5 * 1024 * 1024);
+    for summary in ["byte-a", "byte-b"] {
+        store
+            .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: summary.to_string(),
+                payload: json!({ "blob": big }),
+            })
+            .expect("append oversized workflow row");
+    }
+    let err = hub
+        .replay_after(0)
+        .expect_err("8 MiB transport window cannot cover two 5 MiB rows");
+    assert!(
+        transport_backlog_exceeded(&err),
+        "byte-window overflow must be recoverable resync, got: {err}"
+    );
+    let tip = hub.durable_tail_sequence();
+    assert!(
+        hub.replay_after(tip).expect("tip resume").is_empty(),
+        "after resync, tip cursor must continue without replaying the over-budget window"
+    );
 }

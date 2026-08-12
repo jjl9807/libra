@@ -286,6 +286,170 @@ fn web_bind_error_is_addr_in_use(err: &anyhow::Error) -> bool {
     text.contains("address already in use") || text.contains("addrinuse")
 }
 
+/// W3-08 slow-consumer contract for the SSE matrix filter `sse_slow_consumer`.
+///
+/// A subscribed wire-v2 client that lags past the transport broadcast budget
+/// must receive `event: resync` / `WIRE_V2_RESYNC_REQUIRED` (same capacity
+/// policy as over-budget bootstrap), then tip-cursor reconnect continues
+/// without replaying the over-budget prefix.
+///
+/// Compiled only with `--features test-provider` so release binaries never
+/// carry this assertion helper.
+#[cfg(feature = "test-provider")]
+pub async fn assert_sse_slow_consumer_contract() -> anyhow::Result<()> {
+    use axum::{
+        body::Body,
+        extract::connect_info::MockConnectInfo,
+        http::{Method, Request, StatusCode},
+    };
+    use futures_util::StreamExt;
+    use tempfile::tempdir;
+    use tower::ServiceExt;
+
+    use crate::internal::ai::{
+        session::{CodeWorkflowEventKind, SessionJsonlStore},
+        web::{
+            code_ui::{
+                CodeUiCapabilities, CodeUiInitialController, CodeUiProviderInfo,
+                CodeUiRuntimeHandle, CodeUiSession, ReadOnlyCodeUiAdapter, initial_snapshot,
+            },
+            sse_wire::{
+                CodeUiWorkflowHub, MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS, WIRE_V2_RESYNC_REQUIRED,
+            },
+        },
+    };
+
+    let session = CodeUiSession::new(initial_snapshot(
+        "/tmp/libra-w308-slow",
+        CodeUiProviderInfo {
+            provider: "test".to_string(),
+            model: Some("test-model".to_string()),
+            mode: None,
+            managed: false,
+        },
+        CodeUiCapabilities::default(),
+    ));
+    let runtime = CodeUiRuntimeHandle::build(
+        ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
+        true,
+        CodeUiInitialController::Unclaimed,
+    )
+    .await;
+
+    let dir = tempdir()?;
+    let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+    let hub = Arc::new(CodeUiWorkflowHub::attach(&mut store)?);
+    let app = code_router()
+        .with_state(WebAppState {
+            working_dir: Arc::new(PathBuf::from("/tmp/libra-w308-slow")),
+            code_ui: Some(runtime),
+            automation_control_token: None,
+            audit_sink: Arc::new(TracingAuditSink),
+            control_trace_id: Uuid::new_v4(),
+            bound_addr: SocketAddr::from(([127, 0, 0, 1], 4321)),
+            write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+            secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+            workflow_hub: Some(hub.clone()),
+        })
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/events?wire=2")
+        .body(Body::empty())?;
+    let response = app.clone().oneshot(request).await?;
+    anyhow::ensure!(
+        response.status() == StatusCode::OK,
+        "SSE status {}",
+        response.status()
+    );
+    let mut stream = response.into_body().into_data_stream();
+
+    let over = MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS + 1;
+    let kinds: Vec<_> = (0..over)
+        .map(|i| CodeWorkflowEventKind::CodeUiProjectionDelta {
+            projection: "status".to_string(),
+            summary: format!("slow-{i}"),
+            payload: serde_json::json!({}),
+        })
+        .collect();
+    store.append_code_workflow_batch(&kinds)?;
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                collected.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&collected);
+                if text.contains("event: resync") && text.contains(WIRE_V2_RESYNC_REQUIRED) {
+                    break;
+                }
+            }
+            Ok(Some(Err(error))) => anyhow::bail!("SSE body error: {error}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    let body = String::from_utf8(collected)?;
+    anyhow::ensure!(
+        body.contains("event: resync") && body.contains(WIRE_V2_RESYNC_REQUIRED),
+        "slow consumer must get resync, not silent drop: {body}"
+    );
+    anyhow::ensure!(
+        body.contains("lagged_catchup_exceeded")
+            || body.contains("live_catchup_exceeded")
+            || body.contains("bootstrap_window_exceeded"),
+        "resync reason must name the capacity exit: {body}"
+    );
+
+    let durable_tail = hub.durable_tail_sequence();
+    let reconnect = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/events?wire=2&cursor={durable_tail}"))
+        .body(Body::empty())?;
+    let reconnect_response = app.oneshot(reconnect).await?;
+    anyhow::ensure!(
+        reconnect_response.status() == StatusCode::OK,
+        "reconnect status {}",
+        reconnect_response.status()
+    );
+    let mut reconnect_stream = reconnect_response.into_body().into_data_stream();
+
+    store.append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+        projection: "status".to_string(),
+        summary: "after-slow-resync".to_string(),
+        payload: serde_json::json!({ "ok": true }),
+    })?;
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let expected_cursor = durable_tail + 1;
+    while tokio::time::Instant::now() < deadline {
+        match timeout(Duration::from_millis(200), reconnect_stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                collected.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&collected);
+                if text.contains("after-slow-resync")
+                    && text.contains(&format!("\"cursor\":{expected_cursor}"))
+                {
+                    break;
+                }
+            }
+            Ok(Some(Err(error))) => anyhow::bail!("reconnect SSE error: {error}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    let body = String::from_utf8(collected)?;
+    anyhow::ensure!(
+        body.contains("after-slow-resync")
+            && body.contains(&format!("\"cursor\":{expected_cursor}")),
+        "tip-cursor reconnect must deliver the next event once: {body}"
+    );
+    Ok(())
+}
+
 /// W3-11 host-posture contract for the security matrix filter `host_posture`.
 ///
 /// Non-loopback peers only receive the static remote notice (HTML, no session
@@ -896,14 +1060,38 @@ async fn code_events_handler(
                     retry_after_secs: None,
                 });
             }
-            let replayed = hub.replay_after(cursor).map_err(|error| WebApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "WIRE_V2_REPLAY_FAILED".to_string(),
-                message: format!(
-                    "failed to replay Code UI workflow events after cursor {cursor}: {error}"
-                ),
-                retry_after_secs: None,
-            })?;
+            let replayed = match hub.replay_after(cursor) {
+                Ok(events) => events,
+                Err(error) if sse_wire::transport_backlog_exceeded(&error) => {
+                    // W3-08: over-budget bootstrap is a recoverable resync exit
+                    // (same capacity policy as slow-consumer disconnect).
+                    let resync = code_ui_wire_v2_resync_sse(
+                        "bootstrap_window_exceeded",
+                        cursor,
+                        hub.durable_tail_sequence(),
+                    );
+                    let stream = stream::iter(vec![
+                        Ok::<Event, std::io::Error>(resync),
+                        Err(std::io::Error::other(format!(
+                            "{}: bootstrap replay exceeded transport backlog",
+                            sse_wire::WIRE_V2_RESYNC_REQUIRED
+                        ))),
+                    ]);
+                    return Ok(Sse::new(stream)
+                        .keep_alive(KeepAlive::new())
+                        .into_response());
+                }
+                Err(error) => {
+                    return Err(WebApiError {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        code: "WIRE_V2_REPLAY_FAILED".to_string(),
+                        message: format!(
+                            "failed to replay Code UI workflow events after cursor {cursor}: {error}"
+                        ),
+                        retry_after_secs: None,
+                    });
+                }
+            };
             let last_replayed = replayed
                 .last()
                 .map(|event| event.sequence)
@@ -934,82 +1122,123 @@ async fn code_events_handler(
                 let hub = hub.clone();
                 let redactor = redactor.clone();
                 let last_delivered = last_delivered.clone();
+                let prev = last_delivered.load(std::sync::atomic::Ordering::Relaxed);
                 let events: Vec<Result<Event, std::io::Error>> = match message {
-                    Ok(event) => {
-                        let prev = last_delivered.load(std::sync::atomic::Ordering::Relaxed);
-                        if event.sequence <= prev {
-                            Vec::new()
-                        } else {
-                            match try_code_ui_wire_v2_to_sse(
-                                &sse_wire::CodeUiWireV2Event::from_workflow_event(&event),
-                                redactor.as_ref(),
-                            ) {
-                                Ok(frame) => {
-                                    last_delivered.store(
-                                        event.sequence,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    vec![Ok(frame)]
-                                }
-                                Err(error_event) => vec![
-                                    Ok(error_event),
-                                    Err(std::io::Error::other(
-                                        "WIRE_V2_REPLAY_FAILED: secret redaction failed on live event",
-                                    )),
-                                ],
+                    // Fast path: contiguous in-budget full event — no disk replay.
+                    Ok(sse_wire::CodeUiWorkflowLiveNotify::Event(event))
+                        if event.sequence == prev.saturating_add(1) =>
+                    {
+                        match try_code_ui_wire_v2_to_sse(
+                            &sse_wire::CodeUiWireV2Event::from_workflow_event(event.as_ref()),
+                            redactor.as_ref(),
+                        ) {
+                            Ok(frame) => {
+                                last_delivered
+                                    .store(event.sequence, std::sync::atomic::Ordering::Relaxed);
+                                vec![Ok(frame)]
                             }
+                            Err(error_event) => vec![
+                                Ok(error_event),
+                                Err(std::io::Error::other(
+                                    "WIRE_V2_REPLAY_FAILED: secret redaction failed on live event",
+                                )),
+                            ],
                         }
                     }
-                    Err(BroadcastStreamRecvError::Lagged(_)) => {
-                        let prev = last_delivered.load(std::sync::atomic::Ordering::Relaxed);
-                        match hub.replay_after(prev) {
-                            Ok(catch_up) => {
-                                let mut frames = Vec::with_capacity(catch_up.len());
-                                for event in catch_up {
-                                    match try_code_ui_wire_v2_to_sse(
-                                        &sse_wire::CodeUiWireV2Event::from_workflow_event(&event),
-                                        redactor.as_ref(),
-                                    ) {
-                                        Ok(frame) => {
-                                            last_delivered.store(
-                                                event.sequence,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
-                                            frames.push(Ok(frame));
-                                        }
-                                        Err(error_event) => {
-                                            frames.push(Ok(error_event));
-                                            frames.push(Err(std::io::Error::other(
-                                                "WIRE_V2_REPLAY_FAILED: secret redaction failed during lag catch-up",
-                                            )));
-                                            break;
-                                        }
-                                    }
-                                }
-                                frames
-                            }
-                            Err(error) => {
-                                // Fail closed: emit the error frame then end the
-                                // stream so clients cannot advance past a gap via
-                                // a later live SSE id.
-                                vec![
-                                    Ok(code_ui_wire_v2_error_sse(
-                                        "WIRE_V2_REPLAY_FAILED",
-                                        "lagged SSE consumer could not catch up from the durable workflow log; reconnect from the last acknowledged cursor",
-                                    )),
-                                    Err(std::io::Error::other(format!(
-                                        "WIRE_V2_REPLAY_FAILED: lagged catch-up failed: {error}"
-                                    ))),
-                                ]
-                            }
-                        }
+                    // Tip-only / out-of-order full event / lag: durable catch-up
+                    // under the transport byte+count window (may resync).
+                    Ok(sse_wire::CodeUiWorkflowLiveNotify::Event(event))
+                        if event.sequence > prev =>
+                    {
+                        wire_v2_durable_catch_up_frames(
+                            &hub,
+                            redactor.as_ref(),
+                            &last_delivered,
+                            prev,
+                            "live_catchup_exceeded",
+                        )
                     }
+                    Ok(sse_wire::CodeUiWorkflowLiveNotify::Tip { sequence }) if sequence > prev => {
+                        wire_v2_durable_catch_up_frames(
+                            &hub,
+                            redactor.as_ref(),
+                            &last_delivered,
+                            prev,
+                            "live_catchup_exceeded",
+                        )
+                    }
+                    Ok(_) => Vec::new(),
+                    Err(BroadcastStreamRecvError::Lagged(_)) => wire_v2_durable_catch_up_frames(
+                        &hub,
+                        redactor.as_ref(),
+                        &last_delivered,
+                        prev,
+                        "lagged_catchup_exceeded",
+                    ),
                 };
                 stream::iter(events)
             });
             Ok(Sse::new(initial_stream.chain(live))
                 .keep_alive(KeepAlive::new())
                 .into_response())
+        }
+    }
+}
+
+/// Transport-bounded durable catch-up shared by tip notifies and lag recovery.
+fn wire_v2_durable_catch_up_frames(
+    hub: &sse_wire::CodeUiWorkflowHub,
+    redactor: &SecretRedactor,
+    last_delivered: &std::sync::atomic::AtomicU64,
+    prev: u64,
+    capacity_reason: &str,
+) -> Vec<Result<Event, std::io::Error>> {
+    match hub.replay_after(prev) {
+        Ok(catch_up) => {
+            let mut frames = Vec::with_capacity(catch_up.len());
+            for event in catch_up {
+                match try_code_ui_wire_v2_to_sse(
+                    &sse_wire::CodeUiWireV2Event::from_workflow_event(&event),
+                    redactor,
+                ) {
+                    Ok(frame) => {
+                        last_delivered.store(event.sequence, std::sync::atomic::Ordering::Relaxed);
+                        frames.push(Ok(frame));
+                    }
+                    Err(error_event) => {
+                        frames.push(Ok(error_event));
+                        frames.push(Err(std::io::Error::other(
+                            "WIRE_V2_REPLAY_FAILED: secret redaction failed during durable catch-up",
+                        )));
+                        break;
+                    }
+                }
+            }
+            frames
+        }
+        Err(error) if sse_wire::transport_backlog_exceeded(&error) => {
+            vec![
+                Ok(code_ui_wire_v2_resync_sse(
+                    capacity_reason,
+                    prev,
+                    hub.durable_tail_sequence(),
+                )),
+                Err(std::io::Error::other(format!(
+                    "{}: {capacity_reason}: {error}",
+                    sse_wire::WIRE_V2_RESYNC_REQUIRED
+                ))),
+            ]
+        }
+        Err(error) => {
+            vec![
+                Ok(code_ui_wire_v2_error_sse(
+                    "WIRE_V2_REPLAY_FAILED",
+                    "SSE consumer could not catch up from the durable workflow log; reconnect from the last acknowledged cursor",
+                )),
+                Err(std::io::Error::other(format!(
+                    "WIRE_V2_REPLAY_FAILED: durable catch-up failed: {error}"
+                ))),
+            ]
         }
     }
 }
@@ -1046,6 +1275,21 @@ fn code_ui_wire_v2_error_sse(code: &str, message: &str) -> Event {
             }
         }))
         .unwrap_or_else(|_| Event::default().event("error"))
+}
+
+/// W3-08 recoverable transport-capacity exit (`event: resync` then stream end).
+fn code_ui_wire_v2_resync_sse(reason: &str, last_cursor: u64, durable_tail: u64) -> Event {
+    let payload =
+        sse_wire::CodeUiWireV2ResyncEvent::transport_backlog(reason, last_cursor, durable_tail);
+    Event::default()
+        .event("resync")
+        .json_data(payload)
+        .unwrap_or_else(|_| {
+            Event::default().event("resync").data(format!(
+                "{{\"code\":\"{}\",\"reason\":\"{reason}\",\"lastCursor\":{last_cursor},\"durableTail\":{durable_tail},\"action\":\"fetch_snapshot\"}}",
+                sse_wire::WIRE_V2_RESYNC_REQUIRED
+            ))
+        })
 }
 
 async fn code_ui_broadcast_event_or_recovery(
@@ -3826,6 +4070,97 @@ mod tests {
                 && body.contains("live-after-subscribe")
                 && body.contains("\"cursor\":1"),
             "subscribed v2 client must receive live durable appends: {body}"
+        );
+    }
+
+    /// W3-08: slow consumer past the transport broadcast budget gets the same
+    /// recoverable resync exit as over-budget bootstrap (no silent drop).
+    #[cfg(feature = "test-provider")]
+    #[tokio::test]
+    async fn code_events_wire_v2_slow_consumer_resync() {
+        assert_sse_slow_consumer_contract()
+            .await
+            .expect("sse_slow_consumer contract");
+    }
+
+    /// W3-08: bootstrap past the transport window emits resync (not 500).
+    #[tokio::test]
+    async fn code_events_wire_v2_bootstrap_resync_required() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use futures_util::StreamExt;
+        use tempfile::tempdir;
+
+        use crate::internal::ai::{
+            session::{CodeWorkflowEventKind, SessionJsonlStore},
+            web::sse_wire::{
+                CodeUiWorkflowHub, MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS, WIRE_V2_RESYNC_REQUIRED,
+            },
+        };
+
+        let runtime = test_code_ui_runtime().await;
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = Arc::new(CodeUiWorkflowHub::attach(&mut store).expect("attach workflow hub"));
+        let over = MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS + 1;
+        let kinds: Vec<_> = (0..over)
+            .map(|i| CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: format!("boot-{i}"),
+                payload: serde_json::json!({}),
+            })
+            .collect();
+        store
+            .append_code_workflow_batch(&kinds)
+            .expect("seed over-budget log");
+
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra-w308-boot")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: SocketAddr::from(([127, 0, 0, 1], 4322)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: Some(hub),
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/events?wire=2")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let mut collected = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match timeout(Duration::from_millis(200), stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    collected.extend_from_slice(&chunk);
+                    let text = String::from_utf8_lossy(&collected);
+                    if text.contains("event: resync") {
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) => break,
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        let body = String::from_utf8(collected).expect("utf8 SSE body");
+        assert!(
+            body.contains("event: resync")
+                && body.contains(WIRE_V2_RESYNC_REQUIRED)
+                && body.contains("bootstrap_window_exceeded"),
+            "over-budget bootstrap must emit resync: {body}"
+        );
+        assert!(
+            !body.contains("event: code_workflow"),
+            "over-budget bootstrap must not silently stream a truncated prefix: {body}"
         );
     }
 }

@@ -76,6 +76,15 @@ sse_case!(sse_reconnect_initial_replay_contains_latest_transcript);
 #[cfg(feature = "test-provider")]
 sse_case!(sse_streaming_fixture_transcript_content_grows_monotonically);
 
+/// W3-08: slow consumer past the transport broadcast budget is disconnected
+/// with `event: resync`; tip-cursor reconnect continues without dup/loss.
+#[cfg(feature = "test-provider")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn sse_slow_consumer() -> Result<()> {
+    libra::internal::ai::web::assert_sse_slow_consumer_contract().await
+}
+
 #[cfg(not(feature = "test-provider"))]
 #[test]
 fn sse_matrix_requires_test_provider_feature() {

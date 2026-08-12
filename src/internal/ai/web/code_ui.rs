@@ -497,6 +497,8 @@ pub struct CodeUiSession {
 
 impl CodeUiSession {
     pub fn new(snapshot: CodeUiSessionSnapshot) -> Arc<Self> {
+        // v1 snapshot fan-out is independent of the W3-08 v2 transport budget
+        // (full `CodeUiSessionSnapshot` payloads have no 8 MiB ring policy).
         let (tx, _) = broadcast::channel(256);
         Arc::new(Self {
             snapshot: RwLock::new(snapshot),

@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-08, 2026-08-12, v0.19.137)
+
+- **W3-08 bounds Code UI SSE transport backlog.** Wire v2 uses
+  `MAX_CODE_UI_TRANSPORT_BACKLOG_*` (1,024 events or 8 MiB, whichever first).
+  Over-budget bootstrap or lagged catch-up emits `event: resync` /
+  `WIRE_V2_RESYNC_REQUIRED` then ends the stream (no silent drop). Slow
+  consumers share that policy; reconnect at `durableTail` continues without
+  dup/loss. Live fan-out keeps an in-budget Event fast path and tip-only
+  notifies when the tokio ring would exceed the byte cap.
+
 ### Added (plan-20260715 W3-06, 2026-08-12, v0.19.136)
 
 - **W3-06 adds Code UI SSE wire v2 negotiation.** `GET /api/code/events`
