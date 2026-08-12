@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-14, 2026-08-12, v0.19.138)
+
+- **W3-14 gates large-session Code UI projection.** Hot window stays
+  `MAX_CODE_UI_PROJECTION_*` (1,024 events / 8 MiB), named apart from W3-08
+  transport backlog. JSONL resume walks records from the tail and stops at
+  the cursor / window overflow, so a 10k-row session is not fully parsed
+  for one-event fold. `large_session_projection_smoke` records
+  runner/profile/sample size and asserts release p95 ≤ 5 ms.
+
 ### Added (plan-20260715 W3-08, 2026-08-12, v0.19.137)
 
 - **W3-08 bounds Code UI SSE transport backlog.** Wire v2 uses

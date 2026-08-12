@@ -179,8 +179,11 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 workflow sequence), `eventId`, `kind`, `at`, and minimal `payload`. Reconnect with
 `?wire=2&cursor=<lastCursor>` to replay without duplicates or gaps inside the
 **transport** backlog window (W3-08 / GC-CODE-12): **1,024 events or 8 MiB**,
-whichever is reached first (`MAX_CODE_UI_TRANSPORT_BACKLOG_*`; projection
-hot-window naming stays with W3-14). When bootstrap or a lagged consumer would
+whichever is reached first (`MAX_CODE_UI_TRANSPORT_BACKLOG_*`). The Code UI
+**projection** hot window is a separate budget with the same numeric caps
+(`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`);
+do not add the two together. Single-event folds visit only the suffix, not
+the full session history (W3-14; release p95 ≤ 5 ms on 10k-event sessions). When bootstrap or a lagged consumer would
 exceed that budget, the server emits `event: resync` with
 `WIRE_V2_RESYNC_REQUIRED` (`reason`, `lastCursor`, `durableTail`,
 `action: fetch_snapshot`) and ends the stream — never silent-drops. Clients

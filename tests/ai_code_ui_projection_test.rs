@@ -16,7 +16,10 @@ use libra::internal::ai::{
         ThreadProjection,
     },
     runtime::contracts::ProjectionFreshness,
-    session::{CodeWorkflowEvent, CodeWorkflowEventKind, CodeWorkflowReplay},
+    session::{
+        CodeWorkflowEvent, CodeWorkflowEventKind, CodeWorkflowReplay, SessionJsonlStore,
+        code_workflow_replay_parse_visits, reset_code_workflow_replay_parse_visits,
+    },
     web::{
         code_ui::{
             CodeUiCapabilities, CodeUiInteractionRequest, CodeUiInteractionStatus,
@@ -25,9 +28,12 @@ use libra::internal::ai::{
             snapshot_from_thread_bundle,
         },
         code_ui_projection::{
-            fold_code_ui_snapshot, fold_graph_compatible_code_ui_snapshot,
-            rebuild_code_ui_read_model_from_events,
+            CodeUiProjectionFoldError, MAX_CODE_UI_PROJECTION_EVENTS,
+            MAX_CODE_UI_PROJECTION_REPLAY_BYTES, fold_code_ui_snapshot, fold_event_visits,
+            fold_graph_compatible_code_ui_snapshot, rebuild_code_ui_read_model_from_events,
+            reset_fold_event_visits,
         },
+        sse_wire::{MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES, MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS},
     },
 };
 use serde_json::{json, to_value};
@@ -610,4 +616,193 @@ fn sse_backlog_resync_no_silent_drop_byte_window() {
         hub.replay_after(tip).expect("tip resume").is_empty(),
         "after resync, tip cursor must continue without replaying the over-budget window"
     );
+}
+
+/// W3-14: 10k-event sessions fold a bounded hot window; single-event history
+/// visits stay O(1) in the suffix, not O(session). Release p95 ≤ 5 ms.
+#[test]
+fn large_session_projection_smoke() {
+    const SESSION_EVENTS: usize = 10_000;
+    const SAMPLES: usize = 200;
+    const WARMUP: usize = 20;
+    const P95_BUDGET: std::time::Duration = std::time::Duration::from_millis(5);
+
+    assert_eq!(MAX_CODE_UI_PROJECTION_EVENTS, 1024);
+    assert_eq!(MAX_CODE_UI_PROJECTION_REPLAY_BYTES, 8 * 1024 * 1024);
+    assert_eq!(MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS, 1024);
+    assert_eq!(MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES, 8 * 1024 * 1024);
+    assert_ne!(
+        stringify!(MAX_CODE_UI_PROJECTION_EVENTS),
+        stringify!(MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS),
+        "projection and transport event caps must stay separately named"
+    );
+    assert_ne!(
+        stringify!(MAX_CODE_UI_PROJECTION_REPLAY_BYTES),
+        stringify!(MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES),
+        "projection and transport byte caps must stay separately named"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SessionJsonlStore::new(dir.path().join("session"));
+    for chunk_start in (0..SESSION_EVENTS).step_by(512) {
+        let chunk_end = (chunk_start + 512).min(SESSION_EVENTS);
+        let kinds: Vec<_> = (chunk_start..chunk_end)
+            .map(|_| status_fold_kind(CodeUiSessionStatus::Thinking))
+            .collect();
+        store
+            .append_code_workflow_batch(&kinds)
+            .expect("append 10k workflow rows");
+    }
+
+    reset_code_workflow_replay_parse_visits();
+    let uncheckpointed = store
+        .load_code_workflow_replay_since(
+            0,
+            MAX_CODE_UI_PROJECTION_EVENTS,
+            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .expect_err("10k rows without a checkpoint must fail closed");
+    assert!(
+        uncheckpointed.to_string().contains("bounded limit"),
+        "full-session resume must not silently fold 10k rows, got: {uncheckpointed}"
+    );
+    let overflow_visits = code_workflow_replay_parse_visits();
+    assert!(
+        overflow_visits <= MAX_CODE_UI_PROJECTION_EVENTS + 2,
+        "uncheckpointed 10k resume must stop after the hot window, visits={overflow_visits}"
+    );
+    assert!(
+        overflow_visits < SESSION_EVENTS,
+        "JSONL parse must not scan the full 10k session, visits={overflow_visits}"
+    );
+
+    let compacted = SESSION_EVENTS - MAX_CODE_UI_PROJECTION_EVENTS;
+    reset_code_workflow_replay_parse_visits();
+    reset_fold_event_visits();
+    let window = store
+        .load_code_workflow_replay_since(
+            compacted as u64,
+            MAX_CODE_UI_PROJECTION_EVENTS,
+            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .expect("hot window of 1,024 events must load");
+    assert_eq!(window.events.len(), MAX_CODE_UI_PROJECTION_EVENTS);
+    assert!(code_workflow_replay_parse_visits() <= MAX_CODE_UI_PROJECTION_EVENTS + 2);
+    let folded = fold_code_ui_snapshot(sample_event_fold_bootstrap(), &window)
+        .expect("hot window of 1,024 events must fold");
+    assert_eq!(fold_event_visits(), MAX_CODE_UI_PROJECTION_EVENTS);
+    assert_eq!(folded.last_sequence, Some(SESSION_EVENTS as u64));
+    assert_eq!(folded.snapshot.status, CodeUiSessionStatus::Thinking);
+
+    let oversized: Vec<CodeWorkflowEvent> = (1..=(MAX_CODE_UI_PROJECTION_EVENTS as u64 + 1))
+        .map(|sequence| status_fold_event(sequence, CodeUiSessionStatus::Idle))
+        .collect();
+    match fold_code_ui_snapshot(
+        sample_event_fold_bootstrap(),
+        &CodeWorkflowReplay {
+            events: oversized,
+            gaps: Vec::new(),
+            window_cut_mid_record: false,
+        },
+    ) {
+        Err(CodeUiProjectionFoldError::HistoryLimitExceeded { limit, observed }) => {
+            assert_eq!(limit, MAX_CODE_UI_PROJECTION_EVENTS);
+            assert_eq!(observed, MAX_CODE_UI_PROJECTION_EVENTS + 1);
+        }
+        other => panic!("expected HistoryLimitExceeded, got {other:?}"),
+    }
+
+    reset_code_workflow_replay_parse_visits();
+    reset_fold_event_visits();
+    let live_replay = store
+        .load_code_workflow_replay_since(
+            SESSION_EVENTS as u64 - 1,
+            MAX_CODE_UI_PROJECTION_EVENTS,
+            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+        )
+        .expect("single-event resume must load from JSONL");
+    assert_eq!(live_replay.events.len(), 1);
+    assert!(
+        code_workflow_replay_parse_visits() <= 8,
+        "single-event JSONL resume must not parse the 10k history, visits={}",
+        code_workflow_replay_parse_visits()
+    );
+    let after_live = fold_code_ui_snapshot(folded.snapshot.clone(), &live_replay)
+        .expect("single-event fold must succeed");
+    assert_eq!(
+        fold_event_visits(),
+        1,
+        "single-event fold must not replay the 10k compacted history"
+    );
+    assert_eq!(after_live.snapshot.status, CodeUiSessionStatus::Thinking);
+    assert_eq!(after_live.last_sequence, Some(SESSION_EVENTS as u64));
+
+    for _ in 0..WARMUP {
+        let _ = store
+            .load_code_workflow_replay_since(
+                SESSION_EVENTS as u64 - 1,
+                MAX_CODE_UI_PROJECTION_EVENTS,
+                MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+            )
+            .expect("warmup load");
+        let _ = fold_code_ui_snapshot(folded.snapshot.clone(), &live_replay).expect("warmup fold");
+    }
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for _ in 0..SAMPLES {
+        reset_code_workflow_replay_parse_visits();
+        reset_fold_event_visits();
+        let input = folded.snapshot.clone();
+        let started = std::time::Instant::now();
+        let loaded = store
+            .load_code_workflow_replay_since(
+                SESSION_EVENTS as u64 - 1,
+                MAX_CODE_UI_PROJECTION_EVENTS,
+                MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+            )
+            .expect("timed JSONL resume");
+        let folded_once = fold_code_ui_snapshot(input, &loaded).expect("timed single-event fold");
+        samples.push(started.elapsed());
+        assert!(code_workflow_replay_parse_visits() <= 8);
+        assert_eq!(fold_event_visits(), 1);
+        assert_eq!(folded_once.snapshot.status, CodeUiSessionStatus::Thinking);
+        assert_eq!(loaded.events.len(), 1);
+    }
+    samples.sort();
+    let p50 = samples[SAMPLES / 2];
+    let p95 = samples[(SAMPLES * 95) / 100];
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    eprintln!(
+        "W3-14 large_session_projection_smoke runner={} arch={} profile={} samples={SAMPLES} p50={p50:?} p95={p95:?} budget={P95_BUDGET:?} session_events={SESSION_EVENTS} hot_window={}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        profile,
+        MAX_CODE_UI_PROJECTION_EVENTS,
+    );
+    if cfg!(debug_assertions) {
+        eprintln!("W3-14 p95 wall-clock gate is release-only; access counters already asserted");
+        return;
+    }
+    assert!(
+        p95 <= P95_BUDGET,
+        "release-mode single-event fold p95 {p95:?} exceeds {P95_BUDGET:?} (p50={p50:?}, samples={SAMPLES}, runner={} {})",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+}
+
+fn status_fold_kind(status: CodeUiSessionStatus) -> CodeWorkflowEventKind {
+    CodeWorkflowEventKind::CodeUiProjectionDelta {
+        projection: "status".to_string(),
+        summary: "status".to_string(),
+        payload: to_value(status).expect("status must serialize"),
+    }
+}
+
+fn status_fold_event(sequence: u64, status: CodeUiSessionStatus) -> CodeWorkflowEvent {
+    workflow_event(sequence, status_fold_kind(status))
 }

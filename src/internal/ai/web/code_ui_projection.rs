@@ -6,7 +6,7 @@
 //! legacy/bootstrap snapshot for immutable session metadata, then applies the
 //! bounded fine-grained event suffix.
 
-use std::fmt;
+use std::{cell::Cell, fmt};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -21,14 +21,31 @@ use crate::internal::ai::{
     session::{CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap},
 };
 
-/// The fold never silently applies an unbounded historical suffix.  A later
-/// compaction/checkpoint card can advance this bounded replay window without
-/// changing the event schema or resurrecting a second projection store.
+/// Hot **projection** window event cap (GC-CODE-12 / W3-14).
+///
+/// Named separately from `MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS` (W3-08): the
+/// numeric budgets match, but they must not be treated as one combined quota.
+/// The fold never silently applies an unbounded historical suffix.
 pub const MAX_CODE_UI_PROJECTION_EVENTS: usize = 1024;
-/// Maximum number of bytes read from the end of a session JSONL file during a
-/// resume. A suffix that cannot be proven complete inside this window fails
-/// closed and requires compaction/checkpoint recovery.
+/// Hot **projection** window byte cap for resume JSONL suffix reads (W3-14).
+/// Distinct from `MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES`. A suffix that cannot
+/// be proven complete inside this window fails closed.
 pub const MAX_CODE_UI_PROJECTION_REPLAY_BYTES: u64 = 8 * 1024 * 1024;
+
+thread_local! {
+    static FOLD_EVENT_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Reset the per-thread fold event-visit counter (W3-14 access evidence).
+pub fn reset_fold_event_visits() {
+    FOLD_EVENT_VISITS.with(|cell| cell.set(0));
+}
+
+/// Number of workflow events visited by [`fold_code_ui_snapshot`] since the
+/// last [`reset_fold_event_visits`] on this thread.
+pub fn fold_event_visits() -> usize {
+    FOLD_EVENT_VISITS.with(Cell::get)
+}
 
 /// Result of folding a session-scoped Code UI event suffix.
 #[derive(Debug, Clone)]
@@ -110,6 +127,7 @@ pub fn fold_code_ui_snapshot(
     let mut snapshot = bootstrap;
     let mut last_sequence = None;
     for workflow_event in &replay.events {
+        FOLD_EVENT_VISITS.with(|cell| cell.set(cell.get().saturating_add(1)));
         last_sequence = Some(workflow_event.sequence);
         match &workflow_event.event {
             CodeWorkflowEventKind::CodeUiProjectionDelta {
