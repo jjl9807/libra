@@ -32,7 +32,7 @@ pub use jsonl::{
     CodeCommandAdmission, CodeCommandIdentity, CodeCommandIntent, CodeCommandRecovery,
     CodeCommandStatus, CodeCommandStoreError, CodeWorkflowCursor, CodeWorkflowEvent,
     CodeWorkflowEventKind, CodeWorkflowReplay, CodeWorkflowSequenceGap, SessionEvent,
-    SessionJsonlStore,
+    SessionJsonlStore, code_workflow_replay_parse_visits, reset_code_workflow_replay_parse_visits,
 };
 pub use state::{SessionId, SessionMessage, SessionState};
 pub use store::{SessionInfo, SessionStore};

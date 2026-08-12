@@ -1,6 +1,7 @@
 //! Append-only JSONL session event storage.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -24,6 +25,22 @@ use crate::internal::ai::{
 };
 
 pub const SESSION_EVENTS_FILE: &str = "events.jsonl";
+
+thread_local! {
+    static CODE_WORKFLOW_REPLAY_PARSE_VISITS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Reset the per-thread JSONL parse-visit counter used by bounded workflow
+/// replay (W3-14 access evidence).
+pub fn reset_code_workflow_replay_parse_visits() {
+    CODE_WORKFLOW_REPLAY_PARSE_VISITS.with(|cell| cell.set(0));
+}
+
+/// Number of JSONL records parsed by [`SessionJsonlStore::load_code_workflow_replay_since`]
+/// since the last [`reset_code_workflow_replay_parse_visits`] on this thread.
+pub fn code_workflow_replay_parse_visits() -> usize {
+    CODE_WORKFLOW_REPLAY_PARSE_VISITS.with(Cell::get)
+}
 const CODE_WORKFLOW_APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const CODE_WORKFLOW_APPEND_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STALE_CODE_WORKFLOW_APPEND_LOCK_AGE: Duration = Duration::from_secs(30);
@@ -1302,11 +1319,8 @@ impl SessionJsonlStore {
             content.drain(..=first_newline);
         }
 
-        let events = parse_session_events_content(&path, &content)?;
-        let window_tip_sequence = events.iter().rev().find_map(|event| match event {
-            SessionEvent::CodeWorkflow(workflow) => Some(workflow.sequence),
-            _ => None,
-        });
+        let (events, window_tip_sequence) =
+            parse_code_workflow_suffix_from_window(&path, &content, after_sequence, max_events)?;
         let mut replay = code_workflow_replay_from_events(events, after_sequence)?;
         replay.window_cut_mid_record = start > 0;
         if start > 0 && replay.events.is_empty() {
@@ -2237,6 +2251,93 @@ fn code_workflow_replay_from_events(
         replay.events.push(workflow_event);
     }
     Ok(replay)
+}
+
+/// Parse a bounded workflow suffix by walking JSONL records from the end of
+/// the already-read byte window. Stops at the durable cursor, an overflow of
+/// `max_events + 1`, or the start of the window — so 10k small rows inside
+/// 8 MiB are not fully deserialized for a one-event resume.
+fn parse_code_workflow_suffix_from_window(
+    path: &Path,
+    content: &str,
+    after_sequence: u64,
+    max_events: usize,
+) -> io::Result<(Vec<SessionEvent>, Option<u64>)> {
+    let ends_with_newline = content.ends_with('\n');
+    let bytes = content.as_bytes();
+    let overflow_at = max_events.saturating_add(1);
+    let mut end = bytes.len();
+    let mut newest_first = Vec::new();
+    let mut window_tip_sequence = None;
+    let mut first = true;
+    let mut records_from_end = 0usize;
+
+    while end > 0 {
+        if bytes[end - 1] == b'\n' {
+            end -= 1;
+            if end == 0 {
+                break;
+            }
+        }
+        let start = content[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line = &content[start..end];
+        let is_trailing_incomplete = first && !ends_with_newline;
+        first = false;
+        end = start;
+        if line.trim().is_empty() {
+            continue;
+        }
+        records_from_end = records_from_end.saturating_add(1);
+        CODE_WORKFLOW_REPLAY_PARSE_VISITS.with(|cell| cell.set(cell.get().saturating_add(1)));
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(error) if is_trailing_incomplete => {
+                tracing::warn!(
+                    path = %path.display(),
+                    tail_record = records_from_end,
+                    error = %error,
+                    "stopping session JSONL replay at malformed trailing line"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "malformed complete line in session event log '{}' near tail record {records_from_end}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+        match parse_session_event_value(value) {
+            Ok(Some(SessionEvent::CodeWorkflow(workflow_event))) => {
+                if window_tip_sequence.is_none() {
+                    window_tip_sequence = Some(workflow_event.sequence);
+                }
+                if workflow_event.sequence <= after_sequence {
+                    break;
+                }
+                newest_first.push(SessionEvent::CodeWorkflow(workflow_event));
+                if newest_first.len() >= overflow_at {
+                    break;
+                }
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to decode session event log '{}' near tail record {records_from_end}: {error}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+    }
+
+    newest_first.reverse();
+    Ok((newest_first, window_tip_sequence))
 }
 
 fn parse_session_events_content(path: &Path, content: &str) -> io::Result<Vec<SessionEvent>> {
