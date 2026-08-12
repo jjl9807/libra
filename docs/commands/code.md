@@ -125,7 +125,7 @@ The usage panel mirrors the W2-12 `RuntimeUsageTotals` read model (cumulative, c
 
 The execution/repair panel projects `plans[]`, `toolCalls[]`, and `planExecutionRepair` from the live session snapshot. Continue/Cancel post through `POST /api/code/interactions/{id}` with `selectedOption` (`continue` / `cancel`); when projected `attempt >= max_attempts`, Continue also sends a raised `maxAttempts` (capped at 10) without reclassifying the failure on the client.
 
-The SSE resilience panel surfaces reconnecting / resync-required / resynced status while keeping the last projected session snapshot and the last wire-supplied cursor seq (the browser never invents sequence numbers). Explicit snapshot resync routes through the shared store `refresh()` path and only reports success when that refresh applies (or is superseded by a newer live update); production v2 backlog/resync events land in later wire cards (W3-06/W3-08), with the built-in SPA cutover in W3-09.
+The SSE resilience panel surfaces reconnecting / resync-required / resynced status while keeping the last projected session snapshot and the last wire-supplied cursor seq (the browser never invents sequence numbers). Explicit snapshot resync routes through the shared store `refresh()` path and only reports success when that refresh applies (or is superseded by a newer live update). Production v2 transport backlog/resync (`event: resync` / `WIRE_V2_RESYNC_REQUIRED`) is delivered by W3-08; the built-in SPA cutover to consume it remains W3-09.
 
 The workflow review panel projects pending `intent_review_choice` and `post_plan_choice` interactions (network policy is the same kind with `metadata.phase = "networkPolicy"`). Confirm/modify/cancel (and execute / network-allow / network-deny / back) post `selectedOption` through the leased interaction endpoint; turn cancel is fail-closed when the browser cannot write. The panel does not keep a second workflow FSM — it waits for the next snapshot/SSE update.
 
@@ -178,11 +178,18 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 **SSE wire v2**: `code_workflow` events with camelCase `cursor` (durable W1-06
 workflow sequence), `eventId`, `kind`, `at`, and minimal `payload`. Reconnect with
 `?wire=2&cursor=<lastCursor>` to replay without duplicates or gaps inside the
-bounded fold window. Wire v2 requires a SessionStore-backed workflow hub. Today
-that hub is mounted for `--web-only` headless runs with session persistence
-(non-Codex `HeadlessCodeRuntime`). Default TUI + background web and managed
-`--web-only --provider codex` currently return
-`503 WIRE_V2_REQUIRES_DURABLE_SESSION` until those runtimes expose a hub.
+**transport** backlog window (W3-08 / GC-CODE-12): **1,024 events or 8 MiB**,
+whichever is reached first (`MAX_CODE_UI_TRANSPORT_BACKLOG_*`; projection
+hot-window naming stays with W3-14). When bootstrap or a lagged consumer would
+exceed that budget, the server emits `event: resync` with
+`WIRE_V2_RESYNC_REQUIRED` (`reason`, `lastCursor`, `durableTail`,
+`action: fetch_snapshot`) and ends the stream — never silent-drops. Clients
+fetch a session snapshot, then reconnect at `durableTail`. Wire v2 requires a
+SessionStore-backed workflow hub. Today that hub is mounted for `--web-only`
+headless runs with session persistence (non-Codex `HeadlessCodeRuntime`).
+Default TUI + background web and managed `--web-only --provider codex`
+currently return `503 WIRE_V2_REQUIRES_DURABLE_SESSION` until those runtimes
+expose a hub.
 
 ### SSE v1 compatibility window (DEFER-08)
 
@@ -214,7 +221,8 @@ Code UI API errors use `{ error: { code, message } }`:
 | `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `1`/`v1` and `2`/`v2` are accepted). |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 requires a SessionStore-backed workflow hub (mounted today for `--web-only` headless persistence; TUI background web and managed Codex web-only do not yet expose one). |
 | `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` is ahead of the durable workflow tail; drop the cursor and resync (an ahead cursor would permanently skip live events). |
-| `WIRE_V2_REPLAY_FAILED` | 500 | Wire v2 could not replay durable workflow events after the requested cursor (gap, bound, or I/O). |
+| `WIRE_V2_RESYNC_REQUIRED` | SSE `resync` then close | Transport backlog exceeded (1,024 events / 8 MiB); fetch snapshot and reconnect with `cursor=<durableTail>`. |
+| `WIRE_V2_REPLAY_FAILED` | 500 | Wire v2 could not replay durable workflow events after the requested cursor (gap or I/O; capacity exits use `WIRE_V2_RESYNC_REQUIRED`). |
 | `CONTROL_DISABLED` | 403 | Automation control is not enabled for this process. |
 | `MISSING_CONTROL_TOKEN` | 403 | Automation control token is absent. |
 | `INVALID_CONTROL_TOKEN` | 403 | Automation control token is invalid. |

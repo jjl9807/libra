@@ -394,6 +394,10 @@ pub struct CodeWorkflowSequenceGap {
 pub struct CodeWorkflowReplay {
     pub events: Vec<CodeWorkflowEvent>,
     pub gaps: Vec<CodeWorkflowSequenceGap>,
+    /// Bounded byte-window started after byte 0 and discarded an incomplete
+    /// leading JSONL fragment (W3-08). Prefix sequence gaps in that case are
+    /// transport truncation, not durable log corruption.
+    pub window_cut_mid_record: bool,
 }
 
 /// OC-Phase 4 ArtifactLedger JSONL projection envelope (v0.17.810).
@@ -1303,7 +1307,8 @@ impl SessionJsonlStore {
             SessionEvent::CodeWorkflow(workflow) => Some(workflow.sequence),
             _ => None,
         });
-        let replay = code_workflow_replay_from_events(events, after_sequence)?;
+        let mut replay = code_workflow_replay_from_events(events, after_sequence)?;
+        replay.window_cut_mid_record = start > 0;
         if start > 0 && replay.events.is_empty() {
             match window_tip_sequence {
                 // Client is already at the tip of the retained suffix: idle

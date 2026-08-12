@@ -1,5 +1,6 @@
 //! Code UI SSE wire version negotiation and v2 delta/cursor envelopes (W3-06).
 //!
+//! Transport backlog / resync / slow-consumer backpressure live here (W3-08).
 //! v1 remains the full-snapshot [`super::code_ui::CodeUiEventEnvelope`] stream.
 //! v2 emits minimal payloads keyed by the durable W1-06
 //! [`CodeWorkflowEvent`] sequence — never a second live sequencer.
@@ -18,10 +19,25 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use super::code_ui_projection::{
-    MAX_CODE_UI_PROJECTION_EVENTS, MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
-};
 use crate::internal::ai::session::{CodeWorkflowEvent, CodeWorkflowEventKind, SessionJsonlStore};
+
+/// Transport backlog event-count cap for SSE wire v2 (GC-CODE-12 / W3-08).
+///
+/// Projection hot-window naming/quotas stay in [`super::code_ui_projection`]
+/// (W3-14); this constant is the transport-only fact source.
+pub const MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS: usize = 1024;
+
+/// Transport backlog byte cap for SSE wire v2 catch-up/bootstrap windows
+/// (GC-CODE-12 / W3-08). Whichever of count or bytes is reached first wins.
+pub const MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Live broadcast ring capacity — the event-count half of the transport budget.
+/// Slow consumers that lag past this capacity share the same resync/disconnect
+/// policy as over-budget durable catch-up.
+pub const CODE_UI_TRANSPORT_BROADCAST_CAPACITY: usize = MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS;
+
+/// Wire code for recoverable transport-capacity exits (bootstrap or lag).
+pub const WIRE_V2_RESYNC_REQUIRED: &str = "WIRE_V2_RESYNC_REQUIRED";
 
 /// Default SSE wire when the client omits a version (until W3-09 flips default).
 pub const DEFAULT_CODE_UI_SSE_WIRE_VERSION: CodeUiSseWireVersion = CodeUiSseWireVersion::V1;
@@ -187,13 +203,143 @@ fn workflow_kind_name(kind: &CodeWorkflowEventKind) -> &'static str {
     }
 }
 
-const WORKFLOW_HUB_CAPACITY: usize = 256;
+/// Recoverable transport-capacity exit for SSE wire v2 (W3-08).
+///
+/// Emitted as `event: resync` then the stream ends. Clients must fetch a
+/// snapshot and reconnect with `cursor` at [`Self::durable_tail`] (or the
+/// snapshot tip) — not invent a new sequencer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiWireV2ResyncEvent {
+    pub code: String,
+    pub reason: String,
+    pub last_cursor: u64,
+    pub durable_tail: u64,
+    pub action: String,
+}
+
+impl CodeUiWireV2ResyncEvent {
+    pub fn transport_backlog(reason: &str, last_cursor: u64, durable_tail: u64) -> Self {
+        Self {
+            code: WIRE_V2_RESYNC_REQUIRED.to_string(),
+            reason: reason.to_string(),
+            last_cursor,
+            durable_tail,
+            action: "fetch_snapshot".to_string(),
+        }
+    }
+}
+
+/// True when a durable replay/catch-up failure is a transport capacity exit
+/// (resync + disconnect), not an opaque I/O failure.
+///
+/// Includes count/byte bound errors, unprovable truncated tails, mid-record
+/// truncation, and sequence gaps that appear when the 8 MiB window starts
+/// inside an older oversized row (Codex W3-08 P1).
+pub fn transport_backlog_exceeded(error: &io::Error) -> bool {
+    let message = error.to_string();
+    message.contains("exceeding the bounded limit")
+        || message.contains("cannot prove the retained tail")
+        || message.contains("contains no complete JSONL record")
+        || message.contains("transport backlog window omitted workflow events")
+}
+
+/// Live fan-out notify for SSE wire v2.
+///
+/// Full events are only broadcast when the publisher-side transport byte/count
+/// budget still has room. Oversized or over-budget publishes send a tip-only
+/// notify so slow consumers cannot retain unbounded JSON payloads in the ring
+/// (W3-08 / GC-CODE-12).
+#[derive(Debug, Clone)]
+pub enum CodeUiWorkflowLiveNotify {
+    Event(Box<CodeWorkflowEvent>),
+    Tip { sequence: u64 },
+}
+
+#[derive(Default)]
+struct TransportPublishBudget {
+    /// Serialized sizes of the last `CODE_UI_TRANSPORT_BROADCAST_CAPACITY`
+    /// notifies actually sent (0 = tip-only). Mirrors tokio `broadcast`
+    /// occupancy: a new send drops the oldest slot when the ring is full.
+    sizes: std::collections::VecDeque<u64>,
+    total_bytes: u64,
+}
+
+impl TransportPublishBudget {
+    fn evict_oldest_if_full(&mut self) {
+        if self.sizes.len() >= CODE_UI_TRANSPORT_BROADCAST_CAPACITY {
+            let oldest = self.sizes.pop_front().unwrap_or(0);
+            self.total_bytes = self.total_bytes.saturating_sub(oldest);
+        }
+    }
+
+    /// Record a send and return whether the new slot may hold a full event.
+    ///
+    /// Eviction happens only when this send would overwrite a tokio ring
+    /// slot (ring already at capacity) — never on paper before send.
+    fn reserve_send(&mut self, size: u64) -> bool {
+        let mut projected_bytes = self.total_bytes;
+        let mut projected_len = self.sizes.len();
+        if projected_len >= CODE_UI_TRANSPORT_BROADCAST_CAPACITY {
+            projected_bytes =
+                projected_bytes.saturating_sub(self.sizes.front().copied().unwrap_or(0));
+            projected_len = projected_len.saturating_sub(1);
+        }
+        let enqueue_full = size > 0
+            && size <= MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES
+            && projected_len < CODE_UI_TRANSPORT_BROADCAST_CAPACITY
+            && projected_bytes.saturating_add(size) <= MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES;
+        self.evict_oldest_if_full();
+        let recorded = if enqueue_full { size } else { 0 };
+        self.sizes.push_back(recorded);
+        self.total_bytes = self.total_bytes.saturating_add(recorded);
+        enqueue_full
+    }
+}
+
+/// Approximate serialized size of a workflow event for transport budgeting.
+///
+/// Counts JSON bytes with a capped writer so payloads larger than the 8 MiB
+/// transport window do not allocate a full serialized copy on the append path.
+pub fn approx_workflow_event_transport_bytes(event: &CodeWorkflowEvent) -> u64 {
+    struct CapWriter {
+        count: u64,
+        cap: u64,
+    }
+    impl io::Write for CapWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let n = buf.len() as u64;
+            if self.count.saturating_add(n) > self.cap {
+                self.count = self.cap.saturating_add(1);
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "transport byte budget exceeded",
+                ));
+            }
+            self.count += n;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = CapWriter {
+        count: 0,
+        cap: MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES,
+    };
+    match serde_json::to_writer(&mut writer, event) {
+        Ok(()) => writer.count,
+        Err(_) => writer
+            .count
+            .max(MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES.saturating_add(1)),
+    }
+}
 
 /// Durable workflow fan-out for SSE wire v2 (same sequence space as W1-06).
 #[derive(Clone)]
 pub struct CodeUiWorkflowHub {
     store: SessionJsonlStore,
-    tx: broadcast::Sender<CodeWorkflowEvent>,
+    tx: broadcast::Sender<CodeUiWorkflowLiveNotify>,
     /// In-process durable tail (updated on every append hook). Connect-time
     /// ahead-cursor checks must not re-read the full workflow log.
     last_published: Arc<AtomicU64>,
@@ -209,14 +355,27 @@ impl CodeUiWorkflowHub {
     /// Reads the durable tail once at attach time; subsequent connect checks
     /// use [`Self::durable_tail_sequence`] (O(1) atomic).
     pub fn attach(store: &mut SessionJsonlStore) -> io::Result<Self> {
-        let (tx, _) = broadcast::channel(WORKFLOW_HUB_CAPACITY);
+        let (tx, _) = broadcast::channel(CODE_UI_TRANSPORT_BROADCAST_CAPACITY);
         let tail = durable_workflow_tail_sequence(store)?;
         let last_published = Arc::new(AtomicU64::new(tail));
         let tx_hook = tx.clone();
         let last_hook = last_published.clone();
+        let publish_budget = Arc::new(std::sync::Mutex::new(TransportPublishBudget::default()));
         store.set_on_code_workflow_append(Some(Arc::new(move |event: &CodeWorkflowEvent| {
             last_hook.fetch_max(event.sequence, Ordering::Release);
-            let _ = tx_hook.send(event.clone());
+            let size = approx_workflow_event_transport_bytes(event);
+            let enqueue_full = publish_budget
+                .lock()
+                .map(|mut budget| budget.reserve_send(size))
+                .unwrap_or(false);
+            let notify = if enqueue_full {
+                CodeUiWorkflowLiveNotify::Event(Box::new(event.clone()))
+            } else {
+                CodeUiWorkflowLiveNotify::Tip {
+                    sequence: event.sequence,
+                }
+            };
+            let _ = tx_hook.send(notify);
         })));
         Ok(Self {
             store: store.clone(),
@@ -241,19 +400,36 @@ impl CodeUiWorkflowHub {
         self.last_published.load(Ordering::Acquire)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<CodeWorkflowEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<CodeUiWorkflowLiveNotify> {
         self.tx.subscribe()
     }
 
     /// Replay durable workflow events with `sequence > after_sequence`.
+    ///
+    /// Bounds use the **transport** backlog (1024 events / 8 MiB), not the
+    /// projection hot-window constants owned by W3-14.
     pub fn replay_after(&self, after_sequence: u64) -> io::Result<Vec<CodeWorkflowEvent>> {
         match self.store.load_code_workflow_replay_since_committed(
             after_sequence,
-            MAX_CODE_UI_PROJECTION_EVENTS,
-            MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
+            MAX_CODE_UI_TRANSPORT_BACKLOG_EVENTS,
+            MAX_CODE_UI_TRANSPORT_BACKLOG_BYTES,
         ) {
             Ok(replay) => {
                 if let Some(gap) = replay.gaps.first() {
+                    if replay.window_cut_mid_record
+                        && replay.events.first().is_some_and(|first| {
+                            gap.before == first.sequence && gap.after < first.sequence
+                        })
+                    {
+                        // Bounded reader discarded an incomplete leading record.
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "Code UI wire v2 transport backlog window omitted workflow events between sequences {} and {}; fetch a snapshot and reconnect at the durable tip",
+                                gap.after, gap.before
+                            ),
+                        ));
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -268,20 +444,26 @@ impl CodeUiWorkflowHub {
                 }
                 Ok(replay.events)
             }
-            // Idle reconnect at the process-local durable tip when the bounded
-            // window contains only legacy/non-workflow rows after normal
-            // session-log growth (cannot prove a workflow tip). Propagate any
-            // other I/O or corruption error as WIRE_V2_REPLAY_FAILED.
+            // Idle reconnect at the process-local durable tip: the 8 MiB
+            // suffix may contain only non-workflow rows, or a single
+            // oversized tip record with no complete JSONL line in-window.
+            // Reconnecting at that cursor must not resync-loop.
             Err(error)
                 if after_sequence > 0
                     && after_sequence == self.durable_tail_sequence()
-                    && error.to_string().contains("cannot prove the retained tail") =>
+                    && idle_tip_window_error(&error) =>
             {
                 Ok(Vec::new())
             }
             Err(error) => Err(error),
         }
     }
+}
+
+fn idle_tip_window_error(error: &io::Error) -> bool {
+    let message = error.to_string();
+    message.contains("cannot prove the retained tail")
+        || message.contains("contains no complete JSONL record")
 }
 
 fn durable_workflow_tail_sequence(store: &SessionJsonlStore) -> io::Result<u64> {
@@ -374,5 +556,183 @@ mod tests {
             parse_code_events_wire_version(&CodeEventsQuery::default(), &headers).unwrap(),
             CodeUiSseWireVersion::V1
         );
+    }
+
+    #[test]
+    fn transport_backlog_classifier_matches_bound_errors() {
+        let over_count = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Code workflow replay after sequence 0 has 1025 events, exceeding the bounded limit of 1024; create a projection checkpoint before resuming",
+        );
+        let unprovable = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bounded Code workflow replay after sequence 1 cannot prove the retained tail of 'x' contains no omitted workflow events; create a projection checkpoint before resuming",
+        );
+        let truncated_gap = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Code UI wire v2 transport backlog window omitted workflow events between sequences 0 and 2; fetch a snapshot and reconnect at the durable tip",
+        );
+        let integrity_gap = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Code UI wire v2 cannot resume across missing workflow events between sequences 1 and 3",
+        );
+        let other = io::Error::new(io::ErrorKind::NotFound, "missing workflow log");
+        assert!(transport_backlog_exceeded(&over_count));
+        assert!(transport_backlog_exceeded(&unprovable));
+        assert!(transport_backlog_exceeded(&truncated_gap));
+        assert!(!transport_backlog_exceeded(&integrity_gap));
+        assert!(!transport_backlog_exceeded(&other));
+    }
+
+    #[test]
+    fn transport_byte_window_gap_is_resync_not_opaque_failure() {
+        use tempfile::tempdir;
+
+        use crate::internal::ai::session::{CodeWorkflowEventKind, SessionJsonlStore};
+
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach");
+        // Two ~5 MiB payloads: the 8 MiB transport window cannot cover both,
+        // so bootstrap from 0 must classify as transport backlog (resync).
+        let big = "x".repeat(5 * 1024 * 1024);
+        for summary in ["byte-a", "byte-b"] {
+            store
+                .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                    projection: "status".to_string(),
+                    summary: summary.to_string(),
+                    payload: serde_json::json!({ "blob": big }),
+                })
+                .expect("append oversized");
+        }
+        let err = hub
+            .replay_after(0)
+            .expect_err("two 5MiB rows must exceed the 8MiB transport window");
+        assert!(
+            transport_backlog_exceeded(&err),
+            "byte-window truncation/gap must be resync-classed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn oversized_publish_sends_tip_not_full_event() {
+        use tempfile::tempdir;
+
+        use crate::internal::ai::session::{CodeWorkflowEventKind, SessionJsonlStore};
+
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach");
+        let mut rx = hub.subscribe();
+        let big = "z".repeat(5 * 1024 * 1024);
+        for summary in ["huge-a", "huge-b"] {
+            store
+                .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                    projection: "status".to_string(),
+                    summary: summary.to_string(),
+                    payload: serde_json::json!({ "blob": big }),
+                })
+                .expect("append oversized");
+        }
+        // First ~5 MiB row fits the 8 MiB ring budget as a full event.
+        match rx.try_recv().expect("first notify") {
+            CodeUiWorkflowLiveNotify::Event(event) => assert_eq!(event.sequence, 1),
+            CodeUiWorkflowLiveNotify::Tip { sequence } => {
+                panic!("first in-budget row should be a full event, got tip {sequence}")
+            }
+        }
+        // Second ~5 MiB row would push the retained ring past 8 MiB → tip-only.
+        match rx.try_recv().expect("second notify") {
+            CodeUiWorkflowLiveNotify::Tip { sequence } => assert_eq!(sequence, 2),
+            CodeUiWorkflowLiveNotify::Event(_) => {
+                panic!("over-budget publish must not retain another full payload in the ring")
+            }
+        }
+        store
+            .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: "huge-c".to_string(),
+                payload: serde_json::json!({ "blob": big }),
+            })
+            .expect("append third oversized");
+        match rx.try_recv().expect("third notify") {
+            CodeUiWorkflowLiveNotify::Tip { sequence } => assert_eq!(sequence, 3),
+            CodeUiWorkflowLiveNotify::Event(_) => {
+                panic!(
+                    "while the 5 MiB slot remains in the ring, later 5 MiB publishes must be tips"
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn count_rollover_restores_full_event_fast_path() {
+        use tempfile::tempdir;
+
+        use crate::internal::ai::session::{CodeWorkflowEventKind, SessionJsonlStore};
+
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach");
+        let mut rx = hub.subscribe();
+        let n = CODE_UI_TRANSPORT_BROADCAST_CAPACITY + 1;
+        let kinds: Vec<_> = (0..n)
+            .map(|i| CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: format!("roll-{i}"),
+                payload: serde_json::json!({}),
+            })
+            .collect();
+        store
+            .append_code_workflow_batch(&kinds)
+            .expect("fill then roll the ring");
+        let mut last = None;
+        loop {
+            match rx.try_recv() {
+                Ok(notify) => last = Some(notify),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        match last.expect("at least one notify after draining lag") {
+            CodeUiWorkflowLiveNotify::Event(event) => {
+                assert_eq!(
+                    event.sequence, n as u64,
+                    "rolled slot should be a full event"
+                )
+            }
+            CodeUiWorkflowLiveNotify::Tip { sequence } => {
+                panic!("small in-budget rollover must restore Event fan-out, got tip {sequence}")
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_tip_record_idle_resume_does_not_resync_loop() {
+        use tempfile::tempdir;
+
+        use crate::internal::ai::session::{CodeWorkflowEventKind, SessionJsonlStore};
+
+        let dir = tempdir().expect("tempdir");
+        let mut store = SessionJsonlStore::new(dir.path().to_path_buf());
+        let hub = CodeUiWorkflowHub::attach(&mut store).expect("attach");
+        let huge = "w".repeat(9 * 1024 * 1024);
+        store
+            .append_code_workflow(CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "status".to_string(),
+                summary: "single-oversize".to_string(),
+                payload: serde_json::json!({ "blob": huge }),
+            })
+            .expect("append >8MiB tip");
+        let tail = hub.durable_tail_sequence();
+        assert_eq!(tail, 1);
+        let boot = hub
+            .replay_after(0)
+            .expect_err("bootstrap cannot cover a >8MiB tip record");
+        assert!(transport_backlog_exceeded(&boot));
+        let idle = hub
+            .replay_after(tail)
+            .expect("reconnect at oversized durable tip must be empty, not a resync loop");
+        assert!(idle.is_empty());
     }
 }

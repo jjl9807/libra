@@ -172,7 +172,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 
 **SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
 
-**SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在有界 fold 窗口内无重复、无丢事件。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的 `--web-only` headless（非 Codex `HeadlessCodeRuntime`）；默认 TUI + 后台 web 以及 managed `--web-only --provider codex` 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
+**SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`；projection 热窗口命名归 W3-14）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的 `--web-only` headless（非 Codex `HeadlessCodeRuntime`）；默认 TUI + 后台 web 以及 managed `--web-only --provider codex` 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
 
 ### SSE v1 兼容窗口（DEFER-08）
 
@@ -201,7 +201,8 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `1`/`v1` 与 `2`/`v2`）。 |
 | `WIRE_V2_REQUIRES_DURABLE_SESSION` | 503 | SSE wire v2 需要 SessionStore-backed workflow hub（当前挂在 `--web-only` headless persistence；TUI 后台 web 与 managed Codex web-only 尚未暴露）。 |
 | `WIRE_V2_CURSOR_AHEAD` | 409 | `?cursor=` 超过 durable workflow 尾部；丢弃 cursor 并 resync（超前 cursor 会导致后续 live 事件永久跳过）。 |
-| `WIRE_V2_REPLAY_FAILED` | 500 | Wire v2 无法从指定 cursor 回放 durable workflow 事件（缺口、窗口上限或 I/O）。 |
+| `WIRE_V2_RESYNC_REQUIRED` | SSE `resync` 后断流 | Transport backlog 超限（1,024 条 / 8 MiB）；拉取 snapshot 并以 `cursor=<durableTail>` 重连。 |
+| `WIRE_V2_REPLAY_FAILED` | 500 | Wire v2 无法从指定 cursor 回放 durable workflow 事件（缺口或 I/O；容量出口用 `WIRE_V2_RESYNC_REQUIRED`）。 |
 | `CONTROL_DISABLED` | 403 | 当前进程未启用 automation control。 |
 | `MISSING_CONTROL_TOKEN` / `INVALID_CONTROL_TOKEN` | 403 | Automation control token 缺失或无效。 |
 | `MISSING_CONTROLLER_TOKEN` / `INVALID_CONTROLLER_TOKEN` | 403 | Lease token 对写路由缺失或无效。 |
