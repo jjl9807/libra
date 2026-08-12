@@ -139,7 +139,7 @@ base64 = "0.22.1"
 
 # OTLP telemetry (lore.md 1.7) — optional, compiled only with `--features otlp`;
 # http-proto + blocking reqwest + rustls (no tonic: init/flush run on the
-# runtime-free main thread; see docs/development/telemetry-otlp.md)
+# runtime-free main thread)
 opentelemetry = { version = "0.32.0", optional = true }
 opentelemetry_sdk = { version = "0.32.1", optional = true }
 opentelemetry-otlp = { version = "0.32.0", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }

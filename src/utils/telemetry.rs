@@ -23,7 +23,7 @@
 //! the SDK's bounded timeout; failures warn and never affect the command's
 //! exit code. KNOWN LIMIT: plumbing commands that terminate via
 //! `std::process::exit` inside dispatch skip the flush — their spans are
-//! lost (documented in docs/development/telemetry-otlp.md).
+//! lost (documented under lore.md §1.7).
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::trace::SdkTracerProvider;
