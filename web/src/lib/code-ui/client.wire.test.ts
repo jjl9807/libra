@@ -121,6 +121,7 @@ async function startWireServer(): Promise<{
     methods: string[];
     controllerTokens: Array<string | undefined>;
     attachBodies: unknown[];
+    attachBootstraps: Array<string | undefined>;
   };
   pushSse: (event: CodeUiEventEnvelope) => void;
 }> {
@@ -132,6 +133,7 @@ async function startWireServer(): Promise<{
     methods: [] as string[],
     controllerTokens: [] as Array<string | undefined>,
     attachBodies: [] as unknown[],
+    attachBootstraps: [] as Array<string | undefined>,
   };
   const sseClients = new Set<SseClient>();
 
@@ -153,6 +155,11 @@ async function startWireServer(): Promise<{
     if (req.method === "POST" && url.pathname === "/api/code/controller/attach") {
       const body = JSON.parse(await readBody(req)) as unknown;
       seen.attachBodies.push(body);
+      seen.attachBootstraps.push(
+        typeof req.headers["x-libra-browser-bootstrap"] === "string"
+          ? req.headers["x-libra-browser-bootstrap"]
+          : undefined,
+      );
       json(res, 200, {
         controllerToken: "wire-controller-token",
         leaseExpiresAt: "2026-07-15T00:02:00.000Z",
@@ -212,6 +219,7 @@ async function startWireServer(): Promise<{
 describe("FetchCodeUiTransport loopback wire smoke", () => {
   let server: Server | undefined;
   const previousEventSource = globalThis.EventSource;
+  const previousWindow = (globalThis as { window?: Window }).window;
 
   beforeEach(() => {
     (globalThis as { EventSource: typeof EventSource }).EventSource =
@@ -220,6 +228,11 @@ describe("FetchCodeUiTransport loopback wire smoke", () => {
 
   afterEach(async () => {
     (globalThis as { EventSource: typeof EventSource }).EventSource = previousEventSource;
+    if (previousWindow === undefined) {
+      Reflect.deleteProperty(globalThis, "window");
+    } else {
+      (globalThis as { window: Window }).window = previousWindow;
+    }
     await new Promise<void>((resolve, reject) => {
       if (!server) {
         resolve();
@@ -233,6 +246,9 @@ describe("FetchCodeUiTransport loopback wire smoke", () => {
   it("loads snapshot, attaches with browser kind, sends controller token, and observes named SSE", async () => {
     const wire = await startWireServer();
     server = wire.server;
+    (globalThis as { window: { location: { search: string } } }).window = {
+      location: { search: "?bt=wire-bootstrap-token" },
+    };
     const client = createCodeUiClient(new FetchCodeUiTransport(wire.baseUrl));
 
     const snapshot = await client.snapshot();
@@ -241,6 +257,7 @@ describe("FetchCodeUiTransport loopback wire smoke", () => {
     const attach = await client.attach("browser-1");
     expect(attach.controllerToken).toBe("wire-controller-token");
     expect(wire.seen.attachBodies[0]).toEqual({ clientId: "browser-1", kind: "browser" });
+    expect(wire.seen.attachBootstraps[0]).toBe("wire-bootstrap-token");
 
     await client.cancel(attach.controllerToken);
     expect(wire.seen.controllerTokens.at(-1)).toBe("wire-controller-token");

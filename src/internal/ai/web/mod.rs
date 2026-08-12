@@ -14,6 +14,7 @@ pub mod write_guards;
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 pub use agent_runtime_adapter::AgentRuntimeCodeUiAdapter;
+use anyhow::Context;
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -77,6 +78,9 @@ struct WebAppState {
     working_dir: Arc<PathBuf>,
     code_ui: Option<Arc<CodeUiRuntimeHandle>>,
     automation_control_token: Option<Arc<str>>,
+    /// Session-bound browser attach secret (W4-01). When `Some`, `kind:
+    /// "browser"` attach requires matching `X-Libra-Browser-Bootstrap`.
+    browser_bootstrap_token: Option<Arc<str>>,
     audit_sink: Arc<dyn AuditSink>,
     control_trace_id: Uuid,
     /// Bound listen address used to mint trusted loopback Origins (W3-05).
@@ -96,6 +100,10 @@ struct WebAppState {
 pub struct WebServerOptions {
     pub code_ui: Option<Arc<CodeUiRuntimeHandle>>,
     pub automation_control_token: Option<Arc<str>>,
+    /// Optional session-bound browser bootstrap secret. Production Web
+    /// launches with `--browser-control loopback` mint one so forgeable
+    /// Origin alone cannot attach.
+    pub browser_bootstrap_token: Option<Arc<str>>,
     pub audit_sink: Option<Arc<dyn AuditSink>>,
     /// Optional projection redactor. When `None`, the server uses
     /// [`SecretRedactor::default_runtime`].
@@ -213,7 +221,7 @@ pub async fn start(
     working_dir: PathBuf,
     options: WebServerOptions,
 ) -> anyhow::Result<WebServerHandle> {
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let addr = parse_listen_addr(host, port)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound_addr = listener.local_addr()?;
 
@@ -227,6 +235,7 @@ pub async fn start(
         working_dir: Arc::new(working_dir),
         code_ui: options.code_ui,
         automation_control_token: options.automation_control_token,
+        browser_bootstrap_token: options.browser_bootstrap_token,
         audit_sink: options
             .audit_sink
             .unwrap_or_else(|| Arc::new(TracingAuditSink)),
@@ -272,6 +281,39 @@ pub fn describe_web_bind_error(host: &str, port: u16, err: &anyhow::Error) -> St
     } else {
         format!("failed to start web server on {host}:{port}: {err}")
     }
+}
+
+/// Parse a CLI `--host`/`--port` pair into a concrete [`SocketAddr`].
+///
+/// Accepts dotted IPv4, bracketed or bare IPv6 (`::1`), and hostnames such as
+/// `localhost` (resolved via `ToSocketAddrs`). Plain `format!("{host}:{port}")`
+/// parsing rejects `localhost` and bare `::1`.
+pub fn parse_listen_addr(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let host = host.trim();
+    if host.is_empty() {
+        anyhow::bail!("bind host must not be empty");
+    }
+
+    if let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    // Bare IPv6 without brackets (e.g. `--host ::1`).
+    if host.contains(':')
+        && !host.starts_with('[')
+        && let Ok(addr) = format!("[{host}]:{port}").parse::<SocketAddr>()
+    {
+        return Ok(addr);
+    }
+
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve bind host '{host}'"))?;
+    addrs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("bind host '{host}' resolved to no addresses"))
 }
 
 fn web_bind_error_is_addr_in_use(err: &anyhow::Error) -> bool {
@@ -344,6 +386,7 @@ pub async fn assert_sse_slow_consumer_contract() -> anyhow::Result<()> {
             working_dir: Arc::new(PathBuf::from("/tmp/libra-w308-slow")),
             code_ui: Some(runtime),
             automation_control_token: None,
+            browser_bootstrap_token: None,
             audit_sink: Arc::new(TracingAuditSink),
             control_trace_id: Uuid::new_v4(),
             bound_addr: SocketAddr::from(([127, 0, 0, 1], 4321)),
@@ -472,6 +515,7 @@ pub async fn assert_host_posture_non_loopback_contract() -> anyhow::Result<()> {
         working_dir: Arc::new(PathBuf::from("/tmp/libra-host-posture")),
         code_ui: None,
         automation_control_token: Some(Arc::from("must-not-leak")),
+        browser_bootstrap_token: None,
         audit_sink: Arc::new(TracingAuditSink),
         control_trace_id: Uuid::new_v4(),
         bound_addr: SocketAddr::from(([0, 0, 0, 0], 3020)),
@@ -1672,6 +1716,7 @@ async fn code_controller_attach_handler(
     let result = async {
         if kind == CodeUiControllerKind::Browser {
             ensure_browser_origin_for_write(&state, &headers)?;
+            ensure_browser_bootstrap_token(&headers, state.browser_bootstrap_token.as_ref())?;
         }
         if kind == CodeUiControllerKind::Automation {
             ensure_automation_control_token(&headers, state.automation_control_token.as_ref())?;
@@ -2219,6 +2264,38 @@ fn ensure_automation_control_token(
     Ok(())
 }
 
+/// Require the session-bound browser bootstrap secret when the server minted
+/// one. `None` keeps the historical Origin-only gate (in-process tests).
+fn ensure_browser_bootstrap_token(
+    headers: &HeaderMap,
+    expected: Option<&Arc<str>>,
+) -> Result<(), WebApiError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+
+    let Some(actual) = headers
+        .get("x-libra-browser-bootstrap")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(WebApiError::forbidden(
+            "MISSING_BROWSER_BOOTSTRAP",
+            "X-Libra-Browser-Bootstrap is required for browser controller attach",
+        ));
+    };
+
+    if actual != expected.as_ref() {
+        return Err(WebApiError::forbidden(
+            "INVALID_BROWSER_BOOTSTRAP",
+            "X-Libra-Browser-Bootstrap does not match this Libra Code session",
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlAuditOutcome<'a> {
     Accepted,
@@ -2513,6 +2590,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra-w312")),
                 code_ui: Some(runtime),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2576,6 +2654,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_listen_addr_accepts_loopback_aliases() {
+        let v4 = parse_listen_addr("127.0.0.1", 4317).expect("ipv4");
+        assert_eq!(v4, SocketAddr::from(([127, 0, 0, 1], 4317)));
+
+        let localhost = parse_listen_addr("localhost", 0).expect("localhost");
+        assert!(localhost.ip().is_loopback());
+        assert_eq!(localhost.port(), 0);
+
+        let bare_v6 = parse_listen_addr("::1", 4318).expect("bare ipv6");
+        assert_eq!(bare_v6, SocketAddr::from((Ipv6Addr::LOCALHOST, 4318)));
+
+        let bracket_v6 = parse_listen_addr("[::1]", 4319).expect("bracket ipv6");
+        assert_eq!(bracket_v6, SocketAddr::from((Ipv6Addr::LOCALHOST, 4319)));
+    }
+
+    #[test]
     fn loopback_api_request_rejects_remote_clients() {
         let remote = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 10), 34567));
         let error =
@@ -2627,6 +2721,47 @@ mod tests {
         assert!(ensure_automation_control_token(&headers, Some(&expected)).is_ok());
     }
 
+    #[test]
+    fn browser_bootstrap_auth_skips_when_unset() {
+        let headers = HeaderMap::new();
+        assert!(ensure_browser_bootstrap_token(&headers, None).is_ok());
+    }
+
+    #[test]
+    fn browser_bootstrap_auth_requires_header_when_minted() {
+        let headers = HeaderMap::new();
+        let expected: Arc<str> = Arc::from("bootstrap-secret");
+
+        let error = ensure_browser_bootstrap_token(&headers, Some(&expected)).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "MISSING_BROWSER_BOOTSTRAP");
+    }
+
+    #[test]
+    fn browser_bootstrap_auth_rejects_mismatched_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-libra-browser-bootstrap", "wrong".parse().unwrap());
+        let expected: Arc<str> = Arc::from("bootstrap-secret");
+
+        let error = ensure_browser_bootstrap_token(&headers, Some(&expected)).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "INVALID_BROWSER_BOOTSTRAP");
+    }
+
+    #[test]
+    fn browser_bootstrap_auth_accepts_matching_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-libra-browser-bootstrap",
+            "bootstrap-secret".parse().unwrap(),
+        );
+        let expected: Arc<str> = Arc::from("bootstrap-secret");
+
+        assert!(ensure_browser_bootstrap_token(&headers, Some(&expected)).is_ok());
+    }
+
     /// Wave 2 / PR 2 — route-level loopback gate ordering for read
     /// routes. `docs/development/commands/_general.md` §5.3 / §6.3 inline test:
     /// `GET /api/code/session` from a non-loopback `ConnectInfo`
@@ -2643,6 +2778,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: None,
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2690,6 +2826,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: None,
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2744,6 +2881,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: None,
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2772,6 +2910,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_attach_requires_bootstrap_when_minted() {
+        use axum::extract::connect_info::MockConnectInfo;
+
+        let session = CodeUiSession::new(initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: None,
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        ));
+        let runtime = CodeUiRuntimeHandle::build(
+            ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
+            true,
+            CodeUiInitialController::Unclaimed,
+        )
+        .await;
+        let bootstrap: Arc<str> = Arc::from("session-bootstrap-secret");
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: Some(runtime),
+                automation_control_token: None,
+                browser_bootstrap_token: Some(bootstrap.clone()),
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+
+        let missing = Request::builder()
+            .method(Method::POST)
+            .uri("/controller/attach")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
+            .body(Body::from(
+                r#"{"clientId":"browser-missing","kind":"browser"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(missing).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "MISSING_BROWSER_BOOTSTRAP");
+
+        let wrong = Request::builder()
+            .method(Method::POST)
+            .uri("/controller/attach")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
+            .header("X-Libra-Browser-Bootstrap", "wrong-secret")
+            .body(Body::from(
+                r#"{"clientId":"browser-wrong","kind":"browser"}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(wrong).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"]["code"], "INVALID_BROWSER_BOOTSTRAP");
+
+        let ok = Request::builder()
+            .method(Method::POST)
+            .uri("/controller/attach")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, "http://127.0.0.1:4317")
+            .header("X-Libra-Browser-Bootstrap", bootstrap.as_ref())
+            .body(Body::from(r#"{"clientId":"browser-ok","kind":"browser"}"#))
+            .unwrap();
+        let response = app.oneshot(ok).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "matching bootstrap must allow browser attach"
+        );
+    }
+
+    #[tokio::test]
     async fn code_controller_detach_route_rejects_non_loopback_before_body_parse() {
         use axum::extract::connect_info::MockConnectInfo;
         let app = code_router()
@@ -2779,6 +3000,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: None,
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2809,6 +3031,7 @@ mod tests {
             working_dir: Arc::new(PathBuf::from("/tmp/libra")),
             code_ui: None,
             automation_control_token: None,
+            browser_bootstrap_token: None,
             audit_sink: Arc::new(TracingAuditSink),
             control_trace_id: Uuid::new_v4(),
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2919,6 +3142,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: Some(runtime.clone()),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -2998,6 +3222,7 @@ mod tests {
             working_dir: Arc::new(PathBuf::from("/tmp/libra")),
             code_ui: Some(runtime),
             automation_control_token: Some(Arc::from("control-token-secret")),
+            browser_bootstrap_token: None,
             audit_sink: audit_sink.clone(),
             control_trace_id: Uuid::new_v4(),
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -3301,6 +3526,7 @@ mod tests {
             working_dir: Arc::new(PathBuf::from("/tmp/libra")),
             code_ui: None,
             automation_control_token: None,
+            browser_bootstrap_token: None,
             audit_sink: Arc::new(TracingAuditSink),
             control_trace_id: Uuid::new_v4(),
             bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -3384,6 +3610,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from(&working_dir)),
                 code_ui: Some(runtime),
                 automation_control_token: Some(Arc::from("control-token-secret")),
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -3438,6 +3665,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: None,
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -3489,6 +3717,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: Some(runtime),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: audit_sink.clone(),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -3643,6 +3872,7 @@ mod tests {
                     working_dir: Arc::new(tmp.path().to_path_buf()),
                     code_ui: Some(runtime),
                     automation_control_token: None,
+                    browser_bootstrap_token: None,
                     audit_sink: Arc::new(TracingAuditSink),
                     control_trace_id: Uuid::new_v4(),
                     bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
@@ -3725,6 +3955,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: Some(runtime.clone()),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: SocketAddr::from(([127, 0, 0, 1], 4318)),
@@ -3765,6 +3996,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra")),
                 code_ui: Some(runtime.clone()),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: SocketAddr::from(([127, 0, 0, 1], 4318)),
@@ -3966,6 +4198,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra-w306-lifecycle")),
                 code_ui: Some(runtime),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: SocketAddr::from(([127, 0, 0, 1], 4319)),
@@ -4031,6 +4264,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra-w306-live")),
                 code_ui: Some(runtime),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: SocketAddr::from(([127, 0, 0, 1], 4320)),
@@ -4128,6 +4362,7 @@ mod tests {
                 working_dir: Arc::new(PathBuf::from("/tmp/libra-w308-boot")),
                 code_ui: Some(runtime),
                 automation_control_token: None,
+                browser_bootstrap_token: None,
                 audit_sink: Arc::new(TracingAuditSink),
                 control_trace_id: Uuid::new_v4(),
                 bound_addr: SocketAddr::from(([127, 0, 0, 1], 4322)),

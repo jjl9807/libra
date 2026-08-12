@@ -263,3 +263,193 @@ async fn default_port_conflict_fails_fast() {
     // Holding `holder` until here proves we did not silently bind another port.
     drop(holder);
 }
+
+/// W4-01: default `libra code` (no `--web-only`) prints a Web URL, stays
+/// resident without a TTY, and exits cleanly on SIGTERM (ports released).
+#[cfg(unix)]
+#[tokio::test]
+async fn default_web_no_tty_and_sigterm_clean_shutdown() {
+    use std::{
+        io::{BufRead, BufReader, Read},
+        net::TcpListener,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let repo_path = temp_dir.path();
+    let home_dir = repo_path.join(".home");
+    let config_home = home_dir.join(".config");
+    std::fs::create_dir_all(&config_home).expect("isolated HOME");
+
+    // Use the binary cargo already built for this test target — never nest
+    // `cargo build` under `cargo test` (target-dir lock deadlock).
+    let libra_bin = env!("CARGO_BIN_EXE_libra");
+
+    let status = Command::new(libra_bin)
+        .args(["init"])
+        .current_dir(repo_path)
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .status()
+        .expect("libra init");
+    assert!(status.success(), "libra init failed");
+
+    // Let the child bind ephemeral ports (`--port 0` / `--mcp-port 0`) and
+    // discover the URL from stdout. Pre-bind+drop races with parallel tests.
+    let child = Command::new(libra_bin)
+        .args(["code", "--port", "0", "--mcp-port", "0"])
+        .current_dir(repo_path)
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .env("GEMINI_API_KEY", "test-gemini-api-key")
+        .env("LIBRA_TEST", "1") // skip best-effort browser open
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start default libra code");
+
+    struct KillChildOnDrop(Option<std::process::Child>);
+    impl Drop for KillChildOnDrop {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut child_guard = KillChildOnDrop(Some(child));
+
+    let stdout = child_guard
+        .0
+        .as_mut()
+        .expect("child")
+        .stdout
+        .take()
+        .expect("stdout pipe");
+    // Drain stdout on a dedicated thread for the child's whole lifetime.
+    // Stopping early and dropping the pipe can SIGPIPE the child on the next
+    // println! (bootstrap token / MCP URL), which then fails the health probe.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut captured = String::new();
+        let mut line = String::new();
+        let mut notified = false;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    captured.push_str(&line);
+                    if !notified
+                        && let Some(rest) =
+                            line.trim().strip_prefix("Libra Code server running at ")
+                    {
+                        notified = true;
+                        let _ = tx.send(rest.trim_end_matches('/').to_string());
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = done_tx.send(captured);
+    });
+    let printed_url = match rx.recv_timeout(Duration::from_secs(45)) {
+        Ok(url) => url,
+        Err(_) => {
+            let mut failed = child_guard.0.take().expect("child");
+            let _ = failed.kill();
+            let _ = failed.wait();
+            let mut err = String::new();
+            if let Some(mut stderr) = failed.stderr.take() {
+                let _ = stderr.read_to_string(&mut err);
+            }
+            let captured = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_default();
+            panic!("timed out waiting for default Web bind URL; stdout={captured}; stderr={err}");
+        }
+    };
+    let web_base = printed_url;
+    assert!(
+        web_base.starts_with("http://127.0.0.1:") || web_base.starts_with("http://[::1]:"),
+        "default Web must bind loopback; got {web_base}"
+    );
+    assert!(
+        web_base.contains("?bt="),
+        "default Web open URL must embed browser bootstrap token; got {web_base}"
+    );
+    let web_origin = web_base
+        .split_once('?')
+        .map(|(origin, _)| origin)
+        .unwrap_or(web_base.as_str());
+    let web_port: u16 = web_origin
+        .rsplit(':')
+        .next()
+        .expect("port")
+        .parse()
+        .unwrap_or_else(|_| panic!("parse port from {web_base}"));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let health_url = format!("{web_origin}/api/health");
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if Instant::now() > deadline {
+            let mut failed = child_guard.0.take().expect("child");
+            let _ = failed.kill();
+            let _ = failed.wait();
+            let mut err = String::new();
+            if let Some(mut stderr) = failed.stderr.take() {
+                let _ = stderr.read_to_string(&mut err);
+            }
+            panic!("default Web UI did not become healthy at {health_url}; stderr={err}");
+        }
+        if let Ok(resp) = client.get(&health_url).send().await
+            && resp.status().is_success()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let pid = child_guard.0.as_ref().expect("child").id();
+    let kill_status = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success());
+
+    let mut child = child_guard.0.take().expect("child");
+    let exit = child
+        .wait()
+        .expect("wait for default Web process after SIGTERM");
+    assert!(
+        exit.success(),
+        "SIGTERM must shut down cleanly (exit 0); status={exit:?}"
+    );
+    let captured_stdout = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| String::new());
+
+    assert!(
+        captured_stdout.contains("Libra Code server running")
+            || captured_stdout.contains(&web_base),
+        "default Web launch must print the Code UI URL on stdout; got:\n{captured_stdout}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rebind_web = TcpListener::bind(format!("127.0.0.1:{web_port}"));
+    assert!(
+        rebind_web.is_ok(),
+        "web port must be released after SIGTERM"
+    );
+}

@@ -15,13 +15,13 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## 说明
 
-`libra code` 启动一个交互式编码会话，让人类开发者与 AI agent 协作。默认模式会启动基于 ratatui/crossterm 的终端 UI（TUI），并带有后台 Web 服务器。Generic provider TUI 中的普通开发请求会先路由到内置 planning workflow：Libra 生成可审阅的 IntentSpec 和执行计划，然后在运行 mutating tools 之前等待 Execute Plan / Network / Modify Plan / Cancel。另有两种替代模式：`--web-only` 只运行 Web 服务器而不启动 TUI（适合浏览器访问或远程托管），`--stdio` 通过标准输入/输出运行 MCP server，用于与 Claude Desktop 等 AI clients 集成。
+`libra code` 启动一个交互式编码会话，让人类开发者与 AI agent 协作。默认模式启动 Web Code UI（嵌入式 HTTP + AgentRuntime），打印 URL / control 信息并前台常驻，直到 `Ctrl-C` / SIGTERM。`--web` / `--web-only` 在 W4 烘焙窗口内仍是该默认路径的弃用 no-op 别名（W5-07 删除）。隐藏的 `LIBRA_CODE_LEGACY_TUI=1` 仅用于紧急回滚到旧终端 TUI（非公开兼容面）。`--stdio` 通过标准输入/输出运行 MCP server，用于与 Claude Desktop 等 AI clients 集成。
 
 该命令支持八种 AI provider 后端（Gemini、OpenAI、Anthropic、DeepSeek、Kimi、Zhipu、Ollama、Codex），以及三种运行上下文（dev、review、research），用于针对不同工作流调节 agent 行为。会话可以通过 Libra 规范的 `--resume <thread_id>` 流程持久化和恢复。传入 `--goal "<objective>"` 会直接以 goal 模式启动会话，由 supervisor 驱动 tool loop 朝既定 objective 前进，直到 verifier 接受完成。
 
-沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。TUI dev 会话默认使用 workspace-write 执行且禁止网络访问。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel；选择 Execute 后会再打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`），只有该 gate 解决后才会应用网络策略，且两个 gate 都可在崩溃后恢复。Review 和 research 上下文保持只读，且不授予网络访问。
+沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。遗留 TUI（`LIBRA_CODE_LEGACY_TUI=1`）与 headless Web 在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel；选择 Execute 后会再打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`），只有该 gate 解决后才会应用网络策略，且两个 gate 都可在崩溃后恢复。Review 和 research 上下文保持只读，且不授予网络访问。
 
-当 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令，以便在独立 TUI 中检查该线程的 Intent/Plan/Task/Run/PatchSet 版本图。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
+当遗留 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令，以便在独立 TUI 中检查该线程的 Intent/Plan/Task/Run/PatchSet 版本图。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
 
 **Linked worktree**：在统一的 Code/Agent 配置 resolver 落地前，`libra code`（所有模式）在 linked worktree 中一律拒绝启动——会话配置（agents、hooks、sandbox、审批）在该场景尚未按 worktree 解析，linked 会话可能在仓库 sandbox 策略下运行却缺失其安全 hooks。请改在 main worktree 运行；拒绝信息会给出该提示。同理，linked worktree 中 automation 的 VCS dispatch 被禁用（带 warning），`libra automation` 亦 fail-closed——见 [automation.md](automation.md)。
 
@@ -29,7 +29,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 | 标志 | 短参数 | 长参数 | 默认值 | 说明 |
 |------|--------|--------|--------|------|
-| Web only | | `--web-only` / `--web` | off | 只运行 Web 服务器，不运行 TUI。与 `--stdio` 冲突。 |
+| Web only | | `--web-only` / `--web` | off | 默认 Web Code UI 的弃用别名（W4 烘焙窗口；W5-07 删除）。与 `--stdio` 冲突。 |
 | Port | `-p` | `--port` | `3000` | Web 服务器监听端口。 |
 | Host | | `--host` | `127.0.0.1` | Web 服务器 bind 地址。 |
 | Working directory | | `--cwd` | 当前目录 | 会话工作目录。 |
@@ -52,14 +52,14 @@ libra graph <THREAD_ID> [--repo <PATH>]
 | Resume | | `--resume <THREAD_ID>` | 无 | 按 thread ID 恢复规范 Libra 线程。 |
 | Approval policy | | `--approval-policy` | `on-request` | 工具审批策略（见下方 Approval Policies）。 |
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | 已授予的审批在再次提示前对匹配命令保持可复用的秒数。覆盖 `.libra/config.toml` 中的项目配置 `[approval] ttl_seconds`；与会提示的策略相关。 |
-| Network access | | `--network-access <allow\|deny>` | `deny` | shell 和 gate 执行的默认 TUI 网络策略；仍可在 Plan review 时切换。 |
+| Network access | | `--network-access <allow\|deny>` | `deny` | legacy TUI（`LIBRA_CODE_LEGACY_TUI=1`）下 shell/gate 默认网络策略。默认 Web 与 MCP `--stdio` 拒绝 `--network-access allow`，直到 Plan network-policy gate 接管每次执行的 sandbox 网络（请在 Plan review 中批准网络）。 |
 | MCP port | | `--mcp-port` | `6789` | MCP server 监听端口。 |
 | Stdio | | `--stdio` / `--mcp-stdio` | off | 通过 stdio 运行 MCP。与 `--web-only` 冲突。 |
 | API base | | `--api-base` | provider 默认值 | Provider API base URL 覆盖。 |
 | Codex binary | | `--codex-bin` | `codex` | Codex 可执行文件路径。 |
 | Codex port | | `--codex-port` | 随机 | 覆盖 Codex app-server 端口。 |
 | Plan mode | | `--plan-mode [<true\|false>]` | off（Codex 为 on） | 要求 agent 在执行前生成经批准的计划。有效默认值对 `--provider codex` 为 on，对其他所有 provider 为 off；显式 `--plan-mode=true`（或裸 `--plan-mode`）只在 `--provider=codex` 下被接受——对其他 provider 会被拒绝；传 `--plan-mode=false` 让 Codex 会话关闭计划模式（opt out of plan mode，非退出会话）。 |
-| Browser control | | `--browser-control <off\|loopback>` | provider-aware（见 Web Browser Control） | `/api/code/controller/attach` 浏览器租约姿态。与 `--stdio` 冲突；`loopback` 要求 loopback `--host`。 |
+| Browser control | | `--browser-control <off\|loopback>` | Web 为 `loopback`；遗留 TUI 为 `off` | `/api/code/controller/attach` 浏览器租约姿态。与 `--stdio` 冲突；`loopback` 要求 loopback `--host`。 |
 | Goal | | `--goal <OBJECTIVE>` | 无 | 以 goal 模式启动会话并带上给定 objective，等价于会话打开时运行 `/goal start <objective>`；supervisor 驱动 tool loop 直到声明完成且 verifier 接受。objective 在解析时校验（trim 后非空，至多 16 KiB）。 |
 
 ### Provider Backends
@@ -101,11 +101,14 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 | 入口 | 默认 `--browser-control` |
 |------|--------------------------|
-| TUI 会话（`libra code` 且不带 `--web-only`） | `off` |
-| `libra code --web-only --provider codex` | `loopback` |
-| 使用任意其他 provider 的 `libra code --web-only` | `off` |
+| TUI 会话（`LIBRA_CODE_LEGACY_TUI=1`） | `off` |
+| 默认 Web / `--web` / `--web-only`（任意 provider） | `loopback` |
 
-当 `--host` 不是 loopback 地址时，选择 `loopback` 会被拒绝；该标志也与 `--stdio` 冲突。浏览器服务端 endpoints 在 `code_router()` audit matrix（`src/internal/ai/web/mod.rs`）中标记：
+当 `--host` 不是 loopback 地址时，选择 `loopback` 会被拒绝；该标志也与 `--stdio` 冲突。绑定非 loopback `--host` 做 observe-only / remote-notice 服务时须显式 `--browser-control off`。
+
+**本地信任模型：** 浏览器 attach 要求 loopback 绑定 + 可信同源 `Origin`/`Referer` + 速率限制（W3-05），**以及**每会话的 `X-Libra-Browser-Bootstrap` secret（打印在 stdout / 以 `?bt=` 嵌入打开 URL）。仅伪造 Origin 不足。含 `?bt=` 的 URL **不会**被自动打开（避免 bootstrap secret 出现在 opener 命令行）；请手动打开终端打印的 URL。共享机器请优先 `--browser-control off`（只读）或隔离主机。
+
+浏览器服务端 endpoints 在 `code_router()` audit matrix（`src/internal/ai/web/mod.rs`）中标记：
 
 - `GET /api/code/session`、`GET /api/code/events`、`GET /api/code/diagnostics`、`GET /api/code/threads`、`GET /api/code/usage`、`GET /api/code/skills`、`GET /api/code/goal/status` — 仅 loopback observe。
 - `POST /api/code/controller/attach` — loopback。`kind: "automation"` 请求还要求 `X-Libra-Control-Token`。handler **签发** lease 的 `controllerToken`（不期待调用方发送它）。
@@ -135,7 +138,7 @@ Workflow review 面板投影 pending 的 `intent_review_choice` 与 `post_plan_c
 
 请求 `--browser-control loopback` 且浏览器持有 active lease 时，TUI 初始 controller 是 `LocalTui`（可见 owner，可 reclaim），而不是 `Fixed { Tui }`（永久阻塞）。如果 TUI 也想驱动写入，必须同时提供 `--control write` 和 `--browser-control loopback`；两个 writer 通过同一个 `TuiControlCommand` channel 串行化。
 
-对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走与 TUI 等价的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop。完整 IntentSpec → Phase 1 → repair 对等仍属 GATE-WEB-PLAN。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>` 会在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。`--resume` 在 `--stdio` 模式及 `--provider codex` 下仍不可用；managed app-server 使用独立的 session protocol。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
+对于 `--web-only` 非 Codex providers（`--provider ollama` 是规范 headless 验证路径），Libra 构建 [`HeadlessCodeRuntime`](../../../src/internal/ai/web/headless.rs) 生命周期宿主，并将 [`AgentRuntimeCodeUiAdapter`](../../../src/internal/ai/web/agent_runtime_adapter.rs) 挂载为生产浏览器写路径 owner。浏览器 submit 进入串行的 `AgentRuntimeWorker`：普通（非 `/` 前缀）消息走与 TUI 等价的 Phase 0 plan 工具白名单，使 direct chat 无法绕过默认 mutating gate；以 `/` 开头的消息保留显式 direct tool loop。完整 IntentSpec → Phase 1 → repair 对等仍属 **GATE-WEB-PLAN**（W4-01 有意保留的残差，非静默回归——需要完整 TUI Phase 0/1/repair 时使用 `LIBRA_CODE_LEGACY_TUI=1`）。Headless 模式公布 `messageInput`、`streamingText`、`toolCalls`、`planUpdates`、`patchsets`、`interactiveApprovals`、`structuredQuestions` 和 `providerSessionResume`。`--web-only --resume <thread_id>`（以及默认 Web 的裸 `--resume`）会为非 Codex provider 在同一工作目录加载匹配会话，并在启动浏览器服务器前应用有界的 durable Code UI projection suffix。显式 `--web`/`--web-only --provider codex` 仍拒绝 `--resume`；裸 `libra code --provider codex --resume <thread_id>` 继续走 W4 之前的遗留 TUI resume 驱动，直到 managed Codex Web resume 落地。`update_plan` 投影到 `plans[]`，`apply_patch` metadata 投影到 `patchsets[]`。取消在工具的 mutation boundary 之前采用 cooperative 方式；一旦可能变异的工具已经开始，cancel 会返回可操作的错误，当前 turn 保留到得到可判定结果为止。Libra 不会 hard-abort 该副作用，也不会把它重标为普通 `cancelled` turn。
 
 对于 `--web-only --provider codex`，managed app-server 的 websocket 通知归一到共享 runtime `AgentEvent` 信封（与其他 provider 同一 projection 路径）。未知 Codex method 走显式可诊断的 `ProviderNotification` fallback，不 silent drop、也不 panic。Ask-mode approvals 挂在共享 `AgentRuntime` interaction 注册表上，并把浏览器 `respond_interaction` 决策转发到 app-server；Codex 仍拥有 app-server 内的 approval 回环（见 `docs/development/tracing/code.md` 的 DEFER-07）。对外 approval option id 与非 Codex 一致（`approve` / `deny` / `abort`）。
 
@@ -172,7 +175,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 
 **SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
 
-**SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的 `--web-only` headless（非 Codex `HeadlessCodeRuntime`）；默认 TUI + 后台 web 以及 managed `--web-only --provider codex` 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
+**SSE wire v2**：`code_workflow` 事件，camelCase 字段 `cursor`（W1-06 持久 workflow sequence）、`eventId`、`kind`、`at` 与最小 `payload`。用 `?wire=2&cursor=<lastCursor>` 断线重连，在 **transport** backlog 窗口内无重复、无丢事件（W3-08 / GC-CODE-12）：**1,024 条或 8 MiB**，先达者为准（`MAX_CODE_UI_TRANSPORT_BACKLOG_*`）。Code UI **projection** 热窗口是同数值、独立命名的预算（`MAX_CODE_UI_PROJECTION_EVENTS` / `MAX_CODE_UI_PROJECTION_REPLAY_BYTES`），两者不可相加。单事件 fold 只访问 suffix，不回放整段 session 历史（W3-14；10k events 下 release p95 ≤ 5 ms）。bootstrap 或慢消费者 catch-up 将超过该预算时，服务器发送 `event: resync`（`WIRE_V2_RESYNC_REQUIRED`，含 `reason` / `lastCursor` / `durableTail` / `action: fetch_snapshot`）并结束流，**不 silent drop**。客户端应拉取 session snapshot，再以 `durableTail` 重连。Wire v2 需要 SessionStore-backed workflow hub。当前该 hub 挂在带 session persistence 的默认 Web / `--web-only` headless（非 Codex `HeadlessCodeRuntime`）；遗留 TUI + 后台 web 以及 managed `--provider codex` Web 在暴露 hub 之前会返回 `503 WIRE_V2_REQUIRES_DURABLE_SESSION`。
 
 ### SSE v1 兼容窗口（DEFER-08）
 
@@ -199,6 +202,8 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `LOOPBACK_REQUIRED` | 403 | 非 loopback client 试图访问 API route。 |
 | `PAYLOAD_TOO_LARGE` | 413 | 写请求体超过 256 KiB。 |
 | `ORIGIN_REQUIRED` | 403 | 浏览器写/attach 缺少可信 loopback `Origin`（或同源 `Referer`），或提交了跨站 Origin。 |
+| `MISSING_BROWSER_BOOTSTRAP` | 403 | 已签发 bootstrap secret 的会话上，浏览器 attach 缺少 `X-Libra-Browser-Bootstrap`。 |
+| `INVALID_BROWSER_BOOTSTRAP` | 403 | `X-Libra-Browser-Bootstrap` 与本 Libra Code 会话不匹配。 |
 | `RATE_LIMITED` | 429 | 当前 session 写配额耗尽；等待速率窗口恢复后重试（见 `Retry-After`）。 |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE 投影无法应用 secret redactor（规则为空或序列化失败）。Fail-closed：响应不包含未脱敏 payload；重启 `libra code` 或修复 redactor 配置后重试。 |
 | `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` 的 `wire` / `libra-wire` 取值非法（仅接受 `1`/`v1` 与 `2`/`v2`）。 |
@@ -254,24 +259,25 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 ## 常用命令
 
 ```bash
-# 使用默认 Gemini provider 启动 TUI 会话
+# 使用默认 Gemini provider 启动 Web Code UI
 libra code
 
 # 使用 Anthropic Claude 启动
 libra code --provider anthropic --model claude-sonnet-4-20250514
 
 # 只启动 Web 并绑定所有接口；远程浏览器会看到 loopback-only notice
-libra code --web-only --port 8080 --host 0.0.0.0
+# （须显式 --browser-control off：默认 Web 为 loopback，会拒绝非 loopback host）
+libra code --web-only --port 8080 --host 0.0.0.0 --browser-control off
 
 # 远程人工应 SSH port-forward 到已绑定的端口，而不是直接开放写面
 # ssh -L 8080:127.0.0.1:8080 user@host
 # 然后在本地浏览 http://127.0.0.1:8080
 
-# 浏览器驱动的本地 Ollama 会话
+# 浏览器驱动的本地 Ollama 会话（默认启用 loopback 浏览器写租约）
 libra code --web-only --provider ollama --port 4400
 
-# 允许浏览器通过 loopback 写控制（Codex web-only 默认是 loopback）
-libra code --web-only --provider codex --browser-control loopback
+# managed Codex 默认 Web 路径（浏览器写租约默认为 loopback）
+libra code --web-only --provider codex
 
 # 启用本地自动化写控制（写入 token + lease discovery 文件）
 libra code --control write
@@ -324,7 +330,7 @@ libra code --provider codex --plan-mode
 
 ## 人工输出
 
-输出会根据模式通过 TUI、Web 界面或 MCP 协议交付。默认 TUI 模式没有面向行的 stdout。在 generic provider TUI 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。如果已确认计划执行失败，或 orchestrator 在到达最终决策前中止，Libra 会将失败证据反馈给 planner，要求其添加或调整修复步骤，并在自动修复阈值内自动运行修订计划。达到阈值后，TUI 会等待开发者使用更高的重试限制继续（例如 `/plan continue <higher-limit>`），或提供显式计划修复指导；普通 `continue` 会保留已耗尽的限制并返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`。Cancel 为终态。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
+输出会根据模式通过 Web UI（默认）、遗留 TUI（`LIBRA_CODE_LEGACY_TUI=1`）或 MCP 协议交付。默认 Web 模式会在 stdout 打印 URL / control 信息并前台常驻直到 SIGINT/SIGTERM。遗留 TUI 模式没有面向行的 stdout。在 generic provider workflow 中，普通纯文本请求会自动启动 plan workflow；显式 slash commands 保持其命令专用行为。Generic provider planning 使用两步审阅：LLM 首先起草 IntentSpec 供确认，然后确认后的 IntentSpec 会被送回 LLM，用于在任何执行开始前生成可审阅执行计划。如果已确认计划执行失败，或 orchestrator 在到达最终决策前中止，Libra 会将失败证据反馈给 planner，要求其添加或调整修复步骤，并在自动修复阈值内自动运行修订计划。达到阈值后，TUI 会等待开发者使用更高的重试限制继续（例如 `/plan continue <higher-limit>`），或提供显式计划修复指导；普通 `continue` 会保留已耗尽的限制并返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`。Cancel 为终态。Web 服务器提供嵌入式 Next.js 应用。Stdio 模式通过遵循 Model Context Protocol 的 JSON-RPC 消息通信。
 
 ## Diagnostics
 
@@ -350,7 +356,7 @@ ollama list >> /tmp/libra-logs/libra-code-ollama.log
 
 ### 为什么采用 TUI + Web server 混合？
 
-TUI 为已经在终端中工作的开发者提供低延迟、键盘驱动界面。后台 Web 服务器同时运行，使同一会话可以从浏览器访问，这有助于与队友共享上下文、查看丰富 diff，或从移动设备访问会话。`--web-only` 标志会完全去掉 TUI，用于没有可用终端的 headless 或远程服务器部署。
+默认 Web Code UI 为浏览器驱动协作提供主入口；遗留 TUI（`LIBRA_CODE_LEGACY_TUI=1`）仍可为终端用户提供低延迟键盘界面。`--web` / `--web-only` 是默认 Web 的弃用别名（W5-07 删除）。
 
 ### 为什么支持多个 AI provider？
 

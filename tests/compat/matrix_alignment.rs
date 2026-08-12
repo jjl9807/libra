@@ -206,7 +206,11 @@ fn docs_consistency_covers_code_command_router_contracts() {
         assert_contains(&code_doc, &route, "docs/commands/code.md");
     }
 
-    for header in ["X-Libra-Control-Token", "X-Code-Controller-Token"] {
+    for header in [
+        "X-Libra-Control-Token",
+        "X-Code-Controller-Token",
+        "X-Libra-Browser-Bootstrap",
+    ] {
         assert_contains(&code_doc, header, "docs/commands/code.md");
         assert_contains(&source_and_docs, header, "source/docs control contract");
     }
@@ -216,6 +220,8 @@ fn docs_consistency_covers_code_command_router_contracts() {
         "LOOPBACK_REQUIRED",
         "MISSING_CONTROL_TOKEN",
         "INVALID_CONTROL_TOKEN",
+        "MISSING_BROWSER_BOOTSTRAP",
+        "INVALID_BROWSER_BOOTSTRAP",
         "MISSING_CONTROLLER_TOKEN",
         "INVALID_CONTROLLER_TOKEN",
         "CONTROLLER_CONFLICT",

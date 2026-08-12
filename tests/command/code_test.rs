@@ -202,9 +202,9 @@ fn code_rejects_deepseek_flags_for_other_providers() {
 }
 
 /// `libra code --help` surfaces the EXAMPLES banner so users see the
-/// most common invocations across the three modes (TUI / --web / --stdio)
-/// plus --browser-control loopback, --control write, --resume,
-/// --plan-mode, and --env-file without reading the design doc. Cross-cutting
+/// most common invocations across the three modes (default Web / legacy TUI /
+/// --stdio) plus observe-only host posture, `--control write`, `--resume`,
+/// `--plan-mode`, and `--env-file` without reading the design doc. Cross-cutting
 /// `--help` EXAMPLES rollout per `docs/development/commands/_general.md` item B.
 #[test]
 fn test_code_help_lists_examples_banner() {
@@ -221,11 +221,11 @@ fn test_code_help_lists_examples_banner() {
         "code --help should include EXAMPLES banner, stdout: {stdout}"
     );
     for invocation in [
-        "Launch the default TUI session",
+        "Launch the default Web Code UI",
         "libra code --provider deepseek",
         "libra code --web",
         "libra code --web-only --provider ollama",
-        "libra code --web-only --provider codex --browser-control loopback",
+        "libra code --host 0.0.0.0 --browser-control off",
         "libra code --control write",
         "libra code --resume <thread-uuid>",
         "libra code --plan-mode",

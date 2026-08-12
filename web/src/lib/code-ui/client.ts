@@ -38,10 +38,21 @@ export interface CodeUiClient {
   ): CodeUiEventStream;
 }
 
-function headers(token?: string): HeadersInit {
+function browserBootstrapFromLocation(): string | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    return new URLSearchParams(window.location.search).get("bt") ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function headers(token?: string, includeBrowserBootstrap = false): HeadersInit {
+  const bootstrap = includeBrowserBootstrap ? browserBootstrapFromLocation() : undefined;
   return {
     "content-type": "application/json",
     ...(token ? { "X-Code-Controller-Token": token } : {}),
+    ...(bootstrap ? { "X-Libra-Browser-Bootstrap": bootstrap } : {}),
   };
 }
 
@@ -101,7 +112,7 @@ export function createCodeUiClient(
     attach: (clientId) =>
       transport.request("/api/code/controller/attach", {
         method: "POST",
-        headers: headers(),
+        headers: headers(undefined, true),
         body: JSON.stringify({ clientId, kind: "browser" }),
       }),
     detach: async (clientId, token, keepalive = false) => {

@@ -445,3 +445,56 @@ async fn gemini_completion_request_smoke_boots_against_localhost_stub() -> Resul
     );
     Ok(())
 }
+
+/// W4-01: default `libra code` accepts `--env-file` without requiring
+/// `--web-only`, and env-file values win over a competing process env for the
+/// same provider key through the same validate → load path as `execute_web_only`.
+#[test]
+#[serial_test::serial(libra_code_legacy_tui)]
+fn default_web_env_file_precedence() {
+    use std::path::Path;
+
+    use clap::Parser;
+    use libra::{
+        command::code::{
+            CODE_EXAMPLES, CodeArgs, CodeProvider, resolve_default_web_provider_env_key,
+        },
+        utils::test::ScopedEnvVar,
+    };
+
+    let _unset = ScopedEnvVar::unset("LIBRA_CODE_LEGACY_TUI");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let env_path = temp.path().join(".env.w4-01");
+    std::fs::write(&env_path, "OPENAI_API_KEY=from-env-file\n").expect("write env file");
+
+    let parsed = CodeArgs::try_parse_from([
+        "code",
+        "--env-file",
+        env_path.to_str().expect("utf8 path"),
+        "--provider",
+        "openai",
+    ])
+    .expect("default Web must accept --env-file without --web-only");
+    assert!(
+        !parsed.web_only,
+        "bare --env-file must not force the deprecated --web-only flag"
+    );
+    assert_eq!(parsed.provider, CodeProvider::Openai);
+    assert_eq!(
+        parsed.env_file.as_deref(),
+        Some(Path::new(env_path.as_os_str()))
+    );
+    assert!(
+        CODE_EXAMPLES.contains("--env-file"),
+        "EXAMPLES must keep documenting --env-file on the default launch"
+    );
+
+    let _process = ScopedEnvVar::set("OPENAI_API_KEY", "from-process-env");
+    let resolved = resolve_default_web_provider_env_key(&parsed, "OPENAI_API_KEY")
+        .expect("default Web validate + env-file load must succeed");
+    assert_eq!(
+        resolved.as_deref(),
+        Some("from-env-file"),
+        "env-file must win over a competing process-env value on the default Web bootstrap path"
+    );
+}

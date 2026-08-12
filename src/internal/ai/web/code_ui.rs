@@ -1561,6 +1561,9 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("PAYLOAD_TOO_LARGE", 413),
         // Browser Origin / CSRF gate (W3-05); automation skips this check.
         ("ORIGIN_REQUIRED", 403),
+        // Session-bound browser bootstrap secret (W4-01); Origin alone is not enough.
+        ("MISSING_BROWSER_BOOTSTRAP", 403),
+        ("INVALID_BROWSER_BOOTSTRAP", 403),
         // Per-session write rate limit (browser + automation, W3-05).
         ("RATE_LIMITED", 429),
         // Secret-redactor failure on session/diagnostics/SSE projections (W3-12).
@@ -2127,6 +2130,9 @@ mod tests {
             ("PAYLOAD_TOO_LARGE", 413),
             // mod.rs browser Origin gate / write_guards (W3-05).
             ("ORIGIN_REQUIRED", 403),
+            // mod.rs browser bootstrap secret gate (W4-01).
+            ("MISSING_BROWSER_BOOTSTRAP", 403),
+            ("INVALID_BROWSER_BOOTSTRAP", 403),
             // mod.rs per-session write rate limiter (W3-05).
             ("RATE_LIMITED", 429),
             // mod.rs `parse_optional_u64` (?limit/?offset parser).

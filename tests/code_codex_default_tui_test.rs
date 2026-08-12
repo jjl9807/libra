@@ -1,21 +1,22 @@
 //! Static guard for Phase 2 Task 2.7 of `docs/development/tracing/agent.md` Part B
 //! (merged from the original TUI improvement plan per the 2026-05-02
-//! agent.md consolidation).
+//! agent.md consolidation), updated for plan-20260715 **W4-01**.
 //!
-//! `libra code --provider codex` must always route through the default Libra TUI
-//! (`run_tui_with_managed_code_runtime`) — the legacy standalone Codex stdin loop
+//! `libra code --provider codex` must route through the managed Codex
+//! app-server / Code UI runtime — the legacy standalone Codex stdin loop
 //! (`agent_codex::execute`) is deprecated and must not be reachable from the
-//! `libra code` command path. Spinning up a real Codex app-server inside CI is
+//! `libra code` command path. After W4-01 the **default** entry is Web Code UI
+//! (`execute_web_only`); hidden `LIBRA_CODE_LEGACY_TUI=1` still reaches the
+//! managed TUI driver. Spinning up a real Codex app-server inside CI is
 //! prohibitively heavy, so we rely on source-level invariants instead:
 //!
 //! 1. `src/command/code.rs` must not call `agent_codex::execute`.
-//! 2. `src/command/code.rs` must contain a `CodeProvider::Codex` arm that hands
-//!    off to `run_tui_with_managed_code_runtime`.
-//! 3. `agent_codex::execute` must keep the `#[deprecated]` marker so a future
-//!    refactor immediately surfaces the regression at compile time inside any
-//!    consumer that still references it.
-//! 4. The legacy stdin/stdout primitives (`std::io::stdin`, `stdin_rx.recv`,
-//!    Codex's own approval `print` loops) must not appear inside
+//! 2. Default `execute()` must prefer `execute_web_only` via `code_uses_web_launch`
+//!    (with `LIBRA_CODE_LEGACY_TUI` as the only non-flag TUI rollback).
+//! 3. `CodeProvider::Codex` still hands off to `start_codex_code_ui_runtime` /
+//!    `run_tui_with_managed_code_runtime` (Web default + legacy TUI).
+//! 4. `agent_codex::execute` must keep the `#[deprecated]` marker.
+//! 5. Legacy stdin/stdout primitives must not appear inside
 //!    `src/command/code.rs` or `src/internal/tui/`.
 //!
 //! These checks complement the runtime scenarios in
@@ -75,18 +76,39 @@ fn command_code_does_not_call_legacy_codex_execute() {
 }
 
 #[test]
+fn default_execute_routes_to_web_code_ui() {
+    let source = read_file(COMMAND_CODE_PATH);
+    assert!(
+        source.contains("LIBRA_CODE_LEGACY_TUI"),
+        "expected hidden LIBRA_CODE_LEGACY_TUI rollback env in {COMMAND_CODE_PATH}"
+    );
+    assert!(
+        source.contains("fn code_uses_web_launch"),
+        "expected code_uses_web_launch helper for default Web routing"
+    );
+    assert!(
+        source.contains("execute_web_only(&args).await"),
+        "default execute path must call execute_web_only"
+    );
+    assert!(
+        source.contains("execute_tui(args).await"),
+        "legacy TUI path must remain reachable behind LIBRA_CODE_LEGACY_TUI"
+    );
+}
+
+#[test]
 fn codex_arm_routes_through_managed_runtime() {
     let source = read_file(COMMAND_CODE_PATH);
     assert!(
         source.contains("CodeProvider::Codex =>"),
         "expected `CodeProvider::Codex` match arm in {COMMAND_CODE_PATH}"
     );
-    // The arm must hand off to the shared default-TUI driver, not a Codex-only path.
+    // Legacy TUI rollback still uses the shared managed-TUI driver.
     assert!(
         source.contains("run_tui_with_managed_code_runtime"),
-        "Codex arm must call `run_tui_with_managed_code_runtime` (default Libra TUI)"
+        "Codex arm must keep `run_tui_with_managed_code_runtime` for LIBRA_CODE_LEGACY_TUI"
     );
-    // And it must build the Codex code-ui runtime via the documented helper.
+    // Default Web and Codex web-only construct the runtime via the documented helper.
     assert!(
         source.contains("start_codex_code_ui_runtime"),
         "Codex arm must construct the runtime via `start_codex_code_ui_runtime`"

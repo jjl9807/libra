@@ -117,6 +117,10 @@ impl CodeSessionOptions {
     /// scenarios that still need a live terminal controller.
     pub fn with_pty_tui(mut self) -> Self {
         self.web_only = false;
+        // W4-01: bare `libra code` defaults to Web; PTY reclaim/plan scenarios
+        // still need the legacy TUI controller for the bake window.
+        self.extra_env
+            .push(("LIBRA_CODE_LEGACY_TUI".to_string(), "1".to_string()));
         self
     }
 
@@ -230,6 +234,8 @@ pub struct CodeSession {
     /// runtime starts an MCP server (not in `--web-only`-without-MCP modes).
     mcp_url: Option<String>,
     control_token: String,
+    /// Session-bound browser bootstrap secret from stdout (`?bt=` / header).
+    browser_bootstrap: Option<String>,
     controller_token: Option<String>,
     /// Whether the session was spawned with `--control write`. Observe-mode
     /// sessions never get a control token file, so the harness should not
@@ -437,6 +443,7 @@ impl CodeSession {
             base_url: String::new(),
             mcp_url: None,
             control_token: String::new(),
+            browser_bootstrap: None,
             controller_token: None,
             control_write: options.control_write,
             web_only: options.web_only,
@@ -756,11 +763,15 @@ impl CodeSession {
     /// [`CodeSessionOptions::with_browser_control_loopback`] so the runtime
     /// advertises the browser write surface.
     pub fn attach_browser(&self, client_id: &str) -> Result<String> {
-        let response = self
+        let mut request = self
             .client
             .post(self.url("/controller/attach"))
             .header("Origin", self.base_url.as_str())
-            .json(&json!({ "clientId": client_id, "kind": "browser" }))
+            .json(&json!({ "clientId": client_id, "kind": "browser" }));
+        if let Some(bootstrap) = self.browser_bootstrap.as_deref() {
+            request = request.header("X-Libra-Browser-Bootstrap", bootstrap);
+        }
+        let response = request
             .send()
             .context("failed to send browser attach request")?;
         let status = response.status();
@@ -784,11 +795,15 @@ impl CodeSession {
     /// the server rejects the attach (e.g. `BROWSER_CONTROL_DISABLED` or
     /// `CONTROLLER_CONFLICT`).
     pub fn attach_browser_expect_error(&self, client_id: &str) -> Result<(StatusCode, Value)> {
-        let response = self
+        let mut request = self
             .client
             .post(self.url("/controller/attach"))
             .header("Origin", self.base_url.as_str())
-            .json(&json!({ "clientId": client_id, "kind": "browser" }))
+            .json(&json!({ "clientId": client_id, "kind": "browser" }));
+        if let Some(bootstrap) = self.browser_bootstrap.as_deref() {
+            request = request.header("X-Libra-Browser-Bootstrap", bootstrap);
+        }
+        let response = request
             .send()
             .context("failed to send browser attach request")?;
         let status = response.status();
@@ -798,10 +813,14 @@ impl CodeSession {
 
     /// Browser attach without an Origin header (W3-05 fail-closed case).
     pub fn attach_browser_without_origin(&self, client_id: &str) -> Result<(StatusCode, Value)> {
-        let response = self
+        let mut request = self
             .client
             .post(self.url("/controller/attach"))
-            .json(&json!({ "clientId": client_id, "kind": "browser" }))
+            .json(&json!({ "clientId": client_id, "kind": "browser" }));
+        if let Some(bootstrap) = self.browser_bootstrap.as_deref() {
+            request = request.header("X-Libra-Browser-Bootstrap", bootstrap);
+        }
+        let response = request
             .send()
             .context("failed to send browser attach without Origin")?;
         let status = response.status();
@@ -815,11 +834,15 @@ impl CodeSession {
         client_id: &str,
         origin: &str,
     ) -> Result<(StatusCode, Value)> {
-        let response = self
+        let mut request = self
             .client
             .post(self.url("/controller/attach"))
             .header("Origin", origin)
-            .json(&json!({ "clientId": client_id, "kind": "browser" }))
+            .json(&json!({ "clientId": client_id, "kind": "browser" }));
+        if let Some(bootstrap) = self.browser_bootstrap.as_deref() {
+            request = request.header("X-Libra-Browser-Bootstrap", bootstrap);
+        }
+        let response = request
             .send()
             .context("failed to send browser attach with Origin")?;
         let status = response.status();
@@ -1563,6 +1586,7 @@ impl CodeSession {
                 let _ = fs::write(self.logs_dir.join("control.json"), &info_text);
                 self.base_url = info.base_url;
                 self.mcp_url = info.mcp_url;
+                self.browser_bootstrap = read_browser_bootstrap_from_logs(&self.logs_dir);
                 if self.control_write {
                     // Token file is only written under `--control write`;
                     // observe-mode sessions skip it on purpose.
@@ -1677,6 +1701,45 @@ fn libra_bin() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_libra")
         .map(PathBuf::from)
         .expect("CARGO_BIN_EXE_libra is set for integration tests")
+}
+
+fn read_browser_bootstrap_from_logs(logs_dir: &Path) -> Option<String> {
+    for name in ["pty.log", "libra.log"] {
+        let Ok(text) = fs::read_to_string(logs_dir.join(name)) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("Browser bootstrap token: ") {
+                let token = rest.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+            if let Some(rest) = line.trim().strip_prefix("Libra Code server running at ")
+                && let Some((_, query)) = rest.split_once('?')
+            {
+                for pair in query.split('&') {
+                    if let Some(token) = pair.strip_prefix("bt=")
+                        && !token.is_empty()
+                    {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+            if let Some(rest) = line.trim().strip_prefix("Web: ")
+                && let Some((_, query)) = rest.split_once('?')
+            {
+                for pair in query.split('&') {
+                    if let Some(token) = pair.strip_prefix("bt=")
+                        && !token.is_empty()
+                    {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn path_str(path: &Path) -> Result<&str> {

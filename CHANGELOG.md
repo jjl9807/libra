@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W4-01, 2026-08-12, v0.19.142)
+
+- **W4-01 switches default `libra code` to the Web Code UI.** Bare
+  launches print the Code UI URL + control info (no alternate-screen TUI).
+  `--web` / `--web-only` remain deprecation-warning no-ops; hidden
+  `LIBRA_CODE_LEGACY_TUI=1` restores the TUI for the bake window (removed in
+  W5-07). Default browser-control is `loopback` with a per-session
+  `X-Libra-Browser-Bootstrap` secret (`?bt=` on the printed URL; auto-open
+  skipped so the secret never appears in opener argv). `--network-access
+  allow` stays rejected on Web/MCP until the Plan gate owns per-execution
+  sandbox network. Bare `--provider codex --resume` still uses the legacy
+  TUI resume driver.
+
 ### Added (plan-20260715 W3-09, 2026-08-12, v0.19.141)
 
 - **W3-09 migrates the built-in Code UI SPA to SSE wire v2.**

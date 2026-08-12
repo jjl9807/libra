@@ -15,13 +15,13 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## Description
 
-`libra code` starts an interactive coding session that pairs a human developer with an AI agent. The default mode launches a terminal UI (TUI) built on ratatui/crossterm with a background web server. Plain developer requests in the generic provider TUI are routed through the built-in planning workflow first: Libra generates a reviewable IntentSpec and execution plan, then waits for Execute Plan / Network / Modify Plan / Cancel before running mutating tools. Two alternative modes are available: `--web-only` runs the web server without the TUI (useful for browser access or remote hosting), and `--stdio` runs an MCP server over standard input/output for integration with AI clients like Claude Desktop.
+`libra code` starts an interactive coding session that pairs a human developer with an AI agent. The default mode launches the Web Code UI (embedded HTTP server + AgentRuntime) and prints the URL / control details; it stays in the foreground until `Ctrl-C` / SIGTERM. `--web` / `--web-only` remain accepted as deprecated no-op aliases for that default during the W4 bake window (removed in W5-07). Hidden `LIBRA_CODE_LEGACY_TUI=1` restores the previous terminal UI for emergency rollback only (not a public compatibility surface). `--stdio` runs an MCP server over standard input/output for integration with AI clients like Claude Desktop.
 
 The command supports eight AI provider backends (Gemini, OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, Ollama, Codex) and three operating contexts (dev, review, research) that tune the agent's behavior for different workflows. Sessions can be persisted and resumed with Libra's canonical `--resume <thread_id>` flow. Passing `--goal "<objective>"` boots the session directly in goal mode, where a supervisor drives the tool loop toward the stated objective until a verifier accepts completion.
 
-A sandboxed tool-execution layer enforces approval policies that control when the agent can run shell commands, apply patches, web search, or perform other potentially destructive operations. TUI dev sessions default to workspace-write execution with network access denied. After the execution plan is ready, the Plan review dialog offers Execute Plan / Modify Plan / Cancel. Choosing Execute opens a separate mandatory network-policy prompt (`Network: Deny` / `Network: Allow` / `Back`); the choice is applied only after that gate resolves, and both gates are durable across crash/resume. Review and research contexts remain read-only and do not grant network access.
+A sandboxed tool-execution layer enforces approval policies that control when the agent can run shell commands, apply patches, web search, or perform other potentially destructive operations. Legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`) and headless Web sessions in the `dev` context default to workspace-write execution with network access denied. After the execution plan is ready, the Plan review dialog offers Execute Plan / Modify Plan / Cancel. Choosing Execute opens a separate mandatory network-policy prompt (`Network: Deny` / `Network: Allow` / `Back`); the choice is applied only after that gate resolves, and both gates are durable across crash/resume. Review and research contexts remain read-only and do not grant network access.
 
-When the TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
+When the legacy TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
 **Linked worktrees**: `libra code` (every mode) refuses to launch from a linked worktree until the unified Code/Agent configuration resolver lands — the session's configuration (agents, hooks, sandbox, approvals) is not yet worktree-aware there, and a linked session could run under the repository's sandbox policy without its security hooks. Run from the main worktree instead; the refusal names this remedy. For the same reason, automation VCS dispatch is disabled (with a warning) in linked worktrees and `libra automation` fails closed there — see [automation.md](automation.md).
 
@@ -29,7 +29,7 @@ When the TUI exits and Libra can derive the canonical thread ID, `libra code` pr
 
 | Flag | Short | Long | Default | Description |
 |------|-------|------|---------|-------------|
-| Web only | | `--web-only` / `--web` | off | Run the web server without TUI. Conflicts with `--stdio`. |
+| Web only | | `--web-only` / `--web` | off | Deprecated alias for the default Web Code UI (W4 bake window; removed in W5-07). Conflicts with `--stdio`. |
 | Port | `-p` | `--port` | `3000` | Web server listen port. |
 | Host | | `--host` | `127.0.0.1` | Web server bind address. |
 | Working directory | | `--cwd` | current dir | Working directory for the session. |
@@ -52,14 +52,14 @@ When the TUI exits and Libra can derive the canonical thread ID, `libra code` pr
 | Resume | | `--resume <THREAD_ID>` | none | Resume a canonical Libra thread by thread ID. |
 | Approval policy | | `--approval-policy` | `on-request` | Tool approval policy (see Approval Policies below). |
 | Approval TTL | | `--approval-ttl <SECS>` | `300` | Seconds that a granted approval stays reusable for matching commands before the agent is prompted again. Overrides the project config `[approval] ttl_seconds` in `.libra/config.toml`; relevant to the prompting policies. |
-| Network access | | `--network-access <allow\|deny>` | `deny` | Default TUI network policy for shell and gate execution; can still be toggled at Plan review. |
+| Network access | | `--network-access <allow\|deny>` | `deny` | Default network policy for shell/gate under legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`). Default Web and MCP `--stdio` reject `--network-access allow` until the Plan network-policy gate owns per-execution sandbox network (approve network in Plan review instead). |
 | MCP port | | `--mcp-port` | `6789` | MCP server listen port. |
 | Stdio | | `--stdio` / `--mcp-stdio` | off | Run MCP over stdio. Conflicts with `--web-only`. |
 | API base | | `--api-base` | provider default | Provider API base URL override. |
 | Codex binary | | `--codex-bin` | `codex` | Codex executable path. |
 | Codex port | | `--codex-port` | random | Override Codex app-server port. |
 | Plan mode | | `--plan-mode [<true\|false>]` | off (on for Codex) | Require the agent to produce an approved plan before execution. The effective default is on for `--provider codex` and off for every other provider; Explicit `--plan-mode=true` (or bare `--plan-mode`) is only accepted with `--provider=codex` — it is rejected for other providers; pass `--plan-mode=false` to opt a Codex session out. |
-| Browser control | | `--browser-control <off\|loopback>` | provider-aware (see Web Browser Control) | Posture for `/api/code/controller/attach` browser leases. Conflicts with `--stdio`; `loopback` requires a loopback `--host`. |
+| Browser control | | `--browser-control <off\|loopback>` | `loopback` (Web); `off` (legacy TUI) | Posture for `/api/code/controller/attach` browser leases. Conflicts with `--stdio`; `loopback` requires a loopback `--host`. |
 | Goal | | `--goal <OBJECTIVE>` | none | Boot the session in goal mode with the supplied objective, equivalent to running `/goal start <objective>` as the session opens; the supervisor drives the tool loop until completion is claimed and the verifier accepts. The objective is validated at parse time (non-empty after trim, at most 16 KiB). |
 
 ### Provider Backends
@@ -101,11 +101,14 @@ Automation clients attach with `POST /api/code/controller/attach`, body `{ "clie
 
 | Entry point | Default `--browser-control` |
 |-------------|-----------------------------|
-| TUI session (`libra code` without `--web-only`) | `off` |
-| `libra code --web-only --provider codex` | `loopback` |
-| `libra code --web-only` with any other provider | `off` |
+| TUI session (`LIBRA_CODE_LEGACY_TUI=1`) | `off` |
+| Default Web / `--web` / `--web-only` (any provider) | `loopback` |
 
-Selecting `loopback` is rejected when `--host` is not a loopback address, and the flag conflicts with `--stdio`. The browser server-side endpoints are tagged in the `code_router()` audit matrix (`src/internal/ai/web/mod.rs`):
+Selecting `loopback` is rejected when `--host` is not a loopback address, and the flag conflicts with `--stdio`. Use `--browser-control off` when binding a non-loopback `--host` for observe-only / remote-notice serving.
+
+**Local trust model:** browser attach requires loopback bind + trusted same-origin `Origin`/`Referer` + rate limits (W3-05) **and** a per-session `X-Libra-Browser-Bootstrap` secret (printed on stdout / embedded as `?bt=` in the open URL). Forgeable Origin alone is not enough. Libra does **not** auto-open a `?bt=` URL (so the bootstrap secret never appears in opener argv on shared hosts); open the printed URL yourself. On shared machines, prefer `--browser-control off` (observe-only) or keep the session on a private host.
+
+The browser server-side endpoints are tagged in the `code_router()` audit matrix (`src/internal/ai/web/mod.rs`):
 
 - `GET /api/code/session`, `GET /api/code/events`, `GET /api/code/diagnostics`, `GET /api/code/threads`, `GET /api/code/usage`, `GET /api/code/skills`, `GET /api/code/goal/status` — loopback-only observe.
 - `POST /api/code/controller/attach` — loopback. `kind: "automation"` requests additionally require `X-Libra-Control-Token`. The handler **issues** the lease's `controllerToken` (it does not expect the caller to send one).
@@ -135,7 +138,7 @@ Default listen port is `3000`. If that address is already bound, startup fail-cl
 
 When `--browser-control loopback` is requested and the browser holds the active lease, the TUI initial controller is `LocalTui` (visible owner, can be reclaimed) instead of `Fixed { Tui }` (permanently blocking). If the TUI also wants to drive writes, `--control write` must be supplied alongside `--browser-control loopback`; the two writers serialize through the same `TuiControlCommand` channel.
 
-For `--web-only` non-Codex providers (`--provider ollama` is the canonical headless verification path), Libra builds a [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs) lifecycle host and mounts [`AgentRuntimeCodeUiAdapter`](../../src/internal/ai/web/agent_runtime_adapter.rs) as the production browser write-path owner. Browser submits enter the serialized `AgentRuntimeWorker`: plain (non-`/`) messages use the TUI-equivalent Phase 0 plan tool allowlist so direct chat cannot bypass the default mutating gate; slash/`/`-prefixed messages keep an explicit direct tool loop. Full IntentSpec → Phase 1 → repair parity remains GATE-WEB-PLAN. Headless mode advertises `messageInput`, `streamingText`, `toolCalls`, `planUpdates`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, and `providerSessionResume`. `--web-only --resume <thread_id>` reloads the matching session in the same working directory, then applies the bounded durable Code UI projection suffix before starting the browser server. `--resume` remains unavailable in `--stdio` mode and with `--provider codex`, whose managed app-server has a separate session protocol. `update_plan` projects into `plans[]`, and `apply_patch` metadata projects into `patchsets[]`. Cancellation is cooperative before a tool's mutation boundary. After a potentially mutating tool has begun, cancel returns an actionable error and the active turn remains in place until it reaches a determinate result; Libra never hard-aborts that side effect or relabels it as an ordinary cancelled turn.
+For `--web-only` non-Codex providers (`--provider ollama` is the canonical headless verification path), Libra builds a [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs) lifecycle host and mounts [`AgentRuntimeCodeUiAdapter`](../../src/internal/ai/web/agent_runtime_adapter.rs) as the production browser write-path owner. Browser submits enter the serialized `AgentRuntimeWorker`: plain (non-`/`) messages use the TUI-equivalent Phase 0 plan tool allowlist so direct chat cannot bypass the default mutating gate; slash/`/`-prefixed messages keep an explicit direct tool loop. Full IntentSpec → Phase 1 → repair parity remains **GATE-WEB-PLAN** (intentional residual through W4-01; not a silent cutover regression — use `LIBRA_CODE_LEGACY_TUI=1` when the full TUI Phase 0/1/repair workflow is required). Headless mode advertises `messageInput`, `streamingText`, `toolCalls`, `planUpdates`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, and `providerSessionResume`. `--web-only --resume <thread_id>` (and bare default Web `--resume`) reloads the matching session for non-Codex providers in the same working directory, then applies the bounded durable Code UI projection suffix before starting the browser server. `--resume` remains unavailable with explicit `--web`/`--web-only --provider codex`; bare `libra code --provider codex --resume <thread_id>` keeps the pre-W4 legacy TUI resume driver until managed Codex Web resume lands. `update_plan` projects into `plans[]`, and `apply_patch` metadata projects into `patchsets[]`. Cancellation is cooperative before a tool's mutation boundary. After a potentially mutating tool has begun, cancel returns an actionable error and the active turn remains in place until it reaches a determinate result; Libra never hard-aborts that side effect or relabels it as an ordinary cancelled turn.
 
 For `--web-only --provider codex`, managed app-server websocket notifications are normalized into the shared runtime `AgentEvent` envelope (same projection path as other providers). Unknown Codex methods take an explicit diagnosable `ProviderNotification` fallback rather than silent drop or panic. Ask-mode approvals park on the shared `AgentRuntime` interaction registry and forward browser `respond_interaction` decisions to the app-server; Codex still owns the in-app-server approval loop (see DEFER-07 in `docs/development/tracing/code.md`). Outward approval option ids match non-Codex (`approve` / `deny` / `abort`).
 
@@ -188,11 +191,11 @@ exceed that budget, the server emits `event: resync` with
 `WIRE_V2_RESYNC_REQUIRED` (`reason`, `lastCursor`, `durableTail`,
 `action: fetch_snapshot`) and ends the stream — never silent-drops. Clients
 fetch a session snapshot, then reconnect at `durableTail`. Wire v2 requires a
-SessionStore-backed workflow hub. Today that hub is mounted for `--web-only`
-headless runs with session persistence (non-Codex `HeadlessCodeRuntime`).
-Default TUI + background web and managed `--web-only --provider codex`
-currently return `503 WIRE_V2_REQUIRES_DURABLE_SESSION` until those runtimes
-expose a hub.
+SessionStore-backed workflow hub. Today that hub is mounted for default Web /
+`--web-only` headless runs with session persistence (non-Codex
+`HeadlessCodeRuntime`). Legacy TUI + background web and managed
+`--provider codex` Web currently return `503 WIRE_V2_REQUIRES_DURABLE_SESSION`
+until those runtimes expose a hub.
 
 ### SSE v1 compatibility window (DEFER-08)
 
@@ -223,6 +226,8 @@ Code UI API errors use `{ error: { code, message } }`:
 | `LOOPBACK_REQUIRED` | 403 | Non-loopback client attempted an API route. |
 | `PAYLOAD_TOO_LARGE` | 413 | Write request body exceeded 256 KiB. |
 | `ORIGIN_REQUIRED` | 403 | Browser write/attach lacked a trusted loopback `Origin` (or same-origin `Referer`), or presented a cross-site Origin. |
+| `MISSING_BROWSER_BOOTSTRAP` | 403 | Browser attach lacked `X-Libra-Browser-Bootstrap` for a session that minted a bootstrap secret. |
+| `INVALID_BROWSER_BOOTSTRAP` | 403 | `X-Libra-Browser-Bootstrap` does not match this Libra Code session. |
 | `RATE_LIMITED` | 429 | Per-session write budget exhausted; retry after the rate-limit window (see `Retry-After` / wait for window recovery). |
 | `REDACTION_FAILED` | 500 | Session / diagnostics / SSE projection could not apply the secret redactor (empty rules or serialize failure). Fail closed: the response omits unredacted payload; restart `libra code` or retry after fixing redactor configuration. |
 | `INVALID_WIRE_VERSION` | 400 | `GET /api/code/events` wire negotiation received an illegal `wire` / `libra-wire` value (only `1`/`v1` and `2`/`v2` are accepted). |
@@ -288,24 +293,25 @@ The `web_search` tool requires the session network policy to allow outbound acce
 ## Common Commands
 
 ```bash
-# Start a TUI session with default Gemini provider
+# Start a Web Code UI session with default Gemini provider
 libra code
 
 # Start with Anthropic Claude
 libra code --provider anthropic --model claude-sonnet-4-20250514
 
 # Bind web-only on all interfaces; remote browsers see a loopback-only notice
-libra code --web-only --port 8080 --host 0.0.0.0
+# (explicit --browser-control off: default Web is loopback and rejects non-loopback hosts)
+libra code --web-only --port 8080 --host 0.0.0.0 --browser-control off
 
 # Remote humans should SSH port-forward to the bound loopback port
 # ssh -L 8080:127.0.0.1:8080 user@host
 # then browse http://127.0.0.1:8080 locally
 
-# Browser-driven session against a local Ollama
+# Browser-driven session against a local Ollama (browser write lease is on by default)
 libra code --web-only --provider ollama --port 4400
 
-# Allow browser write control over loopback (Codex web-only is loopback by default)
-libra code --web-only --provider codex --browser-control loopback
+# Managed Codex on the default Web path (browser write lease is loopback by default)
+libra code --web-only --provider codex
 
 # Enable local automation write control (writes token + lease discovery files)
 libra code --control write
@@ -358,7 +364,7 @@ libra code --provider codex --plan-mode
 
 ## Human Output
 
-Output is delivered through the TUI, web interface, or MCP protocol depending on the mode. There is no line-oriented stdout in the default TUI mode. In the generic provider TUI, a normal plain-text request starts the plan workflow automatically; explicit slash commands keep their command-specific behavior. Generic provider planning uses a two-step review: the LLM first drafts an IntentSpec for confirmation, then the confirmed IntentSpec is sent back to the LLM to generate a reviewable execution plan before any execution starts. If a confirmed plan executes and fails, or the orchestrator aborts before reaching a final decision, Libra feeds the failure evidence back into the planner, asks it to add or adjust repair steps, and automatically runs the revised plan up to the automatic repair threshold. After that threshold is reached, the TUI waits for the developer to continue with a higher retry limit (for example, `/plan continue <higher-limit>`) or provide explicit plan repair guidance; a plain `continue` retains the exhausted limit and returns `PLAN_REPAIR_RETRY_LIMIT_REACHED`. Cancel is terminal. The web server serves an embedded Next.js application. The stdio mode communicates via JSON-RPC messages following the Model Context Protocol.
+Output is delivered through the Web UI (default), the legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`), or MCP depending on the mode. Default Web mode prints URL / control details on stdout and stays resident until SIGINT/SIGTERM. Legacy TUI mode has no line-oriented stdout. In the generic provider workflow, a normal plain-text request starts the plan workflow automatically; explicit slash commands keep their command-specific behavior. Generic provider planning uses a two-step review: the LLM first drafts an IntentSpec for confirmation, then the confirmed IntentSpec is sent back to the LLM to generate a reviewable execution plan before any execution starts. If a confirmed plan executes and fails, or the orchestrator aborts before reaching a final decision, Libra feeds the failure evidence back into the planner, asks it to add or adjust repair steps, and automatically runs the revised plan up to the automatic repair threshold. After that threshold is reached, the TUI waits for the developer to continue with a higher retry limit (for example, `/plan continue <higher-limit>`) or provide explicit plan repair guidance; a plain `continue` retains the exhausted limit and returns `PLAN_REPAIR_RETRY_LIMIT_REACHED`. Cancel is terminal. The web server serves an embedded Next.js application. The stdio mode communicates via JSON-RPC messages following the Model Context Protocol.
 
 ## Diagnostics
 
@@ -384,7 +390,7 @@ ollama list >> /tmp/libra-logs/libra-code-ollama.log
 
 ### Why a TUI + web server hybrid?
 
-The TUI provides a low-latency, keyboard-driven interface for developers already working in a terminal. The background web server runs simultaneously so that the same session can be accessed from a browser -- useful for sharing context with teammates, viewing rich diffs, or accessing the session from a mobile device. The `--web-only` flag drops the TUI entirely for headless or remote server deployments where no terminal is available.
+The default Web Code UI is the primary collaborative surface. Legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`) still provides a low-latency, keyboard-driven interface for terminal users. `--web` / `--web-only` are deprecated aliases for the default Web path (removed in W5-07).
 
 ### Why multiple AI provider support?
 
