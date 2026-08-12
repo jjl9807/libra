@@ -24,6 +24,7 @@ use crate::internal::ai::tools::{
 pub mod config;
 pub mod mcp;
 pub mod openapi;
+pub mod resolver;
 
 pub use config::{
     SourceConfigEntry, SourceConfigLoadReport, SourceConfigOrigin, SourceConfigView,
@@ -31,6 +32,10 @@ pub use config::{
 };
 pub use mcp::{BUILTIN_MCP_SOURCE_SLUG, McpSource};
 pub use openapi::{OpenApiToolSpecError, openapi_tool_capabilities_from_fixture};
+pub use resolver::{
+    ConfigLayer, ConfigProvenance, ConfigResolveError, ResolvedConfig, ResolvedConfigDir,
+    resolve_config_dir, resolve_config_file, surface_by_location,
+};
 
 /// Source category. This stays intentionally small for Step 1.10 Phase A.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

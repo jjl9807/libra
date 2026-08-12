@@ -384,7 +384,7 @@ fn is_terminal_common_storage(path: &Path) -> bool {
         >= 2
 }
 
-fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
+pub(crate) fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     let commondir_file = gitdir.join("commondir");
     // W3-s1b (§C.7): a worktree removed from the registry with its directory
     // kept carries a `detached_from_registry` marker — every command run

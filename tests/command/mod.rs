@@ -307,6 +307,7 @@ mod cli_error_test;
 mod clone_cli_test;
 mod clone_test;
 mod cloud_test;
+mod code_agent_config_resolver_test;
 mod code_agent_linked_guard_test;
 mod code_control_files_test;
 mod code_control_help_test;

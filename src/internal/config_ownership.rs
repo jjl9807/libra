@@ -20,6 +20,19 @@
 //! launch the reading runtimes from a linked worktree, which is what makes
 //! the `WorkdirDotLibra` rows safe to keep pre-W4.
 
+/// Which consumer family migrates the surface onto the W4-06 resolver.
+///
+/// W4-06 registers the owner; W4-11 migrates Security loaders and W4-12
+/// migrates Extension/automation loaders. The field is inventory-only until
+/// those cards rewrite the call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigConsumerKind {
+    /// Sandbox / hooks / approval-adjacent security configuration.
+    Security,
+    /// Agents, automations, prompt rules/contexts, skills, commands, MCP config.
+    Extension,
+}
+
 /// Who owns a configuration surface across worktrees (§C.4.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigOwner {
@@ -75,16 +88,22 @@ pub struct ConfigSurface {
     pub kind: SurfaceKind,
     pub owner: ConfigOwner,
     pub resolution: ReadResolution,
+    /// W4-06 consumer family (Security → W4-11, Extension → W4-12).
+    pub consumer: ConfigConsumerKind,
 }
 
 /// The §C.4.1.1 registry. Rows mirror plan-20260714 lines 2268/2272/2274.
 pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
     ConfigSurface {
-        surface: "code/provider/MCP configuration ([mcp] sources included)",
+        surface: "code/provider/MCP configuration ([mcp] sources included; \
+                  [approval] is security-sensitive — W4-06 treats the whole \
+                  file as Security so overlays cannot wholesale weaken approval; \
+                  W4-11/W4-12 section-merge MCP vs approval)",
         location: "config.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "agent definitions",
@@ -92,6 +111,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
         surface: "sandbox policy (security: repository layer must never be \
@@ -100,6 +120,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::CommonStorage,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "hook runner policy (security: repository PreToolUse Block \
@@ -108,6 +129,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "automation rules (linked scope until W4: CLI fail-closed; \
@@ -116,20 +138,25 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
-        surface: "prompt rules",
+        surface: "prompt rules (security-sensitive prompt policy; repository \
+                  layer must remain visible in linked worktrees)",
         location: "rules",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
-        surface: "prompt contexts",
+        surface: "prompt contexts (security-sensitive prompt policy; repository \
+                  layer must remain visible in linked worktrees)",
         location: "contexts",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "agent definitions directory",
@@ -137,6 +164,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
         surface: "custom commands directory",
@@ -144,6 +172,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
         surface: "skills directory",
@@ -151,6 +180,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
         resolution: ReadResolution::WorkdirDotLibra,
+        consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
         surface: "executable VCS hooks directory (plan line 2272: shared \
@@ -160,6 +190,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::Repository,
         resolution: ReadResolution::CommonStorage,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "persisted Always approvals (repo-wide visibility is the \
@@ -168,6 +199,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Store,
         owner: ConfigOwner::Repository,
         resolution: ReadResolution::RepositoryDatabase,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "in-memory approval cache (W4: keyed by canonical repo id)",
@@ -175,6 +207,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Store,
         owner: ConfigOwner::Repository,
         resolution: ReadResolution::ProcessCache,
+        consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
         surface: "agent capture/export state (W4 adds workspace scope keys)",
@@ -182,6 +215,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::Store,
         owner: ConfigOwner::RepositoryWithWorkspaceSessionScope,
         resolution: ReadResolution::RepositoryDatabase,
+        consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
         surface: "publish worker-template manifest (init/status/deploy drift \
@@ -190,6 +224,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         kind: SurfaceKind::File,
         owner: ConfigOwner::Repository,
         resolution: ReadResolution::CommonStorage,
+        consumer: ConfigConsumerKind::Extension,
     },
 ];
 

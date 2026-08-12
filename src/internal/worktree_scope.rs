@@ -70,7 +70,7 @@ impl RequestScope {
     /// invocation ambient, which is what it was before any of this existed —
     /// the repository is gone either way, and the ambient path reports that
     /// with the diagnostics it always had.
-    pub(crate) fn resolve(workdir: PathBuf) -> Option<Self> {
+    pub fn resolve(workdir: PathBuf) -> Option<Self> {
         let (storage, worktree_root, gitdir) =
             util::try_get_request_paths(Some(workdir.clone())).ok()?;
         // The SCOPE comes from the gitdir this same walk produced, never from
