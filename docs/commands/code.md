@@ -168,7 +168,7 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 | Explicit v1 | `?wire=1` or `?wire=v1` |
 | Explicit v2 | `?wire=2` or `?wire=v2` |
 | Accept hint | `Accept: text/event-stream;libra-wire=2` (query `wire=` wins if both are set) |
-| Default (unspecified) | **v1** until the built-in SPA migrates in W3-09 |
+| Default (unspecified) | **v1** for clients that omit `wire` / `libra-wire`. The built-in SPA (W3-09) always requests `?wire=2`. |
 | Illegal values | fail-closed `400 INVALID_WIRE_VERSION` |
 
 **SSE v1** (default): `CodeUiEventEnvelope` records with `seq`, `type`, `at`, and
@@ -201,7 +201,11 @@ release after wire v2 becomes the default and the built-in frontend/automation
 clients have migrated. Physical removal of v1 is **not** part of plan-20260715;
 see DEFER-08 / ADR-CODE-08. Removal preconditions (checklist; all required):
 
-1. Built-in frontend migrated to v2 (W3-09 evidence).
+1. Built-in frontend migrated to v2 (W3-09 evidence): the SPA
+   opens `GET /api/code/events?wire=2` from `sse-resilience` (`wrapClientForSseResilience`),
+   reconnects with `cursor` from the wire, and treats `event: resync` /
+   `WIRE_V2_RESYNC_REQUIRED` as one explicit snapshot pull (W2-15 UI). Cursor/seq
+   are never invented client-side.
 2. Built-in automation clients migrated to v2.
 3. Compat / matrix tests consume v2 by default.
 4. Release notes name the last v1-supporting version and the upgrade path.

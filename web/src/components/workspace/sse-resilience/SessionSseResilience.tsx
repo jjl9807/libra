@@ -3,9 +3,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  allowSseSnapshotFetch,
   initialSseResilienceState,
   reduceSseResilience,
   subscribeSseDisconnect,
+  subscribeSseResync,
+  subscribeSseResyncComplete,
   type SseResilienceState,
 } from "@/lib/code-ui/sse-resilience";
 import { useCodeUiStore } from "@/lib/code-ui/store";
@@ -27,9 +30,10 @@ export interface SessionSseResilienceProps {
 
 /**
  * Observes the shared store without replacing W2-07 reconnect internals.
- * Disconnects are observed via `wrapClientForSseResilience` (page injects the
- * wrapped client). Sequence numbers come only from wire envelopes and never
- * decrease across reconnect replay (synthetic seq 0).
+ * Disconnects and W3-08 resync events are observed via
+ * `wrapClientForSseResilience` (page injects the wrapped client). Sequence
+ * numbers come only from the v2 wire cursor and never decrease across
+ * reconnect replay (synthetic seq 0).
  */
 export function SessionSseResilience({ initialState }: SessionSseResilienceProps) {
   const { snapshot, refresh, subscribe } = useCodeUiStore();
@@ -70,10 +74,34 @@ export function SessionSseResilience({ initialState }: SessionSseResilienceProps
     });
   }, [snapshot]);
 
+  useEffect(() => {
+    return subscribeSseResync((event) => {
+      setState((current) =>
+        reduceSseResilience(current, {
+          type: "backlog_overflow",
+          hint: event.reason || "SSE backlog exceeded; request an explicit snapshot resync.",
+          lastSeq: event.lastCursor,
+        }),
+      );
+    });
+  }, []);
+
+  useEffect(() => {
+    return subscribeSseResyncComplete((seq) => {
+      setState((current) =>
+        reduceSseResilience(current, {
+          type: "resync_completed",
+          seq,
+        }),
+      );
+    });
+  }, []);
+
   const onResync = useCallback(async () => {
     setBusy(true);
     setActionError(undefined);
     setState((current) => reduceSseResilience(current, { type: "resync_requested" }));
+    allowSseSnapshotFetch();
     try {
       let result = await refresh();
       // A concurrent reconnect refresh may own the first attempt — retry once.

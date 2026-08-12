@@ -167,7 +167,7 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | 显式 v1 | `?wire=1` 或 `?wire=v1` |
 | 显式 v2 | `?wire=2` 或 `?wire=v2` |
 | Accept 提示 | `Accept: text/event-stream;libra-wire=2`（若同时给出 query `wire=`，以 query 为准） |
-| 未指定默认 | **v1**，直到内置 SPA 在 W3-09 迁移 |
+| 未指定默认 | 省略 `wire` / `libra-wire` 的客户端仍为 **v1**。内置 SPA（W3-09）始终请求 `?wire=2`。 |
 | 非法值 | fail-closed `400 INVALID_WIRE_VERSION` |
 
 **SSE v1**（默认）：`CodeUiEventEnvelope` 记录，含 `seq`、`type`、`at`、`data`。事件 `type` 为 `session_updated`、`status_changed` 或 `controller_changed`；`session_updated` 携带完整 `CodeUiSessionSnapshot`。
@@ -178,7 +178,10 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 
 在 wire v2 成为默认、且内置前端/automation 客户端完成迁移之后，v1 snapshot SSE 仍至少保留一个成功的公开 patch release。v1 的物理移除**不属于** plan-20260715；见 DEFER-08 / ADR-CODE-08。移除前置条件清单（须全部满足）：
 
-1. 内置前端已迁移到 v2（W3-09 证据）。
+1. 内置前端已迁移到 v2（W3-09 证据）：SPA 经 `sse-resilience` 的
+   `wrapClientForSseResilience` 打开 `GET /api/code/events?wire=2`，用 wire cursor
+   重连，并把 `event: resync` / `WIRE_V2_RESYNC_REQUIRED` 当作一次显式 snapshot
+   拉取（复用 W2-15 UI）。cursor/序号不在客户端另行编号。
 2. 内置 automation 客户端已迁移到 v2。
 3. Compat / matrix 测试默认消费 v2。
 4. Release notes 写明最后支持 v1 的版本与升级路径。

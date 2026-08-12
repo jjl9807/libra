@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-09, 2026-08-12, v0.19.141)
+
+- **W3-09 migrates the built-in Code UI SPA to SSE wire v2.**
+  `wrapClientForSseResilience` opens `GET /api/code/events?wire=2` and
+  reconnects with the wire cursor (no full snapshot on reconnect). Backlog
+  overflow (`event: resync` / `WIRE_V2_RESYNC_REQUIRED`) triggers one
+  snapshot pull plus the W2-15 resync UI. DEFER-08 item 1 is recorded in
+  `docs/commands/code.md`.
+
 ### Added (plan-20260715 W3-15, 2026-08-12, v0.19.140)
 
 - **W3-15 adds Playwright real-browser e2e for Code UI.** `pnpm --dir web
