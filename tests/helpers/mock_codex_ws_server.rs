@@ -48,6 +48,19 @@ pub struct MockCodexWsConfig {
     /// execution gate: Libra must surface the request to the user before it
     /// replies with a resolve request.
     pub emit_turn_command_approval: bool,
+    /// When true, emit a second distinct command-execution approval after the
+    /// first one on `turn/start` (W3-07 sequential gate coverage).
+    pub emit_second_turn_command_approval: bool,
+    /// When true, emit `turn/started` (nested `turn.id`) after the approval
+    /// notification on `turn/start` so cancel-after-started can be exercised
+    /// without also completing the turn (W3-07).
+    pub emit_turn_started_after_approval: bool,
+    /// When true, `turn/start` returns an empty result (no turn id) so cancel
+    /// before `turn/started` parks `pending_cancel` (W3-07).
+    pub turn_start_omits_turn_id: bool,
+    /// When true, emit `turn/started` after a declined approval resolve so the
+    /// parked pending-cancel flush can interrupt off the WS reader (W3-07).
+    pub emit_turn_started_after_declined_approval: bool,
     /// When set, emit `turn/started` + `turn/completed` (with this status)
     /// immediately after the first `turn/start` response (W3-04).
     pub emit_turn_completed_status: Option<String>,
@@ -94,6 +107,11 @@ impl MockCodexWsServer {
             .unwrap_or_else(|| "libra-mock-thread".to_string());
         let emit_thread_started = config.emit_thread_started;
         let emit_turn_command_approval = config.emit_turn_command_approval;
+        let emit_second_turn_command_approval = config.emit_second_turn_command_approval;
+        let emit_turn_started_after_approval = config.emit_turn_started_after_approval;
+        let turn_start_omits_turn_id = config.turn_start_omits_turn_id;
+        let emit_turn_started_after_declined_approval =
+            config.emit_turn_started_after_declined_approval;
         let emit_turn_completed_status = config.emit_turn_completed_status.clone();
         let emit_unknown_notification = config.emit_unknown_notification;
         let handle = tokio::spawn(async move {
@@ -135,6 +153,13 @@ impl MockCodexWsServer {
                         let result = match method.as_str() {
                             "initialize" => json!({}),
                             "thread/start" => json!({ "thread": { "id": thread_id } }),
+                            "turn/start" => {
+                                if turn_start_omits_turn_id {
+                                    json!({})
+                                } else {
+                                    json!({ "turn": { "id": format!("mock-turn-{thread_id}") } })
+                                }
+                            }
                             _ => json!({}),
                         };
                         let response = json!({
@@ -184,6 +209,95 @@ impl MockCodexWsServer {
                                 .is_err()
                             {
                                 break;
+                            }
+                            if emit_turn_started_after_approval {
+                                let started = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "turn/started",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turn": { "id": format!("mock-turn-{thread_id}") },
+                                    },
+                                });
+                                if write
+                                    .send(Message::Text(started.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        if method == "turn/interrupt" {
+                            let interrupt_turn_id = request
+                                .pointer("/params/turnId")
+                                .or_else(|| request.pointer("/params/turn/id"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("mock-interrupted-turn");
+                            let completed = json!({
+                                "jsonrpc": "2.0",
+                                "method": "turn/completed",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "turn": { "id": interrupt_turn_id },
+                                    "status": "cancelled",
+                                },
+                            });
+                            if write
+                                .send(Message::Text(completed.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if emit_turn_started_after_declined_approval
+                            && method.ends_with("/requestApproval/resolve")
+                            && request.pointer("/params/approved").and_then(Value::as_bool)
+                                == Some(false)
+                        {
+                            let started = json!({
+                                "jsonrpc": "2.0",
+                                "method": "turn/started",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "turn": { "id": format!("mock-turn-{thread_id}") },
+                                },
+                            });
+                            if write
+                                .send(Message::Text(started.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if emit_second_turn_command_approval
+                            && method == "item/commandExecution/requestApproval/resolve"
+                        {
+                            let request_id = request
+                                .pointer("/params/requestId")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            if request_id == "codex-plan-gate-command-approval" {
+                                let second = json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "item/commandExecution/requestApproval",
+                                    "params": {
+                                        "requestId": "codex-plan-gate-command-approval-2",
+                                        "itemId": "codex-plan-gate-command-2",
+                                        "threadId": thread_id,
+                                        "command": "touch second-approval-should-also-wait",
+                                        "description": "Codex requested a second command execution",
+                                    },
+                                });
+                                if write
+                                    .send(Message::Text(second.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                         }
                         if method == "turn/start" {

@@ -1525,6 +1525,24 @@ impl AgentRuntimeWorker {
                     turn_id: turn_id.clone(),
                 })?;
             if !active.execution_in_progress {
+                // External adapter-owned turns (managed Codex) clear
+                // `execution_in_progress` while parked so cancel can settle
+                // without a live executor future. They must still accept a
+                // later gate on the same turn until `finish_external_turn`.
+                if !active.external_adapter_owned {
+                    return Err(RuntimeWorkerError::InteractionRegistrationClosed { turn_id });
+                }
+            }
+            // While a response delivery is in flight (e.g. Codex resolve ack),
+            // do not admit another gate on this turn — adapters that track a
+            // single forwarded_resolve would overwrite in-flight correlation.
+            if active.response_in_progress {
+                return Err(RuntimeWorkerError::InteractionAlreadyPending { turn_id });
+            }
+            // Once cancel has been requested, never surface another approval
+            // gate on this turn — an in-flight notification must fail closed
+            // rather than become approvable after the user cancelled.
+            if active.cancellation.is_cancelled() || active.cancel_requested_after_mutation {
                 return Err(RuntimeWorkerError::InteractionRegistrationClosed { turn_id });
             }
             if active.interaction.is_some() {

@@ -76,10 +76,13 @@ pub mod types;
 pub mod view;
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::anyhow;
@@ -88,8 +91,9 @@ use clap::Parser;
 use diffy::create_patch;
 pub use envelope::{
     NormalizedCodexEnvelope, all_known_method_kinds, apply_agent_event_kinds_to_code_ui_status,
-    method_kind_classification, normalize_codex_notification, run_status_for_turn_completed,
-    sample_method_for_kind,
+    approval_resolve_method, codex_tool_approval_interaction,
+    decision_from_code_ui_interaction_response, method_kind_classification,
+    normalize_codex_notification, run_status_for_turn_completed, sample_method_for_kind,
 };
 use futures_util::{SinkExt, StreamExt};
 use git_internal::hash::ObjectHash;
@@ -103,6 +107,7 @@ use protocol::MethodKind;
 use schema_v2::*;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 pub use types::*;
 use walkdir::WalkDir;
 
@@ -113,13 +118,14 @@ use crate::{
             mcp::server::LibraMcpServer,
             runtime::{
                 AgentRuntimeHandle, AgentRuntimeWorker, AgentRuntimeWorkerConfig,
-                ExternalTurnTrackingExecutor, InMemoryAuditSink, PlanningPromptBuilder,
-                ToolBoundaryRuntime,
+                ExternalTurnTrackingExecutor, InMemoryAuditSink, InteractionResponse,
+                InteractionState, PlanningPromptBuilder, RuntimeInteractionDelivery,
+                RuntimeTurnExecution, RuntimeWorkerError, ToolBoundaryRuntime, TurnRequest,
+                runtime_worker_adapter_message,
             },
             web::code_ui::{
-                CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter, CodeUiEventType,
-                CodeUiInitialController, CodeUiInteractionKind, CodeUiInteractionOption,
-                CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
+                CodeUiApiError, CodeUiApplyToFuture, CodeUiCapabilities, CodeUiCommandAdapter,
+                CodeUiEventType, CodeUiInitialController, CodeUiInteractionResponse,
                 CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot, CodeUiPlanStep,
                 CodeUiProviderAdapter, CodeUiProviderInfo, CodeUiReadModel, CodeUiRuntimeHandle,
                 CodeUiSession, CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot,
@@ -249,6 +255,24 @@ fn lock_or_warn<'a, T>(mutex: &'a Arc<Mutex<T>>, context: &str) -> Option<MutexG
             None
         }
     }
+}
+
+/// Whether a `turn/completed` notification should finish the tracked runtime turn.
+///
+/// Only finishes when the completed app-server turn id matches the live id.
+/// Uncorrelated terminals that arrive before `app_server_turn_id` is written are
+/// deferred separately (see `deferred_codex_terminal`).
+fn should_finish_codex_turn_completed(
+    live_app_turn: Option<&str>,
+    completed_app_server_turn: &str,
+) -> bool {
+    live_app_turn == Some(completed_app_server_turn)
+}
+
+#[derive(Clone)]
+struct DeferredCodexTerminal {
+    app_server_turn_id: String,
+    finish_result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
 }
 
 /// 返回 `HISTORY_APPEND_LOCK` 的全局单例引用。
@@ -1293,12 +1317,13 @@ fn codex_code_ui_capabilities() -> CodeUiCapabilities {
     }
 }
 
-fn codex_code_ui_status(session: &CodexSession) -> CodeUiSessionStatus {
-    if session
-        .approval_requests
-        .iter()
-        .any(|request| request.decision.is_none())
-    {
+fn codex_code_ui_status(
+    session: &CodexSession,
+    suppress_interaction_ids: &BTreeSet<String>,
+) -> CodeUiSessionStatus {
+    if session.approval_requests.iter().any(|request| {
+        request.decision.is_none() && !suppress_interaction_ids.contains(&request.id)
+    }) {
         return CodeUiSessionStatus::AwaitingInteraction;
     }
     if session
@@ -1351,6 +1376,7 @@ fn build_code_ui_snapshot_from_codex_session(
     session: &CodexSession,
     current: &CodeUiSessionSnapshot,
     working_dir: &str,
+    suppress_interaction_ids: &BTreeSet<String>,
 ) -> CodeUiSessionSnapshot {
     let active_run_ids = session
         .runs
@@ -1405,7 +1431,7 @@ fn build_code_ui_snapshot_from_codex_session(
         provider: current.provider.clone(),
         capabilities: current.capabilities.clone(),
         controller: current.controller.clone(),
-        status: codex_code_ui_status(session),
+        status: codex_code_ui_status(session, suppress_interaction_ids),
         transcript,
         plans: session
             .plans
@@ -1474,49 +1500,28 @@ fn build_code_ui_snapshot_from_codex_session(
         interactions: session
             .approval_requests
             .iter()
-            .filter(|request| request.decision.is_none())
-            .map(|request| CodeUiInteractionRequest {
-                id: request.id.clone(),
-                kind: match request.approval_type {
-                    ApprovalType::CommandExecution
-                    | ApprovalType::FileChange
-                    | ApprovalType::ApplyPatch
-                    | ApprovalType::Unknown => CodeUiInteractionKind::Approval,
-                },
-                title: Some("Approval required".to_string()),
-                description: request.description.clone(),
-                prompt: request.command.clone(),
-                options: vec![
-                    CodeUiInteractionOption {
-                        id: "approve".to_string(),
-                        label: "Approve".to_string(),
-                        description: Some("Allow this request".to_string()),
-                    },
-                    CodeUiInteractionOption {
-                        id: "approve_all".to_string(),
-                        label: "Approve All".to_string(),
-                        description: Some("Allow this and future approvals".to_string()),
-                    },
-                    CodeUiInteractionOption {
-                        id: "decline".to_string(),
-                        label: "Decline".to_string(),
-                        description: Some("Reject this request".to_string()),
-                    },
-                    CodeUiInteractionOption {
-                        id: "decline_all".to_string(),
-                        label: "Decline All".to_string(),
-                        description: Some("Reject this and future approvals".to_string()),
-                    },
-                ],
-                status: CodeUiInteractionStatus::Pending,
-                metadata: serde_json::json!({
-                    "threadId": request.thread_id,
-                    "runId": request.run_id,
-                    "changes": request.changes,
-                    "itemId": request.item_id,
-                }),
-                requested_at: request.requested_at,
-                resolved_at: request.resolved_at,
+            .filter(|request| {
+                request.decision.is_none() && !suppress_interaction_ids.contains(&request.id)
+            })
+            .map(|request| {
+                let tool_name = match request.approval_type {
+                    ApprovalType::CommandExecution => "command_execution",
+                    ApprovalType::FileChange | ApprovalType::ApplyPatch => "file_change",
+                    ApprovalType::Unknown => "tool",
+                };
+                envelope::codex_tool_approval_interaction(
+                    request.id.clone(),
+                    tool_name,
+                    request.description.clone(),
+                    request.command.clone(),
+                    serde_json::json!({
+                        "threadId": request.thread_id,
+                        "runId": request.run_id,
+                        "changes": request.changes,
+                        "itemId": request.item_id,
+                    }),
+                    request.requested_at,
+                )
             })
             .collect(),
         plan_execution_repair: current.plan_execution_repair.clone(),
@@ -1528,8 +1533,19 @@ async fn publish_code_ui_snapshot(
     code_ui_session: &Arc<CodeUiSession>,
     codex_session: &Arc<Mutex<CodexSession>>,
     working_dir: &str,
+    approval_wait_queue: Option<&Arc<Mutex<VecDeque<QueuedCodexApproval>>>>,
 ) {
-    publish_code_ui_snapshot_with_envelope(code_ui_session, codex_session, working_dir, &[]).await;
+    let suppress = approval_wait_queue
+        .map(queued_codex_approval_ids)
+        .unwrap_or_default();
+    publish_code_ui_snapshot_with_envelope(
+        code_ui_session,
+        codex_session,
+        working_dir,
+        &[],
+        &suppress,
+    )
+    .await;
 }
 
 /// Publish a Code UI snapshot after Codex websocket events have been
@@ -1538,11 +1554,14 @@ async fn publish_code_ui_snapshot(
 /// Content is hydrated from the managed Codex session mirror; lifecycle
 /// status is overlaid from `envelope_kinds` so Codex does not author a
 /// parallel status projection (W3-04).
+/// `suppress_interaction_ids` hides approvals queued behind the single
+/// runtime interaction slot so the UI cannot select an unregistered row.
 async fn publish_code_ui_snapshot_with_envelope(
     code_ui_session: &Arc<CodeUiSession>,
     codex_session: &Arc<Mutex<CodexSession>>,
     working_dir: &str,
     envelope_kinds: &[crate::internal::ai::runtime::AgentEventKind],
+    suppress_interaction_ids: &BTreeSet<String>,
 ) {
     let session = {
         let Some(session_guard) = lock_or_warn(codex_session, "publish code ui snapshot") else {
@@ -1551,13 +1570,26 @@ async fn publish_code_ui_snapshot_with_envelope(
         session_guard.clone()
     };
     let current = code_ui_session.snapshot().await;
-    let mut snapshot = build_code_ui_snapshot_from_codex_session(&session, &current, working_dir);
+    let mut snapshot = build_code_ui_snapshot_from_codex_session(
+        &session,
+        &current,
+        working_dir,
+        suppress_interaction_ids,
+    );
     if !envelope_kinds.is_empty() {
         envelope::apply_agent_event_kinds_to_code_ui_status(&mut snapshot, envelope_kinds);
     }
     code_ui_session
         .replace_snapshot(CodeUiEventType::SessionUpdated, snapshot)
         .await;
+}
+
+fn queued_codex_approval_ids(
+    queue: &Arc<Mutex<VecDeque<QueuedCodexApproval>>>,
+) -> BTreeSet<String> {
+    lock_or_warn(queue, "codex approval wait queue ids")
+        .map(|guard| guard.iter().map(|item| item.request_id.clone()).collect())
+        .unwrap_or_default()
 }
 
 async fn send_request(
@@ -1582,37 +1614,59 @@ async fn send_request(
     let msg = CodexMessage::new_request(id, method, params);
     tx.send(msg.to_json()).await.map_err(|e| e.to_string())?;
 
-    let timeout = tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
-        notify.notified().await;
-    });
+    let response_ready = || {
+        lock_or_warn(responses, "send_request response ready check")
+            .is_some_and(|guard| guard.contains_key(&id))
+    };
 
-    match timeout.await {
-        Ok(_) => {
-            let response =
-                if let Some(mut resp) = lock_or_warn(responses, "send_request response read") {
-                    resp.remove(&id)
-                } else {
-                    None
-                };
-            if let Some(response) = response {
-                if let Some(mut notifs) = lock_or_warn(notifies, "send_request notify cleanup") {
-                    notifs.remove(&id);
-                }
-                if let Some(error_obj) = response.get("error") {
-                    return Err(format!("Error: {}", error_obj));
-                }
-                return Ok(response.get("result").cloned().unwrap_or(response));
-            }
-            Err("Response not found".to_string())
+    // Race-free wait: enable() registers the waiter before the map re-check so
+    // notify_waiters() cannot fire into an unregistered Notified future.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    loop {
+        if response_ready() {
+            break;
         }
-        Err(_) => {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             if let Some(mut notifs) = lock_or_warn(notifies, "send_request notify cleanup timeout")
             {
                 notifs.remove(&id);
             }
-            Err("Timeout".to_string())
+            return Err("Timeout".to_string());
+        }
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if response_ready() {
+            break;
+        }
+        if tokio::time::timeout(remaining, notified).await.is_err() {
+            if response_ready() {
+                break;
+            }
+            if let Some(mut notifs) = lock_or_warn(notifies, "send_request notify cleanup timeout")
+            {
+                notifs.remove(&id);
+            }
+            return Err("Timeout".to_string());
         }
     }
+
+    let response = if let Some(mut resp) = lock_or_warn(responses, "send_request response read") {
+        resp.remove(&id)
+    } else {
+        None
+    };
+    if let Some(mut notifs) = lock_or_warn(notifies, "send_request notify cleanup") {
+        notifs.remove(&id);
+    }
+    if let Some(response) = response {
+        if let Some(error_obj) = response.get("error") {
+            return Err(format!("Error: {}", error_obj));
+        }
+        return Ok(response.get("result").cloned().unwrap_or(response));
+    }
+    Err("Response not found".to_string())
 }
 
 /// Bounded, queryable log of Codex-normalized runtime envelope events.
@@ -1645,6 +1699,639 @@ impl CodexEnvelopeEventLog {
 }
 
 #[derive(Clone)]
+struct CodexForwardedResolve {
+    request_id: String,
+    resolve_method: String,
+}
+
+/// App-server approvals waiting for the single runtime interaction slot.
+/// This is a registration queue only — decisions still flow through
+/// `AgentRuntime` + `CodexAppServerApprovalDelivery` (no second SM).
+#[derive(Clone, Debug)]
+struct QueuedCodexApproval {
+    request_id: String,
+    resolve_method: String,
+    turn_id: String,
+    tool_name: String,
+}
+
+async fn finish_tracked_codex_turn_after_completed(
+    envelope_runtime: &AgentRuntimeHandle,
+    runtime_session_id: &str,
+    tracked_turn_id: &Arc<Mutex<Option<String>>>,
+    app_server_turn_id: &Arc<Mutex<Option<String>>>,
+    pending_cancel: &Arc<Mutex<Option<String>>>,
+    mutation_started: &Arc<AtomicBool>,
+    approval_wait_queue: &Arc<Mutex<VecDeque<QueuedCodexApproval>>>,
+    tx: &mpsc::Sender<String>,
+    responses: &Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
+    notifies: &Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
+    codex_session: &Arc<Mutex<CodexSession>>,
+    forwarded_resolve: &Arc<Mutex<Option<CodexForwardedResolve>>>,
+    finish_turn_id: String,
+    run_id: String,
+    finish_result: Result<RuntimeTurnExecution, RuntimeWorkerError>,
+) {
+    if let Err(error) = envelope_runtime
+        .finish_external_turn(
+            runtime_session_id.to_string(),
+            finish_turn_id.clone(),
+            finish_result,
+        )
+        .await
+    {
+        tracing::warn!(
+            target: "libra::internal::ai::codex",
+            turn_id = %finish_turn_id,
+            app_server_turn_id = %run_id,
+            %error,
+            "failed to finish Codex app-server turn on AgentRuntime"
+        );
+    }
+    if let Some(mut tracked_slot) = lock_or_warn(tracked_turn_id, "codex tracked turn id clear") {
+        *tracked_slot = None;
+    }
+    if let Some(mut app_turn) = lock_or_warn(app_server_turn_id, "codex app-server turn id clear") {
+        *app_turn = None;
+    }
+    if let Some(mut pending) = lock_or_warn(
+        pending_cancel,
+        "codex clear pending cancel on turn completed",
+    ) {
+        *pending = None;
+    }
+    mutation_started.store(false, Ordering::Release);
+    drain_and_decline_queued_codex_approvals(
+        approval_wait_queue,
+        tx,
+        responses,
+        notifies,
+        Some(codex_session),
+    );
+    if let Some(mut session) = lock_or_warn(
+        codex_session,
+        "codex resolve open approvals on turn completed",
+    ) {
+        resolve_open_codex_approvals_on_turn_end(&mut session);
+    }
+    if let Some(mut slot) = lock_or_warn(
+        forwarded_resolve,
+        "clear forwarded resolve on turn completed",
+    ) {
+        *slot = None;
+    }
+}
+
+async fn flush_deferred_codex_terminal_if_matches(
+    deferred_codex_terminal: &Arc<Mutex<Option<DeferredCodexTerminal>>>,
+    envelope_runtime: &AgentRuntimeHandle,
+    runtime_session_id: &str,
+    tracked_turn_id: &Arc<Mutex<Option<String>>>,
+    app_server_turn_id: &Arc<Mutex<Option<String>>>,
+    pending_cancel: &Arc<Mutex<Option<String>>>,
+    mutation_started: &Arc<AtomicBool>,
+    approval_wait_queue: &Arc<Mutex<VecDeque<QueuedCodexApproval>>>,
+    tx: &mpsc::Sender<String>,
+    responses: &Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
+    notifies: &Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
+    codex_session: &Arc<Mutex<CodexSession>>,
+    forwarded_resolve: &Arc<Mutex<Option<CodexForwardedResolve>>>,
+    newly_known_app_turn_id: &str,
+) {
+    let deferred = lock_or_warn(deferred_codex_terminal, "codex take deferred terminal").and_then(
+        |mut slot| match slot.as_ref() {
+            Some(item) if item.app_server_turn_id == newly_known_app_turn_id => slot.take(),
+            Some(_) => {
+                *slot = None;
+                None
+            }
+            None => None,
+        },
+    );
+    let Some(deferred) = deferred else {
+        return;
+    };
+    let tracked = lock_or_warn(tracked_turn_id, "codex tracked for deferred flush")
+        .and_then(|guard| guard.clone());
+    let finish_turn_id = tracked.unwrap_or_else(|| deferred.app_server_turn_id.clone());
+    finish_tracked_codex_turn_after_completed(
+        envelope_runtime,
+        runtime_session_id,
+        tracked_turn_id,
+        app_server_turn_id,
+        pending_cancel,
+        mutation_started,
+        approval_wait_queue,
+        tx,
+        responses,
+        notifies,
+        codex_session,
+        forwarded_resolve,
+        finish_turn_id,
+        deferred.app_server_turn_id,
+        deferred.finish_result,
+    )
+    .await;
+}
+
+/// Forwards one browser/automation decision to the Codex app-server. The
+/// sidecar AgentRuntime owns the pending interaction; this delivery is not a
+/// second state machine.
+struct CodexAppServerApprovalDelivery {
+    request_id: String,
+    resolve_method: String,
+    tx: mpsc::Sender<String>,
+    responses: Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
+    notifies: Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
+    thread_id: Arc<Mutex<String>>,
+    app_server_turn_id: Arc<Mutex<Option<String>>>,
+    tracked_turn_id: Arc<Mutex<Option<String>>>,
+    codex_session: Arc<Mutex<CodexSession>>,
+    browser_session: Arc<CodeUiSession>,
+    working_dir: String,
+    approval_mode: Arc<Mutex<String>>,
+    forwarded_resolve: Arc<Mutex<Option<CodexForwardedResolve>>>,
+    approval_wait_queue: Arc<Mutex<VecDeque<QueuedCodexApproval>>>,
+    envelope_runtime: AgentRuntimeHandle,
+    runtime_session_id: String,
+    pending_cancel: Arc<Mutex<Option<String>>>,
+    mutation_started: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeInteractionDelivery for CodexAppServerApprovalDelivery {
+    fn validate(&self, interaction: &InteractionResponse) -> Result<(), RuntimeWorkerError> {
+        if interaction.interaction_id != self.request_id {
+            return Err(RuntimeWorkerError::UnknownInteraction {
+                turn_id: String::new(),
+                interaction_id: interaction.interaction_id.clone(),
+            });
+        }
+        let response: CodeUiInteractionResponse = serde_json::from_str(&interaction.response)
+            .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+        envelope::decision_from_code_ui_interaction_response(&response)
+            .map(|_| ())
+            .map_err(RuntimeWorkerError::ExecutionFailed)
+    }
+
+    async fn deliver(
+        self: Box<Self>,
+        _request: TurnRequest,
+        interaction: InteractionResponse,
+        context: crate::internal::ai::runtime::RuntimeExecutionContext,
+    ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        if context.cancellation().is_cancelled() {
+            return Err(RuntimeWorkerError::Cancelled);
+        }
+        let response: CodeUiInteractionResponse = serde_json::from_str(&interaction.response)
+            .map_err(|error| RuntimeWorkerError::ExecutionFailed(error.to_string()))?;
+        let (approved, apply_to_future, abort_turn) =
+            envelope::decision_from_code_ui_interaction_response(&response)
+                .map_err(RuntimeWorkerError::ExecutionFailed)?;
+        // Approving a command/file-change may execute immediately on the
+        // app-server even if the JSON-RPC ack is lost. Mark before send so a
+        // timeout/error is reconciliation, not a safe failure.
+        if approved {
+            context.mark_mutation_started();
+            self.mutation_started.store(true, Ordering::Release);
+        }
+        if let Err(error) = forward_codex_approval_resolve(
+            &self.tx,
+            &self.responses,
+            &self.notifies,
+            &self.resolve_method,
+            &self.request_id,
+            approved,
+        )
+        .await
+        {
+            // Ack was not observed. Keep tracked ids until turn/completed when
+            // an approve (or prior mutation) may already be executing. Pure
+            // deny/abort before mutation is retryable.
+            if let Some(mut slot) = lock_or_warn(
+                &self.forwarded_resolve,
+                "clear forwarded after forward fail",
+            ) && slot
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == self.request_id)
+            {
+                *slot = None;
+            }
+            let may_have_mutated = approved || self.mutation_started.load(Ordering::Acquire);
+            if may_have_mutated {
+                return Err(RuntimeWorkerError::IndeterminateSideEffect(format!(
+                    "Codex approval resolve was sent but not acknowledged: {error}"
+                )));
+            }
+            return Err(RuntimeWorkerError::ExecutionFailed(format!(
+                "Codex approval denial was not acknowledged; retry the response: {error}"
+            )));
+        }
+        // Only persist apply-to-future after a successful resolve ack so a
+        // timed-out AcceptAll cannot auto-approve later gates while fenced.
+        if let Some(apply_to_future) = apply_to_future
+            && let Some(mut approval_mode) =
+                lock_or_warn(&self.approval_mode, "codex forwarded approval mode write")
+        {
+            *approval_mode = match apply_to_future {
+                CodeUiApplyToFuture::No => "ask".to_string(),
+                CodeUiApplyToFuture::AcceptAll => "accept".to_string(),
+                CodeUiApplyToFuture::DeclineAll => "decline".to_string(),
+            };
+        }
+        if let Some(mut session) =
+            lock_or_warn(&self.codex_session, "codex forwarded approval resolve")
+            && let Some(approval) = session
+                .approval_requests
+                .iter_mut()
+                .find(|approval| approval.id == self.request_id)
+        {
+            approval.decision = Some(approved);
+            approval.resolved_at = Some(Utc::now());
+        }
+        if let Some(mut slot) =
+            lock_or_warn(&self.forwarded_resolve, "clear forwarded Codex resolve")
+            && slot
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == self.request_id)
+        {
+            *slot = None;
+        }
+        publish_code_ui_snapshot(
+            &self.browser_session,
+            &self.codex_session,
+            &self.working_dir,
+            Some(&self.approval_wait_queue),
+        )
+        .await;
+        if abort_turn {
+            // Prefer a real app-server turn id. Synthetic tracked ids (early
+            // approval / provisional park) cannot interrupt Codex; park the
+            // cancel until turn/started provides the real id (same as cancel_turn).
+            let interrupt_id = lock_or_warn(&self.app_server_turn_id, "codex abort app turn")
+                .and_then(|guard| guard.clone());
+            if let Some(interrupt_id) = interrupt_id {
+                let thread_id = lock_or_warn(&self.thread_id, "codex abort thread id")
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                forward_codex_turn_interrupt(
+                    &self.tx,
+                    &self.responses,
+                    &self.notifies,
+                    &thread_id,
+                    &interrupt_id,
+                )
+                .await?;
+                // Request runtime cancel; keep tracked_turn_id until
+                // turn/completed so finish_external_turn still matches.
+                if let Some(tracked) =
+                    lock_or_warn(&self.tracked_turn_id, "codex abort tracked turn")
+                        .and_then(|guard| guard.clone())
+                {
+                    let _ = self
+                        .envelope_runtime
+                        .cancel(self.runtime_session_id.clone(), tracked)
+                        .await;
+                    if let Some(mut pending) =
+                        lock_or_warn(&self.pending_cancel, "codex abort clear pending cancel")
+                    {
+                        *pending = None;
+                    }
+                }
+            } else if let Some(tracked) =
+                lock_or_warn(&self.tracked_turn_id, "codex abort park pending cancel")
+                    .and_then(|guard| guard.clone())
+                && let Some(mut pending) = lock_or_warn(
+                    &self.pending_cancel,
+                    "codex abort park pending cancel write",
+                )
+            {
+                *pending = Some(tracked);
+            }
+            // Abort ends the turn — do not promote queued gates for a turn the
+            // user explicitly aborted.
+            drain_and_decline_queued_codex_approvals(
+                &self.approval_wait_queue,
+                &self.tx,
+                &self.responses,
+                &self.notifies,
+                Some(&self.codex_session),
+            );
+            publish_code_ui_snapshot(
+                &self.browser_session,
+                &self.codex_session,
+                &self.working_dir,
+                Some(&self.approval_wait_queue),
+            )
+            .await;
+        } else {
+            // `deliver` still runs under `response_in_progress`; promote after
+            // the worker clears that flag so registration is not requeued forever.
+            let seed = CodexAppServerApprovalDelivery {
+                request_id: self.request_id.clone(),
+                resolve_method: self.resolve_method.clone(),
+                tx: self.tx.clone(),
+                responses: self.responses.clone(),
+                notifies: self.notifies.clone(),
+                thread_id: self.thread_id.clone(),
+                app_server_turn_id: self.app_server_turn_id.clone(),
+                tracked_turn_id: self.tracked_turn_id.clone(),
+                codex_session: self.codex_session.clone(),
+                browser_session: self.browser_session.clone(),
+                working_dir: self.working_dir.clone(),
+                approval_mode: self.approval_mode.clone(),
+                forwarded_resolve: self.forwarded_resolve.clone(),
+                approval_wait_queue: self.approval_wait_queue.clone(),
+                envelope_runtime: self.envelope_runtime.clone(),
+                runtime_session_id: self.runtime_session_id.clone(),
+                pending_cancel: self.pending_cancel.clone(),
+                mutation_started: self.mutation_started.clone(),
+            };
+            tokio::spawn(async move {
+                for _ in 0..80 {
+                    let pending = lock_or_warn(
+                        &seed.approval_wait_queue,
+                        "codex approval wait queue len before promote",
+                    )
+                    .map(|queue| queue.len())
+                    .unwrap_or(0);
+                    if pending == 0 {
+                        return;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+                    promote_next_queued_codex_approval(&seed).await;
+                    let remaining = lock_or_warn(
+                        &seed.approval_wait_queue,
+                        "codex approval wait queue len after promote",
+                    )
+                    .map(|queue| queue.len())
+                    .unwrap_or(0);
+                    if remaining < pending {
+                        return;
+                    }
+                }
+                tracing::warn!(
+                    target: "libra::internal::ai::codex",
+                    "queued Codex approval was not promoted after response settlement"
+                );
+            });
+        }
+        Ok(RuntimeTurnExecution::InteractionResponseDelivered)
+    }
+}
+
+async fn promote_next_queued_codex_approval(seed: &CodexAppServerApprovalDelivery) {
+    loop {
+        let next = match lock_or_warn(
+            &seed.approval_wait_queue,
+            "codex approval wait queue promote",
+        )
+        .and_then(|mut queue| queue.pop_front())
+        {
+            Some(next) => next,
+            None => return,
+        };
+        let delivery = Box::new(CodexAppServerApprovalDelivery {
+            request_id: next.request_id.clone(),
+            resolve_method: next.resolve_method.clone(),
+            tx: seed.tx.clone(),
+            responses: seed.responses.clone(),
+            notifies: seed.notifies.clone(),
+            thread_id: seed.thread_id.clone(),
+            app_server_turn_id: seed.app_server_turn_id.clone(),
+            tracked_turn_id: seed.tracked_turn_id.clone(),
+            codex_session: seed.codex_session.clone(),
+            browser_session: seed.browser_session.clone(),
+            working_dir: seed.working_dir.clone(),
+            approval_mode: seed.approval_mode.clone(),
+            forwarded_resolve: seed.forwarded_resolve.clone(),
+            approval_wait_queue: seed.approval_wait_queue.clone(),
+            envelope_runtime: seed.envelope_runtime.clone(),
+            runtime_session_id: seed.runtime_session_id.clone(),
+            pending_cancel: seed.pending_cancel.clone(),
+            mutation_started: seed.mutation_started.clone(),
+        });
+        match seed
+            .envelope_runtime
+            .register_interaction_with_delivery(
+                seed.runtime_session_id.clone(),
+                next.turn_id.clone(),
+                InteractionState::AwaitingToolApproval {
+                    interaction_id: next.request_id.clone(),
+                    tool_name: next.tool_name.clone(),
+                },
+                delivery,
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Some(mut slot) = lock_or_warn(
+                    &seed.forwarded_resolve,
+                    "codex forwarded resolve after promote",
+                ) {
+                    *slot = Some(CodexForwardedResolve {
+                        request_id: next.request_id.clone(),
+                        resolve_method: next.resolve_method.clone(),
+                    });
+                }
+                publish_code_ui_snapshot(
+                    &seed.browser_session,
+                    &seed.codex_session,
+                    &seed.working_dir,
+                    Some(&seed.approval_wait_queue),
+                )
+                .await;
+                return;
+            }
+            Err(RuntimeWorkerError::InteractionAlreadyPending { .. }) => {
+                if let Some(mut queue) = lock_or_warn(
+                    &seed.approval_wait_queue,
+                    "codex approval wait queue requeue",
+                ) {
+                    queue.push_front(next);
+                }
+                return;
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "libra::internal::ai::codex",
+                    request_id = %next.request_id,
+                    %error,
+                    "failed to promote queued Codex approval; declining fail-closed"
+                );
+                if let Some(mut session) =
+                    lock_or_warn(&seed.codex_session, "codex promote failure resolve")
+                    && let Some(approval) = session
+                        .approval_requests
+                        .iter_mut()
+                        .find(|approval| approval.id == next.request_id)
+                {
+                    approval.decision = Some(false);
+                    approval.resolved_at = Some(Utc::now());
+                }
+                let tx = seed.tx.clone();
+                let responses = seed.responses.clone();
+                let notifies = seed.notifies.clone();
+                let resolve_method = next.resolve_method.clone();
+                let request_id = next.request_id.clone();
+                tokio::spawn(async move {
+                    if let Err(forward_error) = forward_codex_approval_resolve(
+                        &tx,
+                        &responses,
+                        &notifies,
+                        &resolve_method,
+                        &request_id,
+                        false,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            target: "libra::internal::ai::codex",
+                            request_id = %request_id,
+                            %forward_error,
+                            "fail-closed decline for queued Codex approval could not reach app-server"
+                        );
+                    }
+                });
+                publish_code_ui_snapshot(
+                    &seed.browser_session,
+                    &seed.codex_session,
+                    &seed.working_dir,
+                    Some(&seed.approval_wait_queue),
+                )
+                .await;
+                // Try the next queued approval.
+            }
+        }
+    }
+}
+
+fn drain_and_decline_queued_codex_approvals(
+    queue: &Arc<Mutex<VecDeque<QueuedCodexApproval>>>,
+    tx: &mpsc::Sender<String>,
+    responses: &Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
+    notifies: &Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
+    codex_session: Option<&Arc<Mutex<CodexSession>>>,
+) {
+    let pending: Vec<QueuedCodexApproval> = lock_or_warn(queue, "codex approval wait queue drain")
+        .map(|mut guard| guard.drain(..).collect())
+        .unwrap_or_default();
+    for next in pending {
+        if let Some(session_arc) = codex_session
+            && let Some(mut session) =
+                lock_or_warn(session_arc, "codex drain queued approval resolve")
+            && let Some(approval) = session
+                .approval_requests
+                .iter_mut()
+                .find(|approval| approval.id == next.request_id)
+        {
+            approval.decision = Some(false);
+            approval.resolved_at = Some(Utc::now());
+        }
+        let tx = tx.clone();
+        let responses = responses.clone();
+        let notifies = notifies.clone();
+        let resolve_method = next.resolve_method;
+        let request_id = next.request_id;
+        tokio::spawn(async move {
+            if let Err(forward_error) = forward_codex_approval_resolve(
+                &tx,
+                &responses,
+                &notifies,
+                &resolve_method,
+                &request_id,
+                false,
+            )
+            .await
+            {
+                tracing::error!(
+                    target: "libra::internal::ai::codex",
+                    request_id = %request_id,
+                    %forward_error,
+                    "fail-closed decline for drained Codex approval could not reach app-server"
+                );
+            }
+        });
+    }
+}
+
+fn resolve_open_codex_approvals_on_turn_end(session: &mut CodexSession) {
+    let now = Utc::now();
+    for approval in &mut session.approval_requests {
+        if approval.decision.is_none() {
+            approval.decision = Some(false);
+            approval.resolved_at = Some(now);
+        }
+    }
+}
+
+async fn forward_codex_approval_resolve(
+    tx: &mpsc::Sender<String>,
+    responses: &Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
+    notifies: &Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
+    resolve_method: &str,
+    request_id: &str,
+    approved: bool,
+) -> Result<(), RuntimeWorkerError> {
+    send_request(
+        tx,
+        responses,
+        notifies,
+        resolve_method,
+        serde_json::json!({
+            "requestId": request_id,
+            "approved": approved,
+        }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        tracing::error!(
+            target: "libra::internal::ai::codex",
+            request_id,
+            resolve_method,
+            approved,
+            %error,
+            "failed to forward Codex approval resolve to app-server"
+        );
+        RuntimeWorkerError::ExecutionFailed(format!(
+            "failed to forward Codex approval resolve for '{request_id}' to the app-server: {error}"
+        ))
+    })
+}
+
+async fn forward_codex_turn_interrupt(
+    tx: &mpsc::Sender<String>,
+    responses: &Arc<Mutex<std::collections::HashMap<u64, serde_json::Value>>>,
+    notifies: &Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<(), RuntimeWorkerError> {
+    if thread_id.is_empty() {
+        return Err(RuntimeWorkerError::ExecutionFailed(
+            "cannot interrupt Codex turn without a thread id".to_string(),
+        ));
+    }
+    send_request(
+        tx,
+        responses,
+        notifies,
+        "turn/interrupt",
+        serde_json::json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+        }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        RuntimeWorkerError::ExecutionFailed(format!(
+            "failed to interrupt Codex turn '{turn_id}': {error}"
+        ))
+    })
+}
+
+#[derive(Clone)]
 struct CodexCodeUiAdapter {
     browser_session: Arc<CodeUiSession>,
     /// Sidecar AgentRuntime that owns the shared AgentEvent envelope stream.
@@ -1656,9 +2343,23 @@ struct CodexCodeUiAdapter {
     notifies: Arc<Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Notify>>>>,
     thread_id: Arc<Mutex<String>>,
     approval_mode: Arc<Mutex<String>>,
-    /// Ask-mode waiters keyed by Codex request id until browser respond
-    /// (full AgentRuntime interaction ownership stays W3-07).
-    pending_approvals: Arc<AsyncMutex<HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+    codex_session: Arc<Mutex<CodexSession>>,
+    working_dir: String,
+    runtime_session_id: String,
+    /// App-server turn currently tracked on the envelope sidecar (W3-07).
+    tracked_turn_id: Arc<Mutex<Option<String>>>,
+    /// Real app-server turn id when it differs from a lazily parked approval id.
+    app_server_turn_id: Arc<Mutex<Option<String>>>,
+    /// Terminal that arrived before `app_server_turn_id` was written.
+    deferred_codex_terminal: Arc<Mutex<Option<DeferredCodexTerminal>>>,
+    /// Tracked turn id for which cancel is parked until turn/started.
+    pending_cancel: Arc<Mutex<Option<String>>>,
+    /// Shared mutation fence for adapter-owned Codex turns.
+    mutation_started: Arc<AtomicBool>,
+    /// Concurrent app-server approvals waiting for the runtime interaction slot.
+    approval_wait_queue: Arc<Mutex<VecDeque<QueuedCodexApproval>>>,
+    /// App-server resolve correlation for the in-flight forwarded approval.
+    forwarded_resolve: Arc<Mutex<Option<CodexForwardedResolve>>>,
 }
 
 impl CodexCodeUiAdapter {
@@ -1707,7 +2408,50 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
                 _ => serde_json::json!("on-request"),
             };
 
-        send_request(
+        // Admit the runtime turn before turn/start so the WS reader can finish
+        // an immediate turn/completed without racing a post-response track.
+        let provisional_id = format!("codex-pending-{}", Utc::now().timestamp_millis());
+        let already_tracked =
+            lock_or_warn(&self.tracked_turn_id, "codex tracked turn before start")
+                .and_then(|guard| guard.clone());
+        if already_tracked.is_some() {
+            return Err(anyhow!(CodeUiApiError::conflict(
+                "TURN_ALREADY_ACTIVE",
+                "a Codex turn is already in progress; wait for it to finish or cancel first"
+            )));
+        }
+        self.mutation_started.store(false, Ordering::Release);
+        if let Some(mut deferred) = lock_or_warn(
+            &self.deferred_codex_terminal,
+            "codex clear deferred terminal on submit",
+        ) {
+            *deferred = None;
+        }
+        self.envelope_runtime
+            .track_external_turn(
+                TurnRequest::new(
+                    self.runtime_session_id.clone(),
+                    provisional_id.clone(),
+                    "codex app-server turn",
+                    true,
+                ),
+                CancellationToken::new(),
+                self.mutation_started.clone(),
+            )
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to track Codex turn before turn/start: {}",
+                    runtime_worker_adapter_message(error)
+                )
+            })?;
+        if let Some(mut tracked) =
+            lock_or_warn(&self.tracked_turn_id, "codex tracked turn id before start")
+        {
+            *tracked = Some(provisional_id.clone());
+        }
+
+        let result = match send_request(
             &self.tx,
             &self.responses,
             &self.notifies,
@@ -1719,8 +2463,71 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
             }),
         )
         .await
-        .map(|_| ())
-        .map_err(|error| anyhow!(error))
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // Only finish the provisional turn created by *this* submit.
+                let tracked = lock_or_warn(&self.tracked_turn_id, "codex tracked after start fail")
+                    .and_then(|mut guard| {
+                        if guard.as_ref() == Some(&provisional_id) {
+                            guard.take()
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(tracked) = tracked {
+                    let _ = self
+                        .envelope_runtime
+                        .finish_external_turn(
+                            self.runtime_session_id.clone(),
+                            tracked,
+                            Err(RuntimeWorkerError::Cancelled),
+                        )
+                        .await;
+                }
+                return Err(anyhow!(error));
+            }
+        };
+
+        let turn_id_from_result = result
+            .pointer("/turn/id")
+            .or_else(|| result.get("turnId"))
+            .or_else(|| result.pointer("/turnId"))
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        // turn/completed may clear ids while we await turn/start's response.
+        // Only record the app-server id when *this* submit's provisional track
+        // is still active — never revive a completed turn id for a later cancel.
+        let still_this_submit =
+            lock_or_warn(&self.tracked_turn_id, "codex tracked turn after start")
+                .is_some_and(|guard| guard.as_ref() == Some(&provisional_id));
+        if still_this_submit && let Some(app_turn_id) = turn_id_from_result {
+            if let Some(mut app_turn) = lock_or_warn(
+                &self.app_server_turn_id,
+                "codex app-server turn after start",
+            ) {
+                *app_turn = Some(app_turn_id.clone());
+            }
+            flush_deferred_codex_terminal_if_matches(
+                &self.deferred_codex_terminal,
+                &self.envelope_runtime,
+                &self.runtime_session_id,
+                &self.tracked_turn_id,
+                &self.app_server_turn_id,
+                &self.pending_cancel,
+                &self.mutation_started,
+                &self.approval_wait_queue,
+                &self.tx,
+                &self.responses,
+                &self.notifies,
+                &self.codex_session,
+                &self.forwarded_resolve,
+                &app_turn_id,
+            )
+            .await;
+        }
+        Ok(())
     }
 
     async fn respond_interaction(
@@ -1728,40 +2535,174 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
         interaction_id: &str,
         response: CodeUiInteractionResponse,
     ) -> anyhow::Result<()> {
-        // Validate the decision and locate the pending sender BEFORE mutating
-        // shared `approval_mode`. Otherwise a malformed response (no decision,
-        // unknown interaction id, or already-resolved approval) would still
-        // flip future Codex approvals to accept-all / decline-all.
-        let Some(approved) = response
-            .approved
-            .or(match response.selected_option.as_deref() {
-                Some("approve") | Some("approve_all") => Some(true),
-                Some("decline") | Some("decline_all") => Some(false),
-                _ => None,
+        envelope::decision_from_code_ui_interaction_response(&response)
+            .map_err(|reason| anyhow!(reason))?;
+        let turn_id = lock_or_warn(&self.tracked_turn_id, "codex tracked turn id read")
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| {
+                anyhow!(CodeUiApiError::conflict(
+                    "INTERACTION_NOT_ACTIVE",
+                    format!(
+                        "interaction '{interaction_id}' has no active Codex turn to receive a response"
+                    )
+                ))
+            })?;
+        let payload = serde_json::to_string(&response)
+            .map_err(|error| anyhow!("failed to encode interaction response: {error}"))?;
+        self.envelope_runtime
+            .respond(
+                self.runtime_session_id.clone(),
+                turn_id,
+                InteractionResponse::new(interaction_id, payload),
+            )
+            .await
+            .map_err(|error| match error {
+                RuntimeWorkerError::UnknownInteraction { interaction_id, .. } => {
+                    anyhow!(CodeUiApiError::conflict(
+                        "INTERACTION_NOT_ACTIVE",
+                        format!("interaction '{interaction_id}' is not pending")
+                    ))
+                }
+                other => anyhow!(
+                    "AgentRuntime rejected the Codex interaction response: {}",
+                    runtime_worker_adapter_message(other)
+                ),
             })
-        else {
-            return Err(anyhow!("Codex approvals require an explicit decision"));
+    }
+
+    async fn cancel_turn(&self) -> anyhow::Result<()> {
+        let turn_id = lock_or_warn(&self.tracked_turn_id, "codex tracked turn id cancel")
+            .and_then(|guard| guard.clone());
+        let forwarded = lock_or_warn(&self.forwarded_resolve, "codex forwarded resolve cancel")
+            .and_then(|mut slot| slot.take());
+        let declined_pending_approval = forwarded.is_some();
+        if let Some(forwarded) = forwarded {
+            // Fire-and-forget decline: interrupt must not wait on resolve ack.
+            let tx = self.tx.clone();
+            let responses = self.responses.clone();
+            let notifies = self.notifies.clone();
+            let resolve_method = forwarded.resolve_method.clone();
+            let request_id = forwarded.request_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = forward_codex_approval_resolve(
+                    &tx,
+                    &responses,
+                    &notifies,
+                    &resolve_method,
+                    &request_id,
+                    false,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "libra::internal::ai::codex",
+                        request_id = %request_id,
+                        %error,
+                        "Codex approval decline during cancel was not acknowledged; interrupt proceeds independently"
+                    );
+                }
+            });
+            if let Some(mut session) =
+                lock_or_warn(&self.codex_session, "codex cancel approval resolve")
+                && let Some(approval) = session
+                    .approval_requests
+                    .iter_mut()
+                    .find(|approval| approval.id == forwarded.request_id)
+            {
+                approval.decision = Some(false);
+                approval.resolved_at = Some(Utc::now());
+            }
+            publish_code_ui_snapshot(
+                &self.browser_session,
+                &self.codex_session,
+                &self.working_dir,
+                Some(&self.approval_wait_queue),
+            )
+            .await;
+        }
+        drain_and_decline_queued_codex_approvals(
+            &self.approval_wait_queue,
+            &self.tx,
+            &self.responses,
+            &self.notifies,
+            Some(&self.codex_session),
+        );
+        let Some(turn_id) = turn_id else {
+            return Err(anyhow!(CodeUiApiError::conflict(
+                "INTERACTION_NOT_ACTIVE",
+                "no active Codex turn to cancel"
+            )));
         };
-
-        let sender = {
-            let mut pending = self.pending_approvals.lock().await;
-            pending.remove(interaction_id)
+        let thread_id = lock_or_warn(&self.thread_id, "codex thread id cancel")
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let app_server_turn_id =
+            lock_or_warn(&self.app_server_turn_id, "codex app-server turn cancel")
+                .and_then(|guard| guard.clone());
+        if let Some(interrupt_turn_id) = app_server_turn_id {
+            // Real app-server turn is live: interrupt must succeed before UI ack.
+            forward_codex_turn_interrupt(
+                &self.tx,
+                &self.responses,
+                &self.notifies,
+                &thread_id,
+                &interrupt_turn_id,
+            )
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to interrupt Codex app-server turn: {}",
+                    runtime_worker_adapter_message(error)
+                )
+            })?;
+        } else {
+            // Declining an early approval does not prove the app-server turn
+            // has stopped. Park the cancel for *this* tracked turn until
+            // turn/started provides a real id.
+            if let Some(mut pending) =
+                lock_or_warn(&self.pending_cancel, "codex park pending cancel")
+            {
+                *pending = Some(turn_id.clone());
+            }
+            return Err(anyhow!(CodeUiApiError::conflict(
+                "TURN_INTERRUPT_PENDING",
+                if declined_pending_approval {
+                    "approval was declined; cancel will interrupt the Codex turn once turn/started arrives"
+                } else {
+                    "Codex app-server turn id is not known yet; cancel after turn/started"
+                }
+            )));
         }
-        .ok_or_else(|| anyhow!("Unknown pending approval: {interaction_id}"))?;
-        sender
-            .send(approved)
-            .map_err(|_| anyhow!("The pending approval is no longer awaiting a response"))?;
-
-        if let Some(apply_to_future) = response.apply_to_future.as_ref()
-            && let Some(mut approval_mode) =
-                lock_or_warn(&self.approval_mode, "codex code ui approval mode write")
+        if let Some(mut pending) = lock_or_warn(
+            &self.pending_cancel,
+            "codex clear pending cancel after interrupt",
+        ) {
+            *pending = None;
+        }
+        match self
+            .envelope_runtime
+            .cancel(self.runtime_session_id.clone(), turn_id.clone())
+            .await
         {
-            *approval_mode = match apply_to_future {
-                CodeUiApplyToFuture::No => "ask".to_string(),
-                CodeUiApplyToFuture::AcceptAll => "accept".to_string(),
-                CodeUiApplyToFuture::DeclineAll => "decline".to_string(),
-            };
+            Ok(()) => {}
+            Err(RuntimeWorkerError::UnknownTurn { .. }) => {
+                // turn/completed can remove the external turn before this
+                // cancel lands; interrupt already succeeded on the app-server.
+                tracing::debug!(
+                    target: "libra::internal::ai::codex",
+                    %turn_id,
+                    "AgentRuntime turn already terminal after Codex interrupt; treating cancel as success"
+                );
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "AgentRuntime rejected Codex turn cancel: {}",
+                    runtime_worker_adapter_message(error)
+                ));
+            }
         }
+        // Interrupt ack is not a terminal event. Keep tracked/app-server ids
+        // until turn/completed so a follow-up submit cannot overlap.
         Ok(())
     }
 
@@ -1810,10 +2751,13 @@ pub async fn start_code_ui_runtime(
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let thread_id = Arc::new(Mutex::new(String::new()));
     let approval_mode = Arc::new(Mutex::new(args.approval.clone()));
-    let pending_approvals = Arc::new(AsyncMutex::new(HashMap::<
-        String,
-        tokio::sync::oneshot::Sender<bool>,
-    >::new()));
+    let tracked_turn_id = Arc::new(Mutex::new(None::<String>));
+    let app_server_turn_id = Arc::new(Mutex::new(None::<String>));
+    let deferred_codex_terminal = Arc::new(Mutex::new(None::<DeferredCodexTerminal>));
+    let pending_cancel = Arc::new(Mutex::new(None::<String>));
+    let mutation_started = Arc::new(AtomicBool::new(false));
+    let approval_wait_queue = Arc::new(Mutex::new(VecDeque::<QueuedCodexApproval>::new()));
+    let forwarded_resolve = Arc::new(Mutex::new(None::<CodexForwardedResolve>));
 
     let browser_session = CodeUiSession::new(initial_snapshot(
         args.cwd.clone(),
@@ -1964,7 +2908,7 @@ pub async fn start_code_ui_runtime(
             .collect();
     }
 
-    publish_code_ui_snapshot(&browser_session, &codex_session, &args.cwd).await;
+    publish_code_ui_snapshot(&browser_session, &codex_session, &args.cwd, None).await;
 
     // Sidecar AgentRuntime owns the shared AgentEvent envelope stream for
     // managed Codex (W3-04). Turn execution stays on the app-server; this
@@ -2063,7 +3007,15 @@ pub async fn start_code_ui_runtime(
     let notifies_clone = notifies.clone();
     let tx_clone = tx.clone();
     let approval_mode_clone = approval_mode.clone();
-    let pending_approvals_clone = pending_approvals.clone();
+    let tracked_turn_id_clone = tracked_turn_id.clone();
+    let app_server_turn_id_clone = app_server_turn_id.clone();
+    let deferred_codex_terminal_clone = deferred_codex_terminal.clone();
+    let pending_cancel_clone = pending_cancel.clone();
+    let mutation_started_clone = mutation_started.clone();
+    let approval_wait_queue_clone = approval_wait_queue.clone();
+    let forwarded_resolve_clone = forwarded_resolve.clone();
+    let envelope_runtime_clone = envelope_runtime.clone();
+    let runtime_session_id_for_reader = runtime_session_id.clone();
     let debug_mode = args.debug;
     let codex_session_clone = codex_session.clone();
     let browser_session_clone = browser_session.clone();
@@ -2161,7 +3113,7 @@ pub async fn start_code_ui_runtime(
                 );
                 for kind in envelope_kinds.iter().cloned() {
                     let payload = (
-                        runtime_session_id.clone(),
+                        runtime_session_id_for_reader.clone(),
                         turn_id_for_envelope.clone(),
                         kind,
                         normalized.method.clone(),
@@ -2242,12 +3194,12 @@ pub async fn start_code_ui_runtime(
                         }
                     }
                     MethodKind::TurnStarted => {
-                        let run_id = params
-                            .get("turnId")
-                            .or_else(|| params.get("turn_id"))
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let run_id = extract_turn_id_for_envelope(
+                            &params,
+                            lock_or_warn(&codex_session_clone, "codex turn started session")
+                                .as_deref(),
+                        )
+                        .unwrap_or_default();
                         tracing::info!(
                             target: "libra::internal::ai::codex",
                             turn_id = %run_id,
@@ -2260,7 +3212,7 @@ pub async fn start_code_ui_runtime(
                             session.thread.current_turn_id = Some(run_id.clone());
                             if !run_id.is_empty() {
                                 session.add_run(Run {
-                                    id: run_id,
+                                    id: run_id.clone(),
                                     thread_id,
                                     status: RunStatus::InProgress,
                                     started_at: Utc::now(),
@@ -2268,18 +3220,188 @@ pub async fn start_code_ui_runtime(
                                 });
                             }
                         }
+                        if !run_id.is_empty() {
+                            if let Some(mut app_turn) = lock_or_warn(
+                                &app_server_turn_id_clone,
+                                "codex app-server turn id write",
+                            ) {
+                                *app_turn = Some(run_id.clone());
+                            }
+                            flush_deferred_codex_terminal_if_matches(
+                                &deferred_codex_terminal_clone,
+                                &envelope_runtime_clone,
+                                &runtime_session_id_for_reader,
+                                &tracked_turn_id_clone,
+                                &app_server_turn_id_clone,
+                                &pending_cancel_clone,
+                                &mutation_started_clone,
+                                &approval_wait_queue_clone,
+                                &tx_clone,
+                                &responses_clone,
+                                &notifies_clone,
+                                &codex_session_clone,
+                                &forwarded_resolve_clone,
+                                &run_id,
+                            )
+                            .await;
+                            let already_tracked = lock_or_warn(
+                                &tracked_turn_id_clone,
+                                "codex tracked turn id read before turn/started",
+                            )
+                            .and_then(|guard| guard.clone());
+                            match already_tracked {
+                                Some(existing) => {
+                                    // Early requestApproval may have parked under a
+                                    // synthetic id (often the approval request id).
+                                    // Keep that runtime turn so respond/finish still
+                                    // match; do not attempt a second track.
+                                    tracing::debug!(
+                                        target: "libra::internal::ai::codex",
+                                        existing_turn_id = %existing,
+                                        app_server_turn_id = %run_id,
+                                        "Codex turn/started arrived while an approval turn is already tracked; keeping parked turn id"
+                                    );
+                                }
+                                None => {
+                                    if let Err(error) = envelope_runtime_clone
+                                        .track_external_turn(
+                                            TurnRequest::new(
+                                                runtime_session_id_for_reader.clone(),
+                                                run_id.clone(),
+                                                "codex app-server turn",
+                                                true,
+                                            ),
+                                            CancellationToken::new(),
+                                            mutation_started_clone.clone(),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            target: "libra::internal::ai::codex",
+                                            turn_id = %run_id,
+                                            %error,
+                                            "failed to track Codex app-server turn on AgentRuntime"
+                                        );
+                                    } else if let Some(mut tracked) = lock_or_warn(
+                                        &tracked_turn_id_clone,
+                                        "codex tracked turn id write",
+                                    ) {
+                                        *tracked = Some(run_id.clone());
+                                    }
+                                }
+                            }
+
+                            // Always flush a pre-start cancel here — including when
+                            // an early approval already parked a synthetic turn —
+                            // now that the real app-server turn id is known.
+                            // Must not await send_request on this reader task
+                            // (response notify is processed by this same loop).
+                            let pending_for_turn = lock_or_warn(
+                                &pending_cancel_clone,
+                                "codex pending cancel take on turn/started",
+                            )
+                            .and_then(|mut pending| {
+                                let tracked = lock_or_warn(
+                                    &tracked_turn_id_clone,
+                                    "codex pending cancel match tracked",
+                                )
+                                .and_then(|guard| guard.clone());
+                                match (pending.as_ref(), tracked) {
+                                    (Some(parked), Some(tracked)) if parked == &tracked => {
+                                        pending.take()
+                                    }
+                                    (Some(parked), _) if parked == &run_id => pending.take(),
+                                    _ => None,
+                                }
+                            });
+                            if let Some(_parked_turn) = pending_for_turn {
+                                let thread_id_for_interrupt = lock_or_warn(
+                                    &thread_id_clone,
+                                    "codex pending cancel thread id",
+                                )
+                                .map(|guard| guard.clone())
+                                .unwrap_or_default();
+                                let cancel_turn_id = lock_or_warn(
+                                    &tracked_turn_id_clone,
+                                    "codex pending cancel tracked id",
+                                )
+                                .and_then(|guard| guard.clone())
+                                .unwrap_or_else(|| run_id.clone());
+                                let tx = tx_clone.clone();
+                                let responses = responses_clone.clone();
+                                let notifies = notifies_clone.clone();
+                                let envelope_runtime = envelope_runtime_clone.clone();
+                                let runtime_session_id = runtime_session_id_for_reader.clone();
+                                let pending_cancel = pending_cancel_clone.clone();
+                                let tracked_turn_id = tracked_turn_id_clone.clone();
+                                let run_id = run_id.clone();
+                                tokio::spawn(async move {
+                                    if thread_id_for_interrupt.is_empty() {
+                                        if let Some(mut pending) = lock_or_warn(
+                                            &pending_cancel,
+                                            "codex repark pending cancel empty thread",
+                                        ) {
+                                            *pending = Some(cancel_turn_id);
+                                        }
+                                        return;
+                                    }
+                                    if let Err(error) = forward_codex_turn_interrupt(
+                                        &tx,
+                                        &responses,
+                                        &notifies,
+                                        &thread_id_for_interrupt,
+                                        &run_id,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            target: "libra::internal::ai::codex",
+                                            turn_id = %run_id,
+                                            %error,
+                                            "failed to interrupt Codex turn for pending cancel; keeping runtime turn active"
+                                        );
+                                        if let Some(mut pending) = lock_or_warn(
+                                            &pending_cancel,
+                                            "codex repark pending cancel interrupt fail",
+                                        ) {
+                                            let tracked = lock_or_warn(
+                                                &tracked_turn_id,
+                                                "codex repark tracked id",
+                                            )
+                                            .and_then(|guard| guard.clone())
+                                            .unwrap_or(cancel_turn_id);
+                                            *pending = Some(tracked);
+                                        }
+                                        return;
+                                    }
+                                    if let Err(error) = envelope_runtime
+                                        .cancel(runtime_session_id, cancel_turn_id)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            target: "libra::internal::ai::codex",
+                                            turn_id = %run_id,
+                                            %error,
+                                            "AgentRuntime cancel after pending Codex interrupt failed"
+                                        );
+                                    }
+                                });
+                            }
+                        }
                     }
                     MethodKind::TurnCompleted => {
                         let turn_id_from_params = extract_turn_id_for_envelope(&params, None);
+                        let mut finish_after_unlock: Option<(
+                            String,
+                            Result<RuntimeTurnExecution, RuntimeWorkerError>,
+                        )> = None;
                         if let Some(mut session) =
                             lock_or_warn(&codex_session_clone, "code ui turn completed update")
                         {
                             let run_id = turn_id_from_params
                                 .or_else(|| session.thread.current_turn_id.clone())
                                 .unwrap_or_default();
-                            if run_id.is_empty() {
-                                // No turn id available; skip durable terminal write.
-                            } else {
+                            if !run_id.is_empty() {
                                 let run_status = envelope::run_status_for_turn_completed(&params);
                                 let status_label = match run_status {
                                     RunStatus::Completed => "completed",
@@ -2323,6 +3445,17 @@ pub async fn start_code_ui_runtime(
                                         _ => None,
                                     }
                                 });
+                                let finish_result = match run_status {
+                                    RunStatus::Failed => Err(RuntimeWorkerError::ExecutionFailed(
+                                        failure_reason.clone().unwrap_or_else(|| {
+                                            "codex app-server turn failed".to_string()
+                                        }),
+                                    )),
+                                    RunStatus::Cancelled => Err(RuntimeWorkerError::Cancelled),
+                                    _ => Ok(RuntimeTurnExecution::Completed {
+                                        summary: "codex app-server turn completed".to_string(),
+                                    }),
+                                };
                                 // HistoryReader only retains run_events whose run_id
                                 // appears in run_snapshot; write the snapshot first so
                                 // failed/cancelled terminals survive Code UI restart.
@@ -2340,11 +3473,12 @@ pub async fn start_code_ui_runtime(
                                     at: completed_at,
                                     error: failure_reason,
                                 };
+                                let history_run_id = run_id.clone();
                                 ClientStorage::spawn_background_index_work(async move {
                                     store_to_mcp(
                                         &mcp_server_for_run,
                                         "run",
-                                        &run_id,
+                                        &history_run_id,
                                         &run,
                                         debug_mode,
                                     )
@@ -2352,18 +3486,80 @@ pub async fn start_code_ui_runtime(
                                     history
                                         .event(
                                             history::EventKind::RunStatus,
-                                            &run_id,
+                                            &history_run_id,
                                             status_label,
                                             serde_json::json!({"thread_id": thread_id}),
                                         )
                                         .await;
                                     history_writer
-                                        .write("run_snapshot", &run_id, &run_snapshot)
+                                        .write("run_snapshot", &history_run_id, &run_snapshot)
                                         .await;
                                     history_writer
                                         .write("run_event", &run_event.id, &run_event)
                                         .await;
                                 });
+                                finish_after_unlock = Some((run_id, finish_result));
+                            }
+                        }
+                        if let Some((run_id, finish_result)) = finish_after_unlock {
+                            // Correlate against the live app-server turn id so a
+                            // late turn/completed from a prior turn cannot finish
+                            // a newly admitted runtime turn after tracking was reset.
+                            let live_app_turn = lock_or_warn(
+                                &app_server_turn_id_clone,
+                                "codex app-server turn id for finish correlate",
+                            )
+                            .and_then(|guard| guard.clone());
+                            let tracked = lock_or_warn(
+                                &tracked_turn_id_clone,
+                                "codex tracked turn id for finish correlate",
+                            )
+                            .and_then(|guard| guard.clone());
+                            if should_finish_codex_turn_completed(live_app_turn.as_deref(), &run_id)
+                            {
+                                // Prefer the parked runtime turn id when early
+                                // approval admitted under a synthetic id.
+                                let finish_turn_id =
+                                    tracked.clone().unwrap_or_else(|| run_id.clone());
+                                finish_tracked_codex_turn_after_completed(
+                                    &envelope_runtime_clone,
+                                    &runtime_session_id_for_reader,
+                                    &tracked_turn_id_clone,
+                                    &app_server_turn_id_clone,
+                                    &pending_cancel_clone,
+                                    &mutation_started_clone,
+                                    &approval_wait_queue_clone,
+                                    &tx_clone,
+                                    &responses_clone,
+                                    &notifies_clone,
+                                    &codex_session_clone,
+                                    &forwarded_resolve_clone,
+                                    finish_turn_id,
+                                    run_id.clone(),
+                                    finish_result,
+                                )
+                                .await;
+                            } else if live_app_turn.is_none() && tracked.is_some() {
+                                // Terminal raced ahead of writing app_server_turn_id.
+                                // Defer until the id is known so a stale completion
+                                // cannot finish a newer provisional track.
+                                if let Some(mut deferred) = lock_or_warn(
+                                    &deferred_codex_terminal_clone,
+                                    "codex defer turn completed",
+                                ) {
+                                    *deferred = Some(DeferredCodexTerminal {
+                                        app_server_turn_id: run_id,
+                                        finish_result,
+                                    });
+                                }
+                            } else {
+                                tracing::debug!(
+                                    target: "libra::internal::ai::codex",
+                                    completed_app_server_turn_id = %run_id,
+                                    ?live_app_turn,
+                                    ?tracked,
+                                    "Ignoring Codex turn/completed that does not match the live app-server turn"
+                                );
                             }
                         }
                     }
@@ -2603,9 +3799,50 @@ pub async fn start_code_ui_runtime(
                             approval_kind = ?approval_type,
                             "Codex approval requested"
                         );
+                        // Retransmits of an already-resolved or already-queued
+                        // request must not reopen the gate in the projection.
+                        let already_handled = lock_or_warn(
+                            &codex_session_clone,
+                            "codex approval retransmit resolved check",
+                        )
+                        .is_some_and(|session| {
+                            session.approval_requests.iter().any(|approval| {
+                                approval.id == request_id && approval.decision.is_some()
+                            })
+                        }) || lock_or_warn(
+                            &approval_wait_queue_clone,
+                            "codex approval retransmit queue check",
+                        )
+                        .is_some_and(|queue| {
+                            queue.iter().any(|item| item.request_id == request_id)
+                        }) || lock_or_warn(
+                            &forwarded_resolve_clone,
+                            "codex approval retransmit forwarded check",
+                        )
+                        .is_some_and(|guard| {
+                            guard
+                                .as_ref()
+                                .is_some_and(|item| item.request_id == request_id)
+                        });
+                        if already_handled {
+                            tracing::debug!(
+                                target: "libra::internal::ai::codex",
+                                request_id = %request_id,
+                                "ignored Codex approval retransmit for a resolved, queued, or in-flight request"
+                            );
+                            publish_code_ui_snapshot_with_envelope(
+                                &browser_session_clone,
+                                &codex_session_clone,
+                                &working_dir_clone,
+                                &envelope_kinds,
+                                &queued_codex_approval_ids(&approval_wait_queue_clone),
+                            )
+                            .await;
+                            continue;
+                        }
                         let approval_request = ApprovalRequest {
                             id: request_id.clone(),
-                            approval_type,
+                            approval_type: approval_type.clone(),
                             item_id: params
                                 .get("itemId")
                                 .and_then(|value| value.as_str())
@@ -2643,78 +3880,545 @@ pub async fn start_code_ui_runtime(
                             lock_or_warn(&approval_mode_clone, "code ui approval mode read")
                                 .map(|mode| mode.clone())
                                 .unwrap_or_else(|| "ask".to_string());
-                        let approved = if current_mode == "accept" {
-                            true
-                        } else if current_mode == "decline" {
-                            false
-                        } else {
-                            // Ask mode: park a oneshot under the request id and
-                            // wait for browser respond_interaction. Full shared
-                            // AgentRuntime interaction ownership remains W3-07.
-                            let (oneshot_tx, oneshot_rx) = tokio::sync::oneshot::channel();
-                            pending_approvals_clone
-                                .lock()
-                                .await
-                                .insert(request_id.clone(), oneshot_tx);
-                            publish_code_ui_snapshot_with_envelope(
-                                &browser_session_clone,
-                                &codex_session_clone,
-                                &working_dir_clone,
-                                &envelope_kinds,
-                            )
-                            .await;
-                            // Default to deny when the approval channel is
-                            // dropped (runtime teardown). Auto-approving on
-                            // cancellation could let a command run after the
-                            // operator already closed the session.
-                            match oneshot_rx.await {
-                                Ok(decision) => decision,
-                                Err(_) => {
-                                    tracing::warn!(
-                                        target: "libra::internal::ai::codex",
-                                        request_id = %request_id,
-                                        "approval channel closed before user response; \
-                                         defaulting to DECLINE"
-                                    );
-                                    false
-                                }
+                        let resolve_method = envelope::approval_resolve_method(mk);
+                        if current_mode == "accept" || current_mode == "decline" {
+                            let approved = current_mode == "accept";
+                            if approved {
+                                mutation_started_clone.store(true, Ordering::Release);
                             }
-                        };
-
-                        if let Some(mut session) =
-                            lock_or_warn(&codex_session_clone, "code ui approval request resolve")
-                            && let Some(approval) = session
+                            if let Some(mut session) = lock_or_warn(
+                                &codex_session_clone,
+                                "code ui approval request resolve",
+                            ) && let Some(approval) = session
                                 .approval_requests
                                 .iter_mut()
                                 .find(|approval| approval.id == request_id)
-                        {
-                            approval.decision = Some(approved);
-                            approval.resolved_at = Some(Utc::now());
+                            {
+                                approval.decision = Some(approved);
+                                approval.resolved_at = Some(Utc::now());
+                            }
+                            {
+                                let tx = tx_clone.clone();
+                                let responses = responses_clone.clone();
+                                let notifies = notifies_clone.clone();
+                                let resolve_method = resolve_method.to_string();
+                                let request_id = request_id.clone();
+                                let envelope_runtime = envelope_runtime_clone.clone();
+                                let runtime_session_id = runtime_session_id_for_reader.clone();
+                                let tracked_turn_id = tracked_turn_id_clone.clone();
+                                let app_server_turn_id = app_server_turn_id_clone.clone();
+                                let browser_session = browser_session_clone.clone();
+                                let codex_session = codex_session_clone.clone();
+                                let working_dir = working_dir_clone.clone();
+                                let approval_wait_queue = approval_wait_queue_clone.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = forward_codex_approval_resolve(
+                                        &tx,
+                                        &responses,
+                                        &notifies,
+                                        &resolve_method,
+                                        &request_id,
+                                        approved,
+                                    )
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            target: "libra::internal::ai::codex",
+                                            request_id = %request_id,
+                                            %error,
+                                            "auto approval mode failed to forward resolve to Codex app-server"
+                                        );
+                                        if let Some(tracked) = lock_or_warn(
+                                            &tracked_turn_id,
+                                            "codex auto-approve forward fail tracked",
+                                        )
+                                        .and_then(|guard| guard.clone())
+                                        {
+                                            let finish = if approved {
+                                                Err(RuntimeWorkerError::IndeterminateSideEffect(
+                                                    format!(
+                                                        "auto approval resolve was sent but not acknowledged: {error}"
+                                                    ),
+                                                ))
+                                            } else {
+                                                Err(RuntimeWorkerError::ExecutionFailed(format!(
+                                                    "auto decline resolve failed: {error}"
+                                                )))
+                                            };
+                                            let _ = envelope_runtime
+                                                .finish_external_turn(
+                                                    runtime_session_id,
+                                                    tracked,
+                                                    finish,
+                                                )
+                                                .await;
+                                        }
+                                        if let Some(mut tracked) = lock_or_warn(
+                                            &tracked_turn_id,
+                                            "codex auto-approve clear tracked",
+                                        ) {
+                                            *tracked = None;
+                                        }
+                                        if let Some(mut app_turn) = lock_or_warn(
+                                            &app_server_turn_id,
+                                            "codex auto-approve clear app turn",
+                                        ) {
+                                            *app_turn = None;
+                                        }
+                                        publish_code_ui_snapshot(
+                                            &browser_session,
+                                            &codex_session,
+                                            &working_dir,
+                                            Some(&approval_wait_queue),
+                                        )
+                                        .await;
+                                    }
+                                });
+                            }
+                        } else {
+                            // Ask mode (W3-07): AgentRuntime owns the pending
+                            // interaction; CodexAppServerApprovalDelivery
+                            // forwards the browser decision. Do not await a
+                            // private oneshot — that would be a second SM.
+                            let tool_name = match approval_type {
+                                ApprovalType::CommandExecution => "command_execution",
+                                ApprovalType::FileChange | ApprovalType::ApplyPatch => {
+                                    "file_change"
+                                }
+                                ApprovalType::Unknown => "tool",
+                            };
+                            let mut turn_id = lock_or_warn(
+                                &tracked_turn_id_clone,
+                                "codex tracked turn id for approval",
+                            )
+                            .and_then(|guard| guard.clone());
+                            if turn_id.is_none() {
+                                // App-server may emit requestApproval before
+                                // turn/started (or without it). Lazily admit the
+                                // external turn so AgentRuntime can own the park.
+                                let lazy_turn_id = extract_turn_id_for_envelope(
+                                    &params,
+                                    lock_or_warn(
+                                        &codex_session_clone,
+                                        "codex approval lazy turn id",
+                                    )
+                                    .as_deref(),
+                                )
+                                .filter(|id| !id.is_empty())
+                                .unwrap_or_else(|| request_id.clone());
+                                if let Err(error) = envelope_runtime_clone
+                                    .track_external_turn(
+                                        TurnRequest::new(
+                                            runtime_session_id_for_reader.clone(),
+                                            lazy_turn_id.clone(),
+                                            "codex app-server approval gate",
+                                            true,
+                                        ),
+                                        CancellationToken::new(),
+                                        mutation_started_clone.clone(),
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        target: "libra::internal::ai::codex",
+                                        request_id = %request_id,
+                                        turn_id = %lazy_turn_id,
+                                        %error,
+                                        "failed to track Codex approval turn; declining fail-closed"
+                                    );
+                                    {
+                                        let tx = tx_clone.clone();
+                                        let responses = responses_clone.clone();
+                                        let notifies = notifies_clone.clone();
+                                        let resolve_method = resolve_method.to_string();
+                                        let request_id = request_id.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(forward_error) =
+                                                forward_codex_approval_resolve(
+                                                    &tx,
+                                                    &responses,
+                                                    &notifies,
+                                                    &resolve_method,
+                                                    &request_id,
+                                                    false,
+                                                )
+                                                .await
+                                            {
+                                                tracing::error!(
+                                                    target: "libra::internal::ai::codex",
+                                                    request_id = %request_id,
+                                                    %forward_error,
+                                                    "fail-closed Codex approval decline could not reach app-server"
+                                                );
+                                            }
+                                        });
+                                    }
+                                    continue;
+                                }
+                                if let Some(mut tracked) = lock_or_warn(
+                                    &tracked_turn_id_clone,
+                                    "codex tracked turn id lazy write",
+                                ) {
+                                    *tracked = Some(lazy_turn_id.clone());
+                                }
+                                turn_id = Some(lazy_turn_id);
+                            }
+                            let Some(turn_id) = turn_id else {
+                                tracing::error!(
+                                    target: "libra::internal::ai::codex",
+                                    request_id = %request_id,
+                                    "Codex approval could not resolve a turn id; declining fail-closed"
+                                );
+                                {
+                                    let tx = tx_clone.clone();
+                                    let responses = responses_clone.clone();
+                                    let notifies = notifies_clone.clone();
+                                    let resolve_method = resolve_method.to_string();
+                                    let request_id = request_id.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(forward_error) = forward_codex_approval_resolve(
+                                            &tx,
+                                            &responses,
+                                            &notifies,
+                                            &resolve_method,
+                                            &request_id,
+                                            false,
+                                        )
+                                        .await
+                                        {
+                                            tracing::error!(
+                                                target: "libra::internal::ai::codex",
+                                                request_id = %request_id,
+                                                %forward_error,
+                                                "fail-closed Codex approval decline could not reach app-server"
+                                            );
+                                        }
+                                    });
+                                }
+                                continue;
+                            };
+                            // Retransmits while deliver() awaits the resolve ack clear
+                            // `active.interaction` but keep `forwarded_resolve` until
+                            // acknowledgement — reject those here so we never re-surface
+                            // an already-submitted approval for a second browser click.
+                            if lock_or_warn(
+                                &forwarded_resolve_clone,
+                                "codex forwarded resolve retransmit guard",
+                            )
+                            .is_some_and(|guard| {
+                                guard
+                                    .as_ref()
+                                    .is_some_and(|item| item.request_id == request_id)
+                            }) {
+                                tracing::debug!(
+                                    target: "libra::internal::ai::codex",
+                                    request_id = %request_id,
+                                    "ignored Codex approval retransmit while resolve is pending or in flight"
+                                );
+                                publish_code_ui_snapshot_with_envelope(
+                                    &browser_session_clone,
+                                    &codex_session_clone,
+                                    &working_dir_clone,
+                                    &envelope_kinds,
+                                    &queued_codex_approval_ids(&approval_wait_queue_clone),
+                                )
+                                .await;
+                                continue;
+                            }
+                            // Reserve the request id *before* awaiting registration so a
+                            // retransmit during that await hits the guard above instead of
+                            // queuing a duplicate invisible interaction.
+                            let reserved_request = lock_or_warn(
+                                &forwarded_resolve_clone,
+                                "codex forwarded resolve reserve before register",
+                            )
+                            .is_some_and(|mut slot| {
+                                if slot.is_some() {
+                                    return false;
+                                }
+                                *slot = Some(CodexForwardedResolve {
+                                    request_id: request_id.clone(),
+                                    resolve_method: resolve_method.to_string(),
+                                });
+                                true
+                            });
+                            match envelope_runtime_clone
+                                .register_interaction_with_delivery(
+                                    runtime_session_id_for_reader.clone(),
+                                    turn_id.clone(),
+                                    InteractionState::AwaitingToolApproval {
+                                        interaction_id: request_id.clone(),
+                                        tool_name: tool_name.to_string(),
+                                    },
+                                    Box::new(CodexAppServerApprovalDelivery {
+                                        request_id: request_id.clone(),
+                                        resolve_method: resolve_method.to_string(),
+                                        tx: tx_clone.clone(),
+                                        responses: responses_clone.clone(),
+                                        notifies: notifies_clone.clone(),
+                                        thread_id: thread_id_clone.clone(),
+                                        app_server_turn_id: app_server_turn_id_clone.clone(),
+                                        tracked_turn_id: tracked_turn_id_clone.clone(),
+                                        codex_session: codex_session_clone.clone(),
+                                        browser_session: browser_session_clone.clone(),
+                                        working_dir: working_dir_clone.clone(),
+                                        approval_mode: approval_mode_clone.clone(),
+                                        forwarded_resolve: forwarded_resolve_clone.clone(),
+                                        approval_wait_queue: approval_wait_queue_clone.clone(),
+                                        envelope_runtime: envelope_runtime_clone.clone(),
+                                        runtime_session_id: runtime_session_id_for_reader.clone(),
+                                        pending_cancel: pending_cancel_clone.clone(),
+                                        mutation_started: mutation_started_clone.clone(),
+                                    }),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    if !reserved_request
+                                        && let Some(mut slot) = lock_or_warn(
+                                            &forwarded_resolve_clone,
+                                            "codex forwarded resolve park",
+                                        )
+                                    {
+                                        *slot = Some(CodexForwardedResolve {
+                                            request_id: request_id.clone(),
+                                            resolve_method: resolve_method.to_string(),
+                                        });
+                                    }
+                                    publish_code_ui_snapshot_with_envelope(
+                                        &browser_session_clone,
+                                        &codex_session_clone,
+                                        &working_dir_clone,
+                                        &envelope_kinds,
+                                        &queued_codex_approval_ids(&approval_wait_queue_clone),
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    if reserved_request
+                                        && let Some(mut slot) = lock_or_warn(
+                                            &forwarded_resolve_clone,
+                                            "codex clear reserved resolve after register fail",
+                                        )
+                                        && slot
+                                            .as_ref()
+                                            .is_some_and(|item| item.request_id == request_id)
+                                    {
+                                        *slot = None;
+                                    }
+                                    match error {
+                                        RuntimeWorkerError::InteractionAlreadyPending {
+                                            ..
+                                        } => {
+                                            // Runtime owns one pending interaction; queue
+                                            // additional app-server gates until the slot frees.
+                                            // Retransmits of the *active* ID must not enter the
+                                            // suppress set or the browser loses the live row.
+                                            let active_id = lock_or_warn(
+                                                &forwarded_resolve_clone,
+                                                "codex active forwarded resolve id",
+                                            )
+                                            .and_then(|guard| {
+                                                guard.as_ref().map(|item| item.request_id.clone())
+                                            });
+                                            if active_id.as_deref() == Some(request_id.as_str()) {
+                                                tracing::debug!(
+                                                    target: "libra::internal::ai::codex",
+                                                    request_id = %request_id,
+                                                    "ignored duplicate Codex approval for the active interaction"
+                                                );
+                                                publish_code_ui_snapshot_with_envelope(
+                                                    &browser_session_clone,
+                                                    &codex_session_clone,
+                                                    &working_dir_clone,
+                                                    &envelope_kinds,
+                                                    &queued_codex_approval_ids(
+                                                        &approval_wait_queue_clone,
+                                                    ),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                            const MAX_QUEUED_CODEX_APPROVALS: usize = 8;
+                                            let enqueue_outcome = lock_or_warn(
+                                                &approval_wait_queue_clone,
+                                                "codex approval wait queue push",
+                                            )
+                                            .map(|mut queue| {
+                                                if queue
+                                                    .iter()
+                                                    .any(|item| item.request_id == request_id)
+                                                {
+                                                    return "duplicate";
+                                                }
+                                                if queue.len() >= MAX_QUEUED_CODEX_APPROVALS {
+                                                    return "full";
+                                                }
+                                                queue.push_back(QueuedCodexApproval {
+                                                    request_id: request_id.clone(),
+                                                    resolve_method: resolve_method.to_string(),
+                                                    turn_id,
+                                                    tool_name: tool_name.to_string(),
+                                                });
+                                                "queued"
+                                            })
+                                            .unwrap_or("unavailable");
+                                            match enqueue_outcome {
+                                                "queued" => {
+                                                    tracing::info!(
+                                                        target: "libra::internal::ai::codex",
+                                                        request_id = %request_id,
+                                                        "queued concurrent Codex approval behind in-flight interaction"
+                                                    );
+                                                }
+                                                "duplicate" => {
+                                                    tracing::debug!(
+                                                        target: "libra::internal::ai::codex",
+                                                        request_id = %request_id,
+                                                        "ignored duplicate Codex approval already waiting in queue"
+                                                    );
+                                                }
+                                                "full" => {
+                                                    tracing::error!(
+                                                        target: "libra::internal::ai::codex",
+                                                        request_id = %request_id,
+                                                        limit = MAX_QUEUED_CODEX_APPROVALS,
+                                                        "Codex approval wait queue full; declining fail-closed"
+                                                    );
+                                                    if let Some(mut session) = lock_or_warn(
+                                                        &codex_session_clone,
+                                                        "codex overflow approval resolve",
+                                                    ) && let Some(approval) = session
+                                                        .approval_requests
+                                                        .iter_mut()
+                                                        .find(|approval| approval.id == request_id)
+                                                    {
+                                                        approval.decision = Some(false);
+                                                        approval.resolved_at = Some(Utc::now());
+                                                    }
+                                                    let tx = tx_clone.clone();
+                                                    let responses = responses_clone.clone();
+                                                    let notifies = notifies_clone.clone();
+                                                    let resolve_method = resolve_method.to_string();
+                                                    let request_id = request_id.clone();
+                                                    tokio::spawn(async move {
+                                                        if let Err(forward_error) =
+                                                            forward_codex_approval_resolve(
+                                                                &tx,
+                                                                &responses,
+                                                                &notifies,
+                                                                &resolve_method,
+                                                                &request_id,
+                                                                false,
+                                                            )
+                                                            .await
+                                                        {
+                                                            tracing::error!(
+                                                                target: "libra::internal::ai::codex",
+                                                                request_id = %request_id,
+                                                                %forward_error,
+                                                                "overflow Codex approval decline could not reach app-server"
+                                                            );
+                                                        }
+                                                    });
+                                                }
+                                                _ => {
+                                                    tracing::error!(
+                                                        target: "libra::internal::ai::codex",
+                                                        request_id = %request_id,
+                                                        "Codex approval wait queue unavailable; declining fail-closed"
+                                                    );
+                                                    let tx = tx_clone.clone();
+                                                    let responses = responses_clone.clone();
+                                                    let notifies = notifies_clone.clone();
+                                                    let resolve_method = resolve_method.to_string();
+                                                    let request_id = request_id.clone();
+                                                    tokio::spawn(async move {
+                                                        let _ = forward_codex_approval_resolve(
+                                                            &tx,
+                                                            &responses,
+                                                            &notifies,
+                                                            &resolve_method,
+                                                            &request_id,
+                                                            false,
+                                                        )
+                                                        .await;
+                                                    });
+                                                }
+                                            }
+                                            publish_code_ui_snapshot_with_envelope(
+                                                &browser_session_clone,
+                                                &codex_session_clone,
+                                                &working_dir_clone,
+                                                &envelope_kinds,
+                                                &queued_codex_approval_ids(
+                                                    &approval_wait_queue_clone,
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        error => {
+                                            tracing::error!(
+                                                target: "libra::internal::ai::codex",
+                                                request_id = %request_id,
+                                                %error,
+                                                "failed to register Codex approval on AgentRuntime; declining fail-closed"
+                                            );
+                                            if let Some(mut session) = lock_or_warn(
+                                                &codex_session_clone,
+                                                "codex register failure approval resolve",
+                                            ) && let Some(approval) = session
+                                                .approval_requests
+                                                .iter_mut()
+                                                .find(|approval| approval.id == request_id)
+                                            {
+                                                approval.decision = Some(false);
+                                                approval.resolved_at = Some(Utc::now());
+                                            }
+                                            {
+                                                let tx = tx_clone.clone();
+                                                let responses = responses_clone.clone();
+                                                let notifies = notifies_clone.clone();
+                                                let resolve_method = resolve_method.to_string();
+                                                let request_id = request_id.clone();
+                                                tokio::spawn(async move {
+                                                    if let Err(forward_error) =
+                                                        forward_codex_approval_resolve(
+                                                            &tx,
+                                                            &responses,
+                                                            &notifies,
+                                                            &resolve_method,
+                                                            &request_id,
+                                                            false,
+                                                        )
+                                                        .await
+                                                    {
+                                                        tracing::error!(
+                                                            target: "libra::internal::ai::codex",
+                                                            request_id = %request_id,
+                                                            %forward_error,
+                                                            "fail-closed Codex approval decline could not reach app-server"
+                                                        );
+                                                    }
+                                                });
+                                            }
+                                            publish_code_ui_snapshot_with_envelope(
+                                                &browser_session_clone,
+                                                &codex_session_clone,
+                                                &working_dir_clone,
+                                                &envelope_kinds,
+                                                &queued_codex_approval_ids(
+                                                    &approval_wait_queue_clone,
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
                         }
-
-                        let resolve_method = match mk {
-                            MethodKind::RequestApprovalCommandExecution => {
-                                "item/commandExecution/requestApproval/resolve"
-                            }
-                            MethodKind::RequestApprovalFileChange => {
-                                "item/fileChange/requestApproval/resolve"
-                            }
-                            MethodKind::RequestApprovalExec => "exec_approval_request/resolve",
-                            MethodKind::RequestApprovalApplyPatch => {
-                                "apply_patch_approval_request/resolve"
-                            }
-                            _ => "requestApproval/resolve",
-                        };
-                        let approval_msg = CodexMessage::new_request(
-                            Utc::now().timestamp_millis() as u64,
-                            resolve_method,
-                            serde_json::json!({
-                                "requestId": request_id,
-                                "approved": approved,
-                            }),
-                        );
-                        let _ = tx_clone.send(approval_msg.to_json()).await;
                     }
+
                     // Remaining MethodKinds (ItemCompleted, Task*, TokenUsage,
                     // Thread*, Initialized, Unknown, …) have no CodexSession
                     // mutation on this path; the normalized AgentEvent envelope
@@ -2747,6 +4451,7 @@ pub async fn start_code_ui_runtime(
                         &codex_session_clone,
                         &working_dir_clone,
                         &envelope_kinds,
+                        &queued_codex_approval_ids(&approval_wait_queue_clone),
                     )
                     .await;
                     delta_skipped_since_publish = false;
@@ -2776,6 +4481,7 @@ pub async fn start_code_ui_runtime(
                 &browser_session_clone,
                 &codex_session_clone,
                 &working_dir_clone,
+                Some(&approval_wait_queue_clone),
             )
             .await;
         }
@@ -2853,7 +4559,16 @@ pub async fn start_code_ui_runtime(
         notifies,
         thread_id,
         approval_mode,
-        pending_approvals,
+        codex_session,
+        working_dir: args.cwd.clone(),
+        runtime_session_id,
+        tracked_turn_id,
+        app_server_turn_id,
+        deferred_codex_terminal,
+        pending_cancel,
+        mutation_started,
+        approval_wait_queue,
+        forwarded_resolve,
     });
     let mut runtime_options = crate::internal::ai::web::code_ui::CodeUiRuntimeOptions::new(
         browser_write_enabled,
@@ -6861,8 +8576,18 @@ Task Completed"
 
 #[cfg(test)]
 mod tests {
-    use super::{is_streaming_delta_method, truncate_for_log};
+    use super::{is_streaming_delta_method, should_finish_codex_turn_completed, truncate_for_log};
     use crate::internal::ai::codex::protocol::MethodKind;
+
+    #[test]
+    fn turn_completed_requires_live_app_server_correlation() {
+        assert!(should_finish_codex_turn_completed(Some("turn-a"), "turn-a"));
+        assert!(!should_finish_codex_turn_completed(
+            Some("turn-a"),
+            "turn-b"
+        ));
+        assert!(!should_finish_codex_turn_completed(None, "turn-a"));
+    }
 
     #[test]
     fn truncate_for_log_escapes_whitespace_and_caps_length() {

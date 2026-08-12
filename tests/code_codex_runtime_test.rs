@@ -675,6 +675,402 @@ fn libra_code_provider_codex_waits_for_user_before_execution_approval_resolve() 
     Ok(())
 }
 
+/// W3-07: a second approval on the same managed Codex turn must remain
+/// registerable after the first response is forwarded (no auto-decline).
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn libra_code_provider_codex_registers_sequential_approvals_on_same_turn() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
+        thread_id: Some("wave-9-codex-multi-approval-thread".to_string()),
+        emit_turn_command_approval: true,
+        emit_second_turn_command_approval: true,
+        ..Default::default()
+    }))?;
+    let port = server.port().to_string();
+    let fake_codex_bin = fake_codex_bin_path()?;
+
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-codex-multi-approval", fixture_path())
+            .with_live_provider("codex", "codex-test")
+            .with_browser_control_loopback()
+            .push_extra_cli_arg("--codex-port")
+            .push_extra_cli_arg(port)
+            .push_extra_cli_arg("--codex-bin")
+            .push_extra_cli_arg(fake_codex_bin),
+    )?;
+    let _ = wait_for_codex_methods(
+        &server,
+        &["initialize", "thread/start"],
+        Duration::from_secs(10),
+    )?;
+
+    let browser_token = session.attach_browser("codex-multi-approval-browser")?;
+    let (status, body) =
+        session.browser_submit_message(&browser_token, "approve two sequential gates")?;
+    assert!(
+        status.is_success(),
+        "browser submit must succeed; got {status}: {body}",
+    );
+    let _ = wait_for_codex_methods(&server, &["turn/start"], Duration::from_secs(10))?;
+
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/interactions")
+            .and_then(serde_json::Value::as_array)
+            .map(|interactions| {
+                interactions.iter().any(|interaction| {
+                    interaction
+                        .pointer("/id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-plan-gate-command-approval")
+                        && interaction
+                            .pointer("/status")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("pending")
+                })
+            })
+            .unwrap_or(false)
+    })?;
+
+    let (status, body) =
+        session.browser_respond_interaction(&browser_token, "codex-plan-gate-command-approval")?;
+    assert!(
+        status.is_success(),
+        "first approval response must succeed; got {status}: {body}",
+    );
+    let _ = wait_for_codex_methods(
+        &server,
+        &["item/commandExecution/requestApproval/resolve"],
+        Duration::from_secs(10),
+    )?;
+
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/interactions")
+            .and_then(serde_json::Value::as_array)
+            .map(|interactions| {
+                interactions.iter().any(|interaction| {
+                    interaction
+                        .pointer("/id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-plan-gate-command-approval-2")
+                        && interaction
+                            .pointer("/status")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("pending")
+                })
+            })
+            .unwrap_or(false)
+    })?;
+
+    let (status, body) = session
+        .browser_respond_interaction(&browser_token, "codex-plan-gate-command-approval-2")?;
+    assert!(
+        status.is_success(),
+        "second approval response must succeed; got {status}: {body}",
+    );
+    let captured = wait_for_codex_methods(
+        &server,
+        &["item/commandExecution/requestApproval/resolve"],
+        Duration::from_secs(10),
+    )?;
+    let resolve_ids: Vec<&str> = captured
+        .iter()
+        .filter(|request| {
+            request.get("method").and_then(serde_json::Value::as_str)
+                == Some("item/commandExecution/requestApproval/resolve")
+        })
+        .filter_map(|request| {
+            request
+                .pointer("/params/requestId")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect();
+    assert!(
+        resolve_ids.contains(&"codex-plan-gate-command-approval")
+            && resolve_ids.contains(&"codex-plan-gate-command-approval-2"),
+        "both sequential approvals must resolve to the app-server; got {resolve_ids:?}"
+    );
+    Ok(())
+}
+
+/// W3-07: cancel while an approval is pending must decline the gate, interrupt
+/// the known app-server turn, and free the sidecar so a later submit works.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn libra_code_provider_codex_cancel_during_pending_approval_interrupts_turn() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
+        thread_id: Some("wave-9-codex-cancel-approval-thread".to_string()),
+        emit_turn_command_approval: true,
+        ..Default::default()
+    }))?;
+    let port = server.port().to_string();
+    let fake_codex_bin = fake_codex_bin_path()?;
+
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-codex-cancel-approval", fixture_path())
+            .with_live_provider("codex", "codex-test")
+            .with_browser_control_loopback()
+            .push_extra_cli_arg("--codex-port")
+            .push_extra_cli_arg(port)
+            .push_extra_cli_arg("--codex-bin")
+            .push_extra_cli_arg(fake_codex_bin),
+    )?;
+    let _ = wait_for_codex_methods(
+        &server,
+        &["initialize", "thread/start"],
+        Duration::from_secs(10),
+    )?;
+
+    let browser_token = session.attach_browser("codex-cancel-approval-browser")?;
+    let (status, body) =
+        session.browser_submit_message(&browser_token, "cancel while approval is pending")?;
+    assert!(
+        status.is_success(),
+        "browser submit must succeed; got {status}: {body}",
+    );
+    let _ = wait_for_codex_methods(&server, &["turn/start"], Duration::from_secs(10))?;
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/interactions")
+            .and_then(serde_json::Value::as_array)
+            .map(|interactions| {
+                interactions.iter().any(|interaction| {
+                    interaction
+                        .pointer("/id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-plan-gate-command-approval")
+                })
+            })
+            .unwrap_or(false)
+    })?;
+
+    let (status, body) = session.browser_cancel_turn(&browser_token)?;
+    assert!(
+        status.is_success(),
+        "browser cancel during approval must succeed; got {status}: {body}",
+    );
+    let captured = wait_for_codex_methods(
+        &server,
+        &[
+            "item/commandExecution/requestApproval/resolve",
+            "turn/interrupt",
+        ],
+        Duration::from_secs(10),
+    )?;
+    let declined = captured.iter().any(|request| {
+        request.get("method").and_then(serde_json::Value::as_str)
+            == Some("item/commandExecution/requestApproval/resolve")
+            && request
+                .pointer("/params/approved")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+    });
+    assert!(
+        declined,
+        "cancel must decline the pending approval; captured {captured:?}"
+    );
+    assert!(
+        captured.iter().any(|request| {
+            request.get("method").and_then(serde_json::Value::as_str) == Some("turn/interrupt")
+        }),
+        "cancel must interrupt the known app-server turn; captured {captured:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_submit = None;
+    while Instant::now() < deadline {
+        let (status, body) = session.browser_submit_message(&browser_token, "after cancel")?;
+        if status.is_success() {
+            last_submit = Some(Ok(()));
+            break;
+        }
+        last_submit = Some(Err((status, body)));
+        thread::sleep(Duration::from_millis(100));
+    }
+    match last_submit {
+        Some(Ok(())) => {}
+        Some(Err((status, body))) => {
+            bail!(
+                "submit after cancel must succeed once turn/completed arrives; last {status}: {body}"
+            );
+        }
+        None => bail!("submit after cancel was not attempted"),
+    }
+    Ok(())
+}
+
+/// W3-07: cancel after `turn/started` still declines a pending approval and
+/// interrupts using the nested turn id.
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn libra_code_provider_codex_cancel_after_turn_started_interrupts_turn() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
+        thread_id: Some("wave-9-codex-cancel-started-thread".to_string()),
+        emit_turn_command_approval: true,
+        emit_turn_started_after_approval: true,
+        ..Default::default()
+    }))?;
+    let port = server.port().to_string();
+    let fake_codex_bin = fake_codex_bin_path()?;
+
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-codex-cancel-started", fixture_path())
+            .with_live_provider("codex", "codex-test")
+            .with_browser_control_loopback()
+            .push_extra_cli_arg("--codex-port")
+            .push_extra_cli_arg(port)
+            .push_extra_cli_arg("--codex-bin")
+            .push_extra_cli_arg(fake_codex_bin),
+    )?;
+    let _ = wait_for_codex_methods(
+        &server,
+        &["initialize", "thread/start"],
+        Duration::from_secs(10),
+    )?;
+
+    let browser_token = session.attach_browser("codex-cancel-started-browser")?;
+    let (status, body) =
+        session.browser_submit_message(&browser_token, "cancel after turn started")?;
+    assert!(
+        status.is_success(),
+        "browser submit must succeed; got {status}: {body}",
+    );
+    let _ = wait_for_codex_methods(&server, &["turn/start"], Duration::from_secs(10))?;
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/interactions")
+            .and_then(serde_json::Value::as_array)
+            .map(|interactions| {
+                interactions.iter().any(|interaction| {
+                    interaction
+                        .pointer("/id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-plan-gate-command-approval")
+                })
+            })
+            .unwrap_or(false)
+    })?;
+
+    let (status, body) = session.browser_cancel_turn(&browser_token)?;
+    assert!(
+        status.is_success(),
+        "browser cancel after turn/started must succeed; got {status}: {body}",
+    );
+    let captured = wait_for_codex_methods(
+        &server,
+        &[
+            "item/commandExecution/requestApproval/resolve",
+            "turn/interrupt",
+        ],
+        Duration::from_secs(10),
+    )?;
+    assert!(
+        captured.iter().any(|request| {
+            request.get("method").and_then(serde_json::Value::as_str) == Some("turn/interrupt")
+                && request
+                    .pointer("/params/turnId")
+                    .or_else(|| request.pointer("/params/turn/id"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.contains("mock-turn-"))
+        }),
+        "cancel after turn/started must interrupt with the nested turn id; captured {captured:?}"
+    );
+    Ok(())
+}
+
+/// W3-07: cancel before `turn/started` parks interrupt; when the nested turn
+/// id later arrives, interrupt is dispatched off the WS reader (no deadlock).
+#[cfg(feature = "test-provider")]
+#[test]
+#[serial]
+fn libra_code_provider_codex_cancel_before_turn_started_interrupts_when_started_arrives()
+-> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    let server = runtime.block_on(MockCodexWsServer::start(MockCodexWsConfig {
+        thread_id: Some("wave-9-codex-cancel-prestart-thread".to_string()),
+        emit_turn_command_approval: true,
+        turn_start_omits_turn_id: true,
+        emit_turn_started_after_declined_approval: true,
+        ..Default::default()
+    }))?;
+    let port = server.port().to_string();
+    let fake_codex_bin = fake_codex_bin_path()?;
+
+    let session = CodeSession::spawn(
+        CodeSessionOptions::new("code-codex-cancel-prestart", fixture_path())
+            .with_live_provider("codex", "codex-test")
+            .with_browser_control_loopback()
+            .push_extra_cli_arg("--codex-port")
+            .push_extra_cli_arg(port)
+            .push_extra_cli_arg("--codex-bin")
+            .push_extra_cli_arg(fake_codex_bin),
+    )?;
+    let _ = wait_for_codex_methods(
+        &server,
+        &["initialize", "thread/start"],
+        Duration::from_secs(10),
+    )?;
+
+    let browser_token = session.attach_browser("codex-cancel-prestart-browser")?;
+    let (status, body) =
+        session.browser_submit_message(&browser_token, "cancel before turn started")?;
+    assert!(
+        status.is_success(),
+        "browser submit must succeed; got {status}: {body}",
+    );
+    let _ = wait_for_codex_methods(&server, &["turn/start"], Duration::from_secs(10))?;
+    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
+        snapshot
+            .pointer("/interactions")
+            .and_then(serde_json::Value::as_array)
+            .map(|interactions| {
+                interactions.iter().any(|interaction| {
+                    interaction
+                        .pointer("/id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-plan-gate-command-approval")
+                })
+            })
+            .unwrap_or(false)
+    })?;
+
+    let (status, body) = session.browser_cancel_turn(&browser_token)?;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "cancel before turn id must park interrupt; got {status}: {body}",
+    );
+    assert!(
+        body.pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+            == Some("TURN_INTERRUPT_PENDING"),
+        "expected TURN_INTERRUPT_PENDING; got {body}",
+    );
+
+    let captured = wait_for_codex_methods(
+        &server,
+        &[
+            "item/commandExecution/requestApproval/resolve",
+            "turn/interrupt",
+        ],
+        Duration::from_secs(10),
+    )?;
+    assert!(
+        captured.iter().any(|request| {
+            request.get("method").and_then(serde_json::Value::as_str) == Some("turn/interrupt")
+        }),
+        "pending cancel must interrupt once turn/started arrives; captured {captured:?}"
+    );
+    Ok(())
+}
+
 /// W3-04: every Codex MethodKind (plus unknown) maps into the shared runtime
 /// `AgentEvent` envelope; unknown methods take an explicit diagnosable fallback.
 #[test]

@@ -119,6 +119,40 @@ bridge 仍未迁入，不能把这条 direct-chat 链路当作 Web-only completi
 | C9 | MCP authorizer 仍是显式 deferred，生产没有 handler 时不可视为完整 authz。 | Web write security 不能依赖 MCP authorization 的不存在保证。 | W3-05/W4-03；保持 loopback/token/lease/tool ACL 的独立边界。 |
 | C10 | headless direct-turn 已通过 `AgentRuntimeWorker` 执行（`headless.rs:718`）；**W2-02**：IntentSpec review gate 已迁入 runtime interaction state（`IntentReviewAckDelivery` / durable `IntentReviewRequested`），TUI `pending_intent_review` 仅为 UI mirror。Plan review（`pending_plan_revision`）仍为 TUI-owned。 | Plan/network policy 仍未进 runtime，不能宣称 headless workflow parity。 | W2-03 迁移 Plan review；W2-16 交付可操作 Web 组件。 |
 
+### W3-07 / DEFER-07 — managed Codex interaction ownership
+
+**Boundary (W3-07):** For `--web-only --provider codex`, the Codex app-server keeps
+owning the approval / user-input loop. Libra does **not** claim that Codex turns
+are fully admitted into the serialized non-Codex turn queue.
+
+What Libra owns today:
+
+- Envelope normalization (W3-04) into shared `AgentEvent` kinds.
+- Outward Code UI projection parity with non-Codex approvals (`approve` /
+  `deny` / `abort` option ids; same interaction id / cancel feedback shape).
+- A thin `AgentRuntime` park via `track_external_turn` +
+  `register_interaction_with_delivery`, so browser `respond_interaction` /
+  cancel are runtime-owned continuations that **forward** resolve/decline to
+  the app-server (`CodexAppServerApprovalDelivery`). There is no private
+  `pending_approvals` map on the Codex adapter.
+- **User-input gates** remain app-server-owned for now: unknown Codex methods
+  (including user-input prompts) take the diagnosable `ProviderNotification`
+  fallback rather than a Libra `request_user_input` park. Full user-input
+  projection/forward is a DEFER-07 follow-up, not claimed by W3-07.
+
+**DEFER-07 restart conditions** (full Codex interaction takeover):
+
+1. App-server protocol exposes a stable, documented way to replace its local
+   approval loop with an external owner (or to mirror every gate as a Libra
+   turn without dual state).
+2. Libra can submit / cancel / resume Codex turns through the same
+   `AgentRuntimeWorker` executor path as non-Codex providers without a second
+   interaction state machine.
+3. Crash/restart recovery for in-flight Codex approvals is durable on the Libra
+   side (not only inside the app-server process).
+
+Until those hold, DEFER-07 remains open: project + forward only.
+
 ### A0 接口漂移登记表（W0-01）
 
 下表是消费接口核对，不是对 20260708 全计划重验。所有行均按当前源码定位；若后续

@@ -15,13 +15,15 @@ pnpm test           # vitest unit tests for the browser foundation
 pnpm build          # static export → web/out/
 ```
 
-## Current UI status (W2-07 … W2-16)
+## Current UI status (W2-07 … W2-16 / W3-07)
 
 The shipped page mounts the shared session/SSE store and browser-controller
-lease provider, domain panels through W2-15, and workflow review
+lease provider, domain panels through W2-15, workflow review
 (`SessionWorkflow`: IntentSpec confirm/modify/cancel, Plan execute/modify/cancel,
-and network-policy allow/deny/back as an explicit human gate). It does not yet
-ship a three-pane workspace, composer, or terminal.
+and network-policy allow/deny/back as an explicit human gate), and a capability-gated
+message composer (`SessionComposer`) with optional `commandId` retention when
+`commandIdempotency` is advertised. It does not yet ship a three-pane workspace
+or terminal.
 
 W2-16 owns workflow under `web/src/lib/code-ui/workflow/` and
 `web/src/components/workspace/workflow/` without modifying W2-07 root adapter
@@ -107,7 +109,14 @@ Recovery semantics in `controller.tsx`:
 
 ## Capability gating
 
-Every writable control is gated on `snapshot.capabilities.*` plus `snapshot.controller.canWrite`. The current capability set is set by the Rust runtime: `--web-only --provider codex` advertises the full set, `HeadlessCodeRuntime` advertises `messageInput` + `streamingText` + `toolCalls`, and the read-only placeholder advertises none.
+Every writable control is gated on `snapshot.capabilities.*`. First write uses
+`withLease` to attach (composer send and cancel do **not** require projected
+`controller.canWrite` beforehand). Managed Codex ask-mode approvals are
+browser-writable after W3-07 (`browserInteractionRespondSupported` always allows
+respond; the Rust sidecar forwards `respond_interaction` to the app-server). The
+current capability set is set by the Rust runtime: `--web-only --provider codex`
+advertises the full set, `HeadlessCodeRuntime` advertises `messageInput` +
+`streamingText` + `toolCalls`, and the read-only placeholder advertises none.
 
 ## Dev tips
 

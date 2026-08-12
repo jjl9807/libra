@@ -645,3 +645,87 @@ fn sse_wire_version_negotiation() {
         "query wire must win over Accept"
     );
 }
+
+/// W3-07: managed Codex approval projection must match the non-Codex headless
+/// exec-approval wire (`approve` / `deny` / `abort`) so the browser does not
+/// branch on provider. App-server still owns the approval loop (DEFER-07).
+#[test]
+fn codex_projection_matches_non_codex_provider() {
+    use libra::internal::ai::codex::codex_tool_approval_interaction;
+
+    let ts = fixed_ts();
+    let codex = codex_tool_approval_interaction(
+        "req-parity-1",
+        "command_execution",
+        Some("Command execution".to_string()),
+        Some("echo hello".to_string()),
+        json!({ "itemId": "item-1" }),
+        ts,
+    );
+    let non_codex = CodeUiInteractionRequest {
+        id: "req-parity-1".to_string(),
+        kind: CodeUiInteractionKind::Approval,
+        title: Some("Approve command execution".to_string()),
+        description: Some("Command execution".to_string()),
+        prompt: Some("echo hello".to_string()),
+        options: vec![
+            CodeUiInteractionOption {
+                id: "approve".to_string(),
+                label: "Approve".to_string(),
+                description: Some("Allow this command once".to_string()),
+            },
+            CodeUiInteractionOption {
+                id: "deny".to_string(),
+                label: "Deny".to_string(),
+                description: Some("Skip this command".to_string()),
+            },
+            CodeUiInteractionOption {
+                id: "abort".to_string(),
+                label: "Abort".to_string(),
+                description: Some("Cancel this tool run immediately".to_string()),
+            },
+        ],
+        status: CodeUiInteractionStatus::Pending,
+        metadata: json!({ "command": "echo hello" }),
+        requested_at: ts,
+        resolved_at: None,
+    };
+
+    assert_eq!(codex.id, non_codex.id);
+    assert_eq!(codex.kind, non_codex.kind);
+    assert_eq!(codex.status, non_codex.status);
+    assert_eq!(
+        codex
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        non_codex
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>(),
+        "Codex and non-Codex approval option ids must match on the wire"
+    );
+
+    let codex_wire = serde_json::to_value(&codex).expect("codex interaction must serialize");
+    let non_codex_wire =
+        serde_json::to_value(&non_codex).expect("non-codex interaction must serialize");
+    assert_eq!(codex_wire["kind"], non_codex_wire["kind"]);
+    assert_eq!(codex_wire["status"], non_codex_wire["status"]);
+    assert_eq!(
+        codex_wire["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .map(|option| option["id"].clone())
+            .collect::<Vec<_>>(),
+        non_codex_wire["options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .map(|option| option["id"].clone())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(codex_wire["id"], json!("req-parity-1"));
+}

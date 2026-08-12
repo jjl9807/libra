@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W3-07, 2026-08-12, v0.19.139)
+
+- **W3-07 pins managed Codex interaction ownership.** App-server keeps the
+  approval loop; Libra projects/forwards via sidecar `AgentRuntime` (no
+  `pending_approvals`). Browser composer + cancel/approve paths are
+  lease-on-first-write; user-input remains DEFER-07.
+
 ### Added (plan-20260715 W3-14, 2026-08-12, v0.19.138)
 
 - **W3-14 gates large-session Code UI projection.** Hot window stays

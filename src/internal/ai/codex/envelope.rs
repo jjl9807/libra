@@ -10,10 +10,17 @@
 //! emit a diagnosable [`AgentEventKind::ProviderNotification`] fallback —
 //! never silent drop and never panic.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::protocol::MethodKind;
-use crate::internal::ai::runtime::{AgentEventKind, InteractionState};
+use crate::internal::ai::{
+    runtime::{AgentEventKind, InteractionState},
+    web::code_ui::{
+        CodeUiApplyToFuture, CodeUiInteractionKind, CodeUiInteractionOption,
+        CodeUiInteractionRequest, CodeUiInteractionResponse, CodeUiInteractionStatus,
+    },
+};
 
 /// Provider label stamped on every Codex-normalized envelope kind.
 pub const CODEX_PROVIDER: &str = "codex";
@@ -266,6 +273,133 @@ fn approval_tool_name(kind: MethodKind) -> String {
     }
 }
 
+/// App-server JSON-RPC method used to forward one approval decision.
+pub fn approval_resolve_method(kind: MethodKind) -> &'static str {
+    match kind {
+        MethodKind::RequestApprovalCommandExecution => {
+            "item/commandExecution/requestApproval/resolve"
+        }
+        MethodKind::RequestApprovalFileChange => "item/fileChange/requestApproval/resolve",
+        MethodKind::RequestApprovalExec => "exec_approval_request/resolve",
+        MethodKind::RequestApprovalApplyPatch => "apply_patch_approval_request/resolve",
+        _ => "requestApproval/resolve",
+    }
+}
+
+/// Outward Code UI approval row for managed Codex (W3-07).
+///
+/// Option ids match the non-Codex headless exec-approval wire (`approve` /
+/// `deny` / `abort`) so the browser does not branch on provider. Codex
+/// app-server still owns the approval loop; this is projection only.
+pub fn codex_tool_approval_interaction(
+    interaction_id: impl Into<String>,
+    tool_name: &str,
+    description: Option<String>,
+    prompt: Option<String>,
+    metadata: Value,
+    requested_at: DateTime<Utc>,
+) -> CodeUiInteractionRequest {
+    let title = match tool_name {
+        "command_execution" => "Approve command execution",
+        "file_change" => "Approve file change",
+        _ => "Approval required",
+    };
+    CodeUiInteractionRequest {
+        id: interaction_id.into(),
+        kind: CodeUiInteractionKind::Approval,
+        title: Some(title.to_string()),
+        description,
+        prompt,
+        options: vec![
+            CodeUiInteractionOption {
+                id: "approve".to_string(),
+                label: "Approve".to_string(),
+                description: Some("Allow this request once".to_string()),
+            },
+            CodeUiInteractionOption {
+                id: "deny".to_string(),
+                label: "Deny".to_string(),
+                description: Some("Reject this request".to_string()),
+            },
+            CodeUiInteractionOption {
+                id: "abort".to_string(),
+                label: "Abort".to_string(),
+                description: Some("Cancel this tool run immediately".to_string()),
+            },
+        ],
+        status: CodeUiInteractionStatus::Pending,
+        metadata,
+        requested_at,
+        resolved_at: None,
+    }
+}
+
+/// Parse a browser/automation interaction response into an app-server
+/// `approved` flag plus whether the user asked to abort the turn.
+/// `deny` declines once; `abort` declines and should interrupt the turn.
+/// `applyToFuture` is returned separately so the adapter can update
+/// ask/accept/decline mode.
+pub fn decision_from_code_ui_interaction_response(
+    response: &CodeUiInteractionResponse,
+) -> Result<(bool, Option<CodeUiApplyToFuture>, bool), String> {
+    let abort_selected = response
+        .selected_option
+        .as_deref()
+        .is_some_and(|option| option.eq_ignore_ascii_case("abort"));
+    let from_option = match response.selected_option.as_deref() {
+        Some(option) if option.eq_ignore_ascii_case("approve") => Some(true),
+        Some(option) if option.eq_ignore_ascii_case("allow") => Some(true),
+        Some(option) if option.eq_ignore_ascii_case("approve_all") => Some(true),
+        Some(option) if option.eq_ignore_ascii_case("yes") => Some(true),
+        Some(option) if option.eq_ignore_ascii_case("deny") => Some(false),
+        Some(option) if option.eq_ignore_ascii_case("decline") => Some(false),
+        Some(option) if option.eq_ignore_ascii_case("decline_all") => Some(false),
+        Some(option) if option.eq_ignore_ascii_case("no") => Some(false),
+        Some(option) if option.eq_ignore_ascii_case("abort") => Some(false),
+        _ => None,
+    };
+    if let (Some(approved), Some(from_option)) = (response.approved, from_option)
+        && approved != from_option
+    {
+        return Err(
+            "Codex approval response has conflicting approved and selectedOption fields"
+                .to_string(),
+        );
+    }
+    let Some(approved) = response.approved.or(from_option) else {
+        return Err("Codex approvals require an explicit decision".to_string());
+    };
+    let apply_to_future =
+        response
+            .apply_to_future
+            .clone()
+            .or(match response.selected_option.as_deref() {
+                Some(option) if option.eq_ignore_ascii_case("approve_all") => {
+                    Some(CodeUiApplyToFuture::AcceptAll)
+                }
+                Some(option) if option.eq_ignore_ascii_case("decline_all") => {
+                    Some(CodeUiApplyToFuture::DeclineAll)
+                }
+                _ => None,
+            });
+    if let Some(apply_to_future) = apply_to_future.as_ref() {
+        let matches_decision = match apply_to_future {
+            CodeUiApplyToFuture::AcceptAll => approved,
+            CodeUiApplyToFuture::DeclineAll => !approved,
+            CodeUiApplyToFuture::No => true,
+        };
+        if !matches_decision {
+            return Err(
+                "Codex approval applyToFuture conflicts with the resolved decision".to_string(),
+            );
+        }
+    }
+    if abort_selected && approved {
+        return Err("Codex abort cannot be combined with an approve decision".to_string());
+    }
+    Ok((approved, apply_to_future, abort_selected))
+}
+
 fn extract_interaction_id(params: &Value) -> String {
     params
         .get("requestId")
@@ -457,6 +591,23 @@ mod tests {
             }) => {
                 assert_eq!(interaction_id, "req-1");
                 assert_eq!(tool_name, "command_execution");
+                let projected = super::codex_tool_approval_interaction(
+                    interaction_id,
+                    tool_name,
+                    None,
+                    None,
+                    json!({}),
+                    chrono::Utc::now(),
+                );
+                assert_eq!(projected.id, "req-1");
+                assert_eq!(
+                    projected
+                        .options
+                        .iter()
+                        .map(|option| option.id.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["approve", "deny", "abort"]
+                );
             }
             other => panic!("expected InteractionRequested, got {other:?}"),
         }
@@ -484,5 +635,50 @@ mod tests {
             run_status_for_turn_completed(&json!({"status": "interrupted"})),
             super::super::types::RunStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn approval_response_rejects_conflicting_decision_fields() {
+        use crate::internal::ai::web::code_ui::CodeUiInteractionResponse;
+
+        let conflict = decision_from_code_ui_interaction_response(&CodeUiInteractionResponse {
+            approved: Some(false),
+            selected_option: Some("approve".to_string()),
+            apply_to_future: None,
+            answers: Default::default(),
+            max_attempts: None,
+            note: None,
+        });
+        assert!(
+            conflict.is_err(),
+            "approved vs selectedOption must conflict"
+        );
+
+        let future_conflict =
+            decision_from_code_ui_interaction_response(&CodeUiInteractionResponse {
+                approved: Some(false),
+                selected_option: None,
+                apply_to_future: Some(CodeUiApplyToFuture::AcceptAll),
+                answers: Default::default(),
+                max_attempts: None,
+                note: None,
+            });
+        assert!(
+            future_conflict.is_err(),
+            "deny + accept_all must not switch future mode"
+        );
+
+        let ok = decision_from_code_ui_interaction_response(&CodeUiInteractionResponse {
+            approved: Some(true),
+            selected_option: Some("approve_all".to_string()),
+            apply_to_future: None,
+            answers: Default::default(),
+            max_attempts: None,
+            note: None,
+        })
+        .expect("matching approve_all must parse");
+        assert!(ok.0);
+        assert_eq!(ok.1, Some(CodeUiApplyToFuture::AcceptAll));
+        assert!(!ok.2);
     }
 }
