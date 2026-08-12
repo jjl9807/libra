@@ -1,9 +1,9 @@
 # `libra code-control`
 
-> **迁移（W4-02）：** 请优先使用 canonical client
-> `libra code --control stdio --control-url <URL> --control-token-file <PATH>`
-> （相同的 JSON-RPC NDJSON 协议）。本 `code-control` 入口在 W4-09 forwarding
-> shim / W5-01 删除前仍作为兼容的遗留命令保留。
+> **迁移（W4-02 / W4-10）：** 请优先使用 canonical client
+> `libra code --control stdio`（默认从 `.libra/code/control.json` discovery；
+> 可选 `--control-url` / `--control-token-file` / `--control-info-file`）。
+> 本 `code-control` 入口在 W4-09 forwarding shim / W5-01 删除前仍作为兼容的遗留命令保留。
 
 `libra code-control --stdio` 是面向已运行 `libra code --control write` 会话的本地自动化适配层。它在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并将请求转发到 loopback `/api/code/*` HTTP/SSE 控制接口。
 
@@ -23,9 +23,12 @@ libra code-control --stdio \
   --token-file .libra/code/control-token
 ```
 
-`--url` / `--control-url` 应来自 `.libra/code/control.json`，且必须使用 **字面 loopback IP**
+`--url` / `--control-url` 应来自 `.libra/code/control.json`（`baseUrl`），且必须使用 **字面 loopback IP**
 （`http://127.0.0.1:…` 或 `http://[::1]:…`）。`localhost` 等主机名会被拒绝，避免 DNS/hosts 重映射。
-`--token-file` / `--control-token-file` 指向由 `libra code --control write` 创建的进程级令牌；该令牌会作为 `X-Libra-Control-Token` 发送，用于写控制 HTTP 请求。HTTP client 禁用代理与重定向，避免 token 离开本机。
+`--token-file` / `--control-token-file` 指向由 `libra code --control write` 创建的进程级令牌。
+在 Unix/macOS 上该文件必须是权限恰好为 `0600` 的普通非符号链接文件，否则 fail-closed 并返回
+`CONTROL_TOKEN_PERMS`（可执行 `chmod 0600 <path>`）。该令牌会作为 `X-Libra-Control-Token` 发送，
+用于写控制 HTTP 请求。HTTP client 禁用代理与重定向，避免 token 离开本机。
 
 ## 方法
 

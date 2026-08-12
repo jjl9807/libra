@@ -30,14 +30,14 @@ use crate::utils::error::{CliError, CliResult};
 /// `--help` EXAMPLES rollout per `docs/development/commands/_general.md` item B.
 pub const CODE_CONTROL_EXAMPLES: &str = "\
 EXAMPLES:
-    libra code-control --stdio --url http://127.0.0.1:3000 --token-file ./control.token
-                                                  Run the JSON-RPC shim against a session at the given URL/token
+    libra code-control --stdio --url http://127.0.0.1:3000 --token-file .libra/code/control-token
+                                                  Run the JSON-RPC shim (token file must be regular 0600 on Unix)
     libra code-control --stdio \\
-        --url $(jq -r .url .libra/code/control.json) \\
-        --token-file .libra/code/control.token
+        --url $(jq -r .baseUrl .libra/code/control.json) \\
+        --token-file .libra/code/control-token
                                                   Wire from the discovery file emitted by 'libra code --control write'
-    echo '{\"jsonrpc\":\"2.0\",\"method\":\"attach\",\"params\":{\"clientId\":\"my-script\"},\"id\":1}' | \\
-        libra code-control --stdio --url http://127.0.0.1:3000 --token-file ./control.token
+    echo '{\"jsonrpc\":\"2.0\",\"method\":\"controller.attach\",\"params\":{\"clientId\":\"my-script\",\"kind\":\"automation\"},\"id\":1}' | \\
+        libra code-control --stdio --url http://127.0.0.1:3000 --token-file .libra/code/control-token
                                                   Send a single attach request through the shim";
 
 #[derive(Debug, Clone, Parser)]
@@ -49,7 +49,12 @@ pub struct CodeControlArgs {
     /// Base URL from `.libra/code/control.json`, e.g. http://127.0.0.1:3000.
     #[arg(long)]
     pub url: String,
-    /// Path to the local process-level control token file
+    /// Path to the local process-level control token file.
+    ///
+    /// On Unix/macOS the file must be a regular non-symlink path with exact
+    /// `0600` permissions (`CONTROL_TOKEN_PERMS` otherwise). Prefer the
+    /// sidecar written by `libra code --control write`
+    /// (`.libra/code/control-token`).
     #[arg(long, value_name = "PATH")]
     pub token_file: PathBuf,
 }
@@ -240,18 +245,35 @@ fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
 }
 
 fn read_control_token(path: &PathBuf) -> CliResult<String> {
-    let content = std::fs::read_to_string(path).map_err(|error| {
-        CliError::fatal(format!(
-            "failed to read local TUI control token file '{}': {error}",
+    if !path.exists() {
+        return Err(CliError::fatal(format!(
+            "CONTROL_TOKEN_MISSING: local TUI control token file '{}' is missing",
             path.display()
         ))
+        .with_stable_code(crate::utils::error::StableErrorCode::AuthMissingCredentials));
+    }
+    // Fail-closed on symlink / non-file / overly permissive mode (W3-10 / W4-10).
+    crate::command::code_control_files::validate_token_file_perms(path).map_err(|error| {
+        CliError::fatal(format!(
+            "CONTROL_TOKEN_PERMS: control token file '{}' rejected: {error}",
+            path.display()
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::AuthPermissionDenied)
+    })?;
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        CliError::fatal(format!(
+            "CONTROL_TOKEN_MISSING: failed to read local TUI control token file '{}': {error}",
+            path.display()
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::AuthMissingCredentials)
     })?;
     let token = content.trim().to_string();
     if token.is_empty() {
         return Err(CliError::fatal(format!(
-            "local TUI control token file '{}' is empty",
+            "CONTROL_TOKEN_MISSING: local TUI control token file '{}' is empty",
             path.display()
-        )));
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::AuthMissingCredentials));
     }
     Ok(token)
 }

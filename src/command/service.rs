@@ -48,8 +48,9 @@ use tokio::sync::broadcast;
 use crate::{
     command::code_control_files::{
         CONTROL_INFO_VERSION, ControlInfo, ControlPaths, ControlScopePolicy, acquire_control_lock,
-        cleanup_control_files, ensure_control_token_file, ensure_scope_takeover_allowed,
-        pid_is_live, resolve_control_scope, validate_token_file_perms, write_control_info,
+        cleanup_control_files, current_pid_starttime, ensure_control_token_file,
+        ensure_scope_takeover_allowed, pid_is_live, resolve_control_scope,
+        validate_token_file_perms, write_control_info,
     },
     internal::dirty::{DirtyCache, MarkError},
     utils::{
@@ -714,6 +715,7 @@ async fn run_service(host: &str, port: u16, output: &OutputConfig) -> CliResult<
         worktree_id: scope.worktree_id.clone(),
         workspace_id: None,
         lease_fence: None,
+        pid_starttime: current_pid_starttime(),
     };
     write_control_info(&paths.info, &info).map_err(|e| {
         CliError::fatal(format!("failed to write service.json: {e}"))

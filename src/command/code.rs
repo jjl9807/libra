@@ -93,8 +93,8 @@ use crate::{
     command::code_control_files::{
         CONTROL_INFO_VERSION, ControlInfo, ControlLockError, ControlLockGuard, ControlPaths,
         ControlScope, ControlScopePolicy, acquire_control_lock, cleanup_control_files,
-        ensure_control_token_file, ensure_scope_takeover_allowed, repo_has_linked_evidence,
-        resolve_control_paths, resolve_control_scope, write_control_info,
+        current_pid_starttime, ensure_control_token_file, ensure_scope_takeover_allowed,
+        repo_has_linked_evidence, resolve_control_paths, resolve_control_scope, write_control_info,
     },
     internal::{
         ai::{
@@ -241,9 +241,9 @@ pub enum ControlMode {
     Observe,
     /// Enable local automation write control with token and controller checks.
     Write,
-    /// Client-only JSON-RPC NDJSON shim (W4-02). Does not start Web/TUI/MCP.
-    /// Connects to an existing `--control write` session via `--control-url`
-    /// and `--control-token-file` (discovery defaults land in W4-10).
+    /// Client-only JSON-RPC NDJSON shim (W4-02 / W4-10). Does not start Web/TUI/MCP.
+    /// Discovers endpoint from `--control-info-file` (default `.libra/code/control.json`);
+    /// `--control-url` / `--control-token-file` override.
     Stdio,
 }
 
@@ -450,8 +450,9 @@ EXAMPLES:
                                                      Deprecated alias; Web UI against a local Ollama
     libra code --host 0.0.0.0 --browser-control off  Bind all interfaces observe-only / remote notice
     libra code --control write                       Enable local automation write control (token + controller checks)
+    libra code --control stdio                       Drive write-control session via control.json discovery
     libra code --control stdio --control-url http://127.0.0.1:3000 --control-token-file .libra/code/control-token
-                                                     Drive an existing write-control session over JSON-RPC NDJSON
+                                                     Explicit endpoint overrides (loopback only)
     libra code --resume <thread-uuid>                Resume a prior canonical thread
     libra code --plan-mode                           Start in plan-only mode (no apply)
     libra code --env-file .env.test                  Load provider keys from a dotenv-style file
@@ -518,13 +519,19 @@ pub struct CodeArgs {
     pub control_token_file: Option<PathBuf>,
 
     /// Path to the local automation control discovery info file
+    ///
+    /// For `--control write`/`observe`, this is the write path for non-secret
+    /// endpoint metadata. For `--control stdio`, this is the read path used to
+    /// discover `baseUrl` (default `.libra/code/control.json`); explicit
+    /// `--control-url` overrides the discovered URL.
     #[arg(long, value_name = "PATH")]
     pub control_info_file: Option<PathBuf>,
 
-    /// Base URL of an existing Code UI control endpoint (W4-02).
+    /// Base URL of an existing Code UI control endpoint (W4-02 / W4-10).
     ///
-    /// Required for `--control stdio` until W4-10 adds control-info discovery.
-    /// Example: `http://127.0.0.1:3000`.
+    /// Optional with `--control stdio`: when omitted, the URL is read from
+    /// `--control-info-file` (default `.libra/code/control.json`). Example:
+    /// `http://127.0.0.1:3000`.
     #[arg(long = "control-url", value_name = "URL")]
     pub control_url: Option<String>,
 
@@ -754,21 +761,47 @@ fn warn_deprecated_web_alias() {
 /// terminal/session initialization failures. Error classification follows
 /// `docs/development/cli-error-contract-design.md`.
 pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
-    // Client-only control shim (W4-02): no worktree gate, no Web/TUI/MCP boot.
-    // Discovery defaults land in W4-10 — require explicit URL + token file now.
+    // Client-only control shim (W4-02) + control-info discovery (W4-10): no
+    // worktree gate, no Web/TUI/MCP boot, no auto-start / port scan.
     if args.control == ControlMode::Stdio {
         validate_mode_args(&args, output).map_err(CliError::command_usage)?;
-        let url = args.control_url.as_deref().ok_or_else(|| {
-            CliError::command_usage(
-                "`libra code --control stdio` requires `--control-url` until control-info discovery lands (W4-10); example: `--control-url http://127.0.0.1:3000`",
-            )
+        let working_dir = std::env::current_dir().map_err(|error| {
+            CliError::fatal(format!(
+                "cannot resolve the current working directory: {error}"
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::IoReadFailed)
         })?;
-        let token_file = args.control_token_file.as_ref().ok_or_else(|| {
-            CliError::command_usage(
-                "`libra code --control stdio` requires `--control-token-file` until control-info discovery lands (W4-10)",
-            )
+        let discovered = crate::command::code_control_files::discover_control_stdio_endpoint(
+            &working_dir,
+            args.control_url.as_deref(),
+            args.control_token_file.as_deref(),
+            args.control_info_file.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            use serde_json::json;
+
+            use crate::utils::error::StableErrorCode;
+            let wire = error.code();
+            let code = match wire {
+                "CONTROL_TOKEN_PERMS" | "CONTROL_INFO_PERMS" => {
+                    StableErrorCode::AuthPermissionDenied
+                }
+                "CONTROL_SCOPE_CONFLICT" => StableErrorCode::ConflictOperationBlocked,
+                "CONTROL_SERVER_MISSING" => StableErrorCode::NetworkUnavailable,
+                _ => StableErrorCode::CliInvalidTarget,
+            };
+            // Preserve CONTROL_* in structured details so `--machine` clients
+            // can key off the same identifiers as JSON-RPC attach `data.code`.
+            CliError::fatal(error.to_string())
+                .with_stable_code(code)
+                .with_detail("code", json!(wire))
         })?;
-        return crate::command::code_control::run_control_stdio_client(url, token_file).await;
+        return crate::command::code_control::run_control_stdio_client(
+            &discovered.base_url,
+            &discovered.token_file,
+        )
+        .await;
     }
 
     // W0 §C.4.1.1 preflight: gate on the SESSION's working directory — which
@@ -2507,6 +2540,7 @@ impl ControlRuntimeConfig {
             worktree_id: self.scope.worktree_id.clone(),
             workspace_id: self.scope.workspace_id.clone(),
             lease_fence: self.scope.lease_fence,
+            pid_starttime: current_pid_starttime(),
         };
         write_control_info(&self.paths.info, &info).map_err(|error| {
             CliError::fatal(format!(
@@ -5601,29 +5635,9 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
                     .to_string(),
             );
         }
-        if args
-            .control_url
-            .as_deref()
-            .map(str::trim)
-            .is_none_or(|s| s.is_empty())
-        {
-            return Err(
-                "`--control stdio` requires `--control-url` until control-info discovery lands (W4-10); example: `--control-url http://127.0.0.1:3000`"
-                    .to_string(),
-            );
-        }
-        if args.control_token_file.is_none() {
-            return Err(
-                "`--control stdio` requires `--control-token-file` until control-info discovery lands (W4-10)"
-                    .to_string(),
-            );
-        }
-        if args.control_info_file.is_some() {
-            return Err(
-                "`--control-info-file` is a launch-side discovery write path and is not supported with `--control stdio`; pass `--control-url` and `--control-token-file` explicitly"
-                    .to_string(),
-            );
-        }
+        // URL/token may be omitted: W4-10 discovers them from --control-info-file
+        // (default .libra/code/control.json) + worktree control-token. Explicit
+        // --control-url / --control-token-file still override.
         if args.browser_control.is_some() {
             return Err(
                 "`--browser-control` is not supported with `--control stdio` (client-only; no Web/TUI launch)"
@@ -6922,22 +6936,17 @@ mod tests {
     }
 
     #[test]
-    fn control_stdio_requires_url_and_token_file() {
+    fn control_stdio_allows_discovery_without_explicit_url_or_token() {
         let mut args = base_args();
         args.control = ControlMode::Stdio;
-        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
-        assert!(
-            err.contains("--control-url"),
-            "expected --control-url requirement; got: {err}"
-        );
+        // W4-10: validate_mode_args must not require URL/token; discovery fills
+        // them (or fails closed later with CONTROL_* codes).
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+
+        args.control_info_file = Some(PathBuf::from(".libra/code/control.json"));
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
 
         args.control_url = Some("http://127.0.0.1:3000".to_string());
-        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
-        assert!(
-            err.contains("--control-token-file"),
-            "expected --control-token-file requirement; got: {err}"
-        );
-
         args.control_token_file = Some(PathBuf::from(".libra/code/control-token"));
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
@@ -7091,6 +7100,7 @@ mod tests {
             worktree_id: None,
             workspace_id: None,
             lease_fence: None,
+            pid_starttime: None,
         };
         let value = serde_json::to_value(&info).expect("control info serializes");
         let object = value.as_object().expect("object");

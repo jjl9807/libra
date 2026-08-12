@@ -131,6 +131,7 @@ fn code_control_info_scope_mismatch_rejected() {
         worktree_id: None,
         workspace_id: None,
         lease_fence: None,
+        pid_starttime: None,
     };
     write_control_info(&clean, &stamped).expect("atomic write");
     let body = fs::read_to_string(&clean).expect("read stamped control.json");

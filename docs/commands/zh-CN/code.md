@@ -35,9 +35,9 @@ libra graph <THREAD_ID> [--repo <PATH>]
 | Working directory | | `--cwd` | 当前目录 | 会话工作目录。 |
 | Env file | | `--env-file <PATH>` | 无 | 从 dotenv 风格文件加载 provider 环境变量；显式文件值优先于 Vault 和进程环境。 |
 | Control mode | | `--control <observe\|write\|stdio>` | `observe` | 本地自动化控制模式。`observe` 保留现有 loopback 读行为；`write` 启用本地 token discovery 和进程级自动化控制认证；`stdio` 是 **client-only** JSON-RPC NDJSON shim，驱动已有 write-control 会话（不启动 Web/TUI/MCP）。 |
-| Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | 每进程本地自动化 token 路径。在 `write` 模式下，Unix/macOS 文件必须是权限 `0600` 的普通文件。在 W4-10 discovery 落地前，与 `--control stdio` 一起使用时为必填。 |
-| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。在 Unix/macOS 上以原子写 + `0600` 落盘。该文件永不包含 token 材料。不用于 `--control stdio`（请传 `--control-url`）。 |
-| Control URL | | `--control-url <URL>` |（`--control stdio` 必填） | 已有 Code UI control endpoint 的 base URL（例如 `http://127.0.0.1:3000`）。仅与 `--control stdio` 合法。 |
+| Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | 每进程本地自动化 token 路径。在 `write` 模式下，Unix/macOS 文件必须是权限 `0600` 的普通文件。与 `--control stdio` 一起使用时可覆盖 worktree 默认 token 路径（与 `--control-info-file` 独立）；权限过宽 fail-closed（`CONTROL_TOKEN_PERMS`）。 |
+| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | 非 secret 本地 endpoint discovery 元数据路径。launch 模式在 Unix/macOS 上以原子写 + `0600` 落盘。该文件永不包含 token 材料。与 `--control stdio` 一起使用时仅为 `baseUrl` 的 **读取** discovery 路径（显式 `--control-url` 可覆盖）。自定义 info 路径**不会**改写默认 token 位置——若 token 不在 worktree `code/` 目录下，请同时传 `--control-token-file`。 |
+| Control URL | | `--control-url <URL>` |（discovery） | 已有 Code UI control endpoint 的 base URL（例如 `http://127.0.0.1:3000`）。仅与 `--control stdio` 合法。省略时从 `--control-info-file` discovery。必须是字面 loopback IP。 |
 | Provider | | `--provider` | `gemini` | AI provider 后端（见下方 Provider Backends）。 |
 | Model | | `--model` | provider 默认值 | Provider 专用 model ID。 |
 | Agent profile | | `--agent <NAME>` | 无 | 按名称选择 agent profile。当 profile 携带结构化 `model: provider/model[@variant]` 绑定时，该绑定原子生效——provider、model ID 和 variant 全部来自 profile，单独提供的 `--model` 会被忽略以避免混搭组合；无结构化绑定的 profile 回退到 CLI 默认值。Profiles 通过三层层级解析（项目 `.libra/agents/`、用户 `~/.config/libra/agents/`、内置）。未知或非 primary-eligible profile 会被拒绝。 |
@@ -94,7 +94,7 @@ Write control 仅限本地。`--control write` 与 `--stdio` 组合会被拒绝�
 
 Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 `{ "clientId": "...", "kind": "automation" }`，header `X-Libra-Control-Token`，然后使用返回的 `X-Code-Controller-Token` 写入。Automation-held leases 对 `/api/code/messages`、`/api/code/interactions/{id}`、`/api/code/controller/detach` 和 `/api/code/control/cancel` 同时要求两个 tokens。本地 TUI 可以用 `/control reclaim` 重新取得控制权，这会使 automation lease 失效。Code UI 写请求体上限为 256KiB。当会话广告 `capabilities.commandIdempotency`（当前仅 headless web-only）时，`POST /api/code/messages` 接受 `{ "text": "...", "commandId": "..." }` 以支持重试去重（相同 id + 相同 text 幂等；相同 id + 不同 text 返回 `COMMAND_PAYLOAD_CONFLICT`）。运行时会用活动 controller `clientId` 的 SHA-256 fence 命名空间化 `commandId`（原始 clientId 不会写入 durable command log）。`commandIdempotency` 仅在配置了 durable SessionStore command admission 时广告。其他 runtime 若收到 `commandId` 会显式拒绝，而不会静默忽略。
 
-`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client（在 W4-10 discovery 落地前需要 `--control-url` 与 `--control-token-file`）。遗留 [`libra code-control --stdio`](code-control.md) shim 在 W4-09 前仍可用。`libra code --stdio` 仍是 **MCP** stdio server，不得与 `--control stdio` 混同。
+`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。遗留 [`libra code-control --stdio`](code-control.md) shim 在 W4-09 前仍可用。`libra code --stdio` 仍是 **MCP** stdio server，不得与 `--control stdio` 混同。
 
 ### Web Browser Control
 
@@ -283,7 +283,11 @@ libra code --web-only --provider codex
 # 启用本地自动化写控制（写入 token + lease discovery 文件）
 libra code --control write
 
-# 以 JSON-RPC NDJSON 驱动已有 write-control 会话（client-only）
+# 以 JSON-RPC NDJSON 驱动已有 write-control 会话（client-only）。
+# 默认读取 `.libra/code/control.json` + sibling `control-token`。
+libra code --control stdio
+
+# 显式 endpoint 覆盖（仍仅限 loopback）
 libra code --control stdio \
   --control-url http://127.0.0.1:3000 \
   --control-token-file .libra/code/control-token

@@ -410,6 +410,7 @@ fn env_file_secrets_never_projected() {
         worktree_id: None,
         workspace_id: None,
         lease_fence: None,
+        pid_starttime: None,
     };
     let info_json = serde_json::to_value(&info).expect("control info");
     let info_obj = info_json.as_object().expect("object");

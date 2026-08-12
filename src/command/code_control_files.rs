@@ -44,7 +44,7 @@ use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt, io::AsRawFd};
 use std::{
     fmt,
     fs::{self, File, OpenOptions},
-    io::{Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -97,6 +97,11 @@ pub struct ControlInfo {
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_fence: Option<i64>,
+    /// OS process starttime (Linux `/proc/<pid>/stat` field 22) stamped at
+    /// write so discovery can reject PID-reuse collisions (W4-10). Absent on
+    /// legacy sidecars and non-Linux writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_starttime: Option<u64>,
 }
 
 impl ControlInfo {
@@ -584,6 +589,20 @@ pub fn resolve_control_paths(
     ControlPaths { token, info, lock }
 }
 
+/// Resolve paths for `--control stdio` discovery (W4-10).
+///
+/// Same defaults as [`resolve_control_paths`]: an info-file override does **not**
+/// relocate the token. That keeps producer (`--control write --control-info-file`)
+/// and consumer (`--control stdio --control-info-file`) on the same token path.
+/// Pass `--control-token-file` explicitly when the token lives elsewhere.
+pub fn resolve_stdio_control_paths(
+    working_dir: &Path,
+    token_override: Option<&Path>,
+    info_override: Option<&Path>,
+) -> ControlPaths {
+    resolve_control_paths(working_dir, token_override, info_override)
+}
+
 /// Acquire the write-control advisory lock, failing fast when another live
 /// process already owns it.
 pub fn acquire_control_lock(
@@ -811,6 +830,361 @@ pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
         .with_context(|| format!("failed to write control info file '{}'", path.display()))
 }
 
+/// Fail-closed discovery/attach errors for `libra code --control stdio` (W4-10 / F34).
+///
+/// Stable `code()` strings mirror Code UI JSON-RPC `error.data.code` naming so
+/// automation can key off the same identifiers whether the failure happens at
+/// local discovery or later at HTTP attach.
+#[derive(Debug)]
+pub enum ControlDiscoverError {
+    InfoMissing {
+        path: PathBuf,
+    },
+    InfoUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    InfoMalformed {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    /// Symlink, non-file, wrong owner, or overly permissive mode on the
+    /// discovery sidecar (would otherwise allow forging `baseUrl` to exfiltrate
+    /// the local control token).
+    InfoInsecure {
+        path: PathBuf,
+        message: String,
+    },
+    Scope(ControlScopeError),
+    ScopeResolve {
+        working_dir: PathBuf,
+        message: String,
+    },
+    ServerNotLive {
+        path: PathBuf,
+        pid: u32,
+        base_url: String,
+    },
+    /// Discovery sidecar was not produced by a write-control session.
+    ModeUnsupported {
+        path: PathBuf,
+        mode: String,
+    },
+    TokenMissing {
+        path: PathBuf,
+    },
+    TokenPerms {
+        path: PathBuf,
+        message: String,
+    },
+}
+
+impl ControlDiscoverError {
+    /// Stable machine-readable code (JSON-RPC `data.code` / CLI diagnostic prefix).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InfoMissing { .. } | Self::InfoUnreadable { .. } | Self::InfoMalformed { .. } => {
+                "CONTROL_INFO_MISSING"
+            }
+            Self::InfoInsecure { .. } => "CONTROL_INFO_PERMS",
+            Self::Scope(_) | Self::ScopeResolve { .. } => "CONTROL_SCOPE_CONFLICT",
+            Self::ServerNotLive { .. } => "CONTROL_SERVER_MISSING",
+            Self::ModeUnsupported { .. } => "CONTROL_MODE_UNSUPPORTED",
+            Self::TokenMissing { .. } => "CONTROL_TOKEN_MISSING",
+            Self::TokenPerms { .. } => "CONTROL_TOKEN_PERMS",
+        }
+    }
+}
+
+impl fmt::Display for ControlDiscoverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InfoMissing { path } => write!(
+                f,
+                "CONTROL_INFO_MISSING: no control discovery file at '{}'. Start a write-control \
+                 session (`libra code --control write`) in this repository, or pass \
+                 `--control-url` and `--control-token-file` explicitly. Discovery does not start \
+                 a server, scan ports, or search other repositories.",
+                path.display()
+            ),
+            Self::InfoUnreadable { path, source } => write!(
+                f,
+                "CONTROL_INFO_MISSING: cannot read control discovery file '{}': {source}",
+                path.display()
+            ),
+            Self::InfoMalformed { path, source } => write!(
+                f,
+                "CONTROL_INFO_MISSING: control discovery file '{}' is not valid ControlInfo JSON: \
+                 {source}",
+                path.display()
+            ),
+            Self::InfoInsecure { path, message } => write!(
+                f,
+                "CONTROL_INFO_PERMS: control discovery file '{}' rejected: {message}. Refusing to \
+                 trust baseUrl from an unauthenticated sidecar (would risk sending the control \
+                 token to a forged loopback endpoint).",
+                path.display()
+            ),
+            Self::Scope(error) => write!(f, "{error}"),
+            Self::ScopeResolve {
+                working_dir,
+                message,
+            } => write!(
+                f,
+                "CONTROL_SCOPE_CONFLICT: cannot resolve repository scope for '{}' to verify \
+                 control ownership: {message}",
+                working_dir.display()
+            ),
+            Self::ServerNotLive {
+                path,
+                pid,
+                base_url,
+            } => write!(
+                f,
+                "CONTROL_SERVER_MISSING: control discovery file '{}' records pid {pid} at \
+                 {base_url}, but that process is not live. Start a write-control session \
+                 (`libra code --control write`) or pass `--control-url`/`--control-token-file` \
+                 for a known live endpoint. Discovery does not auto-start a server.",
+                path.display()
+            ),
+            Self::ModeUnsupported { path, mode } => write!(
+                f,
+                "CONTROL_MODE_UNSUPPORTED: control discovery file '{}' records mode '{mode}', \
+                 which is not write-control. Start `libra code --control write` (or pass \
+                 `--control-url`/`--control-token-file` for a known write endpoint).",
+                path.display()
+            ),
+            Self::TokenMissing { path } => write!(
+                f,
+                "CONTROL_TOKEN_MISSING: control token file '{}' is missing. Start a write-control \
+                 session (`libra code --control write`) or pass `--control-token-file`.",
+                path.display()
+            ),
+            Self::TokenPerms { path, message } => write!(
+                f,
+                "CONTROL_TOKEN_PERMS: control token file '{}' rejected: {message}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlDiscoverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InfoUnreadable { source, .. } => Some(source),
+            Self::InfoMalformed { source, .. } => Some(source),
+            Self::Scope(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Read and parse a `control.json` discovery sidecar (W3-10 schema). Fail-closed
+/// on missing/unreadable/malformed input — never invent defaults.
+///
+/// On Unix the sidecar is opened with `O_NOFOLLOW` and must be a regular file
+/// owned by the current user with exact `0600` permissions before `baseUrl` is
+/// trusted (W4-10: forged discovery must not exfiltrate the control token).
+pub fn read_control_info(path: &Path) -> std::result::Result<ControlInfo, ControlDiscoverError> {
+    let content = read_control_info_bytes(path)?;
+    serde_json::from_str(&content).map_err(|source| ControlDiscoverError::InfoMalformed {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn read_control_info_bytes(path: &Path) -> std::result::Result<String, ControlDiscoverError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ControlDiscoverError::InfoMissing {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(source) => {
+                // Linux returns ELOOP when O_NOFOLLOW hits a symlink.
+                if source.raw_os_error() == Some(libc::ELOOP)
+                    || source.raw_os_error() == Some(libc::EMLINK)
+                {
+                    return Err(ControlDiscoverError::InfoInsecure {
+                        path: path.to_path_buf(),
+                        message: "must not be a symlink".to_string(),
+                    });
+                }
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+                    || source.raw_os_error() == Some(libc::EACCES)
+                {
+                    return Err(ControlDiscoverError::InfoInsecure {
+                        path: path.to_path_buf(),
+                        message: format!("cannot open ({source})"),
+                    });
+                }
+                return Err(ControlDiscoverError::InfoUnreadable {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+            Ok(file) => file,
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|source| ControlDiscoverError::InfoUnreadable {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if !metadata.file_type().is_file() {
+            return Err(ControlDiscoverError::InfoInsecure {
+                path: path.to_path_buf(),
+                message: "must be a regular file".to_string(),
+            });
+        }
+        // SAFETY: geteuid is a trivial libc query of the current process.
+        let euid = unsafe { libc::geteuid() };
+        if metadata.uid() != euid {
+            return Err(ControlDiscoverError::InfoInsecure {
+                path: path.to_path_buf(),
+                message: format!(
+                    "must be owned by the current user (uid {}); found uid {}",
+                    euid,
+                    metadata.uid()
+                ),
+            });
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(ControlDiscoverError::InfoInsecure {
+                path: path.to_path_buf(),
+                message: format!(
+                    "must have permissions 0600 (currently {mode:03o}); run: chmod 0600 {}",
+                    path.display()
+                ),
+            });
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content).map_err(|source| {
+            ControlDiscoverError::InfoUnreadable {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        Ok(content)
+    }
+
+    #[cfg(not(unix))]
+    {
+        match fs::read_to_string(path) {
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                Err(ControlDiscoverError::InfoMissing {
+                    path: path.to_path_buf(),
+                })
+            }
+            Err(source) => Err(ControlDiscoverError::InfoUnreadable {
+                path: path.to_path_buf(),
+                source,
+            }),
+            Ok(content) => Ok(content),
+        }
+    }
+}
+
+/// Resolved endpoint + token path for the canonical stdio control client (W4-10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredControlEndpoint {
+    pub base_url: String,
+    pub token_file: PathBuf,
+}
+
+/// Discover the control endpoint for `libra code --control stdio`.
+///
+/// Precedence (ADR-CODE-10 / F34):
+/// - `--control-url` overrides `control.json` `baseUrl`
+/// - `--control-token-file` overrides the sibling `control-token` path
+/// - `--control-info-file` overrides the default `.libra/code/control.json`
+///
+/// When URL discovery is needed, the info file is scope-checked against the
+/// caller's worktree (W3-10 contract) and the recorded PID must still be live.
+/// Never starts a server, never scans ports, never searches other repositories.
+pub async fn discover_control_stdio_endpoint(
+    working_dir: &Path,
+    url_override: Option<&str>,
+    token_override: Option<&Path>,
+    info_override: Option<&Path>,
+) -> std::result::Result<DiscoveredControlEndpoint, ControlDiscoverError> {
+    let paths = resolve_stdio_control_paths(working_dir, token_override, info_override);
+    let url_override = url_override.map(str::trim).filter(|s| !s.is_empty());
+
+    let base_url = if let Some(url) = url_override {
+        url.to_string()
+    } else {
+        let info = read_control_info(&paths.info)?;
+        let expected = resolve_control_scope(working_dir, None)
+            .await
+            .map_err(|error| ControlDiscoverError::ScopeResolve {
+                working_dir: working_dir.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        let storage =
+            util::try_get_storage_path(Some(working_dir.to_path_buf())).map_err(|error| {
+                ControlDiscoverError::ScopeResolve {
+                    working_dir: working_dir.to_path_buf(),
+                    message: error.to_string(),
+                }
+            })?;
+        let linked = repo_has_linked_evidence(&storage);
+        match classify_control_scope(&info, &expected, ControlScopePolicy::Worktree, linked) {
+            ControlScopeCheck::Match | ControlScopeCheck::LegacyAdoptable => {}
+            ControlScopeCheck::LegacyAmbiguous => {
+                return Err(ControlDiscoverError::Scope(
+                    ControlScopeError::LegacyAmbiguous {
+                        path: paths.info.clone(),
+                    },
+                ));
+            }
+            ControlScopeCheck::Foreign(mismatch) => {
+                return Err(ControlDiscoverError::Scope(ControlScopeError::Foreign {
+                    path: paths.info.clone(),
+                    mismatch,
+                }));
+            }
+        }
+        if info.mode != "write" {
+            return Err(ControlDiscoverError::ModeUnsupported {
+                path: paths.info.clone(),
+                mode: info.mode,
+            });
+        }
+        if !control_writer_instance_matches(info.pid, info.pid_starttime) {
+            return Err(ControlDiscoverError::ServerNotLive {
+                path: paths.info.clone(),
+                pid: info.pid,
+                base_url: info.base_url,
+            });
+        }
+        info.base_url
+    };
+
+    if !paths.token.exists() {
+        return Err(ControlDiscoverError::TokenMissing { path: paths.token });
+    }
+    validate_token_file_perms(&paths.token).map_err(|error| ControlDiscoverError::TokenPerms {
+        path: paths.token.clone(),
+        message: error.to_string(),
+    })?;
+
+    Ok(DiscoveredControlEndpoint {
+        base_url,
+        token_file: paths.token,
+    })
+}
+
 /// Best-effort cleanup for token/info files on normal shutdown or startup
 /// failure. Lock file cleanup is owned by [`ControlLockGuard::drop`].
 ///
@@ -864,6 +1238,78 @@ pub fn pid_is_live(pid: u32) -> bool {
     pid_is_live_impl(pid)
 }
 
+/// Current process starttime for stamping [`ControlInfo::pid_starttime`].
+pub fn current_pid_starttime() -> Option<u64> {
+    read_pid_starttime(std::process::id())
+}
+
+/// True when `pid` is live and (when recorded) matches the stamped starttime.
+///
+/// A bare PID check is insufficient after crash+reuse: an unrelated process can
+/// inherit the numeric PID while a local listener binds the stale `baseUrl`.
+/// When `recorded_starttime` is present, fail closed unless `/proc` (or
+/// platform equivalent) agrees. Legacy sidecars without the field keep the
+/// historical live-PID gate only.
+pub fn control_writer_instance_matches(pid: u32, recorded_starttime: Option<u64>) -> bool {
+    if !pid_is_live(pid) {
+        return false;
+    }
+    match recorded_starttime {
+        None => true,
+        Some(want) => read_pid_starttime(pid) == Some(want),
+    }
+}
+
+fn read_pid_starttime(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `comm` is inside parentheses and may contain spaces; take fields after
+        // the final `)`. starttime is field 22 of the full record = index 19 of
+        // the post-comm remainder (state..).
+        let rest = raw.rsplit_once(')')?.1;
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, FILETIME, HANDLE},
+            System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        };
+        // SAFETY: query-only process handle; always closed before return.
+        unsafe {
+            let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let mut creation = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let mut exit_time = creation;
+            let mut kernel = creation;
+            let mut user = creation;
+            let ok = GetProcessTimes(
+                handle,
+                &mut creation,
+                &mut exit_time,
+                &mut kernel,
+                &mut user,
+            );
+            let _ = CloseHandle(handle);
+            if ok == 0 {
+                return None;
+            }
+            Some(((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64))
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 #[cfg(unix)]
 fn pid_is_live_impl(pid: u32) -> bool {
     if pid > i32::MAX as u32 {
@@ -881,9 +1327,36 @@ fn pid_is_live_impl(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(unix))]
-fn pid_is_live_impl(_pid: u32) -> bool {
-    false
+/// Windows: `OpenProcess` + `GetExitCodeProcess` (`STILL_ACTIVE`). Without this,
+/// discovery would always fail closed with `CONTROL_SERVER_MISSING` because the
+/// historical stub returned `false` for every PID (W4-10 / Codex r1 P1).
+#[cfg(windows)]
+fn pid_is_live_impl(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    // SAFETY: OpenProcess/GetExitCodeProcess/CloseHandle are queried with a
+    // limited rights mask; handle is always closed on the success path.
+    unsafe {
+        let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        let _ = CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pid_is_live_impl(pid: u32) -> bool {
+    // Cannot probe process tables here. Treat sentinel ids as dead so unit
+    // tests and stale-cleanup keep working; assume other PIDs are live so
+    // control-info discovery is not bricked (attach remains fail-closed).
+    pid != u32::MAX
 }
 
 #[cfg(unix)]
@@ -940,6 +1413,7 @@ mod tests {
             worktree_id: None,
             workspace_id: None,
             lease_fence: None,
+            pid_starttime: None,
         }
     }
 
@@ -957,6 +1431,7 @@ mod tests {
             worktree_id: scope.worktree_id.clone(),
             workspace_id: scope.workspace_id.clone(),
             lease_fence: scope.lease_fence,
+            pid_starttime: None,
         }
     }
 
@@ -1147,9 +1622,125 @@ mod tests {
     }
 
     #[test]
+    fn code_control_files_info_override_keeps_default_token_for_stdio() {
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("repo");
+        let session = temp.path().join("session");
+        let info = session.join("control.json");
+
+        let launch = resolve_control_paths(&working_dir, None, Some(&info));
+        let stdio = resolve_stdio_control_paths(&working_dir, None, Some(&info));
+        assert_eq!(launch.info, info);
+        assert_eq!(stdio.info, info);
+        assert_eq!(
+            launch.token, stdio.token,
+            "stdio discovery must reuse the launch-mode token path when only info is overridden"
+        );
+        assert_ne!(stdio.token, session.join("control-token"));
+    }
+
+    #[test]
+    fn control_discover_error_display_pins_stable_codes() {
+        let path = PathBuf::from("/tmp/control.json");
+        let cases: Vec<(ControlDiscoverError, &str)> = vec![
+            (
+                ControlDiscoverError::InfoMissing { path: path.clone() },
+                "CONTROL_INFO_MISSING",
+            ),
+            (
+                ControlDiscoverError::InfoUnreadable {
+                    path: path.clone(),
+                    source: std::io::Error::other("io"),
+                },
+                "CONTROL_INFO_MISSING",
+            ),
+            (
+                ControlDiscoverError::InfoMalformed {
+                    path: path.clone(),
+                    source: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+                },
+                "CONTROL_INFO_MISSING",
+            ),
+            (
+                ControlDiscoverError::InfoInsecure {
+                    path: path.clone(),
+                    message: "must have permissions 0600".to_string(),
+                },
+                "CONTROL_INFO_PERMS",
+            ),
+            (
+                ControlDiscoverError::Scope(ControlScopeError::LegacyAmbiguous {
+                    path: path.clone(),
+                }),
+                "CONTROL_SCOPE_CONFLICT",
+            ),
+            (
+                ControlDiscoverError::ScopeResolve {
+                    working_dir: PathBuf::from("/tmp/repo"),
+                    message: "no storage".to_string(),
+                },
+                "CONTROL_SCOPE_CONFLICT",
+            ),
+            (
+                ControlDiscoverError::ServerNotLive {
+                    path: path.clone(),
+                    pid: 9,
+                    base_url: "http://127.0.0.1:1".to_string(),
+                },
+                "CONTROL_SERVER_MISSING",
+            ),
+            (
+                ControlDiscoverError::ModeUnsupported {
+                    path: path.clone(),
+                    mode: "observe".to_string(),
+                },
+                "CONTROL_MODE_UNSUPPORTED",
+            ),
+            (
+                ControlDiscoverError::TokenMissing {
+                    path: PathBuf::from("/tmp/control-token"),
+                },
+                "CONTROL_TOKEN_MISSING",
+            ),
+            (
+                ControlDiscoverError::TokenPerms {
+                    path: PathBuf::from("/tmp/control-token"),
+                    message: "must have permissions 0600".to_string(),
+                },
+                "CONTROL_TOKEN_PERMS",
+            ),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.code(), code);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(code),
+                "Display must pin {code}; got {rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn code_control_files_pid_liveness_rejects_invalid_pid_values() {
         assert!(!pid_is_live(0));
         assert!(!pid_is_live(u32::MAX));
+    }
+
+    #[test]
+    fn control_writer_instance_rejects_pid_starttime_mismatch() {
+        let pid = std::process::id();
+        assert!(
+            control_writer_instance_matches(pid, current_pid_starttime()),
+            "current process must match its own stamped starttime"
+        );
+        assert!(
+            !control_writer_instance_matches(pid, Some(0)),
+            "deliberately wrong starttime must fail closed (PID-reuse defense)"
+        );
+        assert!(
+            !control_writer_instance_matches(u32::MAX, Some(1)),
+            "dead PID must fail even with a stamped starttime"
+        );
     }
 
     /// §C.12 named regression (plan-20260714 line 2759), UNIT half. `libra

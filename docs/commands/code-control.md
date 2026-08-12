@@ -1,9 +1,10 @@
 # `libra code-control`
 
-> **Migration (W4-02):** prefer the canonical client
-> `libra code --control stdio --control-url <URL> --control-token-file <PATH>`
-> (same JSON-RPC NDJSON protocol). This `code-control` entry remains a
-> compatible legacy command until the W4-09 forwarding shim / W5-01 removal.
+> **Migration (W4-02 / W4-10):** prefer the canonical client
+> `libra code --control stdio` (discovers `.libra/code/control.json` by default;
+> optional `--control-url` / `--control-token-file` / `--control-info-file`).
+> This `code-control` entry remains a compatible legacy command until the
+> W4-09 forwarding shim / W5-01 removal.
 
 `libra code-control --stdio` is a local automation shim for an already running
 `libra code --control write` session. It speaks newline-delimited JSON-RPC 2.0
@@ -28,13 +29,16 @@ libra code-control --stdio \
   --token-file .libra/code/control-token
 ```
 
-`--url` / `--control-url` should come from `.libra/code/control.json` and must
-use a **literal loopback IP** (`http://127.0.0.1:…` or `http://[::1]:…`).
+`--url` / `--control-url` should come from `.libra/code/control.json` (`baseUrl`)
+and must use a **literal loopback IP** (`http://127.0.0.1:…` or `http://[::1]:…`).
 Hostnames such as `localhost` are rejected so DNS/hosts remapping cannot
 redirect the token. `--token-file` / `--control-token-file` points at the
-process-level token created by `libra code --control write`; the token is sent
-as `X-Libra-Control-Token` for write-control HTTP requests. The HTTP client
-disables proxies and redirects so the token cannot leave this machine.
+process-level token created by `libra code --control write`. On Unix/macOS the
+token file must be a regular non-symlink path with exact `0600` permissions
+(otherwise the client fails closed with `CONTROL_TOKEN_PERMS`; run
+`chmod 0600 <path>`). The token is sent as `X-Libra-Control-Token` for
+write-control HTTP requests. The HTTP client disables proxies and redirects so
+the token cannot leave this machine.
 
 ## Methods
 
