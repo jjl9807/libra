@@ -1,9 +1,11 @@
-//! Local automation shim for driving an existing `libra code --control write`
-//! session over NDJSON JSON-RPC 2.0.
+//! Deprecated forwarding shim for local automation control (W4-09).
 //!
-//! This command is intentionally separate from `libra code --stdio`, which
-//! remains the MCP stdio transport. `code-control --stdio` is a local bridge
-//! from JSON-RPC lines to the loopback `/api/code/*` HTTP/SSE control surface.
+//! Prefer the canonical client `libra code --control stdio` (control-info
+//! discovery by default). This `libra code-control` entry only emits a
+//! deprecation warning and forwards to [`run_control_stdio_client`] — the same
+//! helper used by `--control stdio`. It is **not** an MCP server (`libra code
+//! --stdio` is the deprecated MCP-only legacy transport; see DEFER-02 for a
+//! future `libra mcp --stdio`). Physical deletion lands in **W5-01**.
 
 use std::{
     io::{self, BufRead, Write},
@@ -19,26 +21,28 @@ use url::Url;
 
 use crate::utils::error::{CliError, CliResult};
 
+/// Stderr pin for W4-09: `code-control` is a deprecated forwarding shim.
+/// Passed to [`crate::utils::error::emit_warning`] (which prefixes `warning: `).
+pub const CODE_CONTROL_DEPRECATION_WARNING: &str = "`libra code-control` is a deprecated forwarding shim; use `libra code --control stdio` (deleted in W5-01)";
+
 /// `--help` examples shown in `libra code-control --help` output.
 ///
-/// `code-control` drives a local Libra Code TUI automation control
-/// session over NDJSON JSON-RPC 2.0 on stdin/stdout. The banner pins
-/// the canonical `--stdio` form (the only supported form today),
-/// shows how to wire it to the discovery file emitted by
-/// `libra code --control write`, and demonstrates Unix-style piping
-/// to feed a single JSON-RPC request through the shim. Cross-cutting
-/// `--help` EXAMPLES rollout per `docs/development/commands/_general.md` item B.
+/// Deprecated forwarding shim (deleted in W5-01). Prefer canonical
+/// `libra code --control stdio`. Legacy `--url` / `--token-file` remain for
+/// CLI compatibility until removal. Cross-cutting `--help` EXAMPLES rollout
+/// per `docs/development/commands/_general.md` item B.
 pub const CODE_CONTROL_EXAMPLES: &str = "\
 EXAMPLES:
+    libra code --control stdio                        Canonical automation client (discovers control.json)
     libra code-control --stdio --url http://127.0.0.1:3000 --token-file .libra/code/control-token
-                                                  Run the JSON-RPC shim (token file must be regular 0600 on Unix)
+                                                  Deprecated shim (deleted in W5-01); prefer --control stdio
     libra code-control --stdio \\
         --url $(jq -r .baseUrl .libra/code/control.json) \\
         --token-file .libra/code/control-token
-                                                  Wire from the discovery file emitted by 'libra code --control write'
+                                                  Legacy wire from discovery file (prefer code --control stdio)
     echo '{\"jsonrpc\":\"2.0\",\"method\":\"controller.attach\",\"params\":{\"clientId\":\"my-script\",\"kind\":\"automation\"},\"id\":1}' | \\
         libra code-control --stdio --url http://127.0.0.1:3000 --token-file .libra/code/control-token
-                                                  Send a single attach request through the shim";
+                                                  Send a single attach request through the deprecated shim";
 
 #[derive(Debug, Clone, Parser)]
 #[command(after_help = CODE_CONTROL_EXAMPLES)]
@@ -152,7 +156,13 @@ pub async fn execute(args: CodeControlArgs) -> CliResult<()> {
         ));
     }
 
-    // W4-02: shared with canonical `libra code --control stdio`.
+    crate::utils::error::emit_warning(CODE_CONTROL_DEPRECATION_WARNING);
+    // Raw NDJSON on stdout never renders `data.warnings[]`, so under global
+    // `--json`/`--machine` still print the migration notice on stderr.
+    if crate::utils::output::structured_output_active() {
+        eprintln!("warning: {CODE_CONTROL_DEPRECATION_WARNING}");
+    }
+    // W4-09: thin forwarding shim → same helper as `libra code --control stdio`.
     run_control_stdio_client(&args.url, &args.token_file).await
 }
 

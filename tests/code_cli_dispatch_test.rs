@@ -531,3 +531,214 @@ fn code_help_documents_mcp_stdio_legacy_and_control_client() {
         "EXAMPLES must mark --stdio as deprecated MCP-only legacy"
     );
 }
+
+#[tokio::test]
+async fn code_control_shim_forwards_with_deprecation_warning() {
+    use std::{
+        fs,
+        io::Write,
+        process::{Command, Stdio},
+        sync::Arc,
+        time::Duration,
+    };
+
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        routing::post,
+    };
+    use libra::command::code_control::CODE_CONTROL_DEPRECATION_WARNING;
+    use serde_json::json;
+    use tempfile::tempdir;
+    use tokio::sync::{Mutex, oneshot};
+
+    assert!(
+        CODE_CONTROL_DEPRECATION_WARNING.contains("deprecated forwarding shim"),
+        "W4-09 must mark code-control as deprecated forwarding shim: {CODE_CONTROL_DEPRECATION_WARNING}"
+    );
+    assert!(
+        CODE_CONTROL_DEPRECATION_WARNING.contains("libra code --control stdio"),
+        "W4-09 must point at canonical --control stdio: {CODE_CONTROL_DEPRECATION_WARNING}"
+    );
+    assert!(
+        CODE_CONTROL_DEPRECATION_WARNING.contains("W5-01"),
+        "W4-09 must name deletion version W5-01: {CODE_CONTROL_DEPRECATION_WARNING}"
+    );
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        tokens: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn conflict_attach(
+        State(state): State<Capture>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let token = headers
+            .get("x-libra-control-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        state.tokens.lock().await.push(token);
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": {
+                    "code": "CONTROLLER_CONFLICT",
+                    "message": "another controller already holds the lease"
+                }
+            })),
+        )
+    }
+
+    let capture = Capture::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback mock");
+    let addr = listener.local_addr().expect("addr");
+    let app = Router::new()
+        .route("/api/code/controller/attach", post(conflict_attach))
+        .with_state(capture.clone());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let temp = tempdir().expect("tempdir for code-control shim probe");
+    let token_path = temp.path().join("control-token");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _ = fs::remove_file(&token_path);
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&token_path)
+            .expect("create token")
+            .write_all(b"shim-shared-token\n")
+            .expect("write token");
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&token_path, "shim-shared-token\n").expect("write token");
+    }
+    let token_str = token_path.to_str().expect("utf8 token path");
+    let base_url = format!("http://{addr}");
+    let attach_req = concat!(
+        r#"{"jsonrpc":"2.0","method":"controller.attach","params":{"clientId":"w4-09","kind":"automation"},"id":1}"#,
+        "\n",
+    );
+    let libra_bin = env!("CARGO_BIN_EXE_libra");
+    let cwd = temp.path().to_path_buf();
+
+    let run_client = {
+        let cwd = cwd.clone();
+        move |args: Vec<String>| {
+            let cwd = cwd.clone();
+            let attach = attach_req.to_string();
+            tokio::task::spawn_blocking(move || {
+                let mut child = Command::new(libra_bin)
+                    .args(&args)
+                    .current_dir(&cwd)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn control client");
+                {
+                    let mut stdin = child.stdin.take().expect("stdin");
+                    stdin
+                        .write_all(attach.as_bytes())
+                        .expect("write attach request");
+                }
+                child.wait_with_output().expect("wait control client")
+            })
+        }
+    };
+
+    let shim = run_client(vec![
+        "code-control".into(),
+        "--stdio".into(),
+        "--url".into(),
+        base_url.clone(),
+        "--token-file".into(),
+        token_str.to_string(),
+    ])
+    .await
+    .expect("join shim");
+    let shim_stdout = String::from_utf8_lossy(&shim.stdout);
+    let shim_stderr = String::from_utf8_lossy(&shim.stderr);
+    assert!(
+        shim.status.success(),
+        "shim must reach mock attach; stderr:\n{shim_stderr}"
+    );
+    assert!(
+        shim_stderr.contains(CODE_CONTROL_DEPRECATION_WARNING) && shim_stderr.contains("warning:"),
+        "code-control must emit tracked deprecation warning; stderr:\n{shim_stderr}"
+    );
+    assert!(
+        shim_stdout.contains("CONTROLLER_CONFLICT") && shim_stdout.contains("-32000"),
+        "shim must forward JSON-RPC conflict; stdout:\n{shim_stdout}"
+    );
+
+    let canonical = run_client(vec![
+        "code".into(),
+        "--control".into(),
+        "stdio".into(),
+        "--control-url".into(),
+        base_url,
+        "--control-token-file".into(),
+        token_str.to_string(),
+    ])
+    .await
+    .expect("join canonical");
+    let canonical_stdout = String::from_utf8_lossy(&canonical.stdout);
+    let canonical_stderr = String::from_utf8_lossy(&canonical.stderr);
+    assert!(
+        canonical.status.success(),
+        "canonical must reach mock attach; stderr:\n{canonical_stderr}"
+    );
+    assert!(
+        !canonical_stderr.contains(CODE_CONTROL_DEPRECATION_WARNING),
+        "canonical must not emit code-control warning; stderr:\n{canonical_stderr}"
+    );
+    assert!(
+        canonical_stdout.contains("CONTROLLER_CONFLICT") && canonical_stdout.contains("-32000"),
+        "canonical must share JSON-RPC conflict; stdout:\n{canonical_stdout}"
+    );
+    assert_eq!(
+        shim_stdout.trim(),
+        canonical_stdout.trim(),
+        "shim and canonical must emit identical JSON-RPC responses"
+    );
+
+    // Wait briefly for both attach handlers to record tokens.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let tokens = loop {
+        let tokens = capture.tokens.lock().await.clone();
+        if tokens.len() >= 2 || tokio::time::Instant::now() >= deadline {
+            break tokens;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        tokens,
+        vec![
+            "shim-shared-token".to_string(),
+            "shim-shared-token".to_string()
+        ],
+        "both CLIs must forward the same control token header through the shared helper"
+    );
+
+    let _ = shutdown_tx.send(());
+    let _ = server.await;
+}

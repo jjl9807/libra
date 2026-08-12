@@ -1,11 +1,14 @@
 # `libra code-control`
 
-> **迁移（W4-02 / W4-10）：** 请优先使用 canonical client
+> **弃用转发 shim（W4-09）：** 请优先使用 canonical client
 > `libra code --control stdio`（默认从 `.libra/code/control.json` discovery；
 > 可选 `--control-url` / `--control-token-file` / `--control-info-file`）。
-> 本 `code-control` 入口在 W4-09 forwarding shim / W5-01 删除前仍作为兼容的遗留命令保留。
+> 本 `code-control` 入口仅打印弃用警告并转发到与 `--control stdio` 相同的
+> control client helper，**不是**独立协议实现。物理删除在 **W5-01**。请勿与
+> 弃用的 MCP-only `libra code --stdio`（tools/resources；W5 之后的 DEFER-02
+> `libra mcp --stdio`）混同。
 
-`libra code-control --stdio` 是面向已运行 `libra code --control write` 会话的本地自动化适配层。它在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并将请求转发到 loopback `/api/code/*` HTTP/SSE 控制接口。
+`libra code-control --stdio` 是面向已运行 `libra code --control write` 会话的弃用本地自动化转发 shim。它在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并通过与 `libra code --control stdio` 共用的 helper 将请求转发到 loopback `/api/code/*` HTTP/SSE 控制接口。
 
 此命令不是 MCP 服务器。`libra code --stdio` 仍然是 MCP stdio 传输，并且不会驱动正在运行的 Code UI 会话。请勿把 MCP `--stdio` 与 `--control stdio` 混同。
 
@@ -17,7 +20,7 @@ libra code --control stdio \
   --control-url http://127.0.0.1:3000 \
   --control-token-file .libra/code/control-token
 
-# 遗留 shim（仍可用）
+# 弃用 shim（W5-01 删除）
 libra code-control --stdio \
   --url http://127.0.0.1:3000 \
   --token-file .libra/code/control-token

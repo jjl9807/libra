@@ -131,7 +131,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | 命令 | 别名 | 说明 | 文档 |
 |------|------|------|------|
 | `libra code` | | 带 AI agent、Web 服务器和 MCP 集成的交互式 TUI | [code.md](code.md) |
-| `libra code-control` | | 驱动本地 Libra Code TUI 自动化控制会话 | [code-control.md](code-control.md) |
+| `libra code-control` | | 弃用的 Code 自动化控制转发 shim（请用 `libra code --control stdio`；W5-01 删除） | [code-control.md](code-control.md) |
 | Codex data storage | | 将 `libra code --provider codex` 连接到 Codex app-server，并持久化 Codex 会话数据 | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | 列出、运行和检查 AI automation rules | [automation.md](automation.md) |
 | `libra usage` | | 报告并修剪 AI provider/model 使用聚合 | [usage.md](usage.md) |

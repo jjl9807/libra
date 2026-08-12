@@ -1,15 +1,19 @@
 # `libra code-control`
 
-> **Migration (W4-02 / W4-10):** prefer the canonical client
+> **Deprecated forwarding shim (W4-09):** prefer the canonical client
 > `libra code --control stdio` (discovers `.libra/code/control.json` by default;
 > optional `--control-url` / `--control-token-file` / `--control-info-file`).
-> This `code-control` entry remains a compatible legacy command until the
-> W4-09 forwarding shim / W5-01 removal.
+> This `code-control` entry only prints a deprecation warning and forwards to
+> the same control client helper. It is **not** an independent protocol
+> implementation. Physical deletion lands in **W5-01**. Do not confuse with
+> deprecated MCP-only `libra code --stdio` (tools/resources; DEFER-02
+> `libra mcp --stdio` after W5).
 
-`libra code-control --stdio` is a local automation shim for an already running
-`libra code --control write` session. It speaks newline-delimited JSON-RPC 2.0
-on stdin/stdout and forwards requests to the loopback `/api/code/*` HTTP/SSE
-control surface.
+`libra code-control --stdio` is a deprecated local automation forwarding shim
+for an already running `libra code --control write` session. It speaks
+newline-delimited JSON-RPC 2.0 on stdin/stdout and forwards requests to the
+loopback `/api/code/*` HTTP/SSE control surface via the shared helper used by
+`libra code --control stdio`.
 
 This command is not an MCP server. `libra code --stdio` remains the MCP stdio
 transport and does not drive a live Code UI session. Do not confuse MCP
@@ -23,7 +27,7 @@ libra code --control stdio \
   --control-url http://127.0.0.1:3000 \
   --control-token-file .libra/code/control-token
 
-# Legacy shim (still supported)
+# Legacy deprecated shim (deleted in W5-01)
 libra code-control --stdio \
   --url http://127.0.0.1:3000 \
   --token-file .libra/code/control-token

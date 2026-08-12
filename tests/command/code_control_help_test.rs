@@ -26,9 +26,11 @@ fn test_code_control_help_lists_examples_banner() {
         "code-control --help should include EXAMPLES banner, stdout: {stdout}"
     );
     for invocation in [
+        "libra code --control stdio",
         "libra code-control --stdio --url",
         ".libra/code/control.json",
         "echo '{\"jsonrpc\":\"2.0\"",
+        "deleted in W5-01",
     ] {
         assert!(
             stdout.contains(invocation),

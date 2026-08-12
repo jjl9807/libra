@@ -706,7 +706,9 @@ enum Commands {
 
     #[command(about = "Start Libra Code interactive TUI (with background web server)")]
     Code(command::code::CodeArgs),
-    #[command(about = "Drive a local Libra Code TUI automation control session")]
+    #[command(
+        about = "Deprecated forwarding shim for Code automation control (use `libra code --control stdio`; deleted in W5-01)"
+    )]
     CodeControl(command::code_control::CodeControlArgs),
     #[command(about = "Manage AI automation rules and history")]
     Automation(command::automation::AutomationArgs),
