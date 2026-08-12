@@ -34,9 +34,10 @@ When the legacy TUI exits and Libra can derive the canonical thread ID, `libra c
 | Host | | `--host` | `127.0.0.1` | Web server bind address. |
 | Working directory | | `--cwd` | current dir | Working directory for the session. |
 | Env file | | `--env-file <PATH>` | none | Load provider environment variables from a dotenv-style file; explicit file values take precedence over Vault and the process environment. |
-| Control mode | | `--control <observe\|write>` | `observe` | Local automation control mode. `observe` preserves existing loopback read behavior; `write` enables local token discovery and process-level automation control auth. |
-| Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | Path for the per-process local automation token. In `write` mode, Unix/macOS files must be regular files with `0600` permissions. |
-| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | Path for non-secret local endpoint discovery metadata. Written atomically at `0600` on Unix/macOS. The file never contains token material. |
+| Control mode | | `--control <observe\|write\|stdio>` | `observe` | Local automation control mode. `observe` preserves existing loopback read behavior; `write` enables local token discovery and process-level automation control auth; `stdio` is a **client-only** JSON-RPC NDJSON shim that drives an existing write-control session (no Web/TUI/MCP launch). |
+| Control token file | | `--control-token-file <PATH>` | `.libra/code/control-token` | Path for the per-process local automation token. In `write` mode, Unix/macOS files must be regular files with `0600` permissions. Required with `--control stdio` until W4-10 discovery defaults land. |
+| Control info file | | `--control-info-file <PATH>` | `.libra/code/control.json` | Path for non-secret local endpoint discovery metadata. Written atomically at `0600` on Unix/macOS. The file never contains token material. Not used with `--control stdio` (pass `--control-url` instead). |
+| Control URL | | `--control-url <URL>` | (required for `--control stdio`) | Base URL of an existing Code UI control endpoint (e.g. `http://127.0.0.1:3000`). Only valid with `--control stdio`. |
 | Provider | | `--provider` | `gemini` | AI provider backend (see Provider Backends below). |
 | Model | | `--model` | provider default | Provider-specific model ID. |
 | Agent profile | | `--agent <NAME>` | none | Select an agent profile by name. When the profile carries a structured `model: provider/model[@variant]` binding, that binding wins atomically -- provider, model ID, and variant all come from the profile, and a separately supplied `--model` is ignored to avoid hybrid pairs; profiles without a structured binding fall back to the CLI defaults. Profiles resolve through the three-tier hierarchy (project `.libra/agents/`, user `~/.config/libra/agents/`, embedded). Unknown or non-primary-eligible profiles are rejected. |
@@ -93,7 +94,7 @@ Write control is local-only. `--control write` is rejected with `--stdio`, and i
 
 Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB. A plan-repair Continue that raises an exhausted retry limit sends `{ "selectedOption": "continue", "maxAttempts": 3 }`; `maxAttempts` must exceed the current limit and not exceed 10. When the session advertises `capabilities.commandIdempotency` (headless web-only today), `POST /api/code/messages` accepts `{ "text": "...", "commandId": "..." }` for retry de-duplication (same id + same text is idempotent; same id + different text returns `COMMAND_PAYLOAD_CONFLICT`). The runtime namespaces each `commandId` under a SHA-256 fence of the active controller `clientId` before durable admission (the raw clientId is never written into the command log). `commandIdempotency` is advertised only when durable SessionStore command admission is configured.
 
-`GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, use [`libra code-control --stdio`](code-control.md); `libra code --stdio` remains the MCP stdio server and does not control a live TUI.
+`GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, prefer the canonical `libra code --control stdio` JSON-RPC NDJSON client (requires `--control-url` and `--control-token-file` until W4-10 discovery). The legacy [`libra code-control --stdio`](code-control.md) shim remains available until W4-09. `libra code --stdio` remains the **MCP** stdio server and must not be confused with `--control stdio`.
 
 ### Web Browser Control
 
@@ -315,6 +316,11 @@ libra code --web-only --provider codex
 
 # Enable local automation write control (writes token + lease discovery files)
 libra code --control write
+
+# Drive an existing write-control session over JSON-RPC NDJSON (client-only)
+libra code --control stdio \
+  --control-url http://127.0.0.1:3000 \
+  --control-token-file .libra/code/control-token
 
 # Load provider keys from a dotenv-style file (overrides stale shell env vars)
 libra code --env-file .env.test

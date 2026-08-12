@@ -147,14 +147,29 @@ pub async fn execute(args: CodeControlArgs) -> CliResult<()> {
         ));
     }
 
-    let base_url = Url::parse(&args.url).map_err(|error| {
+    // W4-02: shared with canonical `libra code --control stdio`.
+    run_control_stdio_client(&args.url, &args.token_file).await
+}
+
+/// Canonical JSON-RPC 2.0 NDJSON control client (W4-02).
+///
+/// Drives an existing Code UI write-control session over stdin/stdout.
+/// Independent of `Commands::CodeControl` dispatch — both
+/// `libra code-control --stdio` and `libra code --control stdio` call this.
+pub async fn run_control_stdio_client(url: &str, token_file: &PathBuf) -> CliResult<()> {
+    let base_url = Url::parse(url).map_err(|error| {
         CliError::command_usage(format!(
-            "--url must be a valid control endpoint base URL (got '{}': {error})",
-            args.url
+            "--control-url / --url must be a valid control endpoint base URL (got '{url}': {error})"
         ))
     })?;
-    let control_token = read_control_token(&args.token_file)?;
+    ensure_loopback_control_url(&base_url)?;
+    let control_token = read_control_token(token_file)?;
+    // Loopback-only: never honor HTTP(S)_PROXY (would tunnel the control token
+    // off-box) and never follow redirects (a loopback 3xx could bounce the
+    // token header to a remote Location).
     let client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| CliError::fatal(format!("failed to build HTTP client: {error}")))?;
 
@@ -192,6 +207,36 @@ pub async fn execute(args: CodeControlArgs) -> CliResult<()> {
     }
 
     Ok(())
+}
+
+/// Control clients forward the local process token as
+/// `X-Libra-Control-Token`. Restrict the base URL to loopback HTTP(S) so a
+/// mistaken or malicious `--control-url` / `--url` cannot exfiltrate that
+/// token (or an arbitrary readable file passed as the token path) off-box.
+fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(CliError::command_usage(format!(
+            "--control-url / --url must use http or https (got '{scheme}')"
+        )));
+    }
+    // Require a literal loopback IP. Reject `localhost` / other hostnames so a
+    // poisoned hosts/DNS mapping cannot send the control token off-box.
+    let host = match url.host() {
+        Some(url::Host::Ipv4(addr)) if addr.is_loopback() => return Ok(()),
+        Some(url::Host::Ipv6(addr)) if addr.is_loopback() => return Ok(()),
+        Some(url::Host::Domain(name)) => name.to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    Err(CliError::command_usage(format!(
+        "--control-url / --url must use a literal loopback IP such as http://127.0.0.1:3000 or http://[::1]:3000 (got '{url}'{host_hint}); hostnames like localhost are rejected so DNS/hosts remapping cannot exfiltrate the control token",
+        host_hint = if host.is_empty() {
+            String::new()
+        } else {
+            format!("; host '{host}'")
+        }
+    )))
 }
 
 fn read_control_token(path: &PathBuf) -> CliResult<String> {
@@ -681,6 +726,28 @@ mod tests {
         let error = parse_json_rpc_request("{not-json").unwrap_err();
 
         assert_eq!(error.code, -32700);
+    }
+
+    #[test]
+    fn ensure_loopback_control_url_rejects_remote_hosts() {
+        let remote = Url::parse("https://evil.example/api").expect("url");
+        let err = ensure_loopback_control_url(&remote).expect_err("remote must fail closed");
+        assert!(
+            err.to_string().contains("loopback"),
+            "expected loopback guidance; got={err}"
+        );
+
+        let by_name = Url::parse("http://localhost:3000").expect("url");
+        let err = ensure_loopback_control_url(&by_name).expect_err("localhost hostname rejected");
+        assert!(
+            err.to_string().contains("localhost") || err.to_string().contains("literal"),
+            "expected hostname rejection; got={err}"
+        );
+
+        let local = Url::parse("http://127.0.0.1:3000").expect("url");
+        ensure_loopback_control_url(&local).expect("loopback http must be accepted");
+        let v6 = Url::parse("http://[::1]:3000").expect("url");
+        ensure_loopback_control_url(&v6).expect("loopback ipv6 must be accepted");
     }
 
     #[test]

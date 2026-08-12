@@ -25,6 +25,7 @@ use sea_orm::{ConnectionTrait, Statement};
 
 use crate::{
     command,
+    command::code::ControlMode,
     internal::{config::ConfigKv, db},
     utils,
     utils::{
@@ -1588,6 +1589,11 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         }
         // Config global/system scopes don't require a repository.
         Commands::Config(cfg) if cfg.global || cfg.system => Ok(CommandPreflight::none()),
+        // W4-02: `--control stdio` is a client-only JSON-RPC shim (same as
+        // `code-control`) — no repository/hash-kind preflight.
+        Commands::Code(code_args) if code_args.control == ControlMode::Stdio => {
+            Ok(CommandPreflight::none())
+        }
         Commands::Code(code_args) => {
             let working_dir = command::code::resolve_code_preflight_working_dir(code_args)?;
             let storage = utils::util::try_get_storage_path(Some(working_dir.clone()))
@@ -1695,9 +1701,12 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::Fetch(_)
         | Commands::Stash(_)
         // These run tools that edit the working tree.
-        | Commands::Code(_)
         | Commands::Automation(_)
         | Commands::Sandbox(_) => Composite,
+        // W4-02: client-only control shim — same scope as `code-control`.
+        Commands::Code(args) if args.control == ControlMode::Stdio => Repository,
+        // Launch paths (observe/write/MCP/`--stdio`) can mutate via tools.
+        Commands::Code(_) => Composite,
 
         // ── Advisory stores: only their MUTATING subcommands ──────────────
         Commands::SparseView(args) => {
@@ -2431,6 +2440,57 @@ fn utf8_argv_view(argv: &[std::ffi::OsString]) -> Vec<String> {
         .collect()
 }
 
+/// W4-02 product decision: do not implement single-dash `-control`.
+///
+/// Clap would otherwise treat `-control` as a short-flag cluster and emit a
+/// generic unknown-argument error. Fail closed with an actionable pointer to
+/// the canonical `--control stdio` (or observe/write) forms.
+///
+/// Only the selected `code` subcommand is scanned, and tokens after `--` are
+/// ignored so pathspecs like `libra add code -- -control` stay valid.
+fn reject_unsupported_single_dash_control(utf8_argv: &[String]) -> CliResult<()> {
+    let os_argv: Vec<std::ffi::OsString> = utf8_argv
+        .iter()
+        .map(|s| std::ffi::OsString::from(s.as_str()))
+        .collect();
+    let Some((index, after_separator)) = find_subcommand_index(&os_argv) else {
+        return Ok(());
+    };
+    // Tokens after a top-level `--` are pathspecs, not the `code` subcommand.
+    if after_separator {
+        return Ok(());
+    }
+    let Some(token) = utf8_argv.get(index).map(String::as_str) else {
+        return Ok(());
+    };
+    let cli = <Cli as clap::CommandFactory>::command();
+    let Some(code_cmd) = cli
+        .get_subcommands()
+        .find(|candidate| candidate.get_name() == "code")
+    else {
+        return Ok(());
+    };
+    let is_code =
+        code_cmd.get_name() == token || code_cmd.get_all_aliases().any(|alias| alias == token);
+    if !is_code {
+        return Ok(());
+    }
+    let after_code = &utf8_argv[index + 1..];
+    let end = after_code
+        .iter()
+        .position(|arg| arg.as_str() == "--")
+        .unwrap_or(after_code.len());
+    if after_code[..end]
+        .iter()
+        .any(|arg| arg.as_str() == "-control")
+    {
+        return Err(CliError::command_usage(
+            "single-dash `-control` is unsupported; use `libra code --control stdio` for the JSON-RPC automation client (or `--control observe|write` for launch modes)",
+        ));
+    }
+    Ok(())
+}
+
 async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
@@ -2445,6 +2505,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     let argv = status_resolution.argv.clone();
     // Same reasoning as above, for the consumers below that inspect argv.
     let utf8_argv = utf8_argv_view(&argv);
+    reject_unsupported_single_dash_control(&utf8_argv)?;
     let _invocation_scope = pin_invocation_scope();
     prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {

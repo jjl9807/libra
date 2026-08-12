@@ -233,7 +233,7 @@ pub enum CodeContext {
     Research,
 }
 
-/// Local TUI automation control mode.
+/// Local automation control mode.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlMode {
@@ -241,6 +241,10 @@ pub enum ControlMode {
     Observe,
     /// Enable local automation write control with token and controller checks.
     Write,
+    /// Client-only JSON-RPC NDJSON shim (W4-02). Does not start Web/TUI/MCP.
+    /// Connects to an existing `--control write` session via `--control-url`
+    /// and `--control-token-file` (discovery defaults land in W4-10).
+    Stdio,
 }
 
 /// Browser write-control posture for `libra code`.
@@ -446,10 +450,12 @@ EXAMPLES:
                                                      Deprecated alias; Web UI against a local Ollama
     libra code --host 0.0.0.0 --browser-control off  Bind all interfaces observe-only / remote notice
     libra code --control write                       Enable local automation write control (token + controller checks)
+    libra code --control stdio --control-url http://127.0.0.1:3000 --control-token-file .libra/code/control-token
+                                                     Drive an existing write-control session over JSON-RPC NDJSON
     libra code --resume <thread-uuid>                Resume a prior canonical thread
     libra code --plan-mode                           Start in plan-only mode (no apply)
     libra code --env-file .env.test                  Load provider keys from a dotenv-style file
-    libra code --stdio                               Pipe-driven session for embedding";
+    libra code --stdio                               MCP stdio transport (not turn control; use --control stdio for automation)";
 
 /// Command-line arguments for `libra code`.
 ///
@@ -487,7 +493,10 @@ pub struct CodeArgs {
     #[arg(long = "env-file", value_name = "PATH")]
     pub env_file: Option<PathBuf>,
 
-    /// Local TUI automation control mode.
+    /// Local automation control mode (`observe` | `write` | `stdio`).
+    ///
+    /// `observe` / `write` configure the Web/TUI launch control sidecar.
+    /// `stdio` is a client-only JSON-RPC NDJSON shim (no Web/TUI/MCP).
     #[arg(long, value_enum, default_value_t = ControlMode::Observe)]
     pub control: ControlMode,
 
@@ -511,6 +520,13 @@ pub struct CodeArgs {
     /// Path to the local automation control discovery info file
     #[arg(long, value_name = "PATH")]
     pub control_info_file: Option<PathBuf>,
+
+    /// Base URL of an existing Code UI control endpoint (W4-02).
+    ///
+    /// Required for `--control stdio` until W4-10 adds control-info discovery.
+    /// Example: `http://127.0.0.1:3000`.
+    #[arg(long = "control-url", value_name = "URL")]
+    pub control_url: Option<String>,
 
     /// AI provider backend
     #[arg(long, value_enum, default_value_t = CodeProvider::Gemini)]
@@ -718,6 +734,7 @@ fn warn_deprecated_web_alias() {
 /// Entry point for the `libra code` subcommand.
 ///
 /// Validates CLI flag combinations, then dispatches to:
+/// - `--control stdio`: JSON-RPC NDJSON automation client (no Web/TUI/MCP)
 /// - `--stdio`: MCP over stdin/stdout
 /// - default / `--web` / `--web-only`: Web Code UI + AgentRuntime
 /// - `LIBRA_CODE_LEGACY_TUI=1` without `--web*`: legacy terminal TUI (hidden rollback)
@@ -728,7 +745,8 @@ fn warn_deprecated_web_alias() {
 /// - In Web mode, prints URL / control details and waits for SIGINT/SIGTERM.
 /// - In legacy TUI mode, may mutate the workspace through registered tools,
 ///   subject to sandbox and approval policy.
-/// - In stdio mode, owns stdin/stdout for the MCP session.
+/// - In MCP stdio mode, owns stdin/stdout for the MCP session.
+/// - In `--control stdio` mode, owns stdin/stdout for JSON-RPC NDJSON only.
 ///
 /// # Errors
 /// Returns [`CliError`] for invalid mode combinations, provider credential
@@ -736,6 +754,23 @@ fn warn_deprecated_web_alias() {
 /// terminal/session initialization failures. Error classification follows
 /// `docs/development/cli-error-contract-design.md`.
 pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
+    // Client-only control shim (W4-02): no worktree gate, no Web/TUI/MCP boot.
+    // Discovery defaults land in W4-10 — require explicit URL + token file now.
+    if args.control == ControlMode::Stdio {
+        validate_mode_args(&args, output).map_err(CliError::command_usage)?;
+        let url = args.control_url.as_deref().ok_or_else(|| {
+            CliError::command_usage(
+                "`libra code --control stdio` requires `--control-url` until control-info discovery lands (W4-10); example: `--control-url http://127.0.0.1:3000`",
+            )
+        })?;
+        let token_file = args.control_token_file.as_ref().ok_or_else(|| {
+            CliError::command_usage(
+                "`libra code --control stdio` requires `--control-token-file` until control-info discovery lands (W4-10)",
+            )
+        })?;
+        return crate::command::code_control::run_control_stdio_client(url, token_file).await;
+    }
+
     // W0 §C.4.1.1 preflight: gate on the SESSION's working directory — which
     // `--cwd`/`--repo` may point at a different worktree than the process cwd
     // — and BEFORE mode validation, so nothing starts a split-brained session
@@ -2419,6 +2454,8 @@ impl ControlRuntimeConfig {
         match self.mode {
             ControlMode::Observe => "observe",
             ControlMode::Write => "write",
+            // Client-only; prepare_control_runtime must not build a sidecar for Stdio.
+            ControlMode::Stdio => "stdio",
         }
     }
 
@@ -2564,6 +2601,9 @@ async fn prepare_control_runtime(
                 linked_evidence,
             })
         }
+        ControlMode::Stdio => Err(CliError::fatal(
+            "internal error: `--control stdio` is a client-only mode and must not prepare a control sidecar; report this as a bug",
+        )),
     }
 }
 
@@ -5479,6 +5519,13 @@ async fn execute_stdio(args: &CodeArgs) -> CliResult<()> {
 ///   [`reject_non_tui_flags`]).
 /// - Provider-specific flags are only accepted for their respective providers.
 fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), String> {
+    if args.control != ControlMode::Stdio && args.control_url.is_some() {
+        return Err(
+            "`--control-url` is only supported with `--control stdio` (client-only JSON-RPC automation)"
+                .to_string(),
+        );
+    }
+
     if !args.stdio && args.port == args.mcp_port && args.port != 0 {
         return Err(format!(
             "--port ({}) and --mcp-port ({}) must be different",
@@ -5539,10 +5586,79 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         }
     }
 
+    if args.control == ControlMode::Stdio {
+        // Client-only JSON-RPC NDJSON shim. Must not mix with MCP `--stdio`,
+        // Web launch, or provider/host boot flags (W4-02 conflict matrix).
+        if args.stdio {
+            return Err(
+                "`libra code --stdio` is the MCP stdio transport, not turn control; use `libra code --control stdio` for the JSON-RPC automation client"
+                    .to_string(),
+            );
+        }
+        if args.web_only {
+            return Err(
+                "`--web`/`--web-only` cannot be combined with `--control stdio` (client-only; no Web launch)"
+                    .to_string(),
+            );
+        }
+        if args
+            .control_url
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(|s| s.is_empty())
+        {
+            return Err(
+                "`--control stdio` requires `--control-url` until control-info discovery lands (W4-10); example: `--control-url http://127.0.0.1:3000`"
+                    .to_string(),
+            );
+        }
+        if args.control_token_file.is_none() {
+            return Err(
+                "`--control stdio` requires `--control-token-file` until control-info discovery lands (W4-10)"
+                    .to_string(),
+            );
+        }
+        if args.control_info_file.is_some() {
+            return Err(
+                "`--control-info-file` is a launch-side discovery write path and is not supported with `--control stdio`; pass `--control-url` and `--control-token-file` explicitly"
+                    .to_string(),
+            );
+        }
+        if args.browser_control.is_some() {
+            return Err(
+                "`--browser-control` is not supported with `--control stdio` (client-only; no Web/TUI launch)"
+                    .to_string(),
+            );
+        }
+        reject_non_tui_flags(args, "--control stdio", false)?;
+        reject_mode_flag(args.host != DEFAULT_BIND_HOST, "--host", "--control stdio")?;
+        reject_mode_flag(args.port != DEFAULT_WEB_PORT, "--port", "--control stdio")?;
+        reject_mode_flag(
+            args.mcp_port != DEFAULT_MCP_PORT,
+            "--mcp-port",
+            "--control stdio",
+        )?;
+        reject_mode_flag(args.goal.is_some(), "--goal", "--control stdio")?;
+        reject_mode_flag(args.agent.is_some(), "--agent", "--control stdio")?;
+        reject_mode_flag(args.cwd.is_some(), "--cwd", "--control stdio")?;
+        reject_mode_flag(args.repo.is_some(), "--repo", "--control stdio")?;
+        if args.codex_port.is_some() {
+            return Err("--codex-port is not supported with `--control stdio`".to_string());
+        }
+        if args.codex_bin != DEFAULT_CODEX_BIN {
+            return Err("--codex-bin is not supported with `--control stdio`".to_string());
+        }
+        if args.plan_mode.is_some() {
+            return Err("--plan-mode is not supported with `--control stdio`".to_string());
+        }
+        // Skip the rest of the launch-mode gates (provider match, write host, …).
+        return Ok(());
+    }
+
     if args.stdio {
         if args.control == ControlMode::Write {
             return Err(
-                "--control write is not supported with `libra code --stdio` because --stdio is the MCP stdio transport; use `libra code-control --stdio` for local TUI automation"
+                "--control write is not supported with `libra code --stdio` because --stdio is the MCP stdio transport, not turn control; use `libra code --control stdio` for the JSON-RPC automation client"
                     .to_string(),
             );
         }
@@ -5884,6 +6000,7 @@ mod tests {
             browser_control: None,
             control_token_file: None,
             control_info_file: None,
+            control_url: None,
             provider: CodeProvider::Gemini,
             model: None,
             temperature: None,
@@ -6798,7 +6915,73 @@ mod tests {
         args.control = ControlMode::Write;
 
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
-        assert!(err.contains("code-control --stdio"));
+        assert!(
+            err.contains("MCP stdio transport") && err.contains("--control stdio"),
+            "expected MCP vs --control stdio guidance; got: {err}"
+        );
+    }
+
+    #[test]
+    fn control_stdio_requires_url_and_token_file() {
+        let mut args = base_args();
+        args.control = ControlMode::Stdio;
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--control-url"),
+            "expected --control-url requirement; got: {err}"
+        );
+
+        args.control_url = Some("http://127.0.0.1:3000".to_string());
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--control-token-file"),
+            "expected --control-token-file requirement; got: {err}"
+        );
+
+        args.control_token_file = Some(PathBuf::from(".libra/code/control-token"));
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn rejects_mcp_stdio_combined_with_control_stdio() {
+        let mut args = base_args();
+        args.control = ControlMode::Stdio;
+        args.stdio = true;
+        args.control_url = Some("http://127.0.0.1:3000".to_string());
+        args.control_token_file = Some(PathBuf::from("token"));
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("MCP stdio transport") && err.contains("--control stdio"),
+            "expected MCP vs control-stdio conflict; got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_plan_mode_false_with_control_stdio() {
+        let mut args = base_args();
+        args.control = ControlMode::Stdio;
+        args.control_url = Some("http://127.0.0.1:3000".to_string());
+        args.control_token_file = Some(PathBuf::from("token"));
+        args.plan_mode = Some(false);
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--plan-mode") && err.contains("--control stdio"),
+            "explicit --plan-mode=false must be rejected; got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_provider_flags_with_control_stdio() {
+        let mut args = base_args();
+        args.control = ControlMode::Stdio;
+        args.control_url = Some("http://127.0.0.1:3000".to_string());
+        args.control_token_file = Some(PathBuf::from("token"));
+        args.provider = CodeProvider::Ollama;
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--provider") && err.contains("--control stdio"),
+            "expected provider conflict; got: {err}"
+        );
     }
 
     #[test]

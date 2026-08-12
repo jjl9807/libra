@@ -112,6 +112,8 @@ fn run_libra_command_with_stdin(args: &[&str], cwd: &Path, stdin_body: &str) -> 
         stdin
             .write_all(stdin_body.as_bytes())
             .expect("failed to write stdin to libra process");
+        // Explicit close so NDJSON clients see EOF and exit the read loop.
+        drop(stdin);
     }
 
     child
@@ -308,6 +310,7 @@ mod cloud_test;
 mod code_agent_linked_guard_test;
 mod code_control_files_test;
 mod code_control_help_test;
+mod code_control_stdio_test;
 mod code_test;
 mod code_thread_id_test;
 mod commit_autosquash_test;

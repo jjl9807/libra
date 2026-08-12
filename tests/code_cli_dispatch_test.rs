@@ -227,6 +227,38 @@ fn defaults_are_observe_control_and_deny_network() {
     );
 }
 
+#[test]
+fn control_stdio_mode_parses_url_and_token_file() {
+    let parsed = parse(&[
+        "--control",
+        "stdio",
+        "--control-url",
+        "http://127.0.0.1:3000",
+        "--control-token-file",
+        "/tmp/control.token",
+    ])
+    .expect("--control stdio must parse with explicit URL/token");
+    assert_eq!(parsed.control, ControlMode::Stdio);
+    assert_eq!(parsed.control_url.as_deref(), Some("http://127.0.0.1:3000"));
+    assert_eq!(
+        parsed.control_token_file.as_deref(),
+        Some(std::path::Path::new("/tmp/control.token"))
+    );
+    assert!(!parsed.stdio, "--control stdio must not set MCP --stdio");
+}
+
+#[test]
+fn control_stdio_mode_keeps_observe_write_parseable() {
+    assert_eq!(
+        parse(&["--control", "observe"]).expect("observe").control,
+        ControlMode::Observe
+    );
+    assert_eq!(
+        parse(&["--control", "write"]).expect("write").control,
+        ControlMode::Write
+    );
+}
+
 /// W3-11: occupied listen port fail-closes with an actionable `--port` hint
 /// and never auto-increments to another free port.
 #[tokio::test]

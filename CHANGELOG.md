@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W4-02, 2026-08-13, v0.19.143)
+
+- **W4-02 makes `libra code --control stdio` the canonical JSON-RPC NDJSON
+  automation client.** Shared `run_control_stdio_client` powers both the new
+  path and legacy `code-control --stdio` (shim/docs closeout remains W4-09).
+  Requires `--control-url` + `--control-token-file` until W4-10 discovery;
+  conflict matrix separates MCP `--stdio` from control; single-dash
+  `-control` fails closed; control URLs must be literal loopback IPs with
+  proxy/redirect disabled so the process token cannot leave the machine.
+
 ### Added (plan-20260715 W4-01, 2026-08-12, v0.19.142)
 
 - **W4-01 switches default `libra code` to the Web Code UI.** Bare

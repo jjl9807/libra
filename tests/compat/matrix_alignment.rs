@@ -232,7 +232,13 @@ fn docs_consistency_covers_code_command_router_contracts() {
         assert_contains(&source_and_docs, code, "source/docs control error contract");
     }
 
-    for flag in ["--control", "--control-token-file", "--control-info-file"] {
+    for flag in [
+        "--control",
+        "--control-token-file",
+        "--control-info-file",
+        "--control-url",
+        "--control stdio",
+    ] {
         assert_contains(&code_doc, flag, "docs/commands/code.md");
     }
 

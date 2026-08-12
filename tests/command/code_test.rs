@@ -227,6 +227,7 @@ fn test_code_help_lists_examples_banner() {
         "libra code --web-only --provider ollama",
         "libra code --host 0.0.0.0 --browser-control off",
         "libra code --control write",
+        "libra code --control stdio --control-url",
         "libra code --resume <thread-uuid>",
         "libra code --plan-mode",
         "libra code --env-file",
@@ -270,7 +271,7 @@ fn test_code_control_value_enum_rejects_invalid_and_accepts_write() {
 
     // Valid values must parse cleanly (we use --help to short-circuit
     // any further startup work and exit 0 immediately after clap parse).
-    for valid in ["observe", "write"] {
+    for valid in ["observe", "write", "stdio"] {
         let ok = run_libra_command(&["code", "--control", valid, "--help"], repo.path());
         assert!(
             ok.status.success(),

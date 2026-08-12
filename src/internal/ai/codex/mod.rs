@@ -1715,6 +1715,7 @@ struct QueuedCodexApproval {
     tool_name: String,
 }
 
+#[allow(clippy::too_many_arguments)] // Codex turn-finish wires many shared runtime handles.
 async fn finish_tracked_codex_turn_after_completed(
     envelope_runtime: &AgentRuntimeHandle,
     runtime_session_id: &str,
@@ -1782,6 +1783,7 @@ async fn finish_tracked_codex_turn_after_completed(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Deferred terminal flush shares the same runtime handles.
 async fn flush_deferred_codex_terminal_if_matches(
     deferred_codex_terminal: &Arc<Mutex<Option<DeferredCodexTerminal>>>,
     envelope_runtime: &AgentRuntimeHandle,

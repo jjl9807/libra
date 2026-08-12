@@ -1,24 +1,40 @@
 # `libra code-control`
 
+> **Migration (W4-02):** prefer the canonical client
+> `libra code --control stdio --control-url <URL> --control-token-file <PATH>`
+> (same JSON-RPC NDJSON protocol). This `code-control` entry remains a
+> compatible legacy command until the W4-09 forwarding shim / W5-01 removal.
+
 `libra code-control --stdio` is a local automation shim for an already running
 `libra code --control write` session. It speaks newline-delimited JSON-RPC 2.0
 on stdin/stdout and forwards requests to the loopback `/api/code/*` HTTP/SSE
 control surface.
 
 This command is not an MCP server. `libra code --stdio` remains the MCP stdio
-transport and does not drive a live TUI session.
+transport and does not drive a live Code UI session. Do not confuse MCP
+`--stdio` with `--control stdio`.
 
 ## Usage
 
 ```bash
+# Canonical (preferred)
+libra code --control stdio \
+  --control-url http://127.0.0.1:3000 \
+  --control-token-file .libra/code/control-token
+
+# Legacy shim (still supported)
 libra code-control --stdio \
   --url http://127.0.0.1:3000 \
   --token-file .libra/code/control-token
 ```
 
-`--url` should come from `.libra/code/control.json`. `--token-file` points at the
-process-level token created by `libra code --control write`; the token is sent as
-`X-Libra-Control-Token` for write-control HTTP requests.
+`--url` / `--control-url` should come from `.libra/code/control.json` and must
+use a **literal loopback IP** (`http://127.0.0.1:…` or `http://[::1]:…`).
+Hostnames such as `localhost` are rejected so DNS/hosts remapping cannot
+redirect the token. `--token-file` / `--control-token-file` points at the
+process-level token created by `libra code --control write`; the token is sent
+as `X-Libra-Control-Token` for write-control HTTP requests. The HTTP client
+disables proxies and redirects so the token cannot leave this machine.
 
 ## Methods
 
