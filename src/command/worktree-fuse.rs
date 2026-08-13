@@ -131,7 +131,10 @@ pub enum WorktreeSubcommand {
         #[clap(
             long,
             value_name = "WORKTREE_PATH",
-            conflicts_with_all = ["workspace_id", "limit", "cursor", "adopt_capture_session"]
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session",
+                "adopt_approved_project", "clear_approved_project"
+            ]
         )]
         adopt_info_to: Option<String>,
         /// Delete the common `.libra/info/exclude` and `info/attributes`
@@ -139,10 +142,33 @@ pub enum WorktreeSubcommand {
         #[clap(
             long,
             conflicts_with_all = [
-                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to"
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                "adopt_approved_project", "clear_approved_project"
             ]
         )]
         clear_common_info: bool,
+        /// Re-home Always approvals under a legacy `project_id` onto
+        /// `libra.repoid` (requires --confirm).
+        #[clap(
+            long,
+            value_name = "LEGACY_PROJECT_ID",
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                "clear_common_info", "clear_approved_project"
+            ]
+        )]
+        adopt_approved_project: Option<String>,
+        /// Delete Always approvals under a legacy `project_id` (requires
+        /// --confirm).
+        #[clap(
+            long,
+            value_name = "LEGACY_PROJECT_ID",
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                "clear_common_info", "adopt_approved_project"
+            ]
+        )]
+        clear_approved_project: Option<String>,
         /// Confirm a mutating doctor action.
         #[clap(long)]
         confirm: bool,
@@ -442,6 +468,8 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             adopt_capture_session,
             adopt_info_to,
             clear_common_info,
+            adopt_approved_project,
+            clear_approved_project,
             confirm,
         } => {
             // Delegate the WHOLE doctor surface (read-only pages and the
@@ -456,6 +484,8 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                         adopt_capture_session,
                         adopt_info_to,
                         clear_common_info,
+                        adopt_approved_project,
+                        clear_approved_project,
                         confirm,
                     },
                 },

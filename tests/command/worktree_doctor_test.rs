@@ -940,7 +940,146 @@ fn worktree_doctor_capture_adoption_is_documented_in_both_languages() {
             document.contains("worktree.doctor.adopt_capture"),
             "{name} must document the adoption JSON envelope"
         );
+        assert!(
+            document.contains("--adopt-approved-project <legacy-project-id> --confirm"),
+            "{name} must document the confirmed approved_permission adopt grammar"
+        );
+        assert!(
+            document.contains("--clear-approved-project <legacy-project-id> --confirm"),
+            "{name} must document the confirmed approved_permission clear grammar"
+        );
+        assert!(
+            document.contains("worktree.doctor.adopt_approved_project"),
+            "{name} must document the adopt_approved_project JSON envelope"
+        );
+        assert!(
+            document.contains("worktree.doctor.clear_approved_project"),
+            "{name} must document the clear_approved_project JSON envelope"
+        );
     }
+}
+
+/// plan-20260715 W4-07: doctor adopt/clear for legacy approved_permission
+/// project_id requires --confirm, audits, and refuses the canonical id.
+#[tokio::test]
+#[serial]
+async fn worktree_doctor_adopts_and_clears_legacy_approved_project() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    let conn = repo_db(repo.path()).await;
+    let repo_id = repo_identity(&conn).await;
+
+    conn.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "INSERT INTO approved_permission \
+         (project_id, permission, pattern, created_at, \
+          source_worktree_id, source_session_id, source_workspace_id) \
+         VALUES ('opaque-legacy', 'edit', 'src/**', 1, '', '', ''), \
+                ('opaque-clear-me', 'shell', '*', 1, '', '', '')",
+        [],
+    ))
+    .await
+    .expect("seed legacy approved_permission rows");
+
+    let doctor = run_libra_command(&["worktree", "doctor"], repo.path());
+    assert_cli_success(&doctor, "read-only doctor lists legacy approval IDs");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        stdout.contains("opaque-legacy") && stdout.contains("opaque-clear-me"),
+        "doctor must surface legacy project_ids for recovery:\n{stdout}"
+    );
+
+    let unconfirmed = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "doctor",
+            "--adopt-approved-project",
+            "opaque-legacy",
+        ],
+        repo.path(),
+    );
+    assert_eq!(unconfirmed.status.code(), Some(128), "{unconfirmed:?}");
+
+    let adopted = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "doctor",
+            "--adopt-approved-project",
+            "opaque-legacy",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&adopted, "confirmed approved_permission adopt");
+    let response = parse_json(&adopted.stdout, "approved adopt");
+    assert_eq!(
+        response["command"], "worktree.doctor.adopt_approved_project",
+        "{response}"
+    );
+    assert_eq!(response["data"]["legacy_project_id"], "opaque-legacy");
+    assert_eq!(response["data"]["rows_affected"], 1);
+
+    let project_id: String = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT project_id FROM approved_permission WHERE permission = 'edit'".to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row")
+        .try_get_by_index(0)
+        .expect("project_id");
+    assert_eq!(project_id, repo_id);
+
+    let refuse_canonical = run_libra_command(
+        &[
+            "worktree",
+            "doctor",
+            "--clear-approved-project",
+            &repo_id,
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert_ne!(
+        refuse_canonical.status.code(),
+        Some(0),
+        "clear must refuse the canonical libra.repoid"
+    );
+
+    let cleared = run_libra_command(
+        &[
+            "--json",
+            "worktree",
+            "doctor",
+            "--clear-approved-project",
+            "opaque-clear-me",
+            "--confirm",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&cleared, "confirmed approved_permission clear");
+    let clear_response = parse_json(&cleared.stdout, "approved clear");
+    assert_eq!(
+        clear_response["command"], "worktree.doctor.clear_approved_project",
+        "{clear_response}"
+    );
+    assert_eq!(clear_response["data"]["rows_affected"], 1);
+
+    let remaining: i64 = conn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) FROM approved_permission WHERE project_id = 'opaque-clear-me'"
+                .to_string(),
+        ))
+        .await
+        .expect("count")
+        .expect("row")
+        .try_get_by_index(0)
+        .expect("count");
+    assert_eq!(remaining, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -202,7 +202,10 @@ pub enum WorktreeSubcommand {
         #[clap(
             long,
             value_name = "WORKTREE_PATH",
-            conflicts_with_all = ["workspace_id", "limit", "cursor", "adopt_capture_session"]
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session",
+                "adopt_approved_project", "clear_approved_project"
+            ]
         )]
         adopt_info_to: Option<String>,
         /// Delete the repository's common `.libra/info/exclude` and
@@ -211,12 +214,38 @@ pub enum WorktreeSubcommand {
         #[clap(
             long,
             conflicts_with_all = [
-                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to"
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                "adopt_approved_project", "clear_approved_project"
             ]
         )]
         clear_common_info: bool,
+        /// Re-home Always approvals whose opaque `project_id` is not the
+        /// current `libra.repoid` onto the canonical repository identity
+        /// (plan-20260715 W4-07). Migrations never do this; requires
+        /// --confirm.
+        #[clap(
+            long,
+            value_name = "LEGACY_PROJECT_ID",
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                "clear_common_info", "clear_approved_project"
+            ]
+        )]
+        adopt_approved_project: Option<String>,
+        /// Delete Always approvals under a legacy (non-canonical) `project_id`
+        /// without adopting them. Requires --confirm.
+        #[clap(
+            long,
+            value_name = "LEGACY_PROJECT_ID",
+            conflicts_with_all = [
+                "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
+                "clear_common_info", "adopt_approved_project"
+            ]
+        )]
+        clear_approved_project: Option<String>,
         /// Confirm a mutating doctor action (capture-scope adoption,
-        /// info-file adoption, or common-info clearing).
+        /// info-file adoption, common-info clearing, or approved_permission
+        /// adopt/clear).
         #[clap(long)]
         confirm: bool,
     },
@@ -1207,6 +1236,8 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             adopt_capture_session,
             adopt_info_to,
             clear_common_info,
+            adopt_approved_project,
+            clear_approved_project,
             confirm,
         } => {
             if let Some(session_id) = adopt_capture_session {
@@ -1216,6 +1247,22 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                     )
                 })?;
                 adopt_legacy_capture_scope(&workspace_id, &session_id, confirm, output).await
+            } else if let Some(legacy_project_id) = adopt_approved_project {
+                adopt_or_clear_legacy_approved_project(
+                    &legacy_project_id,
+                    confirm,
+                    /* clear */ false,
+                    output,
+                )
+                .await
+            } else if let Some(legacy_project_id) = clear_approved_project {
+                adopt_or_clear_legacy_approved_project(
+                    &legacy_project_id,
+                    confirm,
+                    /* clear */ true,
+                    output,
+                )
+                .await
             } else if let Some(target) = adopt_info_to {
                 // W0 §C.4.1.1: explicit, confirmed, audited — like every
                 // other mutating doctor/repair action.
@@ -4321,6 +4368,113 @@ struct CaptureScopeAdoptionOutput {
     workspace_fence: i64,
 }
 
+/// plan-20260715 W4-07: re-home or clear Always approvals whose opaque
+/// `project_id` is not the current `libra.repoid`. Migrations never rewrite
+/// those rows; this confirmed doctor action is the only supported path.
+async fn adopt_or_clear_legacy_approved_project(
+    legacy_project_id: &str,
+    confirm: bool,
+    clear: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    use crate::internal::ai::permission::ApprovedRulesetStore;
+
+    let action = if clear {
+        "worktree doctor --clear-approved-project"
+    } else {
+        "worktree doctor --adopt-approved-project"
+    };
+    require_repair_confirmation(confirm, action)?;
+
+    let db_path = crate::utils::path::database();
+    let conn = crate::internal::db::get_db_conn_instance_for_path(&db_path)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "cannot open the repository database for approved_permission recovery: {error}"
+            ))
+        })?;
+
+    // Open the audit boundary first. Only if the sole blocker is a missing
+    // libra.repoid do we mint one and retry — so a held control slot never
+    // causes an unaudited identity write.
+    let boundary = match begin_repair_operation(action, Some(legacy_project_id)).await {
+        Ok(boundary) => boundary,
+        Err(error)
+            if error
+                .to_string()
+                .contains("repository identity (libra.repoid) is missing") =>
+        {
+            ApprovedRulesetStore::ensure_repo_identity(&conn)
+                .await
+                .map_err(|init_error| {
+                    CliError::fatal(format!(
+                        "cannot initialize libra.repoid before approved_permission recovery: \
+                         {init_error}"
+                    ))
+                })?;
+            begin_repair_operation(action, Some(legacy_project_id)).await?
+        }
+        Err(error) => return Err(error),
+    };
+
+    let result = async {
+        if clear {
+            let removed = ApprovedRulesetStore::clear_legacy_project_id(&conn, legacy_project_id)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot clear approved_permission project_id '{legacy_project_id}': \
+                             {error}"
+                    ))
+                })?;
+            Ok(serde_json::json!({
+                "action": "clear",
+                "legacy_project_id": legacy_project_id,
+                "rows_affected": removed,
+            }))
+        } else {
+            let adopted = ApprovedRulesetStore::adopt_legacy_project_id(&conn, legacy_project_id)
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!(
+                        "cannot adopt approved_permission project_id '{legacy_project_id}': \
+                             {error}"
+                    ))
+                })?;
+            Ok(serde_json::json!({
+                "action": "adopt",
+                "legacy_project_id": legacy_project_id,
+                "rows_affected": adopted,
+            }))
+        }
+    }
+    .await;
+
+    let payload = finish_repair_operation(boundary, result).await?;
+    if output.is_json() {
+        let command = if clear {
+            "worktree.doctor.clear_approved_project"
+        } else {
+            "worktree.doctor.adopt_approved_project"
+        };
+        return emit_json_data(command, &payload, output);
+    }
+    if clear {
+        println!(
+            "cleared {} approved_permission row(s) under legacy project_id '{legacy_project_id}'",
+            payload["rows_affected"]
+        );
+    } else {
+        println!(
+            "adopted {} approved_permission row(s) from legacy project_id '{legacy_project_id}' \
+             onto libra.repoid",
+            payload["rows_affected"]
+        );
+    }
+    Ok(())
+}
+
 /// Explicit mutation for the W4 legacy boundary. Migration 2026080401 marks
 /// historical capture rows `legacy_unknown` because their original scope was
 /// not recorded. This command is the only supported way to assign one: it
@@ -4614,6 +4768,47 @@ fn print_legacy_capture_scope_guidance(output: &OutputConfig, legacy_exists: boo
     }
 }
 
+fn print_legacy_approved_project_guidance(output: &OutputConfig, legacy_ids: &[String]) {
+    if legacy_ids.is_empty() || output.quiet {
+        return;
+    }
+    let listed = legacy_ids.join(", ");
+    let message = format!(
+        "legacy approved_permission project_id(s): {listed}; they are invisible to the runtime \
+         until adopted with `libra worktree doctor --adopt-approved-project <id> --confirm` or \
+         removed with `libra worktree doctor --clear-approved-project <id> --confirm`"
+    );
+    if output.is_json() {
+        // Keep the frozen worktree.doctor JSON page schema untouched; surface
+        // the recovery IDs on stderr so machine callers can still discover them.
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+}
+
+/// Read-only discovery of opaque Always-approval buckets. Missing table or
+/// columns (pre-migration / no-migration doctor open) reports empty.
+async fn list_legacy_approved_project_ids_readonly(
+    conn: &sea_orm::DatabaseConnection,
+) -> CliResult<Vec<String>> {
+    use crate::internal::ai::permission::ApprovedRulesetStore;
+
+    match ApprovedRulesetStore::list_legacy_project_ids(conn).await {
+        Ok(ids) => Ok(ids),
+        Err(error) => {
+            let text = error.to_string().to_ascii_lowercase();
+            if text.contains("no such table") || text.contains("no such column") {
+                Ok(Vec::new())
+            } else {
+                Err(doctor_scope_corrupt(format!(
+                    "cannot list legacy approved_permission project_id values: {error}"
+                )))
+            }
+        }
+    }
+}
+
 /// `libra worktree doctor [<workspace-id>] [--limit N] [--cursor C]`.
 pub(crate) async fn run_worktree_doctor(
     workspace_id: Option<String>,
@@ -4654,6 +4849,7 @@ pub(crate) async fn run_worktree_doctor(
         })?;
     let now = workspace::now_ms();
     let legacy_capture_exists = legacy_capture_scope_exists(&conn).await?;
+    let legacy_approved_ids = list_legacy_approved_project_ids_readonly(&conn).await?;
 
     if let Some(workspace_id) = workspace_id {
         let record = match WorkspaceStore::doctor_record_with_conn(&conn, &workspace_id).await {
@@ -4683,6 +4879,7 @@ pub(crate) async fn run_worktree_doctor(
         }
         let result = render_doctor_single(diagnostic, output);
         print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+        print_legacy_approved_project_guidance(output, &legacy_approved_ids);
         return result;
     }
 
@@ -4724,6 +4921,7 @@ pub(crate) async fn run_worktree_doctor(
             output,
         );
         print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+        print_legacy_approved_project_guidance(output, &legacy_approved_ids);
         return result;
     }
     let repo_id = doctor_repo_identity(&conn).await?;
@@ -4742,6 +4940,7 @@ pub(crate) async fn run_worktree_doctor(
         output,
     );
     print_legacy_capture_scope_guidance(output, legacy_capture_exists);
+    print_legacy_approved_project_guidance(output, &legacy_approved_ids);
     result
 }
 

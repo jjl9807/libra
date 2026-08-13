@@ -1371,6 +1371,16 @@ pub fn builtin_migrations() -> Vec<Migration> {
                 "../../../sql/migrations/2026080403_agent_usage_event_session_scope_down.sql"
             ),
         ),
+        // plan-20260715 W4-07: Always-approval provenance + Repository ownership
+        // hardening. Empty provenance backfill; project_id not rewritten.
+        sql_migration(
+            2026081301,
+            "approved_permission_provenance",
+            include_str!("../../../sql/migrations/2026081301_approved_permission_provenance.sql"),
+            include_str!(
+                "../../../sql/migrations/2026081301_approved_permission_provenance_down.sql"
+            ),
+        ),
     ]
 }
 
@@ -1818,9 +1828,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 54);
+        assert_eq!(runner.len(), 55);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026080403));
+        assert_eq!(runner.max_registered_version(), Some(2026081301));
     }
 
     #[test]

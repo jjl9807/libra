@@ -169,6 +169,7 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026080401`  | `agent_capture_workspace_scope` | `2026080401_agent_capture_workspace_scope{,_down}.sql` (plan-20260714 W4: marks existing capture/export/import rows `legacy_unknown`; new scoped rows bind repository, worktree, optional live workspace fence, and provider-id collision checks. Explicit doctor adoption is append-only audited; down refuses scoped rows or audit history.) |
 | `2026080402`  | `agent_usage_runtime_attribution` | `2026080402_agent_usage_runtime_attribution{,_down}.sql` (plan-20260715 W2-12: durable repository, turn, and replay-event attribution for runtime usage.) |
 | `2026080403`  | `agent_usage_event_session_scope` | `2026080403_agent_usage_event_session_scope{,_down}.sql` (W2-12 follow-up: replay event IDs are unique within the durable session, permitting the same browser command ID in independent sessions.) |
+| `2026081301`  | `approved_permission_provenance` | `2026081301_approved_permission_provenance{,_down}.sql` (plan-20260715 W4-07: Always-approval provenance columns; empty backfill; `project_id` not rewritten; down fail-closed with provenance or linked HEAD evidence.) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

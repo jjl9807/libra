@@ -254,3 +254,120 @@ fn test_approval_request(
         response_tx,
     }
 }
+
+/// plan-20260715 W4-07: Always approvals key on canonical `libra.repoid`.
+#[tokio::test]
+async fn approved_permission_project_id_is_canonical_repo_identity() {
+    use libra::internal::{
+        ai::permission::{ApprovalProvenance, ApprovedRulesetStore},
+        db::migration::run_builtin_migrations,
+    };
+    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+    let conn = Database::connect("sqlite::memory:").await.expect("connect");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', ?, 0)",
+        ["canonical-repo-id".into()],
+    ))
+    .await
+    .expect("seed libra.repoid");
+
+    ApprovedRulesetStore::append(
+        &conn,
+        "edit",
+        "src/**",
+        &ApprovalProvenance {
+            source_worktree_id: "wt-linked".into(),
+            source_session_id: "sess-1".into(),
+            source_workspace_id: "ws-1".into(),
+        },
+    )
+    .await
+    .expect("append");
+
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT project_id, source_worktree_id, source_session_id, source_workspace_id \
+             FROM approved_permission"
+                .to_string(),
+        ))
+        .await
+        .expect("query")
+        .expect("row");
+    let project_id: String = row.try_get_by_index(0).expect("project_id");
+    let wt: String = row.try_get_by_index(1).expect("wt");
+    let sess: String = row.try_get_by_index(2).expect("sess");
+    let ws: String = row.try_get_by_index(3).expect("ws");
+    assert_eq!(project_id, "canonical-repo-id");
+    assert_eq!(wt, "wt-linked");
+    assert_eq!(sess, "sess-1");
+    assert_eq!(ws, "ws-1");
+
+    let loaded = ApprovedRulesetStore::load(&conn).await.expect("load");
+    assert_eq!(loaded.project_id, "canonical-repo-id");
+    assert_eq!(loaded.rules.len(), 1);
+}
+
+/// plan-20260715 W4-07: legacy opaque project_id rows stay invisible until
+/// an explicit doctor adopt (no silent migration merge).
+#[tokio::test]
+async fn legacy_project_id_rows_require_doctor_adopt() {
+    use libra::internal::{
+        ai::permission::{ApprovalProvenance, ApprovedRulesetStore},
+        db::migration::run_builtin_migrations,
+    };
+    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+
+    let conn = Database::connect("sqlite::memory:").await.expect("connect");
+    run_builtin_migrations(&conn).await.expect("migrations");
+    conn.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "INSERT INTO config_kv (key, value, encrypted) VALUES ('libra.repoid', ?, 0)",
+        ["canonical-repo-id".into()],
+    ))
+    .await
+    .expect("seed libra.repoid");
+
+    ApprovedRulesetStore::append_for_project_id(
+        &conn,
+        "opaque-legacy",
+        "shell",
+        "rm -rf /",
+        &ApprovalProvenance::empty(),
+    )
+    .await
+    .expect("seed legacy");
+
+    assert!(
+        ApprovedRulesetStore::load(&conn)
+            .await
+            .expect("load")
+            .is_empty(),
+        "legacy project_id must not feed the runtime ruleset"
+    );
+    assert_eq!(
+        ApprovedRulesetStore::list_legacy_project_ids(&conn)
+            .await
+            .expect("list"),
+        vec!["opaque-legacy".to_string()]
+    );
+
+    ApprovedRulesetStore::adopt_legacy_project_id(&conn, "opaque-legacy")
+        .await
+        .expect("doctor adopt");
+
+    let loaded = ApprovedRulesetStore::load(&conn)
+        .await
+        .expect("load after adopt");
+    assert_eq!(loaded.rules.len(), 1);
+    assert_eq!(loaded.rules[0].permission, "shell");
+    assert!(
+        ApprovedRulesetStore::list_legacy_project_ids(&conn)
+            .await
+            .expect("list after adopt")
+            .is_empty()
+    );
+}

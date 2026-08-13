@@ -95,7 +95,9 @@ libra --machine worktree list
 | `--adopt-capture-session <session-id>` | 明确归属一个 `legacy_unknown` 的历史 capture session。必须同时给出 `<workspace-id>` 和 `--confirm`，不能和 `--limit`/`--cursor` 组合。它是单独的变更操作；不带该选项的 doctor 始终只读。 |
 | `--adopt-info-to <worktree-path>` | W0 §C.4.1.1：把仓库共享存储（main 的 `.libra/info/*`）中的 `info/exclude`/`info/attributes` 显式复制进**一个** linked worktree 自己的 gitdir——绝不自动、绝不覆盖已存在的目标文件。需要 `--confirm`。 |
 | `--clear-common-info` | 删除共享存储中的 `.libra/info/exclude` 与 `info/attributes`（这些规则自 W0 起只作用于 main worktree；显式清除表示它们不应再作用于任何地方）。需要 `--confirm`。 |
-| `--confirm` | 确认一项 doctor 变更操作（capture 归属、info 文件 adopt/clear）。 |
+| `--adopt-approved-project <legacy-project-id>` | 把 opaque `project_id` 与当前 `libra.repoid` 不一致的 Always 审批行归并到仓库规范身份（plan-20260715 W4-07）。迁移不会改写 `project_id`。需要 `--confirm`。只读 doctor 会列出可发现的 legacy ID。 |
+| `--clear-approved-project <legacy-project-id>` | 删除某个 legacy（非规范）`project_id` 下的 Always 审批，不归并。拒绝作用于当前 `libra.repoid`。需要 `--confirm`。 |
+| `--confirm` | 确认一项 doctor 变更操作（capture 归属、info 文件 adopt/clear、approved_permission adopt/clear）。 |
 
 每条诊断报告该 workspace 的身份（`workspace_id`、`repo_id`、`path`、`worktree_id`）、`lease_state`（`none`/`held`/`expired`），以及 `scope_diagnostics` 发现列表。每项发现带稳定的 `code` 与 `severity`（`warning` 或 `error`）：
 
@@ -160,6 +162,24 @@ libra worktree doctor --clear-common-info --confirm
 `worktree.doctor` 分页 schema 保持不变。只读报告的文本条目还会列出每个
 worktree 实际生效的本地 info 来源（如 `.libra/info/exclude`，双布局树还包括
 `.git/info/exclude`）。
+
+**Legacy Always 审批**（plan-20260715 W4-07）：`approved_permission` 中
+`project_id` 与当前 `libra.repoid` 不一致的行对 runtime 不可见。迁移只回填
+空 provenance，绝不改写 `project_id`。只读 doctor 会列出可发现的 legacy ID；
+恢复必须显式且带确认：
+
+```bash
+# 把某个 legacy project_id 下的 Always 审批归并到 libra.repoid：
+libra worktree doctor --adopt-approved-project <legacy-project-id> --confirm
+
+# 或删除该 legacy bucket（不归并）：
+libra worktree doctor --clear-approved-project <legacy-project-id> --confirm
+```
+
+两者在任何副作用之前都要求 `--confirm`，并运行在同一条 operation-log
+audit 边界内。`--json` envelope 为 `worktree.doctor.adopt_approved_project`
+与 `worktree.doctor.clear_approved_project`（`data.action`、
+`data.legacy_project_id`、`data.rows_affected`）。
 
 ### 子命令：`lock`
 

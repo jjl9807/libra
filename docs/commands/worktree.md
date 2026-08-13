@@ -134,7 +134,9 @@ A *workspace* is the association record an Agent runtime takes over a worktree (
 | `--adopt-capture-session <session-id>` | Explicitly attributes `legacy_unknown` capture rows to the named workspace. Requires `<workspace-id>` and `--confirm`; it cannot be combined with `--limit`/`--cursor`. All other doctor forms remain read-only. |
 | `--adopt-info-to <worktree-path>` | Copies main's legacy common `info/exclude` + `info/attributes` into that ONE linked worktree's own gitdir (existing destination files are kept, never overwritten). Requires `--confirm`. |
 | `--clear-common-info` | Deletes the legacy `info/exclude` + `info/attributes` from common storage (the rules stop applying anywhere). Requires `--confirm`. |
-| `--confirm` | Confirms the irreversible doctor mutations — the capture-scope adoption and the info-file adopt/clear actions. Every other doctor form is read-only and needs no confirmation. |
+| `--adopt-approved-project <legacy-project-id>` | Re-homes Always approvals whose opaque `project_id` is not the current `libra.repoid` onto the canonical repository identity (plan-20260715 W4-07). Migrations never rewrite those rows. Requires `--confirm`. The read-only doctor lists discoverable legacy IDs. |
+| `--clear-approved-project <legacy-project-id>` | Deletes Always approvals under a legacy (non-canonical) `project_id` without adopting them. Refuses the canonical `libra.repoid`. Requires `--confirm`. |
+| `--confirm` | Confirms the irreversible doctor mutations — capture-scope adoption, info-file adopt/clear, and approved_permission adopt/clear. Every other doctor form is read-only and needs no confirmation. |
 
 ```bash
 libra worktree doctor
@@ -210,6 +212,26 @@ actions. In `--json`/`--machine` mode each uses its own envelope —
 `worktree.doctor` page schema untouched. The read-only report also lists
 each worktree's live local info sources (e.g. `.libra/info/exclude`, plus
 `.git/info/exclude` in a dual-layout tree) on its text entry.
+
+**Legacy Always approvals** (plan-20260715 W4-07): `approved_permission`
+rows whose opaque `project_id` is not the current `libra.repoid` stay
+invisible to the runtime. Migrations backfill empty provenance and never
+rewrite `project_id`. The read-only doctor lists discoverable legacy IDs;
+recovery is explicit and confirmed:
+
+```bash
+# Re-home every Always approval under a legacy project_id onto libra.repoid:
+libra worktree doctor --adopt-approved-project <legacy-project-id> --confirm
+
+# Or delete that legacy bucket without adopting:
+libra worktree doctor --clear-approved-project <legacy-project-id> --confirm
+```
+
+Both refuse without `--confirm` before any side effect and run inside the
+same one-row operation-log audit boundary. `--json` envelopes are
+`worktree.doctor.adopt_approved_project` and
+`worktree.doctor.clear_approved_project` (`data.action`,
+`data.legacy_project_id`, `data.rows_affected`).
 
 ### Subcommand: `lock`
 
