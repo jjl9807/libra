@@ -3080,9 +3080,8 @@ fn blocked_reason(error: &io::Error) -> crate::command::status_probe::IoBlockedR
 /// Hash a worktree file for cache revalidation under the §B.3.3 deadline.
 /// A reclaimed read surfaces as `TimedOut` so callers classify it as blocked
 /// rather than as a content change.
-fn hash_under_deadline(abs: &Path) -> io::Result<git_internal::hash::ObjectHash> {
-    let target = abs.to_path_buf();
-    match crate::command::status_probe::with_io_deadline(move || calc_file_blob_hash(&target)) {
+fn hash_under_deadline(abs: &Path, workdir: &Path) -> io::Result<git_internal::hash::ObjectHash> {
+    match crate::command::status_io_worker::deadline_file_blob_hash(abs, workdir) {
         Ok(result) => result,
         Err(()) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -3097,12 +3096,10 @@ fn cached_path_state(abs: &Path) -> CachedPathState {
     // scan. A cached path that became a FIFO or moved onto a hung mount must
     // reclaim the caller and keep its cache row, not block `--check-dirty`
     // forever.
-    let target = abs.to_path_buf();
-    let stat =
-        match crate::command::status_probe::with_io_deadline(move || target.symlink_metadata()) {
-            Ok(result) => result,
-            Err(()) => return CachedPathState::Blocked(IoBlockedReason::IoTimeout),
-        };
+    let stat = match crate::command::status_io_worker::deadline_stat(abs) {
+        Ok(result) => result,
+        Err(()) => return CachedPathState::Blocked(IoBlockedReason::IoTimeout),
+    };
     match stat {
         Ok(_) => CachedPathState::Exists,
         Err(error) if error.kind() == io::ErrorKind::NotFound => CachedPathState::Gone,
@@ -3149,7 +3146,7 @@ fn classify_manual_mark(index: &Index, workdir: &std::path::Path, stored: &str) 
         (true, true) => {
             // Content confirm (no stat shortcut: manual marks are few, and a
             // wrong stat shortcut here would silently drop a real edit).
-            match hash_under_deadline(&abs) {
+            match hash_under_deadline(&abs, workdir) {
                 Ok(hash) if index.verify_hash(path_str, 0, &hash) => ManualMarkClass::Clean,
                 Ok(_) => ManualMarkClass::Dirty(dirty::KIND_MODIFIED),
                 // Readable metadata but an unreadable body: still "cannot
@@ -3334,7 +3331,7 @@ async fn run_status_cache_mode(
                 if verify {
                     still = index.tracked(path_str, 0)
                         && matches!(state, CachedPathState::Exists)
-                        && match hash_under_deadline(&abs) {
+                        && match hash_under_deadline(&abs, &workdir) {
                             Ok(hash) => !index.verify_hash(path_str, 0, &hash),
                             Err(error) => {
                                 blocked_paths.push((native.clone(), blocked_reason(&error)));

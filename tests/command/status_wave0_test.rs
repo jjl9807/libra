@@ -7910,6 +7910,54 @@ fn tracked_scan_io_timeout_is_reported_not_hung() {
     );
 }
 
+/// WIO-01: killing the out-of-process scan worker mid-`read_dir` keeps the
+/// last checkpointed partial and marks the current edge `io_timeout`.
+#[test]
+#[cfg(unix)]
+fn probe_worker_killed_mid_stream_keeps_checkpoint() {
+    let repo = create_repo_with_committed_file("base.txt", "content\n");
+    let wide = repo.path().join("wide");
+    fs::create_dir(&wide).expect("wide dir");
+    for i in 0..40 {
+        fs::write(wide.join(format!("f{i:02}.txt")), format!("payload {i}\n")).unwrap();
+    }
+
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status", "-uall"],
+        repo.path(),
+        "",
+        &[
+            ("LIBRA_TEST_STATUS_IO_TIMEOUT_MS", "300"),
+            ("LIBRA_TEST_STATUS_IO_KILL_AFTER_CHECKPOINT", "1"),
+        ],
+    );
+    assert_cli_success(&out, "killed worker still yields a status envelope");
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let blocked = doc["data"]["io_blocked"].as_array().expect("io_blocked");
+    assert!(
+        !blocked.is_empty(),
+        "the killed listing edge must be IoBlocked: {doc}"
+    );
+    assert!(
+        blocked.iter().any(|event| event["reason"] == "io_timeout"),
+        "mid-stream kill maps to io_timeout: {doc}"
+    );
+    let untracked = doc["data"]["untracked"].as_array().expect("untracked");
+    let kept = untracked
+        .iter()
+        .filter(|p| p.as_str().is_some_and(|p| p.starts_with("wide/")))
+        .count();
+    assert!(
+        kept >= 32,
+        "checkpointed dirents before the kill must survive: kept={kept} {doc}"
+    );
+    assert!(
+        kept < 40,
+        "the kill must interrupt the listing before completion: kept={kept} {doc}"
+    );
+}
+
 // ── R0-5 review follow-up: porcelain v2 `-z` rename record raw bytes ─────
 
 /// §B.6.4/§B.6.7: the v2 rename record under `-z` carries RAW path bytes

@@ -261,6 +261,20 @@ fn run_subagent_discovery_helper_if_requested() -> Option<i32> {
     Some(0)
 }
 
+/// Killable status scan/probe I/O worker (plan-20260715 WIO-01). Handled
+/// before CLI, upgrade, recovery, or any repository write. Stdin/stdout are
+/// framed worker messages; the capability token is the only credential.
+fn run_status_io_worker_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str() != Some(libra::command::status_io_worker::STATUS_IO_WORKER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    Some(libra::command::status_io_worker::run_worker())
+}
+
 /// Killable subprocess boundary for held-descriptor transcript reads. This is
 /// handled before CLI/log initialization so stdout contains only the private
 /// binary frame consumed by the parent importer.
@@ -369,6 +383,9 @@ fn main() {
             std::process::exit(exit_code);
         }
         return;
+    }
+    if let Some(exit_code) = run_status_io_worker_if_requested() {
+        std::process::exit(exit_code);
     }
     install_broken_pipe_panic_hook();
     init_tracing();

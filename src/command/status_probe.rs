@@ -131,15 +131,13 @@ static IO_WORKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsi
 
 /// Run one blocking filesystem operation with a wall-clock deadline.
 ///
-/// A hung syscall cannot be interrupted in safe Rust, so the operation runs
-/// on a pooled worker thread: on timeout the CALLER is reclaimed (it records
-/// an `IoTimeout` blocked event and continues) while the worker stays parked
-/// in the kernel call, holding one of the eight slots until the mount
-/// answers. This bounds `status` — the documented contract — without
-/// claiming to abort the kernel call itself. When all eight slots are held,
-/// further timed reads fail fast as timeouts instead of queueing behind a
-/// hang. (§B.3.3; the reclaimable out-of-process worker described in §B.3.2
-/// is deferred to plan-20260715 W-IO.)
+/// A hung syscall cannot be interrupted in-process, so rename-detect and
+/// trivial unit tests still use this thread pool: on timeout the CALLER is
+/// reclaimed while the worker stays parked in the kernel call. Basic
+/// scan/probe I/O uses the out-of-process pool in `status_io_worker`
+/// (WIO-01), which kills the helper process group and recycles the slot.
+/// When all eight in-process slots are held, further timed reads fail fast
+/// as timeouts instead of queueing behind a hang. (§B.3.3 / WIO-03.)
 pub(crate) fn with_io_deadline<T, F>(op: F) -> Result<T, ()>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -247,6 +245,7 @@ where
 /// the counter unchanged — so a genuinely large directory that keeps
 /// yielding entries is never mistaken for a hung mount, while a mount that
 /// truly stops answering is still reclaimed within one timeout window.
+#[allow(dead_code)] // WIO-03 / thread-pool fallback
 pub(crate) fn with_no_progress_deadline<T, F>(
     progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     op: F,
@@ -297,6 +296,7 @@ where
 
 /// Submit a job to the pooled workers without waiting for it. Shares the
 /// same bounded slot accounting as [`with_io_deadline`].
+#[allow(dead_code)] // used by with_no_progress_deadline
 fn with_io_deadline_detached<F>(op: F) -> Result<(), ()>
 where
     F: FnOnce() + Send + 'static,
@@ -427,20 +427,6 @@ pub(crate) struct IoBlockedEvent {
 pub(crate) enum ProbeBudgetKind {
     Enumeration,
     Destination,
-}
-
-/// One directory's bounded listing, produced INSIDE the deadline worker so
-/// both the blocking reads and the enumeration budget are enforced in the
-/// same place (§B.3.2).
-struct DirListing {
-    entries: Vec<std::ffi::OsString>,
-    errors: Vec<io::Error>,
-    /// Entries actually taken from the iterator — the amount to charge
-    /// against the cross-root enumeration budget, including ones dropped
-    /// afterwards.
-    taken: usize,
-    /// The budget tripped mid-directory; the listing is partial.
-    hit_cap: bool,
 }
 
 /// Composite probe outcome across every root (§B.3.2 归并).
@@ -613,18 +599,7 @@ enum MarkerProbe {
 /// unreadable marker must exclude the directory and be reported, never wave
 /// a foreign repository through.
 fn marker_probe(dir: &Path) -> MarkerProbe {
-    let target = dir.to_path_buf();
-    let probe = with_io_deadline(move || {
-        for marker in [util::ROOT_DIR, util::GIT_DIR] {
-            match target.join(marker).symlink_metadata() {
-                Ok(_) => return Ok(true),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(false)
-    });
-    match probe {
+    match crate::command::status_io_worker::deadline_marker_probe(dir) {
         Ok(Ok(true)) => MarkerProbe::Present,
         Ok(Ok(false)) => MarkerProbe::Absent,
         Ok(Err(error)) => MarkerProbe::Blocked(IoBlockedReason::from_error(&error)),
@@ -643,7 +618,10 @@ fn marker_probe(dir: &Path) -> MarkerProbe {
 fn resolves_inside(candidate: &Path, workdir: &Path) -> bool {
     let canon_candidate = candidate.to_path_buf();
     let canon_root = workdir.to_path_buf();
-    match with_io_deadline(move || (canon_candidate.canonicalize(), canon_root.canonicalize())) {
+    match crate::command::status_io_worker::deadline_canonicalize_pair(
+        &canon_candidate,
+        &canon_root,
+    ) {
         Ok((Ok(resolved), Ok(root))) => resolved.starts_with(&root),
         Ok(_) => util::is_sub_path(candidate, workdir),
         // A reclaimed resolution cannot vouch for containment.
@@ -706,7 +684,7 @@ pub(crate) fn probe_rename_destinations(
             continue;
         }
         let root_stat_target = root_abs.clone();
-        let root_stat = match with_io_deadline(move || root_stat_target.symlink_metadata()) {
+        let root_stat = match crate::command::status_io_worker::deadline_stat(&root_stat_target) {
             Ok(result) => result,
             Err(()) => {
                 outcome.io_blocked.push(IoBlockedEvent {
@@ -727,7 +705,7 @@ pub(crate) fn probe_rename_destinations(
                 });
                 continue;
             }
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            Ok(meta) if meta.is_symlink() || !meta.is_dir() => {
                 // A file/symlink root is itself a candidate.
                 enumerated += 1;
                 if enumerated > limits.max_enumerated_entries {
@@ -774,7 +752,7 @@ pub(crate) fn probe_rename_destinations(
             // worktree. Re-verify the directory is a real directory
             // (not a symlink) and still lexically inside the worktree.
             let dir_stat_target = dir_abs.clone();
-            let dir_stat = match with_io_deadline(move || dir_stat_target.symlink_metadata()) {
+            let dir_stat = match crate::command::status_io_worker::deadline_stat(&dir_stat_target) {
                 Ok(result) => result,
                 Err(()) => {
                     outcome.io_blocked.push(IoBlockedEvent {
@@ -786,7 +764,7 @@ pub(crate) fn probe_rename_destinations(
                 }
             };
             match dir_stat {
-                Ok(meta) if meta.file_type().is_symlink() => continue,
+                Ok(meta) if meta.is_symlink() => continue,
                 Ok(meta) if !meta.is_dir() => continue,
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -832,40 +810,10 @@ pub(crate) fn probe_rename_destinations(
             // reasoning).
             let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let ticker = std::sync::Arc::clone(&progress);
-            let listing = match with_no_progress_deadline(
-                std::sync::Arc::clone(&progress),
-                move || -> io::Result<DirListing> {
-                    let reader = std::fs::read_dir(&read_target)?;
-                    let mut entries = Vec::new();
-                    let mut errors = Vec::new();
-                    let mut taken = 0usize;
-                    let mut hit_cap = false;
-                    for entry in reader {
-                        taken += 1;
-                        ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if taken > remaining {
-                            // The entry that PROVES truncation cost a real
-                            // readdir, so it is charged too — but never
-                            // processed. Reading it PAST the cap check (the
-                            // `for` loop used to pull it uncharged) is how
-                            // a wide directory overran the budget by one
-                            // entry per directory.
-                            hit_cap = true;
-                            break;
-                        }
-                        match entry {
-                            Ok(entry) => entries.push(entry.file_name()),
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                            Err(error) => errors.push(error),
-                        }
-                    }
-                    Ok(DirListing {
-                        entries,
-                        errors,
-                        taken,
-                        hit_cap,
-                    })
-                },
+            let listing = match crate::command::status_io_worker::deadline_read_dir(
+                &read_target,
+                remaining,
+                &ticker,
             ) {
                 Err(()) => {
                     // Only a directory that could hold a QUALIFYING candidate
@@ -898,36 +846,44 @@ pub(crate) fn probe_rename_destinations(
                 }
             };
             enumerated += listing.taken;
-            for error in &listing.errors {
+            if listing.timed_out && filter.could_qualify(&dir, &dir_abs) {
                 outcome.io_blocked.push(IoBlockedEvent {
                     path: dir.clone(),
-                    reason: IoBlockedReason::from_error(error),
+                    reason: IoBlockedReason::IoTimeout,
+                    absorbed: false,
+                });
+            }
+            for (kind, raw_os) in &listing.error_kinds {
+                outcome.io_blocked.push(IoBlockedEvent {
+                    path: dir.clone(),
+                    reason: IoBlockedReason::from_error(
+                        &crate::command::status_io_worker::io_from_wire(*kind, *raw_os),
+                    ),
                     absorbed: false,
                 });
             }
             if listing.hit_cap {
                 outcome.truncated = Some(ProbeBudgetKind::Enumeration);
             }
-            let mut names: Vec<PathBuf> = listing
-                .entries
-                .into_iter()
-                .map(|name| dir.join(name))
-                .collect();
+            let mut entries = listing.entries;
             // Fully-enumerated directories process in byte order for
             // deterministic recursion/qualification.
-            names.sort();
-            for relative in names {
+            entries.sort_by(|left, right| left.name.cmp(&right.name));
+            for dirent in entries {
+                let name = crate::command::status_io_worker::dirent_os(&dirent.name);
+                let relative = dir.join(&name);
                 let absolute = workdir.join(&relative);
-                let name = relative.file_name().unwrap_or_default();
                 if name == std::ffi::OsStr::new(util::ROOT_DIR)
                     || name == std::ffi::OsStr::new(util::GIT_DIR)
                 {
                     continue;
                 }
-                // Per-entry stat under the deadline as well: a hung mount
-                // blocks on the entry, not only on the directory open.
-                let entry_target = absolute.clone();
-                let entry_stat = match with_io_deadline(move || entry_target.symlink_metadata()) {
+                // Type comes from the worker-side readdir record (d_type /
+                // lstat inside the killable helper). A follow-up IPC stat
+                // runs only when `file_type()` failed for that name.
+                let entry_stat = match crate::command::status_io_worker::deadline_dirent_kind(
+                    &absolute, &dirent,
+                ) {
                     Ok(result) => result,
                     Err(()) => {
                         if filter.could_qualify(&relative, &absolute) {
@@ -959,7 +915,7 @@ pub(crate) fn probe_rename_destinations(
                         continue;
                     }
                 };
-                if meta.file_type().is_symlink() || meta.is_file() {
+                if meta.is_symlink() || meta.is_file() {
                     if filter.qualifies(&relative, &absolute, &mut outcome.encoding_skipped) {
                         if outcome.destinations.len() >= limits.max_qualified_destinations {
                             outcome.truncated = Some(ProbeBudgetKind::Destination);

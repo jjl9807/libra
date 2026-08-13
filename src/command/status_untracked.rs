@@ -7,7 +7,6 @@ use std::{
 use git_internal::internal::index::Index;
 
 use super::{
-    calc_file_blob_hash,
     status::{Changes, StatusError, UntrackedFiles},
     status_untracked_paths::{
         TrackedPaths, collapse_untracked_directories, directory_marker, is_top_level_path,
@@ -155,7 +154,7 @@ fn path_to_current_preserving_directory_marker(path: PathBuf) -> PathBuf {
 fn index_stat_differs(
     index: &Index,
     file: &str,
-    metadata: &std::fs::Metadata,
+    metadata: &crate::command::status_io_worker::CapturedStat,
     index_file_mtime: Option<std::time::SystemTime>,
 ) -> bool {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -165,10 +164,9 @@ fn index_stat_differs(
     // Mirrors git-internal's private `index_ctime`/`index_mtime`/
     // `unix_metadata_time` so the comparison stays byte-identical to
     // `Index::is_modified`; only the extra stat (and its `unwrap`) is gone.
-    #[cfg(unix)]
-    fn stat_times(metadata: &std::fs::Metadata) -> (SystemTime, SystemTime) {
-        use std::os::unix::fs::MetadataExt;
-
+    fn stat_times(
+        metadata: &crate::command::status_io_worker::CapturedStat,
+    ) -> (SystemTime, SystemTime) {
         fn at(seconds: i64, nanos: i64) -> SystemTime {
             if seconds < 0 {
                 return UNIX_EPOCH;
@@ -180,22 +178,8 @@ fn index_stat_differs(
             UNIX_EPOCH + Duration::new(seconds as u64, nanos)
         }
         (
-            at(metadata.ctime(), metadata.ctime_nsec()),
-            at(metadata.mtime(), metadata.mtime_nsec()),
-        )
-    }
-    #[cfg(not(unix))]
-    fn stat_times(metadata: &std::fs::Metadata) -> (SystemTime, SystemTime) {
-        let _ = Duration::from_secs(0);
-        (
-            metadata
-                .created()
-                .or_else(|_| metadata.modified())
-                .unwrap_or(UNIX_EPOCH),
-            metadata
-                .modified()
-                .or_else(|_| metadata.created())
-                .unwrap_or(UNIX_EPOCH),
+            at(metadata.ctime_sec, metadata.ctime_nsec),
+            at(metadata.mtime_sec, metadata.mtime_nsec),
         )
     }
 
@@ -269,10 +253,7 @@ fn collect_tracked_worktree_changes(
         // per-operation deadline. A hung mount (or a FIFO left in the tree)
         // must reclaim the caller and report the path blocked — never wedge
         // `status` forever, and never let the timeout read as "clean".
-        let stat_path = file_abs.clone();
-        let stat = match crate::command::status_probe::with_io_deadline(move || {
-            stat_path.symlink_metadata()
-        }) {
+        let stat = match crate::command::status_io_worker::deadline_stat(&file_abs) {
             Ok(result) => result,
             Err(()) => {
                 io_blocked.push(io_timeout_event(file));
@@ -296,16 +277,15 @@ fn collect_tracked_worktree_changes(
         // would panic the whole command instead of degrading to an
         // `io_blocked[]` partial. Same fields, one stat, no panic.
         if index_stat_differs(index, file_str, &metadata, index_file_mtime) {
-            let hash_path = file_abs.clone();
-            let hashed = match crate::command::status_probe::with_io_deadline(move || {
-                calc_file_blob_hash(&hash_path)
-            }) {
-                Ok(result) => result,
-                Err(()) => {
-                    io_blocked.push(io_timeout_event(file));
-                    continue;
-                }
-            };
+            let hashed =
+                match crate::command::status_io_worker::deadline_file_blob_hash(&file_abs, workdir)
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        io_blocked.push(io_timeout_event(file));
+                        continue;
+                    }
+                };
             match hashed {
                 Ok(file_hash) => {
                     if !index.verify_hash(file_str, 0, &file_hash) {
@@ -338,149 +318,53 @@ fn scan_workdir(
 
     while let Some(dir) = pending_dirs.pop() {
         let dir_rel = dir.strip_prefix(workdir).unwrap_or(&dir).to_path_buf();
-        // §B.3.3: opening a directory on a stalled mount must reclaim the
-        // caller, not wedge the whole scan. The listing itself is collected
-        // inside the deadline for the same reason — a `ReadDir` iterator
-        // performs further syscalls as it advances, so returning the lazy
-        // iterator would move the blocking work back outside the budget.
-        // `DirEntry::file_type()` is resolved inside the worker too: on
-        // filesystems without d_type it is a stat, so leaving it outside
-        // would put a blocking syscall per entry beyond the deadline.
-        let open_dir = dir.clone();
-        // The worker publishes entries into a shared buffer as it goes, so a
-        // deadline hit KEEPS everything already collected instead of
-        // discarding a large directory that was making steady progress. That
-        // is what the "no-progress deadline" means for the main scan, whose
-        // contract is to report every `??` it can see.
-        type ScanEntry = (PathBuf, std::ffi::OsString, io::Result<std::fs::FileType>);
-        let collected: std::sync::Arc<std::sync::Mutex<Vec<ScanEntry>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = std::sync::Arc::clone(&collected);
-        // The deadline measures LACK of progress, not total time: a
-        // directory with a million entries that keeps yielding them is not a
-        // hung mount, and reporting it as `io_timeout` would silently drop
-        // untracked files the scan is contractually required to list.
+        // §B.3.3 / WIO-01: listing runs in the out-of-process worker. A
+        // no-progress timeout keeps checkpointed entries and marks the
+        // directory `IoBlocked` instead of hanging or discarding partial.
         let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ticker = std::sync::Arc::clone(&progress);
-        let listing = match crate::command::status_probe::with_no_progress_deadline(
-            std::sync::Arc::clone(&progress),
-            move || {
-                std::fs::read_dir(&open_dir).map(|reader| {
-                    // Debug-only seam companion: replace ONE yielded entry
-                    // with `Err(NotFound)` so the vanished-entry skip arm
-                    // below is exercisable (a real vanish between readdir
-                    // batches cannot be staged from a test).
-                    #[cfg(debug_assertions)]
-                    let mut injected_notfound = false;
-                    for entry in reader {
-                        #[cfg(debug_assertions)]
-                        let entry = if !injected_notfound
-                            && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
-                            && std::env::var("LIBRA_TEST_READDIR_ENTRY_NOTFOUND_DIR")
-                                .is_ok_and(|target| open_dir.ends_with(&target))
-                        {
-                            injected_notfound = true;
-                            Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "injected vanished entry",
-                            ))
-                        } else {
-                            entry
-                        };
-                        // `file_type()` can be a stat on filesystems without
-                        // d_type, so it is resolved BEFORE the lock is taken:
-                        // a reclaimed caller must be able to drain what has
-                        // been collected, and it cannot if the worker is
-                        // parked in a syscall while holding the buffer.
-                        let entry = match entry {
-                            Ok(entry) => entry,
-                            // §B.3.3 "entry NotFound → continue": ONE entry
-                            // vanishing mid-iteration is not a failed
-                            // listing — skip it and keep iterating, never
-                            // abandon the directory's remaining entries.
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                            Err(error) => return Err(error),
-                        };
-                        let record = (entry.path(), entry.file_name(), entry.file_type());
-                        sink.lock().unwrap_or_else(|e| e.into_inner()).push(record);
-                        ticker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        // Debug-only seam: force a mid-iteration
-                        // `ReadDir::next` error — the errno-passthrough
-                        // class (NFS/FUSE readdir failures) that no tempdir
-                        // fixture can produce. The error KIND is
-                        // injectable so the genuine-`TimedOut` mapping is
-                        // testable too. Gated on `LIBRA_TEST` like the
-                        // rest of the seam family.
-                        #[cfg(debug_assertions)]
-                        if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
-                            && std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_DIR")
-                                .is_ok_and(|target| open_dir.ends_with(&target))
-                        {
-                            let kind = match std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_KIND")
-                                .as_deref()
-                            {
-                                Ok("timedout") => io::ErrorKind::TimedOut,
-                                _ => io::ErrorKind::Other,
-                            };
-                            return Err(io::Error::new(
-                                kind,
-                                "injected mid-iteration readdir error",
-                            ));
-                        }
-                    }
-                    Ok::<(), io::Error>(())
-                })
-            },
+        let listing = match crate::command::status_io_worker::deadline_read_dir(
+            &dir,
+            usize::MAX,
+            &progress,
         ) {
             Err(()) => {
-                // Reclaimed by the watchdog: record the block HERE and
-                // resolve to `Ok(())` so no sentinel error value needs a
-                // filtering arm below — a filtering arm keyed on the error
-                // KIND would also swallow a genuine `TimedOut` from the
-                // listing itself (2026-08-05 R0-3 review).
                 scan.io_blocked.push(io_timeout_event(&dir_rel));
-                Ok(())
+                continue;
             }
-            // Flatten BOTH layers: the outer error is the `read_dir` open
-            // failure, the inner one a mid-iteration `ReadDir::next`
-            // failure. Discarding the inner error would claim a complete
-            // scan while this directory's remaining entries were silently
-            // dropped — a fail-open hole in the §B.3.3 accumulator
-            // contract (2026-08-05 R0-3 review).
-            Ok(result) => result.and_then(|iteration| iteration),
-        };
-        match listing {
-            Ok(()) => {}
-            // The directory itself vanished before it could be opened:
-            // nothing to report, nothing was collected for it.
-            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                // §B.3.3: record and continue with the remaining pending
-                // directories — never drop what earlier siblings collected,
-                // nor what this directory already yielded.
-                // (`io_blocked_event` maps a genuine `TimedOut` to the
-                // `IoTimeout` reason.)
+            Ok(Err(source)) if source.kind() == io::ErrorKind::NotFound => continue,
+            Ok(Err(source)) => {
                 scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
+                continue;
             }
-        }
-        let reader = {
-            let mut buffer = collected.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *buffer)
+            Ok(Ok(listing)) => listing,
         };
-        for (path, name, file_type) in reader {
+        if listing.timed_out {
+            scan.io_blocked.push(io_timeout_event(&dir_rel));
+        } else if let Some((kind, raw_os)) = listing.error_kinds.first().copied() {
+            let source = crate::command::status_io_worker::io_from_wire(kind, raw_os);
+            scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
+        }
+        for dirent in listing.entries {
+            let name = crate::command::status_io_worker::dirent_os(&dirent.name);
             if name == OsStr::new(util::ROOT_DIR) || name == OsStr::new(util::GIT_DIR) {
                 continue;
             }
 
+            let path = dir.join(&name);
             let entry_rel = path.strip_prefix(workdir).unwrap_or(&path).to_path_buf();
-            let file_type = match file_type {
-                Ok(file_type) => file_type,
-                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
-                Err(source) => {
-                    scan.io_blocked.push(io_blocked_event(&entry_rel, &source));
-                    continue;
-                }
-            };
+            let file_type =
+                match crate::command::status_io_worker::deadline_dirent_kind(&path, &dirent) {
+                    Err(()) => {
+                        scan.io_blocked.push(io_timeout_event(&entry_rel));
+                        continue;
+                    }
+                    Ok(Err(source)) if source.kind() == io::ErrorKind::NotFound => continue,
+                    Ok(Err(source)) => {
+                        scan.io_blocked.push(io_blocked_event(&entry_rel, &source));
+                        continue;
+                    }
+                    Ok(Ok(kind)) => kind,
+                };
             let relative = path
                 .strip_prefix(workdir)
                 .map_err(|err| list_error(&dir, io::Error::other(err.to_string())))?
@@ -626,62 +510,58 @@ enum DirVisibility {
 }
 
 fn untracked_dir_visibility(workdir: &Path, dir: &Path) -> DirVisibility {
-    // §B.3.3: this probe walks a subtree with `read_dir` + per-entry
-    // metadata, all of which block on a stalled mount. One deadline wraps
-    // the WHOLE walk rather than each syscall: the contract is a
-    // no-progress bound on the operation, and per-entry hops would add a
-    // worker round-trip to every file in a wide tree.
-    let workdir = workdir.to_path_buf();
-    let dir = dir.to_path_buf();
-    // No-progress, not wall-clock: a large untracked tree that keeps
-    // yielding entries is not a hung mount, and reporting it as `io_timeout`
-    // would fail text status and truncate the JSON for a directory that was
-    // perfectly readable.
-    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let ticker = std::sync::Arc::clone(&progress);
-    match crate::command::status_probe::with_no_progress_deadline(
-        std::sync::Arc::clone(&progress),
-        move || untracked_dir_visibility_blocking(&workdir, &dir, &ticker),
-    ) {
-        Ok(visibility) => visibility,
-        Err(()) => DirVisibility::Blocked(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "directory listing exceeded the status I/O deadline",
-        )),
-    }
-}
-
-fn untracked_dir_visibility_blocking(
-    workdir: &Path,
-    dir: &Path,
-    progress: &std::sync::atomic::AtomicUsize,
-) -> DirVisibility {
+    // WIO-01: listing runs in the killable worker and already carries
+    // `file_type()`; ignore lookups stay in-process. A wide tree that
+    // keeps yielding entries is not a hang — `read_dir` uses a
+    // no-progress timeout inside the worker pool.
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
-        let entries = match std::fs::read_dir(&current) {
-            Ok(entries) => entries,
-            Err(error) => return DirVisibility::Blocked(error),
+        let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listing = match crate::command::status_io_worker::deadline_read_dir(
+            &current,
+            usize::MAX,
+            &progress,
+        ) {
+            Err(()) => {
+                return DirVisibility::Blocked(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "directory listing exceeded the status I/O deadline",
+                ));
+            }
+            Ok(Err(error)) => return DirVisibility::Blocked(error),
+            Ok(Ok(listing)) => listing,
         };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => return DirVisibility::Blocked(error),
-            };
-            progress.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let name = entry.file_name();
+        if listing.timed_out {
+            return DirVisibility::Blocked(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "directory listing exceeded the status I/O deadline",
+            ));
+        }
+        if let Some((kind, raw_os)) = listing.error_kinds.first().copied() {
+            return DirVisibility::Blocked(crate::command::status_io_worker::io_from_wire(
+                kind, raw_os,
+            ));
+        }
+        for dirent in listing.entries {
+            let name = crate::command::status_io_worker::dirent_os(&dirent.name);
             if name == OsStr::new(util::ROOT_DIR) || name == OsStr::new(util::GIT_DIR) {
                 continue;
             }
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) => return DirVisibility::Blocked(error),
-            };
-            let path = entry.path();
+            let path = current.join(&name);
+            let file_type =
+                match crate::command::status_io_worker::deadline_dirent_kind(&path, &dirent) {
+                    Err(()) => {
+                        return DirVisibility::Blocked(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "directory listing exceeded the status I/O deadline",
+                        ));
+                    }
+                    Ok(Err(error)) => return DirVisibility::Blocked(error),
+                    Ok(Ok(kind)) => kind,
+                };
             match util::check_gitignore_bounded(workdir, &path) {
                 Some(true) => continue,
                 Some(false) => {}
-                // Undecidable: "cannot tell" is not "empty" — report the
-                // directory blocked so its marker is conservatively kept.
                 None => {
                     return DirVisibility::Blocked(io::Error::new(
                         io::ErrorKind::TimedOut,

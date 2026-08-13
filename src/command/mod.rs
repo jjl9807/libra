@@ -139,6 +139,7 @@ pub mod worktree;
 
 pub mod stash;
 pub mod status;
+pub mod status_io_worker;
 pub(crate) mod status_probe;
 pub(crate) mod status_untracked;
 pub(crate) mod status_untracked_paths;

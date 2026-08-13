@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 WIO-01, 2026-08-13, v0.19.156)
+
+- **WIO-01 moves status basic-scan/probe I/O into an out-of-process
+  recyclable worker pool.** Cap 8 helpers, framed
+  `Begin`/`Record`/`Checkpoint`, capability token, Unix process-group kill
+  (plus Linux `PR_SET_PDEATHSIG` / parent-pid watchdog). A hung syscall
+  recycles the worker, not the `status` caller; mid-stream kill keeps the
+  last checkpointed partial and marks the edge `IoBlocked`. Rename content
+  hashing and ignore lookups stay on the in-process thread pool (WIO-03 /
+  SQLite `core.excludesFile`). `docs/commands/status.md` EN/zh and
+  plan-20260714 §B.3.2 record the `io_timeout` semantics upgrade.
+
 ### Added (plan-20260715 W6-03, 2026-08-13, v0.19.155)
 
 - **W6-03 uploads `install.sh` / `install.ps1` to the CDN root on tag.**

@@ -256,7 +256,7 @@ other subsystems are folded into the same list (see below):
 | `worktree_budget_exceeded` | `worktree` | Worktree-read budget or per-file size cap reached; remaining candidates skipped |
 | `worktree_read_failed` | `worktree` | A worktree read failed (I/O error); the affected path is in `data.io_blocked[]` or its rename candidate was skipped |
 | `worktree_permission_denied` | `worktree` | A path could not be inspected (EACCES); the path is in `data.io_blocked[]` |
-| `worktree_io_timeout` | `worktree` | A worktree read exceeded its deadline |
+| `worktree_io_timeout` | `worktree` | A worktree read exceeded its deadline; the out-of-process I/O worker (not the status caller) is recycled. Ignore-file lookups stay in-process (SQLite-backed `core.excludesFile`) and use the thread-pool deadline |
 | `dirty_cache_lock_stolen` | `cache` | A previous scanner's stale lock was stolen — that scanner may not have finished persisting; THIS scan rebuilds the cache and its result is persisted |
 | `dirty_cache_stale_fallback` | `cache` | The dirty cache was missing/stale; degraded to a full status |
 | `dirty_cache_concurrent_invalidate` | `cache` | A concurrent writer invalidated the cache mid-read |
@@ -302,7 +302,11 @@ a fake deletion, a dirty check reporting clean). Instead:
   unpaired surrogate round-trips too —
   `staged` is the known staged component (`"M"`/`"A"`/`"D"`/`"R"` or `null`), `reason` is
   `"permission_denied"`, `"io_error"`, or `"io_timeout"` (a single filesystem operation
-  exceeded the probe deadline), and `rename` is the affected staged rename pair
+  exceeded the probe deadline — Libra recycles the out-of-process I/O worker and
+  keeps the last checkpointed partial, rather than hanging the `status` caller;
+  `.gitignore` / `.libraignore` lookups are not helper-backed and still use the
+  in-process thread-pool deadline),
+  and `rename` is the affected staged rename pair
   (`{from, to, score}`) when one is known. Entries are sorted by raw path bytes and
   deduplicated; each also emits a `worktree_*` warning.
 - `data.base_scan_complete` is `false` when the base scan itself was blocked;

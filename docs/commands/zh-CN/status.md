@@ -139,7 +139,7 @@ libra status --find-renames=75
 | `worktree_budget_exceeded` | `worktree` | 工作树读取预算或单文件大小上限已达；其余候选被跳过 |
 | `worktree_read_failed` | `worktree` | 工作树读取失败（I/O 错误）；受影响路径在 `data.io_blocked[]` 中或其 rename 候选被跳过 |
 | `worktree_permission_denied` | `worktree` | 路径无法检查（EACCES）；该路径在 `data.io_blocked[]` 中 |
-| `worktree_io_timeout` | `worktree` | 工作树读取超时 |
+| `worktree_io_timeout` | `worktree` | 工作树读取超时；回收 out-of-process I/O worker（而非挂起 status 调用方）。ignore 查找仍在进程内（SQLite `core.excludesFile`），使用线程池 deadline |
 | `dirty_cache_lock_stolen` | `cache` | 抢占了先前扫描者的陈旧锁——该扫描者可能未完成持久化；**本次**扫描会重建缓存并持久化其结果 |
 | `dirty_cache_stale_fallback` | `cache` | dirty 缓存缺失/陈旧；降级为完整 status |
 | `dirty_cache_concurrent_invalidate` | `cache` | 并发写者在读取途中使缓存失效 |
@@ -157,7 +157,7 @@ human/short/porcelain 模式在 stderr 打印 status 警告 `warning: …`（`--
 扫描**无法检查**的路径（权限拒绝、I/O 失败）既不是删除也不是干净——伪造任一都会破坏下游自动化（`commit -a` 记录伪删除、脏检查误报干净）。因此：
 
 - **文本格式**（human/short/porcelain）以 `LBR-IO-001` fail-closed，指出第一个受阻路径与总数，并提示用 `--json` 查看部分结果。
-- **`--json`** 正常成功并报告部分结果：每个受阻路径都出现在 `data.io_blocked[]` 中，形态为 `{path: {display, raw_base64}, staged, reason, rename}`——`display` 是转义后的仓库相对形式（与非 `-z` porcelain 同一 quoting）；名字不是合法 UTF-8 时 `raw_base64` 承载精确 OS 字节（否则为 `null`）——Unix 为原始 `OsStr` 字节，Windows 为按小端序列化的 UTF-16 码元，因此未配对代理项同样可逆还原；`staged` 为已知的 staged 分量（`"M"`/`"A"`/`"D"`/`"R"` 或 `null`）；`reason` 为 `"permission_denied"`、`"io_error"` 或 `"io_timeout"`（单次文件系统操作超过 probe 截止时间）；已知受影响的 staged rename 对时 `rename` 为 `{from, to, score}`。条目按 raw 路径字节升序排序并去重；每条同时产生一条 `worktree_*` 警告。
+- **`--json`** 正常成功并报告部分结果：每个受阻路径都出现在 `data.io_blocked[]` 中，形态为 `{path: {display, raw_base64}, staged, reason, rename}`——`display` 是转义后的仓库相对形式（与非 `-z` porcelain 同一 quoting）；名字不是合法 UTF-8 时 `raw_base64` 承载精确 OS 字节（否则为 `null`）——Unix 为原始 `OsStr` 字节，Windows 为按小端序列化的 UTF-16 码元，因此未配对代理项同样可逆还原；`staged` 为已知的 staged 分量（`"M"`/`"A"`/`"D"`/`"R"` 或 `null`）；`reason` 为 `"permission_denied"`、`"io_error"` 或 `"io_timeout"`（单次文件系统操作超过 probe 截止时间——Libra 回收 out-of-process I/O worker 并保留最后 checkpoint 前的 partial，而不是挂起 `status` 调用方；`.gitignore` / `.libraignore` 查找不走 helper，仍用进程内线程池 deadline）；已知受影响的 staged rename 对时 `rename` 为 `{from, to, score}`。条目按 raw 路径字节升序排序并去重；每条同时产生一条 `worktree_*` 警告。
 - 基础扫描受阻时 `data.base_scan_complete` 为 `false`；任何 rename 配对降级（probe 截断/受阻、引擎跳过、预算、编码跳过）都使 `data.rename_detection_complete` 为 `false`；`data.complete` 是两者的 AND。`io_blocked` 非空期间 `is_clean` 恒为 `false`，`--exit-code` 按 dirty 报告（退出码 1）。
 - dirty-cache 扩展从不持久化疑点：受阻的 `--scan` 拒绝替换缓存，`--check-dirty` 复验时保留无法重新验证的行。
 
