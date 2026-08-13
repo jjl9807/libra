@@ -21,8 +21,8 @@ use libra::internal::ai::{
             CodeUiInteractionStatus, CodeUiPatchChange, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot,
             CodeUiPlanStep, CodeUiProviderInfo, CodeUiSession, CodeUiSessionResumeRequest,
             CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiSkillActivateRequest,
-            CodeUiTaskSnapshot, CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
-            CodeUiTranscriptEntryKind,
+            CodeUiTaskSnapshot, CodeUiThreadGraph, CodeUiThreadGraphNode, CodeUiToolCallSnapshot,
+            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
         },
     },
 };
@@ -140,6 +140,30 @@ fn fully_populated_snapshot() -> CodeUiSessionSnapshot {
                 max_attempts: 2,
             },
         }),
+        thread_graph: Some(CodeUiThreadGraph {
+            thread_id: "thread-1".to_string(),
+            title: Some("Wire thread".to_string()),
+            selected_plan_id: Some("plan-1".to_string()),
+            active_task_id: Some("task-1".to_string()),
+            active_run_id: None,
+            nodes: vec![
+                CodeUiThreadGraphNode {
+                    depth: 1,
+                    kind: "plan".to_string(),
+                    id: "plan-1".to_string(),
+                    label: "Plan 1".to_string(),
+                    tags: vec!["selected".to_string()],
+                },
+                CodeUiThreadGraphNode {
+                    depth: 4,
+                    kind: "patchset".to_string(),
+                    id: "patch-1".to_string(),
+                    label: "PatchSet 1".to_string(),
+                    tags: vec!["ready".to_string()],
+                },
+            ],
+            ..Default::default()
+        }),
         updated_at: ts,
     }
 }
@@ -227,6 +251,22 @@ fn snapshot_round_trips_through_camel_case_wire_shape() {
     assert_eq!(
         serialized["planExecutionRepair"]["interaction_id"],
         Value::String("repair-1".into())
+    );
+    assert_eq!(
+        serialized["threadGraph"]["threadId"],
+        Value::String("thread-1".into())
+    );
+    assert_eq!(
+        serialized["threadGraph"]["nodes"][0]["kind"],
+        Value::String("plan".into())
+    );
+    assert_eq!(
+        serialized["threadGraph"]["nodes"][1]["kind"],
+        Value::String("patchset".into())
+    );
+    assert!(
+        serialized["threadGraph"].get("truncated").is_none(),
+        "untruncated graphs omit truncation metadata"
     );
 
     // Patchset path round-trips with `changeType` (camelCase from `change_type`).

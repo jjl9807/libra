@@ -265,6 +265,44 @@ pub struct CodeUiPatchsetSnapshot {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiThreadGraphNode {
+    pub depth: u32,
+    pub kind: String,
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeUiThreadGraph {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_plan_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_run_id: Option<String>,
+    #[serde(default)]
+    pub nodes: Vec<CodeUiThreadGraphNode>,
+    /// True when indexed lineage exceeded the Code UI node cap.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub omitted_node_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_node_count: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeUiSessionSnapshot {
@@ -286,6 +324,9 @@ pub struct CodeUiSessionSnapshot {
     /// fails. Kept in the Rust wire model for remote Code UI consumers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_execution_repair: Option<PlanExecutionRepairState>,
+    /// Intent/Plan/Task/Run version graph for the current thread (W4-04).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_graph: Option<CodeUiThreadGraph>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -306,6 +347,7 @@ impl Default for CodeUiSessionSnapshot {
             patchsets: Vec::new(),
             interactions: Vec::new(),
             plan_execution_repair: None,
+            thread_graph: None,
             updated_at: Utc::now(),
         }
     }
@@ -728,6 +770,9 @@ impl CodeUiSession {
                 return;
             }
             upsert_by_id(&mut snapshot.plans, plan, |item| item.id.as_str());
+            if !thread_graph_covers_snapshot_heads(snapshot) {
+                snapshot.thread_graph = None;
+            }
         })
         .await;
     }
@@ -735,6 +780,9 @@ impl CodeUiSession {
     pub async fn upsert_task(&self, task: CodeUiTaskSnapshot) {
         self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
             upsert_by_id(&mut snapshot.tasks, task, |item| item.id.as_str());
+            if !thread_graph_covers_snapshot_heads(snapshot) {
+                snapshot.thread_graph = None;
+            }
         })
         .await;
     }
@@ -749,6 +797,9 @@ impl CodeUiSession {
     pub async fn upsert_patchset(&self, patchset: CodeUiPatchsetSnapshot) {
         self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
             upsert_by_id(&mut snapshot.patchsets, patchset, |item| item.id.as_str());
+            if !thread_graph_covers_snapshot_heads(snapshot) {
+                snapshot.thread_graph = None;
+            }
         })
         .await;
     }
@@ -1673,6 +1724,10 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("THREAD_LIST_FAILED", 500),
         ("DB_UNAVAILABLE", 500),
         ("USAGE_UNAVAILABLE", 500),
+        ("THREAD_GRAPH_INVALID_ID", 400),
+        ("THREAD_GRAPH_STORAGE_UNAVAILABLE", 500),
+        ("THREAD_GRAPH_NOT_FOUND", 404),
+        ("THREAD_GRAPH_UNAVAILABLE", 500),
         ("INVALID_SKILL_PROVIDER", 400),
         ("SKILL_NOT_DISCOVERABLE", 400),
         ("SKILL_ACTIVATION_UNSUPPORTED", 422),
@@ -1754,6 +1809,7 @@ pub fn initial_snapshot(
         patchsets: Vec::new(),
         interactions: Vec::new(),
         plan_execution_repair: None,
+        thread_graph: None,
         updated_at: Utc::now(),
     }
 }
@@ -1819,6 +1875,121 @@ pub fn apply_thread_bundle_to_snapshot(
         .into_iter()
         .collect();
     snapshot.updated_at = bundle.thread.updated_at.max(bundle.scheduler.updated_at);
+}
+
+/// True when every live plan/task/patchset head is present in `thread_graph`.
+///
+/// Used to detect a stale indexed graph after scheduler/Codex projection
+/// advances. An absent graph is not covering. Truncated graphs only have to
+/// cover selected/active live heads (plus the latest patchset), not the full
+/// historical snapshot lists.
+pub(crate) fn thread_graph_covers_snapshot_heads(snapshot: &CodeUiSessionSnapshot) -> bool {
+    let Some(graph) = snapshot.thread_graph.as_ref() else {
+        return false;
+    };
+    let has_node = |kind: &str, id: &str| {
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == kind && node.id == id)
+    };
+    if snapshot
+        .thread_id
+        .as_deref()
+        .is_none_or(|thread_id| graph.thread_id != thread_id)
+    {
+        return false;
+    }
+    let selected_plan_id = graph.selected_plan_id.as_deref().or_else(|| {
+        graph.nodes.iter().find_map(|node| {
+            (node.kind == "plan"
+                && node
+                    .tags
+                    .iter()
+                    .any(|tag| tag == "selected" || tag == "running"))
+            .then_some(node.id.as_str())
+        })
+    });
+    let active_task_id = graph.active_task_id.as_deref().or_else(|| {
+        graph.nodes.iter().find_map(|node| {
+            (node.kind == "task"
+                && node
+                    .tags
+                    .iter()
+                    .any(|tag| tag == "active" || tag == "running"))
+            .then_some(node.id.as_str())
+        })
+    });
+    if let Some(id) = selected_plan_id
+        && !has_node("plan", id)
+    {
+        return false;
+    }
+    if let Some(id) = active_task_id
+        && !has_node("task", id)
+    {
+        return false;
+    }
+    if let Some(id) = graph.active_run_id.as_deref()
+        && !has_node("run", id)
+    {
+        return false;
+    }
+
+    let live_plan_ids = snapshot
+        .plans
+        .iter()
+        .filter(|plan| matches!(plan.status.as_str(), "selected" | "running"))
+        .map(|plan| plan.id.as_str())
+        .collect::<Vec<_>>();
+    if !live_plan_ids.is_empty() && selected_plan_id.is_none_or(|id| !live_plan_ids.contains(&id)) {
+        return false;
+    }
+    let live_task_ids = snapshot
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.status.as_str(), "active" | "running"))
+        .map(|task| task.id.as_str())
+        .collect::<Vec<_>>();
+    if !live_task_ids.is_empty() && active_task_id.is_none_or(|id| !live_task_ids.contains(&id)) {
+        return false;
+    }
+
+    let plans = if graph.truncated {
+        snapshot
+            .plans
+            .iter()
+            .filter(|plan| {
+                matches!(plan.status.as_str(), "selected" | "running")
+                    || graph.selected_plan_id.as_deref() == Some(plan.id.as_str())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        snapshot.plans.iter().collect()
+    };
+    let tasks = if graph.truncated {
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| {
+                matches!(task.status.as_str(), "active" | "running")
+                    || graph.active_task_id.as_deref() == Some(task.id.as_str())
+            })
+            .collect::<Vec<_>>()
+    } else {
+        snapshot.tasks.iter().collect()
+    };
+    let patchsets = if graph.truncated {
+        snapshot.patchsets.last().into_iter().collect::<Vec<_>>()
+    } else {
+        snapshot.patchsets.iter().collect()
+    };
+
+    plans.iter().all(|plan| has_node("plan", &plan.id))
+        && tasks.iter().all(|task| has_node("task", &task.id))
+        && patchsets
+            .iter()
+            .all(|patchset| has_node("patchset", &patchset.id))
 }
 
 /// Build the [`CodeUiPlanSnapshot`] list for a snapshot from the
@@ -1899,6 +2070,276 @@ mod tests {
         assert!(is_terminal_plan_status("failed"));
         assert!(!is_terminal_plan_status("running"));
         assert!(!is_terminal_plan_status("pending"));
+    }
+
+    #[test]
+    fn thread_graph_covers_snapshot_heads_requires_plan_task_and_patchset_ids() {
+        let mut snapshot = initial_snapshot(
+            "/tmp/libra",
+            CodeUiProviderInfo::default(),
+            CodeUiCapabilities::default(),
+        );
+        snapshot.thread_id = Some("thread-1".to_string());
+        snapshot.plans = vec![CodeUiPlanSnapshot {
+            id: "plan-1".to_string(),
+            title: None,
+            summary: None,
+            status: "selected".to_string(),
+            steps: Vec::new(),
+            updated_at: Utc::now(),
+        }];
+        snapshot.tasks = vec![CodeUiTaskSnapshot {
+            id: "task-1".to_string(),
+            title: None,
+            status: "active".to_string(),
+            details: None,
+            updated_at: Utc::now(),
+        }];
+        snapshot.patchsets = vec![CodeUiPatchsetSnapshot {
+            id: "patch-1".to_string(),
+            status: "ready".to_string(),
+            changes: Vec::new(),
+            updated_at: Utc::now(),
+        }];
+        assert!(!thread_graph_covers_snapshot_heads(&snapshot));
+
+        snapshot.thread_graph = Some(CodeUiThreadGraph {
+            thread_id: "thread-1".to_string(),
+            title: None,
+            selected_plan_id: Some("plan-1".to_string()),
+            active_task_id: Some("task-1".to_string()),
+            active_run_id: None,
+            nodes: vec![
+                CodeUiThreadGraphNode {
+                    depth: 1,
+                    kind: "plan".to_string(),
+                    id: "plan-1".to_string(),
+                    label: "Plan 1".to_string(),
+                    tags: Vec::new(),
+                },
+                CodeUiThreadGraphNode {
+                    depth: 2,
+                    kind: "task".to_string(),
+                    id: "task-1".to_string(),
+                    label: "Task 1".to_string(),
+                    tags: Vec::new(),
+                },
+                CodeUiThreadGraphNode {
+                    depth: 4,
+                    kind: "patchset".to_string(),
+                    id: "patch-1".to_string(),
+                    label: "PatchSet 1".to_string(),
+                    tags: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        });
+        assert!(thread_graph_covers_snapshot_heads(&snapshot));
+
+        if let Some(graph) = snapshot.thread_graph.as_mut() {
+            graph.selected_plan_id = None;
+            if let Some(plan) = graph.nodes.iter_mut().find(|node| node.id == "plan-1") {
+                plan.tags = vec!["selected".to_string()];
+            }
+        }
+        assert!(
+            thread_graph_covers_snapshot_heads(&snapshot),
+            "a selected node tag covers the live plan when selected_plan_id is omitted"
+        );
+        if let Some(graph) = snapshot.thread_graph.as_mut() {
+            graph.selected_plan_id = Some("plan-1".to_string());
+            if let Some(plan) = graph.nodes.iter_mut().find(|node| node.id == "plan-1") {
+                plan.tags.clear();
+            }
+        }
+
+        snapshot.plans.push(CodeUiPlanSnapshot {
+            id: "plan-2".to_string(),
+            title: None,
+            summary: None,
+            status: "selected".to_string(),
+            steps: Vec::new(),
+            updated_at: Utc::now(),
+        });
+        snapshot.plans[0].status = "completed".to_string();
+        if let Some(graph) = snapshot.thread_graph.as_mut() {
+            graph.nodes.insert(
+                1,
+                CodeUiThreadGraphNode {
+                    depth: 1,
+                    kind: "plan".to_string(),
+                    id: "plan-2".to_string(),
+                    label: "Plan 2".to_string(),
+                    tags: Vec::new(),
+                },
+            );
+        }
+        assert!(
+            !thread_graph_covers_snapshot_heads(&snapshot),
+            "graph.selected_plan_id must match the live selected plan even when both nodes exist"
+        );
+        snapshot.plans.pop();
+        snapshot.plans[0].status = "selected".to_string();
+        if let Some(graph) = snapshot.thread_graph.as_mut() {
+            graph.nodes.retain(|node| node.id != "plan-2");
+        }
+
+        snapshot.thread_graph = Some(CodeUiThreadGraph {
+            thread_id: "thread-1".to_string(),
+            title: None,
+            selected_plan_id: Some("plan-1".to_string()),
+            active_task_id: Some("task-1".to_string()),
+            active_run_id: None,
+            nodes: vec![
+                CodeUiThreadGraphNode {
+                    depth: 1,
+                    kind: "plan".to_string(),
+                    id: "plan-1".to_string(),
+                    label: "Plan 1".to_string(),
+                    tags: Vec::new(),
+                },
+                CodeUiThreadGraphNode {
+                    depth: 2,
+                    kind: "task".to_string(),
+                    id: "task-1".to_string(),
+                    label: "Task 1".to_string(),
+                    tags: Vec::new(),
+                },
+                CodeUiThreadGraphNode {
+                    depth: 4,
+                    kind: "patchset".to_string(),
+                    id: "patch-1".to_string(),
+                    label: "PatchSet 1".to_string(),
+                    tags: Vec::new(),
+                },
+            ],
+            truncated: true,
+            omitted_node_count: 12,
+            total_node_count: Some(268),
+        });
+        snapshot.plans.push(CodeUiPlanSnapshot {
+            id: "plan-historical".to_string(),
+            title: None,
+            summary: None,
+            status: "completed".to_string(),
+            steps: Vec::new(),
+            updated_at: Utc::now(),
+        });
+        assert!(
+            thread_graph_covers_snapshot_heads(&snapshot),
+            "truncated graphs must not be invalidated by historical completed plans"
+        );
+
+        snapshot.plans.push(CodeUiPlanSnapshot {
+            id: "plan-2".to_string(),
+            title: None,
+            summary: None,
+            status: "selected".to_string(),
+            steps: Vec::new(),
+            updated_at: Utc::now(),
+        });
+        assert!(!thread_graph_covers_snapshot_heads(&snapshot));
+
+        snapshot.plans.pop();
+        snapshot.thread_id = Some("thread-2".to_string());
+        assert!(
+            !thread_graph_covers_snapshot_heads(&snapshot),
+            "a graph from another thread must not cover the current snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_plan_invalidates_stale_thread_graph_when_index_unavailable() {
+        let working_dir = tempfile::tempdir().expect("temporary workspace");
+        let mut snapshot = initial_snapshot(
+            working_dir.path().to_string_lossy(),
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: Some("test".to_string()),
+                managed: false,
+            },
+            CodeUiCapabilities::default(),
+        );
+        snapshot.thread_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        snapshot.thread_graph = Some(CodeUiThreadGraph {
+            thread_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            title: None,
+            selected_plan_id: Some("plan-old".to_string()),
+            active_task_id: None,
+            active_run_id: None,
+            nodes: vec![CodeUiThreadGraphNode {
+                depth: 1,
+                kind: "plan".to_string(),
+                id: "plan-old".to_string(),
+                label: "Old plan".to_string(),
+                tags: vec!["selected".to_string()],
+            }],
+            ..Default::default()
+        });
+        let session = CodeUiSession::new(snapshot);
+        session
+            .upsert_plan(CodeUiPlanSnapshot {
+                id: "plan-new".to_string(),
+                title: Some("New plan".to_string()),
+                summary: None,
+                status: "selected".to_string(),
+                steps: Vec::new(),
+                updated_at: Utc::now(),
+            })
+            .await;
+        let after = session.snapshot().await;
+        assert!(
+            after.thread_graph.is_none(),
+            "stale indexed graph must not survive a live plan upsert"
+        );
+        assert!(
+            after.plans.iter().any(|plan| plan.id == "plan-new"),
+            "the new plan must still be visible after graph invalidation"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_plan_keeps_indexed_graph_when_heads_still_covered() {
+        let working_dir = tempfile::tempdir().expect("temporary workspace");
+        let mut snapshot = initial_snapshot(
+            working_dir.path().to_string_lossy(),
+            CodeUiProviderInfo::default(),
+            CodeUiCapabilities::default(),
+        );
+        snapshot.thread_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        snapshot.thread_graph = Some(CodeUiThreadGraph {
+            thread_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            title: None,
+            selected_plan_id: Some("plan-old".to_string()),
+            active_task_id: None,
+            active_run_id: None,
+            nodes: vec![CodeUiThreadGraphNode {
+                depth: 1,
+                kind: "plan".to_string(),
+                id: "plan-old".to_string(),
+                label: "Old plan".to_string(),
+                tags: vec!["selected".to_string()],
+            }],
+            ..Default::default()
+        });
+        let session = CodeUiSession::new(snapshot);
+        session
+            .upsert_plan(CodeUiPlanSnapshot {
+                id: "plan-old".to_string(),
+                title: Some("Old plan".to_string()),
+                summary: None,
+                status: "running".to_string(),
+                steps: Vec::new(),
+                updated_at: Utc::now(),
+            })
+            .await;
+        let after = session.snapshot().await;
+        assert!(
+            after.thread_graph.is_some(),
+            "updating an existing covered plan must not drop the indexed graph"
+        );
+        assert_eq!(after.plans[0].status, "running");
     }
 
     #[tokio::test]
@@ -2220,6 +2661,11 @@ mod tests {
             // mod.rs `code_threads_handler` thread-list query path.
             ("DB_UNAVAILABLE", 500),
             ("THREAD_LIST_FAILED", 500),
+            // mod.rs `code_thread_graph_handler`.
+            ("THREAD_GRAPH_INVALID_ID", 400),
+            ("THREAD_GRAPH_STORAGE_UNAVAILABLE", 500),
+            ("THREAD_GRAPH_NOT_FOUND", 404),
+            ("THREAD_GRAPH_UNAVAILABLE", 500),
             // mod.rs `code_goal_status_handler` response coerce.
             ("STATUS_UNAVAILABLE", 500),
             // mod.rs `WebApiError::From<serde_json::Error>` fallback.

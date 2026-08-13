@@ -21,7 +21,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。遗留 TUI（`LIBRA_CODE_LEGACY_TUI=1`）与 headless Web 在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel；选择 Execute 后会再打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`），只有该 gate 解决后才会应用网络策略，且两个 gate 都可在崩溃后恢复。Review 和 research 上下文保持只读，且不授予网络访问。
 
-当遗留 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令，以便在独立 TUI 中检查该线程的 Intent/Plan/Task/Run/PatchSet 版本图。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
+当遗留 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令。实时版本图在 Web Code UI 中查看；`libra graph --json` 仍是 agent 路径，交互式 TUI 已弃用（W5-08 删除）。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
 
 **Linked worktree**：`libra code`（所有模式）可在 linked worktree 中启动，并走 W4-06 RequestScope resolver。安全相关文件（`sandbox.toml`、`hooks.json`、`config.toml` 的 `[approval]`/`[mcp]`、`rules/`、`contexts/`）以及 extension/automation 表面（`agents.toml`、`automations.toml`、`agents/`、`commands/`、`skills/`）保留仓库默认层。安全 overlay 只能收紧；extension overlay 同名覆盖。不可读或无法解析的安全配置，以及损坏的 worktree scope，均 fail-closed，诊断只报 source layer、不回显文件内容。linked worktree 中 automation 的 VCS dispatch 同样经 resolver 运行——见 [automation.md](automation.md)。已按规范 `libra.repoid` 存储的 Always 审批在同一仓库的 linked worktree 中可见，并保留 worktree/session provenance（仅审计）。Session / 一次性审批绑定发起该次确认的 controller lease；lease takeover / detach / expiry（含 browser/automation 首次从本地 TUI 接手）后不得复用，新 controller 必须重新确认。内存 ApprovalStore cache 以 `repo:{libra.repoid}` 为 key，不再使用进程级 `None` 全局 scope。
 
@@ -111,7 +111,7 @@ Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 
 
 浏览器服务端 endpoints 在 `code_router()` audit matrix（`src/internal/ai/web/mod.rs`）中标记：
 
-- `GET /api/code/session`、`GET /api/code/events`、`GET /api/code/diagnostics`、`GET /api/code/threads`、`GET /api/code/usage`、`GET /api/code/skills`、`GET /api/code/goal/status` — 仅 loopback observe。
+- `GET /api/code/session`、`GET /api/code/thread-graph?threadId=`、`GET /api/code/events`、`GET /api/code/diagnostics`、`GET /api/code/threads`、`GET /api/code/usage`、`GET /api/code/skills`、`GET /api/code/goal/status` — 仅 loopback observe。
 - `POST /api/code/controller/attach` — loopback。`kind: "automation"` 请求还要求 `X-Libra-Control-Token`。handler **签发** lease 的 `controllerToken`（不期待调用方发送它）。
 - `POST /api/code/controller/detach`、`POST /api/code/messages`、`POST /api/code/interactions/{id}` — loopback + `X-Code-Controller-Token`；`Automation` leases 还要求 `X-Libra-Control-Token`。
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`。`Automation` leases 也要求 `X-Libra-Control-Token`；这是与 TUI `Esc` cancel 路径的唯一区别。
@@ -223,7 +223,9 @@ Code UI API 错误使用 `{ error: { code, message } }`：
 | `CODE_UI_UNAVAILABLE` | 404 | 没有 active `libra code` session 附加到 Web 服务器。 |
 | `INVALID_QUERY_PARAM` | 400 | 查询解析失败，目前用于 `/threads` 分页。 |
 | `INVALID_COMMAND_ID` | 400 | `commandId` 为空、过长，或包含空白/控制字符。 |
-| `STORAGE_PATH_INVALID` / `STORAGE_ROOT_UNRESOLVED` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `USAGE_UNAVAILABLE` / `SESSION_RESUME_LOAD_FAILED` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database、usage、resume load 或 fallback internal failure。 |
+| `THREAD_GRAPH_INVALID_ID` | 400 | `GET /api/code/thread-graph` 的 `threadId` 不是 canonical UUID。 |
+| `STORAGE_PATH_INVALID` / `STORAGE_ROOT_UNRESOLVED` / `STATUS_UNAVAILABLE` / `THREAD_LIST_FAILED` / `DB_UNAVAILABLE` / `USAGE_UNAVAILABLE` / `THREAD_GRAPH_STORAGE_UNAVAILABLE` / `THREAD_GRAPH_UNAVAILABLE` / `SESSION_RESUME_LOAD_FAILED` / `INTERNAL_ERROR` | 500 | 服务端 storage、status、projection、database、usage、thread graph、resume load 或 fallback internal failure。 |
+| `THREAD_GRAPH_NOT_FOUND` | 404 | 请求的 `threadId` 没有 indexed thread projection。 |
 | `INVALID_SKILL_PROVIDER` / `SKILL_NOT_DISCOVERABLE` | 400 | skill provider 不是 A0-07 slug，或 skill 对该 provider 不可发现。 |
 | `SKILL_ACTIVATION_UNSUPPORTED` | 422 | skill 可发现，但尚无 in-process activation 路径。 |
 | `SESSION_RESUME_BUSY` | 409 | thinking 或 tool-running session 不能被替换。 |

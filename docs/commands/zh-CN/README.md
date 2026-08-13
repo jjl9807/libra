@@ -135,7 +135,7 @@ porcelain 输出、冲突处理或 plumbing 语法等特定 Git-compatible 表�
 | Codex data storage | | 将 `libra code --provider codex` 连接到 Codex app-server，并持久化 Codex 会话数据 | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | 列出、运行和检查 AI automation rules | [automation.md](automation.md) |
 | `libra usage` | | 报告并修剪 AI provider/model 使用聚合 | [usage.md](usage.md) |
-| `libra graph` | | 在专用 TUI 中检查 Libra Code thread version graph | [graph.md](graph.md) |
+| `libra graph` | | 检查 Libra Code thread version graph（`--json`/`--machine`；交互式 TUI 已弃用，请用 Web Code UI） | [graph.md](graph.md) |
 | `libra sandbox` | | 检查 AI sandbox diagnostics，包括 OS backend 可用性和 downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | 管理外部 agent 捕获、checkpoints、hooks 和 RPC adapters | [agent.md](agent.md) |
 

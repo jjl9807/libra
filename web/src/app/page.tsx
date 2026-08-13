@@ -8,6 +8,7 @@ import { SessionGoalTaskSkill } from "@/components/workspace/goal-task-skill/Ses
 import { SessionInteractions } from "@/components/workspace/interactions/SessionInteractions";
 import { SessionLifecycle } from "@/components/workspace/session-lifecycle/SessionLifecycle";
 import { SessionSseResilience } from "@/components/workspace/sse-resilience/SessionSseResilience";
+import { SessionThreadGraph } from "@/components/workspace/thread-graph/SessionThreadGraph";
 import { SessionUsage } from "@/components/workspace/usage/SessionUsage";
 import { SessionWorkflow } from "@/components/workspace/workflow/SessionWorkflow";
 import { createCodeUiClient } from "@/lib/code-ui/client";
@@ -35,6 +36,7 @@ function PlaceholderShell() {
       <SessionGoalTaskSkill />
       <SessionLifecycle />
       <SessionUsage />
+      <SessionThreadGraph />
       <SessionExecutionRepair />
       <SessionWorkflow />
       <SessionSseResilience />

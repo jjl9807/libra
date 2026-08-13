@@ -170,4 +170,23 @@ describe("sse v2 wire", () => {
     expect(envelope.type).toBe("session_updated");
     expect(envelope.data.status).toBe("thinking");
   });
+
+  it("clears a stale threadGraph on a null thread_graph delta", () => {
+    const start = sessionFixture({
+      threadId: "thread-1",
+      threadGraph: {
+        threadId: "thread-1",
+        nodes: [{ depth: 1, kind: "plan", id: "plan-1", label: "Plan 1", tags: ["selected"] }],
+      },
+      plans: [{ id: "plan-2", title: "New plan", status: "selected", steps: [], updatedAt: "2026-07-15T00:00:00.000Z" }],
+    });
+    const cleared = foldWireV2Event(start, {
+      cursor: 20,
+      kind: "code_ui_projection_delta:thread_graph",
+      at: "2026-07-15T00:00:20.000Z",
+      payload: { projection: "thread_graph", payload: null },
+    });
+    expect(cleared.threadGraph).toBeUndefined();
+    expect(cleared.plans[0]?.id).toBe("plan-2");
+  });
 });

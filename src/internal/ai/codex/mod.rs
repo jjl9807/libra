@@ -1525,6 +1525,14 @@ fn build_code_ui_snapshot_from_codex_session(
             })
             .collect(),
         plan_execution_repair: current.plan_execution_repair.clone(),
+        thread_graph: current.thread_graph.as_ref().and_then(|graph| {
+            let next_thread_id = if session.thread.id.is_empty() {
+                current.thread_id.as_deref()
+            } else {
+                Some(session.thread.id.as_str())
+            };
+            (next_thread_id == Some(graph.thread_id.as_str())).then(|| graph.clone())
+        }),
         updated_at: Utc::now(),
     }
 }
@@ -1578,6 +1586,9 @@ async fn publish_code_ui_snapshot_with_envelope(
     );
     if !envelope_kinds.is_empty() {
         envelope::apply_agent_event_kinds_to_code_ui_status(&mut snapshot, envelope_kinds);
+    }
+    if !crate::internal::ai::web::code_ui::thread_graph_covers_snapshot_heads(&snapshot) {
+        snapshot.thread_graph = None;
     }
     code_ui_session
         .replace_snapshot(CodeUiEventType::SessionUpdated, snapshot)

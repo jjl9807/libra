@@ -98,4 +98,8 @@ fn test_graph_help_lists_examples_banner() {
             "graph --help should include `{invocation}`, stdout: {stdout}"
         );
     }
+    assert!(
+        stdout.contains("Deprecated TUI") || stdout.contains("deprecated"),
+        "graph --help should mention TUI deprecation, stdout: {stdout}"
+    );
 }

@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use super::code_ui::{
     CodeUiInteractionRequest, CodeUiInteractionStatus, CodeUiPatchsetSnapshot, CodeUiPlanSnapshot,
-    CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot, CodeUiToolCallSnapshot,
-    CodeUiTranscriptEntry,
+    CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTaskSnapshot, CodeUiThreadGraph,
+    CodeUiToolCallSnapshot, CodeUiTranscriptEntry,
 };
 use crate::internal::ai::{
     runtime::PlanExecutionRepairState,
@@ -134,7 +134,7 @@ pub fn fold_code_ui_snapshot(
                 projection,
                 payload,
                 ..
-            } if !payload.is_null() => apply_projection_delta(
+            } if !payload.is_null() || projection == "thread_graph" => apply_projection_delta(
                 &mut snapshot,
                 projection,
                 payload,
@@ -274,6 +274,13 @@ fn apply_projection_delta(
         "patchset_upsert" => {
             let patchset: CodeUiPatchsetSnapshot = decode(projection, payload)?;
             upsert_by_id(&mut snapshot.patchsets, patchset, |item| item.id.as_str());
+        }
+        "thread_graph" => {
+            snapshot.thread_graph = if payload.is_null() {
+                None
+            } else {
+                Some(decode::<CodeUiThreadGraph>(projection, payload)?)
+            };
         }
         _ => return Ok(()),
     }

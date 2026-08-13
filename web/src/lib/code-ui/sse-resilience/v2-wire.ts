@@ -191,6 +191,11 @@ function applyProjectionDelta(
     case "patchset_upsert":
       next.patchsets = upsertById(snapshot.patchsets, payload);
       return next;
+    case "thread_graph":
+      next.threadGraph = payload
+        ? (payload as CodeUiSessionSnapshot["threadGraph"])
+        : undefined;
+      return next;
     default:
       return next;
   }

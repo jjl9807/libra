@@ -714,7 +714,9 @@ enum Commands {
     Automation(command::automation::AutomationArgs),
     #[command(about = "Report AI provider/model usage")]
     Usage(command::usage::UsageArgs),
-    #[command(about = "Inspect an AI thread version graph in a TUI")]
+    #[command(
+        about = "Inspect an AI thread version graph (Web Code UI; interactive TUI deprecated)"
+    )]
     Graph(command::graph::GraphArgs),
     #[command(about = "Inspect AI sandbox diagnostics")]
     Sandbox(command::sandbox::SandboxArgs),

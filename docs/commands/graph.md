@@ -1,6 +1,6 @@
 # `libra graph`
 
-Inspect a Libra Code thread as an interactive version graph.
+Inspect a Libra Code thread version graph.
 
 ## Synopsis
 
@@ -11,7 +11,11 @@ libra --json graph <THREAD_ID> [--repo <PATH>]
 
 ## Description
 
-`libra graph` opens a dedicated TUI for a canonical Libra Code thread. It reads the AI projection tables and formal AI history under `.libra/`, then renders the thread's version chain as a graph of:
+The current thread/version graph is shown in Web Code UI (`libra code`). `libra graph` still loads the same projection tables and formal AI history under `.libra/`.
+
+The interactive TUI is **deprecated** (removed in W5-08). Prefer Web Code UI, or `libra graph --json` / `--machine` for agents. The TUI prints a deprecation warning and still works during the W4 bake window.
+
+The graph is a version chain of:
 
 - Intent revisions
 - Execution plans
@@ -51,7 +55,7 @@ libra graph 11111111-1111-4111-8111-111111111111
 |--------|-------------|
 | `--repo <PATH>` | Inspect a specific Libra repository instead of discovering one from the current directory. |
 
-## TUI Controls
+## TUI Controls (deprecated)
 
 | Key | Action |
 |-----|--------|

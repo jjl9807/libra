@@ -339,6 +339,17 @@ fn code_ui_projection_deltas(
         &current.patchsets,
         |patchset| patchset.id.as_str(),
     )?;
+    if previous.thread_graph != current.thread_graph {
+        deltas.push(projection_delta(
+            "thread_graph",
+            if current.thread_graph.is_some() {
+                "thread graph changed"
+            } else {
+                "thread graph cleared"
+            },
+            &current.thread_graph,
+        )?);
+    }
     Ok(deltas)
 }
 
@@ -3291,6 +3302,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn projection_deltas_emit_thread_graph_clears() {
+        use crate::internal::ai::web::code_ui::{
+            CodeUiThreadGraph, CodeUiThreadGraphNode, initial_snapshot,
+        };
+
+        let mut previous = initial_snapshot(
+            "/repo",
+            crate::internal::ai::web::code_ui::CodeUiProviderInfo::default(),
+            crate::internal::ai::web::code_ui::CodeUiCapabilities::default(),
+        );
+        previous.thread_graph = Some(CodeUiThreadGraph {
+            thread_id: "thread-1".to_string(),
+            title: None,
+            selected_plan_id: None,
+            active_task_id: None,
+            active_run_id: None,
+            nodes: vec![CodeUiThreadGraphNode {
+                depth: 1,
+                kind: "plan".to_string(),
+                id: "plan-1".to_string(),
+                label: "Plan 1".to_string(),
+                tags: Vec::new(),
+            }],
+            ..Default::default()
+        });
+        let current = initial_snapshot(
+            "/repo",
+            crate::internal::ai::web::code_ui::CodeUiProviderInfo::default(),
+            crate::internal::ai::web::code_ui::CodeUiCapabilities::default(),
+        );
+
+        let deltas = code_ui_projection_deltas(&previous, &current).expect("deltas");
+        assert!(
+            deltas.iter().any(|delta| matches!(
+                delta,
+                CodeWorkflowEventKind::CodeUiProjectionDelta {
+                    projection,
+                    payload,
+                    ..
+                } if projection == "thread_graph" && payload.is_null()
+            )),
+            "clearing thread_graph must persist a null v2 projection delta; got {deltas:?}"
+        );
+    }
 
     #[test]
     fn request_user_input_question_to_metadata_projects_browser_wire_fields() {

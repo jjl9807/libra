@@ -134,6 +134,24 @@ export interface CodeUiPatchsetSnapshot {
   changes: Array<{ path: string; changeType: string; diff?: string }>;
   updatedAt: IsoTimestamp;
 }
+export interface CodeUiThreadGraphNode {
+  depth: number;
+  kind: string;
+  id: string;
+  label: string;
+  tags?: string[];
+}
+export interface CodeUiThreadGraph {
+  threadId: string;
+  title?: string;
+  selectedPlanId?: string;
+  activeTaskId?: string;
+  activeRunId?: string;
+  nodes: CodeUiThreadGraphNode[];
+  truncated?: boolean;
+  omittedNodeCount?: number;
+  totalNodeCount?: number;
+}
 
 export interface CodeUiPlanExecutionRepair {
   state:
@@ -167,6 +185,7 @@ export interface CodeUiSessionSnapshot {
   patchsets: CodeUiPatchsetSnapshot[];
   interactions: CodeUiInteractionRequest[];
   planExecutionRepair?: CodeUiPlanExecutionRepair;
+  threadGraph?: CodeUiThreadGraph;
   updatedAt: IsoTimestamp;
 }
 

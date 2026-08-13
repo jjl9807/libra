@@ -37,8 +37,8 @@ use crate::{
             session::{SessionJsonlStore, SessionStore},
             web::code_ui::{
                 CodeUiCapabilities, CodeUiInteractionStatus, CodeUiProviderInfo,
-                CodeUiSessionSnapshot, CodeUiSessionStatus, graph_code_ui_read_model_from_events,
-                initial_snapshot,
+                CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiThreadGraph,
+                CodeUiThreadGraphNode, graph_code_ui_read_model_from_events, initial_snapshot,
             },
         },
         db::establish_connection,
@@ -138,9 +138,13 @@ fn status_for_event_kind(event_kind: &str) -> Option<StatusInfo> {
 /// `docs/development/commands/_general.md` item B.
 pub const GRAPH_EXAMPLES: &str = "\
 EXAMPLES:
-    libra graph <thread-uuid>                          Render the version-graph for a thread ID
+    libra graph <thread-uuid>                          Deprecated TUI; prefer Web Code UI (`libra code`)
     libra graph <thread-uuid> --repo /path/to/repo     Inspect a graph in another Libra repository
     libra graph --json <thread-uuid>                   Structured JSON output for agents";
+
+/// Stderr pin: interactive `libra graph` TUI is deprecated after W4-04.
+/// Passed to [`crate::utils::error::emit_warning`] (which prefixes `warning: `).
+pub const GRAPH_TUI_DEPRECATION_WARNING: &str = "`libra graph` interactive TUI is deprecated; open the thread version graph in Web Code UI (`libra code`) or use `libra graph --json` / `--machine` (interactive entry removed in W5-08)";
 
 /// Command-line arguments for `libra graph`.
 #[derive(Parser, Debug)]
@@ -186,6 +190,7 @@ pub async fn execute_safe(args: GraphArgs, output: &OutputConfig) -> CliResult<(
         return emit_json_data("graph", &graph.to_json(), output);
     }
 
+    crate::utils::error::emit_warning(GRAPH_TUI_DEPRECATION_WARNING);
     run_graph_tui(graph).map_err(|error| {
         CliError::io(format!("failed to run graph TUI: {error}"))
             .with_hint("run this command from an interactive terminal.")
@@ -194,7 +199,26 @@ pub async fn execute_safe(args: GraphArgs, output: &OutputConfig) -> CliResult<(
     Ok(())
 }
 
-async fn load_thread_graph(storage_root: &Path, requested_thread_id: Uuid) -> Result<ThreadGraph> {
+pub(crate) async fn load_thread_graph(
+    storage_root: &Path,
+    requested_thread_id: Uuid,
+) -> Result<ThreadGraph> {
+    load_thread_graph_inner(storage_root, requested_thread_id, true).await
+}
+
+/// Indexed lineage for Web Code UI: no per-object history payloads, node cap.
+pub(crate) async fn load_thread_graph_summary(
+    storage_root: &Path,
+    requested_thread_id: Uuid,
+) -> Result<ThreadGraph> {
+    load_thread_graph_inner(storage_root, requested_thread_id, false).await
+}
+
+async fn load_thread_graph_inner(
+    storage_root: &Path,
+    requested_thread_id: Uuid,
+    include_object_details: bool,
+) -> Result<ThreadGraph> {
     let db_path = storage_root.join(DATABASE);
     let db_path_str = db_path.to_str().ok_or_else(|| {
         anyhow::anyhow!("database path is not valid UTF-8: {}", db_path.display())
@@ -214,8 +238,11 @@ async fn load_thread_graph(storage_root: &Path, requested_thread_id: Uuid) -> Re
     let bundle =
         load_bundle_for_graph(&db_conn, &resolver, &rebuilder, requested_thread_id).await?;
     let rows = load_projection_index_rows(&db_conn, &bundle).await?;
-    let object_details =
-        load_graph_object_details(&history, storage.as_ref(), &bundle, &rows).await;
+    let object_details = if include_object_details {
+        load_graph_object_details(&history, storage.as_ref(), &bundle, &rows).await
+    } else {
+        GraphObjectDetails::default()
+    };
     let mut graph = ThreadGraph::from_projection(bundle, rows, object_details);
     // Overlay lookup must use the resolved canonical thread id: callers may
     // pass an intent UUID that projection remaps to its owning thread.
@@ -487,11 +514,28 @@ async fn load_bundle_for_graph(
         return Ok(bundle);
     }
 
-    bail!(
-        "no thread projection or AI history was found for '{}'",
-        requested_thread_id
-    )
+    Err(anyhow::Error::new(ThreadGraphNotFound {
+        thread_id: requested_thread_id,
+    }))
 }
+
+/// Genuine missing-thread outcome for Code UI `GET /thread-graph`.
+#[derive(Debug)]
+pub(crate) struct ThreadGraphNotFound {
+    pub thread_id: Uuid,
+}
+
+impl std::fmt::Display for ThreadGraphNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no thread projection or AI history was found for '{}'",
+            self.thread_id
+        )
+    }
+}
+
+impl std::error::Error for ThreadGraphNotFound {}
 
 async fn resolve_thread_id_from_intent_index(
     db_conn: &DatabaseConnection,
@@ -617,7 +661,7 @@ async fn load_projection_index_rows(
 }
 
 #[derive(Debug, Clone)]
-struct ThreadGraph {
+pub(crate) struct ThreadGraph {
     thread_id: Uuid,
     title: Option<String>,
     freshness: String,
@@ -685,6 +729,136 @@ impl GraphNodeKind {
             Self::Patchset => "patchset",
         }
     }
+}
+
+/// Hydrate `snapshot.thread_graph` from the indexed lineage at `storage_root`.
+/// Returns whether a graph was attached.
+pub(crate) async fn attach_indexed_thread_graph_at(
+    storage_root: &Path,
+    snapshot: &mut CodeUiSessionSnapshot,
+) -> bool {
+    let Some(thread_id) = snapshot
+        .thread_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+    else {
+        snapshot.thread_graph = None;
+        return false;
+    };
+    match load_thread_graph_summary(storage_root, thread_id).await {
+        Ok(graph) => {
+            snapshot.thread_graph = Some(graph.to_code_ui_thread_graph());
+            true
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                %thread_id,
+                "indexed thread graph unavailable for Code UI snapshot"
+            );
+            snapshot.thread_graph = None;
+            false
+        }
+    }
+}
+
+/// Maximum nodes embedded in a Code UI snapshot/API graph (W4-04).
+pub(crate) const MAX_CODE_UI_THREAD_GRAPH_NODES: usize = 256;
+
+impl ThreadGraph {
+    /// Wire projection for Web Code UI. Includes the indexed
+    /// Intent/Plan/Task/Run/PatchSet lineage, not just scheduler heads.
+    pub(crate) fn to_code_ui_thread_graph(&self) -> CodeUiThreadGraph {
+        let selected_plan_id = self.selected_plan_id.map(|id| id.to_string());
+        let active_task_id = self.active_task_id.map(|id| id.to_string());
+        let active_run_id = self.active_run_id.map(|id| id.to_string());
+        let keep = select_code_ui_thread_graph_indices(
+            &self.lines,
+            selected_plan_id.as_deref(),
+            active_task_id.as_deref(),
+            active_run_id.as_deref(),
+        );
+        let total = self.lines.len();
+        let kept = keep.len();
+        let truncated = kept < total;
+        CodeUiThreadGraph {
+            thread_id: self.thread_id.to_string(),
+            title: self.title.clone(),
+            selected_plan_id,
+            active_task_id,
+            active_run_id,
+            nodes: keep
+                .into_iter()
+                .map(|index| {
+                    let line = &self.lines[index];
+                    CodeUiThreadGraphNode {
+                        depth: line.depth.min(u32::MAX as usize) as u32,
+                        kind: line.kind.history_type().to_string(),
+                        id: line.id.clone(),
+                        label: line.label.clone(),
+                        tags: line.tags.clone(),
+                    }
+                })
+                .collect(),
+            truncated,
+            omitted_node_count: if truncated {
+                u32::try_from(total.saturating_sub(kept)).unwrap_or(u32::MAX)
+            } else {
+                0
+            },
+            total_node_count: if truncated {
+                Some(u32::try_from(total).unwrap_or(u32::MAX))
+            } else {
+                None
+            },
+        }
+    }
+}
+
+fn select_code_ui_thread_graph_indices(
+    lines: &[GraphLine],
+    selected_plan_id: Option<&str>,
+    active_task_id: Option<&str>,
+    active_run_id: Option<&str>,
+) -> BTreeSet<usize> {
+    let total = lines.len();
+    if total <= MAX_CODE_UI_THREAD_GRAPH_NODES {
+        return (0..total).collect();
+    }
+
+    let mut required = Vec::new();
+    let mut tagged = Vec::new();
+    let mut patchsets = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if selected_plan_id == Some(line.id.as_str())
+            || active_task_id == Some(line.id.as_str())
+            || active_run_id == Some(line.id.as_str())
+        {
+            required.push(index);
+        } else if line
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "head" | "selected" | "active" | "current"))
+        {
+            tagged.push(index);
+        } else if line.kind == GraphNodeKind::Patchset {
+            patchsets.push(index);
+        }
+    }
+
+    let mut keep = BTreeSet::new();
+    for index in required
+        .into_iter()
+        .chain(tagged)
+        .chain(patchsets.into_iter().rev())
+        .chain((0..total).rev())
+    {
+        if keep.len() >= MAX_CODE_UI_THREAD_GRAPH_NODES {
+            break;
+        }
+        keep.insert(index);
+    }
+    keep
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3245,6 +3419,236 @@ mod tests {
         app.scroll_details_page_up();
         assert_eq!(app.selected, 1);
         assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn to_code_ui_thread_graph_includes_completed_lineage_and_patchsets() {
+        let graph = ThreadGraph {
+            thread_id: id("11111111-1111-4111-8111-111111111111"),
+            title: Some("Indexed thread".to_string()),
+            freshness: "Fresh".to_string(),
+            thread_version: 2,
+            scheduler_version: 3,
+            updated_at: ts(1),
+            selected_plan_id: Some(id("33333333-3333-4333-8333-333333333333")),
+            active_task_id: Some(id("55555555-5555-4555-8555-555555555555")),
+            active_run_id: Some(id("66666666-6666-4666-8666-666666666666")),
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
+            lines: vec![
+                GraphLine {
+                    depth: 0,
+                    kind: GraphNodeKind::Intent,
+                    id: "22222222-2222-4222-8222-222222222222".to_string(),
+                    label: "Intent 1".to_string(),
+                    tags: vec!["head".to_string()],
+                    detail: Vec::new(),
+                    object: None,
+                },
+                GraphLine {
+                    depth: 1,
+                    kind: GraphNodeKind::Plan,
+                    id: "33333333-3333-4333-8333-333333333333".to_string(),
+                    label: "Plan 1".to_string(),
+                    tags: vec!["selected".to_string()],
+                    detail: Vec::new(),
+                    object: None,
+                },
+                GraphLine {
+                    depth: 2,
+                    kind: GraphNodeKind::Task,
+                    id: "44444444-4444-4444-8444-444444444444".to_string(),
+                    label: "Completed task".to_string(),
+                    tags: vec!["completed".to_string()],
+                    detail: Vec::new(),
+                    object: None,
+                },
+                GraphLine {
+                    depth: 2,
+                    kind: GraphNodeKind::Task,
+                    id: "55555555-5555-4555-8555-555555555555".to_string(),
+                    label: "Active task".to_string(),
+                    tags: vec!["active".to_string()],
+                    detail: Vec::new(),
+                    object: None,
+                },
+                GraphLine {
+                    depth: 3,
+                    kind: GraphNodeKind::Run,
+                    id: "66666666-6666-4666-8666-666666666666".to_string(),
+                    label: "Active run".to_string(),
+                    tags: vec!["active".to_string()],
+                    detail: Vec::new(),
+                    object: None,
+                },
+                GraphLine {
+                    depth: 4,
+                    kind: GraphNodeKind::Patchset,
+                    id: "77777777-7777-4777-8777-777777777777".to_string(),
+                    label: "PatchSet 1".to_string(),
+                    tags: Vec::new(),
+                    detail: Vec::new(),
+                    object: None,
+                },
+            ],
+        };
+
+        let wire = graph.to_code_ui_thread_graph();
+        assert_eq!(wire.thread_id, graph.thread_id.to_string());
+        assert_eq!(wire.title.as_deref(), Some("Indexed thread"));
+        assert_eq!(
+            wire.selected_plan_id.as_deref(),
+            Some("33333333-3333-4333-8333-333333333333")
+        );
+        assert_eq!(wire.nodes.len(), 6);
+        assert!(!wire.truncated);
+        assert_eq!(wire.omitted_node_count, 0);
+        assert_eq!(wire.total_node_count, None);
+        assert!(
+            wire.nodes
+                .iter()
+                .any(|node| node.kind == "task" && node.tags.iter().any(|tag| tag == "completed"))
+        );
+        assert!(
+            wire.nodes
+                .iter()
+                .any(|node| node.kind == "patchset" && node.depth == 4)
+        );
+    }
+
+    #[test]
+    fn to_code_ui_thread_graph_preserves_active_heads_past_the_node_cap() {
+        let selected_plan = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let active_task = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let active_run = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let patchset = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let omitted_id = "omitted-0000".to_string();
+        let extra = 12;
+        let mut lines = Vec::with_capacity(MAX_CODE_UI_THREAD_GRAPH_NODES + extra);
+        for index in 0..MAX_CODE_UI_THREAD_GRAPH_NODES + extra - 4 {
+            lines.push(GraphLine {
+                depth: 1,
+                kind: GraphNodeKind::Plan,
+                id: format!("omitted-{index:04}"),
+                label: format!("Historical plan {index}"),
+                tags: Vec::new(),
+                detail: Vec::new(),
+                object: None,
+            });
+        }
+        lines.push(GraphLine {
+            depth: 1,
+            kind: GraphNodeKind::Plan,
+            id: selected_plan.to_string(),
+            label: "Selected plan".to_string(),
+            tags: vec!["selected".to_string()],
+            detail: Vec::new(),
+            object: None,
+        });
+        lines.push(GraphLine {
+            depth: 2,
+            kind: GraphNodeKind::Task,
+            id: active_task.to_string(),
+            label: "Active task".to_string(),
+            tags: vec!["active".to_string()],
+            detail: Vec::new(),
+            object: None,
+        });
+        lines.push(GraphLine {
+            depth: 3,
+            kind: GraphNodeKind::Run,
+            id: active_run.to_string(),
+            label: "Active run".to_string(),
+            tags: vec!["active".to_string()],
+            detail: Vec::new(),
+            object: None,
+        });
+        lines.push(GraphLine {
+            depth: 4,
+            kind: GraphNodeKind::Patchset,
+            id: patchset.to_string(),
+            label: "Latest patchset".to_string(),
+            tags: Vec::new(),
+            detail: Vec::new(),
+            object: None,
+        });
+
+        let graph = ThreadGraph {
+            thread_id: id("11111111-1111-4111-8111-111111111111"),
+            title: Some("Long thread".to_string()),
+            freshness: "Fresh".to_string(),
+            thread_version: 2,
+            scheduler_version: 3,
+            updated_at: ts(1),
+            selected_plan_id: Some(id(selected_plan)),
+            active_task_id: Some(id(active_task)),
+            active_run_id: Some(id(active_run)),
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
+            lines,
+        };
+
+        let wire = graph.to_code_ui_thread_graph();
+        assert!(wire.truncated);
+        assert_eq!(wire.total_node_count, Some(graph.lines.len() as u32));
+        assert_eq!(
+            wire.omitted_node_count,
+            (graph.lines.len() - wire.nodes.len()) as u32
+        );
+        assert!(wire.nodes.len() <= MAX_CODE_UI_THREAD_GRAPH_NODES);
+        assert!(wire.nodes.iter().any(|node| node.id == selected_plan));
+        assert!(wire.nodes.iter().any(|node| node.id == active_task));
+        assert!(wire.nodes.iter().any(|node| node.id == active_run));
+        assert!(wire.nodes.iter().any(|node| node.id == patchset));
+        assert!(
+            !wire.nodes.iter().any(|node| node.id == omitted_id),
+            "oldest generic lineage past the cap must be omitted, not active heads"
+        );
+    }
+
+    #[test]
+    fn to_code_ui_thread_graph_never_exceeds_node_cap_for_large_head_frontier() {
+        let selected_plan = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut lines = Vec::with_capacity(MAX_CODE_UI_THREAD_GRAPH_NODES + 40);
+        for index in 0..MAX_CODE_UI_THREAD_GRAPH_NODES + 40 {
+            let id = if index == 0 {
+                selected_plan.to_string()
+            } else {
+                format!("head-{index:04}")
+            };
+            lines.push(GraphLine {
+                depth: 0,
+                kind: GraphNodeKind::Intent,
+                id,
+                label: format!("Head intent {index}"),
+                tags: vec!["head".to_string()],
+                detail: Vec::new(),
+                object: None,
+            });
+        }
+
+        let graph = ThreadGraph {
+            thread_id: id("11111111-1111-4111-8111-111111111111"),
+            title: Some("Wide frontier".to_string()),
+            freshness: "Fresh".to_string(),
+            thread_version: 2,
+            scheduler_version: 3,
+            updated_at: ts(1),
+            selected_plan_id: Some(id(selected_plan)),
+            active_task_id: None,
+            active_run_id: None,
+            code_ui_status: None,
+            code_ui_transcript_len: 0,
+            code_ui_pending_interactions: 0,
+            lines,
+        };
+
+        let wire = graph.to_code_ui_thread_graph();
+        assert!(wire.truncated);
+        assert_eq!(wire.nodes.len(), MAX_CODE_UI_THREAD_GRAPH_NODES);
+        assert!(wire.nodes.iter().any(|node| node.id == selected_plan));
     }
 
     #[test]

@@ -64,6 +64,7 @@ The browser only talks to its same-origin server. The Rust side enforces loopbac
 | `/api/repo` | GET | Repository identity (`id`, `name`, `description`). |
 | `/api/repo/status` | GET | Working-tree status — same JSON envelope as `libra status --json` (`{ ok, command: "status", data }`). |
 | `/api/code/session` | GET | Initial `CodeUiSessionSnapshot`. |
+| `/api/code/thread-graph?threadId=` | GET | Indexed Intent/Plan/Task/Run/PatchSet graph for one thread (`threadId` must be a UUID). Loopback observe; 404 `THREAD_GRAPH_NOT_FOUND` when the thread is missing, 500 `THREAD_GRAPH_UNAVAILABLE` / `THREAD_GRAPH_STORAGE_UNAVAILABLE` / `REDACTION_FAILED` on loader or redaction failure. |
 | `/api/code/events` | GET (SSE) | `session_updated` / `status_changed` / `controller_changed` frames; server lag emits a full `session_updated` snapshot, and clients fall back to `GET /api/code/session` on disconnect. |
 | `/api/code/threads?limit&offset` | GET | Active thread projections for the sidebar (`{ items, nextOffset }`). |
 | `/api/code/diagnostics` | GET | Redacted runtime info (PID, ports, log file, controller). |
@@ -94,6 +95,7 @@ web/src/
 │   ├── usage/                 # Usage cumulative / turn / sub-agent (W2-13)
 │   ├── execution-repair/      # Plan execution + repair projection (W2-14)
 │   ├── sse-resilience/        # SSE reconnect / resync banners (W2-15)
+│   ├── thread-graph/          # Indexed thread version graph (W4-04)
 │   └── workflow/              # IntentSpec / Plan / network policy (W2-16)
 └── lib/
     └── code-ui/               # Shared wire types, client, store, controller (W2-07)
@@ -103,6 +105,7 @@ web/src/
         ├── usage/             # W2-12 RuntimeUsageTotals mirror + fixtures (W2-13)
         ├── execution-repair/  # Repair view helpers + fixtures (W2-14)
         ├── sse-resilience/    # Fixture-driven SSE status reducer (W2-15)
+        ├── thread-graph/      # Thread graph view helpers + fixtures (W4-04)
         └── workflow/          # Workflow review helpers + fixtures (W2-16)
 ```
 

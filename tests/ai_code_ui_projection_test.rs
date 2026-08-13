@@ -24,7 +24,8 @@ use libra::internal::ai::{
         code_ui::{
             CodeUiCapabilities, CodeUiInteractionRequest, CodeUiInteractionStatus,
             CodeUiPlanSnapshot, CodeUiProviderInfo, CodeUiSessionSnapshot, CodeUiSessionStatus,
-            CodeUiTranscriptEntry, CodeUiTranscriptEntryKind, graph_code_ui_read_model_from_events,
+            CodeUiThreadGraph, CodeUiThreadGraphNode, CodeUiTranscriptEntry,
+            CodeUiTranscriptEntryKind, graph_code_ui_read_model_from_events,
             snapshot_from_thread_bundle,
         },
         code_ui_projection::{
@@ -168,6 +169,10 @@ fn code_ui_snapshot_uses_projection_thread_identity_and_scheduler_state() {
         snapshot.tasks[0].id,
         bundle.scheduler.active_task_id.unwrap().to_string()
     );
+    assert!(
+        snapshot.thread_graph.is_none(),
+        "scheduler heads must not author an incomplete threadGraph; Web attaches the indexed lineage separately"
+    );
 }
 
 /// Plan snapshots must carry `updated_at` from the scheduler revision,
@@ -276,6 +281,46 @@ fn snapshot_rebuilt_from_event_fold() {
         folded.snapshot.interactions[0].status
     );
     assert_eq!(incremental.plans[0].status, folded.snapshot.plans[0].status);
+}
+
+#[test]
+fn thread_graph_clear_delta_replays_on_durable_fold() {
+    let mut bootstrap = sample_event_fold_bootstrap();
+    bootstrap.thread_id = Some("thread-1".to_string());
+    bootstrap.thread_graph = Some(CodeUiThreadGraph {
+        thread_id: "thread-1".to_string(),
+        title: None,
+        selected_plan_id: Some("plan-1".to_string()),
+        active_task_id: None,
+        active_run_id: None,
+        nodes: vec![CodeUiThreadGraphNode {
+            depth: 1,
+            kind: "plan".to_string(),
+            id: "plan-1".to_string(),
+            label: "Plan 1".to_string(),
+            tags: vec!["selected".to_string()],
+        }],
+        ..Default::default()
+    });
+    let replay = CodeWorkflowReplay {
+        events: vec![workflow_event(
+            1,
+            CodeWorkflowEventKind::CodeUiProjectionDelta {
+                projection: "thread_graph".to_string(),
+                summary: "thread graph cleared".to_string(),
+                payload: serde_json::Value::Null,
+            },
+        )],
+        gaps: Vec::new(),
+        window_cut_mid_record: false,
+    };
+
+    let folded = rebuild_code_ui_read_model_from_events(bootstrap, &replay)
+        .expect("null thread_graph delta must replay");
+    assert!(
+        folded.snapshot.thread_graph.is_none(),
+        "durable fold must clear thread_graph on a null projection payload"
+    );
 }
 
 /// W1-06 regression: graph/history Code-UI-equivalent read paths must call the

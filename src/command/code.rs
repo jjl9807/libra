@@ -2985,7 +2985,7 @@ impl std::fmt::Display for ResumeCodeUiSessionError {
     }
 }
 
-pub fn resume_code_ui_session_to_thread(
+pub async fn resume_code_ui_session_to_thread(
     working_dir: &Path,
     thread_id: &str,
     provider: CodeUiProviderInfo,
@@ -3023,12 +3023,29 @@ pub fn resume_code_ui_session_to_thread(
         thread_id: thread_id.to_string(),
         message,
     })?;
-    fold_code_ui_resume_from_session(&session_store, &session, bootstrap)
+    let mut snapshot = fold_code_ui_resume_from_session(&session_store, &session, bootstrap)
         .map(|fold| fold.snapshot)
         .map_err(|message| ResumeCodeUiSessionError::LoadFailed {
             thread_id: thread_id.to_string(),
             message,
-        })
+        })?;
+    attach_indexed_thread_graph(working_dir, &mut snapshot).await;
+    Ok(snapshot)
+}
+
+/// Hydrate `thread_graph` from the indexed Intent/Plan/Task/Run/PatchSet
+/// lineage (`libra graph`), including completed nodes. Missing storage or an
+/// unparseable thread id leaves the field unset so the Web UI can fall back.
+/// Returns whether a graph was attached.
+pub(crate) async fn attach_indexed_thread_graph(
+    working_dir: &Path,
+    snapshot: &mut CodeUiSessionSnapshot,
+) -> bool {
+    let Some(storage_root) = resolve_storage_root(working_dir) else {
+        snapshot.thread_graph = None;
+        return false;
+    };
+    crate::command::graph::attach_indexed_thread_graph_at(&storage_root, snapshot).await
 }
 
 /// Build a headless Code UI runtime for `--web-only` non-Codex providers.
@@ -3088,7 +3105,8 @@ where
         fold_code_ui_resume_from_session(&session_store, &session_state, bootstrap_snapshot)
             .map_err(CliError::fatal)?;
     let projection_sequence = folded.projection_sequence;
-    let snapshot = folded.snapshot;
+    let mut snapshot = folded.snapshot;
+    attach_indexed_thread_graph(working_dir, &mut snapshot).await;
     let session = CodeUiSession::new(snapshot.clone());
 
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
@@ -3846,7 +3864,8 @@ async fn build_tui_code_ui_runtime(
     .map_err(CliError::fatal)?;
     let folded = fold_code_ui_resume_from_session(session_store, session, bootstrap)
         .map_err(CliError::fatal)?;
-    let snapshot = folded.snapshot;
+    let mut snapshot = folded.snapshot;
+    attach_indexed_thread_graph(Path::new(working_dir), &mut snapshot).await;
 
     let code_ui_session = CodeUiSession::new(snapshot);
     let adapter: Arc<dyn CodeUiProviderAdapter> = if let Some(control_tx) = code_control_tx {
@@ -6366,6 +6385,39 @@ mod tests {
         assert!(
             tui_error.contains("cannot be deserialized"),
             "TUI resume must reject a corrupt durable checkpoint: {tui_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_indexed_thread_graph_skips_without_storage_or_uuid() {
+        let working_dir = tempfile::tempdir().expect("create temporary workspace");
+        let mut snapshot = initial_snapshot(
+            working_dir.path().to_string_lossy().to_string(),
+            CodeUiProviderInfo {
+                provider: "test".to_string(),
+                model: Some("test-model".to_string()),
+                mode: Some("web-headless".to_string()),
+                managed: false,
+            },
+            headless_capabilities(),
+        );
+        snapshot.thread_id = Some("not-a-uuid".to_string());
+        attach_indexed_thread_graph(working_dir.path(), &mut snapshot).await;
+        assert!(
+            snapshot.thread_graph.is_none(),
+            "non-UUID thread ids must not invent a graph"
+        );
+
+        snapshot.thread_id = Some("11111111-1111-4111-8111-111111111111".to_string());
+        snapshot.thread_graph = Some(crate::internal::ai::web::code_ui::CodeUiThreadGraph {
+            thread_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            title: Some("stale checkpoint".to_string()),
+            ..Default::default()
+        });
+        attach_indexed_thread_graph(working_dir.path(), &mut snapshot).await;
+        assert!(
+            snapshot.thread_graph.is_none(),
+            "failed hydration must clear a stale checkpoint graph"
         );
     }
 

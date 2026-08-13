@@ -529,6 +529,7 @@ pub async fn assert_host_posture_non_loopback_contract() -> anyhow::Result<()> {
         .layer(MockConnectInfo(remote));
     for (method, uri) in [
         (Method::GET, "/session"),
+        (Method::GET, "/thread-graph"),
         (Method::GET, "/events"),
         (Method::GET, "/diagnostics"),
         (Method::POST, "/controller/attach"),
@@ -627,6 +628,7 @@ fn api_router() -> Router<WebAppState> {
 fn code_router() -> Router<WebAppState> {
     // Auth layer matrix (matches docs/commands/code.md):
     //   /session          -> loopback only (observe)
+    //   /thread-graph     -> loopback only (observe; indexed Intent/Plan/Task/Run graph)
     //   /events           -> loopback only (observe)
     //   /diagnostics      -> loopback only (observe)
     //   /threads          -> loopback only (observe; lists active thread projections)
@@ -647,6 +649,7 @@ fn code_router() -> Router<WebAppState> {
     // leaking that the runtime is up to a remote caller.
     Router::new()
         .route("/session", get(code_session_handler))
+        .route("/thread-graph", get(code_thread_graph_handler))
         .route("/events", get(code_events_handler))
         .route("/diagnostics", get(code_diagnostics_handler))
         .route("/threads", get(code_threads_handler))
@@ -886,6 +889,68 @@ async fn code_session_handler(
                 retry_after_secs: None,
             },
         )?;
+    Ok(Json(projected))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadGraphRawQuery {
+    thread_id: String,
+}
+
+async fn code_thread_graph_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    State(state): State<WebAppState>,
+    Query(query): Query<ThreadGraphRawQuery>,
+) -> Result<Json<serde_json::Value>, WebApiError> {
+    ensure_loopback_api_request(remote_addr)?;
+    let thread_id = Uuid::parse_str(query.thread_id.trim()).map_err(|error| WebApiError {
+        status: StatusCode::BAD_REQUEST,
+        code: "THREAD_GRAPH_INVALID_ID".to_string(),
+        message: format!("thread-graph expects a canonical thread UUID: {error}"),
+        retry_after_secs: None,
+    })?;
+    let storage_root =
+        resolve_storage_root(state.working_dir.as_path()).ok_or_else(|| WebApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "THREAD_GRAPH_STORAGE_UNAVAILABLE".to_string(),
+            message: "cannot resolve the repository storage root for the thread graph".to_string(),
+            retry_after_secs: None,
+        })?;
+    let graph =
+        match crate::command::graph::load_thread_graph_summary(&storage_root, thread_id).await {
+            Ok(graph) => graph,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::command::graph::ThreadGraphNotFound>()
+                    .is_some() =>
+            {
+                return Err(WebApiError {
+                    status: StatusCode::NOT_FOUND,
+                    code: "THREAD_GRAPH_NOT_FOUND".to_string(),
+                    message: error.to_string(),
+                    retry_after_secs: None,
+                });
+            }
+            Err(error) => {
+                return Err(WebApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "THREAD_GRAPH_UNAVAILABLE".to_string(),
+                    message: format!("indexed thread graph could not be loaded: {error}"),
+                    retry_after_secs: None,
+                });
+            }
+        };
+    let projected = project_json_for_wire(
+        &graph.to_code_ui_thread_graph(),
+        state.secret_redactor.as_ref(),
+    )
+    .map_err(|error| WebApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "REDACTION_FAILED".to_string(),
+        message: format!("failed to redact thread graph for wire projection: {error}"),
+        retry_after_secs: None,
+    })?;
     Ok(Json(projected))
 }
 
@@ -1656,6 +1721,7 @@ async fn code_session_resume_handler(
             live.provider.clone(),
             live.capabilities.clone(),
         )
+        .await
         .map_err(|error| match error {
             ResumeCodeUiSessionError::NotFound { .. } => WebApiError {
                 status: StatusCode::NOT_FOUND,
@@ -2770,6 +2836,226 @@ mod tests {
     /// body ↦ token error-code ordering — a regression that hands
     /// remote callers the runtime-unavailable error first would
     /// leak whether the session is up.
+    fn thread_graph_test_app(working_dir: PathBuf) -> axum::Router {
+        use axum::extract::connect_info::MockConnectInfo;
+        code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(working_dir),
+                code_ui: None,
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))))
+    }
+
+    async fn thread_graph_error_code(app: axum::Router, uri: &str) -> (StatusCode, String) {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let code = value["error"]["code"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        (status, code)
+    }
+
+    #[tokio::test]
+    async fn code_thread_graph_route_rejects_invalid_id_and_unresolved_storage() {
+        let app = thread_graph_test_app(PathBuf::from("/tmp/libra-thread-graph-missing-repo"));
+        let (status, code) =
+            thread_graph_error_code(app.clone(), "/thread-graph?threadId=not-a-uuid").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "THREAD_GRAPH_INVALID_ID");
+
+        let (status, code) = thread_graph_error_code(
+            app,
+            "/thread-graph?threadId=11111111-1111-4111-8111-111111111111",
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "THREAD_GRAPH_STORAGE_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn code_thread_graph_route_rejects_non_loopback() {
+        use axum::extract::connect_info::MockConnectInfo;
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(PathBuf::from("/tmp/libra")),
+                code_ui: None,
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: Arc::new(SecretRedactor::default_runtime()),
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from((
+                Ipv4Addr::new(192, 0, 2, 10),
+                34567,
+            ))));
+        let (status, code) = thread_graph_error_code(
+            app,
+            "/thread-graph?threadId=11111111-1111-4111-8111-111111111111",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(code, "LOOPBACK_REQUIRED");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn code_thread_graph_route_returns_not_found_for_missing_thread() {
+        let temp = tempfile::tempdir().expect("temp repo");
+        crate::utils::test::setup_with_new_libra_in(temp.path()).await;
+        let app = thread_graph_test_app(temp.path().to_path_buf());
+        let (status, code) = thread_graph_error_code(
+            app,
+            "/thread-graph?threadId=11111111-1111-4111-8111-111111111111",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(code, "THREAD_GRAPH_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn code_thread_graph_route_returns_redacted_indexed_graph() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use chrono::{TimeZone, Utc};
+        use git_internal::internal::object::types::ActorRef;
+
+        use crate::{
+            internal::{
+                ai::projection::{
+                    PlanHeadRef, SchedulerState, SchedulerStateRepository, ThreadIntentLinkReason,
+                    ThreadIntentRef, ThreadParticipant, ThreadParticipantRole, ThreadProjection,
+                },
+                db::establish_connection,
+            },
+            utils::util::DATABASE,
+        };
+
+        let secret = "sk-w404-thread-graph-envfile-literal";
+        let temp = tempfile::tempdir().expect("temp repo");
+        crate::utils::test::setup_with_new_libra_in(temp.path()).await;
+        let db_path = temp.path().join(".libra").join(DATABASE);
+        let db = establish_connection(db_path.to_str().expect("utf-8 db path"))
+            .await
+            .expect("open test db");
+        let thread_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").expect("uuid");
+        let intent_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").expect("uuid");
+        let plan_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").expect("uuid");
+        let owner = ActorRef::human("thread-graph-route").expect("actor");
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().expect("ts");
+        ThreadProjection {
+            thread_id,
+            title: Some(format!("Planner thread {secret}")),
+            owner: owner.clone(),
+            participants: vec![ThreadParticipant {
+                actor: owner,
+                role: ThreadParticipantRole::Owner,
+                joined_at: now,
+            }],
+            current_intent_id: Some(intent_id),
+            latest_intent_id: Some(intent_id),
+            intents: vec![ThreadIntentRef {
+                intent_id,
+                ordinal: 0,
+                is_head: true,
+                linked_at: now,
+                link_reason: ThreadIntentLinkReason::Seed,
+            }],
+            metadata: None,
+            archived: false,
+            created_at: now,
+            updated_at: now,
+            version: 1,
+        }
+        .create(&db)
+        .await
+        .expect("create thread projection");
+        SchedulerStateRepository::new(db)
+            .insert_initial(&SchedulerState {
+                thread_id,
+                selected_plan_id: Some(plan_id),
+                selected_plan_ids: vec![PlanHeadRef {
+                    plan_id,
+                    ordinal: 0,
+                }],
+                current_plan_heads: vec![PlanHeadRef {
+                    plan_id,
+                    ordinal: 0,
+                }],
+                active_task_id: None,
+                active_run_id: None,
+                live_context_window: Vec::new(),
+                metadata: None,
+                updated_at: now,
+                version: 1,
+            })
+            .await
+            .expect("insert scheduler state");
+
+        let redactor = Arc::new(
+            SecretRedactor::default_runtime()
+                .with_forbidden_env_values([("OPENAI_API_KEY", secret)]),
+        );
+        let app = code_router()
+            .with_state(WebAppState {
+                working_dir: Arc::new(temp.path().to_path_buf()),
+                code_ui: None,
+                automation_control_token: None,
+                browser_bootstrap_token: None,
+                audit_sink: Arc::new(TracingAuditSink),
+                control_trace_id: Uuid::new_v4(),
+                bound_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 4317)),
+                write_rate_limiter: SessionWriteRateLimiter::from_env_or_default(),
+                secret_redactor: redactor,
+                workflow_hub: None,
+            })
+            .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 1))));
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/thread-graph?threadId={thread_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains(secret),
+            "thread-graph leaked env-file secret: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "thread-graph should redact the title secret: {text}"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["threadId"], thread_id.to_string());
+        assert!(
+            value["nodes"]
+                .as_array()
+                .is_some_and(|nodes| nodes.iter().any(|node| node["kind"] == "intent")),
+            "indexed graph must include the intent node: {value}"
+        );
+    }
+
     #[tokio::test]
     async fn code_session_route_rejects_non_loopback_with_loopback_required() {
         use axum::extract::connect_info::MockConnectInfo;

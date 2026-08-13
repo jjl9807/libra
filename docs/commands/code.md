@@ -21,7 +21,7 @@ The command supports eight AI provider backends (Gemini, OpenAI, Anthropic, Deep
 
 A sandboxed tool-execution layer enforces approval policies that control when the agent can run shell commands, apply patches, web search, or perform other potentially destructive operations. Legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`) and headless Web sessions in the `dev` context default to workspace-write execution with network access denied. After the execution plan is ready, the Plan review dialog offers Execute Plan / Modify Plan / Cancel. Choosing Execute opens a separate mandatory network-policy prompt (`Network: Deny` / `Network: Allow` / `Back`); the choice is applied only after that gate resolves, and both gates are durable across crash/resume. Review and research contexts remain read-only and do not grant network access.
 
-When the legacy TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
+When the legacy TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command. The live version graph is in Web Code UI; `libra graph --json` remains the agent path, and the interactive TUI is deprecated (removed in W5-08). Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
 **Linked worktrees**: `libra code` (every mode) launches from a linked worktree through the W4-06 RequestScope resolver. Security-sensitive files (`sandbox.toml`, `hooks.json`, `config.toml` `[approval]`/`[mcp]`, `rules/`, `contexts/`) and extension/automation surfaces (`agents.toml`, `automations.toml`, `agents/`, `commands/`, `skills/`) keep repository defaults visible. Security overlays may only tighten; extension overlays win on the same name. Unreadable or malformed security config, or a damaged worktree scope, fails closed with a source-layer diagnostic (no file contents). Automation VCS dispatch runs in linked worktrees via the same resolver — see [automation.md](automation.md). Always approvals stored under the canonical `libra.repoid` stay visible across linked worktrees with worktree/session provenance (audit only). Session and one-time approvals stay bound to the issuing controller lease and are dropped on lease takeover, detach, or expiry — including the first remote attach that replaces local TUI control; a new controller must reconfirm. The in-memory approval cache is keyed by `repo:{libra.repoid}` — never a process-global `None` scope.
 
@@ -111,7 +111,7 @@ Selecting `loopback` is rejected when `--host` is not a loopback address, and th
 
 The browser server-side endpoints are tagged in the `code_router()` audit matrix (`src/internal/ai/web/mod.rs`):
 
-- `GET /api/code/session`, `GET /api/code/events`, `GET /api/code/diagnostics`, `GET /api/code/threads`, `GET /api/code/usage`, `GET /api/code/skills`, `GET /api/code/goal/status` — loopback-only observe.
+- `GET /api/code/session`, `GET /api/code/thread-graph?threadId=`, `GET /api/code/events`, `GET /api/code/diagnostics`, `GET /api/code/threads`, `GET /api/code/usage`, `GET /api/code/skills`, `GET /api/code/goal/status` — loopback-only observe.
 - `POST /api/code/controller/attach` — loopback. `kind: "automation"` requests additionally require `X-Libra-Control-Token`. The handler **issues** the lease's `controllerToken` (it does not expect the caller to send one).
 - `POST /api/code/controller/detach`, `POST /api/code/messages`, `POST /api/code/interactions/{id}` — loopback + `X-Code-Controller-Token`; `Automation` leases additionally require `X-Libra-Control-Token`.
 - `POST /api/code/control/cancel` — loopback + `X-Code-Controller-Token`. `Automation` leases also require `X-Libra-Control-Token`; this is the only difference from the TUI `Esc` cancel path.
@@ -255,6 +255,10 @@ Code UI API errors use `{ error: { code, message } }`:
 | `THREAD_LIST_FAILED` | 500 | Thread projection enumeration failed. |
 | `DB_UNAVAILABLE` | 500 | Session database is offline. |
 | `USAGE_UNAVAILABLE` | 500 | Durable runtime usage could not be queried. |
+| `THREAD_GRAPH_INVALID_ID` | 400 | `GET /api/code/thread-graph` received a non-UUID `threadId`. |
+| `THREAD_GRAPH_STORAGE_UNAVAILABLE` | 500 | Repository storage root could not be resolved for the thread graph. |
+| `THREAD_GRAPH_NOT_FOUND` | 404 | No indexed thread projection exists for the requested `threadId`. |
+| `THREAD_GRAPH_UNAVAILABLE` | 500 | Indexed thread graph could not be loaded (database, projection, or overlay failure). |
 | `INVALID_SKILL_PROVIDER` | 400 | The requested skill provider is not an A0-07 agent slug. |
 | `SKILL_NOT_DISCOVERABLE` | 400 | The requested skill is not curated for that provider. |
 | `SKILL_ACTIVATION_UNSUPPORTED` | 422 | Skill is discoverable, but in-process activation is not available yet. |

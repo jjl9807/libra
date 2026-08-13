@@ -1,6 +1,6 @@
 # `libra graph`
 
-以交互式版本图检查 Libra Code 线程。
+检查 Libra Code 线程版本图。
 
 ## 概要
 
@@ -10,7 +10,11 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## 说明
 
-`libra graph` 会为规范 Libra Code 线程打开一个专用 TUI。它读取 `.libra/` 下的 AI 投影表和正式 AI 历史，然后将线程的版本链渲染为由以下节点组成的图：
+当前 thread/version graph 在 Web Code UI（`libra code`）中打开。`libra graph` 仍读取 `.libra/` 下的 AI 投影表和正式 AI 历史。
+
+交互式 TUI **已弃用**（W5-08 删除）。请优先使用 Web Code UI，或 `libra graph --json` / `--machine`。TUI 在 W4 烘焙期内仍可用，并打印弃用警告。
+
+版本链节点包括：
 
 - Intent 修订
 - 执行计划
@@ -50,7 +54,7 @@ libra graph 11111111-1111-4111-8111-111111111111
 |--------|-------------|
 | `--repo <PATH>` | 检查指定 Libra 仓库，而不是从当前目录发现仓库。 |
 
-## TUI 控制
+## TUI 控制（已弃用）
 
 | 按键 | 操作 |
 |-----|--------|
