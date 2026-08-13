@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W6-03, 2026-08-13, v0.19.155)
+
+- **W6-03 uploads `install.sh` / `install.ps1` to the CDN root on tag.**
+  `release.yml` adds `upload-install-scripts` (after the 4-target matrix):
+  fail-closed tag/`Cargo.toml`/installer version gate, refuse older CDN
+  copies, pin+checksum rclone, then `rclone copyto` the tagged scripts to
+  bucket-root `install.sh`/`install.ps1` and verify CDN versions. Binary
+  and Homebrew jobs are unchanged. Takes effect on the next `v*` tag.
+
 ### Added (plan-20260715 W4-05, 2026-08-13, v0.19.154)
 
 - **W4-05 closes user-facing docs to Web-default.** `docs/commands/code.md`

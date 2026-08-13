@@ -176,6 +176,132 @@ jobs:
 
           Write-Output "Upload completed for ${{ matrix.component }}-${{ matrix.target.os }}-${{ matrix.target.arch }}"
 
+  upload-install-scripts:
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+    concurrency:
+      group: libra-release-install-scripts
+      cancel-in-progress: false
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Reject stale installer versions
+        shell: bash
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ ! "$cargo_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Cargo.toml version '$cargo_version' is not major.minor.patch"
+            exit 1
+          fi
+          expected_tag="v${cargo_version}"
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "::error::tag '$GITHUB_REF_NAME' != canonical '$expected_tag'"
+            exit 1
+          fi
+          sh_version="$(awk -F'"' '/^DEFAULT_VERSION=/ { print $2; exit }' install.sh)"
+          ps1_version="$(awk -F'"' -v p="\$DefaultVersion = " 'index($0, p)==1 { print $2; exit }' install.ps1)"
+          if [[ "$sh_version" != "$expected_tag" ]]; then
+            echo "::error::install.sh DEFAULT_VERSION='$sh_version' != '$expected_tag'"
+            exit 1
+          fi
+          if [[ "$ps1_version" != "$expected_tag" ]]; then
+            echo "::error::install.ps1 \$DefaultVersion='$ps1_version' != '$expected_tag'"
+            exit 1
+          fi
+          refuse_older_cdn() {
+            local url="$1"
+            local label="$2"
+            local tmp http current newest
+            tmp="$(mktemp)"
+            if ! http="$(curl -sS -o "$tmp" -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+              -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url")"; then
+              echo "::error::CDN $label lookup failed before upload"
+              exit 1
+            fi
+            if [[ "$http" == "404" ]]; then
+              echo "CDN $label not published yet; allowing bootstrap upload"
+              return 0
+            fi
+            if [[ "$http" != "200" ]]; then
+              echo "::error::CDN $label unexpected HTTP $http"
+              exit 1
+            fi
+            if [[ "$label" == "install.sh" ]]; then
+              current="$(awk -F'"' '/^DEFAULT_VERSION=/ { print $2; exit }' "$tmp")"
+            else
+              current="$(awk -F'"' -v p="\$DefaultVersion = " 'index($0, p)==1 { print $2; exit }' "$tmp")"
+            fi
+            if [[ -z "${current:-}" ]]; then
+              echo "::error::CDN $label HTTP 200 but version missing"
+              exit 1
+            fi
+            newest="$(printf '%s\n%s\n' "$current" "$GITHUB_REF_NAME" | sort -V | tail -n1)"
+            if [[ "$newest" != "$GITHUB_REF_NAME" ]]; then
+              echo "::error::CDN $label already at $current; refusing older $GITHUB_REF_NAME"
+              exit 1
+            fi
+          }
+          refuse_older_cdn "https://download.libra.tools/install.sh" "install.sh"
+          refuse_older_cdn "https://download.libra.tools/install.ps1" "install.ps1"
+
+      - name: Upload install.sh and install.ps1 to R2 root
+        shell: bash
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          RCLONE_CONFIG_R2_ACL: private
+        run: |
+          set -euo pipefail
+          rclone_version="1.75.0"
+          rclone_sha256="aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa"
+          rclone_zip="rclone-v${rclone_version}-linux-amd64.zip"
+          curl -fsSL --connect-timeout 10 --max-time 120 -o "$rclone_zip" \
+            "https://github.com/rclone/rclone/releases/download/v${rclone_version}/${rclone_zip}"
+          echo "${rclone_sha256}  ${rclone_zip}" | sha256sum -c -
+          unzip -q "$rclone_zip"
+          rclone_bin="$PWD/rclone-v${rclone_version}-linux-amd64/rclone"
+          chmod +x "$rclone_bin"
+          "$rclone_bin" copyto ./install.sh "r2:${{ secrets.R2_BUCKET_NAME }}/install.sh" \
+            --header-upload "Cache-Control: public, max-age=15" -v
+          "$rclone_bin" copyto ./install.ps1 "r2:${{ secrets.R2_BUCKET_NAME }}/install.ps1" \
+            --header-upload "Cache-Control: public, max-age=15" -v
+
+      - name: Verify CDN installer versions
+        shell: bash
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          check_cdn() {
+            local url="$1"
+            local needle="$2"
+            local attempt=1
+            while [[ "$attempt" -le 16 ]]; do
+              body="$(curl -fsSL --connect-timeout 10 --max-time 30 \
+                -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url")" || true
+              if printf '%s\n' "$body" | grep -Fq "$needle"; then
+                echo "CDN $url matches $GITHUB_REF_NAME"
+                return 0
+              fi
+              echo "CDN $url not yet at $GITHUB_REF_NAME (attempt $attempt/16)"
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+            echo "::error::CDN $url did not contain $GITHUB_REF_NAME after retries"
+            return 1
+          }
+          check_cdn "https://download.libra.tools/install.sh" "DEFAULT_VERSION=\"${GITHUB_REF_NAME}\""
+          check_cdn "https://download.libra.tools/install.ps1" "\$DefaultVersion = \"${GITHUB_REF_NAME}\""
+
   update-homebrew-tap:
     needs: build-and-upload
     runs-on: ubuntu-latest
