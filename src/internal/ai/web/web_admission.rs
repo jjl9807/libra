@@ -549,6 +549,30 @@ impl WebCodeUiAdmission {
         Ok(())
     }
 
+    /// W4-13: drop persisted tool-approval / user-input prompts after a
+    /// controller lease takeover. Intent/Plan/network-policy gates stay.
+    pub(crate) async fn clear_pending_tool_interactions(
+        &self,
+        session: &Arc<CodeUiSession>,
+    ) -> anyhow::Result<()> {
+        let cleared = session.clear_pending_tool_interactions().await;
+        if cleared == 0 {
+            return Ok(());
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        persistence
+            .persist_snapshot(session.snapshot().await)
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to persist Code UI snapshot after lease-takeover interaction drop: {error}"
+                )
+            })?;
+        Ok(())
+    }
+
     async fn cancel_gated_runtime_turn(
         &self,
         runtime: &AgentRuntimeHandle,

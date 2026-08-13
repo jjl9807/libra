@@ -23,7 +23,7 @@ A sandboxed tool-execution layer enforces approval policies that control when th
 
 When the legacy TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command so the thread's Intent/Plan/Task/Run/PatchSet version graph can be inspected in a separate TUI. Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
-**Linked worktrees**: `libra code` (every mode) still refuses to launch from a linked worktree until W4-08 enablement. Security-sensitive files (`sandbox.toml`, `hooks.json`, `config.toml` `[approval]`/`[mcp]`, `rules/`, `contexts/`) and extension/automation surfaces (`agents.toml`, `automations.toml`, `agents/`, `commands/`, `skills/`) resolve through the W4-06 RequestScope resolver: repository defaults stay visible. Security overlays may only tighten; extension overlays win on the same name. Unreadable or malformed security config fails closed with a source-layer diagnostic (no file contents). Run from the main worktree; the refusal names this remedy. Automation VCS dispatch stays disabled (with a warning) in linked worktrees and `libra automation` fails closed there — see [automation.md](automation.md).
+**Linked worktrees**: `libra code` (every mode) still refuses to launch from a linked worktree until W4-08 enablement. Security-sensitive files (`sandbox.toml`, `hooks.json`, `config.toml` `[approval]`/`[mcp]`, `rules/`, `contexts/`) and extension/automation surfaces (`agents.toml`, `automations.toml`, `agents/`, `commands/`, `skills/`) resolve through the W4-06 RequestScope resolver: repository defaults stay visible. Security overlays may only tighten; extension overlays win on the same name. Unreadable or malformed security config fails closed with a source-layer diagnostic (no file contents). Run from the main worktree; the refusal names this remedy. Automation VCS dispatch stays disabled (with a warning) in linked worktrees and `libra automation` fails closed there — see [automation.md](automation.md). Always approvals stored under the canonical `libra.repoid` stay visible across linked worktrees with worktree/session provenance (audit only). Session and one-time approvals stay bound to the issuing controller lease and are dropped on lease takeover, detach, or expiry — including the first remote attach that replaces local TUI control; a new controller must reconfirm. The in-memory approval cache is keyed by `repo:{libra.repoid}` — never a process-global `None` scope.
 
 ## Options
 
@@ -419,6 +419,8 @@ AI agents executing shell commands on a developer's machine present real safety 
 - `on-failure` lets the agent try sandboxed execution and only asks when it fails.
 - `on-request` (default) sandboxes everything and escalates when the agent or sandbox policy requires it.
 - `untrusted` is the most conservative interactive mode, prompting for anything beyond known-safe reads.
+
+Always approvals already stored in `approved_permission` are keyed by repository identity and remain visible to every worktree of that repository. Session/TTL memos live only in the in-memory cache for the current controller lease and are dropped on lease takeover, detach, or expiry — including when a browser or automation client first takes control from the local TUI.
 
 ### Why session persistence and resume?
 

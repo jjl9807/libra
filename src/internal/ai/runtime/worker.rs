@@ -657,6 +657,12 @@ pub enum RuntimeCommand {
         reason: String,
         reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
     },
+    /// Drop pending tool-approval / user-input interactions after a controller
+    /// lease takeover (W4-13). Intent/Plan/network-policy gates stay parked.
+    DropPendingAfterLeaseTakeover {
+        session_id: String,
+        reply: oneshot::Sender<Result<(), RuntimeWorkerError>>,
+    },
     Observe {
         cursor: EventCursor,
         reply: oneshot::Sender<AgentEventStream>,
@@ -915,6 +921,27 @@ impl AgentRuntimeHandle {
     /// Place the session in [`InteractionState::IndeterminateSideEffect`] so
     /// further admissions fail closed until restart/recovery (or an explicit
     /// future reconcile path).
+    /// Invalidate pending tool-approval / user-input interactions after a
+    /// controller lease takeover. The new controller must reconfirm; durable
+    /// Intent/Plan/network-policy gates are left parked.
+    pub async fn drop_pending_after_lease_takeover(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<(), RuntimeWorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.client
+            .command_tx
+            .send(RuntimeCommand::DropPendingAfterLeaseTakeover {
+                session_id: session_id.into(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| RuntimeWorkerError::WorkerStopped)?;
+        reply_rx
+            .await
+            .map_err(|_| RuntimeWorkerError::ResponseDropped)?
+    }
+
     pub async fn fence_session(
         &self,
         session_id: impl Into<String>,
@@ -1242,6 +1269,10 @@ impl AgentRuntimeWorker {
                         reply,
                     } => {
                         let _ = reply.send(self.fence_session_inner(session_id, reason));
+                    }
+                    RuntimeCommand::DropPendingAfterLeaseTakeover { session_id, reply } => {
+                        let _ =
+                            reply.send(self.drop_pending_after_lease_takeover_inner(session_id));
                     }
                     RuntimeCommand::Observe { cursor, reply } => {
                         let _ = reply.send(self.observe(cursor));
@@ -1903,6 +1934,31 @@ impl AgentRuntimeWorker {
             .ok_or_else(|| RuntimeWorkerError::UnknownSession {
                 session_id: session_id.to_string(),
             })
+    }
+
+    fn drop_pending_after_lease_takeover_inner(
+        &mut self,
+        session_id: String,
+    ) -> Result<(), RuntimeWorkerError> {
+        let Some(session) = self.sessions.get(&session_id) else {
+            return Ok(());
+        };
+        let awaiting_approval = matches!(
+            session.snapshot.interaction,
+            InteractionState::AwaitingToolApproval { .. }
+                | InteractionState::AwaitingUserInput { .. }
+        );
+        let Some(turn_id) = awaiting_approval
+            .then(|| session.snapshot.active_turn_id.clone())
+            .flatten()
+        else {
+            return Ok(());
+        };
+        match self.cancel(session_id, turn_id) {
+            Err(RuntimeWorkerError::UnknownSession { .. })
+            | Err(RuntimeWorkerError::UnknownTurn { .. }) => Ok(()),
+            other => other,
+        }
     }
 
     fn fence_session_inner(

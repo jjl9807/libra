@@ -26,11 +26,13 @@ use super::{
 use crate::internal::ai::{
     agent::runtime::{RuntimeUsageService, RuntimeUsageTotals},
     observed_agents::{IndexedSkillEvent, SkillEventProjection},
+    permission::revoke_session_approval_memos,
     runtime::{
         AgentEventKind, AgentRuntimeHandle, CodeSkillActivation, CodeSkillSearch, EventCursor,
         ExecutionControlService, InteractionResponse, InteractionState, RuntimeCommandDurability,
         RuntimeWorkerError, TurnRequest, runtime_worker_adapter_message,
     },
+    sandbox::ApprovalStore,
     usage::UsageQueryFilter,
 };
 
@@ -72,6 +74,8 @@ pub struct AgentRuntimeCodeUiAdapter {
     /// Held as [`Weak`] so the adapter does not form a retain cycle with the
     /// headless lifecycle host (`Headless` → adapter → host).
     lifecycle_shutdown: Arc<Mutex<Option<Weak<dyn CodeUiLifecycleShutdown>>>>,
+    /// In-memory session/TTL approval cache to drop on lease takeover (W4-13).
+    approval_store: Arc<Mutex<Option<Arc<Mutex<ApprovalStore>>>>>,
 }
 
 impl AgentRuntimeCodeUiAdapter {
@@ -120,7 +124,14 @@ impl AgentRuntimeCodeUiAdapter {
             active_turn: Arc::new(Mutex::new(None)),
             web_admission,
             lifecycle_shutdown: Arc::new(Mutex::new(None)),
+            approval_store: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Bind the runtime ApprovalStore so a controller lease takeover can drop
+    /// session/TTL memos (W4-13). Always rows stay in `approved_permission`.
+    pub async fn set_approval_store(&self, store: Arc<Mutex<ApprovalStore>>) {
+        *self.approval_store.lock().await = Some(store);
     }
 
     /// Attach process shutdown for a web-only mount after the lifecycle host
@@ -435,6 +446,24 @@ impl CodeUiCommandAdapter for AgentRuntimeCodeUiAdapter {
             .and_then(Weak::upgrade);
         if let Some(hook) = hook {
             return hook.shutdown().await;
+        }
+        Ok(())
+    }
+
+    async fn on_controller_lease_takeover(&self) -> Result<()> {
+        if let Some(store) = self.approval_store.lock().await.clone() {
+            revoke_session_approval_memos(&store).await;
+        }
+        self.runtime
+            .drop_pending_after_lease_takeover(&self.runtime_session_id)
+            .await
+            .map_err(Self::map_runtime_error)?;
+        if let Some(admission) = self.web_admission.as_ref() {
+            admission
+                .clear_pending_tool_interactions(&self.session)
+                .await?;
+        } else {
+            self.session.clear_pending_tool_interactions().await;
         }
         Ok(())
     }

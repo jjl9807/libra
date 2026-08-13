@@ -31,7 +31,8 @@
 //!   This file is the persistent projection consumed by the cache policy.
 //! - It does not enforce `Deny` rules; only `Allow` reaches the table.
 //!   Deny is a refusal at prompt time and never persists here.
-//! - Runtime ApprovalStore cache keys / lease takeover stay W4-13.
+//! - Runtime ApprovalStore cache keys / lease takeover are W4-13
+//!   ([`super::runtime_cache`]).
 
 use chrono::Utc;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, FromQueryResult, Statement};
@@ -108,6 +109,14 @@ impl ApprovedRuleset {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+}
+
+/// One Always row plus W4-07 provenance (audit only; not a matching key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovedPermissionRecord {
+    pub permission: String,
+    pub pattern: String,
+    pub provenance: ApprovalProvenance,
 }
 
 /// CRUD helpers for the `approved_permission` table. Stateless — every
@@ -193,6 +202,47 @@ impl ApprovedRulesetStore {
             project_id: project_id.to_string(),
             rules,
         })
+    }
+
+    /// Load Always rows including W4-07 provenance for the canonical identity.
+    pub async fn list_with_provenance(
+        conn: &DatabaseConnection,
+    ) -> Result<Vec<ApprovedPermissionRecord>, ApprovedStoreError> {
+        let identity = Self::ensure_repo_identity(conn).await?;
+        Self::list_with_provenance_for_project_id(conn, identity.as_str())
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Load Always rows including provenance for an explicit `project_id`.
+    pub async fn list_with_provenance_for_project_id(
+        conn: &DatabaseConnection,
+        project_id: &str,
+    ) -> Result<Vec<ApprovedPermissionRecord>, DbErr> {
+        let backend = conn.get_database_backend();
+        let stmt = Statement::from_sql_and_values(
+            backend,
+            "SELECT permission, pattern, source_worktree_id, source_session_id, \
+             source_workspace_id FROM approved_permission \
+             WHERE project_id = ? \
+             ORDER BY created_at ASC, permission ASC, pattern ASC",
+            [project_id.into()],
+        );
+        let rows = ApprovedProvenanceRow::find_by_statement(stmt)
+            .all(conn)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ApprovedPermissionRecord {
+                permission: row.permission,
+                pattern: row.pattern,
+                provenance: ApprovalProvenance {
+                    source_worktree_id: row.source_worktree_id,
+                    source_session_id: row.source_session_id,
+                    source_workspace_id: row.source_workspace_id,
+                },
+            })
+            .collect())
     }
 
     /// Persist one `(permission, pattern)` approval under the canonical
@@ -561,6 +611,15 @@ fn is_unique_violation(error: &DbErr) -> bool {
 struct ApprovedRow {
     permission: String,
     pattern: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ApprovedProvenanceRow {
+    permission: String,
+    pattern: String,
+    source_worktree_id: String,
+    source_session_id: String,
+    source_workspace_id: String,
 }
 
 #[cfg(test)]

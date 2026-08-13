@@ -14,10 +14,12 @@
 //!   joint ruleset (session ∪ project) is just a list concatenation.
 //! - [`disabled`] — pattern=`*` deny pre-filter that produces the set of
 //!   tool names the model should never see in its schema.
-//! - [`ApprovedRuleset`] / [`ApprovedRulesetStore`] (OC-Phase 2 P2.5):
+//! - [`ApprovedRuleset`] / [`ApprovedRulesetStore`] (OC-Phase 2 P2.5 / W4-07):
 //!   persistent projection over the `approved_permission` SQLite table
 //!   that materialises an in-memory [`PermissionRuleset`] of every
 //!   `Always`-reply approval for the active project.
+//! - [`ApprovalRuntimeCache`] (W4-13): repo_id-keyed ApprovalStore scope and
+//!   lease-takeover invalidation of session memos.
 //!
 //! What this module does **not** own:
 //! - The prompt + Reply state machine (`Once` / `Always` / `Reject`)
@@ -34,8 +36,16 @@ pub mod approved;
 pub mod evaluate;
 pub mod inheritance;
 pub mod rule;
+pub mod runtime_cache;
 
-pub use approved::{ApprovalProvenance, ApprovedRuleset, ApprovedRulesetStore, ApprovedStoreError};
+pub use approved::{
+    ApprovalProvenance, ApprovedPermissionRecord, ApprovedRuleset, ApprovedRulesetStore,
+    ApprovedStoreError,
+};
 pub use evaluate::{EDIT_TOOLS, disabled, edit_tools, evaluate, wildcard_match};
 pub use inheritance::{agent_permission_spec_to_ruleset, assert_no_escalation, child_ruleset};
 pub use rule::{PermissionAction, PermissionRule, PermissionRuleset};
+pub use runtime_cache::{
+    ApprovalRuntimeCache, ApprovalRuntimeCacheError, approval_cache_scope_key,
+    resolve_approval_runtime_cache, revoke_session_approval_memos, unbound_approval_cache_scope,
+};

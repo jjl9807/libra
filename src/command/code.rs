@@ -112,6 +112,10 @@ use crate::{
             history::HistoryManager,
             hooks::HookRunner,
             mcp::server::LibraMcpServer,
+            permission::{
+                ApprovalRuntimeCacheError, resolve_approval_runtime_cache,
+                unbound_approval_cache_scope,
+            },
             projection::{ProjectionRebuilder, ProjectionResolver, ThreadBundle},
             prompt::{ContextMode, SystemPromptBuilder},
             providers::{
@@ -126,8 +130,8 @@ use crate::{
                 lifecycle_resource, tool_runtime_context,
             },
             sandbox::{
-                ApprovalCachePolicy, AskForApproval, DEFAULT_APPROVAL_TTL, ExecApprovalRequest,
-                ToolRuntimeContext, load_approval_project_config,
+                ApprovalCachePolicy, ApprovalStore, AskForApproval, DEFAULT_APPROVAL_TTL,
+                ExecApprovalRequest, ToolRuntimeContext, load_approval_project_config,
             },
             session::{SessionJsonlStore, SessionState, SessionStore},
             skills::{SkillDispatcher, load_skills},
@@ -2180,6 +2184,10 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
     // (criterion 2), shared with the headless launch path.
     let approval_cfg =
         tui_approval_config_from_args(&args, registry.working_dir()).map_err(CliError::failure)?;
+    let (approval_cfg, approval_cache_scope) =
+        hydrate_tui_approval_runtime(registry.working_dir(), approval_cfg)
+            .await
+            .map_err(CliError::failure)?;
     let provider_name = format!("{:?}", args.provider).to_lowercase();
     let mut launch_config = TuiLaunchConfig {
         host,
@@ -2200,6 +2208,7 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
         allow_all_commands: approval_cfg.allow_all_commands,
         approval_ttl: approval_cfg.ttl,
         approval_cache_policy: approval_cfg.cache_policy,
+        approval_cache_scope,
         network_access: args.network_access.is_allowed(),
         user_input_rx,
         exec_approval_rx,
@@ -3083,13 +3092,23 @@ where
     let session = CodeUiSession::new(snapshot.clone());
 
     let (user_input_tx, user_input_rx) = mpsc::unbounded_channel::<UserInputRequest>();
+    let approval_cfg =
+        tui_approval_config_from_args(args, working_dir).map_err(CliError::failure)?;
+    let (approval_cfg, approval_cache_scope) =
+        hydrate_tui_approval_runtime(working_dir, approval_cfg)
+            .await
+            .map_err(CliError::failure)?;
     let runtime_context = Some(default_tui_runtime_context(
         working_dir,
         args.context,
-        tui_approval_config_from_args(args, working_dir).map_err(CliError::failure)?,
+        approval_cfg,
         args.network_access.is_allowed(),
         exec_approval_tx,
+        approval_cache_scope,
     ));
+    let approval_store = runtime_context
+        .as_ref()
+        .and_then(|ctx| ctx.approval.as_ref().map(|approval| approval.store.clone()));
 
     let env_file = load_code_env_file(args.env_file.as_deref())?;
     let registry = build_headless_tool_registry(
@@ -3218,6 +3237,9 @@ where
     // W3-03: mount AgentRuntimeCodeUiAdapter as the production write-path owner.
     // HeadlessCodeRuntime remains lifecycle-only (worker, listeners, shutdown).
     let adapter = lifecycle.command_adapter();
+    if let Some(store) = approval_store {
+        adapter.set_approval_store(store).await;
+    }
 
     let automation_write_enabled = args.control == ControlMode::Write;
     let mut runtime_options = CodeUiRuntimeOptions::new(
@@ -3700,6 +3722,7 @@ struct TuiLaunchConfig {
     allow_all_commands: bool,
     approval_ttl: Duration,
     approval_cache_policy: ApprovalCachePolicy,
+    approval_cache_scope: String,
     network_access: bool,
     user_input_rx: tokio::sync::mpsc::UnboundedReceiver<UserInputRequest>,
     exec_approval_rx: tokio::sync::mpsc::UnboundedReceiver<ExecApprovalRequest>,
@@ -3804,6 +3827,7 @@ async fn build_tui_code_ui_runtime(
     automation_write_enabled: bool,
     browser_write_enabled: bool,
     lease_duration_override: Option<chrono::Duration>,
+    approval_store: Option<Arc<tokio::sync::Mutex<ApprovalStore>>>,
 ) -> CliResult<Arc<CodeUiRuntimeHandle>> {
     let capabilities = build_tui_code_ui_capabilities();
     let provider = CodeUiProviderInfo {
@@ -3826,7 +3850,11 @@ async fn build_tui_code_ui_runtime(
 
     let code_ui_session = CodeUiSession::new(snapshot);
     let adapter: Arc<dyn CodeUiProviderAdapter> = if let Some(control_tx) = code_control_tx {
-        TuiCodeUiAdapter::new(code_ui_session, capabilities, control_tx)
+        let adapter = TuiCodeUiAdapter::new(code_ui_session, capabilities, control_tx);
+        if let Some(store) = approval_store {
+            adapter.set_approval_store(store);
+        }
+        adapter
     } else {
         ReadOnlyCodeUiAdapter::new(code_ui_session, capabilities)
     };
@@ -4042,6 +4070,7 @@ where
             },
             params.network_access,
             params.exec_approval_tx.clone(),
+            params.approval_cache_scope.clone(),
         )),
         max_turns: None,
         preserve_reasoning_content: params.preserve_reasoning_content,
@@ -4205,8 +4234,14 @@ where
             let adapter = runtime.adapter();
             let code_ui_session = adapter.session();
             let capabilities = adapter.capabilities();
-            let tui_adapter: Arc<dyn CodeUiProviderAdapter> =
-                TuiCodeUiAdapter::new(code_ui_session, capabilities, control_tx);
+            let tui_adapter = TuiCodeUiAdapter::new(code_ui_session, capabilities, control_tx);
+            if let Some(store) = config
+                .runtime_context
+                .as_ref()
+                .and_then(|ctx| ctx.approval.as_ref().map(|approval| approval.store.clone()))
+            {
+                tui_adapter.set_approval_store(store);
+            }
             let mut runtime_options = CodeUiRuntimeOptions::new(
                 browser_write_enabled,
                 automation_write_enabled,
@@ -4246,6 +4281,10 @@ where
             automation_write_enabled,
             browser_write_enabled,
             code_ui_test_lease_duration_override()?,
+            config
+                .runtime_context
+                .as_ref()
+                .and_then(|ctx| ctx.approval.as_ref().map(|approval| approval.store.clone())),
         )
         .await?
     };
@@ -4924,6 +4963,7 @@ fn default_tui_runtime_context(
     approval: DefaultTuiApprovalConfig,
     network_access: bool,
     exec_approval_tx: tokio::sync::mpsc::UnboundedSender<ExecApprovalRequest>,
+    approval_cache_scope: impl Into<String>,
 ) -> ToolRuntimeContext {
     let sandbox_profile = match context {
         Some(CodeContext::Review | CodeContext::Research) => CodeAgentSandboxProfile::ReadOnly,
@@ -4939,7 +4979,24 @@ fn default_tui_runtime_context(
             cache_policy: approval.cache_policy,
         },
         exec_approval_tx,
+        approval_cache_scope,
     )
+}
+
+async fn hydrate_tui_approval_runtime(
+    working_dir: &Path,
+    mut approval: DefaultTuiApprovalConfig,
+) -> Result<(DefaultTuiApprovalConfig, String), String> {
+    match resolve_approval_runtime_cache(working_dir).await {
+        Ok(cache) => {
+            approval.cache_policy.approved_ruleset = Some(cache.approved_ruleset);
+            Ok((approval, cache.scope_key))
+        }
+        Err(ApprovalRuntimeCacheError::NotARepository(_)) => {
+            Ok((approval, unbound_approval_cache_scope(working_dir)))
+        }
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Single source of truth for the approval-related CLI-args -> runtime
@@ -7568,6 +7625,7 @@ no_cache_unknown_network = true
             false,
             false,
             None,
+            None,
         )
         .await
         .expect("build TUI runtime from projection bundle");
@@ -7632,6 +7690,7 @@ no_cache_unknown_network = true
             },
             false,
             tx,
+            "repo:test-tui-runtime",
         );
 
         let sandbox = runtime.sandbox.expect("sandbox context should be present");
@@ -7659,6 +7718,7 @@ no_cache_unknown_network = true
             },
             true,
             tx,
+            "repo:test-tui-runtime",
         );
 
         let sandbox = runtime.sandbox.expect("sandbox context should be present");
@@ -7686,12 +7746,23 @@ no_cache_unknown_network = true
             },
             true,
             tx,
+            "repo:test-tui-runtime",
         );
 
         let approval = runtime
             .approval
             .expect("approval context should be present");
-        assert!(approval.store.lock().await.allow_all_commands());
+        assert_eq!(
+            approval.scope_key_prefix.as_deref(),
+            Some("repo:test-tui-runtime")
+        );
+        assert!(
+            approval
+                .store
+                .lock()
+                .await
+                .allow_all_commands_for_scope("repo:test-tui-runtime")
+        );
     }
 
     #[test]
@@ -7709,6 +7780,7 @@ no_cache_unknown_network = true
                 },
                 true,
                 tx,
+                "repo:test-tui-runtime",
             );
 
             let sandbox = runtime.sandbox.expect("sandbox context should be present");
@@ -7751,6 +7823,7 @@ no_cache_unknown_network = true
             tui_approval_config_from_args(&args, workspace.path()).expect("approval config"),
             args.network_access.is_allowed(),
             tx,
+            "repo:test-tui-runtime",
         );
 
         let approval = runtime

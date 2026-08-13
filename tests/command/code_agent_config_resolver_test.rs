@@ -1026,8 +1026,7 @@ fn code_agent_config_resolves_repository_layer_in_linked() {
     )
     .expect("overlay shared skill");
 
-    let overlay_agents_cfg =
-        AgentsConfig::load_from_working_dir(&wt).expect("overlay agents.toml");
+    let overlay_agents_cfg = AgentsConfig::load_from_working_dir(&wt).expect("overlay agents.toml");
     assert!(
         !overlay_agents_cfg.multi_agent.enabled,
         "extension overlay must win on agents.toml"
@@ -1076,7 +1075,9 @@ fn code_agent_config_resolves_repository_layer_in_linked() {
         "same-name command overlay must win"
     );
     assert!(
-        overlay_cmds.iter().any(|command| command.name == "repo_cmd"),
+        overlay_cmds
+            .iter()
+            .any(|command| command.name == "repo_cmd"),
         "repository-only command must remain visible beside overlay"
     );
 

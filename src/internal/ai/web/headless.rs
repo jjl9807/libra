@@ -2237,6 +2237,10 @@ where
         self.runtime_bridge.cancel_turn().await
     }
 
+    async fn on_controller_lease_takeover(&self) -> anyhow::Result<()> {
+        self.runtime_bridge.on_controller_lease_takeover().await
+    }
+
     async fn task_dispatch(&self, agent: String, prompt: String) -> anyhow::Result<String> {
         self.runtime_bridge.task_dispatch(agent, prompt).await
     }

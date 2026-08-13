@@ -665,6 +665,45 @@ impl CodeUiSession {
         .await;
     }
 
+    /// Drop pending tool-approval / user-input prompts after a lease takeover.
+    /// Intent/Plan/network-policy interactions stay parked.
+    pub async fn clear_pending_tool_interactions(&self) -> usize {
+        let snapshot = self.snapshot().await;
+        let pending: Vec<String> = snapshot
+            .interactions
+            .iter()
+            .filter(|interaction| {
+                interaction.status == CodeUiInteractionStatus::Pending
+                    && matches!(
+                        interaction.kind,
+                        CodeUiInteractionKind::Approval
+                            | CodeUiInteractionKind::SandboxApproval
+                            | CodeUiInteractionKind::RequestUserInput
+                    )
+            })
+            .map(|interaction| interaction.id.clone())
+            .collect();
+        let count = pending.len();
+        for id in pending {
+            self.clear_interaction(&id).await;
+        }
+        if count > 0 {
+            let still_awaiting = self
+                .snapshot()
+                .await
+                .interactions
+                .iter()
+                .any(|interaction| interaction.status == CodeUiInteractionStatus::Pending);
+            self.set_status(if still_awaiting {
+                CodeUiSessionStatus::AwaitingInteraction
+            } else {
+                CodeUiSessionStatus::Idle
+            })
+            .await;
+        }
+        count
+    }
+
     pub async fn set_plan_execution_repair(&self, repair: Option<PlanExecutionRepairState>) {
         self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
             snapshot.plan_execution_repair = repair;
@@ -840,6 +879,12 @@ pub trait CodeUiCommandAdapter: Send + Sync {
     }
 
     async fn shutdown(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// W4-13: drop session approval memos and pending tool-approval /
+    /// user-input interactions after a controller lease takeover.
+    async fn on_controller_lease_takeover(&self) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -1018,6 +1063,7 @@ impl CodeUiRuntimeHandle {
     }
 
     pub async fn snapshot(&self) -> CodeUiSessionSnapshot {
+        self.sync_controller_snapshot().await;
         self.adapter.snapshot().await
     }
 
@@ -1075,11 +1121,24 @@ impl CodeUiRuntimeHandle {
         kind: CodeUiControllerKind,
         client_id: &str,
     ) -> Result<CodeUiControllerAttachResponse, CodeUiApiError> {
-        let lease = self
+        let (lease, is_takeover) = self
             .controller_service
-            .attach(kind, client_id)
+            .attach_with_takeover(kind, client_id)
             .await
             .map_err(CodeUiApiError::from_controller_service)?;
+        let pending_expiry = self
+            .controller_service
+            .take_pending_approval_invalidation()
+            .await;
+        if (is_takeover || pending_expiry)
+            && let Err(error) = self.adapter.on_controller_lease_takeover().await
+        {
+            let _ = self
+                .controller_service
+                .detach(kind, client_id, &lease.token)
+                .await;
+            return Err(CodeUiApiError::unsupported_from_error(error));
+        }
         self.sync_controller_snapshot().await;
 
         Ok(CodeUiControllerAttachResponse {
@@ -1112,10 +1171,14 @@ impl CodeUiRuntimeHandle {
         client_id: &str,
         token: &str,
     ) -> Result<(), CodeUiApiError> {
-        self.controller_service
+        let released = self
+            .controller_service
             .detach(kind, client_id, token)
             .await
             .map_err(CodeUiApiError::from_controller_service)?;
+        if released && let Err(error) = self.adapter.on_controller_lease_takeover().await {
+            return Err(CodeUiApiError::unsupported_from_error(error));
+        }
         self.sync_controller_snapshot().await;
         Ok(())
     }
@@ -1349,10 +1412,14 @@ impl CodeUiRuntimeHandle {
     }
 
     pub async fn reclaim_local_tui_controller(&self) -> Result<(), CodeUiApiError> {
-        self.controller_service
+        let had_remote_lease = self
+            .controller_service
             .reclaim_local_tui()
             .await
             .map_err(CodeUiApiError::from_controller_service)?;
+        if had_remote_lease && let Err(error) = self.adapter.on_controller_lease_takeover().await {
+            return Err(CodeUiApiError::unsupported_from_error(error));
+        }
         self.sync_controller_snapshot().await;
         Ok(())
     }
@@ -1373,6 +1440,17 @@ impl CodeUiRuntimeHandle {
     }
 
     async fn sync_controller_snapshot(&self) {
+        if self
+            .controller_service
+            .take_pending_approval_invalidation()
+            .await
+            && let Err(error) = self.adapter.on_controller_lease_takeover().await
+        {
+            tracing::error!(
+                error = %error,
+                "failed to drop session approvals after controller lease expiry"
+            );
+        }
         let controller = self.code_ui_controller_state().await;
         self.adapter
             .session()
@@ -2165,6 +2243,7 @@ mod tests {
     struct RecordingCodeUiAdapter {
         session: Arc<CodeUiSession>,
         submitted_messages: Arc<Mutex<Vec<String>>>,
+        takeovers: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl RecordingCodeUiAdapter {
@@ -2172,11 +2251,16 @@ mod tests {
             Arc::new(Self {
                 session,
                 submitted_messages: Arc::new(Mutex::new(Vec::new())),
+                takeovers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
         }
 
         async fn submitted_messages(&self) -> Vec<String> {
             self.submitted_messages.lock().await.clone()
+        }
+
+        fn takeover_count(&self) -> usize {
+            self.takeovers.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -2207,6 +2291,12 @@ mod tests {
             _interaction_id: &str,
             _response: CodeUiInteractionResponse,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_controller_lease_takeover(&self) -> anyhow::Result<()> {
+            self.takeovers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2288,6 +2378,102 @@ mod tests {
             .expect_err("stale token must not keep write access");
         assert_eq!(stale_error.status, 403);
         assert_eq!(stale_error.code, "INVALID_CONTROLLER_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn expired_browser_controller_lease_invokes_takeover_hook() {
+        let session = test_session();
+        let adapter = RecordingCodeUiAdapter::new(session.clone());
+        let mut options =
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
+        options.lease_duration = Some(Duration::milliseconds(1));
+        let runtime = CodeUiRuntimeHandle::build_with_options(adapter.clone(), options).await;
+
+        runtime
+            .attach_browser_controller("browser-a")
+            .await
+            .expect("browser controller should attach");
+        assert_eq!(
+            adapter.takeover_count(),
+            0,
+            "initial claim is not a takeover"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        runtime
+            .attach_browser_controller("browser-b")
+            .await
+            .expect("expired lease should not block a new browser");
+        assert_eq!(
+            adapter.takeover_count(),
+            1,
+            "production attach must invoke takeover handling"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_controller_invokes_takeover_hook() {
+        let adapter = RecordingCodeUiAdapter::new(test_session());
+        let runtime = CodeUiRuntimeHandle::build_with_control(
+            adapter.clone(),
+            true,
+            false,
+            CodeUiInitialController::LocalTui {
+                owner_label: "Terminal UI".to_string(),
+                reason: Some("Local TUI owns this session".to_string()),
+            },
+        )
+        .await;
+
+        let attach = runtime
+            .attach_browser_controller("browser-a")
+            .await
+            .expect("browser should attach");
+        assert_eq!(
+            adapter.takeover_count(),
+            1,
+            "TUI to remote attach is a takeover"
+        );
+
+        runtime
+            .detach_browser_controller("browser-a", &attach.controller_token)
+            .await
+            .expect("browser should detach");
+        assert_eq!(
+            adapter.takeover_count(),
+            2,
+            "detach must drop remote session approvals before TUI resumes"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_remote_lease_invokes_takeover_hook_on_snapshot() {
+        let adapter = RecordingCodeUiAdapter::new(test_session());
+        let mut options = CodeUiRuntimeOptions::new(
+            true,
+            false,
+            CodeUiInitialController::LocalTui {
+                owner_label: "Terminal UI".to_string(),
+                reason: Some("Local TUI owns this session".to_string()),
+            },
+        );
+        options.lease_duration = Some(Duration::milliseconds(1));
+        let runtime = CodeUiRuntimeHandle::build_with_options(adapter.clone(), options).await;
+
+        runtime
+            .attach_browser_controller("browser-a")
+            .await
+            .expect("browser should attach");
+        assert_eq!(adapter.takeover_count(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.controller.kind, CodeUiControllerKind::Tui);
+        assert_eq!(
+            adapter.takeover_count(),
+            2,
+            "expiry must drop remote session approvals before local TUI resumes"
+        );
     }
 
     #[tokio::test]
@@ -2459,8 +2645,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_tui_owner_allows_automation_takeover_and_reclaim() {
+        let adapter = RecordingCodeUiAdapter::new(test_session());
         let runtime = CodeUiRuntimeHandle::build_with_control(
-            ReadOnlyCodeUiAdapter::new(test_session(), CodeUiCapabilities::default()),
+            adapter.clone(),
             false,
             true,
             CodeUiInitialController::LocalTui {
@@ -2480,6 +2667,11 @@ mod tests {
             .expect("automation should attach");
         assert_eq!(attach.controller.kind, CodeUiControllerKind::Automation);
         assert!(attach.controller.can_write);
+        assert_eq!(
+            adapter.takeover_count(),
+            1,
+            "first remote attach from local TUI must invalidate TUI-issued approvals"
+        );
 
         let lease = runtime
             .ensure_controller_write_access(Some(&attach.controller_token))
@@ -2491,6 +2683,20 @@ mod tests {
             .reclaim_local_tui_controller()
             .await
             .expect("local TUI should reclaim controller");
+        assert_eq!(
+            adapter.takeover_count(),
+            2,
+            "reclaim must invalidate prior-controller approvals"
+        );
+        runtime
+            .reclaim_local_tui_controller()
+            .await
+            .expect("redundant reclaim should succeed");
+        assert_eq!(
+            adapter.takeover_count(),
+            2,
+            "redundant reclaim must not drop current-controller approvals"
+        );
 
         let reclaimed = runtime.snapshot().await;
         assert_eq!(reclaimed.controller.kind, CodeUiControllerKind::Tui);

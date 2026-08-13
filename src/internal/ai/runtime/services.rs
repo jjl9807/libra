@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::{SecretRedactor, ToolBoundaryRuntime, TracingAuditSink};
 use crate::internal::ai::{
     mcp::server::LibraMcpServer,
+    permission::unbound_approval_cache_scope,
     sandbox::{
         ApprovalCachePolicy, ApprovalStore, AskForApproval, ExecApprovalRequest, NetworkAccess,
         SandboxPermissions, SandboxPolicy, ToolApprovalContext, ToolRuntimeContext,
@@ -224,11 +225,16 @@ pub struct CodeAgentApprovalConfig {
 
 /// Construct the sole sandbox/approval context used by both interactive and
 /// headless Code launches.
+///
+/// `approval_cache_scope` must be a non-empty explicit key (W4-13:
+/// `repo:{libra.repoid}`). An empty value is rewritten to an unbound
+/// per-workdir scope so the runtime never forms a global `None` cache.
 pub fn tool_runtime_context(
     working_dir: &Path,
     sandbox_profile: CodeAgentSandboxProfile,
     approval: CodeAgentApprovalConfig,
     exec_approval_tx: mpsc::UnboundedSender<ExecApprovalRequest>,
+    approval_cache_scope: impl Into<String>,
 ) -> ToolRuntimeContext {
     let policy = match sandbox_profile {
         CodeAgentSandboxProfile::WorkspaceWrite { network_access } => {
@@ -243,9 +249,18 @@ pub fn tool_runtime_context(
         CodeAgentSandboxProfile::ReadOnly => SandboxPolicy::ReadOnly,
     };
 
+    let approval_cache_scope = {
+        let scope = approval_cache_scope.into();
+        if scope.trim().is_empty() {
+            unbound_approval_cache_scope(working_dir)
+        } else {
+            scope
+        }
+    };
+
     let mut approval_store = ApprovalStore::default();
     if approval.allow_all_commands {
-        approval_store.approve_all_commands();
+        approval_store.approve_all_commands_for_scope(&approval_cache_scope);
     }
 
     ToolRuntimeContext {
@@ -258,7 +273,7 @@ pub fn tool_runtime_context(
             policy: approval.policy,
             request_tx: exec_approval_tx,
             store: Arc::new(tokio::sync::Mutex::new(approval_store)),
-            scope_key_prefix: None,
+            scope_key_prefix: Some(approval_cache_scope),
             approval_ttl: approval.ttl,
             cache_policy: approval.cache_policy,
         }),
@@ -305,6 +320,7 @@ mod tests {
                 cache_policy: ApprovalCachePolicy::default(),
             },
             approval_tx,
+            "repo:test-runtime-context",
         );
 
         assert!(matches!(
@@ -316,6 +332,16 @@ mod tests {
         ));
         let approval = context.approval.expect("approval context");
         assert_eq!(approval.policy, AskForApproval::UnlessTrusted);
-        assert!(approval.store.lock().await.allow_all_commands());
+        assert_eq!(
+            approval.scope_key_prefix.as_deref(),
+            Some("repo:test-runtime-context")
+        );
+        assert!(
+            approval
+                .store
+                .lock()
+                .await
+                .allow_all_commands_for_scope("repo:test-runtime-context")
+        );
     }
 }

@@ -17,12 +17,16 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, anyhow};
 use async_trait::async_trait;
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::{Mutex, mpsc::UnboundedSender, oneshot};
 
 use super::control::{TuiControlCommand, TuiControlError};
-use crate::internal::ai::web::code_ui::{
-    CodeUiCapabilities, CodeUiCommandAdapter, CodeUiInteractionResponse, CodeUiInteractionStatus,
-    CodeUiReadModel, CodeUiSession,
+use crate::internal::ai::{
+    permission::revoke_session_approval_memos,
+    sandbox::ApprovalStore,
+    web::code_ui::{
+        CodeUiCapabilities, CodeUiCommandAdapter, CodeUiInteractionResponse,
+        CodeUiInteractionStatus, CodeUiReadModel, CodeUiSession,
+    },
 };
 
 const TUI_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,6 +36,7 @@ pub struct TuiCodeUiAdapter {
     session: Arc<CodeUiSession>,
     capabilities: CodeUiCapabilities,
     control_tx: UnboundedSender<TuiControlCommand>,
+    approval_store: Arc<std::sync::Mutex<Option<Arc<Mutex<ApprovalStore>>>>>,
 }
 
 impl TuiCodeUiAdapter {
@@ -44,7 +49,17 @@ impl TuiCodeUiAdapter {
             session,
             capabilities,
             control_tx,
+            approval_store: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Bind the runtime ApprovalStore so lease takeover can drop session/TTL
+    /// memos (W4-13). Always rows stay in `approved_permission`.
+    pub fn set_approval_store(&self, store: Arc<Mutex<ApprovalStore>>) {
+        match self.approval_store.lock() {
+            Ok(mut slot) => *slot = Some(store),
+            Err(poisoned) => *poisoned.into_inner() = Some(store),
+        }
     }
 
     async fn wait_for_ack(
@@ -149,6 +164,24 @@ impl CodeUiCommandAdapter for TuiCodeUiAdapter {
             .map_err(|_| anyhow!("TUI control channel is closed"))?;
         Self::wait_for_typed_ack(ack_rx).await
     }
+
+    async fn on_controller_lease_takeover(&self) -> anyhow::Result<()> {
+        let store = match self.approval_store.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(store) = store {
+            revoke_session_approval_memos(&store).await;
+        }
+        // Queue pending-interaction drop on the App loop. Do not wait for the
+        // ack: reclaim runs *on* that loop, so blocking here would deadlock.
+        // Unbounded FIFO still drops pending before any later respond/submit.
+        let (ack, _ack_rx) = oneshot::channel();
+        self.control_tx
+            .send(TuiControlCommand::DropPendingAfterLeaseTakeover { ack })
+            .map_err(|_| anyhow!("TUI control channel is closed"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +233,24 @@ mod tests {
             requested_at: Utc::now(),
             resolved_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn lease_takeover_queues_pending_drop_without_blocking() {
+        let (adapter, mut rx) = test_adapter();
+        adapter
+            .on_controller_lease_takeover()
+            .await
+            .expect("takeover should queue without waiting for ack");
+
+        match rx
+            .try_recv()
+            .expect("drop-pending command should be queued")
+        {
+            TuiControlCommand::DropPendingAfterLeaseTakeover { .. } => {}
+            _ => panic!("unexpected command — expected DropPendingAfterLeaseTakeover"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

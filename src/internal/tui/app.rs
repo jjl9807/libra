@@ -101,6 +101,7 @@ use crate::{
                 TaskRuntimeNoteLevel, TaskRuntimePhase, TaskWorkspaceBackend,
             },
         },
+        permission::revoke_session_approval_memos,
         projection::ProjectionRebuilder,
         prompt::SystemPromptBuilder,
         runtime::{
@@ -3897,6 +3898,10 @@ where
                 let result = self.cancel_current_turn(CancelSource::Automation).await;
                 let _ = ack.send(result);
             }
+            TuiControlCommand::DropPendingAfterLeaseTakeover { ack } => {
+                self.drop_pending_after_lease_takeover().await;
+                let _ = ack.send(Ok(()));
+            }
             TuiControlCommand::TaskDispatch { agent, prompt, ack } => {
                 let result = self.task_dispatch_from_control(agent, prompt).await;
                 let _ = ack.send(result);
@@ -4269,6 +4274,35 @@ where
         self.sync_mux_input_context();
         self.schedule_draw();
         Ok(message)
+    }
+
+    async fn drop_pending_after_lease_takeover(&mut self) {
+        // Runtime owns the oneshot continuation (`TuiInteractionDelivery`).
+        // Clear that before TUI render state, or the turn stays parked in
+        // AwaitingToolApproval / AwaitingUserInput with no prompt to reconfirm.
+        if let Some(runtime) = self.local_turn_runtime.clone()
+            && let Err(error) = runtime
+                .drop_pending_after_lease_takeover(self.session.id.clone())
+                .await
+        {
+            tracing::warn!(
+                error = %error,
+                session_id = %self.session.id,
+                "failed to drop pending local-runtime interactions after lease takeover"
+            );
+        }
+        self.cancel_pending_user_input();
+        self.cancel_pending_exec_approval();
+        if let Some(store) = self
+            .config
+            .runtime_context
+            .as_ref()
+            .and_then(|ctx| ctx.approval.as_ref().map(|approval| approval.store.clone()))
+        {
+            revoke_session_approval_memos(&store).await;
+        }
+        self.sync_mux_input_context();
+        self.schedule_draw();
     }
 
     async fn automation_controller_active(&self) -> bool {

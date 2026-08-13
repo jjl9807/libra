@@ -91,6 +91,12 @@ struct ControllerRuntimeState {
     fixed: Option<FixedController>,
     local_tui_owner: Option<FixedController>,
     active_lease: Option<ControllerLease>,
+    /// True once any remote lease has been minted. Subsequent attaches after
+    /// expiry/reclaim/detach are takeovers (W4-13).
+    ever_had_remote_lease: bool,
+    /// Set when a remote lease expires so callers can drop session memos
+    /// before local control resumes (W4-13).
+    pending_approval_invalidation: bool,
 }
 
 /// Runtime configuration for [`ControllerService`].
@@ -233,6 +239,8 @@ impl ControllerService {
                 fixed,
                 local_tui_owner,
                 active_lease: None,
+                ever_had_remote_lease: false,
+                pending_approval_invalidation: false,
             })),
             browser_write_enabled: options.browser_write_enabled,
             automation_write_enabled: options.automation_write_enabled,
@@ -247,6 +255,18 @@ impl ControllerService {
         kind: ControllerKind,
         client_id: &str,
     ) -> Result<ControllerLease, ControllerServiceError> {
+        Ok(self.attach_with_takeover(kind, client_id).await?.0)
+    }
+
+    /// Like [`Self::attach`], but reports whether this mint is a lease
+    /// takeover: a prior remote lease expired, was reclaimed, or was detached,
+    /// or this attach replaces an active local TUI owner. Renewals of the same
+    /// client are not takeovers.
+    pub async fn attach_with_takeover(
+        &self,
+        kind: ControllerKind,
+        client_id: &str,
+    ) -> Result<(ControllerLease, bool), ControllerServiceError> {
         match kind {
             ControllerKind::Browser if !self.browser_write_enabled => {
                 return Err(ControllerServiceError::BrowserControlDisabled);
@@ -276,9 +296,10 @@ impl ControllerService {
                 )));
             }
             existing.expires_at = Utc::now() + self.lease_duration;
-            return Ok(existing.clone());
+            return Ok((existing.clone(), false));
         }
 
+        let is_takeover = state.ever_had_remote_lease || state.local_tui_owner.is_some();
         let lease = ControllerLease {
             kind,
             client_id: client_id.to_string(),
@@ -287,21 +308,25 @@ impl ControllerService {
             expires_at: Utc::now() + self.lease_duration,
         };
         state.active_lease = Some(lease.clone());
-        Ok(lease)
+        state.ever_had_remote_lease = true;
+        Ok((lease, is_takeover))
     }
 
     /// Release a lease.  A no-longer-active lease is already released and is
     /// deliberately idempotent; a mismatched active lease fails closed.
+    ///
+    /// Returns whether an active lease was actually released so callers can
+    /// drop prior-controller session approvals.
     pub async fn detach(
         &self,
         kind: ControllerKind,
         client_id: &str,
         token: &str,
-    ) -> Result<(), ControllerServiceError> {
+    ) -> Result<bool, ControllerServiceError> {
         let mut state = self.state.lock().await;
         Self::clear_expired_lease(&mut state, Utc::now());
         let Some(existing) = state.active_lease.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         if existing.kind != kind {
             return Err(ControllerServiceError::Conflict(
@@ -312,7 +337,19 @@ impl ControllerService {
             return Err(ControllerServiceError::InvalidToken);
         }
         state.active_lease = None;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Expire a stale remote lease (if any) and take the one-shot approval
+    /// invalidation signal. Callers must drop session/TTL memos when this
+    /// returns true so local control cannot reuse the prior controller's
+    /// approvals.
+    pub async fn take_pending_approval_invalidation(&self) -> bool {
+        let mut state = self.state.lock().await;
+        Self::clear_expired_lease(&mut state, Utc::now());
+        let pending = state.pending_approval_invalidation;
+        state.pending_approval_invalidation = false;
+        pending
     }
 
     /// Check a controller token and renew the lease without retaining the
@@ -365,15 +402,19 @@ impl ControllerService {
 
     /// Local TUI reclaim is deliberately scoped to sessions that were started
     /// with a local TUI owner.  Other callers cannot force-clear a lease.
-    pub async fn reclaim_local_tui(&self) -> Result<(), ControllerServiceError> {
+    ///
+    /// Returns whether a remote lease was actually cleared so callers can
+    /// invalidate prior-controller approvals only after a real takeover.
+    pub async fn reclaim_local_tui(&self) -> Result<bool, ControllerServiceError> {
         let mut state = self.state.lock().await;
         if state.local_tui_owner.is_none() {
             return Err(ControllerServiceError::Conflict(
                 "This session does not have a local TUI controller to reclaim".to_string(),
             ));
         }
+        let had_remote_lease = state.active_lease.is_some();
         state.active_lease = None;
-        Ok(())
+        Ok(had_remote_lease)
     }
 
     /// Process-level shutdown release. Clears any active remote/local lease so
@@ -383,14 +424,17 @@ impl ControllerService {
         state.active_lease = None;
     }
 
-    fn clear_expired_lease(state: &mut ControllerRuntimeState, now: DateTime<Utc>) {
+    fn clear_expired_lease(state: &mut ControllerRuntimeState, now: DateTime<Utc>) -> bool {
         if state
             .active_lease
             .as_ref()
             .is_some_and(|lease| lease.expires_at <= now)
         {
             state.active_lease = None;
+            state.pending_approval_invalidation = true;
+            return true;
         }
+        false
     }
 
     fn snapshot_from_state(
@@ -506,5 +550,80 @@ mod tests {
         assert_ne!(first.token, replacement.token);
         assert_ne!(first.fence, replacement.fence);
         assert_eq!(replacement.client_id, "browser-b");
+    }
+
+    #[tokio::test]
+    async fn first_remote_attach_from_local_tui_is_takeover() {
+        let service = ControllerService::new(ControllerServiceOptions::new(
+            true,
+            false,
+            ControllerInitial::LocalTui {
+                owner_label: "TUI".to_string(),
+                reason: None,
+            },
+        ));
+        let (_, is_takeover) = service
+            .attach_with_takeover(ControllerKind::Browser, "browser-a")
+            .await
+            .expect("first remote attach from local TUI");
+        assert!(
+            is_takeover,
+            "replacing local TUI control must drop prior-controller approvals"
+        );
+
+        let (_, renewal) = service
+            .attach_with_takeover(ControllerKind::Browser, "browser-a")
+            .await
+            .expect("same-client renewal");
+        assert!(!renewal, "lease renewal must not be a takeover");
+    }
+
+    #[tokio::test]
+    async fn first_remote_attach_from_unclaimed_is_not_takeover() {
+        let service = ControllerService::new(ControllerServiceOptions::new(
+            true,
+            false,
+            ControllerInitial::Unclaimed,
+        ));
+        let (_, is_takeover) = service
+            .attach_with_takeover(ControllerKind::Browser, "browser-a")
+            .await
+            .expect("first unclaimed attach");
+        assert!(
+            !is_takeover,
+            "unclaimed first attach has no prior controller to invalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_and_expiry_signal_approval_invalidation() {
+        let mut options = ControllerServiceOptions::new(true, false, ControllerInitial::Unclaimed);
+        options.lease_duration = Duration::milliseconds(1);
+        let service = ControllerService::new(options);
+        let lease = service
+            .attach(ControllerKind::Browser, "browser-a")
+            .await
+            .expect("attach");
+        assert!(
+            !service.take_pending_approval_invalidation().await,
+            "fresh lease must not invalidate"
+        );
+
+        let released = service
+            .detach(ControllerKind::Browser, "browser-a", &lease.token)
+            .await
+            .expect("detach");
+        assert!(released, "active lease must report release");
+
+        let lease = service
+            .attach(ControllerKind::Browser, "browser-b")
+            .await
+            .expect("reattach");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(
+            service.take_pending_approval_invalidation().await,
+            "expired lease must invalidate before local control resumes"
+        );
+        let _ = lease;
     }
 }

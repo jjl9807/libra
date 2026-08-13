@@ -2373,6 +2373,72 @@ impl CodexCodeUiAdapter {
     fn envelope_runtime(&self) -> &AgentRuntimeHandle {
         &self.envelope_runtime
     }
+
+    /// Reset AcceptAll/DeclineAll session mode after a controller change.
+    fn reset_approval_mode_after_takeover(approval_mode: &Arc<Mutex<String>>) {
+        if let Some(mut mode) = lock_or_warn(approval_mode, "codex approval mode takeover reset") {
+            *mode = "ask".to_string();
+        }
+    }
+
+    /// Decline in-flight and queued app-server approvals without interrupting
+    /// the turn. Returns whether a forwarded approval was declined.
+    async fn decline_pending_codex_approvals(&self) -> bool {
+        let forwarded = lock_or_warn(&self.forwarded_resolve, "codex forwarded resolve decline")
+            .and_then(|mut slot| slot.take());
+        let declined_forwarded = forwarded.is_some();
+        if let Some(forwarded) = forwarded {
+            let tx = self.tx.clone();
+            let responses = self.responses.clone();
+            let notifies = self.notifies.clone();
+            let resolve_method = forwarded.resolve_method.clone();
+            let request_id = forwarded.request_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = forward_codex_approval_resolve(
+                    &tx,
+                    &responses,
+                    &notifies,
+                    &resolve_method,
+                    &request_id,
+                    false,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        target: "libra::internal::ai::codex",
+                        request_id = %request_id,
+                        %error,
+                        "Codex approval decline was not acknowledged"
+                    );
+                }
+            });
+            if let Some(mut session) =
+                lock_or_warn(&self.codex_session, "codex decline approval resolve")
+                && let Some(approval) = session
+                    .approval_requests
+                    .iter_mut()
+                    .find(|approval| approval.id == forwarded.request_id)
+            {
+                approval.decision = Some(false);
+                approval.resolved_at = Some(Utc::now());
+            }
+            publish_code_ui_snapshot(
+                &self.browser_session,
+                &self.codex_session,
+                &self.working_dir,
+                Some(&self.approval_wait_queue),
+            )
+            .await;
+        }
+        drain_and_decline_queued_codex_approvals(
+            &self.approval_wait_queue,
+            &self.tx,
+            &self.responses,
+            &self.notifies,
+            Some(&self.codex_session),
+        );
+        declined_forwarded
+    }
 }
 
 #[async_trait::async_trait]
@@ -2575,60 +2641,7 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
     async fn cancel_turn(&self) -> anyhow::Result<()> {
         let turn_id = lock_or_warn(&self.tracked_turn_id, "codex tracked turn id cancel")
             .and_then(|guard| guard.clone());
-        let forwarded = lock_or_warn(&self.forwarded_resolve, "codex forwarded resolve cancel")
-            .and_then(|mut slot| slot.take());
-        let declined_pending_approval = forwarded.is_some();
-        if let Some(forwarded) = forwarded {
-            // Fire-and-forget decline: interrupt must not wait on resolve ack.
-            let tx = self.tx.clone();
-            let responses = self.responses.clone();
-            let notifies = self.notifies.clone();
-            let resolve_method = forwarded.resolve_method.clone();
-            let request_id = forwarded.request_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = forward_codex_approval_resolve(
-                    &tx,
-                    &responses,
-                    &notifies,
-                    &resolve_method,
-                    &request_id,
-                    false,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        target: "libra::internal::ai::codex",
-                        request_id = %request_id,
-                        %error,
-                        "Codex approval decline during cancel was not acknowledged; interrupt proceeds independently"
-                    );
-                }
-            });
-            if let Some(mut session) =
-                lock_or_warn(&self.codex_session, "codex cancel approval resolve")
-                && let Some(approval) = session
-                    .approval_requests
-                    .iter_mut()
-                    .find(|approval| approval.id == forwarded.request_id)
-            {
-                approval.decision = Some(false);
-                approval.resolved_at = Some(Utc::now());
-            }
-            publish_code_ui_snapshot(
-                &self.browser_session,
-                &self.codex_session,
-                &self.working_dir,
-                Some(&self.approval_wait_queue),
-            )
-            .await;
-        }
-        drain_and_decline_queued_codex_approvals(
-            &self.approval_wait_queue,
-            &self.tx,
-            &self.responses,
-            &self.notifies,
-            Some(&self.codex_session),
-        );
+        let declined_pending_approval = self.decline_pending_codex_approvals().await;
         let Some(turn_id) = turn_id else {
             return Err(anyhow!(CodeUiApiError::conflict(
                 "INTERACTION_NOT_ACTIVE",
@@ -2705,6 +2718,22 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
         }
         // Interrupt ack is not a terminal event. Keep tracked/app-server ids
         // until turn/completed so a follow-up submit cannot overlap.
+        Ok(())
+    }
+
+    async fn on_controller_lease_takeover(&self) -> anyhow::Result<()> {
+        Self::reset_approval_mode_after_takeover(&self.approval_mode);
+        let _ = self.decline_pending_codex_approvals().await;
+        self.envelope_runtime
+            .drop_pending_after_lease_takeover(&self.runtime_session_id)
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    "failed to drop pending Codex runtime interactions after lease takeover: {}",
+                    runtime_worker_adapter_message(error)
+                )
+            })?;
+        self.browser_session.clear_pending_tool_interactions().await;
         Ok(())
     }
 
@@ -8578,8 +8607,24 @@ Task Completed"
 
 #[cfg(test)]
 mod tests {
-    use super::{is_streaming_delta_method, should_finish_codex_turn_completed, truncate_for_log};
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        CodexCodeUiAdapter, is_streaming_delta_method, should_finish_codex_turn_completed,
+        truncate_for_log,
+    };
     use crate::internal::ai::codex::protocol::MethodKind;
+
+    #[test]
+    fn lease_takeover_resets_accept_all_approval_mode_to_ask() {
+        let approval_mode = Arc::new(Mutex::new("accept".to_string()));
+        CodexCodeUiAdapter::reset_approval_mode_after_takeover(&approval_mode);
+        assert_eq!(approval_mode.lock().expect("mode").as_str(), "ask");
+
+        let decline_all = Arc::new(Mutex::new("decline".to_string()));
+        CodexCodeUiAdapter::reset_approval_mode_after_takeover(&decline_all);
+        assert_eq!(decline_all.lock().expect("mode").as_str(), "ask");
+    }
 
     #[test]
     fn turn_completed_requires_live_app_server_correlation() {

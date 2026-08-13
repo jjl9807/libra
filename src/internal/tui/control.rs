@@ -32,6 +32,11 @@ pub enum TuiControlCommand {
     CancelCurrentTurn {
         ack: oneshot::Sender<Result<(), TuiControlError>>,
     },
+    /// W4-13: drop parked tool-approval / user-input interactions after a
+    /// controller lease takeover. Intent/Plan/network-policy gates stay.
+    DropPendingAfterLeaseTakeover {
+        ack: oneshot::Sender<Result<(), TuiControlError>>,
+    },
     ReclaimController {
         ack: oneshot::Sender<Result<(), TuiControlError>>,
     },
