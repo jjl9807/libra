@@ -148,15 +148,15 @@ cases. Always run Code UI harness targets with
 | `code_ui_remote_generation_matrix` | 2 | Generation control across surfaces (no live LLM) | `src/internal/ai/web/`, `src/command/code.rs` |
 | `code_ui_remote_approval_matrix` | 2 | Approval flow across Web/automation | `src/internal/ai/agent/` approvals |
 | `code_cli_dispatch_test` | 2 | `libra code …` argv parsing & dispatch | `src/command/code.rs` |
-| `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code`, including the shared env-file → process → Vault factory used by TUI and headless launch | `src/command/code.rs`, `src/internal/ai/providers/`, `src/internal/ai/runtime/services.rs` |
+| `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code`, including the shared env-file → process → Vault factory used by default Web and headless launch | `src/command/code.rs`, `src/internal/ai/providers/`, `src/internal/ai/runtime/services.rs` |
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |
 | `code_resume_test` | 2 | Session resume across restarts | `src/internal/ai/session/`, `src/command/code.rs` |
 | `code_codex_default_tui_test` | 2 | W4-01: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; `LIBRA_CODE_LEGACY_TUI` keeps TUI driver) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
 | `code_codex_runtime_test` | 2 | `--provider codex` WS runtime boot: `--codex-port` validation, managed app-server initialize/thread-start, approval-interaction regression, W3-04 `AgentEvent` envelope normalize, W3-07 cancel/interrupt + sequential approval ownership | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
-| `ai_code_ui_projection_test` | 2 | Projection snapshot replication; W3-14 10k-event fold bound + release p95 (`large_session_projection_smoke`) | `src/internal/ai/history.rs`, `src/internal/ai/web/code_ui_projection.rs` |
-| `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events | `src/internal/ai/web/`, `src/internal/ai/agent/` |
+| `ai_code_ui_projection_test` | 2 | Projection snapshot replication; W3-14 10k-event fold bound + release p95 (`large_session_projection_smoke`); W4-04 null `thread_graph` delta fold | `src/internal/ai/history.rs`, `src/internal/ai/web/code_ui_projection.rs` |
+| `ai_code_ui_wire_test` | 2 | Wire-format contract for UI events, including camelCase `threadGraph` | `src/internal/ai/web/`, `src/internal/ai/agent/` |
 
 ### plan-20260715 W3-15 — Playwright real-browser e2e
 

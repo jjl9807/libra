@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 W4-05, 2026-08-13, v0.19.154)
+
+- **W4-05 closes user-facing docs to Web-default.** `docs/commands/code.md`
+  (+ zh-CN), `docs/development/tracing/code.md`, `COMPATIBILITY.md`,
+  `docs/development/commands/_compatibility.md`, and `tests/INDEX.md`
+  describe Web as the default, TUI/graph TUI as deprecated bake-window
+  surfaces (hidden `LIBRA_CODE_LEGACY_TUI=1`; bare `--provider codex
+  --resume` still uses the TUI resume driver), and must not claim
+  physical deletion before W5-09. `threadGraph` / `GET /api/code/thread-graph`
+  wire contract is documented in EN+zh-CN.
+
+### Added (plan-20260715 W4-04, 2026-08-13, v0.19.153)
+
+- **W4-04 moves the thread/version graph into Web Code UI.** Default
+  `libra code` snapshots attach a capped indexed `threadGraph` (256 nodes,
+  live heads preserved) and rehydrate via on-demand
+  `GET /api/code/thread-graph?threadId=` (redacted, AbortController,
+  on-demand with bounded 404/5xx retry plus lineage revalidation — not a
+  timer poll). Interactive `libra graph` TUI prints a deprecation
+  warning (removed in W5-08); `--json` / `--machine` stay. Hidden
+  `LIBRA_CODE_LEGACY_TUI=1` is the hidden TUI rollback during the W4
+  3-patch bake window (removed in W5-07). Bare `--provider codex --resume`
+  still uses the legacy TUI resume driver (managed `--web-only --provider
+  codex` continues to reject `--resume`). Final TUI closeout is W6-02
+  after the W5-01 family breaking release (W5-09).
+
 ### Added (plan-20260715 W4-02, 2026-08-13, v0.19.143)
 
 - **W4-02 makes `libra code --control stdio` the canonical JSON-RPC NDJSON

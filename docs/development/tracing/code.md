@@ -8,7 +8,7 @@
 
 ## 命令实现目标
 
-`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式仍是交互式 TUI + 后台服务；普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
+`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）；`--web` / `--web-only` 是 W4 烘焙窗口的弃用别名（即使 `LIBRA_CODE_LEGACY_TUI=1` 也会强制 Web）；隐藏 `LIBRA_CODE_LEGACY_TUI=1` 仅在未带这些别名时紧急回滚旧 TUI（W5-07 删除）。裸 `libra code --provider codex --resume <thread_id>` 在烘焙期内仍走遗留 TUI resume driver（managed `--web-only --provider codex` 继续拒绝 `--resume`）。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
 
 ## 对比 Git 与兼容性
 
@@ -32,8 +32,8 @@ flowchart TD
     A["src/cli.rs::Commands"] --> B["src/command/code.rs::CodeArgs"]
     B --> C["validate_mode_args"]
     C --> D{"mode"}
-    D -->|"TUI default"| E["AgentRuntime + TUI/Web services"]
-    D -->|"web-only"| F["Headless/Code UI server path"]
+    D -->|"Web default"| E["AgentRuntime + Web Code UI"]
+    D -->|"LEGACY_TUI"| F["hidden TUI rollback"]
     D -->|"stdio"| G["MCP stdio server"]
     E --> H["SessionStore / projection / graph / audit"]
     F --> H
@@ -45,7 +45,7 @@ flowchart TD
 
 | 面向 | 当前结论 | 必须保持 / 补强 |
 |---|---|---|
-| Mode 与参数 | TUI、web-only、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
+| Mode 与参数 | Web default、hidden TUI rollback、web-only alias、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
 | Provider / env | provider-specific flags 和 `--api-base` 规则已有校验；live/provider tests 依赖 `.env.test` 时不得泄露 key。 | C3 固定 provider factory、env-file 优先级、Vault/env lookup、missing-key 错误和 feature-gated live tests。 |
 | Web-only / Code UI | Code UI API、SSE、browser control、control token、diagnostics redaction 是用户可见接口。 | C4 固定 `/api/code/*` observe-only contract；control token/`control.json` 0600（info 原子写 + worktree scope fail-closed）；diagnostics/SSE/control info 不泄露 secrets。 |
 | Session / graph | non-Codex `--web-only --resume` 已走 headless JSONL projection fold；TUI resume 仍走 `SessionState`；`--stdio`/managed Codex 继续拒绝 resume。projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5/W1-06 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、统一 event fold；TUI/managed-Codex/graph 尚未共用同一 fold。 |

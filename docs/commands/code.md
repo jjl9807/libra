@@ -1,6 +1,6 @@
 # `libra code`
 
-Launch an interactive AI coding session with TUI, web, or MCP modes.
+Launch an interactive AI coding session. Default is the Web Code UI (legacy TUI is a hidden bake-window rollback, plus bare `--provider codex --resume`).
 
 ## Synopsis
 
@@ -15,7 +15,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## Description
 
-`libra code` starts an interactive coding session that pairs a human developer with an AI agent. The default mode launches the Web Code UI (embedded HTTP server + AgentRuntime) and prints the URL / control details; it stays in the foreground until `Ctrl-C` / SIGTERM. `--web` / `--web-only` remain accepted as deprecated no-op aliases for that default during the W4 bake window (removed in W5-07). Hidden `LIBRA_CODE_LEGACY_TUI=1` restores the previous terminal UI for emergency rollback only (not a public compatibility surface). `--stdio` is a **deprecated MCP-only legacy** entry: it exposes MCP tools/resources over standard input/output for clients like Claude Desktop, and is **not** live turn control. Prefer `libra code --control stdio` for local automation; a dedicated `libra mcp --stdio` is planned after W5 (DEFER-02).
+`libra code` starts an interactive coding session that pairs a human developer with an AI agent. The default mode launches the Web Code UI (embedded HTTP server + AgentRuntime) and prints the URL / control details; it stays in the foreground until `Ctrl-C` / SIGTERM. `--web` / `--web-only` remain accepted as deprecated aliases for that default during the W4 bake window (removed in W5-07); they still force Web even when `LIBRA_CODE_LEGACY_TUI=1` is set. Hidden `LIBRA_CODE_LEGACY_TUI=1` restores the previous terminal UI for emergency rollback only when those aliases are absent (not a public compatibility surface). Bare `libra code --provider codex --resume <thread_id>` still uses the legacy TUI resume driver during the bake window (managed `--web-only --provider codex` continues to reject `--resume`). `--stdio` is a **deprecated MCP-only legacy** entry: it exposes MCP tools/resources over standard input/output for clients like Claude Desktop, and is **not** live turn control. Prefer `libra code --control stdio` for local automation; a dedicated `libra mcp --stdio` is planned after W5 (DEFER-02).
 
 The command supports eight AI provider backends (Gemini, OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, Ollama, Codex) and three operating contexts (dev, review, research) that tune the agent's behavior for different workflows. Sessions can be persisted and resumed with Libra's canonical `--resume <thread_id>` flow. Passing `--goal "<objective>"` boots the session directly in goal mode, where a supervisor drives the tool loop toward the stated objective until a verifier accepts completion.
 
@@ -80,7 +80,7 @@ For Codex app-server linkage, model forwarding, credentials ownership, and persi
 
 DeepSeek requests can opt into provider-specific fields with `--deepseek-thinking enabled --deepseek-reasoning-effort high --deepseek-stream true`; these flags are rejected for non-DeepSeek providers.
 Kimi requests default to the selected model's thinking behavior; use `--kimi-thinking disabled` for K2.6/K2.5 runs where lower latency or official web-search compatibility matters. Libra preserves Kimi `reasoning_content` across tool-call turns when the provider returns it.
-For normal runs, store provider keys in `vault.env.<NAME>`; Libra checks repo-local Vault, then global Vault, then the process environment. Use `--env-file .env.test` for live tests that need an explicit dotenv override. Under `--web`/`--web-only`, `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl` keep the same semantics as TUI for non-Codex providers (env-file values still override process env/Vault). Managed `--provider codex` still rejects `--env-file`, `--approval-ttl`, and `--resume` because those surfaces are not wired into the Codex app-server path; MCP `--stdio` continues to reject the TUI-only flags.
+For normal runs, store provider keys in `vault.env.<NAME>`; Libra checks repo-local Vault, then global Vault, then the process environment. Use `--env-file .env.test` for live tests that need an explicit dotenv override. Under `--web`/`--web-only`, `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl` keep the same semantics as TUI for non-Codex providers (env-file values still override process env/Vault). Managed `--web-only --provider codex` still rejects `--env-file`, `--approval-ttl`, and `--resume` because those surfaces are not wired into the Codex app-server path. Bare default `libra code --provider codex --resume <thread_id>` still dispatches to the legacy TUI resume driver (bake-window exception; not `LIBRA_CODE_LEGACY_TUI`). MCP `--stdio` continues to reject the TUI-only flags.
 
 Ollama requests stream `/api/chat` responses by default and add a per-request `request_id` to debug logs. They also default to `think:false` so reasoning-capable local models do not spend several minutes generating hidden reasoning before tool calls. Use `--ollama-thinking high` for a single run, or set `OLLAMA_THINK=true`, `low`, `medium`, `high`, or `auto` as the environment default. `auto` omits the `think` field and lets Ollama decide. Use `--ollama-compact-tools` or `OLLAMA_COMPACT_TOOLS=true` when a remote/cloud Ollama endpoint accepts simple tools but returns 503 for Libra's full tool schema payload.
 
@@ -162,7 +162,20 @@ The Code UI JSON contract uses camelCase field names and snake_case enum values.
 | `plans` / `tasks` / `toolCalls` / `patchsets` | arrays | Runtime projections used by Workflow, Summary, Diff, and Terminal panes. |
 | `interactions` | array | Pending/resolved UI prompts. `kind` is `approval`, `sandbox_approval`, `request_user_input`, `intent_review_choice`, `post_plan_choice`, or `plan_execution_repair`. A pending plan-repair interaction offers `continue` and `cancel`; respond through the normal interaction endpoint. |
 | `planExecutionRepair` | object, optional | Runtime-owned plan-execution repair state. It contains a snake_case `state`, bounded and runtime-redacted failure `evidence` (`output`, `diagnostics`, `attempt`, `max_attempts`), and an `interaction_id` while `awaiting_user`. `automatic_repair` records an in-progress retry. `awaiting_user` is projected only after the configured retries are exhausted: a Code UI Continue must send a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }`), otherwise it returns `PLAN_REPAIR_RETRY_LIMIT_REACHED`; alternatively, provide manual revision guidance. Cancel is terminal. `intent_spec_revision` and `manual_action` require a new user-directed workflow. |
+| `threadGraph` | object, optional | Indexed Intent/Plan/Task/Run/PatchSet graph for the current `threadId` (W4-04). Omitted or cleared when storage is unresolved, the id is not a UUID, load fails, or live snapshot heads are not covered. Same camelCase shape as `GET /api/code/thread-graph`. |
 | `updatedAt` | string | ISO 8601 update timestamp. |
+
+`GET /api/code/thread-graph?threadId=<uuid>` returns the same `CodeUiThreadGraph` object used by `threadGraph` (loopback observe, fail-closed redaction). `threadId` is parsed with `Uuid::parse_str` (hyphenated RFC-4122 or 32 hex digits). Anything else is `THREAD_GRAPH_INVALID_ID`. Missing indexed projection is `404 THREAD_GRAPH_NOT_FOUND`; storage/load/redaction failures are `500 THREAD_GRAPH_STORAGE_UNAVAILABLE` / `THREAD_GRAPH_UNAVAILABLE` / `REDACTION_FAILED`.
+
+| Field | Type | Contract |
+|-------|------|----------|
+| `threadId` | string | Canonical thread UUID. |
+| `title` | string, optional | Thread title (redacted). |
+| `selectedPlanId` / `activeTaskId` / `activeRunId` | string, optional | Live heads; may also appear as `selected` / `active` / `running` node tags. |
+| `nodes` | array | `{ depth, kind, id, label, tags? }` for `intent` / `plan` / `task` / `run` / `patchset`. Capped at 256; live heads are preserved and remaining slots fill from newest lineage. |
+| `truncated` | boolean, optional | Present when the indexed graph exceeded the 256-node cap. |
+| `omittedNodeCount` | number, optional | Nodes dropped by the cap. |
+| `totalNodeCount` | number, optional | Full indexed node count when truncated. |
 
 `GET /api/code/events` streams session updates. Wire version is negotiated as follows
 (W3-06 / plan-20260715):
@@ -441,11 +454,11 @@ On `Ctrl-C` or `SIGTERM`, a non-Codex headless or web-only process closes browse
 | Parameter | Libra | Git | jj |
 |-----------|-------|-----|----|
 | Interactive AI session | `libra code` | Not available | Not available |
-| TUI mode | Default | Not available | Not available |
-| Web mode | `--web-only` | Not available | Not available |
+| TUI mode | Hidden `LIBRA_CODE_LEGACY_TUI=1`, or bare `--provider codex --resume` | Not available | Not available |
+| Web mode | Default (`--web`/`--web-only` deprecated aliases) | Not available | Not available |
 | MCP/stdio mode | `--stdio` | Not available | Not available |
 | AI provider selection | `--provider` | Not available | Not available |
-| Session resume | `--resume <thread_id>` | Not available | Not available |
+| Session resume | `--resume <thread_id>` (Web default / non-Codex; Codex resume uses legacy TUI) | Not available | Not available |
 | Tool approval policy | `--approval-policy` | Not available | Not available |
 
 Note: Neither Git nor jj have an equivalent to `libra code`. This command represents Libra's core differentiation as an AI-agent-native version control system. The closest analogs in the Git ecosystem are third-party tools like GitHub Copilot CLI or aider, which are separate applications rather than integrated VCS commands.

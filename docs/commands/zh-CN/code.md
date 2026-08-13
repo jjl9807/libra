@@ -1,6 +1,6 @@
 # `libra code`
 
-启动带 TUI、Web 或 MCP 模式的交互式 AI 编码会话。
+启动交互式 AI 编码会话。默认是 Web Code UI（旧 TUI 为烘焙窗口隐藏回滚，另加裸 `--provider codex --resume`）。
 
 ## 概要
 
@@ -15,7 +15,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 ## 说明
 
-`libra code` 启动一个交互式编码会话，让人类开发者与 AI agent 协作。默认模式启动 Web Code UI（嵌入式 HTTP + AgentRuntime），打印 URL / control 信息并前台常驻，直到 `Ctrl-C` / SIGTERM。`--web` / `--web-only` 在 W4 烘焙窗口内仍是该默认路径的弃用 no-op 别名（W5-07 删除）。隐藏的 `LIBRA_CODE_LEGACY_TUI=1` 仅用于紧急回滚到旧终端 TUI（非公开兼容面）。`--stdio` 是 **弃用的 MCP-only legacy** 入口：仅通过标准输入/输出暴露 MCP tools/resources（例如 Claude Desktop），**不是** live turn control。本地自动化请优先使用 `libra code --control stdio`；独立的 `libra mcp --stdio` 计划在 W5 之后（DEFER-02）。
+`libra code` 启动一个交互式编码会话，让人类开发者与 AI agent 协作。默认模式启动 Web Code UI（嵌入式 HTTP + AgentRuntime），打印 URL / control 信息并前台常驻，直到 `Ctrl-C` / SIGTERM。`--web` / `--web-only` 在 W4 烘焙窗口内仍是该默认路径的弃用别名（W5-07 删除）；即使设置了 `LIBRA_CODE_LEGACY_TUI=1` 也会强制走 Web。隐藏的 `LIBRA_CODE_LEGACY_TUI=1` 仅在未带这些别名时紧急回滚到旧终端 TUI（非公开兼容面）。裸 `libra code --provider codex --resume <thread_id>` 在烘焙期内仍走遗留 TUI resume driver（managed `--web-only --provider codex` 继续拒绝 `--resume`）。`--stdio` 是 **弃用的 MCP-only legacy** 入口：仅通过标准输入/输出暴露 MCP tools/resources（例如 Claude Desktop），**不是** live turn control。本地自动化请优先使用 `libra code --control stdio`；独立的 `libra mcp --stdio` 计划在 W5 之后（DEFER-02）。
 
 该命令支持八种 AI provider 后端（Gemini、OpenAI、Anthropic、DeepSeek、Kimi、Zhipu、Ollama、Codex），以及三种运行上下文（dev、review、research），用于针对不同工作流调节 agent 行为。会话可以通过 Libra 规范的 `--resume <thread_id>` 流程持久化和恢复。传入 `--goal "<objective>"` 会直接以 goal 模式启动会话，由 supervisor 驱动 tool loop 朝既定 objective 前进，直到 verifier 接受完成。
 
@@ -162,7 +162,20 @@ Code UI JSON contract 使用 camelCase 字段名和 snake_case 枚举值。Rust 
 | `plans` / `tasks` / `toolCalls` / `patchsets` | arrays | Workflow、Summary、Diff 和 Terminal panes 使用的 runtime projections。 |
 | `interactions` | array | 待处理/已解决的 UI prompts。`kind` 是 `approval`、`sandbox_approval`、`request_user_input`、`intent_review_choice`、`post_plan_choice` 或 `plan_execution_repair`。待处理的 plan-repair interaction 提供 `continue` 和 `cancel`，通过正常 interaction endpoint 回应。 |
 | `planExecutionRepair` | object, optional | Runtime-owned plan-execution repair 状态。它含 snake_case 的 `state`、有界且经 runtime 脱敏的 failure `evidence`（`output`、`diagnostics`、`attempt`、`max_attempts`），并在 `awaiting_user` 时含 `interaction_id`。`automatic_repair` 表示进行中的重试；`awaiting_user` 只会在配置的重试次数耗尽后出现：Code UI Continue 必须提供更高的 `maxAttempts`（例如当前上限为 2 时发送 `{ "selectedOption": "continue", "maxAttempts": 3 }`），否则返回 `PLAN_REPAIR_RETRY_LIMIT_REACHED`；也可以提供手动修订指导。Cancel 为终态。`intent_spec_revision` 和 `manual_action` 需要新的用户定向 workflow。 |
+| `threadGraph` | object, optional | 当前 `threadId` 的 indexed Intent/Plan/Task/Run/PatchSet 图（W4-04）。storage 未解析、id 非 UUID、加载失败或 live heads 未被覆盖时省略/清空。camelCase 形状与 `GET /api/code/thread-graph` 相同。 |
 | `updatedAt` | string | ISO 8601 更新时间戳。 |
+
+`GET /api/code/thread-graph?threadId=<uuid>` 返回与 `threadGraph` 相同的 `CodeUiThreadGraph`（loopback observe，fail-closed redaction）。`threadId` 经 `Uuid::parse_str` 解析（带连字符的 RFC-4122 或 32 位 hex）；其它输入为 `THREAD_GRAPH_INVALID_ID`。缺少 indexed projection 为 `404 THREAD_GRAPH_NOT_FOUND`；storage/load/redaction 失败为 `500 THREAD_GRAPH_STORAGE_UNAVAILABLE` / `THREAD_GRAPH_UNAVAILABLE` / `REDACTION_FAILED`。
+
+| 字段 | 类型 | 契约 |
+|------|------|------|
+| `threadId` | string | Canonical thread UUID。 |
+| `title` | string, optional | Thread 标题（已脱敏）。 |
+| `selectedPlanId` / `activeTaskId` / `activeRunId` | string, optional | Live heads；也可出现在节点 `selected` / `active` / `running` tags。 |
+| `nodes` | array | `{ depth, kind, id, label, tags? }`，kind 为 `intent` / `plan` / `task` / `run` / `patchset`。上限 256；保留 live heads，剩余名额从最新 lineage 填充。 |
+| `truncated` | boolean, optional | indexed 图超过 256 节点时出现。 |
+| `omittedNodeCount` | number, optional | 被 cap 丢弃的节点数。 |
+| `totalNodeCount` | number, optional | 截断时的完整 indexed 节点数。 |
 
 `GET /api/code/events` 流式传输会话更新。Wire 版本协商如下（W3-06 / plan-20260715）：
 
@@ -405,11 +418,11 @@ AI agents 在开发者机器上执行 shell 命令存在真实安全风险。五
 | 参数 | Libra | Git | jj |
 |------|-------|-----|----|
 | 交互式 AI 会话 | `libra code` | 不可用 | 不可用 |
-| TUI 模式 | 默认 | 不可用 | 不可用 |
-| Web 模式 | `--web-only` | 不可用 | 不可用 |
+| TUI 模式 | 隐藏 `LIBRA_CODE_LEGACY_TUI=1`，或裸 `--provider codex --resume` | 不可用 | 不可用 |
+| Web 模式 | 默认（`--web`/`--web-only` 为弃用别名） | 不可用 | 不可用 |
 | MCP/stdio 模式 | `--stdio` | 不可用 | 不可用 |
 | AI provider 选择 | `--provider` | 不可用 | 不可用 |
-| 会话恢复 | `--resume <thread_id>`（TUI 及非 Codex `--web-only`） | 不可用 | 不可用 |
+| 会话恢复 | `--resume <thread_id>`（Web 默认 / 非 Codex；Codex resume 走遗留 TUI） | 不可用 | 不可用 |
 | 工具 approval policy | `--approval-policy` | 不可用 | 不可用 |
 
 注意：Git 和 jj 都没有 `libra code` 的等价物。该命令体现了 Libra 作为 AI-agent-native 版本控制系统的核心差异。Git 生态中最接近的类似物是 GitHub Copilot CLI 或 aider 等第三方工具，它们是独立应用，而不是集成 VCS 命令。
