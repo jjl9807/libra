@@ -23,7 +23,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 当遗留 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令，以便在独立 TUI 中检查该线程的 Intent/Plan/Task/Run/PatchSet 版本图。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
 
-**Linked worktree**：在 W4-08 enablement 之前，`libra code`（所有模式）在 linked worktree 中仍拒绝启动。安全相关文件（`sandbox.toml`、`hooks.json`、`config.toml` 的 `[approval]`/`[mcp]`、`rules/`、`contexts/`）已走 W4-06 RequestScope resolver：仓库默认层在 linked worktree 可见，overlay 只能收紧（不能去掉仓库 `PreToolUse` Block，也不能放宽 sandbox/approval）；不可读或无法解析的安全配置 fail-closed，诊断只报 source layer、不回显文件内容。agents/automation 等 extension loader 仍待 W4-12。请改在 main worktree 运行；拒绝信息会给出该提示。同理，linked worktree 中 automation 的 VCS dispatch 被禁用（带 warning），`libra automation` 亦 fail-closed——见 [automation.md](automation.md)。
+**Linked worktree**：在 W4-08 enablement 之前，`libra code`（所有模式）在 linked worktree 中仍拒绝启动。安全相关文件（`sandbox.toml`、`hooks.json`、`config.toml` 的 `[approval]`/`[mcp]`、`rules/`、`contexts/`）以及 extension/automation 表面（`agents.toml`、`automations.toml`、`agents/`、`commands/`、`skills/`）已走 W4-06 RequestScope resolver：仓库默认层在 linked worktree 可见。安全 overlay 只能收紧；extension overlay 同名覆盖。不可读或无法解析的安全配置 fail-closed，诊断只报 source layer、不回显文件内容。请改在 main worktree 运行；拒绝信息会给出该提示。同理，linked worktree 中 automation 的 VCS dispatch 被禁用（带 warning），`libra automation` 亦 fail-closed——见 [automation.md](automation.md)。
 
 ## 选项
 

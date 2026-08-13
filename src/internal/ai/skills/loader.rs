@@ -14,8 +14,22 @@ pub fn load_skills(working_dir: &Path) -> Vec<SkillDefinition> {
     let mut skills = Vec::new();
     let mut loaded_names = HashSet::new();
 
-    let project_dir = working_dir.join(".libra").join("skills");
-    load_skills_from_dir_with_seen(&project_dir, &mut skills, &mut loaded_names);
+    match crate::internal::ai::sources::resolved_dir_paths(working_dir, "skills") {
+        Ok((repository, overlay)) => {
+            if let Some(overlay) = overlay.as_ref().filter(|path| !path.as_os_str().is_empty()) {
+                load_skills_from_dir_with_seen(overlay, &mut skills, &mut loaded_names);
+            }
+            if !repository.as_os_str().is_empty() {
+                load_skills_from_dir_with_seen(&repository, &mut skills, &mut loaded_names);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to resolve skills; using user tier only"
+            );
+        }
+    }
 
     if let Some(config_dir) = dirs::config_dir() {
         let user_dir = config_dir.join("libra").join("skills");

@@ -39,7 +39,8 @@ pub use resolver::{
 };
 pub use security::{
     format_resolve_error, format_security_parse_error, json_error_location,
-    request_scope_for_workdir, resolve_security_dir, resolve_security_file, toml_error_location,
+    request_scope_for_workdir, resolve_security_dir, resolve_security_file, resolved_dir_paths,
+    toml_error_location,
 };
 
 /// Source category. This stays intentionally small for Step 1.10 Phase A.

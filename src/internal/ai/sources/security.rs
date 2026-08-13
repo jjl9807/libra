@@ -5,7 +5,7 @@
 //! W4-06 resolver, and formats fail-closed diagnostics that name the source
 //! layer without echoing file contents.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::resolver::{
     ConfigResolveError, ResolvedConfig, ResolvedConfigDir, resolve_config_dir, resolve_config_file,
@@ -61,11 +61,11 @@ pub fn format_resolve_error(err: &ConfigResolveError) -> String {
             repository_path,
             message,
         } => format!(
-            "security config '{location}' repository layer is unreadable at '{}': {message}",
+            "config '{location}' repository layer is unreadable at '{}': {message}",
             repository_path.display()
         ),
         ConfigResolveError::Paths { workdir, message } => format!(
-            "cannot resolve security config paths for workdir '{}': {message}",
+            "cannot resolve config paths for workdir '{}': {message}",
             workdir.display()
         ),
         other => other.to_string(),
@@ -98,8 +98,21 @@ pub fn resolve_security_dir(
 pub fn request_scope_for_workdir(workdir: &Path) -> Result<Option<RequestScope>, String> {
     RequestScope::try_resolve(workdir.to_path_buf()).map_err(|error| {
         format!(
-            "cannot resolve security config paths for workdir '{}': {error}",
+            "cannot resolve config paths for workdir '{}': {error}",
             workdir.display()
         )
     })
+}
+
+/// Resolve a registered directory via RequestScope, or fall back to
+/// `<workdir>/.libra/<location>` outside a repository.
+pub fn resolved_dir_paths(
+    working_dir: &Path,
+    location: &'static str,
+) -> Result<(PathBuf, Option<PathBuf>), String> {
+    if let Some(request) = request_scope_for_workdir(working_dir)? {
+        let resolved = resolve_security_dir(&request, location)?;
+        return Ok((resolved.repository_path, resolved.overlay_path));
+    }
+    Ok((working_dir.join(".libra").join(location), None))
 }

@@ -51,9 +51,9 @@ fn linked_scope_dispatch_disabled(working_dir: &Path) -> bool {
         return false;
     }
     eprintln!(
-        "warning: automation dispatch is disabled in linked worktrees until the \
-         unified Code/Agent config resolver lands; run from the main worktree to \
-         trigger automations (plan-20260714 W0)"
+        "warning: automation dispatch is disabled in linked worktrees until \
+         linked-worktree enablement (plan-20260715 W4-08); run from the main \
+         worktree to trigger automations"
     );
     true
 }

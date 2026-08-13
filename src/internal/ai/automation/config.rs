@@ -2,7 +2,11 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::internal::ai::{automation::events::AutomationError, hooks::HookEvent};
+use crate::internal::ai::{
+    automation::events::AutomationError,
+    hooks::HookEvent,
+    sources::security::{request_scope_for_workdir, resolve_security_file},
+};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AutomationConfig {
@@ -16,17 +20,35 @@ impl AutomationConfig {
     }
 
     pub fn load_from_working_dir(working_dir: &Path) -> Result<Self, AutomationError> {
-        let path = working_dir.join(".libra").join("automations.toml");
-        if !path.exists() {
-            return Ok(Self::default());
+        match request_scope_for_workdir(working_dir) {
+            Ok(Some(request)) => {
+                let resolved = resolve_security_file(&request, "automations.toml")
+                    .map_err(AutomationError::ConfigParse)?;
+                if resolved.bytes.is_empty() {
+                    return Ok(Self::default());
+                }
+                let contents = String::from_utf8(resolved.bytes).map_err(|error| {
+                    AutomationError::ConfigParse(format!(
+                        "automations.toml is not valid UTF-8: {error}"
+                    ))
+                })?;
+                Self::from_toml_str(&contents)
+            }
+            Ok(None) => {
+                let path = working_dir.join(".libra").join("automations.toml");
+                if !path.exists() {
+                    return Ok(Self::default());
+                }
+                let contents = fs::read_to_string(&path).map_err(|error| {
+                    AutomationError::ConfigParse(format!(
+                        "failed to read automation config {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                Self::from_toml_str(&contents)
+            }
+            Err(error) => Err(AutomationError::ConfigParse(error)),
         }
-        let contents = fs::read_to_string(&path).map_err(|error| {
-            AutomationError::ConfigParse(format!(
-                "failed to read automation config {}: {error}",
-                path.display()
-            ))
-        })?;
-        Self::from_toml_str(&contents)
     }
 
     pub fn validate(&self) -> Result<(), AutomationError> {

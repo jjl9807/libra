@@ -82,9 +82,23 @@ pub fn load_commands(working_dir: &std::path::Path) -> Vec<CommandDefinition> {
     let mut commands = Vec::new();
     let mut loaded_names = std::collections::HashSet::new();
 
-    // 1. Project-local
-    let project_dir = working_dir.join(".libra").join("commands");
-    load_commands_from_dir(&project_dir, &mut commands, &mut loaded_names);
+    // 1. Repository (+ overlay-wins) via W4-06 resolver.
+    match crate::internal::ai::sources::resolved_dir_paths(working_dir, "commands") {
+        Ok((repository, overlay)) => {
+            if let Some(overlay) = overlay.as_ref().filter(|path| !path.as_os_str().is_empty()) {
+                load_commands_from_dir(overlay, &mut commands, &mut loaded_names);
+            }
+            if !repository.as_os_str().is_empty() {
+                load_commands_from_dir(&repository, &mut commands, &mut loaded_names);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to resolve custom commands; using user/embedded tiers only"
+            );
+        }
+    }
 
     // 2. User-global
     if let Some(config_dir) = dirs::config_dir() {

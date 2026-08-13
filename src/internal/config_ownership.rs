@@ -18,8 +18,8 @@
 //! repository configuration lives) while sandbox reads COMMON storage. The
 //! W0 preflight (`command::require_main_worktree_for_code_agent`) refuses to
 //! launch the reading runtimes from a linked worktree, which is what makes
-//! remaining `WorkdirDotLibra` (W4-12 extension) rows safe. W4-11 security
-//! loaders resolve through [`ReadResolution::UnifiedResolver`].
+//! remaining `WorkdirDotLibra` rows (if any) safe. W4-11 security and
+//! W4-12 extension loaders resolve through [`ReadResolution::UnifiedResolver`].
 
 /// Which consumer family migrates the surface onto the W4-06 resolver.
 ///
@@ -114,7 +114,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "agents.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
@@ -141,7 +141,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "automations.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
@@ -167,7 +167,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "agents",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
@@ -175,7 +175,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "commands",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
@@ -183,7 +183,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "skills",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Extension,
     },
     ConfigSurface {
@@ -846,6 +846,29 @@ mod tests {
             by_location("contexts").resolution,
             ReadResolution::UnifiedResolver,
             "W4-11 contexts directory uses the unified resolver"
+        );
+        for location in [
+            "agents.toml",
+            "automations.toml",
+            "agents",
+            "commands",
+            "skills",
+        ] {
+            assert_eq!(
+                by_location(location).resolution,
+                ReadResolution::UnifiedResolver,
+                "W4-12 extension surface '{location}' uses the unified resolver"
+            );
+            assert_eq!(
+                by_location(location).consumer,
+                ConfigConsumerKind::Extension,
+                "W4-12 must not reclassify '{location}' away from Extension"
+            );
+        }
+        assert_eq!(
+            by_location("sandbox.toml").consumer,
+            ConfigConsumerKind::Security,
+            "W4-12 must not reclassify sandbox.toml away from Security"
         );
         assert_eq!(
             by_location("publish/worker-template-manifest.json").resolution,

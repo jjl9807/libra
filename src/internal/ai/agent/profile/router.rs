@@ -187,9 +187,10 @@ pub fn load_embedded_profiles() -> Vec<AgentProfile> {
 ///   user-global tier is skipped and we go straight to embedded fallback.
 ///
 /// Lookup order (highest priority first):
-/// 1. `{working_dir}/.libra/agents/*.md`
-/// 2. `~/.config/libra/agents/*.md`
-/// 3. Embedded defaults
+/// 1. Linked-worktree overlay `.libra/agents/*.md` (W4-12 resolver)
+/// 2. Repository `.libra/agents/*.md`
+/// 3. `~/.config/libra/agents/*.md`
+/// 4. Embedded defaults
 ///
 /// See: `tests::test_load_profiles_with_project_override`,
 /// `tests::test_load_profiles_skips_oversized_files`.
@@ -197,9 +198,23 @@ pub fn load_profiles(working_dir: &std::path::Path) -> Vec<AgentProfile> {
     let mut profiles = Vec::new();
     let mut loaded_names = std::collections::HashSet::new();
 
-    // 1. Project-local profiles
-    let project_dir = working_dir.join(".libra").join("agents");
-    load_profiles_from_dir(&project_dir, &mut profiles, &mut loaded_names);
+    // 1. Repository (+ overlay-wins) profiles via W4-06 resolver.
+    match crate::internal::ai::sources::resolved_dir_paths(working_dir, "agents") {
+        Ok((repository, overlay)) => {
+            if let Some(overlay) = overlay.as_ref().filter(|path| !path.as_os_str().is_empty()) {
+                load_profiles_from_dir(overlay, &mut profiles, &mut loaded_names);
+            }
+            if !repository.as_os_str().is_empty() {
+                load_profiles_from_dir(&repository, &mut profiles, &mut loaded_names);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to resolve agent profiles; using user/embedded tiers only"
+            );
+        }
+    }
 
     // 2. User-global profiles
     if let Some(config_dir) = dirs::config_dir() {

@@ -542,6 +542,9 @@ pub enum AgentsConfigLoadError {
         #[source]
         source: toml::de::Error,
     },
+    /// RequestScope / unified resolver failed (damaged worktree, unreadable layer).
+    #[error("{0}")]
+    Resolve(String),
 }
 
 impl std::fmt::Display for AgentsConfigValidationErrors {
@@ -665,6 +668,45 @@ impl AgentsConfig {
             Self::from_path(path)
         } else {
             Ok(Self::default())
+        }
+    }
+
+    /// Load `agents.toml` via the W4-06 resolver when `working_dir` is inside
+    /// a Libra repository (overlay wins). Outside a repository, fall back to
+    /// `<working_dir>/.libra/agents.toml`.
+    pub fn load_from_working_dir(
+        working_dir: &std::path::Path,
+    ) -> Result<Self, AgentsConfigLoadError> {
+        match crate::internal::ai::sources::security::request_scope_for_workdir(working_dir) {
+            Ok(Some(request)) => {
+                let resolved = crate::internal::ai::sources::security::resolve_security_file(
+                    &request,
+                    "agents.toml",
+                )
+                .map_err(AgentsConfigLoadError::Resolve)?;
+                if resolved.bytes.is_empty() {
+                    return Ok(Self::default());
+                }
+                let path = match resolved.provenance.winning_layer {
+                    crate::internal::ai::sources::resolver::ConfigLayer::Overlay => resolved
+                        .provenance
+                        .overlay_path
+                        .as_ref()
+                        .unwrap_or(&resolved.provenance.repository_path),
+                    _ => &resolved.provenance.repository_path,
+                }
+                .display()
+                .to_string();
+                let text = String::from_utf8(resolved.bytes).map_err(|error| {
+                    AgentsConfigLoadError::Resolve(format!(
+                        "agents.toml is not valid UTF-8 at '{path}': {error}"
+                    ))
+                })?;
+                Self::from_toml_str(&text)
+                    .map_err(|source| AgentsConfigLoadError::Parse { path, source })
+            }
+            Ok(None) => Self::load_or_default(&working_dir.join(".libra").join("agents.toml")),
+            Err(error) => Err(AgentsConfigLoadError::Resolve(error)),
         }
     }
 

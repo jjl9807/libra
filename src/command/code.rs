@@ -3101,11 +3101,9 @@ where
     // the TUI. Keep its construction here, before the per-turn config factory,
     // so both model `task` calls and Web controls observe the same budget,
     // approval, depth, and concurrency gates.
-    let agents_config_path = working_dir.join(".libra").join("agents.toml");
-    let agents_config = AgentsConfig::load_or_default(&agents_config_path).unwrap_or_else(|err| {
+    let agents_config = AgentsConfig::load_from_working_dir(working_dir).unwrap_or_else(|err| {
         tracing::warn!(
             error = %err,
-            path = %agents_config_path.display(),
             "failed to load agents.toml for headless task dispatch; using defaults"
         );
         AgentsConfig::default()
@@ -4485,24 +4483,19 @@ where
     // Load agent profiles
     let profiles = load_profiles(registry.working_dir());
     let agent_router = AgentProfileRouter::new(profiles);
-    // OC-Phase 5 P5.1 session bootstrap (v0.17.775): read the
-    // operator's `.libra/agents.toml` if present so
-    // `code.sub_agents.enabled` / `code.multi_agent.enabled` /
-    // `[code.budget]` / `[code.agents.*]` etc. actually take
-    // effect. Missing file degrades to `AgentsConfig::default()`
-    // (the previous hardcoded behavior) per `load_or_default`'s
-    // contract. Parse errors are surfaced as a warning rather than
-    // failing the session — a malformed config should not block an
-    // operator from starting `libra code` to fix it.
-    let agents_config_path = registry.working_dir().join(".libra").join("agents.toml");
-    let agents_config = AgentsConfig::load_or_default(&agents_config_path).unwrap_or_else(|err| {
-        tracing::warn!(
-            error = %err,
-            path = %agents_config_path.display(),
-            "failed to load agents.toml; falling back to AgentsConfig::default()",
-        );
-        AgentsConfig::default()
-    });
+    // OC-Phase 5 P5.1 session bootstrap: read `agents.toml` via the W4-06
+    // resolver so linked worktrees see the repository layer. Missing file
+    // degrades to `AgentsConfig::default()`. Parse errors are a warning
+    // rather than failing the session — a malformed config should not block
+    // an operator from starting `libra code` to fix it.
+    let agents_config =
+        AgentsConfig::load_from_working_dir(registry.working_dir()).unwrap_or_else(|err| {
+            tracing::warn!(
+                error = %err,
+                "failed to load agents.toml; falling back to AgentsConfig::default()",
+            );
+            AgentsConfig::default()
+        });
     // v0.17.804 source_call_log persistence wire-up: build the
     // pool with the per-session SeaORM connection so every
     // SourcePool tool call lands a `source_call_log` row. Soft

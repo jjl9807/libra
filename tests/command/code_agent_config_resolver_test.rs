@@ -1,4 +1,4 @@
-//! W4-06/W4-11: Code/Agent config resolver + security loader contract.
+//! W4-06/W4-11/W4-12: Code/Agent config resolver + security/extension loaders.
 //!
 //! L1 — deterministic. Does not lift linked-worktree preflight (W4-08).
 
@@ -7,12 +7,16 @@ use std::{fs, path::Path};
 use libra::{
     internal::{
         ai::{
+            agent::profile::{AgentsConfig, load_profiles},
+            automation::AutomationConfig,
+            commands::load_commands,
             hooks::{HookEvent, load_hook_config},
             prompt::{ContextMode, RuleCategory, load_rule},
             sandbox::{
                 load_approval_project_config, load_sandbox_config_network_access,
                 load_sandbox_deny_read_paths,
             },
+            skills::load_skills,
             sources::{
                 BUILTIN_MCP_SOURCE_SLUG, SourceEnablement,
                 resolver::{
@@ -22,7 +26,10 @@ use libra::{
                 source_config_view_from_project_config,
             },
         },
-        config_ownership::{ConfigConsumerKind, ConfigOwner},
+        config_ownership::{
+            CODE_AGENT_CONFIG_OWNERSHIP, ConfigConsumerKind, ConfigOwner, ReadResolution,
+            SurfaceKind,
+        },
         worktree_scope::{RequestScope, WorktreeScope},
     },
     utils::test::ChangeDirGuard,
@@ -851,5 +858,262 @@ fn repository_disabled_pretool_stays_disabled() {
     assert!(
         !linked_pre.enabled,
         "overlay must not re-enable a repository PreToolUse that is disabled"
+    );
+}
+
+#[test]
+fn code_agent_config_resolves_repository_layer_in_linked() {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::new();
+    for surface in CODE_AGENT_CONFIG_OWNERSHIP {
+        assert!(
+            seen.insert(surface.location),
+            "duplicate inventory location {}",
+            surface.location
+        );
+    }
+
+    let unified_file_or_dir = [
+        ("config.toml", ConfigConsumerKind::Security),
+        ("sandbox.toml", ConfigConsumerKind::Security),
+        ("hooks.json", ConfigConsumerKind::Security),
+        ("rules", ConfigConsumerKind::Security),
+        ("contexts", ConfigConsumerKind::Security),
+        ("agents.toml", ConfigConsumerKind::Extension),
+        ("automations.toml", ConfigConsumerKind::Extension),
+        ("agents", ConfigConsumerKind::Extension),
+        ("commands", ConfigConsumerKind::Extension),
+        ("skills", ConfigConsumerKind::Extension),
+    ];
+    for (location, consumer) in unified_file_or_dir {
+        let surface = surface_by_location(location).expect(location);
+        assert_eq!(surface.consumer, consumer, "{location} consumer");
+        assert_eq!(
+            surface.resolution,
+            ReadResolution::UnifiedResolver,
+            "{location} must use UnifiedResolver"
+        );
+        assert_eq!(
+            surface.owner,
+            ConfigOwner::RepositoryWithOptionalOverlay,
+            "{location} owner"
+        );
+        match surface.kind {
+            SurfaceKind::File => {
+                // File surfaces are resolvable as files.
+            }
+            SurfaceKind::Directory => {}
+            SurfaceKind::Store => panic!("{location} should not be a store"),
+        }
+    }
+
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+
+    fs::write(
+        main.join(".libra").join("agents.toml"),
+        "[code.multi_agent]\nenabled = true\nmax_concurrent_subagents = 2\nmax_subagent_depth = 1\n",
+    )
+    .expect("repo agents.toml");
+    fs::write(
+        main.join(".libra").join("automations.toml"),
+        "[[rules]]\nid = \"repo-rule\"\n[rules.trigger]\nkind = \"vcs\"\nevent = \"post_commit\"\n[rules.action]\nkind = \"prompt\"\nprompt = \"repo automation\"\n",
+    )
+    .expect("repo automations.toml");
+    let agents_dir = main.join(".libra").join("agents");
+    fs::create_dir_all(&agents_dir).expect("agents dir");
+    fs::write(
+        agents_dir.join("repo_agent.md"),
+        "---\nname: repo_agent\ndescription: Repository agent\ntools: []\nmodel: default\n---\nbody\n",
+    )
+    .expect("repo agent profile");
+    fs::write(
+        agents_dir.join("shared.md"),
+        "---\nname: shared_agent\ndescription: Repository shared\ntools: []\nmodel: default\n---\nrepo body\n",
+    )
+    .expect("repo shared agent");
+    let commands_dir = main.join(".libra").join("commands");
+    fs::create_dir_all(&commands_dir).expect("commands dir");
+    fs::write(
+        commands_dir.join("repo_cmd.md"),
+        "---\nname: repo_cmd\ndescription: Repository command\n---\nRepo $ARGUMENTS\n",
+    )
+    .expect("repo command");
+    fs::write(
+        commands_dir.join("shared.md"),
+        "---\nname: shared_cmd\ndescription: Repository shared command\n---\nRepo shared $ARGUMENTS\n",
+    )
+    .expect("repo shared command");
+    let skills_dir = main.join(".libra").join("skills");
+    fs::create_dir_all(&skills_dir).expect("skills dir");
+    fs::write(
+        skills_dir.join("repo_skill.md"),
+        "---\nname = \"repo_skill\"\n---\nRepository skill body\n",
+    )
+    .expect("repo skill");
+    fs::write(
+        skills_dir.join("shared.md"),
+        "---\nname = \"shared_skill\"\ndescription = \"Repository shared skill\"\n---\nbody\n",
+    )
+    .expect("repo shared skill");
+
+    let linked_agents = AgentsConfig::load_from_working_dir(&wt).expect("linked agents.toml");
+    assert!(
+        linked_agents.multi_agent.enabled,
+        "repository agents.toml must be visible in linked worktree"
+    );
+
+    let linked_automation =
+        AutomationConfig::load_from_working_dir(&wt).expect("linked automations.toml");
+    assert!(
+        linked_automation
+            .rules
+            .iter()
+            .any(|rule| rule.id == "repo-rule"),
+        "repository automations.toml must be visible in linked worktree"
+    );
+
+    let profiles = load_profiles(&wt);
+    assert!(
+        profiles.iter().any(|profile| profile.name == "repo_agent"),
+        "repository agent profile must be visible in linked worktree"
+    );
+
+    let commands = load_commands(&wt);
+    assert!(
+        commands.iter().any(|command| command.name == "repo_cmd"),
+        "repository command must be visible in linked worktree"
+    );
+
+    let skills = load_skills(&wt);
+    assert!(
+        skills.iter().any(|skill| skill.name == "repo_skill"),
+        "repository skill must be visible in linked worktree"
+    );
+
+    let overlay_gitdir = wt.join(".libra");
+    fs::write(
+        overlay_gitdir.join("agents.toml"),
+        "[code.multi_agent]\nenabled = false\n",
+    )
+    .expect("overlay agents.toml");
+    fs::write(
+        overlay_gitdir.join("automations.toml"),
+        "[[rules]]\nid = \"overlay-rule\"\n[rules.trigger]\nkind = \"vcs\"\nevent = \"post_commit\"\n[rules.action]\nkind = \"prompt\"\nprompt = \"overlay automation\"\n",
+    )
+    .expect("overlay automations.toml");
+    let overlay_agents = overlay_gitdir.join("agents");
+    fs::create_dir_all(&overlay_agents).expect("overlay agents dir");
+    fs::write(
+        overlay_agents.join("shared.md"),
+        "---\nname: shared_agent\ndescription: Overlay shared\ntools: []\nmodel: default\n---\noverlay body\n",
+    )
+    .expect("overlay shared agent");
+    let overlay_commands = overlay_gitdir.join("commands");
+    fs::create_dir_all(&overlay_commands).expect("overlay commands dir");
+    fs::write(
+        overlay_commands.join("shared.md"),
+        "---\nname: shared_cmd\ndescription: Overlay shared command\n---\nOverlay shared $ARGUMENTS\n",
+    )
+    .expect("overlay shared command");
+    let overlay_skills = overlay_gitdir.join("skills");
+    fs::create_dir_all(&overlay_skills).expect("overlay skills dir");
+    fs::write(
+        overlay_skills.join("shared.md"),
+        "---\nname = \"shared_skill\"\ndescription = \"Overlay shared skill\"\n---\nbody\n",
+    )
+    .expect("overlay shared skill");
+
+    let overlay_agents_cfg =
+        AgentsConfig::load_from_working_dir(&wt).expect("overlay agents.toml");
+    assert!(
+        !overlay_agents_cfg.multi_agent.enabled,
+        "extension overlay must win on agents.toml"
+    );
+
+    let overlay_automation =
+        AutomationConfig::load_from_working_dir(&wt).expect("overlay automations.toml");
+    assert!(
+        overlay_automation
+            .rules
+            .iter()
+            .any(|rule| rule.id == "overlay-rule"),
+        "extension overlay must win on automations.toml"
+    );
+    assert!(
+        !overlay_automation
+            .rules
+            .iter()
+            .any(|rule| rule.id == "repo-rule"),
+        "file overlay replace must not keep repository-only automation rules"
+    );
+
+    let overlay_profiles = load_profiles(&wt);
+    let shared_agent = overlay_profiles
+        .iter()
+        .find(|profile| profile.name == "shared_agent")
+        .expect("shared agent");
+    assert_eq!(
+        shared_agent.description, "Overlay shared",
+        "same-name agent overlay must win"
+    );
+    assert!(
+        overlay_profiles
+            .iter()
+            .any(|profile| profile.name == "repo_agent"),
+        "repository-only agent must remain visible beside overlay"
+    );
+
+    let overlay_cmds = load_commands(&wt);
+    let shared_cmd = overlay_cmds
+        .iter()
+        .find(|command| command.name == "shared_cmd")
+        .expect("shared command");
+    assert_eq!(
+        shared_cmd.description, "Overlay shared command",
+        "same-name command overlay must win"
+    );
+    assert!(
+        overlay_cmds.iter().any(|command| command.name == "repo_cmd"),
+        "repository-only command must remain visible beside overlay"
+    );
+
+    let overlay_skills_loaded = load_skills(&wt);
+    let shared_skill = overlay_skills_loaded
+        .iter()
+        .find(|skill| skill.name == "shared_skill")
+        .expect("shared skill");
+    assert_eq!(
+        shared_skill.description, "Overlay shared skill",
+        "same-name skill overlay must win"
+    );
+    assert!(
+        overlay_skills_loaded
+            .iter()
+            .any(|skill| skill.name == "repo_skill"),
+        "repository-only skill must remain visible beside overlay"
+    );
+}
+
+#[test]
+fn linked_automation_dispatch_disabled_with_warning_before_w4() {
+    let (_repo, parent) = repo_with_linked_worktree();
+    let wt = parent.path().join("wt");
+
+    fs::write(wt.join("b.txt"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], &wt), "add in wt");
+    let commit = run_libra_command(&["commit", "-m", "wt commit", "--no-verify"], &wt);
+    assert_cli_success(&commit, "commit in linked worktree");
+
+    let stderr = String::from_utf8_lossy(&commit.stderr);
+    let warnings = stderr
+        .matches("automation dispatch is disabled in linked worktrees")
+        .count();
+    assert_eq!(
+        warnings, 1,
+        "W4-12 must keep linked automation dispatch disabled with exactly one warning \
+         (0 = silent skip, >1 = spam): {stderr}"
     );
 }
