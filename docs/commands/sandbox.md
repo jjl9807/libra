@@ -30,7 +30,11 @@ includes `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `.azure`, `.docker`,
 `~/.config/hub`, `~/.kube`, `~/.config/libra/vault`, Firefox, Chrome,
 Chromium, and Brave profile directories, macOS `Library/Cookies`, and
 `/etc/shadow`. Repos can append project-specific paths with
-`.libra/sandbox.toml` `deny_read = [...]`.
+`.libra/sandbox.toml` `deny_read = [...]`. Unreadable or malformed
+`sandbox.toml` fails closed (the command does not fall back to an empty
+policy). In a linked worktree the repository file is the baseline; a
+per-worktree overlay may only tighten `deny_read` / `[sandbox.network]`
+and cannot switch `denied` → `full`.
 
 ## Human Output
 

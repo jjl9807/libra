@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, OnceLock},
@@ -24,7 +25,10 @@ static WORKSPACE_CONTEXT_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedWorkspaceS
     OnceLock::new();
 
 /// Build the dynamic prompt section for the current workspace and intent.
-pub fn build_dynamic_prompt_section(working_dir: &Path, intent: TaskIntent) -> String {
+pub fn build_dynamic_prompt_section(
+    working_dir: &Path,
+    intent: TaskIntent,
+) -> Result<String, String> {
     build_dynamic_prompt_section_with_budget(working_dir, intent, None)
 }
 
@@ -32,15 +36,15 @@ pub fn build_dynamic_prompt_section_with_budget(
     working_dir: &Path,
     intent: TaskIntent,
     context_budget: Option<&ContextBudget>,
-) -> String {
+) -> Result<String, String> {
     let budget = context_budget.cloned().unwrap_or_default();
-    [
+    Ok([
         build_intent_section(intent),
-        cached_workspace_section(working_dir),
+        cached_workspace_section(working_dir)?,
         build_intent_tool_policy_section(intent),
         budget.render_plan_section(),
     ]
-    .join("\n\n")
+    .join("\n\n"))
 }
 
 fn build_intent_section(intent: TaskIntent) -> String {
@@ -84,36 +88,43 @@ fn intent_guidance(intent: TaskIntent) -> &'static str {
     }
 }
 
-fn cached_workspace_section(working_dir: &Path) -> String {
+fn cached_workspace_section(working_dir: &Path) -> Result<String, String> {
     let key = cache_key(working_dir);
     let cache = WORKSPACE_CONTEXT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
-    if let Ok(mut guard) = cache.lock() {
+    let durable = if let Ok(mut guard) = cache.lock() {
         if let Some(cached) = guard.get(&key)
             && cached.captured_at.elapsed() < CACHE_TTL
         {
-            return cached.content.clone();
+            cached.content.clone()
+        } else {
+            let content = build_durable_workspace_section(working_dir);
+            guard.insert(
+                key,
+                CachedWorkspaceSection {
+                    captured_at: Instant::now(),
+                    content: content.clone(),
+                },
+            );
+            content
         }
+    } else {
+        build_durable_workspace_section(working_dir)
+    };
 
-        let content = build_workspace_section(working_dir);
-        guard.insert(
-            key,
-            CachedWorkspaceSection {
-                captured_at: Instant::now(),
-                content: content.clone(),
-            },
-        );
-        return content;
-    }
-
-    build_workspace_section(working_dir)
+    // Security rules/contexts must be re-probed every build so a newly
+    // unreadable or tightened overlay cannot ride the workspace cache.
+    let project_context = project_context_files(working_dir)?;
+    Ok(format!(
+        "{durable}\n\nsource=filesystem trust=untrusted budget_tokens_max=1600\n{project_context}"
+    ))
 }
 
 fn cache_key(working_dir: &Path) -> PathBuf {
     fs::canonicalize(working_dir).unwrap_or_else(|_| working_dir.to_path_buf())
 }
 
-fn build_workspace_section(working_dir: &Path) -> String {
+fn build_durable_workspace_section(working_dir: &Path) -> String {
     let branch = git_output(working_dir, &["branch", "--show-current"])
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_string());
@@ -122,16 +133,14 @@ fn build_workspace_section(working_dir: &Path) -> String {
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     let workspace = workspace_detection(working_dir);
-    let project_context = project_context_files(working_dir);
 
     format!(
-        "## Dynamic Workspace Context\n\nsource=libra status --short trust=trusted budget_tokens_max=900\nworking_dir={}\nbranch={}\nunpushed_commits={}\nstatus_short:\n```text\n{}\n```\n\nsource=filesystem trust=trusted budget_tokens_max=240\n{}\n\nsource=filesystem trust=untrusted budget_tokens_max=1600\n{}",
+        "## Dynamic Workspace Context\n\nsource=libra status --short trust=trusted budget_tokens_max=900\nworking_dir={}\nbranch={}\nunpushed_commits={}\nstatus_short:\n```text\n{}\n```\n\nsource=filesystem trust=trusted budget_tokens_max=240\n{}",
         working_dir.display(),
         branch.trim(),
         unpushed.trim(),
         status.trim(),
-        workspace,
-        project_context
+        workspace
     )
 }
 
@@ -173,51 +182,118 @@ fn workspace_detection(working_dir: &Path) -> String {
     )
 }
 
-fn project_context_files(working_dir: &Path) -> String {
+fn project_context_files(working_dir: &Path) -> Result<String, String> {
     let mut paths = vec![working_dir.join("AGENTS.md"), working_dir.join("CLAUDE.md")];
-    paths.extend(project_rule_paths(working_dir));
+    let rule_paths = project_rule_paths(working_dir)?;
+    paths.extend(rule_paths.iter().cloned());
     paths.sort();
 
     let mut sections = Vec::new();
     for path in paths {
-        if !path.is_file() {
+        let is_security_rule = rule_paths.iter().any(|rule| rule == &path);
+        let content = if is_security_rule {
+            match super::loader::probe_security_file(&path)? {
+                Some(content) => content,
+                None => {
+                    return Err(format!(
+                        "failed to read security config `{}`: not found",
+                        path.display()
+                    ));
+                }
+            }
+        } else if !path.is_file() {
             continue;
-        }
-        if let Ok(content) = fs::read_to_string(&path) {
-            let relative = path
-                .strip_prefix(working_dir)
-                .map(|value| value.display().to_string())
-                .unwrap_or_else(|_| path.display().to_string());
-            sections.push(format!(
-                "file={} trust=untrusted\n~~~markdown\n{}\n~~~",
-                relative,
-                truncate_context_file(&content)
-            ));
-        }
+        } else {
+            match fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(_) => continue,
+            }
+        };
+        let relative = path
+            .strip_prefix(working_dir)
+            .map(|value| value.display().to_string())
+            .unwrap_or_else(|_| path.display().to_string());
+        sections.push(format!(
+            "file={} trust=untrusted\n~~~markdown\n{}\n~~~",
+            relative,
+            truncate_context_file(&content)
+        ));
     }
 
-    if sections.is_empty() {
+    Ok(if sections.is_empty() {
         "project_context_files=none".to_string()
     } else {
         sections.join("\n\n")
-    }
+    })
 }
 
-fn project_rule_paths(working_dir: &Path) -> Vec<PathBuf> {
-    let rules_dir = working_dir.join(".libra").join("rules");
-    let Ok(entries) = fs::read_dir(rules_dir) else {
-        return Vec::new();
-    };
-
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+fn project_rule_paths(working_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let (repository, overlay) = super::loader::project_security_dir_paths(working_dir, "rules")?;
+    let mut paths = md_files_in(&repository)?;
+    let repo_names: Vec<String> = paths
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
         })
-        .collect()
+        .collect();
+    if let Some(overlay) = overlay {
+        for path in md_files_in(&overlay)? {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if repo_names.iter().any(|repo_name| repo_name == name) {
+                continue;
+            }
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn md_files_in(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if dir.as_os_str().is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read security config `{}`: {error}",
+                dir.display()
+            ));
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read security config `{}`: {error}",
+                dir.display()
+            )
+        })?;
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
+        {
+            // Dangling symlinks / non-files named `*.md` fail closed here so
+            // `is_file()` later cannot silently drop them.
+            match super::loader::probe_security_file(&path)? {
+                Some(_) => paths.push(path),
+                None => {
+                    return Err(format!(
+                        "failed to read security config `{}`: not found",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(paths)
 }
 
 fn truncate_context_file(content: &str) -> String {

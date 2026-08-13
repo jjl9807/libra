@@ -1,4 +1,4 @@
-//! W4-06: Code/Agent config resolver scope/precedence contract.
+//! W4-06/W4-11: Code/Agent config resolver + security loader contract.
 //!
 //! L1 — deterministic. Does not lift linked-worktree preflight (W4-08).
 
@@ -6,9 +6,21 @@ use std::{fs, path::Path};
 
 use libra::{
     internal::{
-        ai::sources::resolver::{
-            ConfigLayer, ConfigResolveError, resolve_config_dir, resolve_config_file,
-            surface_by_location,
+        ai::{
+            hooks::{HookEvent, load_hook_config},
+            prompt::{ContextMode, RuleCategory, load_rule},
+            sandbox::{
+                load_approval_project_config, load_sandbox_config_network_access,
+                load_sandbox_deny_read_paths,
+            },
+            sources::{
+                BUILTIN_MCP_SOURCE_SLUG, SourceEnablement,
+                resolver::{
+                    ConfigLayer, ConfigResolveError, resolve_config_dir, resolve_config_file,
+                    surface_by_location,
+                },
+                source_config_view_from_project_config,
+            },
         },
         config_ownership::{ConfigConsumerKind, ConfigOwner},
         worktree_scope::{RequestScope, WorktreeScope},
@@ -424,5 +436,420 @@ fn code_agent_config_resolver_scope_precedence() {
     assert_eq!(
         surface_by_location("agents.toml").expect("agents").consumer,
         ConfigConsumerKind::Extension
+    );
+}
+
+#[test]
+fn sandbox_and_approval_config_not_split_brained_across_scopes() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+
+    fs::write(
+        main.join(".libra").join("sandbox.toml"),
+        r#"deny_read = ["repo-secret"]
+[sandbox.network]
+mode = "denied"
+"#,
+    )
+    .expect("repo sandbox");
+    fs::write(
+        wt.join(".libra").join("sandbox.toml"),
+        r#"deny_read = []
+[sandbox.network]
+mode = "full"
+"#,
+    )
+    .expect("overlay sandbox loosen");
+
+    fs::write(
+        main.join(".libra").join("config.toml"),
+        r#"[approval]
+ttl_seconds = 60
+protected_branches = ["main", "release"]
+allowed_network_domains = ["github.com"]
+no_cache_unknown_network = true
+
+[mcp]
+enabled = true
+"#,
+    )
+    .expect("repo approval+mcp");
+    fs::write(
+        wt.join(".libra").join("config.toml"),
+        r#"[approval]
+ttl_seconds = 3600
+protected_branches = ["develop"]
+allowed_network_domains = ["example.com"]
+no_cache_unknown_network = false
+
+[mcp]
+enabled = false
+"#,
+    )
+    .expect("overlay approval+mcp loosen");
+
+    let main_network = load_sandbox_config_network_access(main)
+        .expect("main sandbox")
+        .expect("network section");
+    let linked_network = load_sandbox_config_network_access(&wt)
+        .expect("linked sandbox")
+        .expect("network section");
+    assert!(
+        main_network.is_denied() && linked_network.is_denied(),
+        "overlay mode=full must not loosen repository denied network"
+    );
+
+    let main_deny = load_sandbox_deny_read_paths(main).expect("main deny");
+    let linked_deny = load_sandbox_deny_read_paths(&wt).expect("linked deny");
+    assert!(
+        main_deny.iter().any(|p| p.ends_with("repo-secret")),
+        "repository deny_read must load on main"
+    );
+    assert!(
+        linked_deny.iter().any(|p| p.ends_with("repo-secret")),
+        "overlay cannot drop repository deny_read"
+    );
+
+    let main_approval = load_approval_project_config(main).expect("main approval");
+    let linked_approval = load_approval_project_config(&wt).expect("linked approval");
+    assert_eq!(main_approval.ttl, Some(std::time::Duration::from_secs(60)));
+    assert_eq!(
+        linked_approval.ttl,
+        Some(std::time::Duration::from_secs(60)),
+        "overlay cannot lengthen approval TTL"
+    );
+    assert!(
+        linked_approval
+            .cache_policy
+            .protected_branches
+            .iter()
+            .any(|b| b == "main")
+            && linked_approval
+                .cache_policy
+                .protected_branches
+                .iter()
+                .any(|b| b == "release"),
+        "overlay cannot drop repository protected branches"
+    );
+    assert!(
+        linked_approval.cache_policy.no_cache_unknown_network,
+        "overlay cannot clear no_cache_unknown_network"
+    );
+    assert_eq!(
+        linked_approval.cache_policy.allowed_network_domains,
+        Vec::<String>::new(),
+        "disjoint overlay allowlist intersects to empty (tighter)"
+    );
+
+    let mcp = source_config_view_from_project_config(&wt).expect("mcp view");
+    let entry = mcp
+        .source(BUILTIN_MCP_SOURCE_SLUG)
+        .expect("builtin mcp present");
+    assert!(
+        entry.enablement.is_enabled() && entry.enablement == SourceEnablement::ProjectConfig,
+        "overlay cannot disable repository-enabled builtin MCP"
+    );
+}
+
+#[test]
+fn approval_overlay_empty_allowlist_tightens_to_empty() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+
+    fs::write(
+        main.join(".libra").join("config.toml"),
+        r#"[approval]
+allowed_network_domains = ["github.com"]
+no_cache_unknown_network = true
+"#,
+    )
+    .expect("repo approval allowlist");
+    fs::write(
+        wt.join(".libra").join("config.toml"),
+        r#"[approval]
+allowed_network_domains = []
+"#,
+    )
+    .expect("overlay explicit empty allowlist");
+
+    let main_approval = load_approval_project_config(main).expect("main approval");
+    let linked_approval = load_approval_project_config(&wt).expect("linked approval");
+    assert_eq!(
+        main_approval.cache_policy.allowed_network_domains,
+        vec!["github.com".to_string()]
+    );
+    assert!(
+        linked_approval
+            .cache_policy
+            .allowed_network_domains
+            .is_empty(),
+        "explicit empty overlay allowlist must revoke repository cached-network domains"
+    );
+    assert!(
+        linked_approval.cache_policy.no_cache_unknown_network,
+        "overlay omission must not clear repository no_cache_unknown_network"
+    );
+}
+
+#[test]
+fn approval_overlay_cannot_loosen_default_ttl_or_protected_branches() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+
+    fs::write(
+        main.join(".libra").join("config.toml"),
+        "[mcp]\nenabled = true\n",
+    )
+    .expect("repo omits approval section");
+    fs::write(
+        wt.join(".libra").join("config.toml"),
+        r#"[approval]
+ttl_seconds = 3600
+protected_branches = ["feature"]
+"#,
+    )
+    .expect("overlay longer ttl + replace branches");
+
+    let linked = load_approval_project_config(&wt).expect("linked approval");
+    assert_eq!(
+        linked.ttl,
+        Some(std::time::Duration::from_secs(300)),
+        "overlay cannot lengthen the 300s default TTL when repository omits ttl_seconds"
+    );
+    assert!(
+        linked
+            .cache_policy
+            .protected_branches
+            .iter()
+            .any(|b| b == "main"),
+        "overlay cannot drop default protected branch `main`"
+    );
+    assert!(
+        linked
+            .cache_policy
+            .protected_branches
+            .iter()
+            .any(|b| b == "feature"),
+        "overlay may add protected branches"
+    );
+}
+
+#[test]
+fn repository_layer_hooks_visible_in_linked_worktree() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+    fs::write(
+        main.join(".libra").join("hooks.json"),
+        r#"{"hooks":[{"event":"pre_tool_use","matcher":"shell","command":"echo repo-block"}]}"#,
+    )
+    .expect("repo hooks");
+
+    let main_hooks = load_hook_config(main).expect("main hooks");
+    let linked_hooks = load_hook_config(&wt).expect("linked hooks");
+    assert!(
+        main_hooks
+            .hooks
+            .iter()
+            .any(|h| h.event == HookEvent::PreToolUse && h.command.contains("repo-block"))
+    );
+    assert!(
+        linked_hooks
+            .hooks
+            .iter()
+            .any(|h| h.event == HookEvent::PreToolUse && h.command.contains("repo-block")),
+        "repository PreToolUse must remain visible in the linked worktree"
+    );
+}
+
+#[test]
+fn hook_overlay_cannot_remove_repository_security_hooks() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+    fs::write(
+        main.join(".libra").join("hooks.json"),
+        r#"{"hooks":[{"event":"pre_tool_use","matcher":"shell","command":"echo repo-block","enabled":true}]}"#,
+    )
+    .expect("repo hooks");
+    fs::write(
+        wt.join(".libra").join("hooks.json"),
+        r#"{"hooks":[{"event":"pre_tool_use","matcher":"shell","command":"echo repo-block","enabled":false},{"event":"post_tool_use","matcher":"*","command":"echo overlay-post"}]}"#,
+    )
+    .expect("overlay disable + extra");
+
+    let linked = load_hook_config(&wt).expect("linked hooks");
+    let pre = linked
+        .hooks
+        .iter()
+        .find(|h| h.event == HookEvent::PreToolUse && h.command.contains("repo-block"))
+        .expect("repository PreToolUse must survive overlay disable");
+    assert!(
+        pre.enabled,
+        "overlay enabled=false must not disable repository PreToolUse"
+    );
+    assert!(
+        linked
+            .hooks
+            .iter()
+            .any(|h| h.event == HookEvent::PostToolUse && h.command.contains("overlay-post")),
+        "overlay may add non-PreToolUse hooks"
+    );
+}
+
+#[test]
+fn sub_agent_and_task_workdir_hooks_not_split_brained() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+    fs::write(
+        main.join(".libra").join("hooks.json"),
+        r#"{"hooks":[{"event":"pre_tool_use","matcher":"*","command":"echo repo-block"}]}"#,
+    )
+    .expect("repo hooks");
+
+    let subdir = main.join("crates").join("task-src");
+    fs::create_dir_all(&subdir).expect("task subdir");
+    let fake_task = parent.path().join("isolated-task");
+    fs::create_dir_all(fake_task.join(".libra")).expect("fake task libra");
+    fs::write(
+        fake_task.join(".libra").join("hooks.json"),
+        r#"{"hooks":[]}"#,
+    )
+    .expect("empty fake hooks");
+
+    let from_subdir = load_hook_config(&subdir).expect("subdir hooks");
+    let from_linked = load_hook_config(&wt).expect("linked hooks");
+    assert!(
+        from_subdir
+            .hooks
+            .iter()
+            .any(|h| h.event == HookEvent::PreToolUse && h.command.contains("repo-block")),
+        "task cwd inside the repository must still see repository PreToolUse"
+    );
+    assert!(
+        from_linked
+            .hooks
+            .iter()
+            .any(|h| h.event == HookEvent::PreToolUse && h.command.contains("repo-block")),
+        "linked worktree task cwd must still see repository PreToolUse"
+    );
+
+    let isolated = load_hook_config(&fake_task).expect("isolated fake dir");
+    assert!(
+        isolated.hooks.is_empty(),
+        "a non-repo task dir is not a Libra worktree; executor must reuse the session runner instead of reloading here"
+    );
+}
+
+#[test]
+fn repository_layer_rules_and_contexts_visible_in_linked() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+
+    let rules_dir = main.join(".libra").join("rules");
+    fs::create_dir_all(&rules_dir).expect("rules dir");
+    fs::write(rules_dir.join("base.md"), "repository-base-rule\n").expect("repo base rule");
+    let overlay_rules = wt.join(".libra").join("rules");
+    fs::create_dir_all(&overlay_rules).expect("overlay rules");
+    fs::write(overlay_rules.join("base.md"), "overlay-must-not-win\n").expect("overlay base");
+    fs::write(overlay_rules.join("extra.md"), "overlay-extra-ok\n").expect("overlay extra");
+
+    let contexts_dir = main.join(".libra").join("contexts");
+    fs::create_dir_all(&contexts_dir).expect("contexts dir");
+    fs::write(contexts_dir.join("dev.md"), "repository-dev-context\n").expect("repo context");
+    let overlay_contexts = wt.join(".libra").join("contexts");
+    fs::create_dir_all(&overlay_contexts).expect("overlay contexts");
+    fs::write(
+        overlay_contexts.join("dev.md"),
+        "overlay-dev-must-not-win\n",
+    )
+    .expect("overlay context");
+
+    let main_rule = load_rule(RuleCategory::Base, main).expect("main rule");
+    let linked_rule = load_rule(RuleCategory::Base, &wt).expect("linked rule");
+    assert_eq!(main_rule.content.trim(), "repository-base-rule");
+    assert_eq!(
+        linked_rule.content.trim(),
+        "repository-base-rule",
+        "overlay must not replace repository rules"
+    );
+
+    let main_ctx = ContextMode::Dev.load_content(main).expect("main context");
+    let linked_ctx = ContextMode::Dev.load_content(&wt).expect("linked context");
+    assert_eq!(main_ctx.trim(), "repository-dev-context");
+    assert_eq!(
+        linked_ctx.trim(),
+        "repository-dev-context",
+        "overlay must not replace repository contexts"
+    );
+}
+
+#[test]
+fn blank_repository_rule_blocks_overlay_same_name() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+    let rules_dir = main.join(".libra").join("rules");
+    fs::create_dir_all(&rules_dir).expect("rules dir");
+    fs::write(rules_dir.join("base.md"), "   \n").expect("blank repo rule");
+    let overlay_rules = wt.join(".libra").join("rules");
+    fs::create_dir_all(&overlay_rules).expect("overlay rules");
+    fs::write(
+        overlay_rules.join("base.md"),
+        "overlay-must-not-replace-blank\n",
+    )
+    .expect("overlay same-name rule");
+
+    let linked = load_rule(RuleCategory::Base, &wt).expect("linked rule");
+    assert!(
+        !linked.content.contains("overlay-must-not-replace-blank"),
+        "blank repository file must block overlay replacement"
+    );
+    assert!(
+        linked.content.contains("{working_dir}"),
+        "blank repository rule should fall back to embedded, not overlay"
+    );
+}
+
+#[test]
+fn repository_disabled_pretool_stays_disabled() {
+    let (repo, parent) = repo_with_linked_worktree();
+    let main = repo.path();
+    let wt = parent.path().join("wt");
+    fs::write(
+        main.join(".libra").join("hooks.json"),
+        r#"{"hooks":[{"event":"pre_tool_use","matcher":"shell","command":"echo intentionally-off","enabled":false}]}"#,
+    )
+    .expect("repo disabled hook");
+    fs::write(
+        wt.join(".libra").join("hooks.json"),
+        r#"{"hooks":[{"event":"pre_tool_use","matcher":"shell","command":"echo intentionally-off","enabled":true}]}"#,
+    )
+    .expect("overlay re-enable attempt");
+
+    let main_hooks = load_hook_config(main).expect("main hooks");
+    let linked = load_hook_config(&wt).expect("linked hooks");
+    let main_pre = main_hooks
+        .hooks
+        .iter()
+        .find(|h| h.event == HookEvent::PreToolUse && h.command.contains("intentionally-off"))
+        .expect("repository disabled PreToolUse");
+    assert!(
+        !main_pre.enabled,
+        "repository enabled=false must be preserved"
+    );
+    let linked_pre = linked
+        .hooks
+        .iter()
+        .find(|h| h.event == HookEvent::PreToolUse && h.command.contains("intentionally-off"))
+        .expect("disabled PreToolUse survives overlay");
+    assert!(
+        !linked_pre.enabled,
+        "overlay must not re-enable a repository PreToolUse that is disabled"
     );
 }

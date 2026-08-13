@@ -71,24 +71,38 @@ impl RequestScope {
     /// the repository is gone either way, and the ambient path reports that
     /// with the diagnostics it always had.
     pub fn resolve(workdir: PathBuf) -> Option<Self> {
-        let (storage, worktree_root, gitdir) =
-            util::try_get_request_paths(Some(workdir.clone())).ok()?;
-        // The SCOPE comes from the gitdir this same walk produced, never from
-        // a second observation: resolving it from the cwd while the paths come
-        // from `workdir` is two reads, and a `set_current_dir` between them
-        // pairs worktree A's scope key with worktree B's gitdir and storage —
-        // every scoped row then written under A's key into B's repository.
-        let scope = match util::worktree_id_for_gitdir(&gitdir) {
-            Some(id) => WorktreeScope::Linked(id),
-            None => WorktreeScope::Main,
-        };
-        Some(Self {
-            scope,
-            workdir,
-            gitdir,
-            storage,
-            worktree_root,
-        })
+        Self::try_resolve(workdir).ok().flatten()
+    }
+
+    /// Like [`Self::resolve`], but distinguishes "not a repository" from a
+    /// damaged worktree (unreadable `commondir`, dangling gitdir, etc.).
+    ///
+    /// `Ok(None)` is a genuine non-repo workdir. Any other filesystem error is
+    /// `Err` so security loaders can fail closed instead of falling back to a
+    /// local `.libra` overlay.
+    pub fn try_resolve(workdir: PathBuf) -> Result<Option<Self>, std::io::Error> {
+        match util::try_get_request_paths(Some(workdir.clone())) {
+            Ok((storage, worktree_root, gitdir)) => {
+                // The SCOPE comes from the gitdir this same walk produced, never from
+                // a second observation: resolving it from the cwd while the paths come
+                // from `workdir` is two reads, and a `set_current_dir` between them
+                // pairs worktree A's scope key with worktree B's gitdir and storage —
+                // every scoped row then written under A's key into B's repository.
+                let scope = match util::worktree_id_for_gitdir(&gitdir) {
+                    Some(id) => WorktreeScope::Linked(id),
+                    None => WorktreeScope::Main,
+                };
+                Ok(Some(Self {
+                    scope,
+                    workdir,
+                    gitdir,
+                    storage,
+                    worktree_root,
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 

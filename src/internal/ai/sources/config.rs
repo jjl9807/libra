@@ -11,6 +11,7 @@ use serde::Deserialize;
 
 use super::{
     BUILTIN_MCP_SOURCE_SLUG, McpSource, SourceEnablement, SourceKind, SourcePool, SourcePoolError,
+    security::{request_scope_for_workdir, resolve_security_file},
 };
 use crate::internal::ai::mcp::server::LibraMcpServer;
 
@@ -59,35 +60,103 @@ struct ProjectSourceConfig {
     mcp: Option<toml::Value>,
 }
 
-pub fn source_config_view_from_project_config(working_dir: &Path) -> SourceConfigView {
-    let path = working_dir.join(".libra").join("config.toml");
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return SourceConfigView::default();
-    };
-
-    let view = match source_config_view_from_toml(&contents) {
-        Ok(view) => view,
-        Err(error) => {
-            tracing::warn!(
-                target: "libra::ai::sources::config",
-                path = %path.display(),
-                error = %error,
-                "failed to parse source config; using default source view"
-            );
-            SourceConfigView::default()
+pub fn source_config_view_from_project_config(
+    working_dir: &Path,
+) -> Result<SourceConfigView, String> {
+    let view = if let Some(request) = request_scope_for_workdir(working_dir)? {
+        let resolved = resolve_security_file(&request, "config.toml")?;
+        let repository = parse_mcp_bytes(
+            &resolved.repository_bytes,
+            "repository",
+            &resolved.provenance.repository_path,
+        )?;
+        let overlay = match resolved.overlay_bytes.as_deref() {
+            Some(bytes) => {
+                let overlay_path = resolved
+                    .provenance
+                    .overlay_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("<overlay>"));
+                parse_mcp_bytes(bytes, "overlay", overlay_path)?
+            }
+            None => SourceConfigView::default(),
+        };
+        merge_mcp_tighten_only(repository, overlay)
+    } else {
+        let path = working_dir.join(".libra").join("config.toml");
+        match fs::read_to_string(&path) {
+            Ok(contents) => parse_mcp_bytes(contents.as_bytes(), "project", &path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                SourceConfigView::default()
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to read MCP config `{}`: {error}",
+                    path.display()
+                ));
+            }
         }
     };
 
     if view.source(BUILTIN_MCP_SOURCE_SLUG).is_some() {
         tracing::warn!(
             target: "libra::ai::sources::config",
-            path = %path.display(),
             source = BUILTIN_MCP_SOURCE_SLUG,
             "`[mcp]` project config is deprecated; treating it as the built-in MCP source view"
         );
     }
 
-    view
+    Ok(view)
+}
+
+fn parse_mcp_bytes(bytes: &[u8], layer: &str, path: &Path) -> Result<SourceConfigView, String> {
+    if bytes.is_empty() {
+        return Ok(SourceConfigView::default());
+    }
+    let contents = std::str::from_utf8(bytes).map_err(|error| {
+        format!(
+            "failed to parse MCP config ({layer} at `{}`): {error}",
+            path.display()
+        )
+    })?;
+    source_config_view_from_toml(contents).map_err(|error| {
+        super::security::format_security_parse_error(
+            "MCP config",
+            layer,
+            path,
+            super::security::toml_error_location(contents, &error),
+        )
+    })
+}
+
+/// Overlay cannot disable a repository-enabled builtin MCP source (implicit
+/// Builtin when `[mcp]` is absent counts as enabled). Overlay also cannot
+/// re-enable a repository-disabled source.
+fn merge_mcp_tighten_only(
+    repository: SourceConfigView,
+    overlay: SourceConfigView,
+) -> SourceConfigView {
+    let repo_entry = repository.source(BUILTIN_MCP_SOURCE_SLUG);
+    let overlay_entry = overlay.source(BUILTIN_MCP_SOURCE_SLUG);
+    match (repo_entry, overlay_entry) {
+        (Some(repo), _) => {
+            let mut view = SourceConfigView::default();
+            view.push(repo.clone());
+            view
+        }
+        (None, Some(overlay)) => {
+            // Repository has no `[mcp]` section → implicit Builtin enablement.
+            // Overlay `enabled = false` must not disable that default.
+            if overlay.enablement.is_enabled() {
+                let mut view = SourceConfigView::default();
+                view.push(overlay.clone());
+                view
+            } else {
+                SourceConfigView::default()
+            }
+        }
+        (None, None) => SourceConfigView::default(),
+    }
 }
 
 fn source_config_view_from_toml(contents: &str) -> Result<SourceConfigView, toml::de::Error> {
@@ -125,7 +194,8 @@ pub fn register_builtin_mcp_source_from_project_config(
     server: Arc<LibraMcpServer>,
     working_dir: &Path,
 ) -> Result<SourceConfigLoadReport, SourcePoolError> {
-    let view = source_config_view_from_project_config(working_dir);
+    let view =
+        source_config_view_from_project_config(working_dir).map_err(SourcePoolError::Internal)?;
     let legacy_mcp_config_mapped = view.source(BUILTIN_MCP_SOURCE_SLUG).is_some();
     let enablement = view
         .source(BUILTIN_MCP_SOURCE_SLUG)
@@ -215,8 +285,7 @@ mod tests {
     }
 
     /// Malformed TOML produces a parse error (NOT a silent default).
-    /// Pin so the production code path that warns + falls back to
-    /// `SourceConfigView::default()` is preceded by a recognisable
+    /// Pin so the W4-11 fail-closed loader is preceded by a recognisable
     /// error type.
     #[test]
     fn source_config_view_from_toml_malformed_returns_error() {

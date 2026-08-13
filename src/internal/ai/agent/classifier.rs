@@ -292,6 +292,8 @@ pub enum TaskIntentClassifierError {
     InvalidIntent(String),
     #[error("task intent classifier returned invalid JSON: {0}")]
     InvalidResponse(String),
+    #[error("failed to rebuild system prompt after task intent classification: {0}")]
+    Prompt(String),
 }
 
 #[cfg(test)]
@@ -307,6 +309,10 @@ mod tests {
         assert_eq!(
             TaskIntentClassifierError::InvalidResponse("trailing brace".to_string()).to_string(),
             "task intent classifier returned invalid JSON: trailing brace",
+        );
+        assert_eq!(
+            TaskIntentClassifierError::Prompt("unreadable rules".to_string()).to_string(),
+            "failed to rebuild system prompt after task intent classification: unreadable rules",
         );
     }
 

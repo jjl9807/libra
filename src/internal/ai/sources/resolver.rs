@@ -1,9 +1,10 @@
 //! W4-06: Code/Agent configuration resolver core.
 //!
 //! Callers pass an explicit [`RequestScope`] (scope + storage + gitdir pinned
-//! from one filesystem observation) and receive bytes + provenance. This
-//! module does **not** migrate production loaders (W4-11 / W4-12) and does
-//! **not** lift the linked worktree preflight (W4-08).
+//! from one filesystem observation) and receive bytes + provenance. W4-11
+//! migrates security-sensitive loaders onto this API; W4-12 migrates
+//! extension/automation loaders. This module does **not** lift the linked
+//! worktree preflight (W4-08).
 
 use std::{
     fs, io,

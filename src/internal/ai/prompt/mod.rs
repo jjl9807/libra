@@ -12,9 +12,11 @@
 //! use libra::internal::ai::prompt::{SystemPromptBuilder, ContextMode};
 //!
 //! let prompt = SystemPromptBuilder::new(std::path::Path::new("/my/project"))
+//!     .expect("load rules")
 //!     .with_context(ContextMode::Dev)
 //!     .extra_section("Project Info", "This is a web service")
-//!     .build();
+//!     .build()
+//!     .expect("build prompt");
 //! ```
 
 mod builder;
@@ -25,4 +27,5 @@ pub mod rules;
 
 pub use builder::SystemPromptBuilder;
 pub use context::ContextMode;
-pub use rules::RuleCategory;
+pub use loader::{load_all_rules, load_rule};
+pub use rules::{RuleCategory, RuleFile};

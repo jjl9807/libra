@@ -26,7 +26,7 @@ use super::{
 ///
 /// Held by the agent runtime for the duration of a session. The runner is
 /// inexpensive to clone-via-`HookRunner::load` and intentionally does not perform
-/// any work in its constructor.
+/// any work beyond reading config.
 #[derive(Debug)]
 pub struct HookRunner {
     config: HookConfig,
@@ -47,11 +47,27 @@ impl HookRunner {
 
     /// Load `hooks.json` from the project + user tiers and build a runner.
     ///
-    /// Boundary conditions: missing config files are tolerated (see
-    /// [`super::config::load_hook_config`]), so this constructor never fails.
-    pub fn load(working_dir: &Path) -> Self {
-        let config = super::config::load_hook_config(working_dir);
-        Self::new(config, working_dir.to_path_buf())
+    /// Missing config files are tolerated (empty runner). Unreadable or
+    /// malformed repository/overlay JSON fails closed.
+    pub fn load(working_dir: &Path) -> Result<Self, String> {
+        let config = super::config::load_hook_config(working_dir)?;
+        Ok(Self::new(config, working_dir.to_path_buf()))
+    }
+
+    /// Rebind to `working_dir` without reloading `hooks.json`.
+    ///
+    /// Isolated task worktrees keep the session's RequestScope-resolved hook
+    /// definitions but must execute them against the workspace being modified.
+    pub fn with_working_dir(&self, working_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            config: self.config.clone(),
+            working_dir: working_dir.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn working_dir(&self) -> &Path {
+        &self.working_dir
     }
 
     /// Quick existence check used by the agent runtime to skip hook plumbing

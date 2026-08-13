@@ -22,9 +22,11 @@ fn ai_dynamic_prompt_includes_intent_budget_sources_trust_and_status() {
     std::fs::write(repo.path().join("dirty.txt"), "untracked").expect("dirty file");
 
     let prompt = SystemPromptBuilder::new(repo.path())
+        .expect("builder")
         .with_intent(TaskIntent::Question)
         .with_dynamic_context()
-        .build();
+        .build()
+        .expect("prompt");
 
     assert!(prompt.contains("## Task Intent"));
     assert!(prompt.contains("intent=question"));
@@ -39,26 +41,46 @@ fn ai_dynamic_prompt_includes_intent_budget_sources_trust_and_status() {
 }
 
 #[test]
-fn ai_dynamic_prompt_reuses_rules_snapshot_within_ttl() {
+fn ai_dynamic_prompt_refreshes_security_rules_despite_workspace_cache() {
     let repo = TempDir::new().expect("temp repo");
     let rules_dir = repo.path().join(".libra").join("rules");
     std::fs::create_dir_all(&rules_dir).expect("rules dir");
     std::fs::write(rules_dir.join("team.md"), "initial team rule").expect("initial rule");
 
     let first = SystemPromptBuilder::new(repo.path())
+        .expect("builder")
         .with_intent(TaskIntent::Feature)
         .with_dynamic_context()
-        .build();
+        .build()
+        .expect("prompt");
     assert!(first.contains("initial team rule"));
 
     std::fs::write(rules_dir.join("team.md"), "updated team rule").expect("updated rule");
 
     let second = SystemPromptBuilder::new(repo.path())
+        .expect("builder")
         .with_intent(TaskIntent::Feature)
         .with_dynamic_context()
-        .build();
-    assert!(second.contains("initial team rule"));
-    assert!(!second.contains("updated team rule"));
+        .build()
+        .expect("prompt");
+    assert!(
+        second.contains("updated team rule"),
+        "security rules must not ride the workspace-status cache"
+    );
+    assert!(!second.contains("initial team rule"));
+
+    std::fs::remove_file(rules_dir.join("team.md")).expect("remove rule file");
+    std::fs::create_dir(rules_dir.join("team.md")).expect("unusable extra rule");
+    let error = SystemPromptBuilder::new(repo.path())
+        .expect("named category rules still load")
+        .with_intent(TaskIntent::Feature)
+        .with_dynamic_context()
+        .build()
+        .expect_err("unusable extra rule after cache populate must fail closed");
+    assert!(
+        error.contains("failed to read security config"),
+        "expected fail-closed security read, got: {error}"
+    );
 }
 
 #[test]
@@ -92,6 +114,25 @@ fn ai_dynamic_prompt_tool_policy_filters_mutating_tools_for_read_only_intents() 
     let feature_tools = registry.filter_by_intent(TaskIntent::Feature);
     assert!(feature_tools.contains(&"apply_patch".to_string()));
     assert!(feature_tools.contains(&"shell".to_string()));
+}
+
+#[test]
+fn ai_dynamic_prompt_rejects_unusable_extra_rule_file() {
+    let repo = TempDir::new().expect("temp repo");
+    let rules_dir = repo.path().join(".libra").join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("rules dir");
+    std::fs::create_dir(rules_dir.join("team.md")).expect("unusable extra rule");
+
+    let error = SystemPromptBuilder::new(repo.path())
+        .expect("named category rules still load")
+        .with_intent(TaskIntent::Question)
+        .with_dynamic_context()
+        .build()
+        .expect_err("unusable extra rule must fail closed");
+    assert!(
+        error.contains("failed to read security config"),
+        "expected fail-closed security read, got: {error}"
+    );
 }
 
 fn run_git(cwd: &std::path::Path, args: &[&str]) {

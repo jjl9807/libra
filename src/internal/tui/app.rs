@@ -6795,6 +6795,15 @@ where
                                     active_goal_state.is_some(),
                                 );
                             }
+                            Err(error @ TaskIntentClassifierError::Prompt(_)) => {
+                                let _ = observer.tx.send(AppEvent::AgentEvent {
+                                    turn_id: observer.turn_id,
+                                    event: AgentEvent::Error {
+                                        message: error.to_string(),
+                                    },
+                                });
+                                return;
+                            }
                             Err(error) => {
                                 tracing::warn!(
                                     error = %error,
@@ -12837,6 +12846,15 @@ where
                             &tx, turn_id, decision, &config, &registry, false,
                         );
                     }
+                    Err(error @ TaskIntentClassifierError::Prompt(_)) => {
+                        let _ = tx.send(AppEvent::AgentEvent {
+                            turn_id,
+                            event: AgentEvent::Error {
+                                message: error.to_string(),
+                            },
+                        });
+                        return;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             error = %error,
@@ -14611,7 +14629,7 @@ mod tests {
     };
     use crate::internal::{
         ai::{
-            agent::{TaskIntent, ToolLoopConfig},
+            agent::{TaskIntent, TaskIntentClassifierError, ToolLoopConfig},
             completion::{
                 AssistantContent, CompletionError, CompletionModel, CompletionRequest,
                 CompletionResponse, CompletionUsageSummary, Message, Text,
@@ -15394,9 +15412,11 @@ mod tests {
         let mut config = ToolLoopConfig {
             preamble: Some(
                 crate::internal::ai::prompt::SystemPromptBuilder::new(temp.path())
+                    .expect("builder")
                     .with_intent(TaskIntent::Unknown)
                     .with_dynamic_context()
-                    .build(),
+                    .build()
+                    .expect("prompt"),
             ),
             allowed_tools: Some(registry.filter_by_intent(TaskIntent::Unknown)),
             ..ToolLoopConfig::default()
@@ -15433,6 +15453,47 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("Classify the user's libra code request")
+        );
+    }
+
+    #[tokio::test]
+    async fn first_turn_classifier_prompt_rebuild_failure_is_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let rules = temp.path().join(".libra").join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::create_dir(rules.join("team.md")).expect("unusable extra rule");
+        let registry = ToolRegistryBuilder::with_working_dir(temp.path().to_path_buf())
+            .register("read_file", Arc::new(NamedToolHandler("read_file")))
+            .register("apply_patch", Arc::new(NamedToolHandler("apply_patch")))
+            .register("shell", Arc::new(NamedToolHandler("shell")))
+            .build();
+        let model = IntentTestModel::new(
+            r#"{"intent":"review","confidence":0.93,"rationale":"user asked for review"}"#,
+        );
+        let mut config = ToolLoopConfig {
+            preamble: Some("launch prompt".to_string()),
+            allowed_tools: Some(registry.filter_by_intent(TaskIntent::Unknown)),
+            ..ToolLoopConfig::default()
+        };
+
+        let error = classify_first_turn_task_intent(
+            &model,
+            &registry,
+            &mut config,
+            "Please review this change for production risks",
+            FirstTurnIntentPolicyUpdate::PromptAndAllowedTools,
+        )
+        .await
+        .expect_err("unusable extra rule must fail prompt rebuild");
+        assert!(
+            matches!(error, TaskIntentClassifierError::Prompt(_)),
+            "expected Prompt error, got {error:?}"
+        );
+        assert_eq!(config.preamble.as_deref(), Some("launch prompt"));
+        let allowed = config.allowed_tools.as_ref().unwrap();
+        assert!(
+            allowed.contains(&"apply_patch".to_string()) && allowed.contains(&"shell".to_string()),
+            "Prompt failure must not silently switch tool policy"
         );
     }
 
@@ -17600,7 +17661,8 @@ where
     let decision = classifier
         .classify(TaskIntentClassificationRequest::new(user_text))
         .await?;
-    apply_task_intent_prompt(config, registry, decision.intent);
+    apply_task_intent_prompt(config, registry, decision.intent)
+        .map_err(TaskIntentClassifierError::Prompt)?;
     if policy_update == FirstTurnIntentPolicyUpdate::PromptAndAllowedTools {
         config.allowed_tools = Some(registry.filter_by_intent(decision.intent));
     }
@@ -17611,13 +17673,14 @@ fn apply_task_intent_prompt(
     config: &mut ToolLoopConfig,
     registry: &ToolRegistry,
     intent: TaskIntent,
-) {
+) -> Result<(), String> {
     config.preamble = Some(
-        SystemPromptBuilder::new(registry.working_dir())
+        SystemPromptBuilder::new(registry.working_dir())?
             .with_intent(intent)
             .with_dynamic_context()
-            .build(),
+            .build()?,
     );
+    Ok(())
 }
 
 fn attach_memory_anchor_prompt_context(config: &mut ToolLoopConfig) {
@@ -17660,12 +17723,7 @@ fn send_task_intent_classified_event(
     registry: &ToolRegistry,
     goal_active: bool,
 ) {
-    let preamble = config.preamble.clone().unwrap_or_else(|| {
-        SystemPromptBuilder::new(registry.working_dir())
-            .with_intent(decision.intent)
-            .with_dynamic_context()
-            .build()
-    });
+    let preamble = config.preamble.clone().unwrap_or_default();
     let mut allowed_tools = registry.filter_by_intent(decision.intent);
     apply_goal_tool_visibility(&mut allowed_tools, goal_active, registry);
     let _ = tx.send(AppEvent::TaskIntentClassified {

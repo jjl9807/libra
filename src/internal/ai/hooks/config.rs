@@ -4,15 +4,20 @@
 //! `hooks.json` files described in [`super`] and exposes the merged set of hook
 //! definitions that the runtime executes when lifecycle events fire.
 //!
-//! Two tiers are merged (not overridden) so a project may layer additional hooks on
-//! top of a user-global default set. Both tiers are optional; missing files are
-//! silently ignored.
+//! Repository + overlay tiers are merged tighten-only (W4-11): overlay cannot
+//! drop or disable a repository `PreToolUse` hook. User-global hooks are then
+//! concatenated. Missing files are a valid empty state; unreadable or
+//! malformed repository/overlay JSON fails closed.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::event::HookEvent;
+use crate::internal::ai::sources::security::{
+    format_security_parse_error, json_error_location, request_scope_for_workdir,
+    resolve_security_file,
+};
 
 /// A single hook definition as read from `hooks.json`.
 ///
@@ -73,6 +78,14 @@ impl HookDefinition {
             .split('|')
             .any(|pattern| pattern.trim() == tool_name)
     }
+
+    fn pre_tool_use_key(&self) -> Option<(&str, &str)> {
+        if self.event == HookEvent::PreToolUse {
+            Some((self.matcher.as_str(), self.command.as_str()))
+        } else {
+            None
+        }
+    }
 }
 
 /// Root document persisted in `hooks.json`.
@@ -86,47 +99,128 @@ pub struct HookConfig {
     pub hooks: Vec<HookDefinition>,
 }
 
-/// Load hook configuration from the project + user tiers and merge them.
+/// Load hook configuration from repository (+ overlay) + user tiers.
 ///
 /// Functional scope:
-/// - Reads `<working_dir>/.libra/hooks.json` first, then the user-global file at
-///   `<config_dir>/libra/hooks.json` (typically `~/.config/libra/hooks.json` on
-///   Linux/macOS).
-/// - Hooks from both files are concatenated; later tiers do not override earlier
-///   ones — every matching hook fires.
+/// - Inside a Libra repository, reads via the W4-06 resolver (`hooks.json`
+///   repository layer, then optional linked-worktree overlay).
+/// - Outside a repository (tests / non-repo use), reads
+///   `<working_dir>/.libra/hooks.json`.
+/// - Then appends the user-global file at `<config_dir>/libra/hooks.json`.
 ///
 /// Boundary conditions:
-/// - Missing files are silently skipped — running without hooks is a valid state.
-/// - Malformed JSON is logged at `warn` level and ignored, so a broken config never
-///   blocks the rest of the agent.
-/// - When `dirs::config_dir()` returns `None` (unusual sandboxed environments) only
-///   the project-local tier is loaded.
-pub fn load_hook_config(working_dir: &Path) -> HookConfig {
-    let mut all_hooks = Vec::new();
+/// - Missing files are skipped — running without hooks is a valid state.
+/// - Unreadable or malformed **repository/overlay** JSON fails closed with a
+///   diagnostic that names the source layer and omits file contents.
+/// - Malformed **user-global** JSON is logged at `warn` and ignored so a
+///   broken personal config never blocks the agent.
+/// - Overlay cannot delete or disable a repository `PreToolUse` hook.
+/// - When `dirs::config_dir()` returns `None` only the project tiers load.
+pub fn load_hook_config(working_dir: &Path) -> Result<HookConfig, String> {
+    let mut all_hooks = load_project_hooks(working_dir)?;
 
-    // 1. Project-local
-    let project_config = working_dir.join(".libra").join("hooks.json");
-    if let Some(config) = load_config_file(&project_config) {
-        all_hooks.extend(config.hooks);
-    }
-
-    // 2. User-global
     if let Some(config_dir) = dirs::config_dir() {
         let user_config = config_dir.join("libra").join("hooks.json");
-        if let Some(config) = load_config_file(&user_config) {
+        if let Some(config) = load_user_config_file(&user_config) {
             all_hooks.extend(config.hooks);
         }
     }
 
-    HookConfig { hooks: all_hooks }
+    Ok(HookConfig { hooks: all_hooks })
 }
 
-/// Try to read and parse a single `hooks.json` from the given path.
+fn load_project_hooks(working_dir: &Path) -> Result<Vec<HookDefinition>, String> {
+    if let Some(request) = request_scope_for_workdir(working_dir)? {
+        let resolved = resolve_security_file(&request, "hooks.json")?;
+        let repository = parse_hook_bytes(
+            &resolved.repository_bytes,
+            "repository",
+            &resolved.provenance.repository_path,
+        )?;
+        let overlay = match resolved.overlay_bytes.as_deref() {
+            Some(bytes) => {
+                let overlay_path = resolved
+                    .provenance
+                    .overlay_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("<overlay>"));
+                parse_hook_bytes(bytes, "overlay", overlay_path)?
+            }
+            None => HookConfig::default(),
+        };
+        return Ok(merge_hooks_tighten_only(repository.hooks, overlay.hooks));
+    }
+
+    let project_config = working_dir.join(".libra").join("hooks.json");
+    Ok(parse_hook_file_optional(&project_config)?
+        .unwrap_or_default()
+        .hooks)
+}
+
+fn parse_hook_bytes(bytes: &[u8], layer: &str, path: &Path) -> Result<HookConfig, String> {
+    if bytes.is_empty() {
+        return Ok(HookConfig::default());
+    }
+    let content = std::str::from_utf8(bytes).map_err(|error| {
+        format!(
+            "failed to parse hook config ({layer} at `{}`): {error}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(content).map_err(|error| {
+        format_security_parse_error("hook config", layer, path, json_error_location(&error))
+    })
+}
+
+fn parse_hook_file_optional(path: &Path) -> Result<Option<HookConfig>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read hook config `{}`: {error}",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str(&content).map(Some).map_err(|error| {
+        format_security_parse_error("hook config", "project", path, json_error_location(&error))
+    })
+}
+
+fn merge_hooks_tighten_only(
+    repository: Vec<HookDefinition>,
+    overlay: Vec<HookDefinition>,
+) -> Vec<HookDefinition> {
+    let mut merged = Vec::with_capacity(repository.len() + overlay.len());
+    merged.extend(repository);
+    let repo_pretool: Vec<(String, String)> = merged
+        .iter()
+        .filter_map(|hook| {
+            hook.pre_tool_use_key()
+                .map(|(matcher, command)| (matcher.to_string(), command.to_string()))
+        })
+        .collect();
+    for hook in overlay {
+        if let Some((matcher, command)) = hook.pre_tool_use_key()
+            && repo_pretool.iter().any(|(repo_matcher, repo_command)| {
+                repo_matcher == matcher && repo_command == command
+            })
+        {
+            // Overlay cannot replace or disable a repository PreToolUse Block.
+            continue;
+        }
+        merged.push(hook);
+    }
+    merged
+}
+
+/// Try to read and parse a single user-global `hooks.json`.
 ///
 /// Returns `None` when the file does not exist, cannot be read, or fails to parse.
 /// Parse errors are surfaced via `tracing::warn` so operators can debug a broken file
 /// without losing the rest of the agent session.
-fn load_config_file(path: &Path) -> Option<HookConfig> {
+fn load_user_config_file(path: &Path) -> Option<HookConfig> {
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content)
         .map_err(|e| {
@@ -192,7 +286,7 @@ mod tests {
     #[test]
     fn test_load_hook_config_missing_files() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = load_hook_config(tmp.path());
+        let config = load_hook_config(tmp.path()).expect("missing hooks is empty");
         assert!(config.hooks.is_empty());
     }
 
@@ -208,9 +302,51 @@ mod tests {
         )
         .unwrap();
 
-        let config = load_hook_config(tmp.path());
+        let config = load_hook_config(tmp.path()).expect("project hooks");
         assert_eq!(config.hooks.len(), 1);
         assert_eq!(config.hooks[0].matcher, "shell");
+    }
+
+    // Scenario: malformed project hooks fail closed (do not silently drop PreToolUse).
+    #[test]
+    fn test_load_hook_config_malformed_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let hook_dir = tmp.path().join(".libra");
+        std::fs::create_dir_all(&hook_dir).unwrap();
+        std::fs::write(hook_dir.join("hooks.json"), "{not json").unwrap();
+
+        let error = load_hook_config(tmp.path()).expect_err("malformed hooks fail closed");
+        assert!(
+            error.contains("parse") && error.contains("hooks.json"),
+            "got {error}"
+        );
+    }
+
+    // Scenario: repository PreToolUse enabled=false stays disabled after overlay merge.
+    #[test]
+    fn test_repository_disabled_pretool_stays_disabled() {
+        let repo = HookDefinition {
+            event: HookEvent::PreToolUse,
+            matcher: "shell".to_string(),
+            command: "echo intentionally-off".to_string(),
+            description: String::new(),
+            timeout_ms: 10_000,
+            enabled: false,
+        };
+        let overlay_reenable = HookDefinition {
+            event: HookEvent::PreToolUse,
+            matcher: "shell".to_string(),
+            command: "echo intentionally-off".to_string(),
+            description: String::new(),
+            timeout_ms: 10_000,
+            enabled: true,
+        };
+        let merged = merge_hooks_tighten_only(vec![repo], vec![overlay_reenable]);
+        assert_eq!(merged.len(), 1);
+        assert!(
+            !merged[0].enabled,
+            "overlay must not re-enable a repository PreToolUse that is disabled"
+        );
     }
 
     // Scenario: full JSON round-trip with both explicit and default-filled fields.

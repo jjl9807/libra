@@ -18,7 +18,8 @@
 //! repository configuration lives) while sandbox reads COMMON storage. The
 //! W0 preflight (`command::require_main_worktree_for_code_agent`) refuses to
 //! launch the reading runtimes from a linked worktree, which is what makes
-//! the `WorkdirDotLibra` rows safe to keep pre-W4.
+//! remaining `WorkdirDotLibra` (W4-12 extension) rows safe. W4-11 security
+//! loaders resolve through [`ReadResolution::UnifiedResolver`].
 
 /// Which consumer family migrates the surface onto the W4-06 resolver.
 ///
@@ -52,7 +53,7 @@ pub enum ConfigOwner {
 
 /// Where the surface's reads resolve TODAY. This column records the truth,
 /// including the pre-W4 brain-split form — it is what the W4 resolver work
-/// will migrate, not a description of the end state.
+/// migrates, not a description of the end state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadResolution {
     /// `<working_dir>/.libra/<location>`: correct in the main worktree
@@ -61,6 +62,9 @@ pub enum ReadResolution {
     WorkdirDotLibra,
     /// Via the fail-closed common-storage resolver (§C.4.1).
     CommonStorage,
+    /// Via the W4-06 [`crate::internal::ai::sources::resolver`] (RequestScope
+    /// + provenance). Security loaders (W4-11) use tighten-only overlay merge.
+    UnifiedResolver,
     /// SQLite table(s) in the shared repository database.
     RepositoryDatabase,
     /// In-process cache; subject to the §C.4.1.1 process-cache key rules.
@@ -102,7 +106,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "config.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
@@ -119,7 +123,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "sandbox.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::CommonStorage,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
@@ -128,7 +132,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "hooks.json",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
@@ -146,7 +150,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "rules",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
@@ -155,7 +159,7 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         location: "contexts",
         kind: SurfaceKind::Directory,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,
-        resolution: ReadResolution::WorkdirDotLibra,
+        resolution: ReadResolution::UnifiedResolver,
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
@@ -818,15 +822,30 @@ mod tests {
         };
         assert_eq!(
             by_location("sandbox.toml").resolution,
-            ReadResolution::CommonStorage,
-            "sandbox reads COMMON storage today (§C.3.2) — flipping this row \
-             means the brain-split changed shape and W0/W4 text must be revisited"
+            ReadResolution::UnifiedResolver,
+            "W4-11 sandbox reads go through the unified resolver — flipping \
+             this row reopens the linked-worktree brain-split"
         );
         assert_eq!(
             by_location("hooks.json").resolution,
-            ReadResolution::WorkdirDotLibra,
-            "hooks read the bare workdir today (§C.3.2); this row is what the \
-             W0 linked preflight makes safe and the W4 resolver will migrate"
+            ReadResolution::UnifiedResolver,
+            "W4-11 hooks read through the unified resolver so repository \
+             PreToolUse Block stays visible in every worktree"
+        );
+        assert_eq!(
+            by_location("config.toml").resolution,
+            ReadResolution::UnifiedResolver,
+            "W4-11 [approval]/[mcp] in config.toml use the unified resolver"
+        );
+        assert_eq!(
+            by_location("rules").resolution,
+            ReadResolution::UnifiedResolver,
+            "W4-11 rules directory uses the unified resolver"
+        );
+        assert_eq!(
+            by_location("contexts").resolution,
+            ReadResolution::UnifiedResolver,
+            "W4-11 contexts directory uses the unified resolver"
         );
         assert_eq!(
             by_location("publish/worker-template-manifest.json").resolution,

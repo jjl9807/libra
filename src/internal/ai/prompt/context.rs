@@ -2,6 +2,8 @@
 
 use std::{fmt, path::Path};
 
+use super::loader::project_security_dir_paths;
+
 /// Operating context that adjusts the AI agent's behavior and priorities.
 ///
 /// Contexts are injected as an additional section in the system prompt,
@@ -42,34 +44,47 @@ impl ContextMode {
     /// Load context content, checking filesystem overrides first.
     ///
     /// Override paths checked:
-    /// 1. `{working_dir}/.libra/contexts/{name}.md`
+    /// 1. Repository `.libra/contexts/{name}.md` (W4-11; overlay adds only when
+    ///    the repository file is absent)
     /// 2. `~/.config/libra/contexts/{name}.md`
     /// 3. Embedded default
-    pub fn load_content(&self, working_dir: &Path) -> String {
+    pub fn load_content(&self, working_dir: &Path) -> Result<String, String> {
         if let Some(filename) = self.filename() {
             let md_name = format!("{}.md", filename);
-
-            // Project-local override
-            let project_path = working_dir.join(".libra").join("contexts").join(&md_name);
-            if let Ok(content) = std::fs::read_to_string(&project_path)
-                && !content.trim().is_empty()
-            {
-                return content;
+            let (repository, overlay) = project_security_dir_paths(working_dir, "contexts")?;
+            if !repository.as_os_str().is_empty() {
+                match super::loader::probe_security_file(&repository.join(&md_name))? {
+                    Some(content) if !content.trim().is_empty() => return Ok(content),
+                    Some(_) => {
+                        // Blank repository file blocks overlay replacement.
+                    }
+                    None => {
+                        if let Some(overlay) = overlay
+                            && let Some(content) =
+                                read_nonempty_security_context(&overlay.join(&md_name))?
+                        {
+                            return Ok(content);
+                        }
+                    }
+                }
             }
 
-            // User-global override
             if let Some(config_dir) = dirs::config_dir() {
                 let user_path = config_dir.join("libra").join("contexts").join(&md_name);
                 if let Ok(content) = std::fs::read_to_string(&user_path)
                     && !content.trim().is_empty()
                 {
-                    return content;
+                    return Ok(content);
                 }
             }
         }
 
-        self.embedded_content().to_string()
+        Ok(self.embedded_content().to_string())
     }
+}
+
+fn read_nonempty_security_context(path: &Path) -> Result<Option<String>, String> {
+    Ok(super::loader::probe_security_file(path)?.filter(|content| !content.trim().is_empty()))
 }
 
 impl fmt::Display for ContextMode {
@@ -156,7 +171,9 @@ mod tests {
     #[test]
     fn test_load_content_uses_embedded_default() {
         let tmp = TempDir::new().unwrap();
-        let content = ContextMode::Dev.load_content(tmp.path());
+        let content = ContextMode::Dev
+            .load_content(tmp.path())
+            .expect("embedded context");
         assert!(content.contains("Development Mode"));
     }
 
@@ -167,7 +184,9 @@ mod tests {
         std::fs::create_dir_all(&ctx_dir).unwrap();
         std::fs::write(ctx_dir.join("dev.md"), "Custom dev context").unwrap();
 
-        let content = ContextMode::Dev.load_content(tmp.path());
+        let content = ContextMode::Dev
+            .load_content(tmp.path())
+            .expect("project context");
         assert_eq!(content, "Custom dev context");
     }
 
@@ -175,7 +194,7 @@ mod tests {
     fn test_load_content_custom_ignores_filesystem() {
         let tmp = TempDir::new().unwrap();
         let ctx = ContextMode::Custom("inline content".to_string());
-        let content = ctx.load_content(tmp.path());
+        let content = ctx.load_content(tmp.path()).expect("custom context");
         assert_eq!(content, "inline content");
     }
 }

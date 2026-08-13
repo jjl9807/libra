@@ -293,7 +293,8 @@ transport = "stdio"
     )
     .expect("write legacy mcp config");
 
-    let view = source_config_view_from_project_config(temp_dir.path());
+    let view =
+        source_config_view_from_project_config(temp_dir.path()).expect("legacy mcp project config");
     let entry = view
         .source(BUILTIN_MCP_SOURCE_SLUG)
         .expect("legacy mcp config should map to builtin MCP source");

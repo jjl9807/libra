@@ -31,9 +31,11 @@ pub struct SystemPromptBuilder {
 
 impl SystemPromptBuilder {
     /// Create a new builder that loads all default rules for the given working directory.
-    pub fn new(working_dir: &Path) -> Self {
-        let rules = load_all_rules(working_dir);
-        Self {
+    ///
+    /// Unreadable repository/overlay `rules` fail closed.
+    pub fn new(working_dir: &Path) -> Result<Self, String> {
+        let rules = load_all_rules(working_dir)?;
+        Ok(Self {
             working_dir: working_dir.to_path_buf(),
             rules,
             context: None,
@@ -42,7 +44,7 @@ impl SystemPromptBuilder {
             context_budget: None,
             memory_anchors: Vec::new(),
             extra_sections: Vec::new(),
-        }
+        })
     }
 
     /// Replace the content of a specific rule category.
@@ -93,7 +95,9 @@ impl SystemPromptBuilder {
     }
 
     /// Build the final system prompt string.
-    pub fn build(self) -> String {
+    ///
+    /// Unreadable repository/overlay `contexts` fail closed.
+    pub fn build(self) -> Result<String, String> {
         let working_dir_str = self.working_dir.display().to_string();
         let mut parts: Vec<String> = Vec::with_capacity(
             self.rules.len()
@@ -109,7 +113,7 @@ impl SystemPromptBuilder {
         }
 
         if let Some(ref context) = self.context {
-            let content = context.load_content(&self.working_dir);
+            let content = context.load_content(&self.working_dir)?;
             parts.push(content.replace("{working_dir}", &working_dir_str));
         }
 
@@ -119,7 +123,7 @@ impl SystemPromptBuilder {
                 &self.working_dir,
                 intent,
                 self.context_budget.as_ref(),
-            ));
+            )?);
         }
 
         if let Some(section) =
@@ -133,7 +137,7 @@ impl SystemPromptBuilder {
             parts.push(section.replace("{working_dir}", &working_dir_str));
         }
 
-        parts.join("\n\n")
+        Ok(parts.join("\n\n"))
     }
 }
 
@@ -146,7 +150,10 @@ mod tests {
     #[test]
     fn test_build_contains_base_content() {
         let tmp = TempDir::new().unwrap();
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
         assert!(
             prompt.contains("Libra"),
             "prompt should contain Libra identity"
@@ -160,7 +167,10 @@ mod tests {
     #[test]
     fn test_working_dir_substituted() {
         let tmp = TempDir::new().unwrap();
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
         let dir_str = tmp.path().display().to_string();
         assert!(
             prompt.contains(&dir_str),
@@ -175,7 +185,10 @@ mod tests {
     #[test]
     fn test_all_rule_sections_present() {
         let tmp = TempDir::new().unwrap();
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
 
         assert!(
             prompt.contains("Coding Style"),
@@ -197,7 +210,10 @@ mod tests {
     #[test]
     fn test_tool_use_mentions_semantic_tools() {
         let tmp = TempDir::new().unwrap();
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
 
         assert!(
             prompt.contains("list_symbols"),
@@ -217,8 +233,10 @@ mod tests {
     fn test_override_rule() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .override_rule(RuleCategory::Security, "Custom security rules here.")
-            .build();
+            .build()
+            .expect("prompt");
 
         assert!(prompt.contains("Custom security rules here."));
     }
@@ -227,8 +245,10 @@ mod tests {
     fn test_extra_section_appended() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .extra_section("Project Context", "This is a Rust CLI tool.")
-            .build();
+            .build()
+            .expect("prompt");
 
         assert!(prompt.contains("## Project Context"));
         assert!(prompt.contains("This is a Rust CLI tool."));
@@ -238,8 +258,10 @@ mod tests {
     fn test_extra_section_working_dir_substituted() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .extra_section("Extra", "Path is {working_dir}")
-            .build();
+            .build()
+            .expect("prompt");
 
         let dir_str = tmp.path().display().to_string();
         assert!(prompt.contains(&format!("Path is {}", dir_str)));
@@ -248,7 +270,10 @@ mod tests {
     #[test]
     fn test_prompt_is_nontrivial_length() {
         let tmp = TempDir::new().unwrap();
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
         // The composed prompt should be substantial (all 7 rule files)
         assert!(
             prompt.len() > 1000,
@@ -268,7 +293,10 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
         assert!(prompt.contains("custom assistant for ProjectX"));
         assert!(prompt.contains(&tmp.path().display().to_string()));
     }
@@ -277,8 +305,10 @@ mod tests {
     fn test_with_context_dev() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .with_context(ContextMode::Dev)
-            .build();
+            .build()
+            .expect("prompt");
 
         assert!(prompt.contains("Development Mode"));
     }
@@ -287,8 +317,10 @@ mod tests {
     fn test_with_context_review() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .with_context(ContextMode::Review)
-            .build();
+            .build()
+            .expect("prompt");
 
         assert!(prompt.contains("Code Review Mode"));
     }
@@ -297,8 +329,10 @@ mod tests {
     fn test_with_context_research() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .with_context(ContextMode::Research)
-            .build();
+            .build()
+            .expect("prompt");
 
         assert!(prompt.contains("Research Mode"));
     }
@@ -307,8 +341,10 @@ mod tests {
     fn test_context_appears_after_rules() {
         let tmp = TempDir::new().unwrap();
         let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
             .with_context(ContextMode::Dev)
-            .build();
+            .build()
+            .expect("prompt");
 
         let tool_use_pos = prompt.find("Tool Use").expect("should contain Tool Use");
         let context_pos = prompt
@@ -323,7 +359,10 @@ mod tests {
     #[test]
     fn test_no_context_by_default() {
         let tmp = TempDir::new().unwrap();
-        let prompt = SystemPromptBuilder::new(tmp.path()).build();
+        let prompt = SystemPromptBuilder::new(tmp.path())
+            .expect("builder")
+            .build()
+            .expect("prompt");
 
         assert!(!prompt.contains("Development Mode"));
         assert!(!prompt.contains("Code Review Mode"));

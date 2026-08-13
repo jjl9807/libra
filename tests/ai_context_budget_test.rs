@@ -168,9 +168,11 @@ fn system_prompt_renders_provider_adjusted_context_budget_plan() {
     ));
 
     let prompt = SystemPromptBuilder::new(temp.path())
+        .expect("builder")
         .with_dynamic_context()
         .with_context_budget(budget)
-        .build();
+        .build()
+        .expect("prompt");
 
     assert!(prompt.contains("## Context Budget Plan"));
     assert!(prompt.contains("provider=ollama model=small-local-model"));

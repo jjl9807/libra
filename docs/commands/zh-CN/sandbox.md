@@ -15,7 +15,7 @@ libra --json sandbox status
 
 默认运行时采用 best-effort 策略：Linux 使用 `LIBRA_LINUX_SANDBOX_EXE` 配置的外部 helper；如果该 helper 不可用，`libra` 会尝试内置 `bwrap` 后端（可由 `LIBRA_BWRAP_BINARY` 覆盖）。当 `/usr/bin/sandbox-exec` 可用时，macOS 使用 Seatbelt；不支持或未配置的主机会报告警告，而不是声称提供隔离。设置 `LIBRA_SANDBOX_ENFORCEMENT=required` 后，当请求 Libra 内部沙箱但没有可应用的受支持后端时，命令会失败。
 
-在 macOS 上，默认 Seatbelt 策略保持项目文件可读，但拒绝常见凭证、令牌和浏览器配置文件路径。内置拒绝列表包括 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`.azure`、`.docker`、`.npmrc`、`.pypirc`、Cargo/Gem 凭证、`~/.config/gcloud`、`~/.config/gh`、`~/.config/hub`、`~/.kube`、`~/.config/libra/vault`、Firefox、Chrome、Chromium 和 Brave 配置目录、macOS `Library/Cookies`，以及 `/etc/shadow`。仓库可以通过 `.libra/sandbox.toml` 的 `deny_read = [...]` 追加项目特定路径。
+在 macOS 上，默认 Seatbelt 策略保持项目文件可读，但拒绝常见凭证、令牌和浏览器配置文件路径。内置拒绝列表包括 `~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`.azure`、`.docker`、`.npmrc`、`.pypirc`、Cargo/Gem 凭证、`~/.config/gcloud`、`~/.config/gh`、`~/.config/hub`、`~/.kube`、`~/.config/libra/vault`、Firefox、Chrome、Chromium 和 Brave 配置目录、macOS `Library/Cookies`，以及 `/etc/shadow`。仓库可以通过 `.libra/sandbox.toml` 的 `deny_read = [...]` 追加项目特定路径。不可读或无法解析的 `sandbox.toml` 会 fail-closed（不会回退到空策略）。在 linked worktree 中以仓库文件为基线，per-worktree overlay 只能收紧 `deny_read` / `[sandbox.network]`，不能把 `denied` 放宽为 `full`。
 
 ## 人类可读输出
 

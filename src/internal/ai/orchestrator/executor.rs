@@ -43,7 +43,6 @@ use crate::internal::ai::{
         CompletionError, CompletionModel, CompletionStreamEvent, CompletionUsage,
         CompletionUsageSummary,
     },
-    hooks::HookRunner,
     intentspec::types::{IntentSpec, NetworkPolicy, ToolAcl},
     libra_vcs::run_libra_vcs_tool_guidance,
     runtime::environment::{ExecutionEnvironmentProvider, SyncBackRequest},
@@ -1234,9 +1233,12 @@ fn clone_tool_loop_config_for_workdir(
     config: &ToolLoopConfig,
     working_dir: &Path,
 ) -> ToolLoopConfig {
+    // W4-11: keep the session's RequestScope-resolved hook definitions, but
+    // rebind the runner cwd/payload to the task worktree. Reloading hooks.json
+    // from an isolated task dir would split-brain repository PreToolUse.
     let mut cloned = config.clone();
-    if cloned.hook_runner.is_some() {
-        cloned.hook_runner = Some(Arc::new(HookRunner::load(working_dir)));
+    if let Some(runner) = cloned.hook_runner.as_ref() {
+        cloned.hook_runner = Some(Arc::new(runner.with_working_dir(working_dir)));
     }
     cloned
 }
@@ -2884,6 +2886,45 @@ mod tests {
             EnvVarGuard::unset("LIBRA_LINUX_SANDBOX_EXE"),
             EnvVarGuard::set("LIBRA_BWRAP_BINARY", "/tmp/libra-never-exists"),
         )
+    }
+
+    #[test]
+    fn clone_tool_loop_config_for_workdir_keeps_session_hooks() {
+        use crate::internal::ai::hooks::{HookConfig, HookDefinition, HookEvent, HookRunner};
+
+        let session_dir = tempfile::tempdir().expect("session dir");
+        let task_dir = tempfile::tempdir().expect("task dir");
+        let runner = Arc::new(HookRunner::new(
+            HookConfig {
+                hooks: vec![HookDefinition {
+                    event: HookEvent::PreToolUse,
+                    matcher: "*".to_string(),
+                    command: "echo repo-block".to_string(),
+                    description: String::new(),
+                    timeout_ms: 10_000,
+                    enabled: true,
+                }],
+            },
+            session_dir.path().to_path_buf(),
+        ));
+        let config = ToolLoopConfig {
+            hook_runner: Some(runner.clone()),
+            ..Default::default()
+        };
+        let cloned = clone_tool_loop_config_for_workdir(&config, task_dir.path());
+        let cloned_runner = cloned.hook_runner.as_ref().expect("cloned hooks");
+        assert!(
+            !Arc::ptr_eq(
+                config.hook_runner.as_ref().expect("session hooks"),
+                cloned_runner
+            ),
+            "task worktree must rebind the runner cwd, not share the session Arc"
+        );
+        assert_eq!(cloned_runner.working_dir(), task_dir.path());
+        assert!(
+            cloned_runner.has_hooks(),
+            "task worktree must keep session PreToolUse definitions, not reload from cwd"
+        );
     }
 
     #[derive(Clone)]

@@ -127,7 +127,7 @@ use crate::{
             },
             sandbox::{
                 ApprovalCachePolicy, AskForApproval, DEFAULT_APPROVAL_TTL, ExecApprovalRequest,
-                ToolRuntimeContext,
+                ToolRuntimeContext, load_approval_project_config,
             },
             session::{SessionJsonlStore, SessionState, SessionStore},
             skills::{SkillDispatcher, load_skills},
@@ -2138,7 +2138,8 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
         args.context,
         effective_provider,
         effective_model_for_preamble.as_deref(),
-    );
+    )
+    .map_err(CliError::failure)?;
     let temperature = args.temperature;
     let thinking = completion_thinking_for_provider(effective_provider, &args);
     let reasoning_effort = completion_reasoning_effort_for_provider(effective_provider, &args);
@@ -2177,7 +2178,8 @@ async fn execute_tui(args: CodeArgs) -> CliResult<()> {
 
     // Single source of truth for the args -> approval-context mapping
     // (criterion 2), shared with the headless launch path.
-    let approval_cfg = tui_approval_config_from_args(&args, registry.working_dir());
+    let approval_cfg =
+        tui_approval_config_from_args(&args, registry.working_dir()).map_err(CliError::failure)?;
     let provider_name = format!("{:?}", args.provider).to_lowercase();
     let mut launch_config = TuiLaunchConfig {
         host,
@@ -3084,7 +3086,7 @@ where
     let runtime_context = Some(default_tui_runtime_context(
         working_dir,
         args.context,
-        tui_approval_config_from_args(args, working_dir),
+        tui_approval_config_from_args(args, working_dir).map_err(CliError::failure)?,
         args.network_access.is_allowed(),
         exec_approval_tx,
     ));
@@ -3141,7 +3143,8 @@ where
     } else {
         None
     };
-    let preamble = system_preamble(working_dir, args.context, args.provider, Some(&model_name));
+    let preamble = system_preamble(working_dir, args.context, args.provider, Some(&model_name))
+        .map_err(CliError::failure)?;
     let preserve_reasoning_content = preserve_reasoning_content_for_provider(args.provider);
     let temperature = args.temperature;
     let thinking = completion_thinking_for_args(args);
@@ -4014,7 +4017,7 @@ where
         }
     };
     let hook_runner = {
-        let runner = HookRunner::load(registry.working_dir());
+        let runner = HookRunner::load(registry.working_dir()).map_err(CliError::failure)?;
         if runner.has_hooks() {
             Some(std::sync::Arc::new(runner))
         } else {
@@ -4845,13 +4848,13 @@ fn system_preamble(
     context: Option<CodeContext>,
     provider: CodeProvider,
     model: Option<&str>,
-) -> String {
+) -> Result<String, String> {
     let intent = task_intent_for_context(context);
     let budget = ContextBudget::for_provider_model(
         context_budget_provider_name(provider),
         model.unwrap_or_else(|| default_context_budget_model(provider)),
     );
-    let mut builder = SystemPromptBuilder::new(working_dir)
+    let mut builder = SystemPromptBuilder::new(working_dir)?
         .with_intent(intent)
         .with_dynamic_context()
         .with_context_budget(budget);
@@ -4946,77 +4949,6 @@ fn default_tui_runtime_context(
     )
 }
 
-#[derive(Debug, Deserialize)]
-struct ApprovalProjectConfig {
-    approval: Option<ApprovalSectionConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ApprovalSectionConfig {
-    ttl_seconds: Option<u64>,
-    #[serde(default)]
-    protected_branches: Option<Vec<String>>,
-    #[serde(default)]
-    allowed_network_domains: Option<Vec<String>>,
-    #[serde(default)]
-    no_cache_unknown_network: bool,
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct ApprovalRuntimeConfig {
-    ttl: Option<Duration>,
-    cache_policy: ApprovalCachePolicy,
-}
-
-fn approval_config_from_project_config(working_dir: &Path) -> ApprovalRuntimeConfig {
-    let path = working_dir.join(".libra").join("config.toml");
-    let Some(contents) = fs::read_to_string(&path).ok() else {
-        return ApprovalRuntimeConfig::default();
-    };
-    let Ok(config) = toml::from_str::<ApprovalProjectConfig>(&contents).map_err(|err| {
-        tracing::warn!(
-            target: "libra::command::code",
-            path = %path.display(),
-            error = %err,
-            "failed to parse approval config"
-        );
-        err
-    }) else {
-        return ApprovalRuntimeConfig::default();
-    };
-    let Some(approval) = config.approval else {
-        return ApprovalRuntimeConfig::default();
-    };
-    let ttl = approval.ttl_seconds.and_then(|ttl_seconds| {
-        if ttl_seconds == 0 {
-            tracing::warn!(
-                target: "libra::command::code",
-                path = %path.display(),
-                "ignoring approval ttl_seconds=0"
-            );
-            None
-        } else {
-            Some(Duration::from_secs(ttl_seconds))
-        }
-    });
-
-    let default_cache_policy = ApprovalCachePolicy::default();
-    ApprovalRuntimeConfig {
-        ttl,
-        cache_policy: ApprovalCachePolicy {
-            protected_branches: approval
-                .protected_branches
-                .unwrap_or(default_cache_policy.protected_branches),
-            allowed_network_domains: approval.allowed_network_domains.unwrap_or_default(),
-            no_cache_unknown_network: approval.no_cache_unknown_network,
-            // OC-Phase 2 P2.5: the persistent ruleset is loaded lazily by
-            // the runtime once it has a `DatabaseConnection`; the project-
-            // config-derived policy starts with no projection attached.
-            approved_ruleset: None,
-        },
-    }
-}
-
 /// Single source of truth for the approval-related CLI-args -> runtime
 /// [`DefaultTuiApprovalConfig`] mapping (C7 criterion 2): `--approval-policy`
 /// maps through `.into()`, `--approval-ttl` through `Duration::from_secs`
@@ -5024,9 +4956,12 @@ fn approval_config_from_project_config(working_dir: &Path) -> ApprovalRuntimeCon
 /// and `--approval-policy` also drives `allow_all_commands`. Both the TUI and
 /// headless launch paths derive their approval config from here, so a dropped
 /// or hardcoded flag is a single-point regression the unit test guards.
-fn tui_approval_config_from_args(args: &CodeArgs, working_dir: &Path) -> DefaultTuiApprovalConfig {
-    let approval_config = approval_config_from_project_config(working_dir);
-    DefaultTuiApprovalConfig {
+fn tui_approval_config_from_args(
+    args: &CodeArgs,
+    working_dir: &Path,
+) -> Result<DefaultTuiApprovalConfig, String> {
+    let approval_config = load_approval_project_config(working_dir)?;
+    Ok(DefaultTuiApprovalConfig {
         policy: args.approval_policy.into(),
         allow_all_commands: args.approval_policy.allows_all_commands(),
         ttl: args
@@ -5035,17 +4970,21 @@ fn tui_approval_config_from_args(args: &CodeArgs, working_dir: &Path) -> Default
             .or(approval_config.ttl)
             .unwrap_or(DEFAULT_APPROVAL_TTL),
         cache_policy: approval_config.cache_policy,
-    }
+    })
 }
 
 #[cfg(test)]
 fn approval_ttl_from_project_config(working_dir: &Path) -> Option<Duration> {
-    approval_config_from_project_config(working_dir).ttl
+    load_approval_project_config(working_dir)
+        .expect("approval config")
+        .ttl
 }
 
 #[cfg(test)]
 fn approval_cache_policy_from_project_config(working_dir: &Path) -> ApprovalCachePolicy {
-    approval_config_from_project_config(working_dir).cache_policy
+    load_approval_project_config(working_dir)
+        .expect("approval config")
+        .cache_policy
 }
 
 // ---------------------------------------------------------------------------
@@ -7675,7 +7614,8 @@ no_cache_unknown_network = true
             Some(CodeContext::Review),
             CodeProvider::Openai,
             Some("gpt-test"),
-        );
+        )
+        .expect("system preamble");
 
         assert!(prompt.contains("Code Review Mode"));
         assert!(prompt.contains("## Task Intent"));
@@ -7815,7 +7755,7 @@ no_cache_unknown_network = true
         let runtime = default_tui_runtime_context(
             workspace.path(),
             Some(CodeContext::Dev),
-            tui_approval_config_from_args(&args, workspace.path()),
+            tui_approval_config_from_args(&args, workspace.path()).expect("approval config"),
             args.network_access.is_allowed(),
             tx,
         );
@@ -7833,7 +7773,8 @@ no_cache_unknown_network = true
         // falls back to the 300s default — proving the 4242s above came from
         // the flag, not a hardcode.
         let default_args = CodeArgs::try_parse_from(["libra"]).expect("parse defaults");
-        let default_cfg = tui_approval_config_from_args(&default_args, workspace.path());
+        let default_cfg = tui_approval_config_from_args(&default_args, workspace.path())
+            .expect("default approval");
         assert_eq!(default_cfg.ttl, DEFAULT_APPROVAL_TTL);
         assert_ne!(default_cfg.ttl, Duration::from_secs(4242));
     }

@@ -25,6 +25,7 @@ pub mod config;
 pub mod mcp;
 pub mod openapi;
 pub mod resolver;
+pub mod security;
 
 pub use config::{
     SourceConfigEntry, SourceConfigLoadReport, SourceConfigOrigin, SourceConfigView,
@@ -35,6 +36,10 @@ pub use openapi::{OpenApiToolSpecError, openapi_tool_capabilities_from_fixture};
 pub use resolver::{
     ConfigLayer, ConfigProvenance, ConfigResolveError, ResolvedConfig, ResolvedConfigDir,
     resolve_config_dir, resolve_config_file, surface_by_location,
+};
+pub use security::{
+    format_resolve_error, format_security_parse_error, json_error_location,
+    request_scope_for_workdir, resolve_security_dir, resolve_security_file, toml_error_location,
 };
 
 /// Source category. This stays intentionally small for Step 1.10 Phase A.

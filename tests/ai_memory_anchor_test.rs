@@ -102,8 +102,10 @@ fn prompt_builder_includes_only_confirmed_active_memory_anchors() {
     );
 
     let prompt = SystemPromptBuilder::new(tmp.path())
+        .expect("builder")
         .with_memory_anchors(vec![confirmed, draft, revoked, expired])
-        .build();
+        .build()
+        .expect("prompt");
 
     assert!(prompt.contains("## Memory Anchors"));
     assert!(prompt.contains("Always preserve user-authored dirty worktree changes."));

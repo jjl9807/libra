@@ -27,8 +27,12 @@ use tokio::{
 use uuid::Uuid;
 
 use self::evidence::SandboxEvidenceSink;
-use super::runtime::hardening::{SafetyDecision, SafetyDisposition};
+use super::{
+    runtime::hardening::{SafetyDecision, SafetyDisposition},
+    sources::security::{request_scope_for_workdir, resolve_security_file},
+};
 
+mod approval_config;
 mod command_safety;
 pub mod evidence;
 pub mod policy;
@@ -38,6 +42,7 @@ pub mod runtime;
 #[cfg(target_os = "linux")]
 pub mod seccomp_compile;
 
+pub use approval_config::{ApprovalProjectRuntimeConfig, load_approval_project_config};
 pub use policy::{
     NetworkAccess, NetworkProtocol, NetworkService, NetworkServiceValidationError,
     SandboxEnforcement, SandboxPermissions, SandboxPolicy, SandboxPolicyError, WritableRoot,
@@ -2111,7 +2116,91 @@ fn resolve_deny_read_paths_from(
     resolved
 }
 
+fn parse_sandbox_config_bytes(
+    bytes: &[u8],
+    layer: &str,
+    path_hint: &Path,
+) -> Result<SandboxConfigFile, String> {
+    if bytes.is_empty() {
+        return Ok(SandboxConfigFile::default());
+    }
+    let contents = std::str::from_utf8(bytes).map_err(|error| {
+        format!(
+            "failed to parse sandbox config ({layer} at `{}`): {error}",
+            path_hint.display()
+        )
+    })?;
+    toml::from_str::<SandboxConfigFile>(contents).map_err(|error| {
+        crate::internal::ai::sources::security::format_security_parse_error(
+            "sandbox config",
+            layer,
+            path_hint,
+            crate::internal::ai::sources::security::toml_error_location(contents, &error),
+        )
+    })
+}
+
+fn merge_sandbox_tighten_only(
+    repository: SandboxConfigFile,
+    overlay: SandboxConfigFile,
+) -> Result<SandboxConfigFile, String> {
+    let repo_network = repository.network_access()?;
+    let overlay_network = overlay.network_access()?;
+    let mut deny_read = repository.deny_read;
+    for path in overlay.deny_read {
+        if !deny_read.iter().any(|existing| existing == &path) {
+            deny_read.push(path);
+        }
+    }
+    let merged_network = match (repo_network, overlay_network) {
+        (None, None) => None,
+        (Some(repo), None) => Some(repo),
+        (None, Some(overlay)) => Some(overlay),
+        (Some(repo), Some(overlay)) => Some(repo.restrict_with(&overlay)),
+    };
+    let sandbox = merged_network.map(|access| SandboxConfigSection {
+        network: Some(sandbox_network_from_access(access)),
+    });
+    Ok(SandboxConfigFile { deny_read, sandbox })
+}
+
+fn sandbox_network_from_access(access: NetworkAccess) -> SandboxNetworkConfig {
+    match access {
+        NetworkAccess::Denied => SandboxNetworkConfig {
+            mode: SandboxNetworkMode::Denied,
+            services: Vec::new(),
+        },
+        NetworkAccess::Full => SandboxNetworkConfig {
+            mode: SandboxNetworkMode::Full,
+            services: Vec::new(),
+        },
+        NetworkAccess::Allowlist { services } => SandboxNetworkConfig {
+            mode: SandboxNetworkMode::Allowlist,
+            services,
+        },
+    }
+}
+
 fn load_sandbox_config_file(cwd: &Path) -> Result<SandboxConfigFile, String> {
+    if let Some(request) = request_scope_for_workdir(cwd)? {
+        let resolved = resolve_security_file(&request, SANDBOX_CONFIG_FILE)?;
+        let repository = parse_sandbox_config_bytes(
+            &resolved.repository_bytes,
+            "repository",
+            &resolved.provenance.repository_path,
+        )?;
+        let Some(overlay_bytes) = resolved.overlay_bytes.as_deref() else {
+            return Ok(repository);
+        };
+        let overlay_path = resolved
+            .provenance
+            .overlay_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new("<overlay>"));
+        let overlay = parse_sandbox_config_bytes(overlay_bytes, "overlay", overlay_path)?;
+        return merge_sandbox_tighten_only(repository, overlay);
+    }
+
     let path = sandbox_config_path(cwd)?;
     let contents = match fs::read_to_string(&path) {
         Ok(contents) => contents,
@@ -2127,9 +2216,11 @@ fn load_sandbox_config_file(cwd: &Path) -> Result<SandboxConfigFile, String> {
     };
 
     toml::from_str::<SandboxConfigFile>(&contents).map_err(|error| {
-        format!(
-            "failed to parse sandbox config `{}`: {error}",
-            path.display()
+        crate::internal::ai::sources::security::format_security_parse_error(
+            "sandbox config",
+            "project",
+            &path,
+            crate::internal::ai::sources::security::toml_error_location(&contents, &error),
         )
     })
 }
@@ -2559,10 +2650,14 @@ fn requested_network_access_upgrade(
     Ok(None)
 }
 
-pub(crate) fn load_sandbox_config_network_access(
-    cwd: &Path,
-) -> Result<Option<NetworkAccess>, String> {
+pub fn load_sandbox_config_network_access(cwd: &Path) -> Result<Option<NetworkAccess>, String> {
     load_sandbox_config_file(cwd)?.network_access()
+}
+
+/// W4-11 test/status helper: deny-read paths after tighten-only overlay merge.
+pub fn load_sandbox_deny_read_paths(cwd: &Path) -> Result<Vec<PathBuf>, String> {
+    let config = load_sandbox_config_file(cwd)?;
+    Ok(resolve_deny_read_paths_from(&config, cwd, None))
 }
 
 pub fn shell_approval_key(
