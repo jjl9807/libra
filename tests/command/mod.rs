@@ -100,6 +100,24 @@ fn run_libra_command(args: &[&str], cwd: &Path) -> Output {
 }
 
 #[allow(dead_code)]
+fn spawn_libra_command_with_env(
+    args: &[&str],
+    cwd: &Path,
+    extra_env: &[(&str, &str)],
+) -> std::process::Child {
+    let mut command = base_libra_command(args, cwd);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn libra binary")
+}
+
+#[allow(dead_code)]
 fn run_libra_command_with_stdin(args: &[&str], cwd: &Path, stdin_body: &str) -> Output {
     let mut child = base_libra_command(args, cwd)
         .stdin(Stdio::piped())

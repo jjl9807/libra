@@ -12,14 +12,12 @@
 //! runtime or hidden behind a multi-segment literal is invisible to it —
 //! reviewers, not the scan, are the backstop for those.
 //!
-//! Why this exists: until the unified resolver lands (plan-20260715
-//! W4-06..W4-08), these surfaces are split-brained in a linked worktree —
-//! most read the bare working directory (the linked LOCAL gitdir, where no
-//! repository configuration lives) while sandbox reads COMMON storage. The
-//! W0 preflight (`command::require_main_worktree_for_code_agent`) refuses to
-//! launch the reading runtimes from a linked worktree, which is what makes
-//! remaining `WorkdirDotLibra` rows (if any) safe. W4-11 security and
-//! W4-12 extension loaders resolve through [`ReadResolution::UnifiedResolver`].
+//! Why this exists: W4-06..W4-12 migrated these surfaces onto
+//! [`ReadResolution::UnifiedResolver`]. Linked worktrees now read repository
+//! defaults plus optional overlays (W4-08 enablement); remaining
+//! `WorkdirDotLibra` rows (if any) are inventory debt, not a launch guard.
+//! Damaged/unreadable scope still fail-closes. W4-11 security and W4-12
+//! extension loaders resolve through the registry consumer kind.
 
 /// Which consumer family migrates the surface onto the W4-06 resolver.
 ///
@@ -136,8 +134,8 @@ pub const CODE_AGENT_CONFIG_OWNERSHIP: &[ConfigSurface] = &[
         consumer: ConfigConsumerKind::Security,
     },
     ConfigSurface {
-        surface: "automation rules (linked scope until W4: CLI fail-closed; \
-                  VCS and hook-lifecycle dispatch disabled with warning)",
+        surface: "automation rules (W4-08: healthy linked worktrees dispatch \
+                  via resolver; damaged/unregistered scope still fail-closes)",
         location: "automations.toml",
         kind: SurfaceKind::File,
         owner: ConfigOwner::RepositoryWithOptionalOverlay,

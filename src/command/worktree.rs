@@ -1906,13 +1906,45 @@ fn load_state_impl(heal_identity_invariants: bool) -> WorktreeResult<WorktreeSta
 /// Returns `None` when the registry itself cannot be read: "unknown" is not
 /// "absent", and a torn registry must not be reported as a corrupt identity.
 pub(crate) fn registry_knows_linked_worktree(worktree_id: &str) -> Option<bool> {
-    let state = load_state_readonly().ok()?;
-    Some(
-        state
-            .entries
-            .iter()
-            .any(|entry| entry.worktree_id.as_deref() == Some(worktree_id)),
-    )
+    let cwd = std::env::current_dir().ok()?;
+    let root = crate::internal::worktree_scope::RequestScope::resolve(cwd)
+        .map(|request| request.worktree_root);
+    registry_knows_linked_worktree_in_storage(&util::storage_path(), worktree_id, root.as_deref())
+}
+
+/// [`registry_knows_linked_worktree`] against an already-resolved common
+/// storage root so `--cwd`/`--repo` and automation dispatch cannot consult
+/// the process cwd's registry for a different worktree.
+///
+/// `worktree_root` is required: a copied `worktree_id` in an unregistered
+/// directory must not pass just because some other active entry owns that
+/// id. v2 entries match stored id + canonical path; lockless v1 readers
+/// leave ids unset and match live gitdir id + registered path.
+/// Detached/tombstone entries never count as registered.
+pub(crate) fn registry_knows_linked_worktree_in_storage(
+    storage: &std::path::Path,
+    worktree_id: &str,
+    worktree_root: Option<&std::path::Path>,
+) -> Option<bool> {
+    let state = load_state_readonly_at(&storage.join("worktrees.json")).ok()?;
+    let Some(requested_root) = worktree_root.and_then(|path| canonicalize(path).ok()) else {
+        return Some(false);
+    };
+    Some(state.entries.iter().any(|entry| {
+        if entry.is_main || !entry.state.is_active() {
+            return false;
+        }
+        let Ok(entry_root) = canonicalize(std::path::Path::new(&entry.path)) else {
+            return false;
+        };
+        if entry_root != requested_root {
+            return false;
+        }
+        match entry.worktree_id.as_deref() {
+            Some(registered_id) => registered_id == worktree_id,
+            None => resolve_worktree_id(&entry_root).as_deref() == Some(worktree_id),
+        }
+    }))
 }
 
 /// The LOCAL gitdir of an explicitly named scope (§C.5 pseudo-ref projection).
@@ -3563,7 +3595,13 @@ pub(crate) async fn collect_worktree_scope_report(
             true
         } else {
             resolve_entry_worktree_id(&entry.path, false)
-                .and_then(|id| registry_knows_linked_worktree(&id))
+                .and_then(|id| {
+                    registry_knows_linked_worktree_in_storage(
+                        &util::storage_path(),
+                        &id,
+                        Some(std::path::Path::new(&entry.path)),
+                    )
+                })
                 .unwrap_or(false)
         };
         let mut findings = Vec::new();

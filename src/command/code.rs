@@ -818,12 +818,12 @@ pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
         .await;
     }
 
-    // W0 §C.4.1.1 preflight: gate on the SESSION's working directory — which
-    // `--cwd`/`--repo` may point at a different worktree than the process cwd
-    // — and BEFORE mode validation, so nothing starts a split-brained session
-    // from a linked worktree.
+    // W4-08: linked worktrees launch through the W4-06/W4-11/W4-12 resolver
+    // and W4-07/W4-13 approval ownership. Still resolve the session workdir
+    // before mode validation so `--cwd`/`--repo` cannot silently retarget,
+    // and fail-close when that target is unregistered or unreadable.
     let session_workdir = resolve_code_preflight_working_dir(&args)?;
-    crate::command::require_main_worktree_for_code_agent("libra code", Some(&session_workdir))?;
+    crate::command::require_registered_worktree_scope("libra code", &session_workdir)?;
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
         execute_stdio(&args).await

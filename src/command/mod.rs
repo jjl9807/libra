@@ -173,38 +173,68 @@ use crate::{
 // repository-global store (sequencers, dirty cache, layer, sparse view, the
 // stash stack protocol) is worktree-aware now, and no command refuses to run
 // in a linked worktree on those grounds.
+//
+// The remaining Code/Agent linked-worktree preflight
+// (`require_main_worktree_for_code_agent`) was retired in W4-08 after the
+// W4-06/W4-11/W4-12 resolver and W4-07/W4-13 approval ownership landed.
+// Damaged/unreadable or unregistered linked scope still fail-closes; healthy
+// registered linked worktrees launch `libra code` / `libra automation`
+// through the resolver.
 
-/// W0 §C.4.1.1 (plan-20260714): the one transition guard that REMAINS — a
-/// different hazard from the retired store guards above.
-///
-/// Until the unified Code/Agent config resolver lands (transferred to
-/// plan-20260715 W4-06..W4-08, not yet delivered), Code/Agent configuration
-/// reads are split-brained in a linked worktree: agents/approval/MCP/profile/
-/// hooks read the LOCAL gitdir while sandbox reads COMMON storage, so a
-/// linked session could run under main's sandbox policy WITHOUT main's
-/// `PreToolUse` Block hooks. Launching the runtime surfaces there fails
-/// closed instead of running silently permissive. Diagnosis surfaces
-/// (`agent`, `review`, `investigate`, `code-control`) stay usable in a
-/// damaged or linked worktree — see the CommandScope note in `cli.rs`.
-/// `base`: the directory the guarded surface will actually OPERATE ON —
-/// `None` means the process cwd. `libra code` accepts `--cwd`/`--repo`, so
-/// gating on the ambient cwd alone would let `libra code --cwd <linked-wt>`
-/// start the exact split-brained session the guard exists to prevent.
-pub(crate) fn require_main_worktree_for_code_agent(
+/// W4-08: healthy registered linked worktrees may run Code/Agent surfaces.
+/// A damaged scope, unreadable registry, or `worktree_id` that is missing
+/// from `worktrees.json` (including a synthesized fallback id) still
+/// fail-closes — unknown ownership must not start a session or automation.
+pub(crate) fn require_registered_worktree_scope(
     surface: &str,
-    base: Option<&std::path::Path>,
+    workdir: &std::path::Path,
 ) -> Result<(), crate::utils::error::CliError> {
-    if util::worktree_id_for_base(base.map(std::path::Path::to_path_buf)).is_some() {
-        return Err(crate::utils::error::CliError::fatal(format!(
-            "{surface} cannot run in a linked worktree yet: Code/Agent \
-             configuration (agents/hooks/sandbox/approvals) is not \
-             worktree-aware until the unified config resolver lands \
-             (plan-20260714 W0 preflight)"
+    use crate::internal::worktree_scope::{RequestScope, WorktreeScope};
+
+    let request = match RequestScope::try_resolve(workdir.to_path_buf()) {
+        Ok(Some(request)) => request,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            return Err(crate::utils::error::CliError::fatal(format!(
+                "{surface} cannot run: the worktree scope at '{}' could not be \
+                 resolved ({error})",
+                workdir.display()
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt)
+            .with_hint(
+                "run `libra worktree repair <this-worktree-path> --confirm` from \
+                 the main worktree",
+            ));
+        }
+    };
+    let WorktreeScope::Linked(id) = &request.scope else {
+        return Ok(());
+    };
+    match worktree::registry_knows_linked_worktree_in_storage(
+        &request.storage,
+        id,
+        Some(&request.worktree_root),
+    ) {
+        Some(true) => Ok(()),
+        Some(false) => Err(crate::utils::error::CliError::fatal(format!(
+            "{surface} cannot run: this linked worktree's identity '{id}' is \
+             not in the worktree registry"
         ))
-        .with_stable_code(crate::utils::error::StableErrorCode::RepoStateInvalid)
-        .with_hint("run this command from the MAIN worktree"));
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt)
+        .with_hint(
+            "run `libra worktree repair <this-worktree-path> --confirm` from \
+             the main worktree to restore this worktree's identity",
+        )),
+        None => Err(crate::utils::error::CliError::fatal(format!(
+            "{surface} cannot run: the worktree registry could not be read, so \
+             this worktree's identity cannot be confirmed"
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::RepoCorrupt)
+        .with_hint(
+            "fix or restore `.libra/worktrees.json` in the repository storage, \
+             then retry",
+        )),
     }
-    Ok(())
 }
 
 pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>

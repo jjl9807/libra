@@ -14,7 +14,7 @@ libra automation history [--limit <n>]
 
 `libra automation` 读取仓库自动化配置，评估 cron 风格规则，并将执行历史记录到仓库数据库中。默认情况下，`run` 使用 dry-run 执行器，因此 shell 动作只会被计划和记录，不会生成外部命令进程。只有在确实应该运行已配置动作时，才传递 `--live`。
 
-**Linked worktree**：`automations.toml` 已通过统一 Code/Agent 配置 resolver 读取（linked worktree 可见仓库层）。在 W4-08 enablement 之前，所有 `libra automation` 子命令在 linked worktree 中仍 fail-closed；VCS 事件 dispatch（commit/add/branch/switch/push）同样禁用，且每条命令输出一次 warning 而非静默跳过。请改在 main worktree 运行。
+**Linked worktree**：`automations.toml` 已通过统一 Code/Agent 配置 resolver 读取（linked worktree 可见仓库层；同名 overlay 覆盖）。健康的 linked worktree 中所有 `libra automation` 子命令均可运行，VCS 事件 dispatch（commit/add/branch/switch/push）同样经 resolver 执行。损坏或无法解析的 worktree scope 仍 fail-closed，不会对未知归属的规则集 dispatch。
 
 ## 子命令
 

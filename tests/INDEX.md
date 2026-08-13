@@ -17,7 +17,7 @@
 
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
-| `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema and confirmed legacy-capture adoption contracts | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs` |
+| `command_test` | 1 | Top-level dispatcher covering most `libra <subcmd>` integration paths, including W4 `worktree doctor` read-only/schema, confirmed legacy-capture adoption, and W4-08 linked-worktree `libra code`/`automation` enablement | `src/command/`, `src/cli.rs`, `tests/command/worktree_doctor_test.rs`, `tests/command/code_agent_linked_guard_test.rs` |
 | `compat_stash_subcommand_surface` | 1 | Guards `libra stash` subcommand surface vs. git CLI | `src/command/stash.rs` |
 | `compat_bisect_subcommand_surface` | 1 | Guards `libra bisect` subcommand surface | `src/command/bisect.rs` |
 | `compat_worktree_delete_dir` | 1 | Guards worktree delete semantics on dir removal | `src/command/worktree.rs` |

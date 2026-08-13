@@ -1,6 +1,7 @@
 //! W4-06/W4-11/W4-12: Code/Agent config resolver + security/extension loaders.
 //!
-//! L1 — deterministic. Does not lift linked-worktree preflight (W4-08).
+//! L1 — deterministic. Linked-worktree launch enablement lives in
+//! `code_agent_linked_guard_test.rs` (W4-08).
 
 use std::{fs, path::Path};
 
@@ -1095,26 +1096,5 @@ fn code_agent_config_resolves_repository_layer_in_linked() {
             .iter()
             .any(|skill| skill.name == "repo_skill"),
         "repository-only skill must remain visible beside overlay"
-    );
-}
-
-#[test]
-fn linked_automation_dispatch_disabled_with_warning_before_w4() {
-    let (_repo, parent) = repo_with_linked_worktree();
-    let wt = parent.path().join("wt");
-
-    fs::write(wt.join("b.txt"), "b\n").unwrap();
-    assert_cli_success(&run_libra_command(&["add", "b.txt"], &wt), "add in wt");
-    let commit = run_libra_command(&["commit", "-m", "wt commit", "--no-verify"], &wt);
-    assert_cli_success(&commit, "commit in linked worktree");
-
-    let stderr = String::from_utf8_lossy(&commit.stderr);
-    let warnings = stderr
-        .matches("automation dispatch is disabled in linked worktrees")
-        .count();
-    assert_eq!(
-        warnings, 1,
-        "W4-12 must keep linked automation dispatch disabled with exactly one warning \
-         (0 = silent skip, >1 = spam): {stderr}"
     );
 }

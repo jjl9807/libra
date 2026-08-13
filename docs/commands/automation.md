@@ -19,11 +19,11 @@ recorded without spawning external commands. Pass `--live` only when the
 configured actions should actually run.
 
 **Linked worktrees**: `automations.toml` is read through the unified Code/Agent
-config resolver (repository layer visible from a linked worktree). Every
-`libra automation` subcommand still fails closed in a linked worktree until
-W4-08 enablement, and VCS-event dispatch (commit/add/branch/switch/push)
-stays disabled with one warning per command rather than a silent skip. Run
-from the main worktree instead.
+config resolver (repository layer visible from a linked worktree; same-name
+overlay wins). Every `libra automation` subcommand runs in a healthy linked
+worktree, and VCS-event dispatch (commit/add/branch/switch/push) runs through
+the same resolver. A damaged or unreadable worktree scope still fail-closes
+instead of running a rule set of unknown ownership.
 
 ## Subcommands
 

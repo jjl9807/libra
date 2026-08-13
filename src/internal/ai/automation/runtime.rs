@@ -19,43 +19,44 @@ use crate::{
     utils::util,
 };
 
-/// W0 §C.4.1.1 (plan-20260714): automation configuration is not
-/// worktree-aware until the W4 unified resolver — in a linked worktree
-/// `automations.toml` would be read from the local gitdir, where no
-/// repository configuration lives, so every dispatch would silently no-op
-/// against an empty rule set. That silent skip is expressly forbidden:
-/// dispatch is DISABLED with one user-visible warning instead. Returns true
-/// when the caller must skip dispatching — including when the worktree's
-/// scope CANNOT be resolved (corrupt metadata), because an unknown scope
-/// must not run a rule set of unknown ownership.
-///
-/// "One warning per command" holds by construction with NO process latch:
-/// every guarded entry (the commit/add/branch/switch/push VCS handlers and
-/// the `agent hooks` provider ingest) dispatches exactly ONE event per
-/// command, so warning on every disabled dispatch is once-per-command in a
-/// one-shot CLI *and* in a long-lived host process — a latch would make a
-/// host's second linked command skip silently, the exact forbidden outcome.
-fn linked_scope_dispatch_disabled(working_dir: &Path) -> bool {
-    // TRI-STATE, fail-closed: `worktree_id_for_base` collapses every
-    // resolution ERROR to `None`, which reads as "main" — so a corrupt or
-    // dangling `commondir` would let a linked worktree run its LOCAL rule
-    // set. Resolve the gitdir explicitly instead: only a definitive
-    // not-a-repository answer permits dispatch; a resolution failure means
-    // the scope is unknown, and unknown scope must not run automations.
-    let linked_or_unknown = match util::try_get_worktree_gitdir(Some(working_dir.to_path_buf())) {
-        Ok(gitdir) => util::worktree_id_for_gitdir(&gitdir).is_some(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
+/// W4-08: healthy main and registered linked worktrees dispatch through the
+/// resolver. A damaged/unreadable worktree or an unregistered `worktree_id`
+/// still fail-closes — unknown scope must not run a rule set of unknown
+/// ownership.
+fn unknown_scope_dispatch_disabled(working_dir: &Path) -> bool {
+    use crate::internal::worktree_scope::{RequestScope, WorktreeScope};
+
+    let request = match RequestScope::try_resolve(working_dir.to_path_buf()) {
+        Ok(Some(request)) => request,
+        Ok(None) => return false,
+        Err(_) => {
+            eprintln!(
+                "warning: automation dispatch is disabled because the worktree \
+                 scope could not be resolved; refusing to run automations \
+                 against an unknown configuration owner"
+            );
+            return true;
+        }
     };
-    if !linked_or_unknown {
+    let WorktreeScope::Linked(id) = &request.scope else {
         return false;
+    };
+    match crate::command::worktree::registry_knows_linked_worktree_in_storage(
+        &request.storage,
+        id,
+        Some(&request.worktree_root),
+    ) {
+        Some(true) => false,
+        _ => {
+            eprintln!(
+                "warning: automation dispatch is disabled because this linked \
+                 worktree's identity is missing from the worktree registry; \
+                 refusing to run automations against an unknown configuration \
+                 owner"
+            );
+            true
+        }
     }
-    eprintln!(
-        "warning: automation dispatch is disabled in linked worktrees until \
-         linked-worktree enablement (plan-20260715 W4-08); run from the main \
-         worktree to trigger automations"
-    );
-    true
 }
 
 /// Dispatch a normalized hook lifecycle event through automation rules and
@@ -68,7 +69,7 @@ pub async fn dispatch_hook_lifecycle_event_to_history(
     let Some(hook_event) = automation_hook_event(event_kind) else {
         return Ok(Vec::new());
     };
-    if linked_scope_dispatch_disabled(working_dir) {
+    if unknown_scope_dispatch_disabled(working_dir) {
         return Ok(Vec::new());
     }
 
@@ -87,7 +88,7 @@ pub async fn dispatch_repo_hook_lifecycle_event_to_history(
     let Some(hook_event) = automation_hook_event(event_kind) else {
         return Ok(Vec::new());
     };
-    if linked_scope_dispatch_disabled(working_dir) {
+    if unknown_scope_dispatch_disabled(working_dir) {
         return Ok(Vec::new());
     }
 
@@ -120,7 +121,7 @@ pub async fn dispatch_current_repo_vcs_event_to_history(event: &'static str) {
             return;
         }
     };
-    if linked_scope_dispatch_disabled(&working_dir) {
+    if unknown_scope_dispatch_disabled(&working_dir) {
         return;
     }
     let storage_path = match util::try_get_storage_path(Some(working_dir.clone())) {
@@ -154,7 +155,7 @@ pub async fn dispatch_vcs_event_to_history(
     conn: &DatabaseConnection,
     event: &str,
 ) -> Result<Vec<AutomationRunResult>, AutomationError> {
-    if linked_scope_dispatch_disabled(working_dir) {
+    if unknown_scope_dispatch_disabled(working_dir) {
         return Ok(Vec::new());
     }
     let config = AutomationConfig::load_from_working_dir(working_dir)?;
@@ -167,7 +168,7 @@ pub async fn dispatch_repo_vcs_event_to_history(
     storage_path: &Path,
     event: &str,
 ) -> Result<Vec<AutomationRunResult>, AutomationError> {
-    if linked_scope_dispatch_disabled(working_dir) {
+    if unknown_scope_dispatch_disabled(working_dir) {
         return Ok(Vec::new());
     }
     let config = AutomationConfig::load_from_working_dir(working_dir)?;
@@ -260,12 +261,22 @@ mod tests {
 
     /// A linked-worktree fixture whose commondir points at a REAL main
     /// storage (the resolver fail-closes on dangling targets), carrying a
-    /// matching post_commit rule in its LOCAL gitdir.
+    /// matching post_commit rule in the repository layer.
     fn linked_fixture_with_rule() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         let main_gitdir = tmp.path().join("main").join(".libra");
         std::fs::create_dir_all(&main_gitdir).expect("main gitdir");
         std::fs::write(main_gitdir.join("libra.db"), b"").expect("db marker");
+        std::fs::write(
+            main_gitdir.join("automations.toml"),
+            br#"
+            [[rules]]
+            id = "commit_summary"
+            trigger = { kind = "vcs", event = "post_commit" }
+            action = { kind = "prompt", prompt = "x" }
+            "#,
+        )
+        .expect("repository rules");
         let wt = tmp.path().join("wt");
         let gitdir = wt.join(".libra");
         std::fs::create_dir_all(&gitdir).expect("linked gitdir");
@@ -276,37 +287,74 @@ mod tests {
         .expect("commondir");
         std::fs::write(gitdir.join("worktree_id"), b"wt-test-1234").expect("worktree id");
         std::fs::write(
-            gitdir.join("automations.toml"),
-            br#"
-            [[rules]]
-            id = "commit_summary"
-            trigger = { kind = "vcs", event = "post_commit" }
-            action = { kind = "prompt", prompt = "x" }
-            "#,
+            main_gitdir.join("worktrees.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 3,
+                "linked_history": "existed",
+                "epoch_counter": 1,
+                "entries": [
+                    {
+                        "path": tmp.path().join("main").to_string_lossy(),
+                        "is_main": true,
+                        "locked": false
+                    },
+                    {
+                        "path": wt.to_string_lossy(),
+                        "is_main": false,
+                        "locked": false,
+                        "worktree_id": "wt-test-1234",
+                        "epoch": 1
+                    }
+                ]
+            }))
+            .expect("registry json"),
         )
-        .expect("rules");
+        .expect("worktrees.json");
         tmp
     }
 
-    /// W0 §C.4.1.1: the DIRECT public dispatch APIs are guarded too — a
-    /// linked working dir returns empty WITHOUT touching config or storage.
-    /// The nonexistent storage path is the discriminator: an unguarded call
-    /// would load the matching rule and then fail connecting to the
-    /// database there.
+    /// An unregistered / forged linked identity must not dispatch even when
+    /// the gitdir itself is readable.
     #[tokio::test]
     #[serial_test::serial]
-    async fn direct_repo_vcs_dispatch_is_guarded_in_linked_scope() {
+    async fn direct_repo_vcs_dispatch_is_disabled_for_unregistered_identity() {
         let tmp = linked_fixture_with_rule();
+        let wt = tmp.path().join("wt");
+        std::fs::write(wt.join(".libra").join("worktree_id"), b"forged-id\n")
+            .expect("forge worktree id");
         let results = dispatch_repo_vcs_event_to_history(
+            &wt,
+            &tmp.path().join("no-such-storage"),
+            "post_commit",
+        )
+        .await
+        .expect("unregistered identity returns empty instead of running");
+        assert!(
+            results.is_empty(),
+            "unregistered linked dispatch must run nothing: {results:?}"
+        );
+    }
+
+    /// W4-08: a healthy linked working dir reaches config + storage instead
+    /// of returning empty. The nonexistent storage path is the discriminator.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn direct_repo_vcs_dispatch_runs_in_linked_scope() {
+        let tmp = linked_fixture_with_rule();
+        let err = dispatch_repo_vcs_event_to_history(
             &tmp.path().join("wt"),
             &tmp.path().join("no-such-storage"),
             "post_commit",
         )
         .await
-        .expect("guarded dispatch returns empty instead of a storage error");
+        .expect_err("linked dispatch must reach storage via the resolver");
+        let message = err.to_string();
         assert!(
-            results.is_empty(),
-            "linked dispatch must run nothing: {results:?}"
+            message.to_lowercase().contains("database")
+                || message.to_lowercase().contains("storage")
+                || message.to_lowercase().contains("no such")
+                || message.to_lowercase().contains("not found"),
+            "expected a storage/database failure after enablement, got: {message}"
         );
     }
 
@@ -363,23 +411,24 @@ mod tests {
         assert!(conn_form.is_empty(), "corrupt scope must run nothing");
     }
 
-    /// Same guard on the conn-taking direct API: nothing runs, nothing is
-    /// appended (an unguarded call would run the matching prompt rule).
+    /// W4-08: the conn-taking direct API runs the matching prompt rule in a
+    /// healthy linked scope (corrupt scope stays fail-closed above).
     #[tokio::test]
     #[serial_test::serial]
-    async fn direct_vcs_dispatch_is_guarded_in_linked_scope() {
+    async fn direct_vcs_dispatch_runs_in_linked_scope() {
         let tmp = linked_fixture_with_rule();
         let db_path = tmp.path().join("test.db");
-        std::fs::write(&db_path, b"").expect("touch db file");
-        let conn = crate::internal::db::establish_connection(&db_path.to_string_lossy())
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let conn = sea_orm::Database::connect(&db_url).await.expect("temp db");
+        crate::internal::db::migration::run_builtin_migrations(&conn)
             .await
-            .expect("temp db");
+            .expect("migrations");
         let result = dispatch_vcs_event_to_history(&tmp.path().join("wt"), &conn, "post_commit")
             .await
-            .expect("guarded dispatch returns empty");
+            .expect("linked dispatch runs");
         assert!(
-            result.is_empty(),
-            "linked dispatch must run nothing: {result:?}"
+            result.iter().any(|row| row.rule_id == "commit_summary"),
+            "linked dispatch must run the repository rule: {result:?}"
         );
     }
 }
