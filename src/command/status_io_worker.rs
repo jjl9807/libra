@@ -11,6 +11,7 @@
 //! an anonymous pipe plus a capability token.
 
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     ffi::{OsStr, OsString},
     io::{self, BufReader, Read, Write},
@@ -108,6 +109,20 @@ impl CapturedStat {
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
+
+    fn from_raw_lstat(raw: &crate::utils::beneath::RawLstat) -> Self {
+        Self {
+            is_symlink: raw.is_symlink,
+            is_dir: raw.is_dir,
+            is_file: raw.is_file,
+            len: raw.len,
+            mode: raw.mode,
+            ctime_sec: raw.ctime_sec,
+            ctime_nsec: raw.ctime_nsec,
+            mtime_sec: raw.mtime_sec,
+            mtime_nsec: raw.mtime_nsec,
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -158,6 +173,52 @@ impl Dirent {
             },
         }
     }
+
+    fn from_fd_dirent(entry: &crate::utils::beneath::FdDirent) -> Self {
+        let name = path_to_bytes(&PathBuf::from(&entry.name));
+        // `d_type` values match libc DT_* / Windows FILE_ATTRIBUTE mapping.
+        const DT_UNKNOWN: u8 = 0;
+        const DT_DIR: u8 = 4;
+        const DT_REG: u8 = 8;
+        const DT_LNK: u8 = 10;
+        match entry.d_type {
+            DT_DIR => Self {
+                name,
+                is_dir: true,
+                is_symlink: false,
+                is_file: false,
+                type_ok: true,
+            },
+            DT_LNK => Self {
+                name,
+                is_dir: false,
+                is_symlink: true,
+                is_file: false,
+                type_ok: true,
+            },
+            DT_REG => Self {
+                name,
+                is_dir: false,
+                is_symlink: false,
+                is_file: true,
+                type_ok: true,
+            },
+            DT_UNKNOWN => Self {
+                name,
+                is_dir: false,
+                is_symlink: false,
+                is_file: false,
+                type_ok: false,
+            },
+            _ => Self {
+                name,
+                is_dir: false,
+                is_symlink: false,
+                is_file: false,
+                type_ok: true,
+            },
+        }
+    }
 }
 
 /// Cheap classify result from a `Dirent` or a fallback `CapturedStat`.
@@ -204,6 +265,8 @@ struct CapRequest {
 enum IoRequest {
     SymlinkMetadata {
         path: Vec<u8>,
+        /// Worktree root. Empty → legacy path lstat (library callers).
+        root: Vec<u8>,
     },
     CanonicalizePair {
         left: Vec<u8>,
@@ -211,6 +274,8 @@ enum IoRequest {
     },
     ReadDir {
         path: Vec<u8>,
+        /// Worktree root. Empty → legacy path `read_dir` (library callers).
+        root: Vec<u8>,
         remaining: usize,
         checkpoint_every: u32,
     },
@@ -223,6 +288,8 @@ enum IoRequest {
     },
     MarkerProbe {
         dir: Vec<u8>,
+        /// Worktree root. Empty → legacy path marker probe (library callers).
+        root: Vec<u8>,
     },
     Shutdown,
 }
@@ -461,16 +528,11 @@ pub fn run_worker() -> i32 {
 fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<bool> {
     match request {
         IoRequest::Shutdown => return Ok(false),
-        IoRequest::SymlinkMetadata { path } => {
+        IoRequest::SymlinkMetadata { path, root } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);
-            let result = match std::fs::symlink_metadata(&path) {
-                Ok(meta) => WireResult::Ok(CapturedStat::from_metadata(&meta)),
-                Err(error) => WireResult::Err {
-                    kind: kind_to_u8(error.kind()),
-                    raw_os: error.raw_os_error(),
-                },
-            };
+            let root_path = bytes_to_path(&root);
+            let result = lstat_request(&path, &root_path);
             write_frame(stdout, &IoEvent::DoneStat { result })?;
         }
         IoRequest::CanonicalizePair { left, right } => {
@@ -487,114 +549,15 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
         }
         IoRequest::ReadDir {
             path,
+            root,
             remaining,
             checkpoint_every,
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let path = bytes_to_path(&path);
-            let mut listing = ReadDirListing {
-                entries: Vec::new(),
-                error_kinds: Vec::new(),
-                taken: 0,
-                hit_cap: false,
-                timed_out: false,
-            };
-            match std::fs::read_dir(&path) {
-                Err(error) => {
-                    listing
-                        .error_kinds
-                        .push((kind_to_u8(error.kind()), error.raw_os_error()));
-                }
-                Ok(reader) => {
-                    let mut seq = 0u64;
-                    let mut records = 0u64;
-                    let every = checkpoint_every.max(1);
-                    #[cfg(debug_assertions)]
-                    let mut injected_notfound = false;
-                    for entry in reader {
-                        #[cfg(debug_assertions)]
-                        let entry = if !injected_notfound
-                            && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
-                            && std::env::var("LIBRA_TEST_READDIR_ENTRY_NOTFOUND_DIR")
-                                .is_ok_and(|target| path.ends_with(&target))
-                        {
-                            injected_notfound = true;
-                            Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "injected vanished entry",
-                            ))
-                        } else {
-                            entry
-                        };
-                        listing.taken += 1;
-                        if listing.taken > remaining {
-                            listing.hit_cap = true;
-                            break;
-                        }
-                        match entry {
-                            Ok(entry) => {
-                                write_frame(
-                                    stdout,
-                                    &IoEvent::RecordDirent(Dirent::from_dir_entry(&entry)),
-                                )?;
-                                records += 1;
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                            Err(error) => {
-                                write_frame(
-                                    stdout,
-                                    &IoEvent::RecordError {
-                                        kind: kind_to_u8(error.kind()),
-                                        raw_os: error.raw_os_error(),
-                                    },
-                                )?;
-                                listing
-                                    .error_kinds
-                                    .push((kind_to_u8(error.kind()), error.raw_os_error()));
-                                break;
-                            }
-                        }
-                        if records > 0 && (records as u32).is_multiple_of(every) {
-                            seq += 1;
-                            write_frame(stdout, &IoEvent::Checkpoint { seq, records })?;
-                            maybe_test_kill_after_checkpoint(seq);
-                        }
-                        #[cfg(debug_assertions)]
-                        if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
-                            && std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_DIR")
-                                .is_ok_and(|target| path.ends_with(&target))
-                        {
-                            let kind = match std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_KIND")
-                                .as_deref()
-                            {
-                                Ok("timedout") => io::ErrorKind::TimedOut,
-                                _ => io::ErrorKind::Other,
-                            };
-                            write_frame(
-                                stdout,
-                                &IoEvent::RecordError {
-                                    kind: kind_to_u8(kind),
-                                    raw_os: None,
-                                },
-                            )?;
-                            listing.error_kinds.push((kind_to_u8(kind), None));
-                            break;
-                        }
-                    }
-                }
-            }
-            write_frame(
-                stdout,
-                &IoEvent::DoneReadDir {
-                    listing: ReadDirListing {
-                        entries: Vec::new(),
-                        error_kinds: listing.error_kinds,
-                        taken: listing.taken,
-                        hit_cap: listing.hit_cap,
-                        timed_out: false,
-                    },
-                },
-            )?;
+            let root_path = bytes_to_path(&root);
+            let listing = read_dir_request(&path, &root_path, remaining, checkpoint_every, stdout)?;
+            write_frame(stdout, &IoEvent::DoneReadDir { listing })?;
         }
         IoRequest::FileBlobHash {
             path,
@@ -630,34 +593,15 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
             };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
         }
-        IoRequest::MarkerProbe { dir } => {
+        IoRequest::MarkerProbe { dir, root } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let dir = bytes_to_path(&dir);
-            let mut present = false;
-            let mut err_kind = None;
-            let mut err_raw_os = None;
-            for marker in [crate::utils::util::ROOT_DIR, crate::utils::util::GIT_DIR] {
-                match dir.join(marker).symlink_metadata() {
-                    Ok(_) => {
-                        present = true;
-                        break;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        err_kind = Some(kind_to_u8(error.kind()));
-                        err_raw_os = error.raw_os_error();
-                        break;
-                    }
-                }
-            }
+            let root_path = bytes_to_path(&root);
+            let (present, err_kind, err_raw_os) = marker_probe_request(&dir, &root_path);
             write_frame(
                 stdout,
                 &IoEvent::DoneMarker {
-                    present: if err_kind.is_some() {
-                        None
-                    } else {
-                        Some(present)
-                    },
+                    present,
                     err_kind,
                     err_raw_os,
                 },
@@ -665,6 +609,285 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
         }
     }
     Ok(true)
+}
+
+fn request_root_bytes() -> io::Result<Vec<u8>> {
+    STATUS_IO_ROOT_BYTES.with(|slot| {
+        if let Some(bytes) = slot.borrow().as_ref() {
+            return Ok(bytes.clone());
+        }
+        let path = crate::utils::util::try_working_dir().map_err(|error| {
+            io::Error::other(format!(
+                "cannot resolve worktree root for beneath I/O: {error}"
+            ))
+        })?;
+        let bytes = path_to_bytes(&path);
+        if bytes.is_empty() {
+            return Err(io::Error::other(
+                "worktree root resolved empty for beneath I/O",
+            ));
+        }
+        *slot.borrow_mut() = Some(bytes.clone());
+        Ok(bytes)
+    })
+}
+
+thread_local! {
+    /// Parent-side worktree root for beneath requests. Resolved once per
+    /// status session so `deadline_stat` / `read_dir` do not re-walk the
+    /// repository ancestry for every path.
+    static STATUS_IO_ROOT_BYTES: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+/// Prime the parent-side worktree-root cache for a status/probe session.
+pub(crate) fn prime_status_io_root_cache(root: &Path) {
+    let bytes = path_to_bytes(root);
+    if bytes.is_empty() {
+        return;
+    }
+    STATUS_IO_ROOT_BYTES.with(|slot| {
+        *slot.borrow_mut() = Some(bytes);
+    });
+}
+
+/// Drop the parent-side worktree-root cache at the end of a status session.
+pub(crate) fn clear_status_io_root_cache() {
+    STATUS_IO_ROOT_BYTES.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+/// RAII session that primes [`prime_status_io_root_cache`] and clears on drop.
+pub(crate) struct StatusIoRootGuard;
+
+impl Drop for StatusIoRootGuard {
+    fn drop(&mut self) {
+        clear_status_io_root_cache();
+    }
+}
+
+/// Begin a status I/O session: resolve the worktree root once for all
+/// subsequent beneath requests on this thread.
+pub(crate) fn begin_status_io_root_session() -> io::Result<StatusIoRootGuard> {
+    let path = crate::utils::util::try_working_dir().map_err(|error| {
+        io::Error::other(format!(
+            "cannot resolve worktree root for beneath I/O: {error}"
+        ))
+    })?;
+    prime_status_io_root_cache(&path);
+    Ok(StatusIoRootGuard)
+}
+
+fn lstat_request(path: &Path, root: &Path) -> WireResult<CapturedStat> {
+    if root.as_os_str().is_empty() {
+        return match std::fs::symlink_metadata(path) {
+            Ok(meta) => WireResult::Ok(CapturedStat::from_metadata(&meta)),
+            Err(error) => WireResult::Err {
+                kind: kind_to_u8(error.kind()),
+                raw_os: error.raw_os_error(),
+            },
+        };
+    }
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => {
+            return WireResult::Err {
+                kind: kind_to_u8(io::ErrorKind::Other),
+                raw_os: None,
+            };
+        }
+    };
+    match crate::utils::beneath::open_root(root)
+        .and_then(|fd| crate::utils::beneath::lstat_beneath(&fd, rel))
+    {
+        Ok(raw) => WireResult::Ok(CapturedStat::from_raw_lstat(&raw)),
+        Err(error) => WireResult::Err {
+            kind: kind_to_u8(error.kind()),
+            raw_os: error.raw_os_error(),
+        },
+    }
+}
+
+fn marker_probe_request(dir: &Path, root: &Path) -> (Option<bool>, Option<u8>, Option<i32>) {
+    if root.as_os_str().is_empty() {
+        let mut present = false;
+        for marker in [crate::utils::util::ROOT_DIR, crate::utils::util::GIT_DIR] {
+            match dir.join(marker).symlink_metadata() {
+                Ok(_) => {
+                    present = true;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return (None, Some(kind_to_u8(error.kind())), error.raw_os_error());
+                }
+            }
+        }
+        return (Some(present), None, None);
+    }
+    let rel = match dir.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => return (None, Some(kind_to_u8(io::ErrorKind::Other)), None),
+    };
+    match crate::utils::beneath::open_root(root)
+        .and_then(|fd| crate::utils::beneath::marker_present_beneath(&fd, rel))
+    {
+        Ok(present) => (Some(present), None, None),
+        Err(error) => (None, Some(kind_to_u8(error.kind())), error.raw_os_error()),
+    }
+}
+
+fn read_dir_request(
+    path: &Path,
+    root: &Path,
+    remaining: usize,
+    checkpoint_every: u32,
+    stdout: &mut impl Write,
+) -> io::Result<ReadDirListing> {
+    let mut listing = ReadDirListing {
+        entries: Vec::new(),
+        error_kinds: Vec::new(),
+        taken: 0,
+        hit_cap: false,
+        timed_out: false,
+    };
+    if root.as_os_str().is_empty() {
+        match std::fs::read_dir(path) {
+            Err(error) => {
+                listing
+                    .error_kinds
+                    .push((kind_to_u8(error.kind()), error.raw_os_error()));
+            }
+            Ok(reader) => {
+                emit_read_dir(
+                    reader.map(|entry| entry.map(|entry| Dirent::from_dir_entry(&entry))),
+                    path,
+                    remaining,
+                    checkpoint_every,
+                    &mut listing,
+                    stdout,
+                )?;
+            }
+        }
+        listing.entries.clear();
+        return Ok(listing);
+    }
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => {
+            listing
+                .error_kinds
+                .push((kind_to_u8(io::ErrorKind::Other), None));
+            listing.entries.clear();
+            return Ok(listing);
+        }
+    };
+    match crate::utils::beneath::open_root(root)
+        .and_then(|fd| crate::utils::beneath::open_beneath(&fd, rel))
+        .and_then(crate::utils::beneath::read_dir_fd)
+    {
+        Err(error) => {
+            listing
+                .error_kinds
+                .push((kind_to_u8(error.kind()), error.raw_os_error()));
+        }
+        Ok(reader) => {
+            emit_read_dir(
+                reader.map(|entry| entry.map(|entry| Dirent::from_fd_dirent(&entry))),
+                path,
+                remaining,
+                checkpoint_every,
+                &mut listing,
+                stdout,
+            )?;
+        }
+    }
+    listing.entries.clear();
+    Ok(listing)
+}
+
+fn emit_read_dir<I>(
+    reader: I,
+    path: &Path,
+    remaining: usize,
+    checkpoint_every: u32,
+    listing: &mut ReadDirListing,
+    stdout: &mut impl Write,
+) -> io::Result<()>
+where
+    I: Iterator<Item = io::Result<Dirent>>,
+{
+    let mut seq = 0u64;
+    let mut records = 0u64;
+    let every = checkpoint_every.max(1);
+    #[cfg(debug_assertions)]
+    let mut injected_notfound = false;
+    for entry in reader {
+        #[cfg(debug_assertions)]
+        let entry = if !injected_notfound
+            && std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+            && std::env::var("LIBRA_TEST_READDIR_ENTRY_NOTFOUND_DIR")
+                .is_ok_and(|target| path.ends_with(&target))
+        {
+            injected_notfound = true;
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "injected vanished entry",
+            ))
+        } else {
+            entry
+        };
+        listing.taken += 1;
+        if listing.taken > remaining {
+            listing.hit_cap = true;
+            break;
+        }
+        match entry {
+            Ok(dirent) => {
+                write_frame(stdout, &IoEvent::RecordDirent(dirent))?;
+                records += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                write_frame(
+                    stdout,
+                    &IoEvent::RecordError {
+                        kind: kind_to_u8(error.kind()),
+                        raw_os: error.raw_os_error(),
+                    },
+                )?;
+                listing
+                    .error_kinds
+                    .push((kind_to_u8(error.kind()), error.raw_os_error()));
+                break;
+            }
+        }
+        if records > 0 && (records as u32).is_multiple_of(every) {
+            seq += 1;
+            write_frame(stdout, &IoEvent::Checkpoint { seq, records })?;
+            maybe_test_kill_after_checkpoint(seq);
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_some()
+            && std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_DIR")
+                .is_ok_and(|target| path.ends_with(&target))
+        {
+            let kind = match std::env::var("LIBRA_TEST_READDIR_ITER_ERROR_KIND").as_deref() {
+                Ok("timedout") => io::ErrorKind::TimedOut,
+                _ => io::ErrorKind::Other,
+            };
+            write_frame(
+                stdout,
+                &IoEvent::RecordError {
+                    kind: kind_to_u8(kind),
+                    raw_os: None,
+                },
+            )?;
+            listing.error_kinds.push((kind_to_u8(kind), None));
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn apply_hash_kind(kind: &str) {
@@ -1228,9 +1451,14 @@ fn write_request(writer: &mut impl Write, token: &str, request: IoRequest) -> io
 }
 
 pub(crate) fn deadline_stat(path: &Path) -> Result<io::Result<CapturedStat>, ()> {
+    let root = match request_root_bytes() {
+        Ok(root) => root,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::SymlinkMetadata {
             path: path_to_bytes(path),
+            root,
         },
         path_to_bytes(path),
         crate::command::status_probe::io_op_timeout(),
@@ -1271,9 +1499,14 @@ pub(crate) fn deadline_read_dir(
     remaining: usize,
     progress: &AtomicUsize,
 ) -> Result<io::Result<ReadDirListing>, ()> {
+    let root = match request_root_bytes() {
+        Ok(root) => root,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::ReadDir {
             path: path_to_bytes(path),
+            root,
             remaining,
             checkpoint_every: 32,
         },
@@ -1388,9 +1621,14 @@ pub(crate) fn deadline_file_blob_hash(
 }
 
 pub(crate) fn deadline_marker_probe(dir: &Path) -> Result<Result<bool, io::Error>, ()> {
+    let root = match request_root_bytes() {
+        Ok(root) => root,
+        Err(error) => return Ok(Err(error)),
+    };
     let events = submit(
         IoRequest::MarkerProbe {
             dir: path_to_bytes(dir),
+            root,
         },
         path_to_bytes(dir),
         crate::command::status_probe::io_op_timeout(),

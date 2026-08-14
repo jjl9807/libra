@@ -5153,6 +5153,63 @@ fn probe_symlinked_escape_is_reported_not_followed() {
     );
 }
 
+/// WIO-02: a check→open directory-escape race must surface as IoBlocked and
+/// must never enumerate outside content. Real symlink/junction swaps are
+/// exercised by `utils::beneath` unit tests; this end-to-end case arms the
+/// non-mutating harness seam so the status worker maps the same failure
+/// through JSON `io_blocked[]` on every platform (including Windows).
+#[test]
+fn probe_toctou_directory_swap_is_blocked() {
+    let outside = tempdir().expect("outside dir");
+    fs::create_dir_all(outside.path().join("child")).unwrap();
+    fs::write(
+        outside.path().join("child/decoy.txt"),
+        "toctou decoy\nline two\n",
+    )
+    .unwrap();
+
+    let repo = repo_with_worktree_move("dest.txt");
+    enable_rename_untracked(repo.path());
+    fs::create_dir(repo.path().join("swapme")).unwrap();
+    fs::write(repo.path().join("swapme/inside.txt"), "inside\n").unwrap();
+
+    let outside_display = outside
+        .path()
+        .to_str()
+        .expect("tempdir path is utf-8")
+        .to_string();
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status", "--", "swapme"],
+        repo.path(),
+        "",
+        &[
+            ("LIBRA_TEST_BENEATH_TOCTOU_SWAP", "swapme"),
+            ("LIBRA_TEST_BENEATH_TOCTOU_OUTSIDE", &outside_display),
+        ],
+    );
+    assert_cli_success(&out, "toctou swap still yields a status envelope");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("json");
+    assert!(
+        !stdout.contains("decoy"),
+        "content outside the worktree is never enumerated: {doc}"
+    );
+    assert!(
+        doc["data"]["io_blocked"].as_array().is_some_and(|events| {
+            events.iter().any(|event| {
+                event["path"]["display"]
+                    .as_str()
+                    .is_some_and(|path| path.contains("swapme"))
+            })
+        }),
+        "the swapped directory is recorded in io_blocked[]: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["complete"], false,
+        "and the run is therefore not complete: {doc}"
+    );
+}
+
 /// §B.3.1.2: a case-fold ALIAS of a tracked path never qualifies as a
 /// rename destination. On a case-insensitive filesystem `README.md` and
 /// `readme.md` are the same file, so pairing a deletion with its own alias

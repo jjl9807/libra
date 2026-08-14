@@ -613,8 +613,8 @@ fn marker_probe(dir: &Path) -> MarkerProbe {
 /// path would wave `link/child` through when `link` points outside.
 ///
 /// An unresolvable path falls back to the lexical check rather than silently
-/// trusting it. (Closes the STATIC case; the remaining check→open race is
-/// the fd/beneath work deferred to plan-20260715 W-IO.)
+/// trusting it. Listing itself is fd/beneath (WIO-02): a check→open swap
+/// of the directory for an escaping symlink is rejected by the worker.
 fn resolves_inside(candidate: &Path, workdir: &Path) -> bool {
     let canon_candidate = candidate.to_path_buf();
     let canon_root = workdir.to_path_buf();
@@ -647,6 +647,7 @@ pub(crate) fn probe_rename_destinations(
     filter: &DestinationFilter<'_>,
     limits: ProbeLimits,
 ) -> ProbeOutcome {
+    let _ignore_walk = util::begin_secure_ignore_walk();
     let mut outcome = ProbeOutcome::default();
     let mut enumerated = 0usize;
     let workdir = filter.workdir;
@@ -747,10 +748,26 @@ pub(crate) fn probe_rename_destinations(
         let mut pending: Vec<PathBuf> = vec![root.clone()];
         while let Some(dir) = pending.pop() {
             let dir_abs = workdir.join(&dir);
-            // §B.3.2 escape guard: an ancestor replaced by a symlink after
-            // the parent walk must never let the probe read outside the
-            // worktree. Re-verify the directory is a real directory
-            // (not a symlink) and still lexically inside the worktree.
+            // Revalidate through the repo-root fd before listing or ignore
+            // I/O: a post-parent-walk swap must not redirect `dir/.gitignore`
+            // pathname reads outside the worktree.
+            if !dir.as_os_str().is_empty() {
+                match marker_probe(&dir_abs) {
+                    MarkerProbe::Blocked(reason) => {
+                        outcome.io_blocked.push(IoBlockedEvent {
+                            path: dir.clone(),
+                            reason,
+                            absorbed: false,
+                        });
+                        continue;
+                    }
+                    MarkerProbe::Present => continue,
+                    MarkerProbe::Absent => {}
+                }
+            }
+            // §B.3.2 escape guard (lexical + symlink leaf): keep the cheap
+            // lstat filter for non-directory entries that slipped into the
+            // pending queue.
             let dir_stat_target = dir_abs.clone();
             let dir_stat = match crate::command::status_io_worker::deadline_stat(&dir_stat_target) {
                 Ok(result) => result,
@@ -782,8 +799,8 @@ pub(crate) fn probe_rename_destinations(
             // one is followed, so a root like `link/inside` can name a
             // directory that physically lives outside the worktree. A
             // lexical comparison of the unresolved path would wave it
-            // through. (Resolution closes the static case; the remaining
-            // check→open race is the fd/beneath work deferred to W-IO.)
+            // through. Listing then uses repo-root fd/beneath (WIO-02) so
+            // a check→open swap cannot read outside the worktree.
             if !resolves_inside(&dir_abs, workdir) {
                 // A path that resolves outside the worktree is REPORTED,
                 // never silently skipped (§B.3.2): silently dropping it
@@ -924,28 +941,32 @@ pub(crate) fn probe_rename_destinations(
                         outcome.destinations.push(relative);
                     }
                 } else if meta.is_dir() {
-                    // Prune ignored subtrees before enumerating them and
-                    // never enter a nested repository or gitlink checkout.
-                    // The ignore lookup and the two marker probes all touch
-                    // the filesystem, so they run under the same deadline as
-                    // every other traversal read. A reclaimed probe is
-                    // treated as "do not descend": conservative, and it
-                    // cannot wedge the walk.
-                    // `core.excludesFile` is a DB read, not a filesystem
-                    // one; resolving it here keeps database contention off
-                    // the worktree I/O deadline.
+                    // Ignore pruning stays ahead of marker/open so an ignored
+                    // unreadable directory does not fail the probe closed.
+                    // Eligible directories are then revalidated through the
+                    // repo-root fd before descent.
                     util::prewarm_ignore_config(workdir);
                     let ignore_target = (workdir.to_path_buf(), absolute.clone());
+                    let walk_epoch = util::secure_ignore_walk_epoch();
                     let ignored = match with_io_deadline(move || {
                         let (workdir, absolute) = ignore_target;
-                        util::check_gitignore(&workdir, &absolute)
+                        util::check_gitignore_as_dir_for_walk(&workdir, &absolute, true, walk_epoch)
                     }) {
-                        Ok(value) => value,
+                        Ok(value) => {
+                            if util::ignore_read_failed() {
+                                if filter.could_qualify(&relative, &absolute) {
+                                    outcome.io_blocked.push(IoBlockedEvent {
+                                        path: relative.clone(),
+                                        reason: IoBlockedReason::IoError,
+                                        absorbed: false,
+                                    });
+                                }
+                                true
+                            } else {
+                                value
+                            }
+                        }
                         Err(()) => {
-                            // "Could not decide" is NOT "ignored": skipping
-                            // the subtree silently would degrade to "no
-                            // renames here", which the contract forbids.
-                            // Report it and skip.
                             if filter.could_qualify(&relative, &absolute) {
                                 outcome.io_blocked.push(IoBlockedEvent {
                                     path: relative.clone(),
@@ -956,20 +977,21 @@ pub(crate) fn probe_rename_destinations(
                             true
                         }
                     };
-                    let marker = marker_probe(&absolute);
-                    if let MarkerProbe::Blocked(reason) = marker
-                        && filter.could_qualify(&relative, &absolute)
-                    {
-                        outcome.io_blocked.push(IoBlockedEvent {
-                            path: relative.clone(),
-                            reason,
-                            absorbed: false,
-                        });
+                    if ignored {
+                        continue;
                     }
-                    if ignored
-                        || !matches!(marker, MarkerProbe::Absent)
-                        || filter.is_gitlink_dir(&relative)
-                    {
+                    let marker = marker_probe(&absolute);
+                    if let MarkerProbe::Blocked(reason) = marker {
+                        if filter.could_qualify(&relative, &absolute) {
+                            outcome.io_blocked.push(IoBlockedEvent {
+                                path: relative.clone(),
+                                reason,
+                                absorbed: false,
+                            });
+                        }
+                        continue;
+                    }
+                    if !matches!(marker, MarkerProbe::Absent) || filter.is_gitlink_dir(&relative) {
                         continue;
                     }
                     pending.push(relative);
@@ -991,6 +1013,11 @@ pub(crate) fn probe_rename_destinations(
     outcome.destinations.dedup();
     outcome.io_blocked.sort_by(|a, b| a.path.cmp(&b.path));
     outcome.io_blocked.dedup_by(|a, b| a.path == b.path);
+    // A failed ignore-source read leaves destination qualification
+    // undecidable; never claim a complete probe root.
+    if util::ignore_read_failed() {
+        outcome.complete_roots.clear();
+    }
     outcome
 }
 

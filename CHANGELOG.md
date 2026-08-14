@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 WIO-02, 2026-08-14, v0.19.157)
+
+- **WIO-02 binds status/probe directory traversal to a repo-root
+  fd/handle.** Linux uses `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`
+  with openat fallback; other Unix/Windows keep equivalent no-follow
+  beneath walks. Escape and check→open directory-swap races map to
+  `IoBlocked` without reading outside the worktree. Ignore sources under
+  the tree are read through the same beneath path; schema/sort/
+  `io_timeout` mapping is unchanged. Cached root fds are rewound before
+  `fdopendir` so a prior listing cannot leave the next probe empty.
+  Unreadable directories still emit the collapsed `dir/` marker with an
+  absorbed `io_blocked` event. `docs/commands/status.md` EN/zh and
+  plan-20260714 §B.3.2 record the fd/beneath semantics.
+
 ### Added (plan-20260715 WIO-01, 2026-08-13, v0.19.156)
 
 - **WIO-01 moves status basic-scan/probe I/O into an out-of-process

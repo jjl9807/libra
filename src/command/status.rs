@@ -1316,6 +1316,10 @@ async fn collect_status_data(
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("this command requires a working tree; bare repositories do not have one"));
     }
+    let _status_io_root = crate::command::status_io_worker::begin_status_io_root_session()
+        .map_err(|source| {
+            CliError::fatal(format!("cannot resolve worktree for status I/O: {source}"))
+        })?;
     let ignore_case = effective_ignore_case_for_status().await?;
 
     let head = Head::current_result()

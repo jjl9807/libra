@@ -56,6 +56,41 @@ static OBJECTS_STORAGE_CACHE: Lazy<Mutex<HashMap<PathBuf, ClientStorage>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static LIBRAIGNORE_CACHE: Lazy<Mutex<HashMap<IgnoreCacheKey, CachedGitignore>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+/// Per-invocation ignore-walk registry. Concurrent status/probe walks each
+/// own an epoch; timed-out workers can only latch failure onto still-active
+/// epochs, so one walk cannot clear or poison another.
+struct SecureIgnoreWalkRegistry {
+    next_epoch: u64,
+    active: HashSet<u64>,
+    failed: HashSet<u64>,
+    /// Per-walk beneath ignore loads (`path` → `Some(matcher)` or `None` for
+    /// NotFound). Avoids re-reading the same `.gitignore` for every entry
+    /// while keeping cache lifetime tied to the walk epoch.
+    matchers: HashMap<u64, HashMap<PathBuf, Option<Arc<Gitignore>>>>,
+}
+
+static SECURE_IGNORE_WALK: Lazy<Mutex<SecureIgnoreWalkRegistry>> = Lazy::new(|| {
+    Mutex::new(SecureIgnoreWalkRegistry {
+        next_epoch: 0,
+        active: HashSet::new(),
+        failed: HashSet::new(),
+        matchers: HashMap::new(),
+    })
+});
+
+thread_local! {
+    /// Epoch of the ignore walk started on this thread (supports nesting).
+    static CURRENT_WALK_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Epoch bound for the duration of a single ignore lookup (worker thread).
+    static IGNORE_OP_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn lock_secure_ignore_walk() -> std::sync::MutexGuard<'static, SecureIgnoreWalkRegistry> {
+    match SECURE_IGNORE_WALK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 static CONFIG_PATH_CACHE: Lazy<Mutex<HashMap<ConfigPathCacheKey, Option<PathBuf>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
@@ -2196,12 +2231,30 @@ pub fn check_gitignore_bounded(workdir: &Path, path: &Path) -> Option<bool> {
     prewarm_ignore_config(workdir);
     let workdir_owned = workdir.to_path_buf();
     let path_owned = path.to_path_buf();
+    let walk_epoch = secure_ignore_walk_epoch();
     let answer = crate::command::status_probe::with_io_deadline(move || {
-        check_gitignore(&workdir_owned, &path_owned)
+        let is_dir = fs::symlink_metadata(&path_owned)
+            .map(|meta| meta.file_type().is_dir())
+            .unwrap_or(false);
+        check_gitignore_as_dir_for_walk(&workdir_owned, &path_owned, is_dir, walk_epoch)
     })
     .ok()?;
-    // An unreadable ignore file yields an EMPTY matcher, so `false` here
-    // would mean "not ignored" when the truth is "unknown".
+    if ignore_read_failed() {
+        return None;
+    }
+    Some(answer)
+}
+
+/// [`check_gitignore_bounded`] with an explicit no-follow directory flag.
+pub fn check_gitignore_bounded_as_dir(workdir: &Path, path: &Path, is_dir: bool) -> Option<bool> {
+    prewarm_ignore_config(workdir);
+    let workdir_owned = workdir.to_path_buf();
+    let path_owned = path.to_path_buf();
+    let walk_epoch = secure_ignore_walk_epoch();
+    let answer = crate::command::status_probe::with_io_deadline(move || {
+        check_gitignore_as_dir_for_walk(&workdir_owned, &path_owned, is_dir, walk_epoch)
+    })
+    .ok()?;
     if ignore_read_failed() {
         return None;
     }
@@ -2230,12 +2283,34 @@ pub fn check_gitignore(work_dir: &Path, target_file: &Path) -> bool {
     )
 }
 
+/// Like [`check_gitignore`], but uses a caller-supplied directory flag instead
+/// of `Path::is_dir()` (which follows symlinks). Status walks must pass the
+/// no-follow dirent kind so a post-listing swap cannot redirect ignore I/O.
+pub fn check_gitignore_as_dir(work_dir: &Path, target_file: &Path, is_dir: bool) -> bool {
+    check_gitignore_with_layers_as_dir(
+        work_dir,
+        target_file,
+        &crate::internal::layer::ExclusionSnapshot::for_request(),
+        is_dir,
+    )
+}
+
 /// [`check_gitignore`] against an ALREADY-CAPTURED layer snapshot, for a walk
 /// that captured once and must not re-read process-global state per path.
 pub fn check_gitignore_with_layers(
     work_dir: &Path,
     target_file: &Path,
     layers: &crate::internal::layer::ExclusionSnapshot,
+) -> bool {
+    check_gitignore_with_layers_as_dir(work_dir, target_file, layers, target_file.is_dir())
+}
+
+/// [`check_gitignore_with_layers`] with an explicit directory flag (no-follow).
+pub fn check_gitignore_with_layers_as_dir(
+    work_dir: &Path,
+    target_file: &Path,
+    layers: &crate::internal::layer::ExclusionSnapshot,
+    is_dir: bool,
 ) -> bool {
     assert!(target_file.starts_with(work_dir));
 
@@ -2266,8 +2341,11 @@ pub fn check_gitignore_with_layers(
     }
 
     for source in ignore_sources_for_target(work_dir, target_file) {
-        let ignore = cached_ignore_file(&source.path, &source.base);
-        if let Some(verdict) = ignore_verdict(&ignore, work_dir, target_file) {
+        let ignore = match &source.preloaded {
+            Some(matcher) => Arc::clone(matcher),
+            None => cached_ignore_file(&source.path, &source.base),
+        };
+        if let Some(verdict) = ignore_verdict_as_dir(&ignore, work_dir, target_file, is_dir) {
             return verdict;
         }
     }
@@ -2313,7 +2391,10 @@ pub fn check_gitignore_match(work_dir: &Path, target_file: &Path) -> Option<Igno
     }
 
     for source in ignore_sources_for_target(work_dir, target_file) {
-        let ignore = cached_ignore_file(&source.path, &source.base);
+        let ignore = match &source.preloaded {
+            Some(matcher) => Arc::clone(matcher),
+            None => cached_ignore_file(&source.path, &source.base),
+        };
         if let Some(info) = ignore_match_info(&ignore, work_dir, target_file) {
             return Some(info);
         }
@@ -2325,6 +2406,9 @@ pub fn check_gitignore_match(work_dir: &Path, target_file: &Path) -> Option<Igno
 struct IgnoreSource {
     path: PathBuf,
     base: PathBuf,
+    /// When set, the matcher was loaded via fd/beneath and must not be
+    /// re-read through a pathname (which could follow a swap).
+    preloaded: Option<Arc<Gitignore>>,
 }
 
 fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreSource> {
@@ -2333,9 +2417,15 @@ fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreS
     dir.pop();
 
     while dir.starts_with(work_dir) {
-        push_ignore_source(&mut sources, dir.join(LIBRAIGNORE_FILE), dir.clone());
-        push_ignore_source(&mut sources, dir.join(GITIGNORE_FILE), dir.clone());
-        dir.pop();
+        let rel = dir.strip_prefix(work_dir).unwrap_or(Path::new(""));
+        push_ignore_source_beneath(&mut sources, work_dir, rel, &dir, LIBRAIGNORE_FILE);
+        push_ignore_source_beneath(&mut sources, work_dir, rel, &dir, GITIGNORE_FILE);
+        if dir == work_dir {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
     }
 
     for info_exclude in worktree_info_file_paths(work_dir, "exclude") {
@@ -2347,14 +2437,161 @@ fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreS
     sources
 }
 
-fn push_ignore_source(sources: &mut Vec<IgnoreSource>, path: PathBuf, base: PathBuf) {
-    if path.exists() {
-        sources.push(IgnoreSource { path, base });
+/// Current ignore-walk epoch for scheduling deadline workers.
+///
+/// Returns the epoch of the walk begun on this thread via
+/// [`begin_secure_ignore_walk`], or `0` when none is active.
+pub fn secure_ignore_walk_epoch() -> u64 {
+    CURRENT_WALK_EPOCH.with(|cell| cell.get())
+}
+
+/// RAII end for [`begin_secure_ignore_walk`].
+pub struct SecureIgnoreWalkGuard {
+    epoch: u64,
+    prev_epoch: u64,
+}
+
+impl Drop for SecureIgnoreWalkGuard {
+    fn drop(&mut self) {
+        {
+            let mut registry = lock_secure_ignore_walk();
+            registry.active.remove(&self.epoch);
+            registry.failed.remove(&self.epoch);
+            registry.matchers.remove(&self.epoch);
+        }
+        CURRENT_WALK_EPOCH.with(|cell| {
+            if cell.get() == self.epoch {
+                cell.set(self.prev_epoch);
+            }
+        });
     }
 }
 
-fn ignore_verdict(ignore: &Gitignore, work_dir: &Path, target_file: &Path) -> Option<bool> {
-    ignore_match_info(ignore, work_dir, target_file).map(|info| info.ignored)
+/// Call at the start of a status/probe walk; drops to end the walk.
+///
+/// Each invocation allocates its own epoch so concurrent in-process status
+/// runs cannot clear each other's failure latch. Ignore matchers are read via
+/// beneath into a walk-scoped cache so timed-out deadline workers cannot
+/// contaminate a later scan, while repeated lookups within one walk reuse the
+/// first beneath read.
+pub fn begin_secure_ignore_walk() -> SecureIgnoreWalkGuard {
+    let epoch = {
+        let mut registry = lock_secure_ignore_walk();
+        registry.next_epoch = registry.next_epoch.saturating_add(1).max(1);
+        let epoch = registry.next_epoch;
+        registry.active.insert(epoch);
+        registry.matchers.insert(epoch, HashMap::new());
+        epoch
+    };
+    let prev_epoch = CURRENT_WALK_EPOCH.with(|cell| cell.replace(epoch));
+    SecureIgnoreWalkGuard { epoch, prev_epoch }
+}
+
+/// Like [`check_gitignore_as_dir`], but binds `walk_epoch` for the duration of
+/// the lookup so a timed-out worker from another scan cannot latch failure.
+pub fn check_gitignore_as_dir_for_walk(
+    work_dir: &Path,
+    target_file: &Path,
+    is_dir: bool,
+    walk_epoch: u64,
+) -> bool {
+    IGNORE_OP_EPOCH.with(|cell| cell.set(walk_epoch));
+    let answer = check_gitignore_as_dir(work_dir, target_file, is_dir);
+    IGNORE_OP_EPOCH.with(|cell| cell.set(0));
+    answer
+}
+
+fn ignore_walk_op_epoch() -> u64 {
+    let op_epoch = IGNORE_OP_EPOCH.with(|cell| cell.get());
+    if op_epoch != 0 {
+        op_epoch
+    } else {
+        CURRENT_WALK_EPOCH.with(|cell| cell.get())
+    }
+}
+
+fn lookup_walk_ignore_matcher(epoch: u64, path: &Path) -> Option<Option<Arc<Gitignore>>> {
+    if epoch == 0 {
+        return None;
+    }
+    let registry = lock_secure_ignore_walk();
+    registry
+        .matchers
+        .get(&epoch)
+        .and_then(|map| map.get(path).cloned())
+}
+
+fn store_walk_ignore_matcher(epoch: u64, path: PathBuf, value: Option<Arc<Gitignore>>) {
+    if epoch == 0 {
+        return;
+    }
+    let mut registry = lock_secure_ignore_walk();
+    if registry.active.contains(&epoch)
+        && let Some(map) = registry.matchers.get_mut(&epoch)
+    {
+        map.insert(path, value);
+    }
+}
+
+fn push_ignore_source_beneath(
+    sources: &mut Vec<IgnoreSource>,
+    work_dir: &Path,
+    dir_rel: &Path,
+    dir_abs: &Path,
+    file_name: &str,
+) {
+    let path = dir_abs.join(file_name);
+    let epoch = ignore_walk_op_epoch();
+    if let Some(cached) = lookup_walk_ignore_matcher(epoch, &path) {
+        if let Some(matcher) = cached {
+            sources.push(IgnoreSource {
+                path,
+                base: dir_abs.to_path_buf(),
+                preloaded: Some(matcher),
+            });
+        }
+        return;
+    }
+    match crate::utils::beneath::read_regular_file_beneath(
+        work_dir,
+        dir_rel,
+        std::ffi::OsStr::new(file_name),
+    ) {
+        Ok(bytes) => {
+            let matcher = cached_ignore_file_from_bytes(&path, dir_abs, &bytes);
+            store_walk_ignore_matcher(epoch, path.clone(), Some(Arc::clone(&matcher)));
+            sources.push(IgnoreSource {
+                path,
+                base: dir_abs.to_path_buf(),
+                preloaded: Some(matcher),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            store_walk_ignore_matcher(epoch, path, None);
+        }
+        Err(_) => {
+            latch_ignore_read_failed();
+        }
+    }
+}
+
+fn push_ignore_source(sources: &mut Vec<IgnoreSource>, path: PathBuf, base: PathBuf) {
+    if path.exists() {
+        sources.push(IgnoreSource {
+            path,
+            base,
+            preloaded: None,
+        });
+    }
+}
+
+fn ignore_verdict_as_dir(
+    ignore: &Gitignore,
+    work_dir: &Path,
+    target_file: &Path,
+    is_dir: bool,
+) -> Option<bool> {
+    ignore_match_info_as_dir(ignore, work_dir, target_file, is_dir).map(|info| info.ignored)
 }
 
 fn ignore_match_info(
@@ -2362,11 +2599,20 @@ fn ignore_match_info(
     work_dir: &Path,
     target_file: &Path,
 ) -> Option<IgnoreMatchInfo> {
-    if let Some(info) = glob_match_info(ignore.matched(target_file, target_file.is_dir())) {
+    ignore_match_info_as_dir(ignore, work_dir, target_file, target_file.is_dir())
+}
+
+fn ignore_match_info_as_dir(
+    ignore: &Gitignore,
+    work_dir: &Path,
+    target_file: &Path,
+    is_dir: bool,
+) -> Option<IgnoreMatchInfo> {
+    if let Some(info) = glob_match_info(ignore.matched(target_file, is_dir)) {
         return Some(info);
     }
 
-    let mut parent_dir = if target_file.is_dir() {
+    let mut parent_dir = if is_dir {
         target_file.to_path_buf()
     } else {
         target_file
@@ -2462,6 +2708,39 @@ fn cached_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
     matcher
 }
 
+fn cached_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) -> Arc<Gitignore> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let content_tag = hasher.finish();
+    let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(content_tag);
+    let len = bytes.len() as u64;
+    let key = IgnoreCacheKey {
+        source: ignore_path.to_path_buf(),
+        base: base.to_path_buf(),
+    };
+    let mut cache = match LIBRAIGNORE_CACHE.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(cached) = cache.get(&key)
+        && cached.len == len
+        && cached.modified == modified
+    {
+        return Arc::clone(&cached.matcher);
+    }
+    let matcher = load_ignore_file_from_bytes(ignore_path, base, bytes);
+    cache.insert(
+        key,
+        CachedGitignore {
+            len,
+            modified,
+            matcher: Arc::clone(&matcher),
+        },
+    );
+    matcher
+}
+
 /// Build an in-memory gitignore matcher from explicit exclude patterns supplied
 /// on the command line (e.g. `ls-files -x <pattern>` / `-X <file>`), rooted at
 /// `work_dir`. Returns `None` when there are no patterns, so callers can skip the
@@ -2520,15 +2799,28 @@ pub fn exclude_matcher_verdict(
     }
 }
 
-/// Set when an ignore file existed but could not be read during this
-/// invocation. `check_gitignore_bounded` turns it into an undecidable
-/// answer, which callers report as `io_blocked` rather than guessing.
-static IGNORE_READ_FAILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Whether any ignore file failed to read since the last reset.
+/// Whether any ignore file failed to read during this thread's active
+/// status/probe walk.
 pub fn ignore_read_failed() -> bool {
-    IGNORE_READ_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+    let epoch = CURRENT_WALK_EPOCH.with(|cell| cell.get());
+    if epoch == 0 {
+        return false;
+    }
+    let registry = lock_secure_ignore_walk();
+    registry.active.contains(&epoch) && registry.failed.contains(&epoch)
+}
+
+fn latch_ignore_read_failed() {
+    let epoch = ignore_walk_op_epoch();
+    if epoch == 0 {
+        return;
+    }
+    let mut registry = lock_secure_ignore_walk();
+    // Only latch onto still-active walks so a timed-out worker from a
+    // finished scan cannot poison a concurrent or later walk.
+    if registry.active.contains(&epoch) {
+        registry.failed.insert(epoch);
+    }
 }
 
 /// Does this ignore file contribute at least one pattern the ENGINE would
@@ -2557,30 +2849,41 @@ pub fn ignore_file_defines_any_pattern(ignore_path: &Path, base: &Path) -> bool 
 }
 
 fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
-    let mut builder = GitignoreBuilder::new(base);
-    match fs::read_to_string(ignore_path) {
-        Ok(contents) => {
-            for line in contents.lines() {
-                if let Err(error) = builder.add_line(Some(ignore_path.to_path_buf()), line) {
-                    eprintln!(
-                        "warning: invalid ignore pattern in {}: {error}",
-                        ignore_path.display()
-                    );
-                }
-            }
+    match fs::read(ignore_path) {
+        Ok(bytes) => load_ignore_file_from_bytes(ignore_path, base, &bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            load_ignore_file_from_bytes(ignore_path, base, b"")
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            // An ignore file we cannot READ leaves an empty matcher, which
-            // silently reclassifies everything under it as NOT ignored. Mark
-            // the invocation so callers that must fail closed (the status
-            // probe and worktree scan) can refuse to answer instead of
-            // inventing a classification.
-            IGNORE_READ_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            latch_ignore_read_failed();
             crate::utils::error::emit_warning(format!(
                 "failed to read ignore file {}: {error}",
                 ignore_path.display()
             ));
+            load_ignore_file_from_bytes(ignore_path, base, b"")
+        }
+    }
+}
+
+fn load_ignore_file_from_bytes(ignore_path: &Path, base: &Path, bytes: &[u8]) -> Arc<Gitignore> {
+    let contents = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            latch_ignore_read_failed();
+            crate::utils::error::emit_warning(format!(
+                "ignore file {} is not valid UTF-8: {error}",
+                ignore_path.display()
+            ));
+            return Arc::new(Gitignore::empty());
+        }
+    };
+    let mut builder = GitignoreBuilder::new(base);
+    for line in contents.lines() {
+        if let Err(error) = builder.add_line(Some(ignore_path.to_path_buf()), line) {
+            eprintln!(
+                "warning: invalid ignore pattern in {}: {error}",
+                ignore_path.display()
+            );
         }
     }
     match builder.build() {
@@ -2590,8 +2893,7 @@ fn load_ignore_file(ignore_path: &Path, base: &Path) -> Arc<Gitignore> {
                 "warning: failed to compile ignore file {}: {error}",
                 ignore_path.display()
             );
-            let (empty, _) = Gitignore::new(base.join(".libra-empty-ignore-fallback"));
-            Arc::new(empty)
+            Arc::new(Gitignore::empty())
         }
     }
 }
@@ -3857,5 +4159,69 @@ mod test {
 
         assert_eq!(location.root, bare.canonicalize().unwrap());
         assert!(location.is_bare);
+    }
+
+    /// Concurrent status walks must not clear each other's failure latch
+    /// (Codex WIO-02 r32 P1).
+    #[test]
+    fn concurrent_ignore_walks_keep_independent_failure_latches() {
+        use std::sync::Barrier;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        let a = std::thread::spawn(move || {
+            let _walk = begin_secure_ignore_walk();
+            let epoch = secure_ignore_walk_epoch();
+            assert_ne!(epoch, 0);
+            barrier_a.wait();
+            // Peer walk begins/ends while we stay active.
+            barrier_a.wait();
+            latch_ignore_read_failed();
+            assert!(
+                ignore_read_failed(),
+                "walk A must still latch after peer walk ends"
+            );
+            epoch
+        });
+        let b = std::thread::spawn(move || {
+            barrier_b.wait();
+            let walk = begin_secure_ignore_walk();
+            let epoch = secure_ignore_walk_epoch();
+            assert_ne!(epoch, 0);
+            latch_ignore_read_failed();
+            assert!(ignore_read_failed());
+            drop(walk);
+            assert!(
+                !ignore_read_failed(),
+                "ended walk B must not report failure"
+            );
+            barrier_b.wait();
+            epoch
+        });
+
+        let epoch_a = a.join().expect("walk A");
+        let epoch_b = b.join().expect("walk B");
+        assert_ne!(epoch_a, epoch_b);
+    }
+
+    /// A timed-out worker from a finished walk must not poison a later walk.
+    #[test]
+    fn finished_ignore_walk_rejects_late_worker_latch() {
+        let epoch = {
+            let _walk = begin_secure_ignore_walk();
+            secure_ignore_walk_epoch()
+        };
+        assert_eq!(secure_ignore_walk_epoch(), 0);
+        IGNORE_OP_EPOCH.with(|cell| cell.set(epoch));
+        latch_ignore_read_failed();
+        IGNORE_OP_EPOCH.with(|cell| cell.set(0));
+
+        let _later = begin_secure_ignore_walk();
+        assert!(
+            !ignore_read_failed(),
+            "late latch from a finished epoch must not poison the next walk"
+        );
     }
 }

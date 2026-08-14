@@ -9,6 +9,7 @@ pub(crate) mod atomic_stream;
 pub mod atomic_write;
 pub mod attributes;
 pub mod backoff;
+pub(crate) mod beneath;
 pub mod client_storage;
 pub mod convert;
 pub mod d1_client;

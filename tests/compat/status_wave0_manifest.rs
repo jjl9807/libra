@@ -129,6 +129,7 @@ pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "probe_skipped_when_renames_disabled",
     "probe_skipped_when_untracked_disabled",
     "probe_symlinked_escape_is_reported_not_followed",
+    "probe_toctou_directory_swap_is_blocked",
     "probe_truncated_keeps_dir_marker",
     "probe_worker_killed_mid_stream_keeps_checkpoint",
     "quiet_does_not_bypass_io_blocked_fail_closed",

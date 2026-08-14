@@ -309,6 +309,7 @@ fn scan_workdir(
     untracked_mode: UntrackedFiles,
     include_ignored: bool,
 ) -> Result<WorkdirScan, StatusError> {
+    let _ignore_walk = util::begin_secure_ignore_walk();
     let mut scan = WorkdirScan {
         untracked: Vec::new(),
         ignored: Vec::new(),
@@ -318,6 +319,36 @@ fn scan_workdir(
 
     while let Some(dir) = pending_dirs.pop() {
         let dir_rel = dir.strip_prefix(workdir).unwrap_or(&dir).to_path_buf();
+        // Revalidate the directory we are about to classify children of.
+        // Ignore sources for those children include `dir/.gitignore` via
+        // pathname I/O; a post-listing swap must not redirect that read.
+        if dir != workdir {
+            match crate::command::status_io_worker::deadline_marker_probe(&dir) {
+                Err(()) => {
+                    // Unreadable revalidation: keep the collapsed `dir/`
+                    // marker and record the block (same contract as
+                    // DirVisibility::Blocked). Dropping the marker made
+                    // status look like the directory was absent.
+                    scan.untracked.push(directory_marker(&dir_rel));
+                    let mut event = io_timeout_event(&dir_rel);
+                    event.absorbed = true;
+                    scan.io_blocked.push(event);
+                    continue;
+                }
+                Ok(Err(source)) => {
+                    scan.untracked.push(directory_marker(&dir_rel));
+                    let mut event = io_blocked_event(&dir_rel, &source);
+                    event.absorbed = true;
+                    scan.io_blocked.push(event);
+                    continue;
+                }
+                Ok(Ok(true)) => {
+                    // Nested repository acquired after queueing — do not scan.
+                    continue;
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
         // §B.3.3 / WIO-01: listing runs in the out-of-process worker. A
         // no-progress timeout keeps checkpointed entries and marks the
         // directory `IoBlocked` instead of hanging or discarding partial.
@@ -328,12 +359,28 @@ fn scan_workdir(
             &progress,
         ) {
             Err(()) => {
-                scan.io_blocked.push(io_timeout_event(&dir_rel));
+                if dir != workdir {
+                    scan.untracked.push(directory_marker(&dir_rel));
+                    let mut event = io_timeout_event(&dir_rel);
+                    event.absorbed = true;
+                    scan.io_blocked.push(event);
+                } else {
+                    scan.io_blocked.push(io_timeout_event(&dir_rel));
+                }
                 continue;
             }
             Ok(Err(source)) if source.kind() == io::ErrorKind::NotFound => continue,
             Ok(Err(source)) => {
-                scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
+                // Worktree root: never emit `/` as an untracked marker — same
+                // contract as the timeout branch above.
+                if dir != workdir {
+                    scan.untracked.push(directory_marker(&dir_rel));
+                    let mut event = io_blocked_event(&dir_rel, &source);
+                    event.absorbed = true;
+                    scan.io_blocked.push(event);
+                } else {
+                    scan.io_blocked.push(io_blocked_event(&dir_rel, &source));
+                }
                 continue;
             }
             Ok(Ok(listing)) => listing,
@@ -370,21 +417,29 @@ fn scan_workdir(
                 .map_err(|err| list_error(&dir, io::Error::other(err.to_string())))?
                 .to_path_buf();
             if file_type.is_dir() {
-                // The ignore lookup reads `.gitignore`/`.libraignore` files,
-                // so it is a filesystem operation like any other and runs
-                // under the deadline. A reclaimed lookup is treated as
-                // "ignored" (conservative: it never invents an untracked
-                // entry) and the directory is reported blocked.
-                // Resolve the DB-backed `core.excludesFile` here, not on the
-                // worker: a database read charged against the worktree I/O
-                // deadline reads back as an `io_timeout` on a fine path.
+                // Ignore pruning stays ahead of marker/open: an ignored
+                // unreadable directory must not become `io_blocked`. After a
+                // non-ignored decision, revalidate through the repo-root fd
+                // before descending so a post-listing escape cannot poison
+                // the walk.
                 util::prewarm_ignore_config(workdir);
                 let ignore_target = (workdir.to_path_buf(), path.clone());
+                let walk_epoch = util::secure_ignore_walk_epoch();
                 let ignored = match crate::command::status_probe::with_io_deadline(move || {
                     let (workdir, path) = ignore_target;
-                    util::check_gitignore(&workdir, &path)
+                    util::check_gitignore_as_dir_for_walk(&workdir, &path, true, walk_epoch)
                 }) {
-                    Ok(value) => value,
+                    Ok(value) => {
+                        if util::ignore_read_failed() {
+                            scan.io_blocked.push(io_blocked_event(
+                                &entry_rel,
+                                &io::Error::other("ignore source unreadable"),
+                            ));
+                            true
+                        } else {
+                            value
+                        }
+                    }
                     Err(()) => {
                         scan.io_blocked.push(io_timeout_event(&entry_rel));
                         true
@@ -392,46 +447,64 @@ fn scan_workdir(
                 };
                 if ignored {
                     if include_ignored {
-                        // Mirror the untracked branch (§B.3.5): an ignored
-                        // DIRECTORY is reported with its `/` marker, never
-                        // as a file-shaped path.
                         scan.ignored.push(directory_marker(&relative));
                     }
                     continue;
+                }
+                match crate::command::status_io_worker::deadline_marker_probe(&path) {
+                    Err(()) => {
+                        scan.untracked.push(directory_marker(&relative));
+                        let mut event = io_timeout_event(&relative);
+                        event.absorbed = true;
+                        scan.io_blocked.push(event);
+                        continue;
+                    }
+                    Ok(Err(source)) => {
+                        scan.untracked.push(directory_marker(&relative));
+                        let mut event = io_blocked_event(&relative, &source);
+                        event.absorbed = true;
+                        scan.io_blocked.push(event);
+                        continue;
+                    }
+                    Ok(Ok(true)) => {
+                        // Nested repository: never descend. Still report the
+                        // outer leaf when it holds visible non-metadata files
+                        // (metadata-only nests stay invisible under Normal).
+                        if matches!(untracked_mode, UntrackedFiles::Normal)
+                            && !include_ignored
+                            && is_top_level_path(&relative)
+                            && !tracked.has_descendant(&relative)
+                        {
+                            match untracked_dir_visibility(workdir, &path) {
+                                DirVisibility::HasVisibleFile => {
+                                    scan.untracked.push(directory_marker(&relative));
+                                }
+                                DirVisibility::Empty => {}
+                                DirVisibility::Blocked(error) => {
+                                    scan.untracked.push(directory_marker(&relative));
+                                    let mut event = io_blocked_event(&relative, &error);
+                                    event.absorbed = true;
+                                    scan.io_blocked.push(event);
+                                }
+                            }
+                        } else {
+                            scan.untracked.push(directory_marker(&relative));
+                        }
+                        continue;
+                    }
+                    Ok(Ok(false)) => {}
                 }
                 if matches!(untracked_mode, UntrackedFiles::Normal)
                     && !include_ignored
                     && is_top_level_path(&relative)
                     && !tracked.has_descendant(&relative)
                 {
-                    // Git only reports an untracked directory when it holds
-                    // at least one visible untracked file. A directory whose
-                    // entire contents are skip-listed (`.libra`/`.git`) or
-                    // ignored must stay invisible — e.g. test harnesses'
-                    // `.libra-test-home/` holding only a nested `.libra`.
-                    // The probe stops at the first qualifying file, so the
-                    // no-descend perf win survives for real content; an
-                    // unreadable directory is conservatively reported (we
-                    // cannot verify it is empty, and git reports it too).
                     match untracked_dir_visibility(workdir, &path) {
                         DirVisibility::HasVisibleFile => {
                             scan.untracked.push(directory_marker(&relative));
                         }
                         DirVisibility::Empty => {}
                         DirVisibility::Blocked(error) => {
-                            // §B.3.3: we could not verify the directory's
-                            // contents. Report the marker (conservative,
-                            // matching git) AND record the block so the
-                            // base scan is not claimed complete and the
-                            // dirty cache is not rewritten from a guess.
-                            //
-                            // The block is ABSORBED in the listing sense:
-                            // the marker is in the output, so over-reporting
-                            // (a readable scan might hide the dir) is the
-                            // safe direction. §B.6.0.1 still fails text
-                            // modes closed — a marker is not an inspection
-                            // result — while JSON keeps the partial
-                            // contract with `base_scan_complete` false.
                             scan.untracked.push(directory_marker(&relative));
                             let mut event = io_blocked_event(&relative, &error);
                             event.absorbed = true;
@@ -559,7 +632,34 @@ fn untracked_dir_visibility(workdir: &Path, dir: &Path) -> DirVisibility {
                     Ok(Err(error)) => return DirVisibility::Blocked(error),
                     Ok(Ok(kind)) => kind,
                 };
-            match util::check_gitignore_bounded(workdir, &path) {
+            if file_type.is_dir() {
+                match util::check_gitignore_bounded_as_dir(workdir, &path, true) {
+                    Some(true) => continue,
+                    Some(false) => {}
+                    None => {
+                        return DirVisibility::Blocked(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "ignore lookup exceeded the status I/O deadline",
+                        ));
+                    }
+                }
+                // Revalidate eligible directories through the repo-root fd before
+                // descending; ignored paths were already pruned above.
+                match crate::command::status_io_worker::deadline_marker_probe(&path) {
+                    Err(()) => {
+                        return DirVisibility::Blocked(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "directory revalidation exceeded the status I/O deadline",
+                        ));
+                    }
+                    Ok(Err(error)) => return DirVisibility::Blocked(error),
+                    Ok(Ok(true)) => continue, // nested metadata root — not visible content
+                    Ok(Ok(false)) => {}
+                }
+                pending.push(path);
+                continue;
+            }
+            match util::check_gitignore_bounded_as_dir(workdir, &path, false) {
                 Some(true) => continue,
                 Some(false) => {}
                 None => {
@@ -571,9 +671,6 @@ fn untracked_dir_visibility(workdir: &Path, dir: &Path) -> DirVisibility {
             }
             if file_type.is_file() || file_type.is_symlink() {
                 return DirVisibility::HasVisibleFile;
-            }
-            if file_type.is_dir() {
-                pending.push(path);
             }
         }
     }

@@ -305,8 +305,13 @@ a fake deletion, a dirty check reporting clean). Instead:
   exceeded the probe deadline — Libra recycles the out-of-process I/O worker and
   keeps the last checkpointed partial, rather than hanging the `status` caller;
   `.gitignore` / `.libraignore` lookups are not helper-backed and still use the
-  in-process thread-pool deadline),
-  and `rename` is the affected staged rename pair
+  in-process thread-pool deadline). Directory walk is bounded by a repository-root
+  fd/handle: Linux uses `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`; other
+  Unix platforms walk with `openat(O_NOFOLLOW | O_DIRECTORY)`; Windows opens with
+  `FILE_FLAG_OPEN_REPARSE_POINT` and fails closed on a reparse point. A directory
+  swapped for an escaping symlink between check and open is reported as
+  `io_error` in `io_blocked[]`, never followed.
+  `rename` is the affected staged rename pair
   (`{from, to, score}`) when one is known. Entries are sorted by raw path bytes and
   deduplicated; each also emits a `worktree_*` warning.
 - `data.base_scan_complete` is `false` when the base scan itself was blocked;
