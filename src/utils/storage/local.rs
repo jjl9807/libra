@@ -91,6 +91,17 @@ impl LocalStorage {
         store
     }
 
+    /// Like [`Self::new_with_alternates`], but never creates directories (WIO-03
+    /// read-only worker path).
+    pub(crate) fn open_no_create_with_alternates(base_path: PathBuf) -> Self {
+        let mut store = Self::open_no_create(base_path.clone());
+        store.alternates = crate::internal::alternates::resolve_chain(&base_path)
+            .into_iter()
+            .map(|dir| std::sync::Arc::new(Self::open_no_create(dir)))
+            .collect();
+        store
+    }
+
     /// Read an object's bytes from THIS store only (loose→pack), no alternates.
     fn get_here(&self, hash: &ObjectHash) -> Result<Option<(Vec<u8>, ObjectType)>, GitError> {
         self.get_here_with_limit(hash, None)

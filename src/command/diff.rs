@@ -3621,15 +3621,6 @@ fn apply_rename_detection(
     // files for inexact) now lives in the shared engine, which is the whole
     // point of routing through it — these rules used to be duplicated here
     // and drifted from `status`.
-    let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
-        let pb = PathBuf::from(path);
-        let hash = map.get(&pb)?;
-        if worktree_entries.get(&pb) == Some(hash) {
-            read_worktree_blob_content(&pb).ok()
-        } else {
-            load_repo_blob_content(hash).ok()
-        }
-    };
 
     // Indices of the deleted (old-only) and added (new-only) entries.
     let deleted: Vec<usize> = (0..files.len())
@@ -3696,18 +3687,19 @@ fn apply_rename_detection(
         }
     }
 
-    /// Content provider over diff's own loaders. `diff` has no read budget
-    /// (§B.7: `max_blob_bytes: None`), so a failed load is simply a skipped
-    /// candidate.
+    /// Content provider over diff's loaders. Object (non-worktree) reads go
+    /// through [`ObjectReadBudget`] so WIO-03's cancellable 5s deadline and
+    /// 2 MiB/64 MiB/64-object caps apply the same way as `status` rename.
     struct DiffContentSource<'a> {
         first_map: &'a HashMap<PathBuf, ObjectHash>,
         second_map: &'a HashMap<PathBuf, ObjectHash>,
         worktree_entries: &'a HashMap<PathBuf, ObjectHash>,
+        objects: rename_detect::ObjectReadBudget,
     }
 
     impl DiffContentSource<'_> {
         fn read(
-            &self,
+            &mut self,
             path: &Path,
             map: &HashMap<PathBuf, ObjectHash>,
         ) -> rename_detect::ContentOutcome {
@@ -3716,18 +3708,23 @@ fn apply_rename_detection(
                     rename_detect::SkipReason::ObjectMissing,
                 );
             };
-            let owned = path.to_path_buf();
-            let loaded = if self.worktree_entries.get(path) == Some(hash) {
-                read_worktree_blob_content(&owned).ok()
-            } else {
-                load_repo_blob_content(hash).ok()
-            };
-            match loaded {
-                Some(bytes) => rename_detect::ContentOutcome::Content(std::rc::Rc::new(bytes)),
-                None => rename_detect::ContentOutcome::Skipped(
-                    rename_detect::SkipReason::ObjectUnavailable,
-                ),
+            if self.worktree_entries.get(path) == Some(hash) {
+                let owned = path.to_path_buf();
+                return match read_worktree_blob_content(&owned) {
+                    Ok(bytes) => rename_detect::ContentOutcome::Content(std::rc::Rc::new(bytes)),
+                    Err(_) => rename_detect::ContentOutcome::Skipped(
+                        rename_detect::SkipReason::ObjectUnavailable,
+                    ),
+                };
             }
+            // Commit dry-run preview blobs live only in scratch storage —
+            // consult that before the worker, which sees `.libra/objects` only.
+            // Repository fallbacks still go through ObjectReadBudget so a
+            // hung store cannot stall `commit --dry-run --verbose` (WIO-03).
+            if let Ok(Some(content)) = preview_object::read(hash) {
+                return rename_detect::ContentOutcome::Content(std::rc::Rc::new(content));
+            }
+            self.objects.read_blob(hash)
         }
     }
 
@@ -3753,6 +3750,7 @@ fn apply_rename_detection(
         first_map,
         second_map,
         worktree_entries,
+        objects: rename_detect::ObjectReadBudget::with_defaults(),
     };
     let config = rename_detect::RenameDetectConfig {
         threshold,
@@ -3760,6 +3758,25 @@ fn apply_rename_detection(
         comparison_budget,
     };
     let outcome = rename_detect::match_pairs(&snapshot, &config, &mut source);
+
+    // Rendering must reuse the same killable ObjectReadBudget (WIO-03): a
+    // second legacy `load_repo_blob_content` pass would stall on a hung store
+    // after detection already succeeded.
+    let mut objects = source.objects;
+    let mut load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
+        let pb = PathBuf::from(path);
+        let hash = map.get(&pb)?;
+        if worktree_entries.get(&pb) == Some(hash) {
+            return read_worktree_blob_content(&pb).ok();
+        }
+        if let Ok(Some(content)) = preview_object::read(hash) {
+            return Some(content);
+        }
+        match objects.read_blob(hash) {
+            rename_detect::ContentOutcome::Content(bytes) => Some((*bytes).clone()),
+            rename_detect::ContentOutcome::Skipped(_) => None,
+        }
+    };
 
     let mut pairs: Vec<(usize, usize, u32)> = Vec::new();
     for matched in &outcome.matches {
@@ -3786,8 +3803,6 @@ fn apply_rename_detection(
         let old_path = files[*di].path.clone();
         let new_path = files[*ai].path.clone();
         let percent = score / 600;
-        // The engine owns its own content caching, so the rendering side
-        // loads what it needs directly.
         let old_content = load(&old_path, first_map).unwrap_or_default();
         let new_content = load(&new_path, second_map).unwrap_or_default();
         let entry = build_rename_entry(

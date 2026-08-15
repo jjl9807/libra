@@ -22,7 +22,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -286,6 +286,15 @@ enum IoRequest {
         /// the spawn CWD; the parent always sends the request repo here.
         workdir: Vec<u8>,
     },
+    /// Local object-store blob read (WIO-03). Parent peels replace refs;
+    /// worker opens `objects_root` with a local-only backend and never
+    /// hydrates or writes.
+    ReadObjectBlob {
+        oid: String,
+        objects_root: Vec<u8>,
+        byte_limit: u64,
+        hash_kind: String,
+    },
     MarkerProbe {
         dir: Vec<u8>,
         /// Worktree root. Empty → legacy path marker probe (library callers).
@@ -320,6 +329,13 @@ enum IoEvent {
     DoneHash {
         hex: WireResult<String>,
     },
+    DoneObjectBlob {
+        status: ObjectBlobStatus,
+        /// Filled by the parent after a trailing binary frame when
+        /// `status == Ok`. Never JSON-encoded (WIO-03 ≤20% overhead).
+        #[serde(skip)]
+        bytes: Option<Vec<u8>>,
+    },
     DoneMarker {
         present: Option<bool>,
         err_kind: Option<u8>,
@@ -328,6 +344,18 @@ enum IoEvent {
     Error {
         message: String,
     },
+}
+
+/// Compact object-read status on the wire (bytes travel in a raw frame).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ObjectBlobStatus {
+    Ok,
+    Missing,
+    Corrupt,
+    Unavailable,
+    TooLarge,
+    Failed,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -593,6 +621,21 @@ fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io::Result<boo
             };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
         }
+        IoRequest::ReadObjectBlob {
+            oid,
+            objects_root,
+            byte_limit,
+            hash_kind,
+        } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            maybe_test_slow_object_read(&oid);
+            apply_hash_kind(&hash_kind);
+            let objects_root = bytes_to_path(&objects_root);
+            write_object_blob_outcome(
+                stdout,
+                read_object_blob_request(&oid, &objects_root, byte_limit),
+            )?;
+        }
         IoRequest::MarkerProbe { dir, root } => {
             write_frame(stdout, &IoEvent::Begin)?;
             let dir = bytes_to_path(&dir);
@@ -808,7 +851,7 @@ fn read_dir_request(
 
 fn emit_read_dir<I>(
     reader: I,
-    path: &Path,
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))] path: &Path,
     remaining: usize,
     checkpoint_every: u32,
     listing: &mut ReadDirListing,
@@ -915,6 +958,109 @@ fn maybe_test_kill_after_checkpoint(seq: u64) {
     }
 }
 
+/// Debug seam: sleep before a local object read so WIO-03 can prove the
+/// parent kills the helper when the batch deadline elapses mid-read.
+fn maybe_test_slow_object_read(oid: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    if std::env::var_os(crate::utils::pager::LIBRA_TEST_ENV).is_none() {
+        return;
+    }
+    let Ok(ms) = std::env::var("LIBRA_TEST_SLOW_OBJECT_READ_MS") else {
+        return;
+    };
+    let Ok(ms) = ms.parse::<u64>() else {
+        return;
+    };
+    if let Ok(wanted) = std::env::var("LIBRA_TEST_SLOW_OBJECT_READ_OID")
+        && !wanted.is_empty()
+        && wanted != oid
+    {
+        return;
+    }
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+fn read_object_blob_request(
+    oid: &str,
+    objects_root: &Path,
+    byte_limit: u64,
+) -> Result<Vec<u8>, ObjectBlobStatus> {
+    use crate::utils::client_storage::{ClientStorage, ObjectReadFailure};
+
+    let Ok(hash) = oid.parse::<git_internal::hash::ObjectHash>() else {
+        return Err(ObjectBlobStatus::Failed);
+    };
+    // Local-only + alternates, no directory creation / remote hydrate
+    // (WIO-03 security AC).
+    let storage = ClientStorage::init_local_existing_with_alternates(objects_root.to_path_buf());
+    match storage.get_with_limit(&hash, byte_limit) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => Err(match ClientStorage::classify_read_failure(&error) {
+            ObjectReadFailure::Missing => ObjectBlobStatus::Missing,
+            ObjectReadFailure::Corrupt => ObjectBlobStatus::Corrupt,
+            ObjectReadFailure::Unavailable => ObjectBlobStatus::Unavailable,
+            ObjectReadFailure::TooLarge => ObjectBlobStatus::TooLarge,
+            ObjectReadFailure::Other => ObjectBlobStatus::Failed,
+        }),
+    }
+}
+
+fn write_object_blob_outcome(
+    writer: &mut impl Write,
+    outcome: Result<Vec<u8>, ObjectBlobStatus>,
+) -> io::Result<()> {
+    match outcome {
+        Ok(bytes) => {
+            write_frame(
+                writer,
+                &IoEvent::DoneObjectBlob {
+                    status: ObjectBlobStatus::Ok,
+                    bytes: None,
+                },
+            )?;
+            write_raw_frame(writer, &bytes)
+        }
+        Err(status) => write_frame(
+            writer,
+            &IoEvent::DoneObjectBlob {
+                status,
+                bytes: None,
+            },
+        ),
+    }
+}
+
+fn write_raw_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > FRAME_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "status io worker binary frame too large",
+        ));
+    }
+    writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+fn read_raw_frame(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > FRAME_CAP {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "status io worker binary frame length invalid",
+        ));
+    }
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut payload)?;
+    }
+    Ok(payload)
+}
+
 fn current_hash_kind() -> String {
     match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
@@ -938,6 +1084,13 @@ struct Pool {
 struct Job {
     request: Mutex<Option<IoRequest>>,
     path_key: Vec<u8>,
+    /// Wall-clock bound captured at submit (`now + timeout`).
+    deadline: Instant,
+    /// Per-stdout-wait window. Status walks use this as a no-progress timeout
+    /// (fresh each frame). Object reads set `absolute` and share `deadline`
+    /// across queue + every wait so a busy pool cannot stretch the budget.
+    window: Duration,
+    absolute: bool,
     result_tx: Mutex<Option<std::sync::mpsc::SyncSender<JobOutcome>>>,
     cancelled: AtomicBool,
 }
@@ -1078,14 +1231,35 @@ fn kill_worker(worker: &mut WorkerProc) {
 }
 
 fn submit(request: IoRequest, path_key: Vec<u8>, timeout: Duration) -> Result<Vec<IoEvent>, ()> {
+    submit_with_clock(request, path_key, timeout, false)
+}
+
+fn submit_absolute(
+    request: IoRequest,
+    path_key: Vec<u8>,
+    timeout: Duration,
+) -> Result<Vec<IoEvent>, ()> {
+    submit_with_clock(request, path_key, timeout, true)
+}
+
+fn submit_with_clock(
+    request: IoRequest,
+    path_key: Vec<u8>,
+    timeout: Duration,
+    absolute: bool,
+) -> Result<Vec<IoEvent>, ()> {
     let pool = pool();
     if DISPATCHERS_STARTED.load(Ordering::SeqCst) == 0 {
         return Err(());
     }
+    let deadline = Instant::now() + timeout;
     let (tx, rx) = mpsc::sync_channel(1);
     let job = Arc::new(Job {
         request: Mutex::new(Some(request)),
         path_key,
+        deadline,
+        window: timeout,
+        absolute,
         result_tx: Mutex::new(Some(tx)),
         cancelled: AtomicBool::new(false),
     });
@@ -1104,14 +1278,16 @@ fn submit(request: IoRequest, path_key: Vec<u8>, timeout: Duration) -> Result<Ve
         pending.insert(idx, Arc::clone(&job));
         pool.ready.notify_one();
     }
-    // CLI helpers: `drive_worker` enforces no-progress, so wait long enough
-    // for a wide progressing directory. In-process fallback (library/tests)
-    // cannot kill a hung syscall — recycle the caller after the op timeout
-    // (R0) instead of blocking `submit` forever.
-    let wait = if helper_exe_is_cli() {
+    // CLI helpers: progressing `read_dir` may outlive one window; wait long
+    // enough. Absolute object reads finish or kill within `deadline`.
+    // In-process fallback cannot kill a hung syscall — recycle the caller
+    // after the op deadline instead of blocking `submit` forever.
+    let wait = if helper_exe_is_cli() && !absolute {
         Duration::from_secs(24 * 60 * 60)
     } else {
-        timeout.saturating_add(Duration::from_secs(1))
+        deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_add(Duration::from_secs(1))
     };
     match rx.recv_timeout(wait) {
         Ok(JobOutcome::Events(events)) => Ok(events),
@@ -1199,16 +1375,35 @@ fn run_job(token: &str, job: Arc<Job>) {
     if job.cancelled.load(Ordering::SeqCst) {
         return;
     }
-    let timeout = crate::command::status_probe::io_op_timeout();
+    if job.absolute && Instant::now() >= job.deadline {
+        if let Some(tx) = job
+            .result_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = tx.send(JobOutcome::Timeout);
+        }
+        return;
+    }
     let outcome = match take_worker(token) {
         // CLI helper spawn/handshake failed (EMFILE, process limit). Do not
         // fall back to an unkillable in-process syscall — that would pin a
-        // dispatcher forever and exhaust the pool. Library/test binaries
-        // cannot host the helper and keep the in-process opcode path (R0).
-        Err(()) if helper_exe_is_cli() => JobOutcome::Timeout,
+        // dispatcher forever and exhaust the pool. Absolute object reads
+        // (WIO-03) are the same: never `run_in_process` them on a pool
+        // thread. Library/test binaries keep in-process only for relative
+        // (no-progress) probe opcodes (R0).
+        Err(()) if helper_exe_is_cli() || job.absolute => JobOutcome::Timeout,
         Err(()) => run_in_process(request),
         Ok(mut worker) => {
-            let (events, timed_out, reuse) = drive_worker(&mut worker, token, request, timeout);
+            let (events, timed_out, reuse) = drive_worker(
+                &mut worker,
+                token,
+                request,
+                job.deadline,
+                job.window,
+                job.absolute,
+            );
             if timed_out || !reuse {
                 kill_worker(&mut worker);
             } else {
@@ -1266,6 +1461,28 @@ fn parse_event_frames(mut data: &[u8]) -> Option<Vec<IoEvent>> {
         }
         let event: IoEvent = serde_json::from_slice(&data[..len]).ok()?;
         data = &data[len..];
+        let event = if let IoEvent::DoneObjectBlob {
+            status: ObjectBlobStatus::Ok,
+            bytes: None,
+        } = &event
+        {
+            if data.len() < 4 {
+                return None;
+            }
+            let raw_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            data = &data[4..];
+            if raw_len > FRAME_CAP || data.len() < raw_len {
+                return None;
+            }
+            let bytes = data[..raw_len].to_vec();
+            data = &data[raw_len..];
+            IoEvent::DoneObjectBlob {
+                status: ObjectBlobStatus::Ok,
+                bytes: Some(bytes),
+            }
+        } else {
+            event
+        };
         events.push(event);
     }
     Some(events)
@@ -1392,14 +1609,27 @@ fn drive_worker(
     worker: &mut WorkerProc,
     token: &str,
     request: IoRequest,
-    timeout: Duration,
+    deadline: Instant,
+    window: Duration,
+    absolute: bool,
 ) -> (Vec<IoEvent>, bool, bool) {
     if write_request(&mut worker.stdin, token, request).is_err() {
         return (Vec::new(), false, false);
     }
     let mut events = Vec::new();
     loop {
-        if wait_stdout_readable(worker, timeout).is_err() {
+        let wait = if absolute {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return (events, true, false);
+            }
+            remaining
+        } else {
+            // No-progress: each frame gets a fresh window so a wide
+            // progressing `read_dir` is not cut by an absolute job clock.
+            window
+        };
+        if wait_stdout_readable(worker, wait).is_err() {
             return (events, true, false);
         }
         let event = match read_frame::<IoEvent>(&mut worker.stdout) {
@@ -1415,16 +1645,47 @@ fn drive_worker(
                 return (events, timed_out, false);
             }
         };
+        let reuse = !matches!(event, IoEvent::Error { .. });
+        // Ok payloads travel as a trailing length-prefixed binary frame
+        // (not base64 in JSON) so a 2 MiB blob stays within the ≤20%
+        // wire-overhead budget (WIO-03).
+        let event = if let IoEvent::DoneObjectBlob {
+            status: ObjectBlobStatus::Ok,
+            bytes: None,
+        } = &event
+        {
+            let wait = if absolute {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return (events, true, false);
+                }
+                remaining
+            } else {
+                window
+            };
+            if wait_stdout_readable(worker, wait).is_err() {
+                return (events, true, false);
+            }
+            match read_raw_frame(&mut worker.stdout) {
+                Ok(bytes) => IoEvent::DoneObjectBlob {
+                    status: ObjectBlobStatus::Ok,
+                    bytes: Some(bytes),
+                },
+                Err(_) => return (events, true, false),
+            }
+        } else {
+            event
+        };
         let done = matches!(
             event,
             IoEvent::DoneStat { .. }
                 | IoEvent::DoneCanonicalize { .. }
                 | IoEvent::DoneReadDir { .. }
                 | IoEvent::DoneHash { .. }
+                | IoEvent::DoneObjectBlob { .. }
                 | IoEvent::DoneMarker { .. }
                 | IoEvent::Error { .. }
         );
-        let reuse = !matches!(event, IoEvent::Error { .. });
         events.push(event);
         if done {
             return (events, false, reuse);
@@ -1618,6 +1879,82 @@ pub(crate) fn deadline_file_blob_hash(
         }
     }
     Err(())
+}
+
+/// Outcome of a killable local object-store read (WIO-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObjectBlobOutcome {
+    Bytes(Vec<u8>),
+    Missing,
+    Corrupt,
+    Unavailable,
+    TooLarge,
+    Failed,
+}
+
+/// Read a peeled OID from `objects_root` under `timeout`. On the `libra` CLI,
+/// a hung store read kills the helper process group and returns `Err(())` so
+/// the caller can map the edge to a metadata skip without stalling the batch.
+///
+/// Library / `cargo test` harness binaries cannot spawn the CLI helper. Those
+/// callers read locally on the **caller** thread (R0 mid-read hang semantics)
+/// instead of occupying a dispatcher slot with an unkillable syscall
+/// (WIO-03 Codex: pool-slot leak under hung mounts).
+pub(crate) fn deadline_read_object_blob(
+    oid: &git_internal::hash::ObjectHash,
+    objects_root: &Path,
+    byte_limit: u64,
+    timeout: Duration,
+) -> Result<ObjectBlobOutcome, ()> {
+    if timeout.is_zero() {
+        return Err(());
+    }
+    if !helper_exe_is_cli() {
+        return Ok(object_blob_outcome_from_status(read_object_blob_request(
+            &oid.to_string(),
+            objects_root,
+            byte_limit,
+        )));
+    }
+    let oid_hex = oid.to_string();
+    let events = submit_absolute(
+        IoRequest::ReadObjectBlob {
+            oid: oid_hex.clone(),
+            objects_root: path_to_bytes(objects_root),
+            byte_limit,
+            hash_kind: current_hash_kind(),
+        },
+        oid_hex.into_bytes(),
+        timeout,
+    )?;
+    for event in events {
+        if let IoEvent::DoneObjectBlob { status, bytes } = event {
+            return Ok(match status {
+                ObjectBlobStatus::Ok => match bytes {
+                    Some(bytes) => ObjectBlobOutcome::Bytes(bytes),
+                    // Wire claimed Ok but the trailing binary frame was
+                    // lost — treat as corrupt rather than silently empty.
+                    None => ObjectBlobOutcome::Corrupt,
+                },
+                other => object_blob_outcome_from_status(Err(other)),
+            });
+        }
+    }
+    Err(())
+}
+
+fn object_blob_outcome_from_status(
+    outcome: Result<Vec<u8>, ObjectBlobStatus>,
+) -> ObjectBlobOutcome {
+    match outcome {
+        Ok(bytes) => ObjectBlobOutcome::Bytes(bytes),
+        Err(ObjectBlobStatus::Ok) => ObjectBlobOutcome::Corrupt,
+        Err(ObjectBlobStatus::Missing) => ObjectBlobOutcome::Missing,
+        Err(ObjectBlobStatus::Corrupt) => ObjectBlobOutcome::Corrupt,
+        Err(ObjectBlobStatus::Unavailable) => ObjectBlobOutcome::Unavailable,
+        Err(ObjectBlobStatus::TooLarge) => ObjectBlobOutcome::TooLarge,
+        Err(ObjectBlobStatus::Failed) => ObjectBlobOutcome::Failed,
+    }
 }
 
 pub(crate) fn deadline_marker_probe(dir: &Path) -> Result<Result<bool, io::Error>, ()> {

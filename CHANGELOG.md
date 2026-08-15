@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (plan-20260715 WIO-03, 2026-08-14, v0.19.158)
+
+- **WIO-03 makes `ObjectReadBudget` object reads cancellable.** Inexact
+  rename blob loads (status and diff) go through the out-of-process status
+  I/O worker; a hung store read kills the helper within the remaining 5s
+  batch window, maps the OID edge to a `metadata_*` warning, and continues
+  other candidates. Per-object 2 MiB / total 64 MiB / 64 objects caps are
+  unchanged. `docs/commands/status.md` and `docs/commands/diff.md` EN/zh
+  record the real deadline.
+
 ### Added (plan-20260715 WIO-02, 2026-08-14, v0.19.157)
 
 - **WIO-02 binds status/probe directory traversal to a repo-root

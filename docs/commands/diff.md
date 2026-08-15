@@ -274,6 +274,12 @@ already scored. Both values fail closed with
 `LBR-CLI-002` on an invalid (non-integer/negative) setting before any diff
 output.
 
+Inexact rename content loads for repository blobs share `status`'s
+`ObjectReadBudget` (2 MiB per object / 64 MiB total / 64 objects / 5s batch).
+A hung object-store read is cancelled by recycling the out-of-process I/O
+helper; the affected candidate is skipped rather than stalling the whole
+rename pass.
+
 ## Human Output
 
 Supported output modes:

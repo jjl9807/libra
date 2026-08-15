@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use git_internal::{errors::GitError, hash::ObjectHash};
+use git_internal::hash::ObjectHash;
 
 /// Git's exact-match similarity score (`-M100%`).
 pub(crate) const EXACT_SCORE: u32 = 60000;
@@ -865,6 +865,10 @@ impl ObjectReadBudget {
     /// Read a blob's content under budget, de-duplicating by OID: repeated
     /// requests for the same object return the cached outcome without
     /// consuming budget again.
+    ///
+    /// Content loads go through the out-of-process status I/O worker
+    /// (WIO-03) so a hung tier/store read can kill the helper within the
+    /// remaining batch deadline instead of stalling the whole rename pass.
     pub fn read_blob(&mut self, oid: &ObjectHash) -> ContentOutcome {
         if let Some(slot) = self.cache.get(oid) {
             return match slot {
@@ -874,10 +878,8 @@ impl ObjectReadBudget {
         }
         // Budget-exceeded outcomes are NOT cached per-OID: they describe the
         // batch, not the object, and later slices may retry with fresh budgets.
-        if Instant::now() >= self.deadline
-            || self.remaining_objects == 0
-            || self.remaining_total == 0
-        {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || self.remaining_objects == 0 || self.remaining_total == 0 {
             return ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded);
         }
 
@@ -888,15 +890,50 @@ impl ObjectReadBudget {
         self.remaining_objects -= 1;
         let cap = self.per_object_cap.min(self.remaining_total);
         // Keep replace-peel semantics consistent with `load_object` (diff and
-        // show read through the same substitution).
+        // show read through the same substitution). Peel on the parent before
+        // submitting — the worker never touches replace refs / SQLite.
         let peeled = super::replace::resolve(*oid);
-        let storage = crate::utils::util::objects_storage();
-        let outcome = match storage.get_with_limit(&peeled, cap) {
-            Ok(bytes) => {
+        let objects_root = match crate::utils::path::try_objects() {
+            Ok(path) => path,
+            Err(_) => {
+                let outcome = ContentSlot::Skipped(SkipReason::ObjectUnavailable);
+                let result = ContentOutcome::Skipped(SkipReason::ObjectUnavailable);
+                self.cache.insert(*oid, outcome);
+                return result;
+            }
+        };
+        let outcome = match crate::command::status_io_worker::deadline_read_object_blob(
+            &peeled,
+            &objects_root,
+            cap,
+            remaining,
+        ) {
+            Err(()) => {
+                // Worker killed / timed out mid-read: cache per-OID so the
+                // hung object is not resubmitted, and map to metadata_*
+                // (ObjectUnavailable → metadata_unavailable), not worktree
+                // IoTimeout.
+                ContentSlot::Skipped(SkipReason::ObjectUnavailable)
+            }
+            Ok(crate::command::status_io_worker::ObjectBlobOutcome::Bytes(bytes)) => {
                 self.remaining_total = self.remaining_total.saturating_sub(bytes.len() as u64);
                 ContentSlot::Content(Rc::new(bytes))
             }
-            Err(err) => ContentSlot::Skipped(classify_object_error(&err)),
+            Ok(crate::command::status_io_worker::ObjectBlobOutcome::Missing) => {
+                ContentSlot::Skipped(SkipReason::ObjectMissing)
+            }
+            Ok(crate::command::status_io_worker::ObjectBlobOutcome::Corrupt) => {
+                ContentSlot::Skipped(SkipReason::ObjectCorrupt)
+            }
+            Ok(crate::command::status_io_worker::ObjectBlobOutcome::Unavailable) => {
+                ContentSlot::Skipped(SkipReason::ObjectUnavailable)
+            }
+            Ok(crate::command::status_io_worker::ObjectBlobOutcome::TooLarge) => {
+                ContentSlot::Skipped(SkipReason::ObjectTooLarge)
+            }
+            Ok(crate::command::status_io_worker::ObjectBlobOutcome::Failed) => {
+                ContentSlot::Skipped(SkipReason::ObjectIoFailed)
+            }
         };
         let result = match &outcome {
             ContentSlot::Content(bytes) => ContentOutcome::Content(bytes.clone()),
@@ -904,20 +941,6 @@ impl ObjectReadBudget {
         };
         self.cache.insert(*oid, outcome);
         result
-    }
-}
-
-/// Map storage errors onto skip reasons (§B.4.1: Missing/Corrupt/Unavailable/
-/// BudgetExceeded 只跳过依赖该对象的 inexact 候选). Classification is owned by
-/// the storage layer so the message details and the mapping evolve together.
-fn classify_object_error(err: &GitError) -> SkipReason {
-    use crate::utils::client_storage::{ClientStorage, ObjectReadFailure};
-    match ClientStorage::classify_read_failure(err) {
-        ObjectReadFailure::Missing => SkipReason::ObjectMissing,
-        ObjectReadFailure::Corrupt => SkipReason::ObjectCorrupt,
-        ObjectReadFailure::Unavailable => SkipReason::ObjectUnavailable,
-        ObjectReadFailure::TooLarge => SkipReason::ObjectTooLarge,
-        ObjectReadFailure::Other => SkipReason::ObjectIoFailed,
     }
 }
 

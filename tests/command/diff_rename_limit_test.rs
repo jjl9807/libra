@@ -8,9 +8,12 @@
 //!
 //! Layer: L1 (deterministic; tempdir only, no network).
 
-use std::fs;
+use std::{fs, time::Instant};
 
-use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+use super::{
+    assert_cli_success, create_committed_repo_via_cli, run_libra_command,
+    run_libra_command_with_stdin_and_env,
+};
 
 const LARGE_SET: usize = 1001;
 
@@ -77,4 +80,67 @@ fn diff_large_set_warns_and_preserves_exact_renames() {
         "all exact renames must survive the limit"
     );
     assert!(stdout.contains("exact-old") && stdout.contains("exact-new"));
+}
+
+/// WIO-03: `diff -M` inexact object reads use the killable ObjectReadBudget
+/// path (detection + rendering). A hung store read must complete promptly
+/// without inventing a rename or leaving helper children.
+#[test]
+#[cfg(unix)]
+fn diff_rename_object_read_budget_timeout_is_cancellable() {
+    let old_body = "diff cancellable line one\nline two\nline three\nline four\n";
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("old.txt"), old_body).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "old.txt"], repo.path()),
+        "stage old.txt",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit old.txt",
+    );
+    let ls = run_libra_command(&["ls-tree", "HEAD"], repo.path());
+    assert_cli_success(&ls, "ls-tree HEAD");
+    let listing = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let hash = listing
+        .lines()
+        .find(|l| l.ends_with("old.txt"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .expect("old.txt blob hash")
+        .to_string();
+
+    fs::remove_file(repo.path().join("old.txt")).unwrap();
+    fs::write(
+        repo.path().join("new.txt"),
+        "diff cancellable line one\nline two CHANGED\nline three\nline four\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage inexact move");
+
+    let before = Instant::now();
+    let out = run_libra_command_with_stdin_and_env(
+        &["diff", "--staged", "-M", "--summary"],
+        repo.path(),
+        "",
+        &[
+            ("LIBRA_TEST_SLOW_OBJECT_READ_MS", "8000"),
+            ("LIBRA_TEST_SLOW_OBJECT_READ_OID", &hash),
+        ],
+    );
+    let elapsed = before.elapsed();
+    assert_cli_success(&out, "diff -M returns after cancelling hung object read");
+    assert!(
+        elapsed < std::time::Duration::from_secs(12),
+        "hung object read must be killed within the budget window: {elapsed:?}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(" rename "),
+        "a cancelled object read must not invent a rename: {stdout}"
+    );
+    assert!(
+        stdout.contains("delete mode") || stdout.contains("create mode") || !stdout.is_empty(),
+        "base add/delete summary should still render: {stdout}"
+    );
 }

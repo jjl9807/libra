@@ -251,8 +251,8 @@ other subsystems are folded into the same list (see below):
 | `similarity_budget_exceeded` | `rename_detect` | The similarity-comparison budget was exhausted; only the exhaustive inexact pass was discarded — exact and already-scored unique-basename matches were kept |
 | `probe_truncated` | `probe` | The rename-destination probe tripped its enumeration/destination budget; pairing is partial |
 | `rename_path_encoding_unsupported` | `rename_detect` | Candidates with non-UTF-8 names sat out rename scoring (base `??`/`D` rows unaffected) |
-| `metadata_unavailable` | `metadata` | Repository objects missing, corrupt, or unavailable; the dependent inexact candidates were skipped |
-| `metadata_budget_exceeded` | `metadata` | Object-read budget or per-object size cap reached; remaining candidates skipped |
+| `metadata_unavailable` | `metadata` | Repository objects missing, corrupt, unavailable, or cancelled mid-read (WIO-03 kills the out-of-process object-read helper when the ObjectReadBudget wall-clock deadline elapses); the dependent inexact candidates were skipped |
+| `metadata_budget_exceeded` | `metadata` | Object-read budget or per-object size cap reached (2 MiB / 64 MiB / 64 objects / 5s batch); remaining candidates skipped |
 | `worktree_budget_exceeded` | `worktree` | Worktree-read budget or per-file size cap reached; remaining candidates skipped |
 | `worktree_read_failed` | `worktree` | A worktree read failed (I/O error); the affected path is in `data.io_blocked[]` or its rename candidate was skipped |
 | `worktree_permission_denied` | `worktree` | A path could not be inspected (EACCES); the path is in `data.io_blocked[]` |

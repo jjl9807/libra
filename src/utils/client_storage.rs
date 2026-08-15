@@ -1072,6 +1072,16 @@ impl ClientStorage {
         ClientStorage { storage, base_path }
     }
 
+    /// Local-only reader that still resolves `objects/info/alternates` and
+    /// never creates directories. Used by the WIO-03 object-read worker so a
+    /// hung/missing objects root cannot mutate the tree or panic.
+    pub fn init_local_existing_with_alternates(base_path: PathBuf) -> ClientStorage {
+        let storage = Arc::new(LocalStorage::open_no_create_with_alternates(
+            base_path.clone(),
+        ));
+        ClientStorage { storage, base_path }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_storage(storage: Arc<dyn Storage>, base_path: PathBuf) -> Self {
         Self { storage, base_path }

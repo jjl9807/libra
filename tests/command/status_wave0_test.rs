@@ -6929,6 +6929,83 @@ fn object_read_budget_exceeded_skips_inexact_only() {
     assert_eq!(doc["data"]["rename_detection_complete"], false, "{doc}");
 }
 
+/// WIO-03: a hung object-store read is cancelled by killing the I/O helper
+/// within the ObjectReadBudget deadline. The edge maps to `metadata_*`, the
+/// base D+A rows survive, and no worker/child is left behind.
+#[test]
+#[cfg(unix)]
+fn object_read_budget_timeout_is_cancellable() {
+    let old_body = "cancellable object line one\nline two\nline three\nline four\n";
+    let repo = create_repo_with_committed_file("old.txt", old_body);
+    let ls = run_libra_command(&["ls-tree", "HEAD"], repo.path());
+    assert_cli_success(&ls, "ls-tree HEAD");
+    let listing = String::from_utf8_lossy(&ls.stdout).into_owned();
+    let hash = listing
+        .lines()
+        .find(|l| l.ends_with("old.txt"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .expect("old.txt blob hash")
+        .to_string();
+
+    fs::remove_file(repo.path().join("old.txt")).unwrap();
+    fs::write(
+        repo.path().join("new.txt"),
+        "cancellable object line one\nline two CHANGED\nline three\nline four\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "."], repo.path());
+    assert_cli_success(&add, "stage inexact move");
+
+    let before = std::time::Instant::now();
+    let out = run_libra_command_with_stdin_and_env(
+        &["--json", "status"],
+        repo.path(),
+        "",
+        &[
+            // Exceed the 5s ObjectReadBudget window so drive_worker kills the
+            // helper mid-read instead of waiting forever.
+            ("LIBRA_TEST_SLOW_OBJECT_READ_MS", "8000"),
+            ("LIBRA_TEST_SLOW_OBJECT_READ_OID", &hash),
+        ],
+    );
+    let elapsed = before.elapsed();
+    assert_cli_success(&out, "status returns after cancelling the hung object read");
+    assert!(
+        elapsed < std::time::Duration::from_secs(12),
+        "hung object read must be killed within the budget window, not stall: {elapsed:?}"
+    );
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("json");
+    let staged = &doc["data"]["staged"];
+    assert!(
+        staged["deleted"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|p| p == "old.txt"))
+            && staged["new"]
+                .as_array()
+                .is_some_and(|n| n.iter().any(|p| p == "new.txt")),
+        "base D + A survive a cancelled object read: {doc}"
+    );
+    assert_eq!(
+        doc["data"]["renames"],
+        serde_json::json!([]),
+        "a cancelled object read must not invent a rename: {doc}"
+    );
+    let warnings = doc["data"]["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["code"] == "metadata_unavailable" || w["code"] == "metadata_budget_exceeded"),
+        "timeout must map to a metadata_* warning, not hang: {doc}"
+    );
+    assert!(
+        !warnings.iter().any(|w| w["code"] == "worktree_io_timeout"),
+        "object-read cancel must not be labeled as worktree_io_timeout: {doc}"
+    );
+    assert_eq!(doc["data"]["rename_detection_complete"], false, "{doc}");
+}
+
 /// §B.5: the dirty-cache stale-fallback warning obeys the same 9 ≻ 1 exit
 /// arbitration as every other path — `--check-dirty` with no cache degrades
 /// with `dirty_cache_stale_fallback`, and `--exit-code-on-warning` beats the

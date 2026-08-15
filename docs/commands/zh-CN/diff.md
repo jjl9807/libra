@@ -250,6 +250,11 @@ diff 驱动的 verbatim 输出。与 Git 一样，`commit -v` 始终使用内建
 唯一 basename 配对；comparisonBudget 只保留耗尽前已评分的部分。两者在非法
 （非整数/负数）设置时于任何 diff 输出前以 `LBR-CLI-002` fail-closed。
 
+inexact 重命名所需的仓库 blob 内容读取与 `status` 共用 `ObjectReadBudget`
+（单对象 2 MiB / 合计 64 MiB / 64 objects / 批次 5s）。卡住的对象存储读取会
+通过回收 out-of-process I/O helper 取消；受影响候选被跳过，而不会挂起整个
+重命名批次。
+
 ## 人类可读输出
 
 支持的输出模式：
