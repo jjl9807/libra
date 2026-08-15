@@ -268,7 +268,7 @@ patterns continue to match them.
 
 ## Code UI And Control Wire Codes
 
-The Code UI and `code-control` surfaces use `{ error: { code, message } }`
+The Code UI and `code --control stdio` surfaces use `{ error: { code, message } }`
 wire errors rather than CLI `LBR-*` stable codes. JSON-RPC exposes these HTTP
 failures as `-32000` with `data.status` and `data.code`.
 

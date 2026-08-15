@@ -533,7 +533,7 @@ fn code_help_documents_mcp_stdio_legacy_and_control_client() {
 }
 
 #[tokio::test]
-async fn code_control_shim_forwards_with_deprecation_warning() {
+async fn code_control_command_removed() {
     use std::{
         fs,
         io::Write,
@@ -549,22 +549,55 @@ async fn code_control_shim_forwards_with_deprecation_warning() {
         response::IntoResponse,
         routing::post,
     };
-    use libra::command::code_control::CODE_CONTROL_DEPRECATION_WARNING;
     use serde_json::json;
     use tempfile::tempdir;
     use tokio::sync::{Mutex, oneshot};
 
-    assert!(
-        CODE_CONTROL_DEPRECATION_WARNING.contains("deprecated forwarding shim"),
-        "W4-09 must mark code-control as deprecated forwarding shim: {CODE_CONTROL_DEPRECATION_WARNING}"
+    // W5-01: the deprecated forwarding shim is physically removed — the binary
+    // rejects `code-control` as an unknown command on the stable CLI error
+    // path; the migration path lives in docs/commands/code-control.md.
+    let removal_probe_dir = tempdir().expect("tempdir for removed-command probe");
+    let rejected = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args([
+            "code-control",
+            "--stdio",
+            "--url",
+            "http://127.0.0.1:3000",
+            "--token-file",
+            "control-token",
+        ])
+        .current_dir(removal_probe_dir.path())
+        .output()
+        .expect("run removed code-control probe");
+    assert_eq!(
+        rejected.status.code(),
+        Some(129),
+        "removed code-control must use the stable CLI-error exit"
+    );
+    let rejected_diag = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
     );
     assert!(
-        CODE_CONTROL_DEPRECATION_WARNING.contains("libra code --control stdio"),
-        "W4-09 must point at canonical --control stdio: {CODE_CONTROL_DEPRECATION_WARNING}"
+        rejected_diag.contains("'code-control' is not a libra command"),
+        "removed code-control must render the unknown-command diagnostic: {rejected_diag}"
+    );
+
+    // Root help must not expose the removed command either.
+    let help = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .arg("--help")
+        .current_dir(removal_probe_dir.path())
+        .output()
+        .expect("run libra --help");
+    let help_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
     );
     assert!(
-        CODE_CONTROL_DEPRECATION_WARNING.contains("W5-01"),
-        "W4-09 must name deletion version W5-01: {CODE_CONTROL_DEPRECATION_WARNING}"
+        !help_text.contains("code-control"),
+        "root --help must not list removed code-control: {help_text}"
     );
 
     #[derive(Clone, Default)]
@@ -610,7 +643,7 @@ async fn code_control_shim_forwards_with_deprecation_warning() {
             .await
     });
 
-    let temp = tempdir().expect("tempdir for code-control shim probe");
+    let temp = tempdir().expect("tempdir for control stdio probe");
     let token_path = temp.path().join("control-token");
     #[cfg(unix)]
     {
@@ -623,18 +656,18 @@ async fn code_control_shim_forwards_with_deprecation_warning() {
             .mode(0o600)
             .open(&token_path)
             .expect("create token")
-            .write_all(b"shim-shared-token\n")
+            .write_all(b"control-stdio-token\n")
             .expect("write token");
         fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).expect("chmod");
     }
     #[cfg(not(unix))]
     {
-        fs::write(&token_path, "shim-shared-token\n").expect("write token");
+        fs::write(&token_path, "control-stdio-token\n").expect("write token");
     }
     let token_str = token_path.to_str().expect("utf8 token path");
     let base_url = format!("http://{addr}");
     let attach_req = concat!(
-        r#"{"jsonrpc":"2.0","method":"controller.attach","params":{"clientId":"w4-09","kind":"automation"},"id":1}"#,
+        r#"{"jsonrpc":"2.0","method":"controller.attach","params":{"clientId":"w5-01","kind":"automation"},"id":1}"#,
         "\n",
     );
     let libra_bin = env!("CARGO_BIN_EXE_libra");
@@ -665,31 +698,8 @@ async fn code_control_shim_forwards_with_deprecation_warning() {
         }
     };
 
-    let shim = run_client(vec![
-        "code-control".into(),
-        "--stdio".into(),
-        "--url".into(),
-        base_url.clone(),
-        "--token-file".into(),
-        token_str.to_string(),
-    ])
-    .await
-    .expect("join shim");
-    let shim_stdout = String::from_utf8_lossy(&shim.stdout);
-    let shim_stderr = String::from_utf8_lossy(&shim.stderr);
-    assert!(
-        shim.status.success(),
-        "shim must reach mock attach; stderr:\n{shim_stderr}"
-    );
-    assert!(
-        shim_stderr.contains(CODE_CONTROL_DEPRECATION_WARNING) && shim_stderr.contains("warning:"),
-        "code-control must emit tracked deprecation warning; stderr:\n{shim_stderr}"
-    );
-    assert!(
-        shim_stdout.contains("CONTROLLER_CONFLICT") && shim_stdout.contains("-32000"),
-        "shim must forward JSON-RPC conflict; stdout:\n{shim_stdout}"
-    );
-
+    // W5-01 must not regress the canonical `code --control stdio` client: it
+    // still reaches the control endpoint and forwards JSON-RPC errors.
     let canonical = run_client(vec![
         "code".into(),
         "--control".into(),
@@ -708,35 +718,23 @@ async fn code_control_shim_forwards_with_deprecation_warning() {
         "canonical must reach mock attach; stderr:\n{canonical_stderr}"
     );
     assert!(
-        !canonical_stderr.contains(CODE_CONTROL_DEPRECATION_WARNING),
-        "canonical must not emit code-control warning; stderr:\n{canonical_stderr}"
-    );
-    assert!(
         canonical_stdout.contains("CONTROLLER_CONFLICT") && canonical_stdout.contains("-32000"),
-        "canonical must share JSON-RPC conflict; stdout:\n{canonical_stdout}"
-    );
-    assert_eq!(
-        shim_stdout.trim(),
-        canonical_stdout.trim(),
-        "shim and canonical must emit identical JSON-RPC responses"
+        "canonical must forward the JSON-RPC conflict; stdout:\n{canonical_stdout}"
     );
 
-    // Wait briefly for both attach handlers to record tokens.
+    // Wait briefly for the attach handler to record the token.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let tokens = loop {
         let tokens = capture.tokens.lock().await.clone();
-        if tokens.len() >= 2 || tokio::time::Instant::now() >= deadline {
+        if !tokens.is_empty() || tokio::time::Instant::now() >= deadline {
             break tokens;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(
         tokens,
-        vec![
-            "shim-shared-token".to_string(),
-            "shim-shared-token".to_string()
-        ],
-        "both CLIs must forward the same control token header through the shared helper"
+        vec!["control-stdio-token".to_string()],
+        "canonical client must forward the control token header"
     );
 
     let _ = shutdown_tx.send(());

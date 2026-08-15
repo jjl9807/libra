@@ -62,7 +62,7 @@ Command Groups:
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
-  AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, review, investigate, service
+  AI And Automation       code, automation, usage, graph, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
@@ -706,10 +706,6 @@ enum Commands {
 
     #[command(about = "Start Libra Code interactive TUI (with background web server)")]
     Code(command::code::CodeArgs),
-    #[command(
-        about = "Deprecated forwarding shim for Code automation control (use `libra code --control stdio`; deleted in W5-01)"
-    )]
-    CodeControl(command::code_control::CodeControlArgs),
     #[command(about = "Manage AI automation rules and history")]
     Automation(command::automation::AutomationArgs),
     #[command(about = "Report AI provider/model usage")]
@@ -1486,7 +1482,6 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         Commands::Init(_)
         | Commands::Clone(_)
         | Commands::Open(_)
-        | Commands::CodeControl(_)
         | Commands::LsRemote(_)
         // `merge-file` is a standalone three-way text merge over files on disk;
         // it touches no objects and works outside a repository, like Git.
@@ -1593,8 +1588,8 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         }
         // Config global/system scopes don't require a repository.
         Commands::Config(cfg) if cfg.global || cfg.system => Ok(CommandPreflight::none()),
-        // W4-02: `--control stdio` is a client-only JSON-RPC shim (same as
-        // `code-control`) — no repository/hash-kind preflight.
+        // W4-02: `--control stdio` is a client-only JSON-RPC transport — no
+        // repository/hash-kind preflight.
         Commands::Code(code_args) if code_args.control == ControlMode::Stdio => {
             Ok(CommandPreflight::none())
         }
@@ -1707,7 +1702,7 @@ fn command_scope(command: &Commands) -> CommandScope {
         // These run tools that edit the working tree.
         | Commands::Automation(_)
         | Commands::Sandbox(_) => Composite,
-        // W4-02: client-only control shim — same scope as `code-control`.
+        // W4-02: client-only control transport — repository scope.
         Commands::Code(args) if args.control == ControlMode::Stdio => Repository,
         // Launch paths (observe/write/MCP/`--stdio`) can mutate via tools.
         Commands::Code(_) => Composite,
@@ -1838,13 +1833,11 @@ fn command_scope(command: &Commands) -> CommandScope {
         | Commands::Publish(_)
         // The agent surface keeps its state in the repository database. The
         // parts that DO edit files go through `code` / task worktrees, which
-        // take a workspace lease of their own; `agent`, `review`,
-        // `investigate` and `code-control` must stay usable for diagnosis in
-        // a damaged worktree.
+        // take a workspace lease of their own; `agent`, `review` and
+        // `investigate` must stay usable for diagnosis in a damaged worktree.
         | Commands::Agent(_)
         | Commands::Review(_)
-        | Commands::Investigate(_)
-        | Commands::CodeControl(_) => Repository,
+        | Commands::Investigate(_) => Repository,
         #[cfg(feature = "fastcdc")]
         Commands::Media(_) => Repository,
 
@@ -1941,7 +1934,6 @@ fn command_holds_shared_maintenance_lock(command: &Commands) -> bool {
             | Commands::Agent(_)
             | Commands::Review(_)
             | Commands::Investigate(_)
-            | Commands::CodeControl(_)
     ) {
         return false;
     }
@@ -2746,7 +2738,6 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             }
             Commands::Clone(cmd_args) => command::clone::execute_safe(cmd_args, &output).await?,
             Commands::Code(cmd_args) => command::code::execute(cmd_args, &output).await?,
-            Commands::CodeControl(cmd_args) => command::code_control::execute(cmd_args).await?,
             Commands::Automation(cmd_args) => {
                 command::automation::execute_safe(cmd_args, &output).await?
             }

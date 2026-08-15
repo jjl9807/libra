@@ -263,15 +263,18 @@ fn docs_consistency_covers_code_command_router_contracts() {
     }
 
     for (body, needle, context) in [
+        // W5-01: the shim is removed; its doc is now a migration note pointing
+        // at the canonical client, and the JSON-RPC method reference moved to
+        // docs/commands/code.md.
         (
             code_control_doc.as_str(),
-            "code-control --stdio",
+            "libra code --control stdio",
             "docs/commands/code-control.md",
         ),
         (
-            code_control_doc.as_str(),
+            code_doc.as_str(),
             "diagnostics.get",
-            "docs/commands/code-control.md",
+            "docs/commands/code.md",
         ),
         (
             integration_plan.as_str(),

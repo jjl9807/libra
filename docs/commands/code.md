@@ -94,7 +94,26 @@ Write control is local-only. `--control write` is rejected with `--stdio`, and i
 
 Automation clients attach with `POST /api/code/controller/attach`, body `{ "clientId": "...", "kind": "automation" }`, header `X-Libra-Control-Token`, and then use the returned `X-Code-Controller-Token` for writes. Automation-held leases require both tokens for `/api/code/messages`, `/api/code/interactions/{id}`, `/api/code/controller/detach`, and `/api/code/control/cancel`. The local TUI can reclaim control with `/control reclaim`, which invalidates the automation lease. Code UI write request bodies are capped at 256KiB. A plan-repair Continue that raises an exhausted retry limit sends `{ "selectedOption": "continue", "maxAttempts": 3 }`; `maxAttempts` must exceed the current limit and not exceed 10. When the session advertises `capabilities.commandIdempotency` (headless web-only today), `POST /api/code/messages` accepts `{ "text": "...", "commandId": "..." }` for retry de-duplication (same id + same text is idempotent; same id + different text returns `COMMAND_PAYLOAD_CONFLICT`). The runtime namespaces each `commandId` under a SHA-256 fence of the active controller `clientId` before durable admission (the raw clientId is never written into the command log). `commandIdempotency` is advertised only when durable SessionStore command admission is configured.
 
-`GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, prefer the canonical `libra code --control stdio` JSON-RPC NDJSON client: it discovers the endpoint from `.libra/code/control.json` by default (override with `--control-url` / `--control-token-file` / `--control-info-file`). Discovery fails closed with stable codes (`CONTROL_INFO_MISSING`, `CONTROL_INFO_PERMS`, `CONTROL_TOKEN_MISSING`, `CONTROL_TOKEN_PERMS`, `CONTROL_SCOPE_CONFLICT`, `CONTROL_SERVER_MISSING`); attach lease/ownership conflicts surface as JSON-RPC `-32000` with Libra codes such as `CONTROLLER_CONFLICT`. The legacy [`libra code-control --stdio`](code-control.md) entry is a **deprecated forwarding shim** (stderr warning; deleted in W5-01) that calls the same helper. Deprecated `libra code --stdio` remains the **MCP-only** tools/resources transport (stderr deprecation warning; not turn control) and must not be confused with `--control stdio`; a dedicated `libra mcp --stdio` is planned after W5.
+`GET /api/code/diagnostics` returns a redacted observe-only status summary for local tools. Control attach, detach, submit, respond, and cancel operations emit `local-tui-control/v1` audit events through the runtime audit sink. For stdio automation clients, prefer the canonical `libra code --control stdio` JSON-RPC NDJSON client: it discovers the endpoint from `.libra/code/control.json` by default (override with `--control-url` / `--control-token-file` / `--control-info-file`). Discovery fails closed with stable codes (`CONTROL_INFO_MISSING`, `CONTROL_INFO_PERMS`, `CONTROL_TOKEN_MISSING`, `CONTROL_TOKEN_PERMS`, `CONTROL_SCOPE_CONFLICT`, `CONTROL_SERVER_MISSING`); attach lease/ownership conflicts surface as JSON-RPC `-32000` with Libra codes such as `CONTROLLER_CONFLICT`. The former `libra code-control` forwarding shim was **removed in the W5 breaking release (W5-01)**; `libra code --control stdio` is the only stdio automation client (see the [migration note](code-control.md)). Deprecated `libra code --stdio` remains the **MCP-only** tools/resources transport (stderr deprecation warning; not turn control) and must not be confused with `--control stdio`; a dedicated `libra mcp --stdio` is planned after W5.
+
+The stdio client speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and maps methods onto the loopback `/api/code/*` HTTP/SSE control surface:
+
+| JSON-RPC method | HTTP equivalent |
+|-----------------|-----------------|
+| `session.get` | `GET /api/code/session` |
+| `events.subscribe` | `GET /api/code/events` as JSON-RPC notifications |
+| `diagnostics.get` | `GET /api/code/diagnostics` |
+| `controller.attach` | `POST /api/code/controller/attach` |
+| `controller.detach` | `POST /api/code/controller/detach` |
+| `message.submit` | `POST /api/code/messages` |
+| `task.dispatch` | `POST /api/code/task/dispatch` |
+| `interaction.respond` | `POST /api/code/interactions/{id}` |
+| `turn.cancel` | `POST /api/code/control/cancel` |
+| `goal.start` | `POST /api/code/goal/start` |
+| `goal.status` | `GET /api/code/goal/status` |
+| `goal.cancel` | `POST /api/code/goal/cancel` |
+
+Malformed JSON maps to JSON-RPC `-32700`. Unknown methods map to `-32601`. Invalid params map to `-32602`. HTTP 4xx/5xx errors map to `-32000` with `data.status` and `data.code`, preserving Libra errors such as `INVALID_CONTROL_TOKEN`, `INVALID_CONTROLLER_TOKEN`, `CONTROLLER_CONFLICT`, and `INTERACTION_NOT_ACTIVE`.
 
 ### Web Browser Control
 

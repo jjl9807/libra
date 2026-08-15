@@ -1,18 +1,16 @@
-//! Deprecated forwarding shim for local automation control (W4-09).
+//! Canonical JSON-RPC 2.0 NDJSON automation control client (W4-02).
 //!
-//! Prefer the canonical client `libra code --control stdio` (control-info
-//! discovery by default). This `libra code-control` entry only emits a
-//! deprecation warning and forwards to [`run_control_stdio_client`] — the same
-//! helper used by `--control stdio`. It is **not** an MCP server (`libra code
-//! --stdio` is the deprecated MCP-only legacy transport; see DEFER-02 for a
-//! future `libra mcp --stdio`). Physical deletion lands in **W5-01**.
+//! Used by `libra code --control stdio` (control-info discovery by default).
+//! It is **not** an MCP server (`libra code --stdio` is the deprecated
+//! MCP-only legacy transport; see DEFER-02 for a future `libra mcp --stdio`).
+//! The W4-09 `code-control` forwarding-shim entry was physically removed in
+//! W5-01; this module now hosts only the canonical client.
 
 use std::{
     io::{self, BufRead, Write},
     path::PathBuf,
 };
 
-use clap::Parser;
 use futures_util::StreamExt;
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,48 +18,6 @@ use serde_json::{Value, json};
 use url::Url;
 
 use crate::utils::error::{CliError, CliResult};
-
-/// Stderr pin for W4-09: `code-control` is a deprecated forwarding shim.
-/// Passed to [`crate::utils::error::emit_warning`] (which prefixes `warning: `).
-pub const CODE_CONTROL_DEPRECATION_WARNING: &str = "`libra code-control` is a deprecated forwarding shim; use `libra code --control stdio` (deleted in W5-01)";
-
-/// `--help` examples shown in `libra code-control --help` output.
-///
-/// Deprecated forwarding shim (deleted in W5-01). Prefer canonical
-/// `libra code --control stdio`. Legacy `--url` / `--token-file` remain for
-/// CLI compatibility until removal. Cross-cutting `--help` EXAMPLES rollout
-/// per `docs/development/commands/_general.md` item B.
-pub const CODE_CONTROL_EXAMPLES: &str = "\
-EXAMPLES:
-    libra code --control stdio                        Canonical automation client (discovers control.json)
-    libra code-control --stdio --url http://127.0.0.1:3000 --token-file .libra/code/control-token
-                                                  Deprecated shim (deleted in W5-01); prefer --control stdio
-    libra code-control --stdio \\
-        --url $(jq -r .baseUrl .libra/code/control.json) \\
-        --token-file .libra/code/control-token
-                                                  Legacy wire from discovery file (prefer code --control stdio)
-    echo '{\"jsonrpc\":\"2.0\",\"method\":\"controller.attach\",\"params\":{\"clientId\":\"my-script\",\"kind\":\"automation\"},\"id\":1}' | \\
-        libra code-control --stdio --url http://127.0.0.1:3000 --token-file .libra/code/control-token
-                                                  Send a single attach request through the deprecated shim";
-
-#[derive(Debug, Clone, Parser)]
-#[command(after_help = CODE_CONTROL_EXAMPLES)]
-pub struct CodeControlArgs {
-    /// Run the local automation shim on stdin/stdout as NDJSON JSON-RPC 2.0.
-    #[arg(long)]
-    pub stdio: bool,
-    /// Base URL from `.libra/code/control.json`, e.g. http://127.0.0.1:3000.
-    #[arg(long)]
-    pub url: String,
-    /// Path to the local process-level control token file.
-    ///
-    /// On Unix/macOS the file must be a regular non-symlink path with exact
-    /// `0600` permissions (`CONTROL_TOKEN_PERMS` otherwise). Prefer the
-    /// sidecar written by `libra code --control write`
-    /// (`.libra/code/control-token`).
-    #[arg(long, value_name = "PATH")]
-    pub token_file: PathBuf,
-}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -149,32 +105,15 @@ struct GoalCancelParams {
     controller_token: String,
 }
 
-pub async fn execute(args: CodeControlArgs) -> CliResult<()> {
-    if !args.stdio {
-        return Err(CliError::command_usage(
-            "`libra code-control` currently supports only `--stdio`",
-        ));
-    }
-
-    crate::utils::error::emit_warning(CODE_CONTROL_DEPRECATION_WARNING);
-    // Raw NDJSON on stdout never renders `data.warnings[]`, so under global
-    // `--json`/`--machine` still print the migration notice on stderr.
-    if crate::utils::output::structured_output_active() {
-        eprintln!("warning: {CODE_CONTROL_DEPRECATION_WARNING}");
-    }
-    // W4-09: thin forwarding shim → same helper as `libra code --control stdio`.
-    run_control_stdio_client(&args.url, &args.token_file).await
-}
-
 /// Canonical JSON-RPC 2.0 NDJSON control client (W4-02).
 ///
 /// Drives an existing Code UI write-control session over stdin/stdout.
-/// Independent of `Commands::CodeControl` dispatch — both
-/// `libra code-control --stdio` and `libra code --control stdio` call this.
+/// Called by the canonical `libra code --control stdio` entry (W5-01 removed
+/// the W4-09 forwarding-shim entry that also reached this helper).
 pub async fn run_control_stdio_client(url: &str, token_file: &PathBuf) -> CliResult<()> {
     let base_url = Url::parse(url).map_err(|error| {
         CliError::command_usage(format!(
-            "--control-url / --url must be a valid control endpoint base URL (got '{url}': {error})"
+            "--control-url must be a valid control endpoint base URL (got '{url}': {error})"
         ))
     })?;
     ensure_loopback_control_url(&base_url)?;
@@ -226,13 +165,13 @@ pub async fn run_control_stdio_client(url: &str, token_file: &PathBuf) -> CliRes
 
 /// Control clients forward the local process token as
 /// `X-Libra-Control-Token`. Restrict the base URL to loopback HTTP(S) so a
-/// mistaken or malicious `--control-url` / `--url` cannot exfiltrate that
+/// mistaken or malicious `--control-url` cannot exfiltrate that
 /// token (or an arbitrary readable file passed as the token path) off-box.
 fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" {
         return Err(CliError::command_usage(format!(
-            "--control-url / --url must use http or https (got '{scheme}')"
+            "--control-url must use http or https (got '{scheme}')"
         )));
     }
     // Require a literal loopback IP. Reject `localhost` / other hostnames so a
@@ -245,7 +184,7 @@ fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
         None => String::new(),
     };
     Err(CliError::command_usage(format!(
-        "--control-url / --url must use a literal loopback IP such as http://127.0.0.1:3000 or http://[::1]:3000 (got '{url}'{host_hint}); hostnames like localhost are rejected so DNS/hosts remapping cannot exfiltrate the control token",
+        "--control-url must use a literal loopback IP such as http://127.0.0.1:3000 or http://[::1]:3000 (got '{url}'{host_hint}); hostnames like localhost are rejected so DNS/hosts remapping cannot exfiltrate the control token",
         host_hint = if host.is_empty() {
             String::new()
         } else {
@@ -335,7 +274,7 @@ async fn dispatch_json_rpc_request(
                 Err(error) => return DispatchResult::Error(error),
             };
             let mut body = json!({ "clientId": params.client_id });
-            // Default omitted kind to automation: this shim always authenticates
+            // Default omitted kind to automation: this client always authenticates
             // with X-Libra-Control-Token and never sends a browser Origin.
             body["kind"] = Value::String(params.kind.unwrap_or_else(|| "automation".to_string()));
             send_post(

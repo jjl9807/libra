@@ -1,112 +1,37 @@
-# `libra code-control`
+# `libra code-control` (removed)
 
-> **Deprecated forwarding shim (W4-09):** prefer the canonical client
-> `libra code --control stdio` (discovers `.libra/code/control.json` by default;
-> optional `--control-url` / `--control-token-file` / `--control-info-file`).
-> This `code-control` entry only prints a deprecation warning and forwards to
-> the same control client helper. It is **not** an independent protocol
-> implementation. Physical deletion lands in **W5-01**. Do not confuse with
-> deprecated MCP-only `libra code --stdio` (tools/resources; DEFER-02
-> `libra mcp --stdio` after W5).
+> **Breaking change (W5-01):** the deprecated `libra code-control` forwarding
+> shim was **physically removed** in the W5 breaking release. The binary now
+> rejects `code-control` as an unknown command (`libra: 'code-control' is not a
+> libra command.`, exit 129). This page is kept as a migration note only; it no
+> longer describes an available command.
 
-`libra code-control --stdio` is a deprecated local automation forwarding shim
-for an already running `libra code --control write` session. It speaks
-newline-delimited JSON-RPC 2.0 on stdin/stdout and forwards requests to the
-loopback `/api/code/*` HTTP/SSE control surface via the shared helper used by
-`libra code --control stdio`.
+## Migration
 
-This command is not an MCP server. `libra code --stdio` remains the MCP stdio
-transport and does not drive a live Code UI session. Do not confuse MCP
-`--stdio` with `--control stdio`.
+Use the canonical stdio automation client. It speaks the same newline-delimited
+JSON-RPC 2.0 protocol as the removed shim and additionally discovers the
+endpoint from `.libra/code/control.json` by default:
 
-## Usage
+| Removed invocation | Replacement |
+|---|---|
+| `libra code-control --stdio --url <baseUrl> --token-file <path>` (the shim required both flags) | `libra code --control stdio --control-url <baseUrl> --control-token-file <path>` |
+| `libra code-control --stdio --url $(jq -r .baseUrl .libra/code/control.json) --token-file .libra/code/control-token` | `libra code --control stdio` (discovers `.libra/code/control.json` by default; override with `--control-url` / `--control-token-file` / `--control-info-file`) |
 
-```bash
-# Canonical (preferred)
-libra code --control stdio \
-  --control-url http://127.0.0.1:3000 \
-  --control-token-file .libra/code/control-token
-
-# Legacy deprecated shim (deleted in W5-01)
-libra code-control --stdio \
-  --url http://127.0.0.1:3000 \
-  --token-file .libra/code/control-token
-```
-
-`--url` / `--control-url` should come from `.libra/code/control.json` (`baseUrl`)
-and must use a **literal loopback IP** (`http://127.0.0.1:…` or `http://[::1]:…`).
-Hostnames such as `localhost` are rejected so DNS/hosts remapping cannot
-redirect the token. `--token-file` / `--control-token-file` points at the
-process-level token created by `libra code --control write`. On Unix/macOS the
-token file must be a regular non-symlink path with exact `0600` permissions
-(otherwise the client fails closed with `CONTROL_TOKEN_PERMS`; run
-`chmod 0600 <path>`). The token is sent as `X-Libra-Control-Token` for
-write-control HTTP requests. The HTTP client disables proxies and redirects so
-the token cannot leave this machine.
-
-## Methods
-
-| JSON-RPC method | HTTP equivalent |
-|-----------------|-----------------|
-| `session.get` | `GET /api/code/session` |
-| `events.subscribe` | `GET /api/code/events` as JSON-RPC notifications |
-| `diagnostics.get` | `GET /api/code/diagnostics` |
-| `controller.attach` | `POST /api/code/controller/attach` |
-| `controller.detach` | `POST /api/code/controller/detach` |
-| `message.submit` | `POST /api/code/messages` |
-| `task.dispatch` | `POST /api/code/task/dispatch` |
-| `interaction.respond` | `POST /api/code/interactions/{id}` |
-| `turn.cancel` | `POST /api/code/control/cancel` |
-| `goal.start` | `POST /api/code/goal/start` |
-| `goal.status` | `GET /api/code/goal/status` |
-| `goal.cancel` | `POST /api/code/goal/cancel` |
+The JSON-RPC methods (`controller.attach`, `message.submit`,
+`events.subscribe`, `diagnostics.get`, …) and the JSON-RPC error mapping are
+unchanged; they are documented in [`code.md`](code.md) under "Local Automation
+Control". Do not confuse `--control stdio` with the deprecated MCP-only
+`libra code --stdio` transport (tools/resources; a dedicated
+`libra mcp --stdio` is planned after W5, DEFER-02).
 
 ## Examples
 
-Attach automation:
+```bash
+# Discover endpoint/token from .libra/code/control.json (preferred)
+libra code --control stdio
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"controller.attach","params":{"clientId":"local-script","kind":"automation"}}
+# Explicit endpoint/token (replaces the removed --url/--token-file spelling)
+libra code --control stdio \
+  --control-url http://127.0.0.1:3000 \
+  --control-token-file .libra/code/control-token
 ```
-
-Submit a message after attach returns `controllerToken`:
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"message.submit","params":{"controllerToken":"...","text":"/chat hello"}}
-```
-
-Dispatch a sub-agent explicitly:
-
-```json
-{"jsonrpc":"2.0","id":3,"method":"task.dispatch","params":{"controllerToken":"...","agent":"explorer","prompt":"grep TODO src/"}}
-```
-
-Respond to a pending interaction:
-
-```json
-{"jsonrpc":"2.0","id":4,"method":"interaction.respond","params":{"controllerToken":"...","interactionId":"interaction-1","response":{"approved":true}}}
-```
-
-Subscribe to events:
-
-```json
-{"jsonrpc":"2.0","id":5,"method":"events.subscribe"}
-```
-
-The shim first returns `{"subscribed":true}` and then emits notifications:
-
-```json
-{"jsonrpc":"2.0","method":"events.notification","params":{"event":"session_updated","data":{}}}
-```
-
-## Errors
-
-Malformed JSON maps to JSON-RPC `-32700`. Unknown methods map to `-32601`.
-Invalid params map to `-32602`. HTTP 4xx/5xx errors map to `-32000` with
-`data.status` and `data.code`, preserving Libra errors such as
-`INVALID_CONTROL_TOKEN`, `INVALID_CONTROLLER_TOKEN`, `CONTROLLER_CONFLICT`, and
-`INTERACTION_NOT_ACTIVE`.
-
-| Code | HTTP | Meaning |
-|------|------|---------|
-| `PLAN_REPAIR_RETRY_LIMIT_REACHED` | 409 | A plan-repair Continue request did not raise the exhausted automatic retry cap. Retry with a higher `maxAttempts` (for example, `{ "selectedOption": "continue", "maxAttempts": 3 }` when the current limit is 2), provide manual revision guidance, or cancel the repair. |

@@ -734,7 +734,7 @@ impl CodeSession {
     }
 
     /// Automation attach with only `clientId` (no `kind`) — mirrors the
-    /// historical `libra code-control` shim payload (W3-05).
+    /// historical automation shim payload (W3-05).
     pub fn attach_automation_omitted_kind(
         &mut self,
         client_id: &str,

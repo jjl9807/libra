@@ -328,7 +328,6 @@ mod cloud_test;
 mod code_agent_config_resolver_test;
 mod code_agent_linked_guard_test;
 mod code_control_files_test;
-mod code_control_help_test;
 mod code_control_stdio_test;
 mod code_test;
 mod code_thread_id_test;

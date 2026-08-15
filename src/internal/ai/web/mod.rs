@@ -1809,9 +1809,9 @@ async fn code_controller_attach_handler(
 
 /// Resolve attach `kind` when callers omit it.
 ///
-/// `libra code-control` historically posts `{ clientId }` with
+/// Automation clients historically post `{ clientId }` with
 /// `X-Libra-Control-Token` and no `kind`. Prefer automation in that case so
-/// the Origin gate does not break the shim. Browser SPAs either send
+/// the Origin gate does not break the control client. Browser SPAs either send
 /// `kind: "browser"` or omit both `kind` and the control token.
 fn resolve_controller_attach_kind(
     kind: Option<CodeUiControllerKind>,

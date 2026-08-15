@@ -12,7 +12,7 @@
 
 - `libra code`：Web Code UI + AgentRuntime，负责 message submit、interaction respond、cancel、observe、snapshot、controller lease。
 - `libra mcp --stdio`：MCP tools/resources/protocol transport，服务 Claude Desktop 等 MCP client。
-- `libra code-control`：TUI automation shim 的遗留命令；Web-only 后按 agent 迁移计划删除或改为纯 Web API shim。
+- `libra code-control`：TUI automation shim 的遗留命令，**已于 plan-20260715 W5-01 物理删除**（历史记录）；automation 接入以 canonical `libra code --control stdio` 为准。
 
 ## Final CLI Contract
 

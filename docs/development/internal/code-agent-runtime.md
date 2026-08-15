@@ -2,7 +2,7 @@
 
 > Status: agent-executable（可交给 Agent 按卡执行；本文档已包含自举清单、执行协议、代码漂移防护、测试骨架、接口契约与常见陷阱，具备直接开发条件）
 > Scope: 先设计并落地独立 Agent framework，再迁移 TUI-owned 行为，最后移除 Code TUI 并让 Web Code UI 成为唯一交互面；新增 entireio/cli 对齐轨道只扩展外部 Agent 能力、checkpoint/export 与 review/investigate 工作流，不改变 MCP 与内部 AgentRuntime 的边界。
-> Companion docs: Web/runtime 现状见 [`docs/development/commands/_general.md`](../commands/_general.md)；控制面契约见 [`docs/commands/code-control.md`](../commands/code-control.md)；`libra agent` 外部捕获公共 CLI/API、E1-E9 wire 契约、AG-16~AG-24 任务卡与验收命令见 [`docs/development/tracing/agent.md`](../tracing/agent.md)；MCP stdio 独立命令拆分见 `mcp.md`（历史拆分计划，文档已删除、未落地，不得作为事实源；当前 MCP stdio 与 code-control 的边界见 `docs/development/tracing/code.md` 的 C6）。
+> Companion docs: Web/runtime 现状见 [`docs/development/commands/_general.md`](../commands/_general.md)；控制面契约见 [`docs/commands/code.md`](../../commands/code.md)「本地自动化控制」一节（W5-01 起，原 code-control 页降为迁移说明）；`libra agent` 外部捕获公共 CLI/API、E1-E9 wire 契约、AG-16~AG-24 任务卡与验收命令见 [`docs/development/tracing/agent.md`](../tracing/agent.md)；MCP stdio 独立命令拆分见 `mcp.md`（历史拆分计划，文档已删除、未落地，不得作为事实源；当前 MCP stdio 与 code-control 的边界见 `docs/development/tracing/code.md` 的 C6）。
 > Supersedes: 旧 `docs/development/web-only.md` 草案已并入本文并删除；旧 `docs/development/agent.md` 也已由本文取代。后续内部 AgentRuntime / Web-only 迁移只维护本文件，不得重新创建或链接旧文档。
 > Control-plane correction (2026-06-04): 停止把 TUI/MCP 作为 Agent 操作入口；`libra code` 只保留 Web Code UI，外部调度参考 Codex 通过 WebSocket 进入 AgentRuntime。
 > 术语消歧（跨文档）：本文的"外部 Agent / 外部调度"指经 WebSocket/Web API **驱动 Libra 内部 runtime** 的外部调用方；[`docs/development/commands/_general.md`](../commands/_general.md) 的"外部 Agent"则指**被观测捕获的第三方编码 Agent**（第一批为 Claude Code/Codex/OpenCode），二者同词反义。本文的"session/checkpoint"指内部 runtime 的 session 与 orchestrator/dagrs 执行 checkpoint；entire.md 的"`agent_session`/`agent_checkpoint`"指外部会话表与 `refs/libra/traces` 上的 transcript 检查点。两者的表 / 类型 / ref / 命令命名空间均不重叠。
@@ -1836,7 +1836,7 @@ fn web_build_required_test() {
 - （历史）曾等待 / 依赖 `mcp.md` 完成独立 `libra mcp --stdio` 迁移；该拆分计划已删除，当前边界见 `docs/development/tracing/code.md` C6。
 - `libra code --stdio` / `--mcp-stdio` 在本计划后续 Phase 中只允许作为 migration error，不再作为 `code` 的运行模式。
 - Agent 外部 submit/respond/cancel/observe 继续只走 WebSocket/Web API；MCP 不承担 Agent turn 控制面。
-- **明确 `libra code-control --stdio` 的边界**：`code-control` 是 TUI automation 的 JSON-RPC shim，不是 MCP server。TUI 删除后，`code-control` 失去其主要用途（驱动 TUI session）。Web-only 时代，automation / external agent control 应直接通过 WebSocket/Web API 控制面接入；`libra mcp --stdio` 只保留 MCP protocol/tools/resources。AG-12 中需要决定：
+- **明确 `libra code-control --stdio` 的边界（历史记录，已按方案 A 于 plan-20260715 W5-01 执行完毕）**：`code-control` 是 TUI automation 的 JSON-RPC shim，不是 MCP server。TUI 删除后，`code-control` 失去其主要用途（驱动 TUI session）。Web-only 时代，automation / external agent control 应直接通过 WebSocket/Web API 控制面接入；`libra mcp --stdio` 只保留 MCP protocol/tools/resources。AG-12 中需要决定：
   - 方案 A：`libra code-control` 随 TUI 同步删除（推荐，因为 Web API 已直接暴露）。在 Phase 11 / Phase 12 删除 `docs/commands/code-control.md` 的同时，必须修改/删除 `tests/compat/matrix_alignment.rs` 中的 `docs_consistency_covers_code_ui_router_matrix` 测试，或者将其重定向到对 `docs/development/web-api.md` 的一致性检查，以确保 `compat_matrix_alignment` 验收命令通过。
   - 方案 B：保留 `libra code-control` 作为纯 HTTP/SSE 的 JSON-RPC shim，但文档必须更新为不再提及 TUI，且 `--url` 指向 Web server 而非 TUI control surface。
   - **本计划推荐方案 A**，因为 `code-control` 的核心价值是跨进程驱动 TUI；Web 时代直接 HTTP 调用更简单，无需 shim层。

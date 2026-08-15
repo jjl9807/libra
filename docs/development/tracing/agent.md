@@ -563,7 +563,7 @@ flowchart TD
 ## 文档边界与 Gate 8
 
 - `libra agent` 是外部 Agent 捕获命令；本文执行目标的第一批 supported roster 仅为 Claude Code/Codex/OpenCode。当前源码和历史迁移中仍可能出现 Gemini/Cursor/Copilot/FactoryAI 等枚举或 adapter，但它们不得作为第一批 supported/installable/launchable agent 暴露。
-- `libra code` 是内部 AgentRuntime/Web Code UI 迁移主线：turn submit/respond/cancel/observe 只走 WebSocket/Web API；`libra code --stdio` 是 MCP stdio server，`libra code-control --stdio` 是 live TUI/Web automation client，二者分工以 [`code.md`](code.md) 的 C6 契约和 `docs/commands/code-control.md` 为准；当前 `docs/development/mcp.md` 不在工作区，不能作为事实源。
+- `libra code` 是内部 AgentRuntime/Web Code UI 迁移主线：turn submit/respond/cancel/observe 只走 WebSocket/Web API；`libra code --stdio` 是 MCP stdio server，`libra code --control stdio` 是 live Web automation client（W4-09 的 `code-control` 转发 shim 已于 W5-01 物理删除），二者分工以 [`code.md`](code.md) 的 C6 契约和 `docs/commands/code.md` 为准；当前 `docs/development/mcp.md` 不在工作区，不能作为事实源。
 - `libra agent` 可以复用 `SessionStore` 原语、Web 展示和内部 AgentRuntime 的 review/fix bridge，但不得与内部 `libra code` 的 turn state、checkpoint 类型、DB 表语义或 MCP 控制面混同。
 - `claudecode` provider 已硬删除；本文第一批只允许 `claude-code`、`codex`、`opencode` 作为 observed external-agent slug/hook provider。`src/internal/ai/claudecode/` 不存在，`src/cli.rs` 对 `--provider claudecode` 返回移除错误，`diagnostics_redaction_test` 仍是 diagnostics 字段脱敏回归测试。
 - Gate 8 的执行顺序：AG-16 先冻结 capability contract；AG-17/AG-18 扩 CLI alias 与 `libra-agent-*` RPC；AG-19/AG-20 扩 lifecycle dispatcher 与 checkpoint/export；AG-21 补 transcript intelligence/skill events；AG-22/AG-23 补 review/investigate workflow；AG-24a 落地 retention/erasure/audit 合规实现；AG-24 收敛 docs/tests/compat。

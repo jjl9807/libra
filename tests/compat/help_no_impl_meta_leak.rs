@@ -97,7 +97,6 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "cloud",
     "publish",
     "code",
-    "code-control",
     "automation",
     "usage",
     "graph",

@@ -77,7 +77,7 @@ Use these **exact** invocations (they are enforced by CI and the project’s AGE
 - Worker checks (inside `worker/`):
   `pnpm lint && pnpm test && pnpm test:miniflare && pnpm build`
 - Required consistency check before PRs that touch surfaces (de-scripted — there is no helper script directory):
-  `cargo test --test compat_matrix_alignment` (covers `COMPATIBILITY.md` ↔ `src/cli.rs::Commands` drift and `docs/commands/code-control.md` ↔ Code UI router coverage; also runs inside `cargo test --all`)
+  `cargo test --test compat_matrix_alignment` (covers `COMPATIBILITY.md` ↔ `src/cli.rs::Commands` drift and `docs/commands/code.md` ↔ Code UI router coverage; also runs inside `cargo test --all`)
 
 ## Language, style & hard rules
 

@@ -3,8 +3,8 @@
 //! L1 — deterministic. Covers CLI conflict surface via the real binary,
 //! control-info discovery/attach fail-closed (W4-10), and attach/submit/detach
 //! through the shared
-//! [`libra::command::code_control::run_control_stdio_client`] helper (same
-//! transport as legacy `code-control --stdio`).
+//! [`libra::command::code_control::run_control_stdio_client`] helper (the
+//! transport formerly also exposed by the W4-09 shim removed in W5-01).
 
 use std::{fs, io::Write, net::SocketAddr, path::PathBuf, sync::Arc};
 

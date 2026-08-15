@@ -94,7 +94,26 @@ Write control 仅限本地。`--control write` 与 `--stdio` 组合会被拒绝�
 
 Automation clients 使用 `POST /api/code/controller/attach` 连接，请求体 `{ "clientId": "...", "kind": "automation" }`，header `X-Libra-Control-Token`，然后使用返回的 `X-Code-Controller-Token` 写入。Automation-held leases 对 `/api/code/messages`、`/api/code/interactions/{id}`、`/api/code/controller/detach` 和 `/api/code/control/cancel` 同时要求两个 tokens。本地 TUI 可以用 `/control reclaim` 重新取得控制权，这会使 automation lease 失效。Code UI 写请求体上限为 256KiB。当会话广告 `capabilities.commandIdempotency`（当前仅 headless web-only）时，`POST /api/code/messages` 接受 `{ "text": "...", "commandId": "..." }` 以支持重试去重（相同 id + 相同 text 幂等；相同 id + 不同 text 返回 `COMMAND_PAYLOAD_CONFLICT`）。运行时会用活动 controller `clientId` 的 SHA-256 fence 命名空间化 `commandId`（原始 clientId 不会写入 durable command log）。`commandIdempotency` 仅在配置了 durable SessionStore command admission 时广告。其他 runtime 若收到 `commandId` 会显式拒绝，而不会静默忽略。
 
-`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。遗留 [`libra code-control --stdio`](code-control.md) 是 **弃用转发 shim**（stderr 警告；W5-01 删除），调用同一 helper。弃用的 `libra code --stdio` 仍是 **MCP-only** tools/resources 传输（stderr 弃用警告；非 turn control），不得与 `--control stdio` 混同；独立的 `libra mcp --stdio` 计划在 W5 之后。
+`GET /api/code/diagnostics` 返回为本地工具准备的脱敏 observe-only 状态摘要。Control attach、detach、submit、respond 和 cancel 操作会通过 runtime audit sink 发出 `local-tui-control/v1` audit events。Stdio automation clients 请优先使用 canonical `libra code --control stdio` JSON-RPC NDJSON client：默认从 `.libra/code/control.json` discovery（可用 `--control-url` / `--control-token-file` / `--control-info-file` 覆盖）。Discovery fail-closed 使用稳定码（`CONTROL_INFO_MISSING`、`CONTROL_INFO_PERMS`、`CONTROL_TOKEN_MISSING`、`CONTROL_TOKEN_PERMS`、`CONTROL_SCOPE_CONFLICT`、`CONTROL_SERVER_MISSING`）；attach lease/ownership 冲突以 JSON-RPC `-32000` + Libra 码（如 `CONTROLLER_CONFLICT`）返回。原 `libra code-control` 转发 shim 已在 **W5 breaking 发布（W5-01）中删除**；`libra code --control stdio` 是唯一的 stdio automation client（见[迁移说明](code-control.md)）。弃用的 `libra code --stdio` 仍是 **MCP-only** tools/resources 传输（stderr 弃用警告；非 turn control），不得与 `--control stdio` 混同；独立的 `libra mcp --stdio` 计划在 W5 之后。
+
+Stdio client 在 stdin/stdout 上使用换行分隔的 JSON-RPC 2.0，并把方法映射到 loopback `/api/code/*` HTTP/SSE 控制接口：
+
+| JSON-RPC 方法 | HTTP 等价接口 |
+|-----------------|-----------------|
+| `session.get` | `GET /api/code/session` |
+| `events.subscribe` | 作为 JSON-RPC 通知的 `GET /api/code/events` |
+| `diagnostics.get` | `GET /api/code/diagnostics` |
+| `controller.attach` | `POST /api/code/controller/attach` |
+| `controller.detach` | `POST /api/code/controller/detach` |
+| `message.submit` | `POST /api/code/messages` |
+| `task.dispatch` | `POST /api/code/task/dispatch` |
+| `interaction.respond` | `POST /api/code/interactions/{id}` |
+| `turn.cancel` | `POST /api/code/control/cancel` |
+| `goal.start` | `POST /api/code/goal/start` |
+| `goal.status` | `GET /api/code/goal/status` |
+| `goal.cancel` | `POST /api/code/goal/cancel` |
+
+格式错误的 JSON 映射为 JSON-RPC `-32700`。未知方法映射为 `-32601`。无效参数映射为 `-32602`。HTTP 4xx/5xx 错误映射为带有 `data.status` 和 `data.code` 的 `-32000`，并保留 `INVALID_CONTROL_TOKEN`、`INVALID_CONTROLLER_TOKEN`、`CONTROLLER_CONFLICT` 和 `INTERACTION_NOT_ACTIVE` 等 Libra 错误。
 
 ### Web Browser Control
 
