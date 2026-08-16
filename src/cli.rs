@@ -711,7 +711,7 @@ enum Commands {
     #[command(about = "Report AI provider/model usage")]
     Usage(command::usage::UsageArgs),
     #[command(
-        about = "Inspect an AI thread version graph (Web Code UI; interactive TUI deprecated)"
+        about = "Inspect an AI thread version graph (JSON/machine output; interactive view in Web Code UI)"
     )]
     Graph(command::graph::GraphArgs),
     #[command(about = "Inspect AI sandbox diagnostics")]
@@ -1470,7 +1470,7 @@ fn repair_invocation_refused_without_confirmation(
     !(*migrate_layout && *dry_run) && !*confirm
 }
 
-fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
+fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<CommandPreflight> {
     match command {
         // Codex invokes this user-level callback in every trusted working
         // directory. Resolve storage lazily in the handler so an unrelated
@@ -1600,6 +1600,14 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
             Ok(CommandPreflight::repo(storage))
         }
         Commands::Graph(graph_args) => {
+            // W5-08: bare (non-JSON) `libra graph` is the removed interactive
+            // entry. Skip repository preflight so the handler's stable
+            // removal refusal is deterministic and independent of repository
+            // state — no repo resolution/maintenance runs for a call that is
+            // always refused.
+            if !structured_output {
+                return Ok(CommandPreflight::none());
+            }
             let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
                 .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
@@ -1607,6 +1615,10 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         Commands::Agent(command::agent::AgentArgs {
             command: command::agent::AgentSubcommand::Graph(graph_args),
         }) => {
+            // W5-08: same removal-refusal ordering as `Commands::Graph`.
+            if !structured_output {
+                return Ok(CommandPreflight::none());
+            }
             let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
                 .map_err(|error| repo_resolution_error(error, graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
@@ -2551,7 +2563,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         command::tag::validate_cli_args(tag_args)?;
     }
     let require_complete_object_index = command_requires_complete_object_index(&args.command);
-    let preflight = command_preflight(&args.command)?;
+    let preflight = command_preflight(&args.command, args.json.is_some() || args.machine)?;
     if let Some(storage) = preflight.storage.as_deref() {
         if preflight.set_hash_kind {
             if preflight.upgrade_schema {
@@ -3275,7 +3287,7 @@ mod tests {
     fn worktree_umount_preflight_does_not_require_repo() {
         let cli = Cli::try_parse_from(["libra", "worktree", "umount", "/tmp/libra-task"]).unwrap();
 
-        let preflight = command_preflight(&cli.command).unwrap();
+        let preflight = command_preflight(&cli.command, false).unwrap();
         assert!(preflight.storage.is_none());
         assert!(!preflight.upgrade_schema);
         assert!(!preflight.set_hash_kind);
@@ -3289,7 +3301,7 @@ mod tests {
         let _guard = test::ChangeDirGuard::new(repo.path());
         let cli = Cli::try_parse_from(["libra", "hash-object", "hello.txt"]).unwrap();
 
-        let preflight = command_preflight(&cli.command).unwrap();
+        let preflight = command_preflight(&cli.command, false).unwrap();
         assert!(preflight.storage.is_some());
         assert!(!preflight.upgrade_schema);
         assert!(preflight.set_hash_kind);
@@ -3537,7 +3549,8 @@ mod tests {
             .to_str()
             .expect("temporary repo path should be valid UTF-8");
         let cli = Cli::try_parse_from(["libra", "code", "--repo", repo_arg]).unwrap();
-        let preflight = command_preflight(&cli.command).expect("--repo should drive preflight");
+        let preflight =
+            command_preflight(&cli.command, false).expect("--repo should drive preflight");
 
         let expected_storage = repo
             .join(".libra")

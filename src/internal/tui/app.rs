@@ -281,9 +281,11 @@ fn graph_thread_id_from_orchestrator_result(result: &OrchestratorResult) -> Opti
 }
 
 fn graph_command_from_thread_id(thread_id: &str) -> Option<String> {
+    // W5-08: the interactive `libra graph` TUI entry is removed, so the
+    // handoff must emit the structured `--json` form that actually runs.
     uuid::Uuid::parse_str(thread_id)
         .ok()
-        .map(|_| format!("libra graph {thread_id}"))
+        .map(|_| format!("libra graph --json {thread_id}"))
 }
 
 fn record_orchestrator_thread_metadata(session: &mut SessionState, result: &OrchestratorResult) {
@@ -16100,7 +16102,7 @@ mod tests {
 
         let rendered = format_orchestrator_result(&result);
 
-        assert!(rendered.contains(&format!("| Graph | `libra graph {thread_id}` |")));
+        assert!(rendered.contains(&format!("| Graph | `libra graph --json {thread_id}` |")));
         assert_eq!(
             graph_thread_id_from_orchestrator_result(&result).as_deref(),
             Some(thread_id)

@@ -142,7 +142,7 @@ Every Libra command accepts the following global flags:
 | Codex data storage | | Link `libra code --provider codex` to Codex app-server and persist Codex session data | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | List, run, and inspect AI automation rules | [automation.md](automation.md) |
 | `libra usage` | | Report and prune AI provider/model usage aggregates | [usage.md](usage.md) |
-| `libra graph` | | Inspect a Libra Code thread version graph (`--json`/`--machine`; interactive TUI deprecated, use Web Code UI) | [graph.md](graph.md) |
+| `libra graph` | | Inspect a Libra Code thread version graph (`--json`/`--machine`; interactive TUI entry removed in the W5 breaking release, use Web Code UI) | [graph.md](graph.md) |
 | `libra sandbox` | | Inspect AI sandbox diagnostics, including OS backend availability and downgrade warnings | [sandbox.md](sandbox.md) |
 | `libra agent` | | Manage external-agent capture, checkpoints, hooks, and RPC adapters | [agent.md](agent.md) |
 

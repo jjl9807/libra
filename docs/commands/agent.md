@@ -8,7 +8,7 @@ Manage external-agent capture for Claude Code, Codex, and OpenCode.
 libra agent status
 libra agent list [--schema-version <1|2>] [--json]
 libra agent import (--session <id> | --path <path> | --since <rfc3339> | --all) [--agent <name>] [--limit <n>] [--cursor <n>] --yes
-libra agent graph <session> [--repo <path>]
+libra --json agent graph <session> [--repo <path>]
 libra agent enable [--agent <name>]...
 libra agent add [<name>...]
 libra agent disable [--agent <name>]...
@@ -60,7 +60,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `status` | Report captured external-agent session status |
 | `list` | List the supported agents with their capability matrix (roster, hooks, install state) |
 | `import` | Discover and import historical Claude/Codex transcript files or one trusted, sandboxed OpenCode export after explicit consent |
-| `graph <session>` | Browse the read-only session → turn → revision → subagent capture graph; use global `--json`/`--machine` outside a terminal |
+| `graph <session>` | Inspect the read-only session → turn → revision → subagent capture graph; requires global `--json`/`--machine` (the interactive TUI entry was removed in the W5 breaking release) |
 | `enable` | Enable one or more external agents and install hooks |
 | `add` | Alias of `enable`: `add <name>` ≡ `enable --agent <name>` |
 | `disable` | Disable one or more external agents and uninstall hooks |
@@ -170,23 +170,16 @@ facts. Subagent nodes expose only checkpoint/link structure and retain
 
 The JSON/machine graph query never opens transcript or object blobs and never
 selects working directories, descriptions, metadata JSON, redaction reports,
-or coverage digests. In the interactive TUI, selecting a session, turn,
-revision, or subagent additionally shows a bounded content summary: event
-counts plus compact user/assistant message previews from the linked
-checkpoint. The TUI reads at most 256 KiB per checkpoint, follows the stored
-manifest, and applies the default redactor again; it never renders the full
-transcript or provider file path. The session row and title identify the
-captured agent, and human-readable `created_at`/`updated_at` values use the
-machine's local timezone while retaining the Unix value. Turn rows also show
-the captured input for that turn. Thinking is shown only from a stored,
-redacted provider summary; when the provider stores reasoning as encrypted
-content without a summary, the TUI reports that it is unavailable rather than
-attempting to decrypt it. A locally erased session succeeds with `state="erased"`, a
-null session, empty turns, and unavailable subagents; it is not recreated.
-An id absent from both the session catalog and erasure tombstones fails with
-`LBR-AGENT-021`. Without global `--json` or `--machine`, stdin and stdout must
-both be terminals; non-interactive callers receive a usage error before TUI
-initialization.
+or coverage digests. **Breaking change (W5-08):** the interactive
+capture-graph TUI was removed in the W5 breaking release — its bounded,
+redacted content previews (event counts and compact user/assistant message
+previews read from the linked checkpoint, at most 256 KiB each) went away with
+it, and the frozen JSON v1 schema above never carried them. A locally erased
+session succeeds with `state="erased"`, a null session, empty turns, and
+unavailable subagents; it is not recreated. An id absent from both the session
+catalog and erasure tombstones fails with `LBR-AGENT-021`. Without global
+`--json` or `--machine`, `libra agent graph` exits with a usage error and a
+migration hint (exit 129, `LBR-CLI-002`) before reading any capture state.
 
 `agent import` has its own schema version 1 result with `results`, `skipped`,
 `partial_results`, `failures`, and `next_cursor`. Every item has one status:
@@ -443,8 +436,8 @@ libra agent import --session <provider-session-id> --agent claude-code --yes
 # Import a bounded page of Codex rollouts modified since a timestamp
 libra agent import --since 2026-07-01T00:00:00Z --agent codex --limit 20 --yes --json
 
-# Browse one captured session's turn/revision/subagent structure
-libra agent graph <session-id>
+# Read one captured session's turn/revision/subagent structure as frozen JSON v1
+libra --json agent graph <session-id>
 
 # Read the same graph safely in automation or from another repository
 libra --json agent graph <session-id> --repo /path/to/repo

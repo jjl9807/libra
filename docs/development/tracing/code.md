@@ -259,12 +259,15 @@ projection 已事件化。
 
 W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际命中（2026-08-09 `rg`
 重验）；它们不是 W1 的删除范围。`agent/graph.rs` 仍是额外编译期 consumer，不能因旧
-清单漏列而被静默遗忘。
+清单漏列而被静默遗忘。**2026-08-17 更新**：W5-08 删除 interactive graph 公开入口时，
+两处 graph 模块内的 ratatui/crossterm 渲染器与 TUI-only 结构随之移除（保留即为死代码，
+无法过 clippy `-D warnings`），故 helper 解耦轴实际由 W5-08 吸收；W5-10 保留
+`Cargo.toml`/`Cargo.lock` 依赖摘除、`format.rs` doc-link 清理与零命中守卫。
 
 | 路径 | 当前依赖 | 后续 owner |
 |---|---|---|
-| `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`。 | W4-04/W5-08 → W5-10。 |
-| `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI。 | W5-03/W5-10 必须单独迁移或明确保留兼容策略。 |
+| `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`（W5-08 已随 interactive 入口删除一并移除）。 | W4-04/W5-08 → W5-10（仅余依赖摘除）。 |
+| `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI（W5-08 已一并移除）。 | W5-08 已解耦；W5-10 负责依赖摘除与守卫。 |
 | `src/internal/ai/web/code_ui.rs:1266` | `TuiControlError` downcast 是 Web API 的编译期耦合。 | W5-02 先迁为 UI-neutral error。 |
 | `src/command/code.rs` `execute_tui` @ `:1561` | Code TUI startup/adapter。 | W5-01/W5-06，不能在 W1 删除。 |
 | `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 清理链接即可。 |

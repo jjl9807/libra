@@ -2,37 +2,23 @@
 //!
 //! This module deliberately does not reuse `command::graph`'s projection
 //! resolver. External-agent capture is keyed by `agent_session.session_id`,
-//! not by an orchestrator `thread_id`; only the terminal shell and visual
-//! layout are shared (plan-20260713 ADR-DR-20).
+//! not by an orchestrator `thread_id`. Output is the frozen capture-graph
+//! JSON v1 schema (`--json` / `--machine`); the interactive TUI entry was
+//! removed in the W5 breaking release.
 
 use std::{
     collections::BTreeMap,
-    io::{IsTerminal, stdin, stdout},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-use chrono::{Local, TimeZone};
 use clap::Args;
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    prelude::{Color, Line, Span, Style},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
-};
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, QueryResult, Statement, TransactionTrait, TryGetable,
 };
 use serde::Serialize;
 
 use crate::{
-    command::agent::checkpoint::load_checkpoint_transcript_bytes_from_storage,
-    internal::{
-        ai::observed_agents::Redactor,
-        db::get_db_conn_instance_for_path,
-        tui::{Tui, tui_init, tui_restore},
-    },
+    internal::db::get_db_conn_instance_for_path,
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -42,10 +28,9 @@ use crate::{
 
 pub const AGENT_GRAPH_EXAMPLES: &str = "\
 EXAMPLES:
-    libra agent graph <session>                     Browse captured turns and revisions
-    libra agent graph <session> --repo /path/to/repo  Inspect capture data in another repository
     libra --json agent graph <session>              Emit the frozen capture-graph JSON v1 schema
-    libra --machine agent graph <session>           Emit compact machine-readable JSON";
+    libra --machine agent graph <session>           Emit compact machine-readable JSON
+    libra --json agent graph <session> --repo /path/to/repo  Inspect capture data in another repository";
 
 #[derive(Args, Debug)]
 #[command(after_help = AGENT_GRAPH_EXAMPLES)]
@@ -117,44 +102,7 @@ struct SubagentNodeOutput {
 #[derive(Debug, Clone)]
 struct CheckpointStructure {
     checkpoint_id: String,
-    parent_checkpoint_id: Option<String>,
-    scope: String,
     created_at: i64,
-    content: CheckpointContentSummary,
-}
-
-/// Bounded, redacted content used only by the interactive graph detail pane.
-/// JSON graph output remains the frozen metadata-only schema, while the TUI
-/// can answer what was in a captured turn without rendering an entire
-/// transcript.
-#[derive(Debug, Clone, Default)]
-struct CheckpointContentSummary {
-    availability: String,
-    truncated: bool,
-    event_count: usize,
-    user_message_count: usize,
-    assistant_message_count: usize,
-    user_preview: Option<String>,
-    assistant_preview: Option<String>,
-    thinking_count: usize,
-    thinking_encrypted: bool,
-    thinking_preview: Option<String>,
-    turns: BTreeMap<String, TurnContentSummary>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct TurnContentSummary {
-    user_inputs: Vec<String>,
-    assistant_previews: Vec<String>,
-    thinking_previews: Vec<String>,
-    thinking_count: usize,
-    thinking_encrypted: bool,
-}
-
-#[derive(Debug, Clone)]
-struct AgentGraphProjection {
-    output: AgentGraphOutput,
-    checkpoints: BTreeMap<String, CheckpointStructure>,
 }
 
 #[derive(Debug)]
@@ -169,40 +117,31 @@ struct ClaimRow {
 }
 
 pub async fn execute_safe(args: GraphArgs, output: &OutputConfig) -> CliResult<()> {
+    // Breaking change: the interactive capture-graph TUI is removed; the
+    // frozen JSON/machine schema is the only output. Refuse before resolving
+    // repository storage or loading the capture so the rejection is
+    // deterministic and independent of repository/capture state. The CLI
+    // preflight (`command_preflight`) likewise skips repo resolution for
+    // non-JSON invocations.
+    if !output.is_json() {
+        return Err(CliError::command_usage(
+            "`libra agent graph` no longer opens an interactive TUI",
+        )
+        .with_hint(
+            "rerun as `libra --json agent graph <session>` or `libra --machine agent graph <session>` for structured output.",
+        ));
+    }
+
     let storage_root = try_get_storage_path(args.repo.clone()).map_err(|_| {
         CliError::repo_not_found()
             .with_hint("verify that --repo names an initialized Libra repository.")
     })?;
-    let interactive = stdin().is_terminal() && stdout().is_terminal();
-    let projection = load_agent_graph(
-        &storage_root,
-        &args.session,
-        interactive && !output.is_json(),
-    )
-    .await?;
 
-    if output.is_json() {
-        return emit_json_data("agent_graph", &projection.output, output);
-    }
-
-    if !interactive {
-        return Err(CliError::command_usage(
-            "agent graph requires an interactive terminal unless --json or --machine is used",
-        )
-        .with_hint("rerun as `libra --json agent graph <session>` for structured output."));
-    }
-
-    run_agent_graph_tui(projection).map_err(|error| {
-        CliError::io(format!("failed to run agent graph TUI: {error}"))
-            .with_hint("rerun with --json for non-interactive output.")
-    })
+    let graph = load_agent_graph(&storage_root, &args.session).await?;
+    emit_json_data("agent_graph", &graph, output)
 }
 
-async fn load_agent_graph(
-    storage_root: &Path,
-    session_id: &str,
-    include_content: bool,
-) -> CliResult<AgentGraphProjection> {
+async fn load_agent_graph(storage_root: &Path, session_id: &str) -> CliResult<AgentGraphOutput> {
     let db_path = storage_root.join(DATABASE);
     let connection = get_db_conn_instance_for_path(&db_path)
         .await
@@ -212,16 +151,14 @@ async fn load_agent_graph(
         .await
         .map_err(|_| graph_store_error("start a consistent capture-graph read"))?;
 
-    let result =
-        load_agent_graph_from_connection(&transaction, session_id, storage_root, include_content)
-            .await;
+    let result = load_agent_graph_from_connection(&transaction, session_id).await;
     match result {
-        Ok(projection) => {
+        Ok(graph) => {
             transaction
                 .commit()
                 .await
                 .map_err(|_| graph_store_error("finish the capture-graph read"))?;
-            Ok(projection)
+            Ok(graph)
         }
         Err(error) => {
             let _ = transaction.rollback().await;
@@ -233,23 +170,18 @@ async fn load_agent_graph(
 async fn load_agent_graph_from_connection<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
-    storage_root: &Path,
-    include_content: bool,
-) -> CliResult<AgentGraphProjection> {
+) -> CliResult<AgentGraphOutput> {
     if tombstone_exists(connection, session_id).await? {
-        return Ok(AgentGraphProjection {
-            output: AgentGraphOutput {
-                schema_version: 1,
-                state: "erased".to_string(),
-                session: None,
-                turns: Vec::new(),
-                subagents: SubagentsOutput {
-                    available: false,
-                    unavailable_reason: Some("erased".to_string()),
-                    nodes: Vec::new(),
-                },
+        return Ok(AgentGraphOutput {
+            schema_version: 1,
+            state: "erased".to_string(),
+            session: None,
+            turns: Vec::new(),
+            subagents: SubagentsOutput {
+                available: false,
+                unavailable_reason: Some("erased".to_string()),
+                nodes: Vec::new(),
             },
-            checkpoints: BTreeMap::new(),
         });
     }
 
@@ -261,8 +193,7 @@ async fn load_agent_graph_from_connection<C: ConnectionTrait>(
         .with_stable_code(StableErrorCode::AgentGraphSessionUnknown)
         .with_hint("run `libra agent session list` and pass its exact session_id.")
     })?;
-    let checkpoints =
-        load_checkpoints(connection, session_id, storage_root, include_content).await?;
+    let checkpoints = load_checkpoints(connection, session_id).await?;
     let mut turns = load_indexed_turns(connection, session_id).await?;
     validate_turn_checkpoints(&turns, &checkpoints)?;
     if turns.is_empty() {
@@ -290,15 +221,12 @@ async fn load_agent_graph_from_connection<C: ConnectionTrait>(
     }
     let subagents = load_subagents(connection, session_id, &checkpoints).await?;
 
-    Ok(AgentGraphProjection {
-        output: AgentGraphOutput {
-            schema_version: 1,
-            state: "present".to_string(),
-            session: Some(session),
-            turns,
-            subagents,
-        },
-        checkpoints,
+    Ok(AgentGraphOutput {
+        schema_version: 1,
+        state: "present".to_string(),
+        session: Some(session),
+        turns,
+        subagents,
     })
 }
 
@@ -344,13 +272,11 @@ async fn load_session<C: ConnectionTrait>(
 async fn load_checkpoints<C: ConnectionTrait>(
     connection: &C,
     session_id: &str,
-    storage_root: &Path,
-    include_content: bool,
 ) -> CliResult<BTreeMap<String, CheckpointStructure>> {
     let rows = connection
         .query_all_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "SELECT checkpoint_id, session_id, parent_checkpoint_id, scope, tree_oid, created_at \
+            "SELECT checkpoint_id, created_at \
              FROM agent_checkpoint WHERE session_id = ? \
              ORDER BY created_at, checkpoint_id",
             [session_id.to_owned().into()],
@@ -362,199 +288,11 @@ async fn load_checkpoints<C: ConnectionTrait>(
         let checkpoint_id = required::<String>(&row, "checkpoint_id")?;
         let checkpoint = CheckpointStructure {
             checkpoint_id: checkpoint_id.clone(),
-            parent_checkpoint_id: required(&row, "parent_checkpoint_id")?,
-            scope: required(&row, "scope")?,
             created_at: required(&row, "created_at")?,
-            content: if include_content {
-                load_checkpoint_content_summary(
-                    storage_root,
-                    &checkpoint_id,
-                    &required::<String>(&row, "tree_oid")?,
-                )
-            } else {
-                CheckpointContentSummary::default()
-            },
         };
         checkpoints.insert(checkpoint.checkpoint_id.clone(), checkpoint);
     }
     Ok(checkpoints)
-}
-
-const GRAPH_CONTENT_READ_MAX_BYTES: u64 = 256 * 1024;
-const GRAPH_PREVIEW_MAX_CHARS: usize = 240;
-const GRAPH_MAX_TURN_CONTENT_ROWS: usize = 128;
-const GRAPH_MAX_PREVIEWS_PER_TURN: usize = 8;
-const UNATTRIBUTED_TURN_KEY: &str = "__unattributed__";
-
-fn load_checkpoint_content_summary(
-    storage_root: &Path,
-    checkpoint_id: &str,
-    tree_oid: &str,
-) -> CheckpointContentSummary {
-    let Ok((bytes, truncated)) = load_checkpoint_transcript_bytes_from_storage(
-        storage_root,
-        checkpoint_id,
-        tree_oid,
-        GRAPH_CONTENT_READ_MAX_BYTES,
-    ) else {
-        return CheckpointContentSummary {
-            availability: "unavailable".to_string(),
-            ..CheckpointContentSummary::default()
-        };
-    };
-    summarize_transcript(&bytes, truncated)
-}
-
-fn summarize_transcript(bytes: &[u8], truncated: bool) -> CheckpointContentSummary {
-    let mut summary = CheckpointContentSummary {
-        availability: "available".to_string(),
-        truncated,
-        ..CheckpointContentSummary::default()
-    };
-    for line in bytes.split(|byte| *byte == b'\n') {
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-            continue;
-        };
-        summary.event_count += 1;
-        let Some(payload) = value.get("payload") else {
-            continue;
-        };
-        let turn_key = transcript_turn_key(payload);
-        match payload.get("type").and_then(serde_json::Value::as_str) {
-            Some("message") => {
-                let Some(role) = payload.get("role").and_then(serde_json::Value::as_str) else {
-                    continue;
-                };
-                let Some(text) = message_text(payload) else {
-                    continue;
-                };
-                let Some(preview) = compact_preview(&text) else {
-                    continue;
-                };
-                match role {
-                    "user" => {
-                        summary.user_message_count += 1;
-                        summary.user_preview = Some(preview.clone());
-                        let turn = turn_summary_mut(&mut summary, turn_key.as_deref());
-                        push_preview(&mut turn.user_inputs, preview);
-                    }
-                    "assistant" => {
-                        summary.assistant_message_count += 1;
-                        summary.assistant_preview = Some(preview.clone());
-                        let turn = turn_summary_mut(&mut summary, turn_key.as_deref());
-                        push_preview(&mut turn.assistant_previews, preview);
-                    }
-                    _ => {}
-                }
-            }
-            Some("reasoning") | Some("thinking") => {
-                summary.thinking_count += 1;
-                let encrypted = payload
-                    .get("encrypted_content")
-                    .is_some_and(serde_json::Value::is_string);
-                if encrypted {
-                    summary.thinking_encrypted = true;
-                }
-                let preview = reasoning_preview(payload);
-                if let Some(preview) = &preview {
-                    summary.thinking_preview = Some(preview.clone());
-                }
-                let turn = turn_summary_mut(&mut summary, turn_key.as_deref());
-                turn.thinking_count += 1;
-                if let Some(preview) = preview {
-                    push_preview(&mut turn.thinking_previews, preview);
-                } else {
-                    turn.thinking_encrypted = encrypted;
-                }
-            }
-            _ => {}
-        }
-    }
-    summary
-}
-
-fn transcript_turn_key(payload: &serde_json::Value) -> Option<String> {
-    payload
-        .get("internal_chat_message_metadata_passthrough")
-        .or_else(|| payload.get("internal_chat_message_metadata"))
-        .and_then(|metadata| metadata.get("turn_id"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-}
-
-fn turn_summary_mut<'a>(
-    summary: &'a mut CheckpointContentSummary,
-    turn_key: Option<&str>,
-) -> &'a mut TurnContentSummary {
-    let key = turn_key.unwrap_or(UNATTRIBUTED_TURN_KEY).to_string();
-    if !summary.turns.contains_key(&key) && summary.turns.len() >= GRAPH_MAX_TURN_CONTENT_ROWS {
-        return summary
-            .turns
-            .entry(UNATTRIBUTED_TURN_KEY.to_string())
-            .or_default();
-    }
-    summary.turns.entry(key).or_default()
-}
-
-fn push_preview(previews: &mut Vec<String>, preview: String) {
-    if previews.len() < GRAPH_MAX_PREVIEWS_PER_TURN {
-        previews.push(preview);
-    }
-}
-
-fn reasoning_preview(payload: &serde_json::Value) -> Option<String> {
-    let summary = payload.get("summary")?;
-    let text = match summary {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|item| {
-                item.as_str()
-                    .or_else(|| item.get("text").and_then(serde_json::Value::as_str))
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    };
-    compact_preview(&text)
-}
-
-fn message_text(payload: &serde_json::Value) -> Option<String> {
-    if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
-        return Some(text.to_string());
-    }
-    match payload.get("content")? {
-        serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Array(blocks) => {
-            let text = blocks
-                .iter()
-                .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
-            (!text.trim().is_empty()).then_some(text)
-        }
-        _ => None,
-    }
-}
-
-fn compact_preview(text: &str) -> Option<String> {
-    let redactor = Redactor::new_default();
-    let (redacted, _) = redactor.redact(text.as_bytes());
-    let compact = String::from_utf8_lossy(redacted.bytes())
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if compact.is_empty() {
-        return None;
-    }
-    let mut preview = compact
-        .chars()
-        .take(GRAPH_PREVIEW_MAX_CHARS)
-        .collect::<String>();
-    if compact.chars().count() > GRAPH_PREVIEW_MAX_CHARS {
-        preview.push_str("...");
-    }
-    Some(preview)
 }
 
 async fn load_indexed_turns<C: ConnectionTrait>(
@@ -781,649 +519,8 @@ fn safe_display(value: &str) -> String {
     output
 }
 
-// GitHub Dark palette copied from the existing thread graph TUI shell.
-const COLOR_BG: Color = Color::Rgb(13, 17, 23);
-const COLOR_BG_PANEL: Color = Color::Rgb(1, 4, 9);
-const COLOR_BG_SEL: Color = Color::Rgb(31, 111, 235);
-const COLOR_FG: Color = Color::Rgb(201, 209, 217);
-const COLOR_FG_MUTED: Color = Color::Rgb(110, 118, 129);
-const COLOR_BORDER: Color = Color::Rgb(48, 54, 61);
-const COLOR_ACCENT: Color = Color::Rgb(88, 166, 255);
-
-#[derive(Debug, Clone)]
-struct TuiRow {
-    label: String,
-    details: Vec<(String, String)>,
-}
-
-struct AgentGraphTuiApp {
-    rows: Vec<TuiRow>,
-    state: ListState,
-    agent_kind: String,
-}
-
-fn append_content_details(
-    details: &mut Vec<(String, String)>,
-    content: Option<&CheckpointContentSummary>,
-) {
-    let Some(content) = content else {
-        details.push(("content_status".to_string(), "not linked".to_string()));
-        return;
-    };
-    let status = if content.availability.is_empty() {
-        "not loaded"
-    } else {
-        content.availability.as_str()
-    };
-    details.push(("content_status".to_string(), status.to_string()));
-    if content.event_count > 0 {
-        details.push((
-            "events".to_string(),
-            format!(
-                "{} (user {}, assistant {}){}",
-                content.event_count,
-                content.user_message_count,
-                content.assistant_message_count,
-                if content.truncated {
-                    ", preview truncated"
-                } else {
-                    ""
-                }
-            ),
-        ));
-    }
-    if let Some(preview) = &content.user_preview {
-        details.push(("user_content".to_string(), preview.clone()));
-    }
-    if let Some(preview) = &content.assistant_preview {
-        details.push(("assistant_content".to_string(), preview.clone()));
-    }
-    if content.thinking_count > 0 {
-        details.push((
-            "thinking_events".to_string(),
-            content.thinking_count.to_string(),
-        ));
-        if let Some(preview) = &content.thinking_preview {
-            details.push(("thinking_summary".to_string(), preview.clone()));
-        } else if content.thinking_encrypted {
-            details.push((
-                "thinking_status".to_string(),
-                "encrypted; plaintext summary unavailable".to_string(),
-            ));
-        }
-    }
-}
-
-fn append_turn_content_details(
-    details: &mut Vec<(String, String)>,
-    content: Option<&CheckpointContentSummary>,
-    logical_turn_key: &str,
-    ordinal: usize,
-) {
-    let Some(content) = content else {
-        details.push((
-            format!("turn[{ordinal}]_input"),
-            "unavailable (checkpoint not linked)".to_string(),
-        ));
-        return;
-    };
-    let Some(turn) = content
-        .turns
-        .get(logical_turn_key)
-        .or_else(|| content.turns.get(UNATTRIBUTED_TURN_KEY))
-    else {
-        details.push((
-            format!("turn[{ordinal}]_input"),
-            "unavailable in captured transcript".to_string(),
-        ));
-        if content.thinking_encrypted {
-            details.push((
-                format!("turn[{ordinal}]_thinking_status"),
-                "encrypted; plaintext summary unavailable".to_string(),
-            ));
-        }
-        return;
-    };
-    if turn.user_inputs.is_empty() {
-        details.push((
-            format!("turn[{ordinal}]_input"),
-            "none recorded".to_string(),
-        ));
-    } else {
-        for input in &turn.user_inputs {
-            details.push((format!("turn[{ordinal}]_input"), input.clone()));
-        }
-    }
-    if turn.thinking_previews.is_empty() {
-        if turn.thinking_encrypted {
-            details.push((
-                format!("turn[{ordinal}]_thinking_status"),
-                "encrypted; plaintext summary unavailable".to_string(),
-            ));
-        }
-    } else {
-        for thinking in &turn.thinking_previews {
-            details.push((format!("turn[{ordinal}]_thinking"), thinking.clone()));
-        }
-    }
-}
-
-fn format_local_timestamp(timestamp: i64) -> String {
-    Local
-        .timestamp_opt(timestamp, 0)
-        .single()
-        .map(|value| {
-            format!(
-                "{} (unix: {timestamp})",
-                value.format("%Y-%m-%d %H:%M:%S %:z")
-            )
-        })
-        .unwrap_or_else(|| timestamp.to_string())
-}
-
-impl AgentGraphTuiApp {
-    fn new(projection: &AgentGraphProjection) -> Self {
-        let agent_kind = projection
-            .output
-            .session
-            .as_ref()
-            .map(|session| safe_display(&session.agent_kind))
-            .unwrap_or_else(|| "unknown".to_string());
-        let mut rows = Vec::new();
-        if projection.output.state == "erased" {
-            rows.push(TuiRow {
-                label: "session [erased]".to_string(),
-                details: vec![("state".to_string(), "erased".to_string())],
-            });
-        } else if let Some(session) = &projection.output.session {
-            let mut session_details = vec![
-                ("agent".to_string(), safe_display(&session.agent_kind)),
-                ("state".to_string(), safe_display(&session.state)),
-                (
-                    "created_at".to_string(),
-                    format_local_timestamp(session.created_at),
-                ),
-                (
-                    "updated_at".to_string(),
-                    format_local_timestamp(session.updated_at),
-                ),
-                (
-                    "checkpoints".to_string(),
-                    projection.checkpoints.len().to_string(),
-                ),
-            ];
-            let latest_checkpoint = projection
-                .checkpoints
-                .values()
-                .filter(|checkpoint| checkpoint.content.event_count > 0)
-                .max_by_key(|checkpoint| checkpoint.created_at);
-            append_content_details(
-                &mut session_details,
-                latest_checkpoint.map(|checkpoint| &checkpoint.content),
-            );
-            for turn in &projection.output.turns {
-                let checkpoint = turn
-                    .checkpoint_id
-                    .as_ref()
-                    .and_then(|id| projection.checkpoints.get(id));
-                append_turn_content_details(
-                    &mut session_details,
-                    checkpoint.map(|value| &value.content),
-                    &turn.logical_turn_key,
-                    turn.ordinal,
-                );
-            }
-            rows.push(TuiRow {
-                label: format!(
-                    "session [{}] {}",
-                    safe_display(&session.agent_kind),
-                    safe_display(&session.session_id)
-                ),
-                details: session_details,
-            });
-            for turn in &projection.output.turns {
-                let current_checkpoint = turn
-                    .checkpoint_id
-                    .as_ref()
-                    .and_then(|id| projection.checkpoints.get(id));
-                let current_scope = current_checkpoint
-                    .map(|checkpoint| checkpoint.scope.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let mut turn_details = vec![
-                    ("coverage_state".to_string(), turn.coverage_state.clone()),
-                    (
-                        "completeness".to_string(),
-                        turn.completeness
-                            .clone()
-                            .unwrap_or_else(|| "unindexed".to_string()),
-                    ),
-                    (
-                        "current_revision".to_string(),
-                        turn.current_revision
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
-                    ),
-                    ("scope".to_string(), current_scope),
-                    (
-                        "source_channel".to_string(),
-                        turn.source_channel
-                            .clone()
-                            .unwrap_or_else(|| "none".to_string()),
-                    ),
-                ];
-                append_content_details(
-                    &mut turn_details,
-                    current_checkpoint.map(|checkpoint| &checkpoint.content),
-                );
-                append_turn_content_details(
-                    &mut turn_details,
-                    current_checkpoint.map(|checkpoint| &checkpoint.content),
-                    &turn.logical_turn_key,
-                    turn.ordinal,
-                );
-                rows.push(TuiRow {
-                    label: format!(
-                        "  turn[{}] {} [{}]",
-                        turn.ordinal,
-                        safe_display(&turn.logical_turn_key),
-                        turn.coverage_state
-                    ),
-                    details: turn_details,
-                });
-                for revision in &turn.revisions {
-                    let checkpoint = projection.checkpoints.get(&revision.checkpoint_id);
-                    let mut revision_details = vec![
-                        (
-                            "checkpoint_id".to_string(),
-                            safe_display(&revision.checkpoint_id),
-                        ),
-                        (
-                            "scope".to_string(),
-                            checkpoint
-                                .map(|value| value.scope.clone())
-                                .unwrap_or_else(|| "unknown".to_string()),
-                        ),
-                        (
-                            "created_at".to_string(),
-                            format_local_timestamp(revision.created_at),
-                        ),
-                    ];
-                    append_content_details(
-                        &mut revision_details,
-                        checkpoint.map(|checkpoint| &checkpoint.content),
-                    );
-                    rows.push(TuiRow {
-                        label: format!(
-                            "    revision {} {} ({})",
-                            revision.revision, revision.completeness, revision.source_channel
-                        ),
-                        details: revision_details,
-                    });
-                }
-            }
-            if projection.output.subagents.available {
-                for node in &projection.output.subagents.nodes {
-                    let checkpoint = projection.checkpoints.get(&node.checkpoint_id);
-                    let mut subagent_details = vec![
-                        ("scope".to_string(), "subagent".to_string()),
-                        ("link_state".to_string(), node.link_state.clone()),
-                        (
-                            "boundary_checkpoint_id".to_string(),
-                            node.boundary_checkpoint_id
-                                .as_deref()
-                                .map(safe_display)
-                                .unwrap_or_else(|| "none".to_string()),
-                        ),
-                        (
-                            "parent_checkpoint_id".to_string(),
-                            checkpoint
-                                .and_then(|value| value.parent_checkpoint_id.as_deref())
-                                .map(safe_display)
-                                .unwrap_or_else(|| "none".to_string()),
-                        ),
-                        (
-                            "created_at".to_string(),
-                            format_local_timestamp(
-                                checkpoint
-                                    .map(|value| value.created_at)
-                                    .unwrap_or(node.created_at),
-                            ),
-                        ),
-                    ];
-                    append_content_details(
-                        &mut subagent_details,
-                        checkpoint.map(|checkpoint| &checkpoint.content),
-                    );
-                    rows.push(TuiRow {
-                        label: format!(
-                            "  subagent {} [{}]",
-                            safe_display(&node.checkpoint_id),
-                            node.link_state
-                        ),
-                        details: subagent_details,
-                    });
-                }
-            } else {
-                rows.push(TuiRow {
-                    label: "  subagents [unavailable]".to_string(),
-                    details: vec![(
-                        "unavailable_reason".to_string(),
-                        projection
-                            .output
-                            .subagents
-                            .unavailable_reason
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string()),
-                    )],
-                });
-            }
-        }
-
-        let mut state = ListState::default();
-        if !rows.is_empty() {
-            state.select(Some(0));
-        }
-        Self {
-            rows,
-            state,
-            agent_kind,
-        }
-    }
-
-    fn move_up(&mut self) {
-        let selected = self.state.selected().unwrap_or(0);
-        self.state.select(Some(selected.saturating_sub(1)));
-    }
-
-    fn move_down(&mut self) {
-        let selected = self.state.selected().unwrap_or(0);
-        let last = self.rows.len().saturating_sub(1);
-        self.state.select(Some((selected + 1).min(last)));
-    }
-}
-
-fn run_agent_graph_tui(projection: AgentGraphProjection) -> std::io::Result<()> {
-    let terminal = tui_init()?;
-    let _guard = scopeguard::guard((), |_| {
-        let _ = tui_restore();
-    });
-    let mut tui = Tui::new(terminal);
-    tui.enter_alt_screen()?;
-    let mut app = AgentGraphTuiApp::new(&projection);
-
-    loop {
-        tui.draw(|frame| render_agent_graph(frame, &mut app))?;
-        if event::poll(Duration::from_millis(250))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == event::KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                KeyCode::Home | KeyCode::Char('g') => app.state.select(Some(0)),
-                KeyCode::End | KeyCode::Char('G') => {
-                    app.state.select(Some(app.rows.len().saturating_sub(1)));
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn render_agent_graph(frame: &mut Frame<'_>, app: &mut AgentGraphTuiApp) {
-    let area = frame.area();
-    frame.render_widget(Block::default().style(Style::default().bg(COLOR_BG)), area);
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(2),
-        ])
-        .split(area);
-
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(" Libra ", Style::default().fg(COLOR_ACCENT)),
-        Span::styled(
-            format!("Agent Capture Graph [{}]", safe_display(&app.agent_kind)),
-            Style::default().fg(COLOR_FG),
-        ),
-    ]))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(COLOR_BORDER))
-            .style(Style::default().bg(COLOR_BG_PANEL)),
-    );
-    frame.render_widget(title, vertical[0]);
-
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(vertical[1]);
-    render_tree_pane(frame, panes[0], app);
-    render_detail_pane(frame, panes[1], app);
-
-    let footer = Paragraph::new(" ↑/k ↓/j select   g/G first/last   q/Esc quit ")
-        .style(Style::default().fg(COLOR_FG_MUTED).bg(COLOR_BG_PANEL));
-    frame.render_widget(footer, vertical[2]);
-}
-
-fn render_tree_pane(frame: &mut Frame<'_>, area: Rect, app: &mut AgentGraphTuiApp) {
-    let items = app
-        .rows
-        .iter()
-        .map(|row| ListItem::new(safe_display(&row.label)))
-        .collect::<Vec<_>>();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(" capture structure ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .style(Style::default().fg(COLOR_FG).bg(COLOR_BG))
-        .highlight_style(Style::default().fg(Color::White).bg(COLOR_BG_SEL))
-        .highlight_symbol("› ");
-    frame.render_stateful_widget(list, area, &mut app.state);
-}
-
-fn render_detail_pane(frame: &mut Frame<'_>, area: Rect, app: &AgentGraphTuiApp) {
-    let lines = app
-        .state
-        .selected()
-        .and_then(|index| app.rows.get(index))
-        .map(|row| {
-            row.details
-                .iter()
-                .map(|(key, value)| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("{}: ", safe_display(key)),
-                            Style::default().fg(COLOR_FG_MUTED),
-                        ),
-                        Span::styled(safe_display(value), Style::default().fg(COLOR_FG)),
-                    ])
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let details = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(" details ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(COLOR_BORDER)),
-        )
-        .style(Style::default().bg(COLOR_BG))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(details, area);
-}
-
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend};
-
-    use super::*;
-
-    fn fixture_projection() -> AgentGraphProjection {
-        let session = SessionOutput {
-            session_id: "codex__fixture".to_string(),
-            agent_kind: "codex".to_string(),
-            state: "stopped".to_string(),
-            created_at: 1,
-            updated_at: 2,
-        };
-        AgentGraphProjection {
-            output: AgentGraphOutput {
-                schema_version: 1,
-                state: "present".to_string(),
-                session: Some(session),
-                turns: vec![TurnOutput {
-                    logical_turn_key: "turn:1".to_string(),
-                    ordinal: 0,
-                    coverage_schema_version: Some(1),
-                    coverage_state: "indexed".to_string(),
-                    completeness: Some("complete".to_string()),
-                    current_revision: Some(2),
-                    checkpoint_id: Some("checkpoint-current".to_string()),
-                    source_channel: Some("live".to_string()),
-                    revisions: vec![RevisionOutput {
-                        revision: 1,
-                        completeness: "incomplete".to_string(),
-                        checkpoint_id: "checkpoint-shared".to_string(),
-                        source_channel: "live".to_string(),
-                        created_at: 1,
-                    }],
-                }],
-                subagents: SubagentsOutput {
-                    available: true,
-                    unavailable_reason: None,
-                    nodes: vec![SubagentNodeOutput {
-                        checkpoint_id: "subagent-content".to_string(),
-                        link_state: "unresolved".to_string(),
-                        boundary_checkpoint_id: None,
-                        created_at: 3,
-                    }],
-                },
-            },
-            checkpoints: BTreeMap::from([
-                (
-                    "checkpoint-current".to_string(),
-                    CheckpointStructure {
-                        checkpoint_id: "checkpoint-current".to_string(),
-                        parent_checkpoint_id: None,
-                        scope: "committed".to_string(),
-                        created_at: 2,
-                        content: CheckpointContentSummary {
-                            availability: "available".to_string(),
-                            event_count: 4,
-                            user_message_count: 1,
-                            assistant_message_count: 1,
-                            user_preview: Some("show the captured turn".to_string()),
-                            assistant_preview: Some("the turn was captured".to_string()),
-                            turns: BTreeMap::from([(
-                                "turn:1".to_string(),
-                                TurnContentSummary {
-                                    user_inputs: vec!["show the captured turn".to_string()],
-                                    thinking_previews: vec![
-                                        "inspect the captured input".to_string(),
-                                    ],
-                                    thinking_count: 1,
-                                    ..TurnContentSummary::default()
-                                },
-                            )]),
-                            ..CheckpointContentSummary::default()
-                        },
-                    },
-                ),
-                (
-                    "subagent-content".to_string(),
-                    CheckpointStructure {
-                        checkpoint_id: "subagent-content".to_string(),
-                        parent_checkpoint_id: None,
-                        scope: "subagent".to_string(),
-                        created_at: 3,
-                        content: CheckpointContentSummary::default(),
-                    },
-                ),
-            ]),
-        }
-    }
-
-    #[test]
-    fn agent_graph_renders_session_turn_revisions_and_subagents() {
-        let backend = TestBackend::new(120, 50);
-        let mut terminal = Terminal::new(backend).expect("create test terminal");
-        let mut app = AgentGraphTuiApp::new(&fixture_projection());
-        terminal
-            .draw(|frame| render_agent_graph(frame, &mut app))
-            .expect("render capture graph");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("Agent Capture Graph"));
-        assert!(rendered.contains("[codex]"));
-        assert!(rendered.contains("codex__fixture"));
-        assert!(rendered.contains("turn[0] turn:1"));
-        assert!(rendered.contains("revision 1 incomplete"));
-        assert!(rendered.contains("subagent-content"));
-        assert!(rendered.contains("show the captured turn"));
-        assert!(rendered.contains("the turn was captured"));
-        assert!(rendered.contains("turn[0]_input"));
-        assert!(rendered.contains("inspect the captured input"));
-    }
-
-    #[test]
-    fn graph_content_preview_extracts_redacted_user_and_assistant_messages() {
-        let transcript = br#"
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"inspect AKIAIOSFODNN7EXAMPLE"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
-{"type":"response_item","payload":{"type":"reasoning","summary":[{"text":"inspect the request safely"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
-{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done\nwith details"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
-{"type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"opaque","internal_chat_message_metadata_passthrough":{"turn_id":"turn:1"}}}
-"#;
-        let summary = summarize_transcript(transcript, false);
-        assert_eq!(summary.event_count, 4);
-        assert_eq!(summary.user_message_count, 1);
-        assert_eq!(summary.assistant_message_count, 1);
-        assert_eq!(summary.thinking_count, 2);
-        assert!(summary.thinking_encrypted);
-        assert_eq!(summary.turns["turn:1"].user_inputs.len(), 1);
-        assert!(summary.turns["turn:1"].user_inputs[0].contains("<REDACTED:"));
-        assert_eq!(
-            summary.turns["turn:1"].thinking_previews,
-            vec!["inspect the request safely".to_string()]
-        );
-        assert!(
-            summary
-                .user_preview
-                .as_deref()
-                .is_some_and(|value| value.contains("<REDACTED:"))
-        );
-        assert_eq!(
-            summary.assistant_preview.as_deref(),
-            Some("done with details")
-        );
-    }
-
-    #[test]
-    fn graph_formats_local_time_while_retaining_unix_timestamp() {
-        let formatted = format_local_timestamp(1);
-        assert!(formatted.contains("(unix: 1)"));
-        assert!(formatted.contains(":00:01"));
-    }
-
     #[test]
     fn graph_source_has_no_capture_mutations_or_writer_dependencies() {
         let source = include_str!("graph.rs");

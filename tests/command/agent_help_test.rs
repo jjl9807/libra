@@ -30,8 +30,8 @@ fn test_agent_help_lists_examples_banner() {
         "libra agent status",
         "libra agent list --schema-version 2 --json",
         "libra agent import --session <id>",
-        "libra agent graph <session>",
         "libra --json agent graph <session>",
+        "libra --machine agent graph <session>",
         "libra agent enable --agent claude",
         "libra agent disable --agent claude",
         "libra agent session list",
@@ -52,6 +52,12 @@ fn test_agent_help_lists_examples_banner() {
             "agent --help should include `{invocation}`, stdout: {stdout}"
         );
     }
+    // W5-08: the bare interactive `libra agent graph <session>` entry was
+    // removed; the EXAMPLES banner must not advertise it.
+    assert!(
+        !stdout.contains("libra agent graph <session>"),
+        "agent --help must not advertise the removed interactive graph entry, stdout: {stdout}"
+    );
 }
 
 #[test]

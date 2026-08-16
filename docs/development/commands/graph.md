@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra graph` 的目标是在 TUI 中查看 AI thread 的版本图和运行关系。它服务于 Libra Code/Agent 运行历史诊断，重点是 thread UUID、仓库路径解析和只读展示，不对应 Git 命令。
+`libra graph` 的目标是查看 AI thread 的版本图和运行关系。它服务于 Libra Code/Agent 运行历史诊断，重点是 thread UUID、仓库路径解析和只读展示，不对应 Git 命令。（W5-08 迁移注记：interactive TUI 入口已在 W5 breaking 发布中删除，实时图视图归 Web Code UI；本命令现在只输出 `--json` / `--machine` 结构化结果，裸调用以 usage error 加迁移提示拒绝。）
 
 ## 对比 Git 与兼容性
 
@@ -30,7 +30,7 @@ flowchart TD
 ```
 
 - 底层操作对象：AI thread graph（线程版本图和运行关系）；SeaORM / `.libra/libra.db`（配置、refs、reflog、AI/发布元数据等 SQLite 表）；`Index` / `.libra/index`（暂存区状态、路径条目和刷新/保存边界）；`Blob`（文件内容或 LFS pointer 写入对象库后的 blob 对象）；`Tree`（由索引或对象遍历生成的目录树对象）；`LocalStorage`（本地对象或发布存储根目录）；`Storage` / `StorageExt`（对象存储抽象，覆盖本地、remote 和 publish 存储）；`DatabaseConnection`（SeaORM 数据库连接）
-- 输出与错误契约：`execute_safe(args, output)` 在加载 `ThreadGraph` 后，若 `output.is_json()` 则调 `ThreadGraph::to_json()` + `emit_json_data("graph", ...)` 返回结构化输出（agent 路径，免去需要终端的 TUI），否则调用 `run_graph_tui` 启动 ratatui TUI；失败路径仍通过 `CliError`（`command_usage` / `repo_not_found` / `fatal` + `RepoCorrupt` / `io`）返回稳定错误码、用户提示和回归测试。`--json` 是全局 flag（经 `OutputConfig`），非 `GraphArgs` 字段。
+- 输出与错误契约：`execute_safe(args, output)` 在 W5-08 起对非 `--json`/`--machine` 调用先行稳定拒绝（interactive TUI 入口已删除，实时图视图在 Web Code UI）——拒绝发生在 thread UUID 解析与 repo resolve 之前，且 `cli.rs::command_preflight` 对非结构化 graph 调用跳过仓库预检，保证拒绝确定性、与仓库状态无关。结构化调用再解析 thread UUID、resolve repo，加载 `ThreadGraph` 并调 `ThreadGraph::to_json()` + `emit_json_data("graph", ...)` 返回结构化输出（agent 路径）；失败路径仍通过 `CliError`（`command_usage` / `repo_not_found` / `fatal` + `RepoCorrupt`）返回稳定错误码、用户提示和回归测试。`--json` 是全局 flag（经 `OutputConfig`），非 `GraphArgs` 字段。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 
 ## 实现历史
@@ -44,7 +44,7 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/graph.md`。
-- Synopsis：`libra graph <THREAD_UUID> [--repo <PATH>]`。
+- Synopsis：`libra graph --json <THREAD_UUID> [--repo <PATH>]`（W5-08 起仅结构化输出；裸调用拒绝）。
 - 公开参数/子命令包括：`<THREAD_UUID>`、`--repo <PATH>`。
 
 
@@ -53,7 +53,7 @@ flowchart TD
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | 兼容矩阵说明 | Libra AI graph inspection extension, 不是 Git 命令 | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
-| ✅ 已实现 | `--json` / `--machine` 结构化输出 | 全局 `--json`（`OutputConfig`）使 `execute_safe` 在 TUI 之前走 `ThreadGraph::to_json()` + `emit_json_data`。`data` 含线程元数据（`thread_id`/`title`/`freshness`/`thread_version`/`scheduler_version`/`updated_at`/`selected_plan_id`/`active_task_id`/`active_run_id`）与 `nodes` 数组（每个节点 `depth`/`kind`(intent/plan/task/run/patchset 小写)/`id`/`label`/`tags`/`detail`(k-v 对象)/`object`(可空，含 `object_type`/`hash`/`git_object_type`/`summary`)）。`GRAPH_EXAMPLES` 第三行 `libra graph --json <thread-uuid>` 现已兑现。带单元测试（`to_json_serializes_metadata_and_nodes`）。 |
+| ✅ 已实现 | `--json` / `--machine` 结构化输出 | 全局 `--json`（`OutputConfig`）使 `execute_safe` 走 `ThreadGraph::to_json()` + `emit_json_data`。`data` 含线程元数据（`thread_id`/`title`/`freshness`/`thread_version`/`scheduler_version`/`updated_at`/`selected_plan_id`/`active_task_id`/`active_run_id`）与 `nodes` 数组（每个节点 `depth`/`kind`(intent/plan/task/run/patchset 小写)/`id`/`label`/`tags`/`detail`(k-v 对象)/`object`(可空，含 `object_type`/`hash`/`git_object_type`/`summary`)）。`GRAPH_EXAMPLES` 的 `libra graph --json <thread-uuid>` 行现已兑现。带单元测试（`to_json_serializes_metadata_and_nodes`）。 |
 
 ## 维护要求
 

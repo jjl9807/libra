@@ -16,6 +16,21 @@
   `libra code --provider codex --resume <thread_id>` still uses the legacy
   TUI resume driver until W5-06 removes the TUI startup path.
 
+### Removed (plan-20260715 W5-08, 2026-08-16; ships with the W5-09 breaking minor)
+
+- **W5-08 removes the interactive TUI entry of `libra graph` and
+  `libra agent graph`.** Bare `libra graph <THREAD_ID>` /
+  `libra agent graph <session>` now fail with a stable usage error
+  (`LBR-CLI-002`, exit 129) plus a migration hint, refused deterministically
+  before any projection/capture load. The live thread version graph view
+  lives in Web Code UI (`libra code`, delivered in W4-04); the structured
+  `libra graph --json` / `--machine` output and the frozen capture-graph JSON
+  v1 schema of `libra --json agent graph` are unchanged and remain the
+  agent/automation path (W5-09 aggregates the release note for the whole
+  W5-01 family; no version bump here). Migration: open the graph in Web Code
+  UI, or add `--json` / `--machine` to existing `libra graph` /
+  `libra agent graph` invocations.
+
 ### Added (plan-20260715 WIO-03, 2026-08-14, v0.19.158)
 
 - **WIO-03 makes `ObjectReadBudget` object reads cancellable.** Inexact

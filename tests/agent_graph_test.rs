@@ -344,13 +344,20 @@ async fn agent_graph_json_and_machine_non_tty_never_launch_tui() {
 }
 
 #[tokio::test]
-async fn agent_graph_non_tty_without_json_refuses_before_tui() {
+async fn agent_graph_without_json_refuses_with_migration_hint() {
     let fixture = GraphRepo::init().await;
     let output = fixture.run(&["agent", "graph", SESSION_ID]);
     assert_eq!(output.status.code(), Some(129), "{}", describe(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("LBR-CLI-002"));
-    assert!(stderr.contains("--json or --machine"));
+    assert!(
+        stderr.contains("no longer opens an interactive TUI"),
+        "expected the breaking refusal message, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--json") && stderr.contains("--machine"),
+        "expected the migration hint to name --json/--machine, stderr: {stderr}"
+    );
     assert!(!stderr.contains("failed to run agent graph TUI"));
 }
 

@@ -10,7 +10,7 @@ libra code [-p <PORT>] [--host <HOST>]
 libra code --stdio
 libra code --provider <PROVIDER> [--model <MODEL>]
 libra code --resume <THREAD_ID>
-libra graph <THREAD_ID> [--repo <PATH>]
+libra graph --json <THREAD_ID> [--repo <PATH>]
 ```
 
 ## 说明
@@ -21,7 +21,7 @@ libra graph <THREAD_ID> [--repo <PATH>]
 
 沙箱化工具执行层会强制 approval policies，控制 agent 何时可以运行 shell 命令、应用补丁、Web 搜索或执行其他可能破坏性的操作。遗留 TUI（仅限裸 `--provider codex --resume`；W5-06 删除）与 headless Web 在 `dev` 上下文中默认使用 workspace-write 执行且禁止网络访问。执行计划就绪后，Plan review 对话框提供 Execute Plan / Modify Plan / Cancel；选择 Execute 后会再打开独立的强制 network-policy 提示（`Network: Deny` / `Network: Allow` / `Back`），只有该 gate 解决后才会应用网络策略，且两个 gate 都可在崩溃后恢复。Review 和 research 上下文保持只读，且不授予网络访问。
 
-当遗留 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph <thread_id>` 命令。实时版本图在 Web Code UI 中查看；`libra graph --json` 仍是 agent 路径，交互式 TUI 已弃用（W5-08 删除）。检查非当前目录仓库时，使用 `libra graph <thread_id> --repo <path>`。
+当遗留 TUI 退出且 Libra 能推导出规范 thread ID 时，`libra code` 会打印后续 `libra graph --json <thread_id>` 命令。实时版本图在 Web Code UI 中查看；`libra graph --json` 仍是 agent 路径，交互式 graph TUI 入口已在 W5 breaking 发布中删除（W5-08）——因此打印的后续命令始终带 `--json`（紧凑形式可用 `--machine`）。检查非当前目录仓库时，使用 `libra graph --json <thread_id> --repo <path>`。
 
 **Linked worktree**：`libra code`（所有模式）可在 linked worktree 中启动，并走 W4-06 RequestScope resolver。安全相关文件（`sandbox.toml`、`hooks.json`、`config.toml` 的 `[approval]`/`[mcp]`、`rules/`、`contexts/`）以及 extension/automation 表面（`agents.toml`、`automations.toml`、`agents/`、`commands/`、`skills/`）保留仓库默认层。安全 overlay 只能收紧；extension overlay 同名覆盖。不可读或无法解析的安全配置，以及损坏的 worktree scope，均 fail-closed，诊断只报 source layer、不回显文件内容。linked worktree 中 automation 的 VCS dispatch 同样经 resolver 运行——见 [automation.md](automation.md)。已按规范 `libra.repoid` 存储的 Always 审批在同一仓库的 linked worktree 中可见，并保留 worktree/session provenance（仅审计）。Session / 一次性审批绑定发起该次确认的 controller lease；lease takeover / detach / expiry（含 browser/automation 首次从本地 TUI 接手）后不得复用，新 controller 必须重新确认。内存 ApprovalStore cache 以 `repo:{libra.repoid}` 为 key，不再使用进程级 `None` 全局 scope。
 
@@ -360,10 +360,10 @@ libra code --resume 11111111-1111-4111-8111-111111111111
 libra code --provider ollama --resume 11111111-1111-4111-8111-111111111111
 
 # 检查同一线程的版本图
-libra graph 11111111-1111-4111-8111-111111111111
+libra graph --json 11111111-1111-4111-8111-111111111111
 
 # 从该仓库外部检查线程图
-libra graph 11111111-1111-4111-8111-111111111111 --repo /Volumes/Data/linked
+libra graph --json 11111111-1111-4111-8111-111111111111 --repo /Volumes/Data/linked
 
 # 以 code review 上下文和严格 approval 启动
 libra code --context review --approval-policy untrusted

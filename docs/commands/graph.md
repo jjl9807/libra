@@ -5,15 +5,15 @@ Inspect a Libra Code thread version graph.
 ## Synopsis
 
 ```bash
-libra graph <THREAD_ID> [--repo <PATH>]
 libra --json graph <THREAD_ID> [--repo <PATH>]
+libra --machine graph <THREAD_ID> [--repo <PATH>]
 ```
 
 ## Description
 
 The current thread/version graph is shown in Web Code UI (`libra code`). `libra graph` still loads the same projection tables and formal AI history under `.libra/`.
 
-The interactive TUI is **deprecated** (removed in W5-08). Prefer Web Code UI, or `libra graph --json` / `--machine` for agents. The TUI prints a deprecation warning and still works during the W4 bake window.
+**Breaking change (W5-08):** the interactive graph TUI entry was removed in the W5 breaking release. Bare `libra graph <THREAD_ID>` now fails with a usage error plus a migration hint; open the live graph in Web Code UI (`libra code`) instead, or use `libra graph --json` / `--machine` for the structured output, which is unchanged.
 
 The graph is a version chain of:
 
@@ -25,9 +25,7 @@ The graph is a version chain of:
 
 The graph highlights current/latest intent heads, selected plan heads, active tasks/runs, latest runs, and latest patchsets when that projection data is available.
 
-The Details pane shows both the projection links for the selected graph node and the persisted AI object content loaded from history, including a bounded pretty-printed JSON view of the corresponding `intent`, `plan`, `task`, `run`, or `patchset` object.
-
-With the global `--json` (or `--machine`) flag, `libra graph` skips the interactive TUI and instead emits the graph as a structured JSON document — the agent-friendly path, since the TUI requires a terminal. The envelope's `data` carries the thread metadata (`thread_id`, `title`, `freshness`, `thread_version`, `scheduler_version`, `updated_at`, and the `selected_plan_id` / `active_task_id` / `active_run_id` heads) plus optional Code UI overlays folded from the newest matching session workflow log:
+With the global `--json` (or `--machine`) flag, `libra graph` emits the graph as a structured JSON document — the agent-friendly path. The envelope's `data` carries the thread metadata (`thread_id`, `title`, `freshness`, `thread_version`, `scheduler_version`, `updated_at`, and the `selected_plan_id` / `active_task_id` / `active_run_id` heads) plus optional Code UI overlays folded from the newest matching session workflow log:
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -37,11 +35,13 @@ With the global `--json` (or `--machine`) flag, `libra graph` skips the interact
 
 A missing session is non-fatal (overlay fields stay null/zero). An unreadable or malformed session workflow log is a hard error so an indeterminate reconciliation fence cannot be hidden. On first overlay lookup, Libra may run a one-time thread→session index rebuild under `.libra/.../sessions/.thread_index/` (also performed when `libra code` starts); that migration fails closed if any existing session cannot be loaded or indexed. Pending mutating commands without a live owner surface as `indeterminate_side_effect` even before a runtime restart fences them. The payload also includes a `nodes` array; each node has its `depth`, `kind` (`intent` / `plan` / `task` / `run` / `patchset`), `id`, `label`, `tags`, key/value `detail`, and — when the underlying AI object was loaded — an `object` with its `object_type`, `hash`, `git_object_type`, and a `summary` of key fields.
 
-After `libra code` exits, it prints a follow-up command in this form:
+After a legacy `libra code` TUI session exits, it prints a follow-up command in this form:
 
 ```bash
-libra graph 11111111-1111-4111-8111-111111111111
+libra graph --json 11111111-1111-4111-8111-111111111111
 ```
+
+The follow-up always includes `--json` (use `--machine` for the compact form): the bare interactive entry was removed in the W5 breaking release (W5-08) and now fails with a usage error plus a migration hint. For an interactive view, open the thread's graph in Web Code UI instead.
 
 ## Arguments
 
@@ -55,24 +55,14 @@ libra graph 11111111-1111-4111-8111-111111111111
 |--------|-------------|
 | `--repo <PATH>` | Inspect a specific Libra repository instead of discovering one from the current directory. |
 
-## TUI Controls (deprecated)
-
-| Key | Action |
-|-----|--------|
-| Up / Down | Select previous or next graph node. |
-| PageUp / PageDown | Scroll the Details pane by one visible page. |
-| Home / End | Jump to the first or last graph node. |
-| `[` / `]` | Scroll the Details pane by one line. |
-| `q`, Esc, Ctrl-C | Exit the graph TUI. |
-
 ## Common Commands
 
 ```bash
-# Open the version graph for a thread
-libra graph 11111111-1111-4111-8111-111111111111
+# Emit the version graph for a thread as structured JSON
+libra graph --json 11111111-1111-4111-8111-111111111111
 
-# Open the graph for a thread in another working tree
-libra graph 11111111-1111-4111-8111-111111111111 --repo /path/to/repo
+# Emit the graph for a thread in another working tree
+libra graph --json 11111111-1111-4111-8111-111111111111 --repo /path/to/repo
 
 # Resume the same thread in Code after inspection
 libra code --resume 11111111-1111-4111-8111-111111111111
@@ -80,7 +70,7 @@ libra code --resume 11111111-1111-4111-8111-111111111111
 
 ## Output
 
-By default `libra graph` is an interactive TUI command that does not produce line-oriented stdout — run it from an interactive terminal. With the global `--json` (or `--machine`) flag it instead skips the TUI and writes the graph as a single structured JSON document to stdout (the envelope described under *Description*), so it can run headless in agent/automation contexts. In both modes the command exits with a usage error if the thread ID is not a UUID, and with a repository/projection error if neither the current directory nor `--repo` resolves to a Libra repository, or if the requested thread cannot be found.
+`libra graph` requires the global `--json` (or `--machine`) flag: without it the command exits with a usage error and a migration hint (the interactive TUI entry was removed in the W5 breaking release; the live graph view is in Web Code UI). With `--json`/`--machine` it writes the graph as a single structured JSON document to stdout (the envelope described under *Description*), so it can run headless in agent/automation contexts. The command exits with a usage error if the thread ID is not a UUID, and with a repository/projection error if neither the current directory nor `--repo` resolves to a Libra repository, or if the requested thread cannot be found.
 
 ## Design Notes
 

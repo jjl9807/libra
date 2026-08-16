@@ -2067,15 +2067,17 @@ legacy writer barrier、不执行 generation-0 adoption。任一 companion 行
 
 ## 捕获数据只读图（DR-07 / M6）
 
-`libra agent graph <session>` 已落地为 capture 表之上的只读投影，与顶层
-`libra graph <thread-uuid>` 的 orchestrator thread 投影严格分离。实现只复用 ratatui
-终端外壳、GitHub Dark 主题和双 pane 布局；不 import `ProjectionResolver`、
-`ThreadBundle`、`ai_index_*`，也不合成 `thread_id`。`--repo` 在 root command preflight
-阶段即决定目标 storage，因此可从仓库外安全查看另一仓库。普通交互模式要求 stdin/stdout
-均为 TTY；全局 `--json` 与 `--machine` 在 TUI 初始化前进入相同 machine 分支。
+`libra --json agent graph <session>` 已落地为 capture 表之上的只读投影，与顶层
+`libra graph --json <thread-uuid>` 的 orchestrator thread 投影严格分离；不 import
+`ProjectionResolver`、`ThreadBundle`、`ai_index_*`，也不合成 `thread_id`。**W5-08 起
+interactive ratatui 双 pane TUI 入口已删除**：裸 `libra agent graph <session>` 在解析
+session 与 resolve repo 之前即以 usage error + 迁移 hint 稳定拒绝（`cli.rs::command_preflight`
+对非结构化 graph 调用跳过仓库预检）；全局 `--json` 与 `--machine` 是唯一输出路径，
+schema v1 冻结不变。`--repo` 在 root command preflight 阶段决定目标 storage（结构化调用），
+因此可从仓库外安全查看另一仓库。
 
-读取列采用固定 allowlist：session 只读 id/kind/state/time，checkpoint 只读结构 id、parent、
-scope、time，coverage 只读 logical key/schema/completeness/revision/checkpoint/channel/time，
+读取列采用固定 allowlist：session 只读 id/kind/state/time，checkpoint 只读结构
+`checkpoint_id` 与 `created_at`，coverage 只读 logical key/schema/completeness/revision/checkpoint/channel/time，
 subagent 只读 link state 与结构外键，tombstone 只读 `erased_session_id`。禁止读取
 `working_dir`、`metadata_json`、description、redaction report、coverage digest、对象 OID
 内容或 transcript blob。整个查询在一致的 SQLite 只读事务中完成，不取得 lease，不调用

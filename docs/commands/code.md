@@ -10,7 +10,7 @@ libra code [-p <PORT>] [--host <HOST>]
 libra code --stdio
 libra code --provider <PROVIDER> [--model <MODEL>]
 libra code --resume <THREAD_ID>
-libra graph <THREAD_ID> [--repo <PATH>]
+libra graph --json <THREAD_ID> [--repo <PATH>]
 ```
 
 ## Description
@@ -21,7 +21,7 @@ The command supports eight AI provider backends (Gemini, OpenAI, Anthropic, Deep
 
 A sandboxed tool-execution layer enforces approval policies that control when the agent can run shell commands, apply patches, web search, or perform other potentially destructive operations. Legacy TUI (bare `--provider codex --resume` only; removed in W5-06) and headless Web sessions in the `dev` context default to workspace-write execution with network access denied. After the execution plan is ready, the Plan review dialog offers Execute Plan / Modify Plan / Cancel. Choosing Execute opens a separate mandatory network-policy prompt (`Network: Deny` / `Network: Allow` / `Back`); the choice is applied only after that gate resolves, and both gates are durable across crash/resume. Review and research contexts remain read-only and do not grant network access.
 
-When the legacy TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph <thread_id>` command. The live version graph is in Web Code UI; `libra graph --json` remains the agent path, and the interactive TUI is deprecated (removed in W5-08). Use `libra graph <thread_id> --repo <path>` when inspecting a repository other than the current directory.
+When the legacy TUI exits and Libra can derive the canonical thread ID, `libra code` prints a follow-up `libra graph --json <thread_id>` command. The live version graph is in Web Code UI; `libra graph --json` remains the agent path, and the interactive graph TUI entry was removed in the W5 breaking release (W5-08) — the printed follow-up therefore always includes `--json` (use `--machine` for the compact form). Use `libra graph --json <thread_id> --repo <path>` when inspecting a repository other than the current directory.
 
 **Linked worktrees**: `libra code` (every mode) launches from a linked worktree through the W4-06 RequestScope resolver. Security-sensitive files (`sandbox.toml`, `hooks.json`, `config.toml` `[approval]`/`[mcp]`, `rules/`, `contexts/`) and extension/automation surfaces (`agents.toml`, `automations.toml`, `agents/`, `commands/`, `skills/`) keep repository defaults visible. Security overlays may only tighten; extension overlays win on the same name. Unreadable or malformed security config, or a damaged worktree scope, fails closed with a source-layer diagnostic (no file contents). Automation VCS dispatch runs in linked worktrees via the same resolver — see [automation.md](automation.md). Always approvals stored under the canonical `libra.repoid` stay visible across linked worktrees with worktree/session provenance (audit only). Session and one-time approvals stay bound to the issuing controller lease and are dropped on lease takeover, detach, or expiry — including the first remote attach that replaces local TUI control; a new controller must reconfirm. The in-memory approval cache is keyed by `repo:{libra.repoid}` — never a process-global `None` scope.
 
@@ -396,10 +396,10 @@ libra code --resume 11111111-1111-4111-8111-111111111111
 libra code --provider ollama --resume 11111111-1111-4111-8111-111111111111
 
 # Inspect the same thread's version graph
-libra graph 11111111-1111-4111-8111-111111111111
+libra graph --json 11111111-1111-4111-8111-111111111111
 
 # Inspect a thread graph from outside that repository
-libra graph 11111111-1111-4111-8111-111111111111 --repo /Volumes/Data/linked
+libra graph --json 11111111-1111-4111-8111-111111111111 --repo /Volumes/Data/linked
 
 # Start in code review context with strict approval
 libra code --context review --approval-policy untrusted

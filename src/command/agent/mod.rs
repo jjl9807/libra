@@ -83,8 +83,8 @@ EXAMPLES:
     libra agent list --json                         Capability matrix as JSON (stable schema for automation)
     libra agent list --schema-version 2 --json      Capability matrix with transcript import/export methods
     libra agent import --session <id> --agent claude-code --yes  Import one historical transcript after consent
-    libra agent graph <session>                    Browse captured turns, revisions, and subagent links
     libra --json agent graph <session>             Capture graph as frozen JSON schema v1
+    libra --machine agent graph <session>          Capture graph as compact machine-readable JSON
     libra agent add claude-code                     Enable Claude Code capture and install its hooks (alias of enable)
     libra agent add                                 Enable every supported agent
     libra agent remove claude-code                  Disable Claude Code capture and uninstall its hooks (alias of disable)
@@ -133,8 +133,10 @@ pub enum AgentSubcommand {
     #[command(about = "Import historical external-agent transcripts")]
     Import(import::ImportArgs),
 
-    /// Browse the read-only turn/revision graph for a captured session.
-    #[command(about = "Browse a captured agent session graph")]
+    /// Inspect the read-only turn/revision graph for a captured session
+    /// (`--json` / `--machine` output; the interactive TUI entry was removed
+    /// in the W5 breaking release).
+    #[command(about = "Inspect a captured agent session graph (JSON/machine output)")]
     Graph(graph::GraphArgs),
 
     /// Enable an external Agent and install its hooks.

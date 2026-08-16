@@ -1308,7 +1308,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 **验收标准**：
 
 - [x] `--resume <THREAD_UUID>` 只在 TUI 允许，错误路径有测试。
-- [x] TUI exit 时能打印/记录后续 `libra graph <thread_id>` 的入口，远程 repo 场景说明 `--repo <path>`。
+- [x] TUI exit 时能打印/记录后续 `libra graph <thread_id>` 的入口，远程 repo 场景说明 `--repo <path>`（**W5-08 更新**：interactive graph TUI 入口已删除，handoff 现打印 `libra graph --json <thread_id>`，`--repo` 语义不变）。
 - [x] Session JSONL reader 可跳过未知 event、恢复 truncated tail。
 - [x] Projection bundle identity 优先于临时 session id。
 - [x] Runtime audit sink 记录 local-tui-control 事件，不把 audit 当作 user-facing transcript。

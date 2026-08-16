@@ -3951,8 +3951,11 @@ async fn run_tui_with_managed_code_runtime(
 /// Formats the post-exit "inspect this thread graph" handoff line printed
 /// when the TUI leaves and Libra could derive a canonical thread id.
 ///
-/// The bare `libra graph <thread_id>` form discovers the repository from the
-/// current directory. When the code session ran against a different repository
+/// The emitted command always includes `--json`: the interactive `libra
+/// graph` TUI entry was removed in the W5 breaking release (W5-08), so the
+/// structured form is the only one that runs. The `libra graph --json
+/// <thread_id>` form discovers the repository from the current directory.
+/// When the code session ran against a different repository
 /// (`--repo`/`--cwd`, or simply launched from elsewhere), that discovery would
 /// resolve the wrong repo, so the hint appends `--repo <path>` pointing at the
 /// session's working directory — matching the remote-repo guidance in
@@ -3991,11 +3994,11 @@ fn format_graph_handoff_hint(
     };
     if needs_repo_hint {
         format!(
-            "Inspect this thread graph with: libra graph {thread_id} --repo {}",
+            "Inspect this thread graph with: libra graph --json {thread_id} --repo {}",
             shell_quote_for_display(&session_working_dir.display().to_string())
         )
     } else {
-        format!("Inspect this thread graph with: libra graph {thread_id}")
+        format!("Inspect this thread graph with: libra graph --json {thread_id}")
     }
 }
 
@@ -6403,9 +6406,11 @@ mod tests {
         );
     }
 
-    /// C5: the post-exit graph handoff prints a bare `libra graph <thread_id>`
-    /// when the session ran against the current directory (graph discovers the
-    /// repo from cwd), so no `--repo` suffix is needed.
+    /// C5: the post-exit graph handoff prints `libra graph --json
+    /// <thread_id>` when the session ran against the current directory (graph
+    /// discovers the repo from cwd), so no `--repo` suffix is needed. The
+    /// `--json` flag is required: the interactive `libra graph` TUI entry was
+    /// removed in the W5 breaking release (W5-08).
     #[test]
     fn graph_handoff_hint_omits_repo_for_current_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6413,7 +6418,7 @@ mod tests {
         let hint = format_graph_handoff_hint(thread_id, dir.path(), Some(dir.path()));
         assert_eq!(
             hint,
-            format!("Inspect this thread graph with: libra graph {thread_id}")
+            format!("Inspect this thread graph with: libra graph --json {thread_id}")
         );
         assert!(
             !hint.contains("--repo"),
@@ -6423,7 +6428,7 @@ mod tests {
 
     /// C5: when the code session ran against a repository other than the
     /// current directory (`--repo`/`--cwd`), the handoff appends
-    /// `--repo <path>` so `libra graph` resolves the same repository — matching
+    /// `--repo <path>` so `libra graph --json` resolves the same repository — matching
     /// the remote-repo guidance in `docs/commands/code.md`.
     #[test]
     fn graph_handoff_hint_appends_repo_for_remote_repository() {
@@ -6434,7 +6439,7 @@ mod tests {
         assert_eq!(
             hint,
             format!(
-                "Inspect this thread graph with: libra graph {thread_id} --repo {}",
+                "Inspect this thread graph with: libra graph --json {thread_id} --repo {}",
                 session_dir.path().display()
             )
         );

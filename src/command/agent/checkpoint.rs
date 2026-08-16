@@ -1565,9 +1565,8 @@ fn load_checkpoint_transcript_bytes(
 }
 
 /// Read a bounded checkpoint transcript using an already-resolved repository
-/// storage path. The graph TUI uses this read-only helper for its content
-/// preview; keeping the object traversal here ensures graph and checkpoint
-/// export agree on the E4-libra manifest/chunk rules.
+/// storage path. Keeping the object traversal here ensures checkpoint
+/// preview/export paths agree on the E4-libra manifest/chunk rules.
 pub(super) fn load_checkpoint_transcript_bytes_from_storage(
     storage: &Path,
     checkpoint_id: &str,

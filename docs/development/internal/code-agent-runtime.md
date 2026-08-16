@@ -172,7 +172,7 @@
 - `libra code --web` / `--web-only` 不保留兼容期；默认 Web 切换时同步删除或立即拒绝。
 - `libra code --stdio` / `--mcp-stdio` 从 `code` 命令移出；独立 MCP 命令的 CLI / docs / tests 曾由 `mcp.md`（历史拆分计划，已删除）跟踪；当前边界见 `docs/development/tracing/code.md` C6。
 - Browser/automation 写控制只允许 loopback + controller token；非 loopback 仍 fail closed。
-- `libra graph` 终端命令删除；thread/version graph 迁入 Web Code UI。
+- `libra graph` interactive TUI 入口删除（W5-08 已落地）；thread/version graph 实时视图在 Web Code UI；`--json`/`--machine` 结构化 surface 永久保留（产品决策记录）。
 - `src/internal/tui/*` 不再是任何 agent/session 行为的唯一实现位置。
 
 ## 非目标
@@ -1253,7 +1253,7 @@ rg -n "SubAgentDispatcher|run_tool_loop_with_history_and_observer|ToolLoopConfig
 - goal、usage、skill、task 等 slash command 效果仍由 TUI 私有 handler 承载（部分已通过 `CodeUiCommandAdapter` 暴露默认 "not supported"）。
 - Web headless path 已有 submit/streaming/approval/user-input/cancel/patchset/session persistence 的部分能力 + 复用 `ProviderFactory` + `ToolRuntimeContext`，**但仍调用 `default_tui_runtime_context` 且未完整加载 skills/hooks/profiles/SourcePool**，不能作为最终核心 runtime。
 - `TuiCodeUiAdapter`/`TuiControlCommand` 仍是 Web write 进入 TUI App 的桥；reclaim 语义仍存在。
-- `src/command/graph.rs` 仍是独立 ratatui/crossterm graph 命令。
+- `src/command/graph.rs` 曾直接依赖 ratatui/crossterm；**W5-08 已删除 interactive TUI 入口并移除渲染器**，仅余 `--json`/`--machine` 结构化输出（依赖摘除归 W5-10）。
 - `src/internal/ai/agent/runtime/` 已提供 `ChatAgent` / `run_tool_loop*` / `SubAgentDispatcher` 等可复用的中立执行原语；`intentspec/` / `goal/` / `runtime/phase*.rs` 已有部分 workflow 合同。
 - **dagrs 的实际位置（2026-06-17 复核，勿误判）：** `rg -ln "dagrs::|use dagrs" src/internal/ai/` 显示 dagrs 实际仅在 **2 文件**中使用：`orchestrator/executor.rs`（`execute_dag`/`build_dagrs_graph`/`TaskDagrsAction`）和 `node_adapter.rs`（`AgentAction`/`ToolLoopAction` 把 agent/tool-loop 包成 `dagrs::Action`）。`runtime/phase1.rs`、`task_executors.rs` 中只是**注释**提到 dagrs。`runtime/mod.rs` 仅 `pub mod phase0..4` + 类型 re-export，**不是** dagrs 执行器。结论：dagrs 驱动的是**多 agent 执行 DAG**，不是 Intent/Plan/Validation 的 phase 推进。（注：原版本声称 dagrs 在 orchestrator/ 的 9 个文件中使用，经 2026-06-17 复核不正确——实际仅 `executor.rs` + `node_adapter.rs`。）
 - **交互 plan workflow 现状：** 在 `tui/app.rs` 是 `pending_intent_review: Option<PendingIntentReview>` / `pending_plan_revision: Option<String>` 字段 + `handle_intent_review_choice` / `handle_post_plan_choice` 等 async 方法（约 `app.rs:523-525`、`5884`、`6377`），**字段散落、非 dagrs、非单一 enum**。AG-03 的中立化目标即把它收敛成 worker 持有的序列化 typed 状态机。
@@ -1907,14 +1907,14 @@ fn web_build_required_test() {
   - 单节点 detail 响应体上限 256 KiB（与现有写路径 body limit 对齐），超限截断并标记 `truncated: true`。
   - Graph 节点数上限 10,000，超限返回 `GRAPH_TOO_LARGE` 错误并提示过滤。
 - Web UI 增加 Graph 视图，覆盖 DAG/tree、children/list、detail、状态、搜索/过滤、loading/empty/error。
-- 删除 `libra graph` CLI surface、docs、help/compat 注册和 ratatui renderer。
+- 删除 `libra graph` interactive TUI 入口与 ratatui renderer（**W5-08 已落地**：裸调用以 usage error + 迁移 hint 拒绝）；`--json`/`--machine` 结构化 CLI surface、help/compat 注册与文档保留（产品决策记录：agent/自动化路径永久保留）。
 
 验收：
 
 - `GET /api/code/graph` 能返回当前 thread graph。
 - Web Graph view 能展示 intent、plan、task、run、patchset 节点及状态。
 - Graph view 可键盘操作；颜色不是唯一状态表达。
-- `rg -n "libra graph|GraphArgs|GRAPH_EXAMPLES|run_graph_tui|render_graph|Inspect this thread graph" src docs tests README.md` 无结果，本计划除外。
+- `! rg -n "run_graph_tui|render_graph" src`（生产源码零命中为通过——interactive renderer 已删除，W5-08；守卫限定 `src` 避免文档自匹配）；`libra graph` 的 `--json`/`--machine` 结构化 surface（`GraphArgs`、`GRAPH_EXAMPLES`、结构化文档与测试）**保留**，不在本守卫范围内（产品决策记录：agent/自动化路径永久保留）。
 
 ### Phase 10: 替换 PTY harness
 
@@ -1972,18 +1972,18 @@ fn web_build_required_test() {
 - `docs/commands/code.md` synopsis 只保留 Web usage。
 - README 只描述 Web interactive + separate MCP command。
 - `docs/commands/code-control.md` 从 local TUI 改为 local Code UI automation control。
-- 删除或重定向 `docs/commands/graph.md`。
+- `docs/commands/graph.md` 改写为 JSON/machine-only（**W5-08 已落地**：interactive 入口删除、裸调用拒绝、结构化输出保留）。
 - 更新 `COMPATIBILITY.md`、`docs/error-codes.md`、`docs/commands/README.md`。
 - 旧 local TUI automation 独立文档在错误码 source-of-truth 和引用迁完后删除；删除后以 `docs/commands/code.md` 承接用户可见控制面说明。
 
 验收：
 
 ```bash
-rg -n "libra code.*TUI|TUI Mode \\(Default\\)|Local TUI Automation|libra code --stdio|libra code --web|libra code --web-only|libra graph|--web-only.*without the TUI" README.md docs/commands docs/development/commands tests
+rg -n "libra code.*TUI|TUI Mode \\(Default\\)|Local TUI Automation|libra code --stdio|libra code --web|libra code --web-only|--web-only.*without the TUI" README.md docs/commands docs/development/commands tests
 cargo test --test compat_matrix_alignment
 ```
 
-允许本计划保留历史迁移说明。
+允许本计划保留历史迁移说明。注：`libra graph` 已从上述守卫移除——interactive TUI 入口由 W5-08 删除并另有 refusal 回归覆盖，而 `--json`/`--machine` 结构化 surface 的文档/测试引用为合法保留项；守卫若再含裸 `libra graph` 会误伤保留面。
 
 ### Phase 13: Dynamic Workflow 编排层（与主迁移并行）
 
@@ -3049,10 +3049,10 @@ Reasoning / thinking（推理 / 思考）支持是通过 provider 的 transform 
 - Web UI 覆盖 message submit、streaming、intent/plan review、tool approval、request_user_input、cancel、resume、goal、usage、skills、multi-agent dispatch。
 - AgentRuntime 具备可测试 harness：normalized model event stream（Completion + Codex 归一）、serialized turn queue、序列化 typed turn/interaction 状态机、dagrs-backed 执行 DAG（task/sub-agent fan-out）、runtime event cursor（snapshot = fold(events)）、append-only replay、projection builder、tool scheduler gate、command service、被持有的 `CodeAgentServices`。
 - Web Graph view 覆盖 thread graph 的 DAG/list/detail/status/history thread。
-- `libra graph` 命令、docs、help、CLI 注册和 TUI renderer 均已删除。
+- `libra graph` 的 interactive TUI 入口与 TUI renderer 已删除（W5-08）；`--json`/`--machine` 结构化命令、docs、help、CLI 注册保留（产品决策记录）。
 - PTY/TUI harness 已被 Web process + HTTP/SSE harness 替换。
 - `src/command/code.rs` 不引用 TUI runtime（仅保留为历史迁移说明）。
-- 用户文档不再描述 `libra code` 支持 TUI，也不推荐 `--web-only` 或 `libra graph`。
+- 用户文档不再描述 `libra code` 支持 TUI，也不推荐 `--web-only` 或裸 `libra graph` 交互入口（`libra graph --json`/`--machine` 结构化用法保留）。
 - `docs/development/web-only.md` 不存在；仓库内不得再出现指向旧 `docs/development/web-only.md` 或旧 `docs/development/agent.md` 的 Markdown 链接。
 - TUI `App` 在 Gate 6 后不应存在于任何生产路径；若测试仍需最小 TUI 桩（仅用于验证 AgentRuntime 的 backward compatibility），必须显式标注为 `#[cfg(test)]` 且仅做渲染/输入委托，不拥有 plan/goal/workflow 状态机。
 - 所有 must-migrate 行为在种子清单中都有对应的中立实现与回归测试。
