@@ -1153,7 +1153,7 @@ async fn code_events_handler(
             let hub = state.workflow_hub.clone().ok_or_else(|| WebApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "WIRE_V2_REQUIRES_DURABLE_SESSION".to_string(),
-                message: "SSE wire v2 requires a durable Code UI session store (use --web/--web-only with session persistence)".to_string(),
+                message: "SSE wire v2 requires a durable Code UI session store (use the default Web launch with session persistence)".to_string(),
                 retry_after_secs: None,
             })?;
             let redactor = state.secret_redactor.clone();

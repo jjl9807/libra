@@ -745,10 +745,11 @@ pub fn build_session_options(file: &CaseFile, case: &Case) -> CodeSessionOptions
                 let provider_lower = provider_value.to_ascii_lowercase();
                 options = options
                     .with_live_provider(provider_value.clone(), model_value)
-                    .with_env_file(env_path)
-                    // Live model matrix still needs `--env-file`, which
-                    // Web-only CLI validation rejects until W3-13 parity.
-                    .with_pty_tui();
+                    .with_env_file(env_path);
+                // W5-07: the legacy-TUI rollback env is gone, so live cases
+                // ride the default Web launch; W3-13 parity makes `--env-file`
+                // accepted there for non-Codex providers (managed Codex keeps
+                // its own credential surface and rejects `--env-file`).
                 // Wave 11 Codex pass-2 fix: §5.19 specifies the
                 // DeepSeek live invocation runs with thinking
                 // mode + high reasoning effort

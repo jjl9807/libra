@@ -23,8 +23,8 @@
 //!
 //! | Mode | Flag | Description |
 //! |------|------|-------------|
-//! | **Web** (default) | *(none)* / `--web` / `--web-only` | Headless web server + MCP; prints URL/control info and waits |
-//! | **Legacy TUI** | `LIBRA_CODE_LEGACY_TUI=1` | Terminal UI rollback (hidden; removed in W5-07) |
+//! | **Web** (default) | *(none)* | Headless web server + MCP; prints URL/control info and waits |
+//! | **Legacy TUI** | bare `--provider codex --resume` | Terminal UI resume driver (hidden; removed in W5-06) |
 //! | **Stdio** | `--stdio` | MCP server over stdin/stdout for AI client integration |
 //!
 //! ## Provider Dispatch
@@ -260,12 +260,13 @@ pub enum ControlMode {
 /// [`ensure_loopback_browser_control_host`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, Default)]
 pub enum BrowserControlMode {
-    /// Browser controllers cannot attach. Default for legacy TUI sessions
-    /// (`LIBRA_CODE_LEGACY_TUI=1`) and for explicit `--browser-control off`.
+    /// Browser controllers cannot attach. Default for the legacy TUI resume
+    /// driver (bare `--provider codex --resume`) and for explicit
+    /// `--browser-control off`.
     #[default]
     Off,
     /// Browser controllers may attach as long as the bound `--host` is
-    /// loopback. Default for the Web Code UI launch (default / `--web*`).
+    /// loopback. Default for the Web Code UI launch (the default mode).
     Loopback,
 }
 
@@ -437,8 +438,8 @@ impl From<CodeApprovalPolicy> for AskForApproval {
 /// `--help` examples shown in `libra code --help` output.
 ///
 /// `code` launches the interactive Libra Code session in one of three
-/// modes: Web Code UI (the default; `--web` / `--web-only` are deprecated
-/// aliases), hidden legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`), or stdio.
+/// modes: Web Code UI (the default), the legacy TUI resume driver
+/// (bare `--provider codex --resume` only; removed in W5-06), or stdio.
 /// The banner pins the most common invocations (Web default, provider
 /// selection, `--browser-control loopback`, `--control write`, resume,
 /// plan mode, and `--env-file`) so users see the right entry point
@@ -449,9 +450,6 @@ EXAMPLES:
     libra code                                       Launch the default Web Code UI (browser write lease on)
     libra code --provider deepseek --model deepseek-reasoner
                                                      Pick a provider/model at startup
-    libra code --web                                 Deprecated alias; same as default Web
-    libra code --web-only --provider ollama --port 4400
-                                                     Deprecated alias; Web UI against a local Ollama
     libra code --host 0.0.0.0 --browser-control off  Bind all interfaces observe-only / remote notice
     libra code --control write                       Enable local automation write control (token + controller checks)
     libra code --control stdio                       Drive write-control session via control.json discovery
@@ -464,17 +462,12 @@ EXAMPLES:
 
 /// Command-line arguments for `libra code`.
 ///
-/// This struct is parsed by `clap` and drives all three operating modes
-/// (TUI, web-only, stdio). Many flags are mode-specific and validated
-/// at runtime by [`validate_mode_args`].
+/// This struct is parsed by `clap` and drives the operating modes
+/// (Web default, legacy TUI resume driver, stdio). Many flags are
+/// mode-specific and validated at runtime by [`validate_mode_args`].
 #[derive(Parser, Debug)]
 #[command(after_help = CODE_EXAMPLES)]
 pub struct CodeArgs {
-    /// Deprecated alias for the default Web Code UI (W4 bake window; removed in W5-07).
-    /// Alias: `--web`.
-    #[arg(long, alias = "web", conflicts_with = "stdio")]
-    pub web_only: bool,
-
     /// Port to listen on (web server)
     #[arg(short, long, default_value_t = DEFAULT_WEB_PORT)]
     pub port: u16,
@@ -508,8 +501,8 @@ pub struct CodeArgs {
     /// Browser write-control posture (`off` | `loopback`).
     ///
     /// Defaults are mode-specific:
-    /// - Web launch (default or `--web`/`--web-only`) → `loopback`
-    /// - Legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`) → `off`
+    /// - Web launch (the default) → `loopback`
+    /// - Legacy TUI resume driver (bare `--provider codex --resume`) → `off`
     ///
     /// Selecting `loopback` is rejected when `--host` is not a loopback
     /// address, and the flag is incompatible with `--stdio`. Use
@@ -629,7 +622,7 @@ pub struct CodeArgs {
     /// Deprecated MCP-only legacy stdio transport (tools/resources; not turn control).
     /// Prefer `libra code --control stdio` for automation; a dedicated
     /// `libra mcp --stdio` is planned after W5 (DEFER-02).
-    #[arg(long, alias = "mcp-stdio", conflicts_with = "web_only")]
+    #[arg(long, alias = "mcp-stdio")]
     pub stdio: bool,
 
     /// Provider API base URL.
@@ -708,40 +701,18 @@ pub(crate) fn effective_plan_mode(args: &CodeArgs) -> bool {
 // Top-level entry point — mode dispatch
 // ---------------------------------------------------------------------------
 
-/// Hidden W4 bake-window rollback: force the legacy terminal TUI instead of
-/// the default Web Code UI. Not a public compatibility surface; removed in W5-07.
-pub(crate) const LIBRA_CODE_LEGACY_TUI_ENV: &str = "LIBRA_CODE_LEGACY_TUI";
-
-fn legacy_tui_enabled() -> bool {
-    matches!(
-        std::env::var(LIBRA_CODE_LEGACY_TUI_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
-    )
-}
-
 /// Managed Codex Web has no Libra `--resume` protocol yet. Preserve the
 /// pre-W4 TUI resume driver for bare `libra code --provider codex --resume …`
 /// so existing sessions remain recoverable after the Web default cutover.
-/// Explicit `--web` / `--web-only` stay fail-closed for this combination.
+/// W5-06 removes this driver together with the Code TUI startup path.
 fn codex_resume_uses_legacy_tui(args: &CodeArgs) -> bool {
-    !args.stdio
-        && !args.web_only
-        && !legacy_tui_enabled()
-        && matches!(args.provider, CodeProvider::Codex)
-        && args.resume.is_some()
+    !args.stdio && matches!(args.provider, CodeProvider::Codex) && args.resume.is_some()
 }
 
-/// True when this invocation runs the Web Code UI path (default or deprecated
-/// `--web`/`--web-only`), as opposed to `--stdio`, hidden legacy TUI, or the
-/// Codex `--resume` TUI compatibility path.
+/// True when this invocation runs the Web Code UI path (the default), as
+/// opposed to `--stdio` or the Codex `--resume` TUI compatibility path.
 fn code_uses_web_launch(args: &CodeArgs) -> bool {
-    !args.stdio && !codex_resume_uses_legacy_tui(args) && (args.web_only || !legacy_tui_enabled())
-}
-
-fn warn_deprecated_web_alias() {
-    eprintln!(
-        "warning: `--web` / `--web-only` is deprecated; `libra code` already defaults to the Web Code UI (remove the flag; rollback via {LIBRA_CODE_LEGACY_TUI_ENV}=1 until W5-07)"
-    );
+    !args.stdio && !codex_resume_uses_legacy_tui(args)
 }
 
 /// Stderr pin for W4-03: MCP `--stdio` is legacy tools/resources only (C6), not
@@ -757,8 +728,8 @@ fn warn_deprecated_mcp_stdio() {
 /// Validates CLI flag combinations, then dispatches to:
 /// - `--control stdio`: JSON-RPC NDJSON automation client (no Web/TUI/MCP)
 /// - `--stdio`: MCP over stdin/stdout
-/// - default / `--web` / `--web-only`: Web Code UI + AgentRuntime
-/// - `LIBRA_CODE_LEGACY_TUI=1` without `--web*`: legacy terminal TUI (hidden rollback)
+/// - default: Web Code UI + AgentRuntime
+/// - bare `--provider codex --resume`: legacy TUI resume driver (hidden; W5-06 removes it)
 ///
 /// # Side Effects
 /// - May start local web, MCP, and Codex app-server processes depending on mode.
@@ -828,16 +799,11 @@ pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     if args.stdio {
         execute_stdio(&args).await
     } else if code_uses_web_launch(&args) {
-        if args.web_only {
-            warn_deprecated_web_alias();
-        }
         execute_web_only(&args).await
     } else {
-        if codex_resume_uses_legacy_tui(&args) {
-            eprintln!(
-                "note: `--provider codex --resume` uses the legacy TUI resume driver until managed Codex Web resume lands (explicit `--web`/`--web-only` still reject this combination)"
-            );
-        }
+        eprintln!(
+            "note: `--provider codex --resume` uses the legacy TUI resume driver until managed Codex Web resume lands"
+        );
         execute_tui(args).await
     }
 }
@@ -1171,7 +1137,7 @@ async fn shutdown_code_lifecycle(
 // Mode: Web-only — headless web + MCP servers (no TUI)
 // ---------------------------------------------------------------------------
 
-/// Which Code UI runtime a `--web-only` invocation dispatches to, decided
+/// Which Code UI runtime the default Web launch dispatches to, decided
 /// purely from the selected provider.
 ///
 /// This is the single source of truth for the provider branch in
@@ -1710,7 +1676,7 @@ pub fn resolve_default_web_provider_env_key(
 ) -> CliResult<Option<String>> {
     if !code_uses_web_launch(args) {
         return Err(CliError::failure(
-            "expected default Web Code UI launch (unset LIBRA_CODE_LEGACY_TUI; do not use --stdio)"
+            "expected default Web Code UI launch (not reachable with --stdio or bare --provider codex --resume)"
                 .to_string(),
         ));
     }
@@ -2683,8 +2649,8 @@ fn ensure_loopback_browser_control_host(host: &str) -> CliResult<()> {
 ///
 /// User-supplied `--browser-control` always wins. When the flag is omitted
 /// the default is mode-aware:
-///   - Web launch (default or `--web*`) → `loopback` (interactive browser writes)
-///   - Legacy TUI (`LIBRA_CODE_LEGACY_TUI=1`) → `off`
+///   - Web launch (the default) → `loopback` (interactive browser writes)
+///   - Legacy TUI resume driver (bare `--provider codex --resume`) → `off`
 ///
 /// `loopback` further requires that `--host` is a loopback address; this is
 /// validated up-front so we fail closed before any port is bound. Non-loopback
@@ -2754,9 +2720,9 @@ struct HeadlessApprovalChannels {
     exec_approval_rx: mpsc::UnboundedReceiver<ExecApprovalRequest>,
 }
 
-/// Bootstraps the `SessionState` for a `--web-only` non-Codex headless run.
+/// Bootstraps the `SessionState` for a default Web non-Codex headless run.
 ///
-/// `--web-only --resume <thread_id>` reaches this same load-or-create path for
+/// Default Web `--resume <thread_id>` reaches this same load-or-create path for
 /// non-Codex providers. The restored state is then folded with the bounded
 /// Code UI workflow suffix before the browser server starts. Managed Codex
 /// keeps its separate app-server session protocol and remains rejected by the
@@ -3048,7 +3014,7 @@ pub(crate) async fn attach_indexed_thread_graph(
     crate::command::graph::attach_indexed_thread_graph_at(&storage_root, snapshot).await
 }
 
-/// Build a headless Code UI runtime for `--web-only` non-Codex providers.
+/// Build a headless Code UI runtime for the default Web launch with non-Codex providers.
 ///
 /// Constructs a minimal local-read-only [`ToolRegistry`] and a
 /// [`HeadlessCodeRuntime`] lifecycle host, then mounts the production
@@ -3298,7 +3264,7 @@ fn build_headless_tool_registry(
 ///
 /// v0 now routes several non-Codex providers through the same provider-factory
 /// bootstrap used by TUI. This keeps API-key/base-URL resolution centralized and
-/// ensures `--web-only` behavior stays aligned with existing provider construction.
+/// ensures the Web launch stays aligned with existing provider construction.
 ///
 /// The placeholder path is still available for providers that are not in this
 /// dispatch arm or fail during bootstrap for other reasons.
@@ -3407,7 +3373,7 @@ async fn build_placeholder_web_code_ui_runtime(
         kind: CodeUiTranscriptEntryKind::InfoNote,
         title: Some("Web Control Unavailable".to_string()),
         content: Some(
-            "The interactive web runtime for this provider could not be started; showing a read-only view. Retry, or launch `libra code` without `--web-only` to drive the live terminal session directly."
+            "The interactive web runtime for this provider could not be started; showing a read-only view. Retry, or use a provider with a supported headless runtime to drive the live session directly."
                 .to_string(),
         ),
         status: Some("completed".to_string()),
@@ -5558,13 +5524,13 @@ async fn execute_stdio(args: &CodeArgs) -> CliResult<()> {
 // CLI argument validation
 // ---------------------------------------------------------------------------
 
-/// Validates CLI flag combinations across all three operating modes.
+/// Validates CLI flag combinations across the operating modes.
 ///
 /// Enforces constraints such as:
 /// - Web and MCP ports must differ (except in stdio mode).
 /// - `--stdio` (MCP transport) rejects provider/model/api-base/temperature and
 ///   the provider-specific tuning flags — it has no provider surface.
-/// - `--web`/`--web-only` relaxes provider/model/api-base/temperature, the
+/// - The default Web launch relaxes provider/model/api-base/temperature, the
 ///   provider-specific tuning flags, `--resume` (non-Codex), `--env-file`,
 ///   `--context`, `--approval-policy`, and `--approval-ttl` so they feed the
 ///   headless web runtime. It still rejects `--network-access allow` until the
@@ -5611,29 +5577,22 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
     }
 
     if code_uses_web_launch(args) {
-        // Web launch (default or deprecated --web/--web-only): relax
-        // provider/model/api-base/temperature and the provider-specific tuning
-        // flags (they feed the headless web runtime and still pass through the
-        // cross-provider match gate below).
-        reject_non_tui_flags(args, "--web", true)?;
-        if args.provider == CodeProvider::Codex && args.resume.is_some() {
-            return Err(
-                "--resume is not supported with --web/--web-only and --provider=codex; remove --resume, omit the deprecated --web alias (bare `libra code --provider codex --resume` still uses the legacy TUI resume driver), or use a non-Codex headless provider"
-                    .to_string(),
-            );
-        }
+        // Web launch (the default): relax provider/model/api-base/temperature
+        // and the provider-specific tuning flags (they feed the headless web
+        // runtime and still pass through the cross-provider match gate below).
+        reject_non_tui_flags(args, "the Web Code UI", true)?;
         // Managed Codex web owns its own credential/approval surface; these
         // TUI/headless flags are accepted for non-Codex web but must not be
         // silently ignored under Codex.
         if args.provider == CodeProvider::Codex && args.env_file.is_some() {
             return Err(
-                "--env-file is not supported with --web and --provider=codex; remove --env-file or use a non-Codex headless provider"
+                "--env-file is not supported with the Web Code UI and --provider=codex; remove --env-file or use a non-Codex headless provider"
                     .to_string(),
             );
         }
         if args.provider == CodeProvider::Codex && args.approval_ttl.is_some() {
             return Err(
-                "--approval-ttl is not supported with --web and --provider=codex; remove --approval-ttl or use a non-Codex headless provider"
+                "--approval-ttl is not supported with the Web Code UI and --provider=codex; remove --approval-ttl or use a non-Codex headless provider"
                     .to_string(),
             );
         }
@@ -5645,12 +5604,6 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         if args.stdio {
             return Err(
                 "`libra code --stdio` is the deprecated MCP-only legacy transport (tools/resources; not turn control); use `libra code --control stdio` for the JSON-RPC automation client (a dedicated `libra mcp --stdio` is planned after W5)"
-                    .to_string(),
-            );
-        }
-        if args.web_only {
-            return Err(
-                "`--web`/`--web-only` cannot be combined with `--control stdio` (client-only; no Web launch)"
                     .to_string(),
             );
         }
@@ -5695,9 +5648,9 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
                     .to_string(),
             );
         }
-        // web_only = false: --stdio is the MCP transport with no provider
-        // surface, so it stays fully locked on provider/model/api-base and the
-        // provider-specific flags.
+        // --stdio is the MCP transport with no provider surface, so it stays
+        // fully locked on provider/model/api-base and the provider-specific
+        // flags (web_launch = false below).
         reject_non_tui_flags(args, "--stdio", false)?;
         reject_mode_flag(args.host != DEFAULT_BIND_HOST, "--host", "--stdio")?;
         reject_mode_flag(args.port != DEFAULT_WEB_PORT, "--port", "--stdio")?;
@@ -5835,19 +5788,20 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 
 /// Rejects TUI-specific flags that are invalid in a non-TUI mode.
 ///
-/// Two non-TUI modes reach this helper — `--web`/`--web-only` and `--stdio` —
-/// and they receive DIFFERENT relaxations (plan.md Task C2). The `web_only`
-/// argument selects which set applies; `--stdio` passes `web_only = false`.
+/// Two non-TUI modes reach this helper — the default Web launch and `--stdio`
+/// (plus the client-only `--control stdio` shim) — and they receive DIFFERENT
+/// relaxations (plan.md Task C2). The `web_launch` argument selects which set
+/// applies; `--stdio` and `--control stdio` pass `web_launch = false`.
 ///
 /// * `--stdio` is the deprecated MCP-only legacy transport and has no provider / model / browser
 ///   surface, so it stays fully locked: `--provider != gemini`, `--model`,
 ///   `--api-base`, `--temperature`, and every provider-specific tuning flag are
 ///   rejected here.
-/// * `--web`/`--web-only` drives the headless web runtime, which DOES consume
+/// * The default Web launch drives the headless web runtime, which DOES consume
 ///   `--provider` (all seven providers plus the Codex branch), `--model`,
 ///   `--api-base`, `--temperature`, and the provider-specific tuning flags via
 ///   `build_any_completion_model_for_args` / the headless config factory. Under
-///   web-only those are therefore NOT blanket-rejected here as "TUI-only"; they
+///   the Web launch those are therefore NOT blanket-rejected here as "TUI-only"; they
 ///   flow through to the cross-provider match gate in `validate_mode_args`,
 ///   which still rejects a provider-specific flag that does not match the
 ///   selected provider and still rejects `--api-base` under `--provider=codex`.
@@ -5858,19 +5812,19 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 /// `--network-access allow`.
 /// MCP `--stdio` also rejects it (no Plan UI).
 /// W3-13: `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl`
-/// are accepted under Web-only (same semantics as TUI) and remain rejected for
+/// are accepted under the Web launch (same semantics as TUI) and remain rejected for
 /// MCP `--stdio`.
 /// `--resume` is accepted only for the non-Codex Web headless path; it remains
 /// rejected for MCP stdio and managed Codex, which do not share that session
 /// protocol.
-fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(), String> {
+fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_launch: bool) -> Result<(), String> {
     // Provider / model / api-base / temperature and the provider-specific tuning
-    // flags feed the headless web runtime, so they are relaxed under web-only and
-    // rejected only under stdio. Under web-only they still pass through the
-    // cross-provider match gate and the Codex `--api-base` rejection in
-    // `validate_mode_args` (invoked after this helper), so mismatched flags and
-    // `--api-base` under Codex are still rejected there.
-    if !web_only {
+    // flags feed the headless web runtime, so they are relaxed under the Web
+    // launch and rejected only under stdio. Under the Web launch they still
+    // pass through the cross-provider match gate and the Codex `--api-base`
+    // rejection in `validate_mode_args` (invoked after this helper), so
+    // mismatched flags and `--api-base` under Codex are still rejected there.
+    if !web_launch {
         reject_mode_flag(args.provider != CodeProvider::Gemini, "--provider", mode)?;
         reject_mode_flag(args.model.is_some(), "--model", mode)?;
         reject_mode_flag(args.temperature.is_some(), "--temperature", mode)?;
@@ -5905,7 +5859,7 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(
     // let slash-direct tool turns use the network before Plan Allow/Deny.
     if args.network_access != CodeNetworkAccess::Deny {
         return Err(format!(
-            "--network-access allow is not supported with {mode} yet: Web/MCP must not grant sandbox network ahead of the Plan network-policy gate. Omit the flag (default deny), approve network in Plan review, or use LIBRA_CODE_LEGACY_TUI=1 for the legacy TUI flag path"
+            "--network-access allow is not supported with {mode} yet: Web/MCP must not grant sandbox network ahead of the Plan network-policy gate. Omit the flag (default deny) or approve network in Plan review"
         ));
     }
     Ok(())
@@ -5931,7 +5885,6 @@ mod tests {
 
     use axum::{Json, Router, extract::Request, routing::post};
     use serde_json::{Value, json};
-    use serial_test::serial;
     use tokio::{
         net::TcpListener,
         sync::{Mutex as AsyncMutex, mpsc::unbounded_channel},
@@ -6023,7 +5976,6 @@ mod tests {
 
     fn base_args() -> CodeArgs {
         CodeArgs {
-            web_only: false,
             port: DEFAULT_WEB_PORT,
             host: DEFAULT_BIND_HOST.to_string(),
             cwd: None,
@@ -6177,34 +6129,25 @@ mod tests {
     }
 
     /// W1-06: the non-Codex headless runtime has a durable JSONL projection
-    /// fold, so its CLI surface must make `--web-only --resume` reachable.
-    /// Managed Codex uses a separate app-server session protocol and remains
-    /// explicitly rejected below.
+    /// fold, so its CLI surface must make `--resume` reachable on the default
+    /// Web launch. Managed Codex `--resume` never reaches Web validation — it
+    /// dispatches to the legacy TUI resume driver (pinned by
+    /// `bare_codex_resume_uses_legacy_tui_not_web_launch`).
     #[test]
-    fn accepts_resume_in_non_codex_web_mode_and_rejects_managed_codex() {
+    fn accepts_resume_in_non_codex_web_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Ollama;
         args.resume = Some("thread-id".to_string());
         assert!(
             validate_mode_args(&args, &OutputConfig::default()).is_ok(),
             "the generic headless Web runtime must make its resume implementation reachable"
         );
-
-        args.provider = CodeProvider::Codex;
-        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
-        assert!(
-            err.contains("--resume") && err.contains("--web") && err.contains("codex"),
-            "managed Codex resume rejection must name the flag, mode, and provider; got: {err}"
-        );
     }
 
     /// W4-01: bare `libra code --provider codex --resume` must keep the
     /// pre-cutover TUI resume driver (managed Codex Web has no Libra resume).
     #[test]
-    #[serial(libra_code_legacy_tui)]
     fn bare_codex_resume_uses_legacy_tui_not_web_launch() {
-        let _unset = crate::utils::test::ScopedEnvVar::unset(super::LIBRA_CODE_LEGACY_TUI_ENV);
         let args = CodeArgs::try_parse_from([
             "libra",
             "--provider",
@@ -6214,12 +6157,8 @@ mod tests {
         ])
         .expect("parse bare codex resume");
         assert!(
-            !args.web_only,
-            "bare resume must not force the deprecated --web-only flag"
-        );
-        assert!(
             codex_resume_uses_legacy_tui(&args),
-            "Codex resume without --web* must select the legacy TUI resume driver"
+            "Codex resume must select the legacy TUI resume driver"
         );
         assert!(
             !code_uses_web_launch(&args),
@@ -6234,22 +6173,20 @@ mod tests {
     #[test]
     fn rejects_env_file_and_approval_ttl_for_managed_codex_web() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Codex;
         args.env_file = Some(PathBuf::from(".env.test"));
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
-            err.contains("--env-file") && err.contains("--web") && err.contains("codex"),
+            err.contains("--env-file") && err.contains("Web Code UI") && err.contains("codex"),
             "managed Codex must fail-closed on --env-file; got: {err}"
         );
 
         let mut ttl_args = base_args();
-        ttl_args.web_only = true;
         ttl_args.provider = CodeProvider::Codex;
         ttl_args.approval_ttl = Some(42);
         let err = validate_mode_args(&ttl_args, &OutputConfig::default()).unwrap_err();
         assert!(
-            err.contains("--approval-ttl") && err.contains("--web") && err.contains("codex"),
+            err.contains("--approval-ttl") && err.contains("Web Code UI") && err.contains("codex"),
             "managed Codex must fail-closed on --approval-ttl; got: {err}"
         );
     }
@@ -6287,7 +6224,6 @@ mod tests {
             .expect("persist headless session");
 
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Ollama;
         args.resume = Some("headless-thread".to_string());
         let restored =
@@ -6607,7 +6543,6 @@ mod tests {
         ];
         for provider in providers {
             let mut args = base_args();
-            args.web_only = true;
             args.provider = provider;
             assert!(
                 validate_mode_args(&args, &OutputConfig::default()).is_ok(),
@@ -6621,7 +6556,6 @@ mod tests {
     #[test]
     fn accepts_model_api_base_and_temperature_in_web_only_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Ollama;
         args.model = Some("llama3".to_string());
         args.api_base = Some("http://127.0.0.1:11434/v1".to_string());
@@ -6634,7 +6568,6 @@ mod tests {
     #[test]
     fn accepts_matching_provider_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Ollama;
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -6646,7 +6579,6 @@ mod tests {
     #[test]
     fn accepts_matching_deepseek_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Deepseek;
         args.deepseek_thinking = Some(DeepSeekThinkingArg::Enabled);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -6655,37 +6587,29 @@ mod tests {
     #[test]
     fn accepts_matching_kimi_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Kimi;
         args.kimi_thinking = Some(KimiThinkingArg::Enabled);
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
 
     /// C2 (P1, codex review): `--temperature` reaches the headless runtime after
-    /// the web-only relaxation, so its 0.0–2.0 contract is enforced
+    /// the web relaxation, so its 0.0–2.0 contract is enforced
     /// mode-independently. Out-of-range and non-finite values are rejected.
     #[test]
     fn rejects_out_of_range_temperature() {
-        for (mode_web_only, bad) in [
-            (true, 2.5_f64),
-            (true, -0.1),
-            (true, f64::NAN),
-            (false, 3.0),
-        ] {
+        for bad in [2.5_f64, -0.1, f64::NAN, 3.0] {
             let mut args = base_args();
-            args.web_only = mode_web_only;
             args.provider = CodeProvider::Ollama;
             args.temperature = Some(bad);
             let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
             assert!(
                 err.contains("--temperature"),
-                "temperature {bad} (web_only={mode_web_only}) must be rejected; got: {err}"
+                "temperature {bad} must be rejected; got: {err}"
             );
         }
         // Boundary values are accepted.
         for good in [0.0_f64, 2.0, 1.0] {
             let mut args = base_args();
-            args.web_only = true;
             args.provider = CodeProvider::Ollama;
             args.temperature = Some(good);
             assert!(
@@ -6701,7 +6625,6 @@ mod tests {
     #[test]
     fn rejects_mismatched_provider_flag_in_web_only_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Deepseek;
         args.ollama_thinking = Some(OllamaThinkingArg::High);
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
@@ -6715,7 +6638,6 @@ mod tests {
     #[test]
     fn rejects_api_base_under_codex_in_web_only_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.provider = CodeProvider::Codex;
         args.api_base = Some("http://127.0.0.1:8080".to_string());
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
@@ -6725,12 +6647,11 @@ mod tests {
         );
     }
 
-    /// W3-13: `--env-file` / `--approval-ttl` are accepted under web-only;
+    /// W3-13: `--env-file` / `--approval-ttl` are accepted under the Web launch;
     /// `--network-access allow` stays rejected until Plan owns sandbox network.
     #[test]
     fn accepts_env_file_and_approval_ttl_in_web_only_mode_but_rejects_network_allow() {
         let mut env_file_args = base_args();
-        env_file_args.web_only = true;
         env_file_args.env_file = Some(PathBuf::from(".env.test"));
         assert!(
             validate_mode_args(&env_file_args, &OutputConfig::default()).is_ok(),
@@ -6738,7 +6659,6 @@ mod tests {
         );
 
         let mut ttl_args = base_args();
-        ttl_args.web_only = true;
         ttl_args.approval_ttl = Some(42);
         assert!(
             validate_mode_args(&ttl_args, &OutputConfig::default()).is_ok(),
@@ -6746,7 +6666,6 @@ mod tests {
         );
 
         let mut net_args = base_args();
-        net_args.web_only = true;
         net_args.network_access = CodeNetworkAccess::Allow;
         let err = validate_mode_args(&net_args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -6815,21 +6734,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_control_write_in_default_web_mode() {
-        let args = CodeArgs::try_parse_from(["libra", "--web", "--control", "write"]).unwrap();
-
-        assert!(args.web_only);
-        assert_eq!(args.control, ControlMode::Write);
-        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
-    }
-
-    #[test]
-    #[serial(libra_code_legacy_tui)]
     fn browser_control_resolution_matrix_pins_mode_provider_and_host_contract() {
         #[derive(Copy, Clone)]
         struct BrowserControlCase {
             name: &'static str,
-            web_only: bool,
             provider: CodeProvider,
             explicit: Option<BrowserControlMode>,
             host: &'static str,
@@ -6839,7 +6747,6 @@ mod tests {
         let cases = [
             BrowserControlCase {
                 name: "default web non-codex defaults to loopback on loopback host",
-                web_only: false,
                 provider: CodeProvider::Gemini,
                 explicit: None,
                 host: "127.0.0.1",
@@ -6847,7 +6754,6 @@ mod tests {
             },
             BrowserControlCase {
                 name: "default web non-codex default loopback rejects non-loopback host",
-                web_only: false,
                 provider: CodeProvider::Gemini,
                 explicit: None,
                 host: "0.0.0.0",
@@ -6855,7 +6761,6 @@ mod tests {
             },
             BrowserControlCase {
                 name: "default web explicit off allows non-loopback host",
-                web_only: false,
                 provider: CodeProvider::Gemini,
                 explicit: Some(BrowserControlMode::Off),
                 host: "0.0.0.0",
@@ -6863,7 +6768,6 @@ mod tests {
             },
             BrowserControlCase {
                 name: "default web explicit loopback allows loopback host",
-                web_only: false,
                 provider: CodeProvider::Gemini,
                 explicit: Some(BrowserControlMode::Loopback),
                 host: "127.0.0.1",
@@ -6871,71 +6775,55 @@ mod tests {
             },
             BrowserControlCase {
                 name: "default web explicit loopback rejects non-loopback host",
-                web_only: false,
                 provider: CodeProvider::Gemini,
                 explicit: Some(BrowserControlMode::Loopback),
                 host: "0.0.0.0",
                 expected: Err("loopback"),
             },
             BrowserControlCase {
-                name: "default web (no --web-only) codex defaults to loopback on loopback host",
-                web_only: false,
-                provider: CodeProvider::Codex,
-                explicit: None,
-                host: "localhost",
-                expected: Ok(BrowserControlMode::Loopback),
-            },
-            BrowserControlCase {
-                name: "non-codex web-only defaults to loopback on loopback host",
-                web_only: true,
+                name: "non-codex web defaults to loopback on loopback host",
                 provider: CodeProvider::Ollama,
                 explicit: None,
                 host: "127.0.0.1",
                 expected: Ok(BrowserControlMode::Loopback),
             },
             BrowserControlCase {
-                name: "non-codex web-only default loopback rejects non-loopback host",
-                web_only: true,
+                name: "non-codex web default loopback rejects non-loopback host",
                 provider: CodeProvider::Ollama,
                 explicit: None,
                 host: "0.0.0.0",
                 expected: Err("loopback"),
             },
             BrowserControlCase {
-                name: "non-codex web-only explicit loopback rejects non-loopback host",
-                web_only: true,
+                name: "non-codex web explicit loopback rejects non-loopback host",
                 provider: CodeProvider::Ollama,
                 explicit: Some(BrowserControlMode::Loopback),
                 host: "0.0.0.0",
                 expected: Err("loopback"),
             },
             BrowserControlCase {
-                name: "codex web-only defaults to loopback on loopback host",
-                web_only: true,
+                name: "codex web defaults to loopback on loopback host",
                 provider: CodeProvider::Codex,
                 explicit: None,
                 host: "localhost",
                 expected: Ok(BrowserControlMode::Loopback),
             },
             BrowserControlCase {
-                name: "codex web-only default loopback rejects non-loopback host",
-                web_only: true,
+                name: "codex web default loopback rejects non-loopback host",
                 provider: CodeProvider::Codex,
                 explicit: None,
                 host: "0.0.0.0",
                 expected: Err("loopback"),
             },
             BrowserControlCase {
-                name: "codex web-only explicit off allows non-loopback host",
-                web_only: true,
+                name: "codex web explicit off allows non-loopback host",
                 provider: CodeProvider::Codex,
                 explicit: Some(BrowserControlMode::Off),
                 host: "0.0.0.0",
                 expected: Ok(BrowserControlMode::Off),
             },
             BrowserControlCase {
-                name: "codex web-only explicit loopback allows ipv6 loopback host",
-                web_only: true,
+                name: "codex web explicit loopback allows ipv6 loopback host",
                 provider: CodeProvider::Codex,
                 explicit: Some(BrowserControlMode::Loopback),
                 host: "::1",
@@ -6944,10 +6832,7 @@ mod tests {
         ];
 
         for case in cases {
-            let _unset_legacy =
-                crate::utils::test::ScopedEnvVar::unset(super::LIBRA_CODE_LEGACY_TUI_ENV);
             let mut args = base_args();
-            args.web_only = case.web_only;
             args.provider = case.provider;
             args.browser_control = case.explicit;
             args.host = case.host.to_string();
@@ -7070,7 +6955,6 @@ mod tests {
     #[test]
     fn accepts_env_file_in_web_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.env_file = Some(PathBuf::from(".env.test"));
 
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -7079,7 +6963,6 @@ mod tests {
     #[test]
     fn accepts_approval_ttl_in_web_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.approval_ttl = Some(42);
 
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
@@ -7192,20 +7075,32 @@ mod tests {
         assert_eq!(value.as_deref(), Some("file-key"));
     }
 
+    /// The legacy TUI resume driver (bare `--provider codex --resume`) is the
+    /// only remaining entry that accepts `--network-access allow`; W5-06
+    /// removes that driver together with the Code TUI startup path.
     #[test]
-    #[serial(libra_code_legacy_tui)]
     fn accepts_network_access_cli_arg_in_legacy_tui_mode() {
-        let _legacy = crate::utils::test::ScopedEnvVar::set(super::LIBRA_CODE_LEGACY_TUI_ENV, "1");
-        let args = CodeArgs::try_parse_from(["libra", "--network-access", "allow"]).unwrap();
+        let args = CodeArgs::try_parse_from([
+            "libra",
+            "--provider",
+            "codex",
+            "--resume",
+            "11111111-1111-4111-8111-111111111111",
+            "--network-access",
+            "allow",
+        ])
+        .unwrap();
 
         assert_eq!(args.network_access, CodeNetworkAccess::Allow);
+        assert!(
+            codex_resume_uses_legacy_tui(&args),
+            "codex+resume must select the legacy TUI driver (the network-access accept path)"
+        );
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
     }
 
     #[test]
-    #[serial(libra_code_legacy_tui)]
     fn rejects_network_access_on_default_web_launch() {
-        let _unset = crate::utils::test::ScopedEnvVar::unset(super::LIBRA_CODE_LEGACY_TUI_ENV);
         let args = CodeArgs::try_parse_from(["libra", "--network-access", "allow"]).unwrap();
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
@@ -7377,7 +7272,6 @@ no_cache_unknown_network = true
     #[test]
     fn rejects_network_access_flag_in_web_mode() {
         let mut args = base_args();
-        args.web_only = true;
         args.network_access = CodeNetworkAccess::Allow;
 
         let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
@@ -8542,13 +8436,11 @@ no_cache_unknown_network = true
         server.abort();
     }
 
-    /// W4-01: default `libra code` (no `--web-only`) must load `--env-file`
-    /// through the same `execute_web_only` bootstrap chain and send the
-    /// env-file credential on the wire — not a competing process-env value.
+    /// W4-01: default `libra code` must load `--env-file` through the same
+    /// `execute_web_only` bootstrap chain and send the env-file credential on
+    /// the wire — not a competing process-env value.
     #[tokio::test]
-    #[serial(libra_code_legacy_tui)]
     async fn default_web_execute_path_sends_env_file_credential_on_wire() {
-        let _unset = crate::utils::test::ScopedEnvVar::unset(super::LIBRA_CODE_LEGACY_TUI_ENV);
         let _process = crate::utils::test::ScopedEnvVar::set("OPENAI_API_KEY", "from-process-env");
 
         let (base_url, captured, auths, server) = start_chat_completions_stub_with_auth().await;
@@ -8569,8 +8461,7 @@ no_cache_unknown_network = true
             "--model",
             "gpt-test",
         ])
-        .expect("default Web must accept --env-file without --web-only");
-        assert!(!args.web_only);
+        .expect("default Web must accept --env-file");
         assert!(
             code_uses_web_launch(&args),
             "bare libra code must select the Web Code UI launch path"

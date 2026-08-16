@@ -704,7 +704,7 @@ enum Commands {
     #[command(about = "Manage read-only Cloudflare Worker publishing")]
     Publish(command::publish::PublishArgs),
 
-    #[command(about = "Start Libra Code interactive TUI (with background web server)")]
+    #[command(about = "Launch an interactive AI coding session (Web Code UI default)")]
     Code(command::code::CodeArgs),
     #[command(about = "Manage AI automation rules and history")]
     Automation(command::automation::AutomationArgs),
@@ -2316,6 +2316,7 @@ fn classify_parse_error(argv: &[std::ffi::OsString], err: &clap::Error) -> CliEr
 
     let (message, usage, mut hints) = parse_error_components(err);
     hints.extend(removed_code_claudecode_hints(argv));
+    hints.extend(crate::utils::error::removed_code_web_alias_hints(argv));
     let mut cli_error = if find_subcommand_index(argv).is_some() {
         match err.kind() {
             ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => CliError::parse_usage(message),

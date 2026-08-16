@@ -4,7 +4,7 @@
 //! projection cache used by the HTTP/SSE surface; commands are admitted,
 //! responded to, and cancelled by the serialized runtime worker.
 //!
-//! For `--web-only` non-Codex launches, optional [`WebCodeUiAdmission`] supplies
+//! For default Web non-Codex launches, optional [`WebCodeUiAdmission`] supplies
 //! persist-before-gate transcript semantics and plan-vs-explicit routing while
 //! this adapter remains the mounted [`CodeUiCommandAdapter`] write-path owner.
 

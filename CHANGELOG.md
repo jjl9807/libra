@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Removed (plan-20260715 W5-07, 2026-08-16; ships with the W5-09 breaking minor)
+
+- **W5-07 removes the deprecated `--web` / `--web-only` aliases and the
+  hidden `LIBRA_CODE_LEGACY_TUI` rollback switch from `libra code`.** The
+  Web Code UI has been the default since W4-01; the old flags now fail with
+  a clap usage error plus a migration hint pointing at plain `libra code`,
+  and the environment variable no longer changes any behavior. The
+  bake-period rollback capability ends with this change (W5-09 aggregates
+  the release note for the whole W5-01 family; no version bump here).
+  Migration: drop `--web` / `--web-only` and unset `LIBRA_CODE_LEGACY_TUI`;
+  plain `libra code` already opens the Web Code UI. Bare
+  `libra code --provider codex --resume <thread_id>` still uses the legacy
+  TUI resume driver until W5-06 removes the TUI startup path.
+
 ### Added (plan-20260715 WIO-03, 2026-08-14, v0.19.158)
 
 - **WIO-03 makes `ObjectReadBudget` object reads cancellable.** Inexact

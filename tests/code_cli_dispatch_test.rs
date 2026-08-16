@@ -8,8 +8,10 @@
 //!
 //! What this file covers (P0 set):
 //!
-//! * `--web --stdio` mutual exclusion error.
-//! * `--web` (alias for `--web-only`) parses to the same flag.
+//! * W5-07: `--web` / `--web-only` were removed — the binary rejects them
+//!   with clap's unexpected-argument usage error plus a migration hint, and
+//!   the removed hidden legacy-TUI rollback env no longer changes the
+//!   default Web launch (spawns the real binary).
 //! * `--mcp-port 0` is accepted (kernel-assigned port, used by the
 //!   PTY harness).
 //! * `--port 0` likewise.
@@ -30,49 +32,14 @@ use std::path::PathBuf;
 use clap::Parser;
 use libra::command::code::{CodeArgs, CodeContext, CodeNetworkAccess, CodeProvider, ControlMode};
 
-/// Helper: parse `argv0 + args` with a fixed binary name. Strip the
-/// `--web`/`--stdio` from the spelling caller passed since clap
-/// expects the binary name as `argv[0]`.
+/// Helper: parse `argv0 + args` with a fixed binary name. clap expects the
+/// binary name as `argv[0]`, so prepend one to the caller's spelling.
 fn parse(args: &[&str]) -> Result<CodeArgs, clap::Error> {
     let mut full: Vec<String> = vec!["code".to_string()];
     for arg in args {
         full.push((*arg).to_string());
     }
     CodeArgs::try_parse_from(full)
-}
-
-#[test]
-fn web_only_and_stdio_are_mutually_exclusive() {
-    let error = parse(&["--web-only", "--stdio"]).expect_err("clap must reject the combination");
-    let rendered = error.to_string();
-    // clap formats this as "argument '--stdio' cannot be used with '--web-only'".
-    // We assert on both flag names instead of the exact phrasing so a
-    // future clap upgrade doesn't break the test.
-    assert!(
-        rendered.contains("--stdio") && rendered.contains("--web-only"),
-        "expected mutual-exclusion error to mention both flags; got: {rendered}",
-    );
-}
-
-#[test]
-fn web_alias_resolves_to_web_only() {
-    let parsed = parse(&["--web"]).expect("--web is a documented alias");
-    assert!(
-        parsed.web_only,
-        "--web must set web_only=true (alias for --web-only)",
-    );
-    assert!(!parsed.stdio, "--web must NOT enable stdio mode");
-}
-
-#[test]
-fn web_and_stdio_are_mutually_exclusive_via_alias() {
-    // Same conflict but exercised through the `--web` alias.
-    let error = parse(&["--web", "--stdio"]).expect_err("alias must inherit conflicts_with");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("--stdio"),
-        "expected --stdio in error: {rendered}"
-    );
 }
 
 #[test]
@@ -129,8 +96,8 @@ fn browser_control_loopback_conflicts_with_stdio() {
 }
 
 #[test]
-fn web_only_with_non_gemini_provider_parses() {
-    // C2 (GAP-1): `--web-only --provider <non-gemini>` must parse cleanly at the
+fn default_web_with_non_gemini_provider_parses() {
+    // C2 (GAP-1): default-Web `--provider <non-gemini>` must parse cleanly at the
     // CLI layer; the previous web-only rejection lived in `validate_mode_args`,
     // not the parser, and is now relaxed (verified in code.rs unit tests).
     for provider in [
@@ -142,19 +109,17 @@ fn web_only_with_non_gemini_provider_parses() {
         "zhipu",
         "ollama",
     ] {
-        let parsed = parse(&["--web-only", "--provider", provider])
-            .unwrap_or_else(|e| panic!("--web-only --provider {provider} must parse: {e}"));
-        assert!(parsed.web_only);
+        let parsed = parse(&["--provider", provider])
+            .unwrap_or_else(|e| panic!("default Web --provider {provider} must parse: {e}"));
         assert_ne!(parsed.provider, CodeProvider::Gemini);
     }
 }
 
 #[test]
-fn web_only_with_provider_tuning_flags_parse() {
+fn default_web_with_provider_tuning_flags_parse() {
     // C2 (GAP-3): the provider-tuning flags the headless runtime consumes must
-    // reach `CodeArgs` under `--web-only`.
+    // reach `CodeArgs` on the default Web launch.
     let parsed = parse(&[
-        "--web-only",
         "--provider",
         "ollama",
         "--model",
@@ -166,8 +131,7 @@ fn web_only_with_provider_tuning_flags_parse() {
         "--ollama-thinking",
         "high",
     ])
-    .expect("--web-only provider-tuning flags must parse");
-    assert!(parsed.web_only);
+    .expect("default Web provider-tuning flags must parse");
     assert_eq!(parsed.provider, CodeProvider::Ollama);
     assert_eq!(parsed.model.as_deref(), Some("llama3"));
     assert_eq!(
@@ -179,11 +143,10 @@ fn web_only_with_provider_tuning_flags_parse() {
 }
 
 #[test]
-fn web_only_env_file_context_and_approval_flags_parse() {
-    // W3-13: public TUI flags that feed headless bootstrap must parse under
-    // `--web-only` (mode validation is covered in `code.rs` unit tests).
+fn default_web_env_file_context_and_approval_flags_parse() {
+    // W3-13: public TUI flags that feed headless bootstrap must parse on the
+    // default Web launch (mode validation is covered in `code.rs` unit tests).
     let parsed = parse(&[
-        "--web-only",
         "--env-file",
         "/tmp/.env.web-test",
         "--context",
@@ -193,8 +156,7 @@ fn web_only_env_file_context_and_approval_flags_parse() {
         "--approval-ttl",
         "42",
     ])
-    .expect("--web-only must parse env-file/context/approval flags");
-    assert!(parsed.web_only);
+    .expect("default Web must parse env-file/context/approval flags");
     assert_eq!(
         parsed.env_file.as_deref(),
         Some(std::path::Path::new("/tmp/.env.web-test"))
@@ -296,7 +258,7 @@ async fn default_port_conflict_fails_fast() {
     drop(holder);
 }
 
-/// W4-01: default `libra code` (no `--web-only`) prints a Web URL, stays
+/// W4-01: default `libra code` prints a Web URL, stays
 /// resident without a TTY, and exits cleanly on SIGTERM (ports released).
 #[cfg(unix)]
 #[tokio::test]
@@ -739,4 +701,92 @@ async fn code_control_command_removed() {
 
     let _ = shutdown_tx.send(());
     let _ = server.await;
+}
+
+/// W5-07: the deprecated `--web` / `--web-only` aliases and the hidden
+/// legacy-TUI rollback env are removed. The old flags must fail with clap's
+/// unexpected-argument usage error plus a migration hint pointing at the
+/// default Web Code UI, and the env var must no longer switch `libra code`
+/// off the Web launch path.
+#[tokio::test]
+async fn web_alias_and_legacy_tui_env_removed() {
+    use std::process::Command;
+
+    let libra_bin = env!("CARGO_BIN_EXE_libra");
+
+    // (a) Removed aliases: usage error + migration hint.
+    for flag in ["--web", "--web-only"] {
+        let probe_dir = tempfile::tempdir().expect("tempdir for removed-alias probe");
+        let rejected = Command::new(libra_bin)
+            .args(["code", flag])
+            .current_dir(probe_dir.path())
+            .output()
+            .expect("run removed-alias probe");
+        assert!(
+            !rejected.status.success(),
+            "removed alias {flag} must exit non-zero"
+        );
+        let diag = format!(
+            "{}{}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(
+            diag.contains("unexpected argument"),
+            "{flag} must surface clap's unexpected-argument error; got:\n{diag}"
+        );
+        assert!(
+            diag.contains("already defaults to the Web Code UI"),
+            "{flag} must surface the W5-07 migration hint; got:\n{diag}"
+        );
+    }
+
+    // (b) The removed rollback env no longer reaches the legacy TUI: with the
+    // variable set, `code --provider codex --env-file …` must still hit the
+    // Web-mode managed-Codex rejection instead of booting a TUI.
+    let temp = tempfile::tempdir().expect("tempdir for legacy-env probe");
+    let home_dir = temp.path().join(".home");
+    let config_home = home_dir.join(".config");
+    std::fs::create_dir_all(&config_home).expect("isolated HOME");
+    let init = Command::new(libra_bin)
+        .args(["init"])
+        .current_dir(temp.path())
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .output()
+        .expect("libra init");
+    assert!(init.status.success(), "libra init failed");
+    let env_path = temp.path().join(".env.w5-07");
+    std::fs::write(&env_path, "OPENAI_API_KEY=from-env-file\n").expect("write env file");
+
+    let rejected = Command::new(libra_bin)
+        .args([
+            "code",
+            "--provider",
+            "codex",
+            "--env-file",
+            env_path.to_str().expect("utf8 path"),
+        ])
+        .current_dir(temp.path())
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .env("LIBRA_CODE_LEGACY_TUI", "1")
+        .output()
+        .expect("run legacy-env probe");
+    assert!(
+        !rejected.status.success(),
+        "codex + --env-file must remain a Web-mode rejection"
+    );
+    let diag = format!(
+        "{}{}",
+        String::from_utf8_lossy(&rejected.stdout),
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        diag.contains("Web Code UI") && diag.contains("--provider=codex"),
+        "the removed env var must not switch to the legacy TUI; expected the Web-mode \
+         codex/--env-file rejection, got:\n{diag}"
+    );
 }

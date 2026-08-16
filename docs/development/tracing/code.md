@@ -8,7 +8,7 @@
 
 ## 命令实现目标
 
-`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）；`--web` / `--web-only` 是 W4 烘焙窗口的弃用别名（即使 `LIBRA_CODE_LEGACY_TUI=1` 也会强制 Web）；隐藏 `LIBRA_CODE_LEGACY_TUI=1` 仅在未带这些别名时紧急回滚旧 TUI（W5-07 删除）。裸 `libra code --provider codex --resume <thread_id>` 在烘焙期内仍走遗留 TUI resume driver（managed `--web-only --provider codex` 继续拒绝 `--resume`）。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
+`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）。W5-07 已删除 W4 烘焙窗口的弃用别名 `--web` / `--web-only` 与隐藏回滚环境变量 `LIBRA_CODE_LEGACY_TUI`：旧 flag 现在以 clap unexpected-argument usage error + 迁移提示被拒绝，env 不再切换模式。裸 `libra code --provider codex --resume <thread_id>` 仍走遗留 TUI resume driver（managed Web `--provider codex` 继续拒绝 `--resume`），W5-06 将其与 TUI 启动路径一并删除。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
 
 ## 对比 Git 与兼容性
 
@@ -18,12 +18,12 @@
 ## 当前源码事实
 
 - 入口与分发：`src/cli.rs::Commands` 公开接入；`src/command/mod.rs` 导出；主要实现文件是 `src/command/code.rs`，入口为 `execute`。
-- 参数模型：`CodeArgs`、`CodeProvider`。`validate_mode_args` 当前负责四类 mode 校验：默认 Web（含弃用 `--web`/`--web-only`）、隐藏 `LIBRA_CODE_LEGACY_TUI=1` 的 TUI 回滚、MCP `--stdio`、以及 W4-02 的 client-only `--control stdio`。
+- 参数模型：`CodeArgs`、`CodeProvider`。`validate_mode_args` 当前负责四类 mode 校验：默认 Web（W5-07 起为唯一 flagless 入口）、裸 `--provider codex --resume` 的遗留 TUI resume driver（W5-06 删除）、MCP `--stdio`、以及 W4-02 的 client-only `--control stdio`。
 - `--stdio` 是弃用的 MCP-only legacy transport（tools/resources；非 turn control；stderr 弃用警告）。源码在 `validate_mode_args` 中明确拒绝 `--control write` 并提示使用 `libra code --control stdio` 做本地 automation（`code-control --stdio` 是 W4-09 弃用转发 shim，已于 W5-01 物理删除）。独立 `libra mcp --stdio` 为 DEFER-02（W5 之后），本计划不新增半成品 `libra mcp`。
-- 非 TUI mode 调用 `reject_non_tui_flags(args, mode, web_only)`，该函数按 mode 区分放宽（C2 已落地 C1 对 GAP-1/GAP-3 的 **code behavior** 分类）：
-  - `--web`/`--web-only`（`web_only = true`）**放宽** `--provider`（全部 7 个 provider + Codex 分支）、`--model`、`--api-base`、`--temperature` 和 provider-specific tuning flags，使已构建的 headless web runtime / Codex web 分支 CLI 可达；这些 flag 转由 `validate_mode_args` 中的 cross-provider match gate 校验（不匹配的 provider-specific flag 仍拒绝，`--api-base` 在 `--provider=codex` 下仍拒绝）。banner/`BrowserControlMode` 注释/用户文档中的 `--web-only --provider <ollama|codex>` 示例因此变为真实可用。
-  - `--stdio`（`web_only = false`）保持**完全锁定** provider/model/api-base/temperature 和 provider-specific flags —— 它是 MCP transport，没有 provider surface。
-  - `--web`/`--web-only` 对 **非 Codex provider** 接受 `--resume`：它经 `load_or_create_headless_web_session_state` 读取同一工作目录的持久化会话，再由有界 JSONL projection fold 重建 Code UI。`--stdio` 和 managed Codex app-server 仍拒绝该 flag，因为两者不使用这套 headless session protocol。Web-only 同时对非 Codex 接受 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl`（与 TUI 同语义；env-file → process → Vault bootstrap 共用）；managed Codex 对 `--env-file`/`--approval-ttl` fail-closed（未接入 app-server）。Web 与 MCP `--stdio` 仍拒绝 `--network-access allow`（避免在 Plan Allow/Deny 前把 sandbox 设为 Full network）。`--stdio` 继续拒绝 provider/env-file/context/approval/resume 等 TUI-only surface。
+- 非 TUI mode 调用 `reject_non_tui_flags(args, mode, web_launch)`，该函数按 mode 区分放宽（C2 已落地 C1 对 GAP-1/GAP-3 的 **code behavior** 分类）：
+  - 默认 Web 启动（`web_launch = true`；W5-07 前对应已删除的 `--web`/`--web-only` 别名）**放宽** `--provider`（全部 7 个 provider + Codex 分支）、`--model`、`--api-base`、`--temperature` 和 provider-specific tuning flags，使已构建的 headless web runtime / Codex web 分支 CLI 可达；这些 flag 转由 `validate_mode_args` 中的 cross-provider match gate 校验（不匹配的 provider-specific flag 仍拒绝，`--api-base` 在 `--provider=codex` 下仍拒绝）。banner/`BrowserControlMode` 注释/用户文档中的 `--provider <ollama|codex>` 示例因此变为真实可用。
+  - `--stdio`（`web_launch = false`）保持**完全锁定** provider/model/api-base/temperature 和 provider-specific flags —— 它是 MCP transport，没有 provider surface。
+  - 默认 Web 启动对 **非 Codex provider** 接受 `--resume`：它经 `load_or_create_headless_web_session_state` 读取同一工作目录的持久化会话，再由有界 JSONL projection fold 重建 Code UI。`--stdio` 和 managed Codex app-server 仍拒绝该 flag，因为两者不使用这套 headless session protocol。默认 Web 同时对非 Codex 接受 `--env-file`、`--context`、`--approval-policy`、`--approval-ttl`（与 TUI 同语义；env-file → process → Vault bootstrap 共用）；managed Codex 对 `--env-file`/`--approval-ttl` fail-closed（未接入 app-server）。Web 与 MCP `--stdio` 仍拒绝 `--network-access allow`（避免在 Plan Allow/Deny 前把 sandbox 设为 Full network）。`--stdio` 继续拒绝 provider/env-file/context/approval/resume 等 TUI-only surface。
 - provider-specific 约束：`--codex-bin`、`--codex-port`、`--plan-mode=true` 只允许 `--provider=codex`；`--api-base` 在 `--provider=codex` 下被拒绝；Ollama/DeepSeek/Kimi 的 thinking/stream/compact flags 只能用于对应 provider。
 - `--control write` 要求 loopback host；control token、control info、browser control 和 Code UI API 的安全边界必须继续由 Code UI / code-control 相关测试守卫。
 
@@ -33,7 +33,7 @@ flowchart TD
     B --> C["validate_mode_args"]
     C --> D{"mode"}
     D -->|"Web default"| E["AgentRuntime + Web Code UI"]
-    D -->|"LEGACY_TUI"| F["hidden TUI rollback"]
+    D -->|"codex --resume（遗留，W5-06 删除）"| F["legacy TUI resume driver"]
     D -->|"stdio"| G["MCP stdio server"]
     E --> H["SessionStore / projection / graph / audit"]
     F --> H
@@ -45,10 +45,10 @@ flowchart TD
 
 | 面向 | 当前结论 | 必须保持 / 补强 |
 |---|---|---|
-| Mode 与参数 | Web default、hidden TUI rollback、web-only alias、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
+| Mode 与参数 | Web default、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；W4 烘焙窗口的 hidden TUI rollback（`LIBRA_CODE_LEGACY_TUI`）与 `--web`/`--web-only` alias 已由 W5-07 物理删除（旧 flag 返回 usage error + 迁移提示，env 不再改变任何行为）；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
 | Provider / env | provider-specific flags 和 `--api-base` 规则已有校验；live/provider tests 依赖 `.env.test` 时不得泄露 key。 | C3 固定 provider factory、env-file 优先级、Vault/env lookup、missing-key 错误和 feature-gated live tests。 |
 | Web-only / Code UI | Code UI API、SSE、browser control、control token、diagnostics redaction 是用户可见接口。 | C4 固定 `/api/code/*` observe-only contract；control token/`control.json` 0600（info 原子写 + worktree scope fail-closed）；diagnostics/SSE/control info 不泄露 secrets。 |
-| Session / graph | non-Codex `--web-only --resume` 已走 headless JSONL projection fold；TUI resume 仍走 `SessionState`；`--stdio`/managed Codex 继续拒绝 resume。projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5/W1-06 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、统一 event fold；TUI/managed-Codex/graph 尚未共用同一 fold。 |
+| Session / graph | non-Codex Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）已走 headless JSONL projection fold；TUI resume 仍走 `SessionState`；`--stdio`/managed Codex 继续拒绝 resume。projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5/W1-06 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、统一 event fold；TUI/managed-Codex/graph 尚未共用同一 fold。 |
 | MCP / code-control | `libra code --stdio` 是弃用的 MCP-only legacy（tools/resources；非 turn control）；canonical automation client 是 `libra code --control stdio`（`code-control --stdio` 为 W4-09 弃用转发 shim，已于 W5-01 物理删除）；`libra mcp --stdio` 为 DEFER-02。 | C6 禁止把 MCP stdio 当 turn control plane；双入口 tool set、shutdown、token/lease gate 都要有测试。 |
 | Sandbox / approval / fix bridge | workspace mutation 只能走内部 AgentRuntime serialized queue、approval、sandbox 和 tool ACL。 | C7 是 `review --fix` / `investigate fix` 的唯一解锁点；证据不足时 Agent 阶段必须返回 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE` 对应错误码。 |
 | Docs / compat | `libra code` 是 Libra-only extension；用户文档、compat matrix、tests/INDEX 必须与源码同步。 | C8 收敛 `docs/commands/code.md`、zh-CN、`COMPATIBILITY.md`、`tests/INDEX.md`、release notes。 |
@@ -112,7 +112,7 @@ bridge 仍未迁入，不能把这条 direct-chat 链路当作 Web-only completi
 | C2 | web-only 已可选 provider，且 non-Codex headless 已接受 `--resume` / `--env-file` / `--context` / `--approval-policy` / `--approval-ttl`（W3-13）；仍拒绝 `--network-access allow`（`reject_non_tui_flags`，直到 Plan gate 拥有 per-execution sandbox network）。 | Web default 切默认时不得再丢这些可配置能力。 | W4-01；若删除 flag 必须 breaking migration。 |
 | C3 | TUI/headless 共享三层 bootstrap：`CodeAgentServicesBuilder` → registry/hardening；`build_any_completion_model_for_args` → env/model；`tui_approval_config_from_args` + `default_tui_runtime_context` → approval/sandbox。 | Web-only 已公开接受 `--env-file`（W3-13），优先级仍为 env-file > process/vault。 | W4-01 默认路径复用同一断言。 |
 | C4 | `code_ui.rs:674-685` `broadcast_snapshot` 仍发送完整 `CodeUiSessionSnapshot`；browser control/SSE 是公开 wire。 | 全量 snapshot 与有界 cursor/replay 目标不相容。 | W3-01/W3-06/W3-08；v2 须保留 v1 兼容窗口。 |
-| C5 | non-Codex headless 已经由公开 `--web-only --resume` 进入 JSONL fold；stdio 与 managed Codex 仍不共享该协议。 | TUI/managed-Codex/graph 的 resume/recovery 尚未收敛为一个 runtime owner。 | W1-06 → W3-03、W4-01/W4-05。 |
+| C5 | non-Codex headless 已经由公开 Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）进入 JSONL fold；stdio 与 managed Codex 仍不共享该协议。 | TUI/managed-Codex/graph 的 resume/recovery 尚未收敛为一个 runtime owner。 | W1-06 → W3-03、W4-01/W4-05。 |
 | C6 | `code --stdio`（`execute_stdio`）是弃用的 MCP-only legacy transport（tools/resources；stderr 警告；非 turn control）；canonical automation client 是 `code --control stdio`（`ControlMode::Stdio` + `run_control_stdio_client` + W4-10 control-info discovery）；`code-control --stdio` 是 W4-09 弃用转发 shim（已于 W5-01 物理删除）；独立 `libra mcp --stdio` 为 DEFER-02。 | MCP 与 control client 不可混作 turn control plane；discovery/attach fail-closed（`CONTROL_*` / JSON-RPC `-32000`）。 | W4-02/W4-03/W4-09/W4-10；breaking command migration。 |
 | C7 | `runtime::hardening` 是 mutating policy；A0-05 fix 仍 fail-closed `LBR-AGENT-010`（`review.rs:23,74` / `investigate.rs:22,77`）。 | 不能把不存在的 bridge 当可复用实现，也不能另建 mutation/approval 表。 | W1-01/W2-04/W6-02；bridge 仍 deferred。 |
 | C8 | command docs、compat matrix、tests index 尚描述 TUI/current commands。 | 源码迁移会留下错误的公开行为承诺。 | W4-05/W6-01/W6-02；用户可见文档为发布门禁。 |
@@ -121,7 +121,7 @@ bridge 仍未迁入，不能把这条 direct-chat 链路当作 Web-only completi
 
 ### W3-07 / DEFER-07 — managed Codex interaction ownership
 
-**Boundary (W3-07):** For `--web-only --provider codex`, the Codex app-server keeps
+**Boundary (W3-07):** For Web `--provider codex`（原 `--web-only --provider codex`，W5-07 删除别名）, the Codex app-server keeps
 owning the approval / user-input loop. Libra does **not** claim that Codex turns
 are fully admitted into the serialized non-Codex turn queue.
 
@@ -250,7 +250,7 @@ headless shutdown 现先关闭 adapter admission，再等待 active turn 的 ter
 显式 CLI error 返回，而不是被吞掉或允许自动 replay。此路径尚未与 runtime worker 的
 shutdown owner、Web/MCP/provider child 的资源 owner 合并，不能作为 W1-08 完成证据。
 
-这仍不是 W1-06 完成证据：`--web-only --resume` 现已让非 Codex headless 路径可达，但
+这仍不是 W1-06 完成证据：Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）现已让非 Codex headless 路径可达，但
 TUI/managed-Codex 的 live projection 与 graph read model 尚未接入同一 fold，`CodeUiSession`
 仍保留内存 cache 供现有 SSE 使用。因此不得以 headless resume 已通就宣称所有 Code UI
 projection 已事件化。
@@ -271,7 +271,7 @@ W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际
 
 ## Web-only completion gate（W0-03）
 
-**当前 Web-only direct-turn 不是完成态。** headless/`--web-only` 仍可跳过
+**当前 Web-only direct-turn 不是完成态。** headless Web 默认路径（原 `--web-only`，W5-07 删除别名）仍可跳过
 IntentSpec/Plan human gates（见 C10）；不得据此删除默认 TUI 或宣称 Web-only
 parity closeout。
 
@@ -297,7 +297,7 @@ Gate 的 A0 输入是上表 A0-02..A0-11 的已核对消费接口；它们不因
 
 以下产品决定也属于 gate 的固定输入，不能在删除阶段重新解释：
 
-- **GATE-WEB-DECISION-WEB-ONLY**：`--web-only` 的兼容期和废弃路径有明确版本界限。
+- **GATE-WEB-DECISION-WEB-ONLY**：`--web-only` 的兼容期和废弃路径有明确版本界限；W5-07 已执行该删除（随 W5-09 一次 breaking minor 发布）。
 - **GATE-WEB-DECISION-BAKE**：breaking removal 前完成连续 **3 patch** 烘焙期。
 - **GATE-WEB-DECISION-STDIO**：`--stdio` 保持弃用的 MCP-only legacy transport（tools/resources；非 turn control），绝不回流成 worker/control 替代品；独立 `libra mcp --stdio` 为 DEFER-02（W5 之后），本计划不新增半成品 `libra mcp`。
 - **GATE-WEB-DECISION-SSH**：远程 SSH 的权衡不降低 loopback/token/lease 安全边界。
@@ -326,7 +326,7 @@ Gate 的 A0 输入是上表 A0-02..A0-11 的已核对消费接口；它们不因
 | Mutating fix bridge | observed external agent 的 review/investigate findings 不能直接改工作区。 | 未找到内部 serialized fix bridge 证据前，Agent 阶段 fix/action 统一 unsupported。 |
 | MCP/control 混同 | 把 MCP stdio 当 live turn/control plane 会绕过 token/lease/approval 边界。 | C6 固定 `code --stdio` 与 `code --control stdio` 分工。 |
 | MCP 授权门（Phase-5 scaffold，**延期**，Task C9） | `McpAuthorizer` 门在生产**仅部分接入**：`resources/{list,read,templates}`（`server.rs:186/194/479`）与**部分** `tools/call` 站点（`resource.rs` 至 :2297 一带）走 `authorize_or_error[_with_actor]`，但 **`tools/list` 未接入**（`McpOperation::ListTools` 仅存在于 `authz.rs` 枚举与测试），且**若干 tool impl 完全无 authz 调用**（如 `create_patchset_impl:2354`、`list_patchsets_impl:2423`、`create_evidence_impl:2483`、`create_tool_invocation_impl:2608` 等）。**最关键**：**生产从不安装 handler**（`set_authz` 仅测试调用），`authorize_with_principal_or_error`（`server.rs:144`）在无 handler 时无条件 `Ok(())`——即便对已接入站点，**当前生产 MCP 授权也是 allow-all no-op**。（principal 侧：actor-aware 的 `authorize_or_error_with_actor`（`server.rs:130`）已用 `PrincipalContext::from_actor`；非 actor 的 `authorize_or_error` 仍跑 system principal，见 `server.rs:116`。）C6 只固定 stdio/HTTP 分工与 token/lease，未安装真实授权策略。 | **显式延期**：安装真实授权策略（当前无 handler=allow-all）+ 补齐未接入的 tool impl 与 `tools/list` 授权门 + 非 actor 站点的 principal threading，均为 Phase-5 后续工作；重启条件为落地 `McpAuthorizer` 生产实现并接入 serve 全路径。C6/C7「完成」仅覆盖 stdio 边界与 approval/sandbox/tool-ACL，**不**声称 MCP 授权门已闭环。当前安全边界由 loopback-only + control token/lease + tool ACL 承担。 |
-| Web-only headless IntentSpec 审批环（**延期**，Task C10） | `--web-only --provider <非 codex>` 的 headless runtime（`src/internal/ai/web/headless.rs:23-31,78`）把每次 browser submit 当单次直连 turn，**跳过** TUI 的 Phase 0/1 IntentSpec/Plan 审阅-审批环（`code.md`「命令实现目标」的默认契约）。tool ACL/sandbox 仍生效，属 workflow/approval-UX 差异而非裸安全洞。 | **显式延期，非漏实现**：headless 为 direct-turn 契约，Full IntentSpec plan approval 为后续工作（源码注释已注明 will land in subsequent phases）。重启条件为把 TUI Phase 0/1 审批环接入 headless 路径并补 CLI/UI regression。C4「完成」覆盖 observe-only API/SSE/browser-control/diagnostics，**不**覆盖 headless 的 IntentSpec 审批环。 |
+| Web-only headless IntentSpec 审批环（**延期**，Task C10） | Web 默认 `--provider <非 codex>`（原 `--web-only --provider <非 codex>`，W5-07 删除别名）的 headless runtime（`src/internal/ai/web/headless.rs:23-31,78`）把每次 browser submit 当单次直连 turn，**跳过** TUI 的 Phase 0/1 IntentSpec/Plan 审阅-审批环（`code.md`「命令实现目标」的默认契约）。tool ACL/sandbox 仍生效，属 workflow/approval-UX 差异而非裸安全洞。 | **显式延期，非漏实现**：headless 为 direct-turn 契约，Full IntentSpec plan approval 为后续工作（源码注释已注明 will land in subsequent phases）。重启条件为把 TUI Phase 0/1 审批环接入 headless 路径并补 CLI/UI regression。C4「完成」覆盖 observe-only API/SSE/browser-control/diagnostics，**不**覆盖 headless 的 IntentSpec 审批环。 |
 | Secret 泄露 | `.env.test`、provider key、control token、diagnostics、SSE、raw transcript 都可能泄露。 | live tests 关闭 xtrace；输出只保留 redacted summary；diagnostics/control/SSE 必测 redaction。 |
 
 ## 实现历史

@@ -446,11 +446,11 @@ async fn gemini_completion_request_smoke_boots_against_localhost_stub() -> Resul
     Ok(())
 }
 
-/// W4-01: default `libra code` accepts `--env-file` without requiring
-/// `--web-only`, and env-file values win over a competing process env for the
-/// same provider key through the same validate → load path as `execute_web_only`.
+/// W4-01: default `libra code` accepts `--env-file` (W5-07 removed the
+/// deprecated `--web`/`--web-only` aliases entirely), and env-file values win
+/// over a competing process env for the same provider key through the same
+/// validate → load path as `execute_web_only`.
 #[test]
-#[serial_test::serial(libra_code_legacy_tui)]
 fn default_web_env_file_precedence() {
     use std::path::Path;
 
@@ -462,7 +462,6 @@ fn default_web_env_file_precedence() {
         utils::test::ScopedEnvVar,
     };
 
-    let _unset = ScopedEnvVar::unset("LIBRA_CODE_LEGACY_TUI");
     let temp = tempfile::tempdir().expect("tempdir");
     let env_path = temp.path().join(".env.w4-01");
     std::fs::write(&env_path, "OPENAI_API_KEY=from-env-file\n").expect("write env file");
@@ -474,11 +473,7 @@ fn default_web_env_file_precedence() {
         "--provider",
         "openai",
     ])
-    .expect("default Web must accept --env-file without --web-only");
-    assert!(
-        !parsed.web_only,
-        "bare --env-file must not force the deprecated --web-only flag"
-    );
+    .expect("default Web must accept --env-file");
     assert_eq!(parsed.provider, CodeProvider::Openai);
     assert_eq!(
         parsed.env_file.as_deref(),

@@ -1351,6 +1351,58 @@ pub fn emit_advisory_warning(message: impl std::fmt::Display) {
     eprintln!("warning: {message}");
 }
 
+/// W5-07 migration hint for the removed `libra code` Web aliases.
+///
+/// When a clap parse failure came from the `code` subcommand and argv still
+/// carries the removed `--web` / `--web-only` flags (exact or `=value`
+/// forms), return one hint pointing at the default Web Code UI launch. The
+/// matcher lives here — outside `src/command/` and `src/cli.rs` — so the
+/// removed-flag literals never reappear on the guarded CLI surface.
+pub(crate) fn removed_code_web_alias_hints(argv: &[std::ffi::OsString]) -> Vec<String> {
+    // The first positional token is the subcommand; skip the value-taking
+    // global flags that may precede it. Keep this list in sync with the
+    // value-taking `global = true` options on `cli.rs::Cli` — currently
+    // `--color`, `--progress`, and `--max-connections` (`--json` requires
+    // `=` for its optional value, so it never consumes the next token).
+    let mut i = 1;
+    let subcommand = loop {
+        let Some(arg) = argv.get(i).and_then(|arg| arg.to_str()) else {
+            return Vec::new();
+        };
+        if arg == "--" {
+            i += 1;
+            continue;
+        }
+        if matches!(arg, "--color" | "--progress" | "--max-connections") {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break arg;
+    };
+    if subcommand != "code" {
+        return Vec::new();
+    }
+
+    let has_removed_alias = argv.iter().filter_map(|arg| arg.to_str()).any(|text| {
+        text == "--web"
+            || text.starts_with("--web=")
+            || text == "--web-only"
+            || text.starts_with("--web-only=")
+    });
+    if has_removed_alias {
+        vec![
+            "`--web` / `--web-only` were removed in the W5 breaking release; `libra code` already defaults to the Web Code UI — remove the flag"
+                .to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Transitional best-effort classifier for legacy string-only error paths.
 ///
 /// New command implementations should set [`StableErrorCode`] explicitly with
@@ -1725,9 +1777,58 @@ mod tests {
 
     use super::{
         CliError, CliErrorCategory, CliErrorKind, LIBRA_ERROR_JSON_ENV, LIBRA_FINE_EXIT_CODES_ENV,
-        StableErrorCode, StderrRenderMode, StructuredStderrMode, stderr_render_mode,
+        StableErrorCode, StderrRenderMode, StructuredStderrMode, removed_code_web_alias_hints,
+        stderr_render_mode,
     };
     use crate::utils::test::ScopedEnvVar;
+
+    /// W5-07: the hint fires only for the `code` subcommand carrying a removed
+    /// Web alias (exact or `=value` form), never for other subcommands or
+    /// unrelated flags.
+    #[test]
+    fn removed_code_web_alias_hints_match_only_code_subcommand() {
+        let argv = |args: &[&str]| -> Vec<std::ffi::OsString> {
+            args.iter().map(std::ffi::OsString::from).collect()
+        };
+
+        for args in [
+            &["libra", "code", "--web"][..],
+            &["libra", "code", "--web-only"][..],
+            &["libra", "code", "--web-only=true"][..],
+            &["libra", "--color", "always", "code", "--web"][..],
+            &["libra", "--max-connections", "4", "code", "--web"][..],
+            &[
+                "libra",
+                "--progress",
+                "none",
+                "--max-connections",
+                "4",
+                "code",
+                "--web-only",
+            ][..],
+        ] {
+            let hints = removed_code_web_alias_hints(&argv(args));
+            assert_eq!(hints.len(), 1, "expected one hint for {args:?}");
+            assert!(
+                hints[0].contains("already defaults to the Web Code UI"),
+                "hint must point at the default Web Code UI; got: {}",
+                hints[0]
+            );
+        }
+
+        for args in [
+            &["libra", "code"][..],
+            &["libra", "code", "--stdio"][..],
+            &["libra", "add", "--web"][..],
+            &["libra", "--max-connections", "4", "add", "--web"][..],
+            &["libra", "code", "--webhook"][..],
+        ] {
+            assert!(
+                removed_code_web_alias_hints(&argv(args)).is_empty(),
+                "no hint expected for {args:?}"
+            );
+        }
+    }
 
     #[test]
     fn fatal_render_uses_git_style_prefix() {

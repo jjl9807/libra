@@ -45,7 +45,7 @@ dirty-mark 摄入（自动化触发承载），显式**不做 hosted server**。
 | 文件监视器喂标记 | 加速器而非正确性前提（1.1 契约）；需引入新重依赖（notify）+ 风暴/符号链接语义；标记可经令牌门 POST 流入。 |
 | repo/status 只读透传 | 处理器在 code 路由内部，抽取面大；v1 聚焦 lore 行核心（总线+通知+dirty 承载）。 |
 | MCP | `libra code` 已提供；lore 行未要求。 |
-| 守护化/systemd | 「不要做 hosted server」；前台 + 外部监督（同 `libra code --web-only` 模型）。 |
+| 守护化/systemd | 「不要做 hosted server」；前台 + 外部监督（同 `libra code` 默认 Web 模型）。 |
 | §7.7 自动重放 | 依赖不存在的操作台账；v1 保证「标记不静默丢失」。 |
 | code_ui 事件流重基到共享总线 | 服务总线为独立小模块（信封 `{seq,type,at,data}`）；code SSE 线格式由既有测试钉住，重基属纯重构后续项。 |
 | 依赖 1.6 | lore 依赖列 1.6（HTTP 远端令牌）；本服务纯本地，最小访问控制由 0600 令牌满足——此读法记录于此，如维护者按字面依赖裁决，落地顺序移至 1.6 后。 |

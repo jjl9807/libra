@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# W3-15 — start a deterministic `libra code --web-only` runtime for Playwright.
+# W3-15 — start a deterministic `libra code` (default Web) runtime for Playwright.
+# W5-07 removed the `--web-only` alias; the flagless default is the Web launch.
 #
 # Requires a build with `--features test-provider` and LIBRA_ENABLE_TEST_PROVIDER=1.
 # Does not run Playwright; leave this process in the foreground, then in another
@@ -82,7 +83,6 @@ echo "Starting ${BIN} on http://127.0.0.1:${PORT} …"
 (
   cd "${WORKDIR}"
   exec "${BIN}" code \
-    --web-only \
     --browser-control loopback \
     --control write \
     --context dev \

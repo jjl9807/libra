@@ -7,7 +7,7 @@
 //! lifecycle; the adapter never mutates snapshot state directly.
 //!
 //! Boundary with [`CodexCodeUiAdapter`]: `CodexCodeUiAdapter` (in
-//! `src/internal/ai/codex/mod.rs`) is used **only** for `--web-only --provider codex`,
+//! `src/internal/ai/codex/mod.rs`) is used **only** for Web `--provider codex`,
 //! where it speaks directly to the Codex app-server WebSocket. In TUI mode,
 //! `--provider codex` uses the default Libra TUI (`run_tui_with_managed_code_runtime`)
 //! and routes automation writes through this `TuiCodeUiAdapter`, so Codex

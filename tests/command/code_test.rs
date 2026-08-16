@@ -202,10 +202,12 @@ fn code_rejects_deepseek_flags_for_other_providers() {
 }
 
 /// `libra code --help` surfaces the EXAMPLES banner so users see the
-/// most common invocations across the three modes (default Web / legacy TUI /
-/// --stdio) plus observe-only host posture, `--control write`, `--resume`,
-/// `--plan-mode`, and `--env-file` without reading the design doc. Cross-cutting
-/// `--help` EXAMPLES rollout per `docs/development/commands/_general.md` item B.
+/// most common invocations across the modes (default Web / legacy TUI resume
+/// driver / --stdio) plus observe-only host posture, `--control write`,
+/// `--resume`, `--plan-mode`, and `--env-file` without reading the design doc.
+/// Cross-cutting `--help` EXAMPLES rollout per
+/// `docs/development/commands/_general.md` item B. W5-07 removed the
+/// deprecated `--web` / `--web-only` example rows with the aliases.
 #[test]
 fn test_code_help_lists_examples_banner() {
     let repo = tempdir().expect("tempdir for code --help");
@@ -223,8 +225,6 @@ fn test_code_help_lists_examples_banner() {
     for invocation in [
         "Launch the default Web Code UI",
         "libra code --provider deepseek",
-        "libra code --web",
-        "libra code --web-only --provider ollama",
         "libra code --host 0.0.0.0 --browser-control off",
         "libra code --control write",
         "libra code --control stdio --control-url",

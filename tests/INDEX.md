@@ -112,7 +112,7 @@
 ### plan-20260715 W0-02 — workflow behavior baselines
 
 Machine-readable inventory for Checkpoint A. W3-02 Web harness retargets these
-rows onto `--web-only` HTTP/SSE (baselines live in
+rows onto the default Web launch HTTP/SSE (baselines live in
 `src/internal/ai/workflow_baseline.rs`; TUI re-exports for in-process panes).
 
 | TUI-owned behavior | baseline test name | expected output / assertion |
@@ -129,11 +129,15 @@ rows onto `--web-only` HTTP/SSE (baselines live in
 
 ### plan-20260715 W3-02 — Code UI Web harness
 
-Default `CodeSession` spawn is `libra code --web-only` with `--port 0` /
+Default `CodeSession` spawn is flagless `libra code` (the default Web launch;
+W5-07 removed the `--web-only` alias) with `--port 0` /
 `--mcp-port 0`. Readiness waits on `control.json` (MCP URL populated) then an
-HTTP `/session` snapshot — not sleep-only. Use
-`CodeSessionOptions::with_pty_tui()` only for reclaim / legacy TUI lifecycle
-cases. Always run Code UI harness targets with
+HTTP `/session` snapshot — not sleep-only. W5-07 removed the hidden legacy-TUI
+rollback env, so `CodeSessionOptions::with_pty_tui()` can no longer reach a
+terminal TUI and now fails the spawn with an actionable error; the reclaim /
+legacy TUI lifecycle scenarios that still use it stay parked until W5-06
+removes the TUI startup path and reworks them. Always run Code UI harness
+targets with
 `LIBRA_ENABLE_TEST_PROVIDER=1`, `--features test-provider`, and
 `--test-threads=1` (shared control-file / port contention otherwise).
 
@@ -152,7 +156,7 @@ cases. Always run Code UI harness targets with
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |
 | `code_resume_test` | 2 | Session resume across restarts | `src/internal/ai/session/`, `src/command/code.rs` |
-| `code_codex_default_tui_test` | 2 | W4-01: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; `LIBRA_CODE_LEGACY_TUI` keeps TUI driver) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
+| `code_codex_default_tui_test` | 2 | W4-01/W5-07: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; bare `--provider codex --resume` keeps the TUI resume driver until W5-06) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
 | `code_codex_runtime_test` | 2 | `--provider codex` WS runtime boot: `--codex-port` validation, managed app-server initialize/thread-start, approval-interaction regression, W3-04 `AgentEvent` envelope normalize, W3-07 cancel/interrupt + sequential approval ownership | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
 | `ai_code_ui_projection_test` | 2 | Projection snapshot replication; W3-14 10k-event fold bound + release p95 (`large_session_projection_smoke`); W4-04 null `thread_graph` delta fold | `src/internal/ai/history.rs`, `src/internal/ai/web/code_ui_projection.rs` |
@@ -163,7 +167,7 @@ cases. Always run Code UI harness targets with
 Not a cargo `--test` target. Owner suite is `pnpm --dir web test:e2e`
 (`web/playwright.config.ts` + `web/e2e/**`). Specs assert only through
 user-visible DOM/HTTP against an **already-started** deterministic Web runtime
-(`libra code --web-only --browser-control loopback --provider fake` with
+(`libra code --browser-control loopback --provider fake` with
 `--features test-provider` + `LIBRA_ENABLE_TEST_PROVIDER=1`).
 
 **Startup**

@@ -20,7 +20,7 @@ function newCommandId(): string {
 }
 
 /**
- * Capability-gated message composer for `--web-only` sessions.
+ * Capability-gated message composer for Web Code UI sessions.
  * First submit attaches the browser controller via withLease; do not gate on
  * projected canWrite (same pattern as cancel).
  */

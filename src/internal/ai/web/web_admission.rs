@@ -31,7 +31,7 @@ use crate::internal::ai::runtime::{
 ///
 /// Plan vs explicit-direct routing is an admission/mode concern
 /// ([`WebTurnMode`]), not a separate durability identity. Keep the historical
-/// `headless_direct_turn` kind so `--web-only --resume` retries of a prior
+/// `headless_direct_turn` kind so default Web `--resume` retries of a prior
 /// `commandId` still match the stored `CodeCommandIntent` (idempotent ACK).
 pub const CODE_UI_WEB_TURN_KIND: &str = "headless_direct_turn";
 

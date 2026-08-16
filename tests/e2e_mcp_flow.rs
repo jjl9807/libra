@@ -1,6 +1,7 @@
 //! End-to-end MCP (Model Context Protocol) flow tests over SSE/HTTP streaming.
 //!
-//! Spawns the real `libra code --web-only` binary on dynamically allocated MCP/Web
+//! Spawns the real `libra code` binary (default Web Code UI; W5-07 removed the
+//! deprecated `--web-only` alias) on dynamically allocated MCP/Web
 //! ports, walks through the full Streamable HTTP transport handshake (initialize →
 //! initialized notification → tools/call), and verifies a created task is visible
 //! both via `list_tasks` and on disk under `.libra/objects`. This is the canonical
@@ -113,7 +114,7 @@ async fn mcp_post(
 ///
 /// 1. Build the `libra` binary (so the test runs against current code).
 /// 2. Initialize a temp-dir repo with isolated HOME/XDG_CONFIG_HOME.
-/// 3. Start `libra code --web-only` on dynamically allocated ports.
+/// 3. Start `libra code` (default Web Code UI) on dynamically allocated ports.
 /// 4. Wait up to 30 seconds for the MCP TCP listener to accept connections.
 /// 5. Initialize handshake → notifications/initialized → tools/call create_task →
 ///    resources/list → tools/call list_tasks.
@@ -162,8 +163,8 @@ async fn test_e2e_mcp_flow() {
     assert!(status.success(), "libra init failed");
 
     // ── 2. Start Server ────────────────────────────────────────────────────────
-    // Use --web-only so the test can run without a terminal (no TUI).
-    // The MCP server is started identically in both TUI and web-only modes.
+    // The default Web Code UI launch is headless, so the test can run without a
+    // terminal (no TUI). The MCP server is started identically in TUI and Web modes.
     let (mcp_port, web_port) = pick_test_ports();
 
     println!("Starting server on MCP port {mcp_port}, Web port {web_port}");
@@ -171,7 +172,6 @@ async fn test_e2e_mcp_flow() {
     let mut child = Command::new(&libra_bin)
         .args([
             "code",
-            "--web-only",
             "--mcp-port",
             &mcp_port.to_string(),
             "--port",
@@ -493,7 +493,6 @@ async fn test_web_only_sigterm_releases_ports() {
     let child = Command::new(&libra_bin)
         .args([
             "code",
-            "--web-only",
             "--mcp-port",
             &mcp_port.to_string(),
             "--port",
@@ -507,9 +506,9 @@ async fn test_web_only_sigterm_releases_ports() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("Failed to start libra code --web-only");
+        .expect("Failed to start libra code");
     // SIGKILL+wait on any early return/panic so failed assertions cannot leak
-    // a running web-only process into later tests.
+    // a running Web process into later tests.
     struct KillChildOnDrop(Option<std::process::Child>);
     impl Drop for KillChildOnDrop {
         fn drop(&mut self) {

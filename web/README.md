@@ -2,7 +2,7 @@
 
 This directory holds the Next.js source for the embedded `libra code` browser UI. The build is consumed two ways:
 
-1. **`pnpm dev`** during local development serves the UI on the Next.js dev server's default `http://localhost:3000`. All API calls use relative `/api/...` paths with `same-origin` credentials (see `src/lib/code-ui/client.ts`), so the dev server must share its origin with a running `libra code` process. The typical workflow is to launch the backend on a non-default port — `libra code --web-only --port 4400` — and then run `pnpm dev -- --port 4400` so both share the loopback origin. There is **no** `LIBRA_DEV_API_BASE`-style env-var-based proxy: the client speaks to `/api/*` directly and the Rust side's `ensure_loopback_api_request` guard refuses remote callers regardless.
+1. **`pnpm dev`** during local development serves the UI on the Next.js dev server's default `http://localhost:3000`. All API calls use relative `/api/...` paths with `same-origin` credentials (see `src/lib/code-ui/client.ts`), so the dev server must share its origin with a running `libra code` process. The typical workflow is to launch the backend on a non-default port — `libra code --port 4400` — and then run `pnpm dev -- --port 4400` so both share the loopback origin. There is **no** `LIBRA_DEV_API_BASE`-style env-var-based proxy: the client speaks to `/api/*` directly and the Rust side's `ensure_loopback_api_request` guard refuses remote callers regardless.
 2. **`pnpm build`** emits a static export to `web/out/`. The Rust binary embeds that directory at compile time via `WebAssets` (`src/command/web_assets.rs`) and serves it from `axum::Router::fallback`. Any production change to the UI therefore requires `pnpm build` so the embedded snapshot stays current; CI fails closed if `web/out/` falls behind the source.
 
 ## Scripts
@@ -19,7 +19,7 @@ pnpm build          # static export → web/out/
 ### Playwright e2e (W3-15)
 
 Specs live under `web/e2e/` and assert only through user-visible DOM against an
-**already-started** deterministic `libra code --web-only` process (they do not
+**already-started** deterministic `libra code` (default Web) process (they do not
 spawn the runtime and must not import frontend stores).
 
 ```bash
@@ -142,7 +142,7 @@ Every writable control is gated on `snapshot.capabilities.*`. First write uses
 `controller.canWrite` beforehand). Managed Codex ask-mode approvals are
 browser-writable after W3-07 (`browserInteractionRespondSupported` always allows
 respond; the Rust sidecar forwards `respond_interaction` to the app-server). The
-current capability set is set by the Rust runtime: `--web-only --provider codex`
+current capability set is set by the Rust runtime: Web `--provider codex`
 advertises the full set, `HeadlessCodeRuntime` advertises `messageInput` +
 `streamingText` + `toolCalls`, and the read-only placeholder advertises none.
 

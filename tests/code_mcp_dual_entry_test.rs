@@ -12,9 +12,11 @@
 //!     URL, (c) the `<port>` differs from the web port (the
 //!     runtime requires the two to be distinct outside `--stdio`
 //!     mode, see `code.rs:3354` "Web and MCP ports must differ").
-//!   * **Item 2 — `--stdio` mutex**: clap-level mutual exclusion
-//!     of `--stdio` and `--web-only`. Pins that the conflict is
-//!     surfaced as a usage error before any runtime work runs.
+//!   * **Item 2 — removed `--web-only` alias**: W5-07 removed the
+//!     deprecated `--web` / `--web-only` aliases (the Web Code UI has
+//!     been the flagless default since W4-01), so `--web-only` now
+//!     fails as a clap unexpected-argument usage error before any
+//!     runtime work runs.
 //!
 //!   * **Item 3 — dual-reachability smoke**: same `libra code`
 //!     process responds on BOTH the web HTTP transport
@@ -312,9 +314,10 @@ fn wait_for_mcp_task(
 #[test]
 #[serial]
 fn libra_code_writes_mcp_url_into_control_info_file() -> Result<()> {
-    let session = CodeSession::spawn(
-        CodeSessionOptions::new("code-mcp-control-info", fixture_path()).with_pty_tui(),
-    )?;
+    let session = CodeSession::spawn(CodeSessionOptions::new(
+        "code-mcp-control-info",
+        fixture_path(),
+    ))?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| {
@@ -351,27 +354,27 @@ fn libra_code_writes_mcp_url_into_control_info_file() -> Result<()> {
     Ok(())
 }
 
-/// Wave 9 §5.14 item 2 — `--stdio` + `--web-only` mutual
-/// exclusion.
+/// Wave 9 §5.14 item 2 — `--web-only` removal (W5-07).
 ///
-/// `code.rs:439` declares `pub web_only: bool` with
-/// `conflicts_with = "stdio"`. This test pins clap surfaces that
-/// conflict as a usage error before the runtime starts, so a
-/// future refactor that drops the `conflicts_with` attribute
-/// silently breaks the documented mutex.
+/// The deprecated `--web` / `--web-only` aliases were removed in the
+/// W5 breaking release (the Web Code UI has been the flagless default
+/// since W4-01), so the old flag must now fail at arg parse with
+/// clap's unexpected-argument usage error plus the W5-07 migration
+/// hint. This pins the removal so a future refactor cannot silently
+/// reintroduce the alias.
 ///
-/// Driven via `Command` (no PTY) because the conflict is
-/// resolved during arg parsing — neither mode actually starts.
+/// Driven via `Command` (no PTY) because the rejection is resolved
+/// during arg parsing — no mode actually starts.
 #[cfg(feature = "test-provider")]
 #[test]
-fn libra_code_stdio_web_only_combo_is_rejected_at_arg_parse() -> Result<()> {
+fn libra_code_web_only_flag_is_rejected_at_arg_parse() -> Result<()> {
     let output = Command::new(libra_bin_path())
         .args(["code", "--stdio", "--web-only"])
         .output()
         .context("failed to spawn libra code --stdio --web-only")?;
     if output.status.success() {
         bail!(
-            "expected --stdio + --web-only to fail at arg parse, but exit was successful;\nstdout: {}\nstderr: {}",
+            "expected removed --web-only to fail at arg parse, but exit was successful;\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -382,17 +385,16 @@ fn libra_code_stdio_web_only_combo_is_rejected_at_arg_parse() -> Result<()> {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        combined.contains("--stdio") && combined.contains("--web-only"),
-        "clap conflict error must reference both flags; got:\n{combined}",
+        combined.contains("--web-only"),
+        "unexpected-argument error must reference the removed flag; got:\n{combined}",
     );
-    // clap's conflict-resolution error commonly includes the
-    // phrase "cannot be used with" or "the argument ... cannot be
-    // used with"; assert the keyword "cannot" so any future clap
-    // wording change still passes as long as the conflict is
-    // reported.
     assert!(
-        combined.contains("cannot") || combined.contains("conflicts"),
-        "expected a conflict-style error mentioning the mutex; got:\n{combined}",
+        combined.contains("unexpected argument"),
+        "expected clap's unexpected-argument usage error; got:\n{combined}",
+    );
+    assert!(
+        combined.contains("already defaults to the Web Code UI"),
+        "expected the W5-07 migration hint; got:\n{combined}",
     );
     Ok(())
 }
@@ -416,9 +418,10 @@ fn libra_code_stdio_web_only_combo_is_rejected_at_arg_parse() -> Result<()> {
 #[test]
 #[serial]
 fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()> {
-    let session = CodeSession::spawn(
-        CodeSessionOptions::new("code-mcp-dual-reachability", fixture_path()).with_pty_tui(),
-    )?;
+    let session = CodeSession::spawn(CodeSessionOptions::new(
+        "code-mcp-dual-reachability",
+        fixture_path(),
+    ))?;
 
     // 1. Web reachability — drive the existing snapshot accessor
     //    so the failure mode is identical to other tests that
@@ -497,9 +500,10 @@ fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()>
 #[test]
 #[serial]
 fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> {
-    let mut session = CodeSession::spawn(
-        CodeSessionOptions::new("code-mcp-web-message-consistency", fixture_path()).with_pty_tui(),
-    )?;
+    let mut session = CodeSession::spawn(CodeSessionOptions::new(
+        "code-mcp-web-message-consistency",
+        fixture_path(),
+    ))?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?
@@ -546,9 +550,10 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
 #[test]
 #[serial]
 fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
-    let session = CodeSession::spawn(
-        CodeSessionOptions::new("code-mcp-write-web-sse", fixture_path()).with_pty_tui(),
-    )?;
+    let session = CodeSession::spawn(CodeSessionOptions::new(
+        "code-mcp-write-web-sse",
+        fixture_path(),
+    ))?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?
@@ -588,7 +593,7 @@ fn mcp_created_task_is_observable_through_web_sse() -> Result<()> {
 // C6 — MCP stdio transport regression coverage.
 //
 // The tests above drive only the MCP Streamable-HTTP transport (plus the
-// clap-level `--stdio`/`--web-only` mutex). C6's acceptance criterion
+// W5-07 removed-`--web-only` arg-parse pin). C6's acceptance criterion
 // (`plan.md:1346`) requires the MCP HTTP/stdio *dual entry* to have regression
 // coverage for the shared **tool set**, **error behavior**, and **shutdown**
 // behavior. The helpers below drive the real `libra code --stdio` MCP server
@@ -949,9 +954,10 @@ fn libra_code_stdio_serves_tool_surface_reports_errors_and_shuts_down() -> Resul
 #[serial]
 fn mcp_http_and_stdio_expose_identical_tool_set() -> Result<()> {
     // HTTP side — reuse the harness-spawned `libra code` MCP HTTP transport.
-    let session = CodeSession::spawn(
-        CodeSessionOptions::new("code-mcp-tool-set-parity", fixture_path()).with_pty_tui(),
-    )?;
+    let session = CodeSession::spawn(CodeSessionOptions::new(
+        "code-mcp-tool-set-parity",
+        fixture_path(),
+    ))?;
     let mcp_url = session
         .mcp_url()
         .ok_or_else(|| anyhow::anyhow!("control.json did not surface mcpUrl after spawn"))?

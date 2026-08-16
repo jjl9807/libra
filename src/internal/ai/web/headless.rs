@@ -1,6 +1,6 @@
 //! Headless web-only **lifecycle** host for non-Codex providers.
 //!
-//! `--web-only --provider <X>` (X != codex) builds a [`HeadlessCodeRuntime`] that
+//! The default Web launch with `--provider <X>` (X != codex) builds a [`HeadlessCodeRuntime`] that
 //! owns session construction, worker spawn, approval listeners, persistence
 //! helpers, and shutdown. The production browser write path is
 //! [`super::agent_runtime_adapter::AgentRuntimeCodeUiAdapter`] (see W3-03):
@@ -673,7 +673,7 @@ pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
     /// Every repeated shutdown caller observes this same terminal result,
     /// rather than racing to independently cancel or detach the active turn.
     shutdown_result_tx: watch::Sender<Option<Result<(), String>>>,
-    /// Optional on-disk session persistence used by `libra code --web-only
+    /// Optional on-disk session persistence used by default Web `libra code
     /// --resume <thread_id>` for non-Codex providers.
     persistence: Option<HeadlessSessionPersistence>,
     /// Production Code UI write-path owner (submit/cancel/respond/goal/task).

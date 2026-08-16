@@ -84,10 +84,12 @@ pub struct CodeSessionOptions {
     /// matrix uses this for `--deepseek-thinking enabled
     /// --deepseek-reasoning-effort high`.
     pub extra_cli_args: Vec<String>,
-    /// W3-02 — when `true` (default), spawn `libra code --web-only` so
-    /// Code UI remote matrices drive a headless Web process over HTTP/SSE
-    /// rather than the default TUI. Set `false` only for scenarios that
-    /// intentionally exercise TUI reclaim / PTY lifecycle.
+    /// W3-02 — when `true` (default), spawn the default headless
+    /// Web Code UI process so Code UI remote matrices drive it over
+    /// HTTP/SSE. W5-07 removed every PTY legacy-TUI entry except
+    /// bare `--provider codex --resume`, so `false` (set by
+    /// [`CodeSessionOptions::with_pty_tui`]) now fails the spawn with
+    /// an actionable error instead of silently launching Web.
     pub web_only: bool,
 }
 
@@ -113,14 +115,14 @@ impl CodeSessionOptions {
         }
     }
 
-    /// Keep the historical PTY + default-TUI spawn for reclaim / SIGTERM
-    /// scenarios that still need a live terminal controller.
+    /// Historical PTY + legacy-TUI spawn for reclaim / SIGTERM
+    /// scenarios. W5-07 removed the hidden legacy-TUI rollback env,
+    /// so this option can no longer reach a terminal TUI: it flips
+    /// `web_only` to `false` and `CodeSession::spawn` fails with an
+    /// actionable error until W5-06 removes the TUI startup path and
+    /// reworks these scenarios.
     pub fn with_pty_tui(mut self) -> Self {
         self.web_only = false;
-        // W4-01: bare `libra code` defaults to Web; PTY reclaim/plan scenarios
-        // still need the legacy TUI controller for the bake window.
-        self.extra_env
-            .push(("LIBRA_CODE_LEGACY_TUI".to_string(), "1".to_string()));
         self
     }
 
@@ -231,7 +233,7 @@ pub struct CodeSession {
     info_path: PathBuf,
     base_url: String,
     /// MCP server URL captured from `control.json`. Populated only when the
-    /// runtime starts an MCP server (not in `--web-only`-without-MCP modes).
+    /// runtime starts an MCP server.
     mcp_url: Option<String>,
     control_token: String,
     /// Session-bound browser bootstrap secret from stdout (`?bt=` / header).
@@ -241,7 +243,8 @@ pub struct CodeSession {
     /// sessions never get a control token file, so the harness should not
     /// look for one and authorized POSTs are limited to non-write routes.
     control_write: bool,
-    /// W3-02: when true, the child is `--web-only` (no TUI `/quit` path).
+    /// W3-02: when true, the child is the headless Web process (no TUI
+    /// `/quit` path). W5-07: always true — `spawn` rejects `false`.
     web_only: bool,
     child: Option<Box<dyn Child + Send + Sync>>,
     writer: Option<Box<dyn Write + Send>>,
@@ -259,6 +262,21 @@ struct ControlInfo {
 
 impl CodeSession {
     pub fn spawn(options: CodeSessionOptions) -> Result<Self> {
+        if !options.web_only {
+            // W5-07: the hidden legacy-TUI rollback env is gone, so a PTY
+            // spawn can no longer reach the terminal TUI — bare `libra code`
+            // always launches the Web Code UI. The only remaining TUI entry
+            // is bare `--provider codex --resume` (removed in W5-06 together
+            // with the TUI startup path). Fail loudly instead of hanging on
+            // a `/quit` writer the Web process never reads.
+            bail!(
+                "legacy TUI spawn is no longer reachable: the W5-07 removal left bare \
+                 `--provider codex --resume` as the only TUI entry (W5-06 deletes the TUI \
+                 startup path and reworks the PTY scenarios); scenario '{}' must not use \
+                 with_pty_tui()",
+                options.name
+            );
+        }
         let bin = libra_bin();
         let temp = tempfile::Builder::new()
             .prefix(&format!("libra-code-ui-{}-", options.name))
@@ -366,10 +384,8 @@ impl CodeSession {
         let provider_arg = options.provider_override.as_deref().unwrap_or("fake");
         let model_arg = options.model_override.as_deref().unwrap_or("fake-local");
         cmd.args(["code"]);
-        if options.web_only {
-            // W3-02: Code UI matrices target the headless Web process.
-            cmd.arg("--web-only");
-        }
+        // W3-02 / W5-07: Code UI matrices target the headless Web process,
+        // which has been the flagless default since W4-01.
         cmd.args([
             "--provider",
             provider_arg,
