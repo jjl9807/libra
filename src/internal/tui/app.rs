@@ -25,9 +25,8 @@ use serde::Deserialize;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
-    time::{interval, sleep, timeout},
+    time::{sleep, timeout},
 };
-use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -1215,37 +1214,6 @@ where
         }
     }
 
-    /// Run the main event loop.
-    ///
-    /// Local AgentRuntime finalization is intentionally left to the caller
-    /// ([`crate::command::code`] process lifecycle owner) so it shares the same
-    /// deadline as web/MCP/managed-child cleanup.
-    pub async fn run(&mut self) -> anyhow::Result<AppExitInfo> {
-        // Enter alternate screen.
-        let run_result = match self.tui.enter_alt_screen() {
-            Ok(()) => self.run_in_alt_screen().await,
-            Err(error) => Err(error.into()),
-        };
-        let leave_result = self.tui.leave_alt_screen();
-        // FUSE task-worktree sweep is registered with the process lifecycle
-        // owner after `run` returns so a stalled umount is reported under the
-        // shared deadline instead of being detached by a local timeout.
-
-        // Save session on exit (best-effort)
-        if self.session.message_count() > 0
-            && let Err(e) = self.session_store.save(&self.session)
-        {
-            tracing::warn!("Failed to save session: {}", e);
-        }
-
-        match (run_result, leave_result) {
-            (Ok(exit_info), Ok(())) => Ok(exit_info),
-            (Err(run_err), Ok(())) => Err(run_err),
-            (Ok(_), Err(leave_err)) => Err(leave_err.into()),
-            (Err(run_err), Err(_leave_err)) => Err(run_err),
-        }
-    }
-
     /// Repo working directory used for process-lifecycle FUSE cleanup.
     pub fn working_dir(&self) -> &Path {
         self.registry.working_dir()
@@ -1269,161 +1237,6 @@ where
     pub async fn finalize_local_runtime_for_lifecycle(&mut self, settle_budget: Duration) {
         self.settle_local_runtime_turns_for_shutdown(settle_budget)
             .await;
-    }
-
-    async fn run_in_alt_screen(&mut self) -> anyhow::Result<AppExitInfo> {
-        self.tui.clear()?;
-
-        // Set up slash-command autocomplete hints (built-in + YAML-defined).
-        let mut hints: Vec<(String, String)> = super::slash_command::BuiltinCommand::all_hints();
-        hints.extend(
-            self.command_dispatcher
-                .commands()
-                .iter()
-                .map(|c| (c.name.clone(), c.description.clone())),
-        );
-        hints.extend(self.skill_dispatcher.skills().iter().map(|skill| {
-            (
-                format!("skill {}", skill.name),
-                format!("Skill: {}", skill.description),
-            )
-        }));
-        self.widget.bottom_pane.set_command_hints(hints);
-        // Seed the bottom-pane Goal indicator so a `libra code --goal "..."`
-        // launch shows the active Goal on the very first frame (no
-        // need to wait for the first slash-command refresh).
-        self.refresh_bottom_pane_goal_status();
-
-        // Initial draw - ensure UI is rendered immediately
-        self.draw()?;
-
-        // Get the event stream
-        let mut event_stream = self.tui.event_stream();
-        let mut animation_tick = interval(Duration::from_millis(120));
-        let (managed_event_tx, mut managed_event_rx) =
-            mpsc::unbounded_channel::<CodeUiEventEnvelope>();
-        let mut code_control_rx = self.code_control_rx.take();
-        let managed_event_task = self.managed_code_ui_runtime.as_ref().map(|runtime| {
-            let mut events = runtime.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match events.recv().await {
-                        Ok(event) => {
-                            if managed_event_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            })
-        });
-        let process_terminate = self.process_terminate.clone();
-
-        loop {
-            // Check if we should exit
-            if self.exit_info.is_some() {
-                break;
-            }
-
-            tokio::select! {
-                // Handle terminal events
-                Some(event) = event_stream.next() => {
-                    self.handle_tui_event(event).await?;
-                }
-
-                // Handle app events
-                Some(event) = self.app_event_rx.recv() => {
-                    self.handle_app_event(event).await?;
-                }
-
-                // Mirror managed provider snapshots into the local TUI.
-                Some(event) = managed_event_rx.recv(), if self.managed_code_ui_runtime.is_some() => {
-                    self.handle_managed_code_ui_event(event).await?;
-                }
-
-                Some(command) = async {
-                    match code_control_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                }, if code_control_rx.is_some() => {
-                    self.handle_tui_control_command(command).await;
-                }
-
-                // Handle user-input requests from the tool handler
-                Some(request) = self.user_input_rx.recv() => {
-                    self.drain_pending_app_events().await?;
-                    self.handle_user_input_request(request).await;
-                }
-
-                // Handle exec-approval requests from sandbox-governed handlers.
-                Some(request) = self.exec_approval_rx.recv() => {
-                    self.drain_pending_app_events().await?;
-                    self.handle_exec_approval_request(request).await;
-                }
-
-                // Drive subtle status/tool animations while the agent is active.
-                _ = animation_tick.tick() => {
-                    if matches!(
-                        self.widget.bottom_pane.status,
-                        AgentStatus::Thinking | AgentStatus::Retrying | AgentStatus::ExecutingTool
-                    ) || self.welcome_active {
-                        self.schedule_draw();
-                    }
-                }
-
-                // Supervisor SIGTERM (installed before servers start) takes the
-                // same graceful exit path as `/quit`.
-                _ = async {
-                    match process_terminate.as_ref() {
-                        Some(gate) => gate.wait().await,
-                        None => std::future::pending().await,
-                    }
-                }, if process_terminate.is_some() => {
-                    tracing::info!("received SIGTERM; requesting graceful TUI shutdown");
-                    // Bound cancel so a stuck local turn cannot prevent App::run
-                    // from returning; the process lifecycle owner then drains
-                    // web/MCP/child/control under the shared deadline.
-                    const SIGTERM_EXIT_CANCEL_BUDGET: Duration = Duration::from_secs(5);
-                    match tokio::time::timeout(
-                        SIGTERM_EXIT_CANCEL_BUDGET,
-                        self.request_user_exit(),
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(_) => {
-                            tracing::warn!(
-                                "SIGTERM exit cancel exceeded {SIGTERM_EXIT_CANCEL_BUDGET:?}; forcing TUI exit for lifecycle shutdown"
-                            );
-                            let _ = self.interrupt_agent_task();
-                            self.clear_mcp_run_id();
-                            self.exit_info = Some(AppExitInfo {
-                                reason: ExitReason::UserRequested,
-                                thread_id: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(task) = managed_event_task {
-            task.abort();
-        }
-        self.mcp_write_tracker.drain().await;
-        let mut exit_info = self.exit_info.clone().unwrap_or(AppExitInfo {
-            reason: ExitReason::UserRequested,
-            thread_id: None,
-        });
-        self.create_mcp_exit_decision(&exit_info.reason).await;
-        if exit_info.thread_id.is_none() {
-            exit_info.thread_id = self.graph_thread_id_hint().await;
-        }
-
-        Ok(exit_info)
     }
 
     fn begin_turn(&mut self) -> TurnId {

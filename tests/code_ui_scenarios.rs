@@ -39,33 +39,6 @@ fn basic_chat_submit_updates_transcript() -> Result<()> {
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial]
-fn automation_reclaim_returns_control_to_tui() -> Result<()> {
-    let mut session = CodeSession::spawn(
-        CodeSessionOptions::new("reclaim", fixture("basic_chat")).with_pty_tui(),
-    )?;
-    session.attach_automation("scenario-reclaim")?;
-    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
-        controller_kind(snapshot) == Some("automation")
-    })?;
-
-    session.write_tui_line("/control reclaim")?;
-    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
-        controller_kind(snapshot) == Some("tui")
-    })?;
-
-    let (status, body) = session.submit_message_expect_error("/chat hello")?;
-    assert!(!status.is_success());
-    assert!(matches!(
-        error_code(&body),
-        Some("INVALID_CONTROLLER_TOKEN" | "CONTROLLER_CONFLICT")
-    ));
-
-    session.shutdown()
-}
-
-#[cfg(feature = "test-provider")]
-#[test]
-#[serial]
 fn cancel_running_turn_returns_session_to_idle() -> Result<()> {
     let mut session =
         CodeSession::spawn(CodeSessionOptions::new("cancel", fixture("delayed_chat")))?;
@@ -270,17 +243,18 @@ fn browser_same_client_reconnect_renews_existing_lease() -> Result<()> {
     session.shutdown()
 }
 
-/// `--browser-control` defaults to `off` for the harness's TUI fixture, so
-/// without `with_browser_control_loopback()` an attach must come back with
-/// `BROWSER_CONTROL_DISABLED` and the runtime stays controlled by the TUI.
+/// W5-06: the Web launch defaults `--browser-control` to `loopback`, so this
+/// scenario pins `off` explicitly — an attach must come back with
+/// `BROWSER_CONTROL_DISABLED` and no browser controller may be published.
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial]
 fn browser_attach_rejected_when_control_disabled() -> Result<()> {
-    let mut session = CodeSession::spawn(CodeSessionOptions::new(
-        "browser-disabled",
-        fixture("basic_chat"),
-    ))?;
+    let mut session = CodeSession::spawn(
+        CodeSessionOptions::new("browser-disabled", fixture("basic_chat"))
+            .push_extra_cli_arg("--browser-control")
+            .push_extra_cli_arg("off"),
+    )?;
 
     let (http_status, body) = session.attach_browser_expect_error("scenario-browser-disabled")?;
     assert_eq!(http_status, StatusCode::FORBIDDEN);
@@ -510,47 +484,10 @@ fn browser_write_appends_redacted_control_audit() -> Result<()> {
     session.shutdown()
 }
 
-/// `/control reclaim` from the TUI must clear an active browser lease and
-/// flip the controller back to `tui`. Subsequent writes from the browser's
-/// (now stale) lease token must be rejected. Browser counterpart of
-/// `automation_reclaim_returns_control_to_tui`.
-#[cfg(feature = "test-provider")]
-#[test]
-#[serial]
-fn local_tui_reclaim_invalidates_browser_lease() -> Result<()> {
-    let mut session = CodeSession::spawn(
-        CodeSessionOptions::new("browser-reclaim", fixture("basic_chat"))
-            .with_browser_control_loopback()
-            .with_pty_tui(),
-    )?;
-
-    let token = session.attach_browser("scenario-browser-reclaim")?;
-    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
-        controller_kind(snapshot) == Some("browser")
-    })?;
-
-    session.write_tui_line("/control reclaim")?;
-    session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
-        controller_kind(snapshot) == Some("tui")
-    })?;
-
-    let (status, body) = session.browser_submit_message(&token, "/chat hello")?;
-    assert!(
-        !status.is_success(),
-        "stale browser lease must be rejected after TUI reclaim, got {status}: {body}",
-    );
-    assert!(
-        matches!(
-            error_code(&body),
-            Some("INVALID_CONTROLLER_TOKEN" | "CONTROLLER_CONFLICT")
-        ),
-        "expected INVALID_CONTROLLER_TOKEN or CONTROLLER_CONFLICT, got: {body}",
-    );
-
-    session.shutdown()
-}
-
 /// Once a browser holds the lease, a second browser attempting to attach
+/// with a different `clientId` must trip `CONTROLLER_CONFLICT` instead of
+/// kicking the first writer out — the lease must be released or expire
+/// first. Mirrors the multi-tab scenario the frontend has to defend against.
 /// with a different `clientId` must trip `CONTROLLER_CONFLICT` instead of
 /// kicking the first writer out — the lease must be released or expire
 /// first. Mirrors the multi-tab scenario the frontend has to defend against.
@@ -608,14 +545,14 @@ fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
 /// Drive `/plan` through risk profile + `submit_intent_draft` until an
 /// `intent_review_choice` interaction is pending, then respond with
 /// `selected_option` and wait until the session leaves `awaiting_interaction`.
+///
+/// W5-06: these scenarios now run against the default headless Web launch —
+/// `HeadlessCodeRuntime` routes plain messages through Phase 0 and owns the
+/// IntentSpec review gate, so no PTY/TUI spawn is involved.
 #[cfg(feature = "test-provider")]
 fn plan_workflow_intent_review_respond(name: &str, selected_option: &str) -> Result<()> {
     let mut session = CodeSession::spawn(
-        // Plan Phase-0 routing still depends on the TUI App path until W3-03
-        // merges headless plan ownership; keep these scenarios on PTY/TUI.
-        CodeSessionOptions::new(name, fixture("plan_intent_review"))
-            .with_context("dev")
-            .with_pty_tui(),
+        CodeSessionOptions::new(name, fixture("plan_intent_review")).with_context("dev"),
     )?;
     session.attach_automation(&format!("scenario-{name}"))?;
 
@@ -757,8 +694,7 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
         let mut session = CodeSession::spawn(
             CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_intent_review"))
                 .with_existing_repo_dir(repo_dir.clone())
-                .with_context("dev")
-                .with_pty_tui(),
+                .with_context("dev"),
         )?;
         session.attach_automation(&format!("{case_name}-spawn"))?;
         session
@@ -797,8 +733,7 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
         CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_intent_review"))
             .with_existing_repo_dir(repo_dir)
             .with_resume_thread(&session_id)
-            .with_context("dev")
-            .with_pty_tui(),
+            .with_context("dev"),
     )?;
     resumed.attach_automation(&format!("{case_name}-resume"))?;
     let snapshot = resumed.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
@@ -834,166 +769,15 @@ fn plan_workflow_intent_review_survives_resume_and_can_be_confirmed() -> Result<
     resumed.shutdown()
 }
 
-/// Drive `/plan` through IntentSpec confirm → Phase 1 `post_plan_choice` →
-/// Execute → network-policy gate, then hard-kill and `--resume` so the
-/// network gate is restored before Allow/Deny.
-#[cfg(feature = "test-provider")]
-#[test]
-#[serial]
-fn plan_review_network_policy_survives_resume_and_can_be_denied() -> Result<()> {
-    use std::process::Command;
-
-    let case_name = "plan-review-network-resume";
-    let repo_root = tempfile::Builder::new()
-        .prefix(&format!("{case_name}-"))
-        .tempdir()
-        .context("failed to create plan-review resume tempdir")?;
-    let repo_dir = repo_root.path().join("repo");
-    std::fs::create_dir_all(&repo_dir).context("failed to create resume repo subdir")?;
-    std::fs::write(
-        repo_dir.join("README.md"),
-        "# Fixture\n\nPlaceholder for plan-review PTY.\n",
-    )
-    .context("failed to seed README.md")?;
-    let init = Command::new(env!("CARGO_BIN_EXE_libra"))
-        .args(["init", "--vault=false", "--quiet"])
-        .arg(&repo_dir)
-        .output()
-        .context("failed to run libra init for plan-review resume")?;
-    if !init.status.success() {
-        anyhow::bail!(
-            "libra init failed\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&init.stdout),
-            String::from_utf8_lossy(&init.stderr)
-        );
-    }
-
-    let session_id = {
-        let mut session = CodeSession::spawn(
-            CodeSessionOptions::new(format!("{case_name}-spawn"), fixture("plan_review"))
-                .with_existing_repo_dir(repo_dir.clone())
-                .with_context("dev")
-                .with_pty_tui(),
-        )?;
-        session.attach_automation(&format!("{case_name}-spawn"))?;
-        session
-            .submit_message("Add a Usage section to the README documenting the CLI commands.")?;
-        session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
-            interaction_status(snapshot, "call_request_user_input_1") == Some("pending")
-        })?;
-        let (http_status, body) = session.respond_interaction(
-            "call_request_user_input_1",
-            &json!({ "answers": { "risk_profile": ["Low"] } }),
-        )?;
-        assert_eq!(
-            http_status,
-            StatusCode::OK,
-            "risk profile answer rejected: {body}"
-        );
-
-        let snapshot = session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
-            find_interaction_by_kind(snapshot, "intent_review_choice")
-                .and_then(|interaction| interaction.get("status"))
-                .and_then(Value::as_str)
-                == Some("pending")
-        })?;
-        let intent_id = find_interaction_by_kind(&snapshot, "intent_review_choice")
-            .and_then(|interaction| interaction.get("id"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("intent_review_choice missing id: {snapshot}"))?
-            .to_string();
-        let (http_status, body) =
-            session.respond_interaction(&intent_id, &json!({ "selectedOption": "confirm" }))?;
-        assert_eq!(
-            http_status,
-            StatusCode::OK,
-            "intent confirm rejected: {body}"
-        );
-
-        let snapshot = session.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
-            find_post_plan_execute_interaction(snapshot)
-                .and_then(|interaction| interaction.get("status"))
-                .and_then(Value::as_str)
-                == Some("pending")
-        })?;
-        let plan_id = find_post_plan_execute_interaction(&snapshot)
-            .and_then(|interaction| interaction.get("id"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("post_plan_choice missing id: {snapshot}"))?
-            .to_string();
-        let (http_status, body) =
-            session.respond_interaction(&plan_id, &json!({ "selectedOption": "execute" }))?;
-        assert_eq!(http_status, StatusCode::OK, "plan Execute rejected: {body}");
-
-        session.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
-            find_network_policy_interaction(snapshot)
-                .and_then(|interaction| interaction.get("status"))
-                .and_then(Value::as_str)
-                == Some("pending")
-        })?;
-        let id = session
-            .wait_for_snapshot(Duration::from_secs(5), |snapshot| {
-                snapshot.get("sessionId").and_then(Value::as_str).is_some()
-            })?
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("snapshot missing sessionId"))?;
-        session.kill_without_cleanup()?;
-        id
-    };
-
-    let mut resumed = CodeSession::spawn(
-        CodeSessionOptions::new(format!("{case_name}-resume"), fixture("plan_review"))
-            .with_existing_repo_dir(repo_dir)
-            .with_resume_thread(&session_id)
-            .with_context("dev")
-            .with_pty_tui(),
-    )?;
-    resumed.attach_automation(&format!("{case_name}-resume"))?;
-    let snapshot = resumed.wait_for_snapshot(Duration::from_secs(20), |snapshot| {
-        find_network_policy_interaction(snapshot)
-            .and_then(|interaction| interaction.get("status"))
-            .and_then(Value::as_str)
-            == Some("pending")
-    })?;
-    assert_eq!(
-        status(&snapshot),
-        Some("awaiting_interaction"),
-        "resumed session must reopen the network-policy gate: {snapshot}"
-    );
-    let interaction_id = find_network_policy_interaction(&snapshot)
-        .and_then(|interaction| interaction.get("id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("restored network gate missing id: {snapshot}"))?
-        .to_string();
-    let (http_status, body) = resumed.respond_interaction(
-        &interaction_id,
-        &json!({ "selectedOption": "network-deny" }),
-    )?;
-    assert_eq!(
-        http_status,
-        StatusCode::OK,
-        "network-deny on restored gate should be accepted: {body}"
-    );
-    resumed.wait_for_snapshot(Duration::from_secs(30), |snapshot| {
-        status(snapshot) != Some("awaiting_interaction")
-            && find_network_policy_interaction(snapshot)
-                .and_then(|interaction| interaction.get("status"))
-                .and_then(Value::as_str)
-                == Some("resolved")
-    })?;
-    resumed.shutdown()
-}
-
 /// W2-03 Plan review / network-policy recovery contract (cargo filter: `plan_review`).
 ///
 /// Pins the network-policy human-gate labels and exercises the same
 /// `open_plan_review_from_workflow` / `open_network_policy_from_workflow`
-/// scans that `App::restore_pending_*` call after crash/resume — including
-/// the App-owned Execute→network marker ordering and the Back demote window.
-/// End-to-end PTY coverage lives in
-/// `plan_review_network_policy_survives_resume_and_can_be_denied`.
+/// scans that the Web resume path performs after crash/resume — including
+/// the Execute→network marker ordering and the Back demote window. The
+/// former end-to-end PTY scenario
+/// (`plan_review_network_policy_survives_resume_and_can_be_denied`) was
+/// deleted in W5-06 together with the TUI startup path it drove.
 #[test]
 fn plan_review_baseline_pins_network_policy_choices() {
     use libra::internal::ai::{
@@ -1226,50 +1010,6 @@ fn find_interaction_by_kind<'a>(snapshot: &'a Value, kind: &str) -> Option<&'a V
         .into_iter()
         .flatten()
         .find(|interaction| interaction.get("kind").and_then(Value::as_str) == Some(kind))
-}
-
-/// Plan-review Execute gate (`post_plan_choice` without `phase=networkPolicy`).
-/// Prefer a pending item when both Execute and network gates are present.
-#[cfg(feature = "test-provider")]
-fn find_post_plan_execute_interaction(snapshot: &Value) -> Option<&Value> {
-    let interactions = snapshot.get("interactions").and_then(Value::as_array)?;
-    let mut fallback = None;
-    for interaction in interactions {
-        if interaction.get("kind").and_then(Value::as_str) != Some("post_plan_choice") {
-            continue;
-        }
-        if interaction
-            .get("metadata")
-            .and_then(|metadata| metadata.get("phase"))
-            .and_then(Value::as_str)
-            == Some("networkPolicy")
-        {
-            continue;
-        }
-        if interaction.get("status").and_then(Value::as_str) == Some("pending") {
-            return Some(interaction);
-        }
-        fallback = Some(interaction);
-    }
-    fallback
-}
-
-/// Network-policy gate projected as `post_plan_choice` with `phase=networkPolicy`.
-#[cfg(feature = "test-provider")]
-fn find_network_policy_interaction(snapshot: &Value) -> Option<&Value> {
-    snapshot
-        .get("interactions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|interaction| {
-            interaction.get("kind").and_then(Value::as_str) == Some("post_plan_choice")
-                && interaction
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("phase"))
-                    .and_then(Value::as_str)
-                    == Some("networkPolicy")
-        })
 }
 
 #[cfg(feature = "test-provider")]

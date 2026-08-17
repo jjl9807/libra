@@ -44,11 +44,6 @@ impl<'s, 'a> ScenarioStep<'s, 'a> {
         Ok(self)
     }
 
-    pub fn reclaim_via_tui_command(mut self) -> Result<Self> {
-        self.with_context(|session| session.write_tui_line("/control reclaim"))?;
-        Ok(self)
-    }
-
     pub fn expect_controller_kind(mut self, expected: &str) -> Result<Self> {
         self.with_context(|session| {
             session

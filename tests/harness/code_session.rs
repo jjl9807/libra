@@ -84,13 +84,6 @@ pub struct CodeSessionOptions {
     /// matrix uses this for `--deepseek-thinking enabled
     /// --deepseek-reasoning-effort high`.
     pub extra_cli_args: Vec<String>,
-    /// W3-02 — when `true` (default), spawn the default headless
-    /// Web Code UI process so Code UI remote matrices drive it over
-    /// HTTP/SSE. W5-07 removed every PTY legacy-TUI entry except
-    /// bare `--provider codex --resume`, so `false` (set by
-    /// [`CodeSessionOptions::with_pty_tui`]) now fails the spawn with
-    /// an actionable error instead of silently launching Web.
-    pub web_only: bool,
 }
 
 impl CodeSessionOptions {
@@ -111,19 +104,7 @@ impl CodeSessionOptions {
             model_override: None,
             env_file: None,
             extra_cli_args: Vec::new(),
-            web_only: true,
         }
-    }
-
-    /// Historical PTY + legacy-TUI spawn for reclaim / SIGTERM
-    /// scenarios. W5-07 removed the hidden legacy-TUI rollback env,
-    /// so this option can no longer reach a terminal TUI: it flips
-    /// `web_only` to `false` and `CodeSession::spawn` fails with an
-    /// actionable error until W5-06 removes the TUI startup path and
-    /// reworks these scenarios.
-    pub fn with_pty_tui(mut self) -> Self {
-        self.web_only = false;
-        self
     }
 
     /// Wave 11 / PR 11 — point the spawn at a live provider
@@ -243,11 +224,7 @@ pub struct CodeSession {
     /// sessions never get a control token file, so the harness should not
     /// look for one and authorized POSTs are limited to non-write routes.
     control_write: bool,
-    /// W3-02: when true, the child is the headless Web process (no TUI
-    /// `/quit` path). W5-07: always true — `spawn` rejects `false`.
-    web_only: bool,
     child: Option<Box<dyn Child + Send + Sync>>,
-    writer: Option<Box<dyn Write + Send>>,
     reader_thread: Option<thread::JoinHandle<()>>,
     client: Client,
 }
@@ -262,21 +239,6 @@ struct ControlInfo {
 
 impl CodeSession {
     pub fn spawn(options: CodeSessionOptions) -> Result<Self> {
-        if !options.web_only {
-            // W5-07: the hidden legacy-TUI rollback env is gone, so a PTY
-            // spawn can no longer reach the terminal TUI — bare `libra code`
-            // always launches the Web Code UI. The only remaining TUI entry
-            // is bare `--provider codex --resume` (removed in W5-06 together
-            // with the TUI startup path). Fail loudly instead of hanging on
-            // a `/quit` writer the Web process never reads.
-            bail!(
-                "legacy TUI spawn is no longer reachable: the W5-07 removal left bare \
-                 `--provider codex --resume` as the only TUI entry (W5-06 deletes the TUI \
-                 startup path and reworks the PTY scenarios); scenario '{}' must not use \
-                 with_pty_tui()",
-                options.name
-            );
-        }
         let bin = libra_bin();
         let temp = tempfile::Builder::new()
             .prefix(&format!("libra-code-ui-{}-", options.name))
@@ -369,11 +331,6 @@ impl CodeSession {
             }
         });
 
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to take PTY writer")?;
-
         let mut cmd = CommandBuilder::new(&bin);
         // Wave 11 / PR 11 — split the provider / model / fixture
         // args so a live-provider spawn (model_generation matrix)
@@ -462,9 +419,7 @@ impl CodeSession {
             browser_bootstrap: None,
             controller_token: None,
             control_write: options.control_write,
-            web_only: options.web_only,
             child: Some(child),
-            writer: Some(writer),
             reader_thread: Some(reader_thread),
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -1363,20 +1318,6 @@ impl CodeSession {
         Ok(status)
     }
 
-    pub fn write_tui_line(&mut self, line: &str) -> Result<()> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| anyhow!("PTY writer is closed"))?;
-        writer
-            .write_all(line.as_bytes())
-            .context("failed to write line to PTY")?;
-        writer
-            .write_all(b"\r")
-            .context("failed to write enter key to PTY")?;
-        writer.flush().context("failed to flush PTY writer")
-    }
-
     pub fn wait_for_snapshot<F>(&self, timeout: Duration, mut predicate: F) -> Result<Value>
     where
         F: FnMut(&Value) -> bool,
@@ -1404,34 +1345,12 @@ impl CodeSession {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        if self.web_only {
-            // Headless Web has no TUI `/quit` reader — SIGTERM the process so
-            // control-file cleanup still runs through the lifecycle owner.
-            return self.terminate_without_cleanup();
-        }
-        if let Some(writer) = self.writer.as_mut() {
-            let _ = writer.write_all(b"/quit\r");
-            let _ = writer.flush();
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if self.child_exited()? {
-                self.join_reader();
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        self.join_reader();
-        Ok(())
+        // Headless Web has no TUI `/quit` reader — SIGTERM the process so
+        // control-file cleanup still runs through the lifecycle owner.
+        self.terminate_without_cleanup()
     }
 
-    /// Abruptly terminate the spawned TUI without sending `/quit`.
+    /// Abruptly terminate the spawned process without a graceful shutdown.
     ///
     /// This intentionally leaves default control files behind when the child is
     /// killed with SIGKILL, letting stale-PID takeover tests prove a follow-up
@@ -1463,7 +1382,7 @@ impl CodeSession {
         Ok(())
     }
 
-    /// Ask the spawned TUI to terminate without first sending `/quit`.
+    /// Ask the spawned process to terminate via SIGTERM.
     ///
     /// Unlike [`Self::shutdown`], this exercises OS-level process termination
     /// while preserving any session snapshots the runtime already flushed.
@@ -1670,7 +1589,6 @@ impl CodeSession {
     }
 
     fn join_reader(&mut self) {
-        self.writer.take();
         if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }

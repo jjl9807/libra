@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Removed (plan-20260715 W5-06, 2026-08-17; ships with the W5-09 breaking minor)
+
+- **W5-06 removes the legacy Code TUI startup path from `libra code`.**
+  Every non-stdio `libra code` now launches the Web Code UI: the
+  `execute_tui` startup path, the `TuiCodeUiAdapter`, terminal
+  alternate-screen/panic-hook setup, and the follow-up
+  `libra graph --json <thread_id>` printed on TUI exit are gone. Bare
+  `libra code --provider codex --resume <thread_id>` no longer dispatches
+  to the legacy TUI resume driver — it fails with a clap usage error plus
+  a migration hint (managed Codex Web resume has not landed; Web
+  `--provider codex` still rejects `--resume`), while non-Codex Web
+  `--resume <thread_id>` in the same working directory is unchanged. With
+  no TUI mode left that accepted it, `--network-access allow` is now
+  rejected in every mode until the Plan network-policy gate owns
+  per-execution sandbox network (W5-09 aggregates the release note for the
+  whole W5-01 family; no version bump here). Migration: use plain
+  `libra code` (Web Code UI); resume threads with a non-Codex Web
+  `--resume <thread_id>` in the same working directory; approve network
+  through the Plan review gate instead of `--network-access allow`.
+
 ### Removed (plan-20260715 W5-07, 2026-08-16; ships with the W5-09 breaking minor)
 
 - **W5-07 removes the deprecated `--web` / `--web-only` aliases and the
@@ -12,9 +32,9 @@
   bake-period rollback capability ends with this change (W5-09 aggregates
   the release note for the whole W5-01 family; no version bump here).
   Migration: drop `--web` / `--web-only` and unset `LIBRA_CODE_LEGACY_TUI`;
-  plain `libra code` already opens the Web Code UI. Bare
-  `libra code --provider codex --resume <thread_id>` still uses the legacy
-  TUI resume driver until W5-06 removes the TUI startup path.
+  plain `libra code` already opens the Web Code UI. The bare
+  `libra code --provider codex --resume <thread_id>` TUI resume driver was
+  later removed by W5-06 (see the W5-06 entry above).
 
 ### Removed (plan-20260715 W5-08, 2026-08-16; ships with the W5-09 breaking minor)
 

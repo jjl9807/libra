@@ -7,8 +7,6 @@
 //!
 //! The command orchestrates several concurrent subsystems:
 //!
-//! - **TUI (Terminal UI)**: A `ratatui`/`crossterm`-based interactive terminal interface
-//!   that renders the chat conversation, tool outputs, and approval prompts.
 //! - **Web Server**: An embedded `axum` HTTP server that serves the Next.js static export
 //!   from `web/out/`, providing a browser-based UI alternative.
 //! - **MCP Server**: A Model Context Protocol server (using `rmcp`) that exposes Libra's
@@ -24,18 +22,14 @@
 //! | Mode | Flag | Description |
 //! |------|------|-------------|
 //! | **Web** (default) | *(none)* | Headless web server + MCP; prints URL/control info and waits |
-//! | **Legacy TUI** | bare `--provider codex --resume` | Terminal UI resume driver (hidden; removed in W5-06) |
 //! | **Stdio** | `--stdio` | MCP server over stdin/stdout for AI client integration |
 //!
 //! ## Provider Dispatch
 //!
-//! The `--provider` flag selects the AI backend. Each provider follows the same pattern:
-//! 1. Create a client from environment variables (API keys).
-//! 2. Instantiate a completion model with the selected (or default) model name.
-//! 3. Pass the model into the shared `run_tui_with_model` function.
-//!
-//! The `codex` provider bypasses the generic completion model path and uses its
-//! managed app-server runtime with a dedicated execution flow.
+//! The `--provider` flag selects the AI backend. The default Web launch builds
+//! the provider inside the headless runtime (`build_non_codex_headless_runtime`
+//! for generic completion providers, `start_codex_code_ui_runtime` for the
+//! managed Codex app-server).
 //!
 //! ## Sandbox & Approval
 //!
@@ -99,54 +93,46 @@ use crate::{
     internal::{
         ai::{
             agent::{
-                TaskIntent, ToolLoopConfig,
+                TaskIntent,
                 profile::{AgentProfileRouter, AgentsConfig, load_profiles},
             },
             codex as agent_codex,
-            commands::{CommandDispatcher, load_commands},
             completion::{
-                CompletionError, CompletionModel, CompletionReasoningEffort, CompletionRequest,
-                CompletionResponse, CompletionThinking, CompletionUsage,
+                CompletionModel, CompletionReasoningEffort, CompletionThinking, CompletionUsage,
             },
             context_budget::ContextBudget,
             history::HistoryManager,
-            hooks::HookRunner,
             mcp::server::LibraMcpServer,
             permission::{
                 ApprovalRuntimeCacheError, resolve_approval_runtime_cache,
                 unbound_approval_cache_scope,
             },
-            projection::{ProjectionRebuilder, ProjectionResolver, ThreadBundle},
+            projection::ThreadBundle,
             prompt::{ContextMode, SystemPromptBuilder},
             providers::{
                 anthropic::CLAUDE_3_5_SONNET, gemini::GEMINI_2_5_FLASH, kimi::KIMI_K2_6,
                 openai::GPT_4O_MINI, zhipu::GLM_5,
             },
             runtime::{
-                AgentRuntimeWorker, AgentRuntimeWorkerConfig, CodeAgentApprovalConfig,
-                CodeAgentSandboxProfile, CodeAgentServicesBuilder, DeferredPlanExecutionExecutor,
-                InMemoryAuditSink, LifecycleShutdownError, LifecycleShutdownOwner,
-                LifecycleStepError, RuntimeCommandDurability, SecretRedactor, ToolBoundaryRuntime,
+                CodeAgentApprovalConfig, CodeAgentSandboxProfile, CodeAgentServicesBuilder,
+                LifecycleShutdownError, LifecycleShutdownOwner, LifecycleStepError, SecretRedactor,
                 lifecycle_resource, tool_runtime_context,
             },
             sandbox::{
-                ApprovalCachePolicy, ApprovalStore, AskForApproval, DEFAULT_APPROVAL_TTL,
-                ExecApprovalRequest, ToolRuntimeContext, load_approval_project_config,
+                ApprovalCachePolicy, AskForApproval, DEFAULT_APPROVAL_TTL, ExecApprovalRequest,
+                ToolRuntimeContext, load_approval_project_config,
             },
             session::{SessionJsonlStore, SessionState, SessionStore},
-            skills::{SkillDispatcher, load_skills},
-            sources::{SourcePool, register_builtin_mcp_source_from_project_config},
             tools::{ToolRegistry, context::UserInputRequest},
             usage::{UsageContext, UsagePriceTable, UsageRecorder},
             web::{
                 WebServerHandle, WebServerOptions,
                 code_ui::{
                     CodeUiCapabilities, CodeUiControllerKind, CodeUiInitialController,
-                    CodeUiInteractionStatus, CodeUiProviderAdapter, CodeUiProviderInfo,
-                    CodeUiRuntimeHandle, CodeUiRuntimeOptions, CodeUiSession,
-                    CodeUiSessionSnapshot, CodeUiSessionStatus, CodeUiTranscriptEntry,
-                    CodeUiTranscriptEntryKind, ReadOnlyCodeUiAdapter, initial_snapshot,
-                    snapshot_from_thread_bundle,
+                    CodeUiInteractionStatus, CodeUiProviderInfo, CodeUiRuntimeHandle,
+                    CodeUiRuntimeOptions, CodeUiSession, CodeUiSessionSnapshot,
+                    CodeUiSessionStatus, CodeUiTranscriptEntry, CodeUiTranscriptEntryKind,
+                    ReadOnlyCodeUiAdapter, initial_snapshot, snapshot_from_thread_bundle,
                 },
                 code_ui_projection::{
                     MAX_CODE_UI_PROJECTION_EVENTS, MAX_CODE_UI_PROJECTION_REPLAY_BYTES,
@@ -160,18 +146,13 @@ use crate::{
             },
         },
         db::establish_connection,
-        tui::{
-            App, AppConfig, ExitReason, ProcessTerminateGate, Tui, TuiCodeUiAdapter,
-            control::TuiControlCommand, tui_init, tui_restore,
-        },
+        tui::ProcessTerminateGate,
     },
     utils::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
-        fuse as fuse_utils,
         output::OutputConfig,
         pager::LIBRA_TEST_ENV,
-        storage::local::LocalStorage,
         util::{DATABASE, try_get_storage_path},
     },
 };
@@ -260,9 +241,8 @@ pub enum ControlMode {
 /// [`ensure_loopback_browser_control_host`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, Default)]
 pub enum BrowserControlMode {
-    /// Browser controllers cannot attach. Default for the legacy TUI resume
-    /// driver (bare `--provider codex --resume`) and for explicit
-    /// `--browser-control off`.
+    /// Browser controllers cannot attach. Selected explicitly with
+    /// `--browser-control off` (e.g. for non-loopback `--host` binds).
     #[default]
     Off,
     /// Browser controllers may attach as long as the bound `--host` is
@@ -369,7 +349,7 @@ impl From<DeepSeekReasoningEffortArg> for CompletionReasoningEffort {
 }
 
 /// User-facing approval policy controlling when tool execution requires
-/// explicit human confirmation in the TUI.
+/// explicit human confirmation in the Code UI session.
 ///
 /// This enum is the CLI-facing representation; it converts into the internal
 /// [`AskForApproval`] enum via the `From` impl below.
@@ -396,7 +376,11 @@ pub enum CodeApprovalPolicy {
     Untrusted,
 }
 
-/// Developer-selected network access policy for TUI execution.
+/// Developer-selected network access policy for shell/gate execution.
+///
+/// Only the default `deny` is accepted today: `allow` is rejected in every
+/// mode until the Plan network-policy gate owns per-execution sandbox
+/// network (approve network in Plan review instead).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CodeNetworkAccess {
     /// Allow shell and gate tasks to use network access.
@@ -437,9 +421,8 @@ impl From<CodeApprovalPolicy> for AskForApproval {
 
 /// `--help` examples shown in `libra code --help` output.
 ///
-/// `code` launches the interactive Libra Code session in one of three
-/// modes: Web Code UI (the default), the legacy TUI resume driver
-/// (bare `--provider codex --resume` only; removed in W5-06), or stdio.
+/// `code` launches the interactive Libra Code session in one of two
+/// modes: Web Code UI (the default) or stdio.
 /// The banner pins the most common invocations (Web default, provider
 /// selection, `--browser-control loopback`, `--control write`, resume,
 /// plan mode, and `--env-file`) so users see the right entry point
@@ -463,7 +446,7 @@ EXAMPLES:
 /// Command-line arguments for `libra code`.
 ///
 /// This struct is parsed by `clap` and drives the operating modes
-/// (Web default, legacy TUI resume driver, stdio). Many flags are
+/// (Web default, stdio). Many flags are
 /// mode-specific and validated at runtime by [`validate_mode_args`].
 #[derive(Parser, Debug)]
 #[command(after_help = CODE_EXAMPLES)]
@@ -493,8 +476,8 @@ pub struct CodeArgs {
 
     /// Local automation control mode (`observe` | `write` | `stdio`).
     ///
-    /// `observe` / `write` configure the Web/TUI launch control sidecar.
-    /// `stdio` is a client-only JSON-RPC NDJSON shim (no Web/TUI/MCP).
+    /// `observe` / `write` configure the Web launch control sidecar.
+    /// `stdio` is a client-only JSON-RPC NDJSON shim (no Web/MCP launch).
     #[arg(long, value_enum, default_value_t = ControlMode::Observe)]
     pub control: ControlMode,
 
@@ -502,7 +485,7 @@ pub struct CodeArgs {
     ///
     /// Defaults are mode-specific:
     /// - Web launch (the default) → `loopback`
-    /// - Legacy TUI resume driver (bare `--provider codex --resume`) → `off`
+    /// - `--stdio` (MCP transport) → `off` (the flag conflicts with `--stdio`)
     ///
     /// Selecting `loopback` is rejected when `--host` is not a loopback
     /// address, and the flag is incompatible with `--stdio`. Use
@@ -611,7 +594,9 @@ pub struct CodeArgs {
     #[arg(long = "approval-ttl", value_name = "SECS")]
     pub approval_ttl: Option<u64>,
 
-    /// Network access policy for TUI shell and gate execution.
+    /// Network access policy for shell and gate execution (`allow` is
+    /// rejected in every mode until the Plan network-policy gate owns
+    /// per-execution sandbox network).
     #[arg(long, value_enum, default_value_t = CodeNetworkAccess::Deny)]
     pub network_access: CodeNetworkAccess,
 
@@ -701,18 +686,12 @@ pub(crate) fn effective_plan_mode(args: &CodeArgs) -> bool {
 // Top-level entry point — mode dispatch
 // ---------------------------------------------------------------------------
 
-/// Managed Codex Web has no Libra `--resume` protocol yet. Preserve the
-/// pre-W4 TUI resume driver for bare `libra code --provider codex --resume …`
-/// so existing sessions remain recoverable after the Web default cutover.
-/// W5-06 removes this driver together with the Code TUI startup path.
-fn codex_resume_uses_legacy_tui(args: &CodeArgs) -> bool {
-    !args.stdio && matches!(args.provider, CodeProvider::Codex) && args.resume.is_some()
-}
-
 /// True when this invocation runs the Web Code UI path (the default), as
-/// opposed to `--stdio` or the Codex `--resume` TUI compatibility path.
+/// opposed to `--stdio`. Bare `--provider codex --resume` no longer reaches a
+/// launch path: the legacy TUI resume driver was removed in W5-06 and
+/// `validate_mode_args` rejects the combination with a migration hint.
 fn code_uses_web_launch(args: &CodeArgs) -> bool {
-    !args.stdio && !codex_resume_uses_legacy_tui(args)
+    !args.stdio
 }
 
 /// Stderr pin for W4-03: MCP `--stdio` is legacy tools/resources only (C6), not
@@ -729,13 +708,12 @@ fn warn_deprecated_mcp_stdio() {
 /// - `--control stdio`: JSON-RPC NDJSON automation client (no Web/TUI/MCP)
 /// - `--stdio`: MCP over stdin/stdout
 /// - default: Web Code UI + AgentRuntime
-/// - bare `--provider codex --resume`: legacy TUI resume driver (hidden; W5-06 removes it)
 ///
 /// # Side Effects
 /// - May start local web, MCP, and Codex app-server processes depending on mode.
 /// - May create `.libra/objects` and connect to `.libra/libra.db` for history.
 /// - In Web mode, prints URL / control details and waits for SIGINT/SIGTERM.
-/// - In legacy TUI mode, may mutate the workspace through registered tools,
+/// - In Web mode, tools may mutate the workspace through the headless AgentRuntime,
 ///   subject to sandbox and approval policy.
 /// - In MCP stdio mode, owns stdin/stdout for the MCP session.
 /// - In `--control stdio` mode, owns stdin/stdout for JSON-RPC NDJSON only.
@@ -798,13 +776,8 @@ pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     validate_mode_args(&args, output).map_err(CliError::command_usage)?;
     if args.stdio {
         execute_stdio(&args).await
-    } else if code_uses_web_launch(&args) {
-        execute_web_only(&args).await
     } else {
-        eprintln!(
-            "note: `--provider codex --resume` uses the legacy TUI resume driver until managed Codex Web resume lands"
-        );
-        execute_tui(args).await
+        execute_web_only(&args).await
     }
 }
 
@@ -1012,45 +985,6 @@ async fn push_control_runtime_lifecycle_step(
             // Drop also calls cleanup which is fine/idempotent. Just drop.
             drop(control_runtime);
             Ok(())
-        })
-        .await;
-}
-
-#[cfg(unix)]
-async fn push_fuse_task_worktree_lifecycle_step(
-    owner: &LifecycleShutdownOwner,
-    repo_working_dir: std::path::PathBuf,
-) {
-    owner
-        .push_step(lifecycle_resource::FUSE_TASK_WORKTREE, async move {
-            let display_repo = repo_working_dir.display().to_string();
-            let sweep = tokio::task::spawn_blocking(move || {
-                fuse_utils::sweep_repo_fuse_task_worktrees(&repo_working_dir)
-            });
-            match sweep.await {
-                Ok(Ok(report)) => {
-                    if !report.is_empty() {
-                        tracing::info!(
-                            repo = %display_repo,
-                            scanned = report.scanned,
-                            cleaned = report.cleaned,
-                            skipped_live_owner = report.skipped_live_owner,
-                            failures = report.failures.len(),
-                            "swept repo-local FUSE task worktrees during lifecycle shutdown"
-                        );
-                    }
-                    for failure in report.failures {
-                        tracing::warn!(
-                            path = %failure.path.display(),
-                            error = %failure.message,
-                            "failed to clean repo-local FUSE task worktree during lifecycle shutdown"
-                        );
-                    }
-                    Ok(())
-                }
-                Ok(Err(err)) => Err(LifecycleStepError::failed(err.to_string())),
-                Err(err) => Err(LifecycleStepError::failed(err.to_string())),
-            }
         })
         .await;
 }
@@ -1493,7 +1427,7 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Mode: TUI — full interactive terminal with background servers
+// Shared bootstrap helpers — env files, credentials, provider factories
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
@@ -1650,7 +1584,7 @@ fn provider_env_value_with_lookup(
 }
 
 /// Resolve a provider credential / base-URL key with the shared env-file →
-/// process/Vault precedence used by default Web and legacy TUI bootstrap.
+/// process/Vault precedence used by the default Web bootstrap.
 ///
 /// Exposed for W4-01 verification (`default_web_env_file_precedence`): an
 /// env-file value must win over a competing process-env value for the same key.
@@ -1962,54 +1896,6 @@ fn build_any_completion_model_for_args_with_lookup(
     Ok((model, model_name, provider_id_str))
 }
 
-/// Resolve the **effective** [`CodeProvider`] enum that downstream
-/// provider-specific helpers should dispatch on (OC-Phase 2 P2.4).
-///
-/// When `--agent <name>` is set and the agent's profile carries a structured
-/// `model: provider/model` binding, the effective provider is the one named
-/// by the binding's `provider_id`. Otherwise the effective provider is the
-/// CLI `--provider` default.
-///
-/// An agent binding whose `provider_id` does NOT map to a known
-/// [`CodeProvider`] variant is rejected with a `command_usage` error.
-/// Silently falling back to `args.provider` would leave the system prompt /
-/// context-budget / completion knobs computed against the CLI provider
-/// while the model is ultimately built for a different (or non-existent)
-/// provider — a partial-misconfiguration trap. The list of known provider
-/// ids stays in lock-step with [`provider_id::ALL_PRODUCTION`] (plus
-/// `FAKE` under the `test-provider` feature).
-fn effective_code_provider_for_args(
-    args: &CodeArgs,
-    working_dir: &std::path::Path,
-) -> CliResult<CodeProvider> {
-    use crate::internal::ai::providers::runtime::provider_id;
-
-    let Some(binding) = resolve_agent_binding_override(args, working_dir)? else {
-        return Ok(args.provider);
-    };
-    let mapped = match binding.provider_id.as_str() {
-        provider_id::GEMINI => Some(CodeProvider::Gemini),
-        provider_id::OPENAI => Some(CodeProvider::Openai),
-        provider_id::ANTHROPIC => Some(CodeProvider::Anthropic),
-        provider_id::DEEPSEEK => Some(CodeProvider::Deepseek),
-        provider_id::KIMI => Some(CodeProvider::Kimi),
-        provider_id::ZHIPU => Some(CodeProvider::Zhipu),
-        provider_id::OLLAMA => Some(CodeProvider::Ollama),
-        #[cfg(feature = "test-provider")]
-        provider_id::FAKE => Some(CodeProvider::Fake),
-        _ => None,
-    };
-    mapped.ok_or_else(|| {
-        CliError::command_usage(format!(
-            "agent '{}' selects provider '{}', which is not a known `--provider` value. \
-             Pick a binding whose provider id is one of: {}",
-            args.agent.as_deref().unwrap_or("?"),
-            binding.provider_id,
-            provider_id::ALL_PRODUCTION.join(", "),
-        ))
-    })
-}
-
 /// Look up the agent profile selected by `--agent <name>` and return its
 /// structured `ModelBinding` if the profile carries one (OC-Phase 2 P2.4).
 ///
@@ -2052,244 +1938,6 @@ fn resolve_agent_binding_override(
         )));
     }
     Ok(spec.model)
-}
-
-/// Main TUI execution path: initializes the AI provider, builds the tool
-/// registry, starts background web/MCP servers, and launches the interactive
-/// terminal application.
-///
-/// This function handles provider-specific client creation (API key validation,
-/// model selection) and delegates the actual TUI lifecycle to [`run_tui_with_model`].
-///
-/// # Side Effects
-/// - Reads provider credentials from environment variables and optional dotenv
-///   files.
-/// - Registers local file, shell, planning, and MCP bridge tools for the agent.
-/// - May start web/MCP background services and a managed Codex app-server.
-/// - May mutate the workspace through tools when the selected context permits it.
-///
-/// # Errors
-/// Returns [`CliError`] for missing credentials, invalid provider configuration,
-/// unsafe mode/host combinations, provider bootstrap failures, or failures from
-/// the shared TUI lifecycle.
-async fn execute_tui(args: CodeArgs) -> CliResult<()> {
-    let working_dir = resolve_code_working_dir(&args)?;
-    let env_file = load_code_env_file(args.env_file.as_deref())?;
-    let browser_control = resolve_browser_control_mode(&args)?;
-    // Install SIGINT/SIGTERM before spawning the managed Codex child or binding
-    // listeners so a supervisor signal during bootstrap still reaches cleanup.
-    let process_terminate = ProcessTerminateGate::install().map_err(|error| {
-        CliError::failure(format!(
-            "failed to install the TUI process terminate listener: {error}"
-        ))
-    })?;
-    let control_runtime = prepare_control_runtime(&args, &working_dir).await?;
-
-    let task_intent = task_intent_for_context(args.context);
-    // OC-Phase 2 P2.4: resolve `--agent <name>` once before any provider-
-    // specific knob (context budget, completion thinking / reasoning /
-    // stream, preamble) is computed. When the agent's spec carries a
-    // structured binding, the effective provider may differ from the CLI
-    // `--provider` default; downstream computations need the agent's
-    // provider, not the CLI one.
-    let effective_provider = effective_code_provider_for_args(&args, &working_dir)?;
-    let effective_model_for_preamble = if effective_provider == args.provider {
-        args.model.as_deref().map(str::to_string)
-    } else {
-        // The agent override path resolves the concrete model id later
-        // inside `build_any_completion_model_for_args`; here we only need
-        // it for `system_preamble`'s context budget defaulting, where
-        // `None` falls back to the provider's flagship via
-        // [`default_context_budget_model`].
-        None
-    };
-    let preamble = system_preamble(
-        &working_dir,
-        args.context,
-        effective_provider,
-        effective_model_for_preamble.as_deref(),
-    )
-    .map_err(CliError::failure)?;
-    let temperature = args.temperature;
-    let thinking = completion_thinking_for_provider(effective_provider, &args);
-    let reasoning_effort = completion_reasoning_effort_for_provider(effective_provider, &args);
-    let stream = completion_stream_for_provider(effective_provider, &args);
-    let preserve_reasoning_content = preserve_reasoning_content_for_provider(effective_provider);
-    let resume_thread_id = args.resume.clone();
-    let host = args.host.clone();
-    let trace_id = resume_thread_id
-        .as_deref()
-        .and_then(|thread_id| Uuid::parse_str(thread_id).ok())
-        .unwrap_or_else(Uuid::new_v4);
-
-    // Prepare MCP server instance shared between the HTTP transport and TUI bridge.
-    // INVARIANT: the same server instance backs both transports so an agent sees
-    // one coherent history/object store regardless of whether a tool is invoked
-    // through HTTP MCP or the in-process TUI bridge.
-    let mcp_server = init_mcp_server(&working_dir).await;
-
-    // Create the bridge channel for request_user_input tool <-> TUI communication.
-    let (user_input_tx, user_input_rx) = tokio::sync::mpsc::unbounded_channel::<UserInputRequest>();
-    let (exec_approval_tx, exec_approval_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ExecApprovalRequest>();
-
-    // Runtime-owned services build the single hardened registry for both
-    // launch profiles.  The TUI merely selects the baseline capability set.
-    let registry = CodeAgentServicesBuilder::tui_baseline_with_redactor(
-        working_dir.clone(),
-        trace_id,
-        user_input_tx.clone(),
-        mcp_server.clone(),
-        (*projection_secret_redactor(&env_file)).clone(),
-    )
-    .build()
-    .registry();
-    let allowed_tools = registry.filter_by_intent(task_intent);
-
-    // Single source of truth for the args -> approval-context mapping
-    // (criterion 2), shared with the headless launch path.
-    let approval_cfg =
-        tui_approval_config_from_args(&args, registry.working_dir()).map_err(CliError::failure)?;
-    let (approval_cfg, approval_cache_scope) =
-        hydrate_tui_approval_runtime(registry.working_dir(), approval_cfg)
-            .await
-            .map_err(CliError::failure)?;
-    let provider_name = format!("{:?}", args.provider).to_lowercase();
-    let mut launch_config = TuiLaunchConfig {
-        host,
-        port: args.port,
-        mcp_port: args.mcp_port,
-        registry,
-        preamble,
-        temperature,
-        thinking,
-        reasoning_effort,
-        stream,
-        preserve_reasoning_content,
-        allowed_tools: Some(allowed_tools),
-        auto_classify_first_user_message: args.context.is_none(),
-        context: args.context,
-        resume_thread_id,
-        approval_policy: approval_cfg.policy,
-        allow_all_commands: approval_cfg.allow_all_commands,
-        approval_ttl: approval_cfg.ttl,
-        approval_cache_policy: approval_cfg.cache_policy,
-        approval_cache_scope,
-        network_access: args.network_access.is_allowed(),
-        user_input_rx,
-        exec_approval_rx,
-        exec_approval_tx,
-        mcp_server,
-        control_runtime,
-        browser_control,
-        initial_goal: args.goal.clone(),
-        managed_codex_server: None,
-        process_terminate,
-        secret_redactor: projection_secret_redactor(&env_file),
-    };
-
-    // Create agent based on provider. Every non-Codex provider funnels
-    // through `ProviderFactory`; Codex keeps its own managed-runtime path.
-    match args.provider {
-        CodeProvider::Codex => {
-            let server =
-                start_managed_codex_server(&args.codex_bin, args.codex_port, &working_dir).await?;
-            if launch_config.process_terminate.is_signaled() {
-                let shutdown_error =
-                    shutdown_code_lifecycle(None, None, None, None, Some(server), None)
-                        .await
-                        .err();
-                let mut error = CliError::failure(
-                    "received a terminate signal while starting the managed Codex child; shutting down"
-                        .to_string(),
-                );
-                if let Some(shutdown_error) = shutdown_error {
-                    error = error.with_detail("shutdown", shutdown_error.to_string());
-                }
-                return Err(error);
-            }
-            let browser_write_enabled =
-                launch_config.browser_control == BrowserControlMode::Loopback;
-            // `LocalTui` keeps the terminal as the visible owner while letting
-            // browser/automation leases attach when their writer is enabled.
-            // Fall back to `Fixed { Tui }` only when both writers are off
-            // (read-only observe).
-            let initial_controller =
-                if launch_config.control_runtime.is_write() || browser_write_enabled {
-                    CodeUiInitialController::LocalTui {
-                        owner_label: "Terminal UI".to_string(),
-                        reason: Some("The terminal UI controls this live Codex run".to_string()),
-                    }
-                } else {
-                    CodeUiInitialController::Fixed {
-                        kind: CodeUiControllerKind::Tui,
-                        owner_label: "Terminal UI".to_string(),
-                        reason: Some("The terminal UI controls this live Codex run".to_string()),
-                    }
-                };
-            let code_ui_runtime = match start_codex_code_ui_runtime(
-                &args,
-                &working_dir,
-                &server.ws_url,
-                launch_config.mcp_server.clone(),
-                browser_write_enabled,
-                initial_controller,
-            )
-            .await
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let mut server = server;
-                    if let Err(cleanup_error) = server.shutdown().await {
-                        return Err(CliError::failure(format!(
-                            "failed to initialize the managed Codex runtime: {error}; managed Codex cleanup failed: {cleanup_error}"
-                        )));
-                    }
-                    return Err(error);
-                }
-            };
-            if launch_config.process_terminate.is_signaled() {
-                let shutdown_error = shutdown_code_lifecycle(
-                    Some(code_ui_runtime),
-                    None,
-                    None,
-                    None,
-                    Some(server),
-                    None,
-                )
-                .await
-                .err();
-                let mut error = CliError::failure(
-                    "received a terminate signal while initializing the managed Codex runtime; shutting down"
-                        .to_string(),
-                );
-                if let Some(shutdown_error) = shutdown_error {
-                    error = error.with_detail("shutdown", shutdown_error.to_string());
-                }
-                return Err(error);
-            }
-            let model_name = args.model.clone().unwrap_or_else(|| "codex".to_string());
-            launch_config.managed_codex_server = Some(server);
-            run_tui_with_managed_code_runtime(
-                code_ui_runtime,
-                launch_config,
-                model_name,
-                provider_name,
-            )
-            .await?;
-        }
-        _ => {
-            // OC-Phase 2 P2.4: the helper returns the *effective* provider
-            // name so usage / UI metadata reports the agent-selected
-            // provider after a `--agent <name>` override, not the CLI
-            // `--provider` default that the helper started from.
-            let (model, model_name, effective_provider_name) =
-                build_any_completion_model_for_args(&args, &env_file, &working_dir)?;
-            run_tui_with_model(model, launch_config, model_name, effective_provider_name).await?;
-        }
-    }
-
-    Ok(())
 }
 
 fn completion_thinking_for_args(args: &CodeArgs) -> Option<CompletionThinking> {
@@ -2466,10 +2114,6 @@ struct ControlRuntimeConfig {
 }
 
 impl ControlRuntimeConfig {
-    fn is_write(&self) -> bool {
-        self.mode == ControlMode::Write
-    }
-
     fn mode_name(&self) -> &'static str {
         match self.mode {
             ControlMode::Observe => "observe",
@@ -2650,7 +2294,7 @@ fn ensure_loopback_browser_control_host(host: &str) -> CliResult<()> {
 /// User-supplied `--browser-control` always wins. When the flag is omitted
 /// the default is mode-aware:
 ///   - Web launch (the default) → `loopback` (interactive browser writes)
-///   - Legacy TUI resume driver (bare `--provider codex --resume`) → `off`
+///   - `--stdio` → `off` (no browser surface on the MCP transport)
 ///
 /// `loopback` further requires that `--host` is a loopback address; this is
 /// validated up-front so we fail closed before any port is bound. Non-loopback
@@ -3678,86 +3322,6 @@ fn validate_code_working_dir(working_dir: PathBuf, flag: &str) -> CliResult<Path
     Ok(working_dir)
 }
 
-// ---------------------------------------------------------------------------
-// TUI launch configuration and model abstraction
-// ---------------------------------------------------------------------------
-
-/// Aggregates all parameters needed to launch the TUI application.
-///
-/// This struct is built once in [`execute_tui`] and consumed by
-/// [`run_tui_with_model`]. It bundles network config, tool registry,
-/// prompt/temperature settings, session state, and inter-component channels.
-struct TuiLaunchConfig {
-    host: String,
-    port: u16,
-    mcp_port: u16,
-    registry: Arc<ToolRegistry>,
-    preamble: String,
-    temperature: Option<f64>,
-    thinking: Option<CompletionThinking>,
-    reasoning_effort: Option<CompletionReasoningEffort>,
-    stream: Option<bool>,
-    preserve_reasoning_content: bool,
-    allowed_tools: Option<Vec<String>>,
-    auto_classify_first_user_message: bool,
-    context: Option<CodeContext>,
-    resume_thread_id: Option<String>,
-    approval_policy: AskForApproval,
-    allow_all_commands: bool,
-    approval_ttl: Duration,
-    approval_cache_policy: ApprovalCachePolicy,
-    approval_cache_scope: String,
-    network_access: bool,
-    user_input_rx: tokio::sync::mpsc::UnboundedReceiver<UserInputRequest>,
-    exec_approval_rx: tokio::sync::mpsc::UnboundedReceiver<ExecApprovalRequest>,
-    exec_approval_tx: tokio::sync::mpsc::UnboundedSender<ExecApprovalRequest>,
-    mcp_server: Arc<LibraMcpServer>,
-    control_runtime: ControlRuntimeConfig,
-    browser_control: BrowserControlMode,
-    /// Goal objective passed via `libra code --goal`. The TUI app
-    /// uses this to bootstrap a `GoalSpec` and seed
-    /// [`AppConfig::initial_goal`] before the first turn.
-    initial_goal: Option<String>,
-    /// Managed Codex app-server child, when the TUI owns a Codex provider
-    /// session. Released through [`shutdown_code_lifecycle`] with the same
-    /// deadline/result contract as listeners and the Code UI runtime.
-    managed_codex_server: Option<ManagedCodexServer>,
-    /// Process terminate gate installed before provider/child startup.
-    process_terminate: ProcessTerminateGate,
-    /// Code UI wire-projection redactor (includes `--env-file` forbidden values).
-    secret_redactor: Arc<SecretRedactor>,
-}
-
-#[derive(Clone)]
-struct ManagedCodeRuntimeModel;
-
-impl CompletionModel for ManagedCodeRuntimeModel {
-    type Response = ();
-
-    async fn completion(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
-        Err(CompletionError::NotImplemented(
-            "managed code runtime handles turns outside the generic completion model".to_string(),
-        ))
-    }
-}
-
-fn build_tui_code_ui_capabilities() -> CodeUiCapabilities {
-    CodeUiCapabilities {
-        message_input: true,
-        streaming_text: true,
-        plan_updates: true,
-        tool_calls: true,
-        patchsets: true,
-        interactive_approvals: true,
-        structured_questions: true,
-        provider_session_resume: false,
-        command_idempotency: false,
-    }
-}
-
 fn build_tui_code_ui_transcript(session: &SessionState) -> Vec<CodeUiTranscriptEntry> {
     session
         .messages
@@ -3797,987 +3361,6 @@ fn session_canonical_thread_id(session: &SessionState) -> Option<String> {
                 .ok()
                 .map(|thread_id| thread_id.to_string())
         })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn build_tui_code_ui_runtime(
-    working_dir: &str,
-    session: &SessionState,
-    session_store: &SessionStore,
-    provider_name: &str,
-    model_name: &str,
-    projection_bundle: Option<&ThreadBundle>,
-    code_control_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiControlCommand>>,
-    automation_write_enabled: bool,
-    browser_write_enabled: bool,
-    lease_duration_override: Option<chrono::Duration>,
-    approval_store: Option<Arc<tokio::sync::Mutex<ApprovalStore>>>,
-) -> CliResult<Arc<CodeUiRuntimeHandle>> {
-    let capabilities = build_tui_code_ui_capabilities();
-    let provider = CodeUiProviderInfo {
-        provider: provider_name.to_string(),
-        model: Some(model_name.to_string()),
-        mode: Some("tui".to_string()),
-        managed: false,
-    };
-    let bootstrap = build_code_ui_resume_bootstrap_snapshot(
-        working_dir,
-        session,
-        provider,
-        capabilities.clone(),
-        projection_bundle,
-    )
-    .map_err(CliError::fatal)?;
-    let folded = fold_code_ui_resume_from_session(session_store, session, bootstrap)
-        .map_err(CliError::fatal)?;
-    let mut snapshot = folded.snapshot;
-    attach_indexed_thread_graph(Path::new(working_dir), &mut snapshot).await;
-
-    let code_ui_session = CodeUiSession::new(snapshot);
-    let adapter: Arc<dyn CodeUiProviderAdapter> = if let Some(control_tx) = code_control_tx {
-        let adapter = TuiCodeUiAdapter::new(code_ui_session, capabilities, control_tx);
-        if let Some(store) = approval_store {
-            adapter.set_approval_store(store);
-        }
-        adapter
-    } else {
-        ReadOnlyCodeUiAdapter::new(code_ui_session, capabilities)
-    };
-    // `LocalTui` keeps the terminal as the visible owner but still lets
-    // browser/automation leases attach when their write surface is enabled.
-    // `Fixed { Tui }` is reserved for sessions where neither writer should
-    // ever be allowed to take control (read-only browser observe).
-    let initial_controller = if automation_write_enabled || browser_write_enabled {
-        CodeUiInitialController::LocalTui {
-            owner_label: "Terminal UI".to_string(),
-            reason: Some("The terminal UI controls this live session".to_string()),
-        }
-    } else {
-        CodeUiInitialController::Fixed {
-            kind: CodeUiControllerKind::Tui,
-            owner_label: "Terminal UI".to_string(),
-            reason: Some("The terminal UI controls this live session".to_string()),
-        }
-    };
-    let mut runtime_options = CodeUiRuntimeOptions::new(
-        browser_write_enabled,
-        automation_write_enabled,
-        initial_controller,
-    );
-    runtime_options.lease_duration = lease_duration_override;
-    Ok(CodeUiRuntimeHandle::build_with_options(adapter, runtime_options).await)
-}
-
-async fn load_code_ui_projection_bundle(
-    working_dir: &Path,
-    thread_id: Uuid,
-) -> anyhow::Result<Option<ThreadBundle>> {
-    let storage_root = resolve_storage_root(working_dir).ok_or_else(|| {
-        anyhow::anyhow!(
-            "cannot resolve the repository storage root for '{}' — if this is a linked \
-             worktree, run `libra worktree repair --confirm <worktree-path>`",
-            working_dir.display()
-        )
-    })?;
-    let db_path = storage_root.join("libra.db");
-    let db_path = db_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("database path is not valid UTF-8"))?;
-    let db_conn = establish_connection(db_path).await?;
-    let storage = Arc::new(LocalStorage::new(storage_root.join("objects")));
-    let history = HistoryManager::new(storage.clone(), storage_root, Arc::new(db_conn.clone()));
-    let rebuilder = ProjectionRebuilder::new(storage.as_ref(), &history);
-    let resolver = ProjectionResolver::new(db_conn);
-    resolver
-        .load_or_rebuild_thread_bundle(thread_id, &rebuilder)
-        .await
-}
-
-/// Core TUI lifecycle: wires up the terminal, background servers, agent
-/// configuration, session persistence, and the interactive `App` event loop.
-///
-/// This function is generic over the completion model `M`, allowing all
-/// providers to share the same TUI setup code. The flow is:
-///
-/// 1. Load git hooks from the working directory.
-/// 2. Build the agent's `ToolLoopConfig` (preamble, temperature, sandbox policy).
-/// 3. Initialize the terminal via `tui_init()` with a restore guard.
-/// 4. Start the web server and MCP server as background tasks.
-/// 5. Load slash commands and agent profiles from disk.
-/// 6. Restore or create a new session.
-/// 7. Run the `App` event loop until the user exits.
-/// 8. Gracefully shut down all background servers.
-///
-/// # Side Effects
-/// - Switches the terminal into TUI mode and restores it on exit.
-/// - Starts background web and MCP listeners when their ports are available.
-/// - Reads hook, slash-command, profile, session, and projection state from the
-///   working directory.
-/// - Persists session updates and may drive tool-mediated workspace writes.
-///
-/// # Errors
-/// Returns [`CliError`] for terminal initialization failures, invalid resume
-/// thread IDs, missing sessions, session/projection load failures, or fatal app
-/// exits reported by the TUI event loop.
-async fn run_tui_with_model<M>(
-    model: M,
-    params: TuiLaunchConfig,
-    model_name: String,
-    provider_name: String,
-) -> CliResult<()>
-where
-    M: CompletionModel + Clone + 'static,
-    M::Response: CompletionUsage,
-{
-    run_tui_with_model_inner(model, params, model_name, provider_name, None).await
-}
-
-async fn run_tui_with_managed_code_runtime(
-    code_ui_runtime: Arc<CodeUiRuntimeHandle>,
-    params: TuiLaunchConfig,
-    model_name: String,
-    provider_name: String,
-) -> CliResult<()> {
-    run_tui_with_model_inner(
-        ManagedCodeRuntimeModel,
-        params,
-        model_name,
-        provider_name,
-        Some(code_ui_runtime),
-    )
-    .await
-}
-
-/// Formats the post-exit "inspect this thread graph" handoff line printed
-/// when the TUI leaves and Libra could derive a canonical thread id.
-///
-/// The emitted command always includes `--json`: the interactive `libra
-/// graph` TUI entry was removed in the W5 breaking release (W5-08), so the
-/// structured form is the only one that runs. The `libra graph --json
-/// <thread_id>` form discovers the repository from the current directory.
-/// When the code session ran against a different repository
-/// (`--repo`/`--cwd`, or simply launched from elsewhere), that discovery would
-/// resolve the wrong repo, so the hint appends `--repo <path>` pointing at the
-/// session's working directory — matching the remote-repo guidance in
-/// `docs/commands/code.md`.
-///
-/// `current_dir` is the process working directory (`None` when it cannot be
-/// resolved). Paths are canonicalized before comparison so `.`/relative/symlink
-/// forms of the same directory do not produce a spurious `--repo` suffix; if
-/// the current directory is unknown we fail safe by including the explicit
-/// `--repo` path.
-/// Quote a path for a copy-pasteable shell command when it contains
-/// whitespace or shell-special characters; otherwise return it bare so the
-/// common case stays readable. POSIX single-quote escaping (`'` -> `'\''`).
-fn shell_quote_for_display(value: &str) -> String {
-    let needs_quoting = value.is_empty()
-        || value
-            .chars()
-            .any(|c| c.is_whitespace() || "'\"\\$`&|;<>()*?[]{}#~!".contains(c));
-    if needs_quoting {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    } else {
-        value.to_string()
-    }
-}
-
-fn format_graph_handoff_hint(
-    thread_id: &str,
-    session_working_dir: &Path,
-    current_dir: Option<&Path>,
-) -> String {
-    let canonical =
-        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let needs_repo_hint = match current_dir {
-        Some(cwd) => canonical(cwd) != canonical(session_working_dir),
-        None => true,
-    };
-    if needs_repo_hint {
-        format!(
-            "Inspect this thread graph with: libra graph --json {thread_id} --repo {}",
-            shell_quote_for_display(&session_working_dir.display().to_string())
-        )
-    } else {
-        format!("Inspect this thread graph with: libra graph --json {thread_id}")
-    }
-}
-
-async fn run_tui_with_model_inner<M>(
-    model: M,
-    params: TuiLaunchConfig,
-    model_name: String,
-    provider_name: String,
-    managed_code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
-) -> CliResult<()>
-where
-    M: CompletionModel + Clone + 'static,
-    M::Response: CompletionUsage,
-{
-    let registry = params.registry;
-    let control_runtime = params.control_runtime;
-    let mut managed_codex_for_lifecycle =
-        ManagedCodexBootstrapGuard::new(params.managed_codex_server);
-    let browser_control = params.browser_control;
-    let process_terminate = params.process_terminate;
-    let process_terminate_for_deadline = process_terminate.clone();
-    let check_process_terminate = |gate: &ProcessTerminateGate| -> CliResult<()> {
-        if gate.is_signaled() {
-            Err(CliError::failure(
-                "received a terminate signal while starting Libra Code; shutting down before the TUI started"
-                    .to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    };
-    let hook_runner = {
-        let runner = HookRunner::load(registry.working_dir()).map_err(CliError::failure)?;
-        if runner.has_hooks() {
-            Some(std::sync::Arc::new(runner))
-        } else {
-            None
-        }
-    };
-
-    let mut config = ToolLoopConfig {
-        preamble: Some(params.preamble),
-        temperature: params.temperature,
-        thinking: params.thinking,
-        reasoning_effort: params.reasoning_effort,
-        stream: params.stream,
-        hook_runner,
-        allowed_tools: params.allowed_tools,
-        runtime_context: Some(default_tui_runtime_context(
-            registry.working_dir(),
-            params.context,
-            DefaultTuiApprovalConfig {
-                policy: params.approval_policy,
-                allow_all_commands: params.allow_all_commands,
-                ttl: params.approval_ttl,
-                cache_policy: params.approval_cache_policy,
-            },
-            params.network_access,
-            params.exec_approval_tx.clone(),
-            params.approval_cache_scope.clone(),
-        )),
-        max_turns: None,
-        preserve_reasoning_content: params.preserve_reasoning_content,
-        ..Default::default()
-    };
-
-    check_process_terminate(&process_terminate)?;
-
-    // Initialize terminal.
-    let terminal = match tui_init() {
-        Ok(t) => t,
-        Err(e) => return Err(CliError::io(format!("failed to initialize terminal: {e}"))),
-    };
-
-    // INVARIANT: every successful `tui_init` must install this guard before any
-    // await point that can fail, otherwise a later error could leave the user's
-    // terminal in raw/alternate-screen mode.
-    let _guard = scopeguard::guard((), |_| {
-        let _ = tui_restore();
-    });
-
-    let tui = Tui::new(terminal);
-
-    // Set up session persistence
-    let working_dir_str = registry.working_dir().to_string_lossy().to_string();
-    // Capture the resolved session working directory before `registry` is
-    // moved into `App::new`; the post-exit graph handoff hint needs it to
-    // decide whether to surface a `--repo <path>` suffix for a non-cwd repo.
-    let session_working_dir = registry.working_dir().to_path_buf();
-    let storage_root = require_storage_root(registry.working_dir())?;
-    let session_store = SessionStore::from_storage_path(&storage_root);
-    session_store
-        .rebuild_thread_session_index()
-        .map_err(|error| {
-            CliError::io(format!(
-                "failed to rebuild the Code thread→session index under '{}': {error}",
-                storage_root.display()
-            ))
-        })?;
-    let session = if let Some(thread_id) = params.resume_thread_id.as_deref() {
-        // The resume identifier may be either a canonical UUID (planning-bound
-        // thread) or a chat-flow session id from `generate_session_id`
-        // (millisecond-hex / pid-hex / counter-hex). The store accepts either
-        // shape — reject empty input here and let `load_for_thread_id` surface
-        // a unified "no session found" error for any unknown identifier.
-        if thread_id.trim().is_empty() {
-            return Err(CliError::command_usage(
-                "--resume requires a non-empty thread_id",
-            ));
-        }
-        match session_store.load_for_thread_id(thread_id, &working_dir_str) {
-            Ok(Some(session)) => session,
-            Ok(None) => {
-                return Err(CliError::fatal(format!(
-                    "no Libra Code session found for thread_id '{thread_id}' in working directory '{working_dir_str}'"
-                )));
-            }
-            Err(error) => {
-                return Err(CliError::io(format!(
-                    "failed to load Libra Code session for thread_id '{thread_id}': {error}"
-                )));
-            }
-        }
-    } else {
-        SessionState::new(&working_dir_str)
-    };
-    check_process_terminate(&process_terminate)?;
-    // Non-managed TUI owns IntentSpec/Plan review + confirmed plan-exec on the
-    // W1-01 worker. Managed Code UI sessions keep their own chat/tool loop and
-    // must not preadmit control turns onto a parallel local runtime (W2-04).
-    let (mut local_turn_runtime, mut local_turn_runtime_task, plan_execution_executor) =
-        if managed_code_ui_runtime.is_some() {
-            (None, None, None)
-        } else {
-            let session_jsonl = SessionJsonlStore::new(session_store.session_root(&session.id));
-            // An unresolved IntentSpec (Phase 0) or Plan (Phase 1) review gate is
-            // durable proof that its draft-writing mutation completed, so recovery
-            // may complete that single command id; every other pending mutation
-            // still lands in the reconciliation fence.
-            let review_gate_turn_id =
-                crate::internal::ai::runtime::phase1::open_review_gate_phase_turn_id(
-                    &session_jsonl,
-                );
-            let durability = RuntimeCommandDurability::new(session_jsonl);
-            let recovered_mutations = durability
-                .recover_pending_mutations_for_intent_review(review_gate_turn_id.as_deref())
-                .map_err(|error| {
-                    CliError::io(format!(
-                        "failed to recover pending durable commands for Code session '{}': {error}",
-                        session.id
-                    ))
-                })?;
-            let plan_execution_executor = Arc::new(DeferredPlanExecutionExecutor::new());
-            let mut worker_config = AgentRuntimeWorkerConfig::new(
-                plan_execution_executor.clone(),
-                ToolBoundaryRuntime::system(Uuid::new_v4(), Arc::new(InMemoryAuditSink::default())),
-            )
-            .with_durability(durability, working_dir_str.clone(), "tui-local")
-            .with_durability_command_kind("tui_local_turn");
-            if !recovered_mutations.is_empty() {
-                worker_config =
-                    worker_config.with_recovered_reconciliation_session(session.id.clone());
-            }
-            let (handle, worker_task) = AgentRuntimeWorker::spawn(worker_config);
-            (
-                Some(handle),
-                Some(worker_task),
-                Some(plan_execution_executor),
-            )
-        };
-    check_process_terminate(&process_terminate)?;
-    // v0.17.791 session-bootstrap usage auto-prune: if the
-    // operator configured `[usage] retention_days = N` in
-    // `config.toml`, drop usage rows older than N days at session
-    // start. Soft-failure (logs warn + continues) so a malformed
-    // config or DB error doesn't block startup.
-    crate::command::usage::auto_prune_at_session_start(&storage_root).await;
-
-    check_process_terminate(&process_terminate)?;
-
-    if let Some(usage_recorder) = build_usage_recorder(&storage_root).await {
-        let usage_repo_id = canonical_usage_repo_id(Some(&usage_recorder)).await;
-        config.usage_recorder = Some(usage_recorder);
-        config.usage_context = Some(UsageContext {
-            repo_id: usage_repo_id,
-            session_id: Some(session.id.clone()),
-            thread_id: session_canonical_thread_id(&session),
-            agent_run_id: None,
-            run_id: None,
-            turn_id: None,
-            event_id: None,
-            provider: provider_name.clone(),
-            model: model_name.clone(),
-            request_kind: "completion".to_string(),
-            intent: None,
-            // OC-Phase 5 P5.2: single-agent legacy path. The
-            // dispatcher (P5.3) sets this to the active profile name
-            // when multi-agent is enabled.
-            agent_name: None,
-        });
-    }
-
-    let automation_write_enabled = control_runtime.is_write();
-    let browser_write_enabled = browser_control == BrowserControlMode::Loopback;
-    // The TUI control command channel is created whenever any writer
-    // (automation or browser) is enabled, so the runtime adapter can route
-    // submit/respond/cancel into the TUI app loop. Selecting the adapter
-    // based on `code_control_tx.is_some()` would gate browser writes behind
-    // `--control write`; gating on the explicit booleans avoids that.
-    let (code_control_tx, code_control_rx) = if automation_write_enabled || browser_write_enabled {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TuiControlCommand>();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let code_ui_runtime = if let Some(runtime) = managed_code_ui_runtime.clone() {
-        if let Some(control_tx) = code_control_tx {
-            // Managed Codex owns the AgentRuntime, but HTTP writes for the
-            // TUI+browser path still need TuiCodeUiAdapter so cancel / interact /
-            // goal / task / automation-lease route through the TUI control channel.
-            let adapter = runtime.adapter();
-            let code_ui_session = adapter.session();
-            let capabilities = adapter.capabilities();
-            let tui_adapter = TuiCodeUiAdapter::new(code_ui_session, capabilities, control_tx);
-            if let Some(store) = config
-                .runtime_context
-                .as_ref()
-                .and_then(|ctx| ctx.approval.as_ref().map(|approval| approval.store.clone()))
-            {
-                tui_adapter.set_approval_store(store);
-            }
-            let mut runtime_options = CodeUiRuntimeOptions::new(
-                browser_write_enabled,
-                automation_write_enabled,
-                CodeUiInitialController::LocalTui {
-                    owner_label: "Terminal UI".to_string(),
-                    reason: Some("The terminal UI controls this live managed session".to_string()),
-                },
-            );
-            runtime_options.lease_duration = code_ui_test_lease_duration_override()?;
-            CodeUiRuntimeHandle::build_with_options(tui_adapter, runtime_options).await
-        } else {
-            runtime
-        }
-    } else {
-        let projection_bundle = session_canonical_thread_id(&session)
-            .and_then(|thread_id| Uuid::parse_str(&thread_id).ok());
-        let projection_bundle = match projection_bundle {
-            Some(thread_id) => {
-                match load_code_ui_projection_bundle(registry.working_dir(), thread_id).await {
-                    Ok(bundle) => bundle,
-                    Err(error) => {
-                        tracing::warn!(%thread_id, error = %error, "failed to load projection-backed code ui snapshot; falling back to session state");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        build_tui_code_ui_runtime(
-            &working_dir_str,
-            &session,
-            &session_store,
-            &provider_name,
-            &model_name,
-            projection_bundle.as_ref(),
-            code_control_tx,
-            automation_write_enabled,
-            browser_write_enabled,
-            code_ui_test_lease_duration_override()?,
-            config
-                .runtime_context
-                .as_ref()
-                .and_then(|ctx| ctx.approval.as_ref().map(|approval| approval.store.clone())),
-        )
-        .await?
-    };
-    let code_ui_session = code_ui_runtime.adapter().session();
-    params
-        .mcp_server
-        .set_code_ui_session(code_ui_session.clone());
-    let code_ui_runtime_for_app = code_ui_runtime.clone();
-
-    if let Err(error) = check_process_terminate(&process_terminate) {
-        let shutdown_error = shutdown_code_lifecycle(
-            Some(code_ui_runtime_for_app.clone()),
-            local_turn_runtime
-                .take()
-                .map(|runtime| (runtime, local_turn_runtime_task.take())),
-            None,
-            None,
-            managed_codex_for_lifecycle.take(),
-            Some(control_runtime),
-        )
-        .await
-        .err();
-        if let Some(shutdown_error) = shutdown_error {
-            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-        }
-        return Err(error);
-    }
-
-    let control_thread_id = session_canonical_thread_id(&session);
-    let browser_bootstrap_token = mint_browser_bootstrap_token(params.browser_control);
-    let (mut web_handle, web_line) = match start_web_server(
-        &params.host,
-        params.port,
-        registry.working_dir().to_path_buf(),
-        WebServerOptions {
-            code_ui: Some(code_ui_runtime),
-            automation_control_token: control_runtime.token.clone(),
-            browser_bootstrap_token: browser_bootstrap_token.clone(),
-            audit_sink: None,
-            secret_redactor: Some(params.secret_redactor.clone()),
-            workflow_hub: None,
-        },
-    )
-    .await
-    {
-        Ok(handle) => {
-            let base_url = format!("http://{}", handle.addr);
-            let open_url = code_ui_url_with_bootstrap(&base_url, browser_bootstrap_token.as_ref());
-            if let Err(error) = control_runtime.write_info_file(
-                registry.working_dir(),
-                base_url.clone(),
-                None,
-                control_thread_id.clone(),
-            ) {
-                let shutdown_error = shutdown_code_lifecycle(
-                    Some(code_ui_runtime_for_app.clone()),
-                    local_turn_runtime
-                        .take()
-                        .map(|runtime| (runtime, local_turn_runtime_task.take())),
-                    Some(handle),
-                    None,
-                    managed_codex_for_lifecycle.take(),
-                    None,
-                )
-                .await
-                .err();
-                if let Some(shutdown_error) = shutdown_error {
-                    return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-                }
-                return Err(error);
-            }
-            if let Some(token) = browser_bootstrap_token.as_ref() {
-                println!("Browser bootstrap token: {token}");
-            }
-            let line = format!("Web: {open_url}");
-            (Some(handle), line)
-        }
-        Err(err) if control_runtime.is_write() => {
-            let shutdown_error = shutdown_code_lifecycle(
-                Some(code_ui_runtime_for_app.clone()),
-                local_turn_runtime
-                    .take()
-                    .map(|runtime| (runtime, local_turn_runtime_task.take())),
-                None,
-                None,
-                managed_codex_for_lifecycle.take(),
-                None,
-            )
-            .await
-            .err();
-            let mut error =
-                CliError::network(describe_web_bind_error(&params.host, params.port, &err))
-                    .with_detail("component", "web_server");
-            if let Some(shutdown_error) = shutdown_error {
-                error = error.with_detail("shutdown", shutdown_error.to_string());
-            }
-            return Err(error);
-        }
-        Err(err) => {
-            let message = describe_web_bind_error(&params.host, params.port, &err);
-            // W3-11: occupied ports are always fatal (no auto-scan), including the
-            // default TUI + observe path. Other bind failures remain soft so an
-            // optional browser surface does not abort an otherwise healthy TUI.
-            if message.contains("already in use") {
-                let shutdown_error = shutdown_code_lifecycle(
-                    Some(code_ui_runtime_for_app.clone()),
-                    local_turn_runtime
-                        .take()
-                        .map(|runtime| (runtime, local_turn_runtime_task.take())),
-                    None,
-                    None,
-                    managed_codex_for_lifecycle.take(),
-                    None,
-                )
-                .await
-                .err();
-                let mut error = CliError::network(message).with_detail("component", "web_server");
-                if let Some(shutdown_error) = shutdown_error {
-                    error = error.with_detail("shutdown", shutdown_error.to_string());
-                }
-                return Err(error);
-            }
-            (None::<WebServerHandle>, message)
-        }
-    };
-    if let Err(error) = check_process_terminate(&process_terminate) {
-        let shutdown_error = shutdown_code_lifecycle(
-            Some(code_ui_runtime_for_app.clone()),
-            local_turn_runtime
-                .take()
-                .map(|runtime| (runtime, local_turn_runtime_task.take())),
-            web_handle.take(),
-            None,
-            managed_codex_for_lifecycle.take(),
-            Some(control_runtime),
-        )
-        .await
-        .err();
-        if let Some(shutdown_error) = shutdown_error {
-            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-        }
-        return Err(error);
-    }
-    let control_base_url = web_handle
-        .as_ref()
-        .map(|handle| format!("http://{}", handle.addr));
-
-    // Start MCP Server
-    let (mcp_handle, mcp_line) =
-        match start_mcp_server(&params.host, params.mcp_port, params.mcp_server.clone()).await {
-            Ok(handle) => {
-                let mcp_url = format!("http://{}", handle.addr);
-                if let Some(base_url) = control_base_url.as_ref()
-                    && let Err(error) = control_runtime.write_info_file(
-                        registry.working_dir(),
-                        base_url.clone(),
-                        Some(mcp_url.clone()),
-                        control_thread_id.clone(),
-                    )
-                {
-                    let shutdown_error = shutdown_code_lifecycle(
-                        Some(code_ui_runtime_for_app.clone()),
-                        local_turn_runtime
-                            .take()
-                            .map(|runtime| (runtime, local_turn_runtime_task.take())),
-                        web_handle.take(),
-                        Some(handle),
-                        managed_codex_for_lifecycle.take(),
-                        None,
-                    )
-                    .await
-                    .err();
-                    if let Some(shutdown_error) = shutdown_error {
-                        return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-                    }
-                    return Err(error);
-                }
-                let line = format!("MCP: {mcp_url}");
-                (Some(handle), line)
-            }
-            Err(err) if control_runtime.is_write() => {
-                let shutdown_error = shutdown_code_lifecycle(
-                    Some(code_ui_runtime_for_app.clone()),
-                    local_turn_runtime
-                        .take()
-                        .map(|runtime| (runtime, local_turn_runtime_task.take())),
-                    web_handle.take(),
-                    None,
-                    managed_codex_for_lifecycle.take(),
-                    None,
-                )
-                .await
-                .err();
-                let mut error = CliError::network(format!("failed to start MCP server: {err}"))
-                    .with_detail("component", "mcp_server");
-                if let Some(shutdown_error) = shutdown_error {
-                    error = error.with_detail("shutdown", shutdown_error.to_string());
-                }
-                return Err(error);
-            }
-            Err(err) => (None, format!("MCP: failed to start ({err})")),
-        };
-    if let Err(error) = check_process_terminate(&process_terminate) {
-        let shutdown_error = shutdown_code_lifecycle(
-            Some(code_ui_runtime_for_app.clone()),
-            local_turn_runtime
-                .take()
-                .map(|runtime| (runtime, local_turn_runtime_task.take())),
-            web_handle.take(),
-            mcp_handle,
-            managed_codex_for_lifecycle.take(),
-            Some(control_runtime),
-        )
-        .await
-        .err();
-        if let Some(shutdown_error) = shutdown_error {
-            return Err(error.with_detail("shutdown", shutdown_error.to_string()));
-        }
-        return Err(error);
-    }
-
-    let input_guidance = if managed_code_ui_runtime.is_some() {
-        "Type your message and press Enter to work with the managed provider."
-    } else {
-        "Type a development request and press Enter to generate a reviewable plan before execution."
-    };
-    let welcome = format!("Welcome to Libra Code! {input_guidance}\n{web_line}\n{mcp_line}");
-
-    // Load slash commands
-    let commands = load_commands(registry.working_dir());
-    let command_dispatcher = CommandDispatcher::new(commands);
-    let skills = load_skills(registry.working_dir());
-    let skill_dispatcher = SkillDispatcher::new(skills);
-
-    // Load agent profiles
-    let profiles = load_profiles(registry.working_dir());
-    let agent_router = AgentProfileRouter::new(profiles);
-    // OC-Phase 5 P5.1 session bootstrap: read `agents.toml` via the W4-06
-    // resolver so linked worktrees see the repository layer. Missing file
-    // degrades to `AgentsConfig::default()`. Parse errors are a warning
-    // rather than failing the session — a malformed config should not block
-    // an operator from starting `libra code` to fix it.
-    let agents_config =
-        AgentsConfig::load_from_working_dir(registry.working_dir()).unwrap_or_else(|err| {
-            tracing::warn!(
-                error = %err,
-                "failed to load agents.toml; falling back to AgentsConfig::default()",
-            );
-            AgentsConfig::default()
-        });
-    // v0.17.804 source_call_log persistence wire-up: build the
-    // pool with the per-session SeaORM connection so every
-    // SourcePool tool call lands a `source_call_log` row. Soft
-    // fallback to `SourcePool::new()` (in-memory only) if the DB
-    // path can't be resolved or the connection fails — same
-    // posture as `build_usage_recorder` further down so session
-    // bootstrap never blocks on a telemetry-layer issue.
-    let source_pool = {
-        let db_path = storage_root.join(DATABASE);
-        let db_path_str = db_path.to_string_lossy();
-        match establish_connection(&db_path_str).await {
-            Ok(conn) => SourcePool::with_persistence(Arc::new(conn)),
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    path = %db_path.display(),
-                    "failed to open repo DB for SourcePool persistence; \
-                     falling back to in-memory-only source call log",
-                );
-                SourcePool::new()
-            }
-        }
-    };
-    if let Err(error) = register_builtin_mcp_source_from_project_config(
-        &source_pool,
-        params.mcp_server.clone(),
-        registry.working_dir(),
-    ) {
-        tracing::warn!("failed to register built-in MCP source: {error}");
-    }
-    config.source_pool = Some(source_pool.clone());
-    config.source_session_id = Some(session.id.clone());
-
-    // OC-Phase 3 P3.4 session bootstrap (v0.17.776): when the
-    // operator's agents.toml flips `code.sub_agents.enabled =
-    // true`, build the full `SubAgentToolLoopRuntime` so the
-    // `task` tool actually routes through the dispatcher.
-    //
-    // Required parent context fields are sourced as:
-    //   - dispatcher: DefaultSubAgentDispatcher::new(registry, cfg)
-    //     .with_default_child_runner()
-    //   - permission_service: a `DenyByDefaultPermissionAsker`
-    //     fallback (interactive prompt wiring is a follow-up).
-    //     `UserInitiated{bypass_permission_ask:true}` /task
-    //     paths work; LlmInitiated paths that need escalation
-    //     get rejected with an actionable feedback message.
-    //   - parent_model_binding: ModelBinding from CLI flags.
-    //   - parent_agent: minimal `AgentExecutionSpec` with the
-    //     CLI-resolved model — enough for dispatcher gates
-    //     (depth/concurrency/feature flag) which never reach
-    //     into the parent_agent's tool/permission spec.
-    //   - All other Arc'd state is sourced from values already
-    //     constructed earlier in this function.
-    //
-    // Failure-to-build is logged and the runtime stays None —
-    // `code.sub_agents.enabled = true` with a malformed agents
-    // block degrades to the same "task tool not available" UX
-    // an operator sees with the flag off.
-    //
-    // OC-Phase 4 P4.4 diagnostic (v0.17.783): if the operator
-    // configured `[code.compaction]`, log the resolved model
-    // binding so an operator can confirm the binding round-trip
-    // works before the dispatcher-side integration lands. A
-    // future commit consumes this binding in
-    // `build_subagent_runtime_for_session` to route parent
-    // frames through `run_compaction(...)` before feeding the
-    // child via `ContextHandoff::to_handoff_messages`.
-    if let Some(binding) = agents_config.compaction_model_binding() {
-        tracing::info!(
-            provider = %binding.provider_id,
-            model = %binding.model_id,
-            "compaction model binding resolved from [code.compaction]; \
-             dispatcher integration is a v0.17.783+ follow-up",
-        );
-    }
-    if agents_config.sub_agents.enabled {
-        match build_subagent_runtime_for_session(
-            &agents_config,
-            registry.clone(),
-            &session,
-            &session_store,
-            &storage_root,
-            &model_name,
-            &provider_name,
-            &agent_router,
-            config.hook_runner.clone(),
-            // Hand the dispatcher the parent tool loop's resolved
-            // runtime context (sandbox / approval / file-history)
-            // so dispatched sub-agents inherit the parent's authority
-            // rather than running unsandboxed (S2-INV-06).
-            config.runtime_context.clone(),
-        )
-        .await
-        {
-            Ok(runtime) => {
-                tracing::info!(
-                    enabled = true,
-                    max_depth = agents_config.multi_agent.max_subagent_depth,
-                    // Log the EFFECTIVE concurrency (CEX-S2-12 caps it to
-                    // 1), not the configured value, so the diagnostic
-                    // matches what the dispatcher actually enforces.
-                    max_concurrent = cex_s2_12_subagent_concurrency_cap(
-                        agents_config.multi_agent.max_concurrent_subagents,
-                    ),
-                    "sub-agent dispatcher attached to tool_loop config",
-                );
-                config.subagent_runtime = Some(runtime);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "failed to build SubAgentToolLoopRuntime; the `task` tool will surface \
-                     'sub_agents.enabled = true required' until this is resolved",
-                );
-            }
-        }
-    }
-
-    let code_ui_for_lifecycle = code_ui_runtime_for_app.clone();
-    let auto_classify_first_user_message =
-        params.auto_classify_first_user_message && managed_code_ui_runtime.is_none();
-
-    // Create and run app
-    let mut app = App::new(
-        tui,
-        model,
-        registry,
-        config,
-        AppConfig {
-            welcome_message: welcome,
-            command_dispatcher,
-            skill_dispatcher,
-            agent_router,
-            agents_config,
-            session,
-            session_store,
-            user_input_rx: params.user_input_rx,
-            exec_approval_rx: params.exec_approval_rx,
-            model_name,
-            provider_name,
-            mcp_server: Some(params.mcp_server),
-            code_ui_session: Some(code_ui_session),
-            code_ui_runtime: Some(code_ui_runtime_for_app),
-            code_control_rx,
-            managed_code_ui_runtime,
-            local_turn_runtime,
-            local_turn_runtime_task,
-            plan_execution_executor,
-            default_network_access: params.network_access,
-            auto_classify_first_user_message,
-            initial_goal: params.initial_goal.clone(),
-            source_pool,
-            process_terminate: Some(process_terminate),
-        },
-    );
-    // W2-02: reopen an unresolved IntentSpec review after crash/resume so
-    // confirm/modify/cancel cannot disappear while a draft remains unconfirmed.
-    app.restore_pending_intent_review_gate().await;
-    // W2-03: an unanswered post-plan network-policy choice is restored before
-    // the plan review, because an open network marker means the plan review is
-    // already resolved — that gate is the only one still owed a human answer.
-    app.restore_pending_network_policy_gate().await;
-    // W2-03: likewise for an unresolved execution-plan review. Phase 0 is
-    // restored first because an open IntentSpec gate means no plan was ever
-    // approved; the plan restore then no-ops on the already-parked gate.
-    app.restore_pending_plan_review_gate().await;
-    // W2-11: restore a durable Continue/Cancel repair gate before considering
-    // any execution handoff. A corrupt/unreadable repair replay fences the
-    // session and must never fall through to replay approved mutations.
-    let repair_gate_allows_handoff = app.restore_pending_plan_execution_repair_gate().await;
-    // W2-03 r18: network Allow/Deny may have settled while execute admission
-    // never ran — resume that handoff only after repair recovery confirms that
-    // no unresolved Continue/Cancel decision is owed.
-    if should_restore_plan_execution_handoff(repair_gate_allows_handoff) {
-        app.restore_pending_plan_execution_handoff().await;
-    }
-
-    let run_result = app.run().await;
-    // Prefer the signal receipt timestamp so SIGTERM spent draining the TUI
-    // still counts against the shared process shutdown budget.
-    let process_deadline = process_terminate_for_deadline
-        .signaled_at()
-        .unwrap_or_else(std::time::Instant::now)
-        + CODE_LIFECYCLE_SHUTDOWN_TIMEOUT;
-    // Keep the historical ~30s mutating reconciliation window when budget
-    // remains; never exceed the shared process deadline.
-    let settle_budget = process_deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .min(Duration::from_secs(30));
-    app.finalize_local_runtime_for_lifecycle(settle_budget)
-        .await;
-    let fuse_repo = app.working_dir().to_path_buf();
-    let local_runtime = {
-        let (handle, task) = app.take_local_turn_runtime();
-        handle.map(|runtime| (runtime, task))
-    };
-    let remaining = process_deadline.saturating_duration_since(std::time::Instant::now());
-    let shutdown_result = {
-        let owner = LifecycleShutdownOwner::with_timeout(remaining);
-        if let Some((runtime, worker_task)) = local_runtime {
-            push_local_runtime_lifecycle_step(&owner, runtime, worker_task).await;
-        }
-        let code_ui_for_lease = code_ui_for_lifecycle.clone();
-        if let Some(runtime) = Some(code_ui_for_lifecycle) {
-            push_code_ui_lifecycle_step(&owner, runtime).await;
-        }
-        if let Some(handle) = web_handle {
-            push_web_server_lifecycle_step(&owner, handle).await;
-        }
-        if let Some(handle) = mcp_handle {
-            push_mcp_server_lifecycle_step(&owner, handle).await;
-        }
-        if let Some(server) = managed_codex_for_lifecycle.take() {
-            push_managed_codex_lifecycle_step(&owner, server).await;
-        }
-        #[cfg(unix)]
-        push_fuse_task_worktree_lifecycle_step(&owner, fuse_repo).await;
-        push_controller_lease_lifecycle_step(&owner, code_ui_for_lease).await;
-        push_control_runtime_lifecycle_step(&owner, control_runtime).await;
-        owner.shutdown().await
-    };
-
-    let graph_thread_hint = match run_result {
-        Ok(exit_info) => {
-            if let ExitReason::Fatal(msg) = exit_info.reason {
-                let mut error =
-                    CliError::fatal(msg).with_stable_code(StableErrorCode::InternalInvariant);
-                if let Err(shutdown_error) = shutdown_result {
-                    error = error.with_detail("shutdown", shutdown_error.to_string());
-                }
-                return Err(error);
-            }
-            if let Err(error) = shutdown_result {
-                return Err(lifecycle_shutdown_cli_error(error));
-            }
-            exit_info.thread_id
-        }
-        Err(e) => {
-            let mut error = CliError::internal(format!("TUI exited unexpectedly: {e}"));
-            if let Err(shutdown_error) = shutdown_result {
-                error = error.with_detail("shutdown", shutdown_error.to_string());
-            }
-            return Err(error);
-        }
-    };
-
-    if let Some(thread_id) = graph_thread_hint {
-        let current_dir = std::env::current_dir().ok();
-        println!(
-            "{}",
-            format_graph_handoff_hint(&thread_id, &session_working_dir, current_dir.as_deref())
-        );
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5584,6 +4167,16 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // and the provider-specific tuning flags (they feed the headless web
         // runtime and still pass through the cross-provider match gate below).
         reject_non_tui_flags(args, "the Web Code UI", true)?;
+        // W5-06: the legacy TUI resume driver is removed and managed Codex
+        // Web resume has not landed (W4-01 residual), so bare
+        // `--provider codex --resume` must fail closed with a migration hint
+        // instead of silently starting a fresh, unresumed Web session.
+        if args.provider == CodeProvider::Codex && args.resume.is_some() {
+            return Err(
+                "--resume is not supported with --provider=codex: the legacy TUI resume driver was removed in the W5 breaking release and managed Codex Web resume has not landed yet; start a new session with `libra code --provider codex` (omit --resume), or resume the thread with a non-Codex provider"
+                    .to_string(),
+            );
+        }
         // Managed Codex web owns its own credential/approval surface; these
         // TUI/headless flags are accepted for non-Codex web but must not be
         // silently ignored under Codex.
@@ -5868,12 +4461,6 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_launch: bool) -> Result
     Ok(())
 }
 
-/// A repair replay failure is a fail-closed startup condition: the execution
-/// handoff may be replayed only when the repair restore explicitly permits it.
-fn should_restore_plan_execution_handoff(repair_gate_allows_handoff: bool) -> bool {
-    repair_gate_allows_handoff
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5894,27 +4481,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::internal::ai::sandbox::SandboxPolicy;
-
-    #[test]
-    fn corrupt_repair_replay_blocks_pending_execution_handoff() {
-        use crate::internal::ai::session::SessionJsonlStore;
-
-        let temp = tempfile::tempdir().expect("temporary session root");
-        let store = SessionJsonlStore::new(temp.path().to_path_buf());
-        std::fs::write(store.events_path(), "{not valid JSONL}\n")
-            .expect("write corrupt workflow replay");
-
-        let repair_gate_allows_handoff = store.load_code_workflow_replay().is_ok();
-        assert!(
-            !repair_gate_allows_handoff,
-            "a corrupt repair replay must be treated as unrecoverable"
-        );
-        assert!(
-            !should_restore_plan_execution_handoff(repair_gate_allows_handoff),
-            "startup must not replay a pending mutating execution handoff when repair recovery fails"
-        );
-    }
+    use crate::internal::ai::{completion::CompletionRequest, sandbox::SandboxPolicy};
 
     /// CEX-S2-12 "single sub-agent behind flag": the dispatcher
     /// concurrency cap is forced to 1 for every configured value —
@@ -6133,9 +4700,8 @@ mod tests {
 
     /// W1-06: the non-Codex headless runtime has a durable JSONL projection
     /// fold, so its CLI surface must make `--resume` reachable on the default
-    /// Web launch. Managed Codex `--resume` never reaches Web validation — it
-    /// dispatches to the legacy TUI resume driver (pinned by
-    /// `bare_codex_resume_uses_legacy_tui_not_web_launch`).
+    /// Web launch. Managed Codex `--resume` is rejected outright (pinned by
+    /// `bare_codex_resume_is_rejected_after_legacy_tui_removal`).
     #[test]
     fn accepts_resume_in_non_codex_web_mode() {
         let mut args = base_args();
@@ -6147,10 +4713,11 @@ mod tests {
         );
     }
 
-    /// W4-01: bare `libra code --provider codex --resume` must keep the
-    /// pre-cutover TUI resume driver (managed Codex Web has no Libra resume).
+    /// W5-06: the legacy TUI resume driver is gone, so bare
+    /// `libra code --provider codex --resume` must fail closed with a
+    /// migration hint instead of silently starting a fresh Web session.
     #[test]
-    fn bare_codex_resume_uses_legacy_tui_not_web_launch() {
+    fn bare_codex_resume_is_rejected_after_legacy_tui_removal() {
         let args = CodeArgs::try_parse_from([
             "libra",
             "--provider",
@@ -6159,17 +4726,14 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
         ])
         .expect("parse bare codex resume");
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
         assert!(
-            codex_resume_uses_legacy_tui(&args),
-            "Codex resume must select the legacy TUI resume driver"
+            err.contains("--resume") && err.contains("codex"),
+            "bare Codex resume must be rejected naming both the flag and the provider; got: {err}"
         );
         assert!(
-            !code_uses_web_launch(&args),
-            "Codex resume must not enter execute_web_only"
-        );
-        assert!(
-            validate_mode_args(&args, &OutputConfig::default()).is_ok(),
-            "bare Codex resume must remain a valid mode combination"
+            err.contains("legacy TUI resume driver") && err.contains("removed"),
+            "rejection must explain the removal and the migration path; got: {err}"
         );
     }
 
@@ -6313,17 +4877,17 @@ mod tests {
             "headless resume must reject a corrupt durable checkpoint: {headless_error}"
         );
 
-        let tui_error = build_code_ui_resume_bootstrap_snapshot(
+        let bootstrap_error = build_code_ui_resume_bootstrap_snapshot(
             working_dir.path().to_string_lossy(),
             &session,
             provider,
-            build_tui_code_ui_capabilities(),
+            capabilities,
             None,
         )
-        .expect_err("malformed checkpoint must fail closed for TUI bootstrap");
+        .expect_err("malformed checkpoint must fail closed for the shared resume bootstrap");
         assert!(
-            tui_error.contains("cannot be deserialized"),
-            "TUI resume must reject a corrupt durable checkpoint: {tui_error}"
+            bootstrap_error.contains("cannot be deserialized"),
+            "resume bootstrap must reject a corrupt durable checkpoint: {bootstrap_error}"
         );
     }
 
@@ -6367,10 +4931,10 @@ mod tests {
         let provider = CodeUiProviderInfo {
             provider: "test".to_string(),
             model: Some("test-model".to_string()),
-            mode: Some("tui".to_string()),
+            mode: Some("web-headless".to_string()),
             managed: false,
         };
-        let capabilities = build_tui_code_ui_capabilities();
+        let capabilities = headless_capabilities();
         let mut persisted = initial_snapshot(
             working_dir.path().to_string_lossy().to_string(),
             provider.clone(),
@@ -6403,105 +4967,6 @@ mod tests {
             folded.snapshot.status,
             CodeUiSessionStatus::IndeterminateSideEffect,
             "TUI/headless shared fold must retain the reconciliation fence when replay is empty"
-        );
-    }
-
-    /// C5: the post-exit graph handoff prints `libra graph --json
-    /// <thread_id>` when the session ran against the current directory (graph
-    /// discovers the repo from cwd), so no `--repo` suffix is needed. The
-    /// `--json` flag is required: the interactive `libra graph` TUI entry was
-    /// removed in the W5 breaking release (W5-08).
-    #[test]
-    fn graph_handoff_hint_omits_repo_for_current_directory() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let thread_id = "11111111-1111-4111-8111-111111111111";
-        let hint = format_graph_handoff_hint(thread_id, dir.path(), Some(dir.path()));
-        assert_eq!(
-            hint,
-            format!("Inspect this thread graph with: libra graph --json {thread_id}")
-        );
-        assert!(
-            !hint.contains("--repo"),
-            "same-dir hint must not add --repo"
-        );
-    }
-
-    /// C5: when the code session ran against a repository other than the
-    /// current directory (`--repo`/`--cwd`), the handoff appends
-    /// `--repo <path>` so `libra graph --json` resolves the same repository — matching
-    /// the remote-repo guidance in `docs/commands/code.md`.
-    #[test]
-    fn graph_handoff_hint_appends_repo_for_remote_repository() {
-        let session_dir = tempfile::tempdir().expect("session tempdir");
-        let cwd = tempfile::tempdir().expect("cwd tempdir");
-        let thread_id = "11111111-1111-4111-8111-111111111111";
-        let hint = format_graph_handoff_hint(thread_id, session_dir.path(), Some(cwd.path()));
-        assert_eq!(
-            hint,
-            format!(
-                "Inspect this thread graph with: libra graph --json {thread_id} --repo {}",
-                session_dir.path().display()
-            )
-        );
-    }
-
-    /// C5 (codex review): the copy-pasteable `--repo` hint must survive paths
-    /// with whitespace/shell-special characters — clean paths stay bare, dirty
-    /// ones are POSIX single-quoted so the emitted command word-splits correctly.
-    #[test]
-    fn shell_quote_for_display_quotes_only_when_needed() {
-        assert_eq!(
-            shell_quote_for_display("/home/user/repo"),
-            "/home/user/repo"
-        );
-        assert_eq!(
-            shell_quote_for_display("/Volumes/Data/My Repo"),
-            "'/Volumes/Data/My Repo'"
-        );
-        // Embedded single quote is escaped via the '\'' idiom.
-        assert_eq!(
-            shell_quote_for_display("/tmp/o'brien"),
-            "'/tmp/o'\\''brien'"
-        );
-        // Shell metacharacters force quoting even without whitespace.
-        assert_eq!(shell_quote_for_display("/tmp/a$b"), "'/tmp/a$b'");
-        assert_eq!(shell_quote_for_display(""), "''");
-    }
-
-    /// C5 (codex review): a session dir with a space produces a quoted
-    /// `--repo` argument in the handoff hint.
-    #[test]
-    fn graph_handoff_hint_quotes_repo_path_with_spaces() {
-        let base = tempfile::tempdir().expect("base tempdir");
-        let session_dir = base.path().join("My Repo");
-        std::fs::create_dir_all(&session_dir).expect("create spaced dir");
-        let cwd = tempfile::tempdir().expect("cwd tempdir");
-        let thread_id = "22222222-2222-4222-8222-222222222222";
-        let hint = format_graph_handoff_hint(thread_id, &session_dir, Some(cwd.path()));
-        assert!(
-            hint.ends_with(&format!(
-                "--repo {}",
-                shell_quote_for_display(&session_dir.display().to_string())
-            )),
-            "spaced repo path must be quoted in the hint: {hint}"
-        );
-        assert!(
-            hint.contains('\''),
-            "quoted path must contain a quote: {hint}"
-        );
-    }
-
-    /// C5: if the process working directory can't be resolved, fail safe by
-    /// emitting the explicit `--repo <path>` form rather than a bare hint that
-    /// might discover the wrong repository.
-    #[test]
-    fn graph_handoff_hint_appends_repo_when_current_dir_unknown() {
-        let session_dir = tempfile::tempdir().expect("session tempdir");
-        let thread_id = "11111111-1111-4111-8111-111111111111";
-        let hint = format_graph_handoff_hint(thread_id, session_dir.path(), None);
-        assert!(
-            hint.contains("--repo") && hint.contains(&session_dir.path().display().to_string()),
-            "unknown cwd must fall back to explicit --repo; got: {hint}"
         );
     }
 
@@ -7080,30 +5545,6 @@ mod tests {
         assert_eq!(value.as_deref(), Some("file-key"));
     }
 
-    /// The legacy TUI resume driver (bare `--provider codex --resume`) is the
-    /// only remaining entry that accepts `--network-access allow`; W5-06
-    /// removes that driver together with the Code TUI startup path.
-    #[test]
-    fn accepts_network_access_cli_arg_in_legacy_tui_mode() {
-        let args = CodeArgs::try_parse_from([
-            "libra",
-            "--provider",
-            "codex",
-            "--resume",
-            "11111111-1111-4111-8111-111111111111",
-            "--network-access",
-            "allow",
-        ])
-        .unwrap();
-
-        assert_eq!(args.network_access, CodeNetworkAccess::Allow);
-        assert!(
-            codex_resume_uses_legacy_tui(&args),
-            "codex+resume must select the legacy TUI driver (the network-access accept path)"
-        );
-        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
-    }
-
     #[test]
     fn rejects_network_access_on_default_web_launch() {
         let args = CodeArgs::try_parse_from(["libra", "--network-access", "allow"]).unwrap();
@@ -7524,8 +5965,8 @@ no_cache_unknown_network = true
         );
     }
 
-    #[tokio::test]
-    async fn tui_code_ui_runtime_prefers_projection_bundle_identity() {
+    #[test]
+    fn resume_bootstrap_snapshot_prefers_projection_bundle_identity() {
         let thread_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
         let actor = git_internal::internal::object::types::ActorRef::human("tester").unwrap();
         let bundle = ThreadBundle {
@@ -7563,24 +6004,20 @@ no_cache_unknown_network = true
         };
         let mut session = SessionState::new("/tmp/workspace");
         session.id = "legacy-session".to_string();
-        let session_store = SessionStore::from_storage_path(Path::new("/tmp/workspace/.libra"));
 
-        let runtime = build_tui_code_ui_runtime(
+        let snapshot = build_code_ui_resume_bootstrap_snapshot(
             "/tmp/workspace",
             &session,
-            &session_store,
-            "ollama",
-            "gemma4:31b",
+            CodeUiProviderInfo {
+                provider: "ollama".to_string(),
+                model: Some("gemma4:31b".to_string()),
+                mode: Some("web-headless".to_string()),
+                managed: false,
+            },
+            headless_capabilities(),
             Some(&bundle),
-            None,
-            false,
-            false,
-            None,
-            None,
         )
-        .await
-        .expect("build TUI runtime from projection bundle");
-        let snapshot = runtime.snapshot().await;
+        .expect("build resume bootstrap snapshot from projection bundle");
 
         // plan-20260715 W3-01 (74d3ab2): the bootstrap always stamps durable
         // `SessionState.id` as session_id — mirroring the thread UUID into
@@ -7956,11 +6393,9 @@ no_cache_unknown_network = true
     /// the dispatcher unconditionally would fail this test by surfacing
     /// `task` in the registry's `tool_names()`.
     ///
-    /// The TUI path inlines its registry construction inside
-    /// `execute_tui` and is not testable in isolation; the unit-level
-    /// guard at
+    /// The unit-level guard at
     /// `internal::ai::tools::registry::tests::registry_does_not_expose_task_tool_in_flag_off_default`
-    /// covers the fixture-level invariant for that path.
+    /// covers the fixture-level invariant for registry construction.
     #[test]
     fn build_headless_tool_registry_omits_task_tool_in_flag_off_default() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8001,46 +6436,6 @@ no_cache_unknown_network = true
                 "headless registry must expose guarded tool `{tool}` after runtime context wiring; got {names:?}"
             );
         }
-    }
-
-    /// Scenario: an agent binding whose `provider_id` does NOT match any
-    /// `CodeProvider` variant must be rejected at
-    /// `effective_code_provider_for_args` with a clear, actionable error.
-    /// Silent fallback to `args.provider` would leave system prompt and
-    /// context-budget computations pointed at the CLI provider while the
-    /// model itself was built (or refused) for a different provider —
-    /// a partial-misconfiguration trap. Pinning this gate prevents the
-    /// regression Codex flagged on the OC-Phase 2 P2.4 review.
-    #[test]
-    fn effective_provider_rejects_unknown_binding_provider_id() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_agent_profile(
-            tmp.path(),
-            "alien",
-            "---\n\
-             name: alien\n\
-             model: aleph-omega/some-model\n\
-             ---\n\
-             body",
-        );
-        let mut args = base_args();
-        args.agent = Some("alien".to_string());
-
-        let err = effective_code_provider_for_args(&args, tmp.path())
-            .expect_err("unknown binding provider must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("alien"),
-            "error must mention the agent name: {msg}"
-        );
-        assert!(
-            msg.contains("aleph-omega"),
-            "error must echo the offending provider id: {msg}"
-        );
-        assert!(
-            msg.contains("anthropic"),
-            "error must list the known provider ids: {msg}"
-        );
     }
 
     #[test]

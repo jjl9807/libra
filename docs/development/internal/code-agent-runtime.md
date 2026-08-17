@@ -1247,12 +1247,12 @@ rg -n "SubAgentDispatcher|run_tool_loop_with_history_and_observer|ToolLoopConfig
 
 当前可确认的事实（执行任何 AG 卡前必须用 rg 刷新）：
 
-- `src/command/code.rs` 有 `execute_tui`、`execute_web_only`、`execute_stdio` 三条 mode path。
-- `--web` 是 `CodeArgs.web_only` 的 alias；`--mcp-stdio` 是 `CodeArgs.stdio` 的 alias。
-- generic provider 的 IntentSpec/Plan 两阶段确认和 repair loop 仍在 TUI App 中（headless 仅支持部分 plan 工具投影 + direct turn）。
-- goal、usage、skill、task 等 slash command 效果仍由 TUI 私有 handler 承载（部分已通过 `CodeUiCommandAdapter` 暴露默认 "not supported"）。
-- Web headless path 已有 submit/streaming/approval/user-input/cancel/patchset/session persistence 的部分能力 + 复用 `ProviderFactory` + `ToolRuntimeContext`，**但仍调用 `default_tui_runtime_context` 且未完整加载 skills/hooks/profiles/SourcePool**，不能作为最终核心 runtime。
-- `TuiCodeUiAdapter`/`TuiControlCommand` 仍是 Web write 进入 TUI App 的桥；reclaim 语义仍存在。
+- `src/command/code.rs` 只有 `execute_web_only`、`execute_stdio` 两条 mode path（`execute_tui` 已由 plan-20260715 **W5-06** 删除；bare `--provider codex --resume` 现在 fail-closed 为 usage error + 迁移提示）。
+- （历史，W5-07 前）`--web` 曾是 `CodeArgs.web_only` 的 alias——两者均已由 **W5-07** 删除；`--mcp-stdio` 仍是 `CodeArgs.stdio` 的 alias。
+- （历史，W5-06 前）generic provider 的 IntentSpec/Plan 两阶段确认和 repair loop 曾由 TUI App 承载；现由 AgentRuntime worker 持有（headless 场景覆盖 intent review/plan/repair 门），TUI App 内的副本是待 W5-03 删除的死代码。
+- （历史，W5-06 前）goal、usage、skill、task 等 slash command 效果曾由 TUI 私有 handler 承载；现经 runtime / `CodeUiCommandAdapter` 暴露。
+- Web headless path 已有 submit/streaming/approval/user-input/cancel/patchset/session persistence 的部分能力 + 复用 `ProviderFactory` + `ToolRuntimeContext`，**但仍调用 `default_tui_runtime_context`（命名为 tui 系历史遗留，归 W5-02/W5-03 搬迁更名）且未完整加载 skills/hooks/profiles/SourcePool**，不能作为最终核心 runtime。
+- （历史，W5-06 前）`TuiCodeUiAdapter`/`TuiControlCommand` 曾是 Web write 进入 TUI App 的桥；**W5-06 已删除该桥**，Web write 直达 AgentRuntime adapter（`TuiControlError` downcast 残留归 W5-02，`control.rs` 迁移归 W5-02/W5-03）。
 - `src/command/graph.rs` 曾直接依赖 ratatui/crossterm；**W5-08 已删除 interactive TUI 入口并移除渲染器**，仅余 `--json`/`--machine` 结构化输出（依赖摘除归 W5-10）。
 - `src/internal/ai/agent/runtime/` 已提供 `ChatAgent` / `run_tool_loop*` / `SubAgentDispatcher` 等可复用的中立执行原语；`intentspec/` / `goal/` / `runtime/phase*.rs` 已有部分 workflow 合同。
 - **dagrs 的实际位置（2026-06-17 复核，勿误判）：** `rg -ln "dagrs::|use dagrs" src/internal/ai/` 显示 dagrs 实际仅在 **2 文件**中使用：`orchestrator/executor.rs`（`execute_dag`/`build_dagrs_graph`/`TaskDagrsAction`）和 `node_adapter.rs`（`AgentAction`/`ToolLoopAction` 把 agent/tool-loop 包成 `dagrs::Action`）。`runtime/phase1.rs`、`task_executors.rs` 中只是**注释**提到 dagrs。`runtime/mod.rs` 仅 `pub mod phase0..4` + 类型 re-export，**不是** dagrs 执行器。结论：dagrs 驱动的是**多 agent 执行 DAG**，不是 Intent/Plan/Validation 的 phase 推进。（注：原版本声称 dagrs 在 orchestrator/ 的 9 个文件中使用，经 2026-06-17 复核不正确——实际仅 `executor.rs` + `node_adapter.rs`。）

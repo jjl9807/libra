@@ -1,33 +1,19 @@
-//! Terminal management for the TUI.
+//! Terminal types for the (removed) TUI event loop.
 //!
-//! Owns the crossterm bootstrap (raw mode, bracketed paste, keyboard
-//! enhancement flags, focus change, alternate screen), the matching teardown,
-//! and a unified [`TuiEvent`] stream that merges:
-//! - Terminal events (key / paste / mouse / resize) from `crossterm::EventStream`.
-//! - Draw requests scheduled through a tokio broadcast channel.
-//!
-//! The merged stream is the single input source for [`super::app::App`]. By
-//! collapsing the two sources into one enum the event loop can be a flat
-//! `while let Some(ev) = stream.next().await` with no dual-source bookkeeping.
+//! W5-06 removed the Code TUI startup path (`libra code` no longer enters a
+//! terminal UI), including the crossterm bootstrap/teardown and alternate
+//! screen switching that used to live here. What remains is the shared
+//! [`TuiEvent`] stream and the [`Tui`] wrapper consumed by
+//! [`super::app::App`]; the rest of the module retires with the
+//! `src/internal/tui` module removal (W5-03).
 
 use std::{
-    io::{self, IsTerminal, Result, Stdout, stdin, stdout},
-    panic,
+    io::{Result, Stdout},
     pin::Pin,
-    sync::OnceLock,
-    thread::{self, ThreadId},
     time::Duration,
 };
 
-use crossterm::{
-    event::{
-        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-        EnableFocusChange, KeyEvent, KeyboardEnhancementFlags, MouseEvent,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
-    execute, terminal,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
-};
+use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::broadcast;
 use tokio_stream::{Stream, StreamExt};
@@ -40,10 +26,8 @@ pub const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16); // ~60 FP
 /// A type alias for the terminal type used in this application.
 ///
 /// Always crossterm-backed because the TUI binds platform behaviour (raw
-/// mode, alt-screen, keyboard flags) directly to crossterm primitives.
+/// mode, keyboard flags) directly to crossterm primitives.
 pub type TerminalType = Terminal<CrosstermBackend<Stdout>>;
-
-static PANIC_RESTORE_THREAD: OnceLock<ThreadId> = OnceLock::new();
 
 /// Events from the terminal.
 ///
@@ -64,176 +48,6 @@ pub enum TuiEvent {
     Draw,
     /// Terminal resize; new dimensions are re-queried at draw time.
     Resize,
-}
-
-/// Initialize the terminal for TUI mode.
-///
-/// Functional scope: validates that both stdin and stdout are TTYs, then
-/// installs the modes required by the TUI (raw mode, bracketed paste,
-/// keyboard enhancement flags, focus change). Also registers a panic hook so
-/// a panicking task does not leave the terminal in raw mode.
-///
-/// Boundary conditions:
-/// - Returns an `io::Error` if either stream is not a terminal — running
-///   `libra code` while piped is unsupported and would silently misbehave.
-/// - Keyboard enhancement flags and focus change are best-effort; some
-///   terminals reject them silently and the TUI still works without them.
-pub fn init() -> Result<TerminalType> {
-    if !stdin().is_terminal() {
-        return Err(io::Error::other("stdin is not a terminal"));
-    }
-    if !stdout().is_terminal() {
-        return Err(io::Error::other("stdout is not a terminal"));
-    }
-
-    // Once-per-process: redirect fd 2 (stderr) to either the libra log file
-    // or /dev/null so external child processes (e.g. `mount_macfuse` from
-    // rfuse3) cannot scribble error text onto the alternate-screen TUI.
-    // Tracing-subscriber configured by main.rs writes through its own
-    // file/non-stderr path when LIBRA_LOG_FILE is set, so this redirect does
-    // not lose libra's own diagnostics.
-    let _ = redirect_stderr_for_tui();
-
-    set_modes()?;
-    record_panic_restore_thread();
-    set_panic_hook();
-
-    let backend = CrosstermBackend::new(stdout());
-    let terminal = Terminal::new(backend)?;
-    Ok(terminal)
-}
-
-/// Redirect process-wide fd 2 to a sink that the TUI does not render.
-///
-/// Functional scope: the TUI runs in alternate-screen mode, but fd 2
-/// belongs to the controlling tty regardless. External child processes
-/// (e.g. `mount_macfuse` invoked deep inside rfuse3) write diagnostic text
-/// directly to fd 2, which then bleeds through the alternate-screen and
-/// corrupts the rendered frame. We pick a destination once at TUI startup:
-/// the `LIBRA_LOG_FILE` path if the user set it, otherwise `/dev/null`. The
-/// redirect is best-effort — any failure is logged via tracing and the TUI
-/// proceeds with the original stderr.
-///
-/// Boundary conditions:
-/// - Idempotent across repeated calls; subsequent calls are cheap dups.
-/// - We deliberately leave the saved fd dangling because TUI mode runs
-///   until process exit; restoring stderr on `tui_restore` would mean
-///   plumbing a global guard through every panic path with no real benefit.
-#[cfg(unix)]
-fn redirect_stderr_for_tui() -> io::Result<()> {
-    use std::{fs::OpenOptions, os::fd::AsRawFd};
-
-    let target_path = std::env::var_os("LIBRA_LOG_FILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
-
-    let target = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&target_path)?;
-
-    // SAFETY: libc::dup2 is FFI; we pass valid file descriptors and ignore
-    // EINTR-like transient errors via the syscall-loop convention.
-    let rc = unsafe { libc::dup2(target.as_raw_fd(), libc::STDERR_FILENO) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Intentionally leak the file handle — the kernel keeps fd 2 alive
-    // referencing the same inode until process exit.
-    std::mem::forget(target);
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn redirect_stderr_for_tui() -> io::Result<()> {
-    // Windows-side TUI does not face the same FUSE child-process leak; if
-    // a future Windows backend needs equivalent protection, reuse the
-    // same `LIBRA_LOG_FILE` convention here.
-    Ok(())
-}
-
-/// Set up terminal modes for TUI.
-///
-/// Functional scope: enables bracketed paste, raw mode, keyboard enhancement
-/// flags, and focus-change reporting. Mouse capture is intentionally left
-/// disabled so the host terminal's native text-selection still works.
-///
-/// Boundary conditions: enhancement flag pushes and focus change use
-/// `let _ = execute!(...)` because terminals that don't support them return
-/// errors that are not actionable — the TUI continues to function with
-/// reduced fidelity.
-fn set_modes() -> Result<()> {
-    execute!(stdout(), EnableBracketedPaste)?;
-
-    // Leave mouse capture disabled so the terminal can provide native text
-    // selection and mouse-driven paste. The TUI still accepts mouse events if a
-    // terminal sends them without capture, but selection must take priority.
-    terminal::enable_raw_mode()?;
-
-    // Enable keyboard enhancement flags for better key event handling
-    // (disambiguate Esc, surface key release events). Best-effort.
-    let _ = execute!(
-        stdout(),
-        PushKeyboardEnhancementFlags(
-            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-        )
-    );
-
-    let _ = execute!(stdout(), EnableFocusChange);
-    Ok(())
-}
-
-/// Restore the terminal to its original state.
-///
-/// Functional scope: reverses every change made by [`set_modes`] (and a few
-/// extras like leaving alt-screen and showing the cursor) so the user's shell
-/// is left in a clean state on exit.
-///
-/// Boundary conditions:
-/// - Pop / disable calls use `let _ = execute!` because the matching enables
-///   may have failed silently; we still attempt cleanup to avoid stranding
-///   the terminal in a partial state.
-/// - Called from [`set_panic_hook`] *before* the previous panic hook runs, so
-///   panic backtraces print into a sane terminal.
-pub fn restore() -> Result<()> {
-    // Pop may fail on platforms that didn't support the push; ignore errors.
-    let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    execute!(stdout(), DisableBracketedPaste)?;
-    let _ = execute!(stdout(), DisableMouseCapture);
-    let _ = execute!(stdout(), DisableFocusChange);
-    let _ = execute!(stdout(), LeaveAlternateScreen);
-    terminal::disable_raw_mode()?;
-    let _ = execute!(stdout(), crossterm::cursor::Show);
-    Ok(())
-}
-
-/// Install a panic hook that restores the terminal before delegating to the
-/// previous hook for fatal CLI-thread panics.
-///
-/// Without this, a panic mid-frame would leave the user staring at a terminal
-/// in raw mode with no echo and no cursor.
-fn set_panic_hook() {
-    let hook = panic::take_hook();
-    panic::set_hook(Box::new(move |panic_info| {
-        let current_thread = thread::current();
-        if should_restore_terminal_for_panic(current_thread.id()) {
-            let _ = restore(); // ignore any errors as we are already failing
-        }
-        hook(panic_info);
-    }));
-}
-
-fn record_panic_restore_thread() {
-    let _ = PANIC_RESTORE_THREAD.set(thread::current().id());
-}
-
-fn should_restore_terminal_for_panic(thread_id: ThreadId) -> bool {
-    thread_should_restore_terminal(thread_id, PANIC_RESTORE_THREAD.get().copied())
-}
-
-fn thread_should_restore_terminal(thread_id: ThreadId, restore_thread: Option<ThreadId>) -> bool {
-    restore_thread.is_some_and(|owner| owner == thread_id)
 }
 
 /// The TUI wrapper that manages terminal and event streaming.
@@ -389,19 +203,6 @@ impl Tui {
         Ok(())
     }
 
-    /// Enter alternate screen mode so the TUI gets a clean canvas and the
-    /// user's scrollback is preserved.
-    pub fn enter_alt_screen(&mut self) -> Result<()> {
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
-        Ok(())
-    }
-
-    /// Leave alternate screen mode, restoring the user's prior shell content.
-    pub fn leave_alt_screen(&mut self) -> Result<()> {
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        Ok(())
-    }
-
     /// Get the terminal size.
     ///
     /// Functional scope: returns a `Rect` rooted at the origin so callers
@@ -410,28 +211,5 @@ impl Tui {
     pub fn size(&self) -> Result<ratatui::layout::Rect> {
         let size = self.terminal.size()?;
         Ok(ratatui::layout::Rect::new(0, 0, size.width, size.height))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::thread;
-
-    use super::thread_should_restore_terminal;
-
-    #[test]
-    fn owner_thread_panic_restores_terminal() {
-        let owner = thread::current().id();
-
-        assert!(thread_should_restore_terminal(owner, Some(owner)));
-    }
-
-    #[test]
-    fn worker_thread_panic_does_not_restore_terminal() {
-        let owner = thread::current().id();
-        let worker = thread::spawn(|| thread::current().id()).join().unwrap();
-
-        assert!(!thread_should_restore_terminal(worker, Some(owner)));
-        assert!(!thread_should_restore_terminal(owner, None));
     }
 }

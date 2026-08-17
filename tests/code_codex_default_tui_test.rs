@@ -1,24 +1,28 @@
 //! Static guard for Phase 2 Task 2.7 of `docs/development/tracing/agent.md` Part B
 //! (merged from the original TUI improvement plan per the 2026-05-02
-//! agent.md consolidation), updated for plan-20260715 **W4-01** / **W5-07**.
+//! agent.md consolidation), updated for plan-20260715 **W4-01** / **W5-06** /
+//! **W5-07**.
 //!
 //! `libra code --provider codex` must route through the managed Codex
 //! app-server / Code UI runtime — the legacy standalone Codex stdin loop
 //! (`agent_codex::execute`) is deprecated and must not be reachable from the
 //! `libra code` command path. After W4-01 the **default** entry is Web Code UI
 //! (`execute_web_only`); W5-07 removed the hidden `LIBRA_CODE_LEGACY_TUI=1`
-//! rollback env and the deprecated `--web`/`--web-only` aliases, leaving bare
-//! `--provider codex --resume` as the only legacy TUI entry (W5-06 removes
-//! that resume driver together with the TUI startup path). Spinning up a real
-//! Codex app-server inside CI is prohibitively heavy, so we rely on
-//! source-level invariants instead:
+//! rollback env and the deprecated `--web`/`--web-only` aliases, and W5-06
+//! removed the TUI startup path together with the bare
+//! `--provider codex --resume` legacy TUI resume driver (it now fails closed
+//! with a usage error). Spinning up a real Codex app-server inside CI is
+//! prohibitively heavy, so we rely on source-level invariants instead:
 //!
 //! 1. `src/command/code.rs` must not call `agent_codex::execute`.
 //! 2. Default `execute()` must prefer `execute_web_only` via
 //!    `code_uses_web_launch`, and the removed rollback env must not reappear
 //!    (mirrors the W5-07 guard).
-//! 3. `CodeProvider::Codex` still hands off to `start_codex_code_ui_runtime` /
-//!    `run_tui_with_managed_code_runtime` (Web default + legacy resume driver).
+//! 3. The W5-06-removed TUI startup path (`execute_tui`,
+//!    `codex_resume_uses_legacy_tui`, `run_tui_with_managed_code_runtime`)
+//!    must not reappear; bare `--provider codex --resume` must fail closed
+//!    with a migration-hint usage error, and `CodeProvider::Codex` hands off
+//!    to `start_codex_code_ui_runtime` (Web default).
 //! 4. `agent_codex::execute` must keep the `#[deprecated]` marker.
 //! 5. Legacy stdin/stdout primitives must not appear inside
 //!    `src/command/code.rs` or `src/internal/tui/`.
@@ -96,13 +100,19 @@ fn default_execute_routes_to_web_code_ui() {
         source.contains("execute_web_only(&args).await"),
         "default execute path must call execute_web_only"
     );
+    // W5-06: the TUI startup path and the bare `--provider codex --resume`
+    // legacy resume driver are deleted; these symbols must not reappear.
     assert!(
-        source.contains("execute_tui(args).await"),
-        "legacy TUI resume driver (bare --provider codex --resume) must remain reachable until W5-06"
+        !source.contains("execute_tui"),
+        "W5-06 removed the execute_tui startup path from {COMMAND_CODE_PATH}"
     );
     assert!(
-        source.contains("fn codex_resume_uses_legacy_tui"),
-        "bare --provider codex --resume must be the only legacy TUI entry until W5-06"
+        !source.contains("codex_resume_uses_legacy_tui"),
+        "W5-06 removed the codex_resume_uses_legacy_tui dispatch from {COMMAND_CODE_PATH}"
+    );
+    assert!(
+        source.contains("--resume is not supported with --provider=codex"),
+        "bare --provider codex --resume must fail closed with a migration-hint usage error"
     );
 }
 
@@ -113,10 +123,11 @@ fn codex_arm_routes_through_managed_runtime() {
         source.contains("CodeProvider::Codex =>"),
         "expected `CodeProvider::Codex` match arm in {COMMAND_CODE_PATH}"
     );
-    // The legacy TUI resume driver still uses the shared managed-TUI driver.
+    // W5-06: the shared managed-TUI driver went away with the legacy resume
+    // driver; it must not come back.
     assert!(
-        source.contains("run_tui_with_managed_code_runtime"),
-        "Codex arm must keep `run_tui_with_managed_code_runtime` for the legacy resume driver"
+        !source.contains("run_tui_with_managed_code_runtime"),
+        "W5-06 removed `run_tui_with_managed_code_runtime` from {COMMAND_CODE_PATH}"
     );
     // Default Web and Codex web construct the runtime via the documented helper.
     assert!(

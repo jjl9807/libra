@@ -8,7 +8,7 @@
 
 ## 命令实现目标
 
-`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）。W5-07 已删除 W4 烘焙窗口的弃用别名 `--web` / `--web-only` 与隐藏回滚环境变量 `LIBRA_CODE_LEGACY_TUI`：旧 flag 现在以 clap unexpected-argument usage error + 迁移提示被拒绝，env 不再切换模式。裸 `libra code --provider codex --resume <thread_id>` 仍走遗留 TUI resume driver（managed Web `--provider codex` 继续拒绝 `--resume`），W5-06 将其与 TUI 启动路径一并删除。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
+`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）。W5-07 已删除 W4 烘焙窗口的弃用别名 `--web` / `--web-only` 与隐藏回滚环境变量 `LIBRA_CODE_LEGACY_TUI`：旧 flag 现在以 clap unexpected-argument usage error + 迁移提示被拒绝，env 不再切换模式。W5-06 已删除遗留 TUI 启动路径与裸 `libra code --provider codex --resume <thread_id>` 的 TUI resume driver：该组合现在以 clap usage error + 迁移提示 fail-closed（managed Web `--provider codex` 继续拒绝 `--resume`），所有非 stdio `libra code` 均启动 Web Code UI。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
 
 ## 对比 Git 与兼容性
 
@@ -18,7 +18,7 @@
 ## 当前源码事实
 
 - 入口与分发：`src/cli.rs::Commands` 公开接入；`src/command/mod.rs` 导出；主要实现文件是 `src/command/code.rs`，入口为 `execute`。
-- 参数模型：`CodeArgs`、`CodeProvider`。`validate_mode_args` 当前负责四类 mode 校验：默认 Web（W5-07 起为唯一 flagless 入口）、裸 `--provider codex --resume` 的遗留 TUI resume driver（W5-06 删除）、MCP `--stdio`、以及 W4-02 的 client-only `--control stdio`。
+- 参数模型：`CodeArgs`、`CodeProvider`。`validate_mode_args` 当前负责三类 mode 校验：默认 Web（W5-07 起为唯一 flagless 入口；裸 `--provider codex --resume` 的遗留 TUI resume driver 已由 W5-06 删除，该组合现在以 usage error + 迁移提示 fail-closed）、MCP `--stdio`、以及 W4-02 的 client-only `--control stdio`。
 - `--stdio` 是弃用的 MCP-only legacy transport（tools/resources；非 turn control；stderr 弃用警告）。源码在 `validate_mode_args` 中明确拒绝 `--control write` 并提示使用 `libra code --control stdio` 做本地 automation（`code-control --stdio` 是 W4-09 弃用转发 shim，已于 W5-01 物理删除）。独立 `libra mcp --stdio` 为 DEFER-02（W5 之后），本计划不新增半成品 `libra mcp`。
 - 非 TUI mode 调用 `reject_non_tui_flags(args, mode, web_launch)`，该函数按 mode 区分放宽（C2 已落地 C1 对 GAP-1/GAP-3 的 **code behavior** 分类）：
   - 默认 Web 启动（`web_launch = true`；W5-07 前对应已删除的 `--web`/`--web-only` 别名）**放宽** `--provider`（全部 7 个 provider + Codex 分支）、`--model`、`--api-base`、`--temperature` 和 provider-specific tuning flags，使已构建的 headless web runtime / Codex web 分支 CLI 可达；这些 flag 转由 `validate_mode_args` 中的 cross-provider match gate 校验（不匹配的 provider-specific flag 仍拒绝，`--api-base` 在 `--provider=codex` 下仍拒绝）。banner/`BrowserControlMode` 注释/用户文档中的 `--provider <ollama|codex>` 示例因此变为真实可用。
@@ -33,10 +33,9 @@ flowchart TD
     B --> C["validate_mode_args"]
     C --> D{"mode"}
     D -->|"Web default"| E["AgentRuntime + Web Code UI"]
-    D -->|"codex --resume（遗留，W5-06 删除）"| F["legacy TUI resume driver"]
     D -->|"stdio"| G["MCP stdio server"]
+    C -.->|"codex --resume（W5-06 已删除：usage error + 迁移提示）"| X["fail-closed 拒绝"]
     E --> H["SessionStore / projection / graph / audit"]
-    F --> H
     G --> I["MCP tool surface only"]
     E --> J["approval / sandbox / tool ACL"]
 ```
@@ -48,7 +47,7 @@ flowchart TD
 | Mode 与参数 | Web default、stdio 已共用 `CodeArgs` 和 `validate_mode_args`；W4 烘焙窗口的 hidden TUI rollback（`LIBRA_CODE_LEGACY_TUI`）与 `--web`/`--web-only` alias 已由 W5-07 物理删除（旧 flag 返回 usage error + 迁移提示，env 不再改变任何行为）；C1 审计出的 help/banner 与 web-only provider 校验漂移已由 C2 放宽 web-only provider/model/api-base/temperature + provider-specific flags 消除（`--stdio` 保持锁定）。 | C2 已落地放宽并有 CLI regression（`code_cli_dispatch_test` + `src/command/code.rs::tests` web-only accept/reject 矩阵）；后续任何 mode 变更仍必须带 CLI regression。 |
 | Provider / env | provider-specific flags 和 `--api-base` 规则已有校验；live/provider tests 依赖 `.env.test` 时不得泄露 key。 | C3 固定 provider factory、env-file 优先级、Vault/env lookup、missing-key 错误和 feature-gated live tests。 |
 | Web-only / Code UI | Code UI API、SSE、browser control、control token、diagnostics redaction 是用户可见接口。 | C4 固定 `/api/code/*` observe-only contract；control token/`control.json` 0600（info 原子写 + worktree scope fail-closed）；diagnostics/SSE/control info 不泄露 secrets。 |
-| Session / graph | non-Codex Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）已走 headless JSONL projection fold；TUI resume 仍走 `SessionState`；`--stdio`/managed Codex 继续拒绝 resume。projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5/W1-06 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、统一 event fold；TUI/managed-Codex/graph 尚未共用同一 fold。 |
+| Session / graph | non-Codex Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）已走 headless JSONL projection fold；TUI resume（`SessionState`）已随 W5-06 删除；`--stdio`/managed Codex 继续拒绝 resume。projection、graph handoff、audit sink 不能与 user transcript 混用。 | C5/W1-06 固定 SessionStore JSONL unknown-event-safe、truncated-tail recovery、统一 event fold；managed-Codex/graph 尚未共用同一 fold。 |
 | MCP / code-control | `libra code --stdio` 是弃用的 MCP-only legacy（tools/resources；非 turn control）；canonical automation client 是 `libra code --control stdio`（`code-control --stdio` 为 W4-09 弃用转发 shim，已于 W5-01 物理删除）；`libra mcp --stdio` 为 DEFER-02。 | C6 禁止把 MCP stdio 当 turn control plane；双入口 tool set、shutdown、token/lease gate 都要有测试。 |
 | Sandbox / approval / fix bridge | workspace mutation 只能走内部 AgentRuntime serialized queue、approval、sandbox 和 tool ACL。 | C7 是 `review --fix` / `investigate fix` 的唯一解锁点；证据不足时 Agent 阶段必须返回 `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE` 对应错误码。 |
 | Docs / compat | `libra code` 是 Libra-only extension；用户文档、compat matrix、tests/INDEX 必须与源码同步。 | C8 收敛 `docs/commands/code.md`、zh-CN、`COMPATIBILITY.md`、`tests/INDEX.md`、release notes。 |
@@ -269,7 +268,7 @@ W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际
 | `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`（W5-08 已随 interactive 入口删除一并移除）。 | W4-04/W5-08 → W5-10（仅余依赖摘除）。 |
 | `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI（W5-08 已一并移除）。 | W5-08 已解耦；W5-10 负责依赖摘除与守卫。 |
 | `src/internal/ai/web/code_ui.rs:1266` | `TuiControlError` downcast 是 Web API 的编译期耦合。 | W5-02 先迁为 UI-neutral error。 |
-| `src/command/code.rs` `execute_tui` @ `:1561` | Code TUI startup/adapter。 | W5-01/W5-06，不能在 W1 删除。 |
+| `src/command/code.rs` `execute_tui`（原 `:1561`） | Code TUI startup/adapter（W5-06 已删除）。 | W5-06 已随 TUI 启动路径一并删除。 |
 | `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 清理链接即可。 |
 
 ## Web-only completion gate（W0-03）
