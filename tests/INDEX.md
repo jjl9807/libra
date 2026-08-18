@@ -153,7 +153,7 @@ targets with
 | `code_ui_remote_security_matrix` | 2 | Auth/token/origin enforcement matrix | `src/command/code_control*.rs` |
 | `code_ui_remote_generation_matrix` | 2 | Generation control across surfaces (no live LLM) | `src/internal/ai/web/`, `src/command/code.rs` |
 | `code_ui_remote_approval_matrix` | 2 | Approval flow across Web/automation | `src/internal/ai/agent/` approvals |
-| `code_cli_dispatch_test` | 2 | `libra code …` argv parsing & dispatch | `src/command/code.rs` |
+| `code_cli_dispatch_test` | 2 | `libra code …` argv parsing & dispatch; W5-09 aggregate breaking guard `breaking_code_surface_migration` pins the whole family surface (removed `--web`/`--web-only` aliases + inert rollback env, unexposed `code-control`, refused interactive graph with `--json`/`--machine` pinned to the structured `LBR-REPO-001` path, rejected bare codex+resume) in one pre-push run | `src/command/code.rs` |
 | `code_provider_boot_test` | 2 | Provider/agent bootstrap inside `libra code`, including the shared env-file → process → Vault factory used by default Web and headless launch | `src/command/code.rs`, `src/internal/ai/providers/`, `src/internal/ai/runtime/services.rs` |
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |

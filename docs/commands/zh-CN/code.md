@@ -1,6 +1,6 @@
 # `libra code`
 
-启动交互式 AI 编码会话。所有非 stdio 的 `libra code` 均启动 Web Code UI（遗留 TUI 启动路径已在 W5 breaking 发布中删除，W5-06）。
+启动交互式 AI 编码会话。除 MCP `--stdio` 与 `--control stdio` 客户端 shim 外，所有 `libra code` 启动均进入 Web Code UI（遗留 TUI 启动路径已在 W5 breaking 发布中删除，W5-06）。
 
 ## 概要
 

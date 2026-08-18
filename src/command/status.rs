@@ -2956,14 +2956,11 @@ async fn run_status_scan_locked_inner(
             json_data["mode"] = serde_json::json!("scan");
             json_data["cache_written"] = serde_json::json!(false);
             // A non-EPIPE stdout failure must not swallow the collected
-            // warnings: JSON is their only channel, so they fall back to stderr
-            // rather than vanishing with the envelope.
-            if let Err(error) = emit_json_data("status", &json_data, output) {
-                if !error.is_silent() {
-                    deliver_warnings_stderr(&data.warnings);
-                }
-                return Err(error);
-            }
+            // warnings; the OUTER `run_status_scan_locked` wrapper owns the
+            // stderr fallback for every non-silent inner failure (a second
+            // delivery here double-printed the shared `cache_warnings` set,
+            // Codex W5-09 r9 P2).
+            emit_json_data("status", &json_data, output)?;
             StatusOutcome::new(&data, args).resolve(output)?;
             return Ok(());
         }
@@ -3024,14 +3021,11 @@ async fn run_status_scan_locked_inner(
         json_data["mode"] = serde_json::json!("scan");
         json_data["cached_paths"] = serde_json::json!(row_count);
         // A non-EPIPE stdout failure must not swallow the collected
-        // warnings: JSON is their only channel, so they fall back to stderr
-        // rather than vanishing with the envelope.
-        if let Err(error) = emit_json_data("status", &json_data, output) {
-            if !error.is_silent() {
-                deliver_warnings_stderr(&data.warnings);
-            }
-            return Err(error);
-        }
+        // warnings; the OUTER `run_status_scan_locked` wrapper owns the
+        // stderr fallback for every non-silent inner failure (a second
+        // delivery here double-printed the shared `cache_warnings` set,
+        // Codex W5-09 r9 P2).
+        emit_json_data("status", &json_data, output)?;
     } else {
         // Deliver AFTER the body renders: a render failure then reaches the
         // wrapper's snapshot fallback instead of double-printing (warnings
@@ -4467,10 +4461,26 @@ fn render_upstream_human(upstream: &UpstreamInfo, buffer: &mut Vec<u8>) -> CliRe
 /// warning tracker — human/short/porcelain delivery only (§B.5 matrix).
 /// JSON callers must NOT use this: their warnings ride in `data.warnings[]`.
 fn deliver_warnings_stderr(warnings: &[StatusWarning]) {
+    // In TEXT mode RepositoryPreflight entries were already printed live by
+    // `emit_warning` when the preflight raised them (with structured output
+    // inactive it prints immediately); they join the structured list only so
+    // JSON payloads and §B.5 exit arbitration see them, and re-printing them
+    // here doubled the stderr line. Under a structured envelope nothing was
+    // printed live (`emit_warning` only buffers), so the JSON output-failure
+    // fallback that calls this MUST deliver them or they vanish with the
+    // envelope — the skip is therefore conditional on live delivery having
+    // happened.
+    let preflight_already_live = !crate::utils::output::structured_output_active();
+    let mut delivered_any = false;
     for warning in warnings {
+        if preflight_already_live && matches!(warning.code, StatusWarningCode::RepositoryPreflight)
+        {
+            continue;
+        }
         eprintln!("warning: {}", warning.message);
+        delivered_any = true;
     }
-    if !warnings.is_empty() {
+    if delivered_any {
         crate::utils::output::record_warning();
     }
 }

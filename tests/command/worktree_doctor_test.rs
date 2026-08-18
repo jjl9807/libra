@@ -855,9 +855,17 @@ fn worktree_doctor_hints_are_inspect_only() {
             // sanctioned exception: naming one is not the bare diagnostic
             // promising recovery, it is pointing at the explicit command
             // that performs it.
-            if ["--adopt-capture-session", "--adopt-info-to"]
-                .iter()
-                .any(|action| line.contains(action))
+            if [
+                "--adopt-capture-session",
+                "--adopt-info-to",
+                // W4-07 approved_permission recovery: a separately named,
+                // `--confirm`-gated action grammar (see
+                // `require_repair_confirmation` in worktree.rs), not a bare
+                // diagnostic promising recovery.
+                "--adopt-approved-project",
+            ]
+            .iter()
+            .any(|action| line.contains(action))
             {
                 continue;
             }

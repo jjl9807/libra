@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-02T09:00:00Z","message":{"role":"user","content":"/review the staged diff"}}
+{"timestamp":"2026-07-02T09:00:04Z","message":{"role":"assistant","model":"gpt-5.3-codex","content":"Looking at the staged diff."},"usage":{"input_tokens":120,"output_tokens":35}}
+{"timestamp":"2026-07-02T09:01:00Z","message":{"role":"user","content":"Summarize the findings."}}
+{"timestamp":"2026-07-02T09:01:05Z","message":{"role":"assistant","model":"gpt-5.3-codex","content":"Two findings, both minor."},"usage":{"input_tokens":80,"output_tokens":25}}

@@ -2,10 +2,52 @@
 
 ## [Unreleased]
 
-### Removed (plan-20260715 W5-06, 2026-08-17; ships with the W5-09 breaking minor)
+### Breaking (plan-20260715 W5-09, 2026-08-17, v0.20.0)
+
+- **v0.20.0 is the single breaking release of the W5-01 family**
+  (sub-cards W5-01/W5-06/W5-07/W5-08 + this release point). It deletes
+  every public surface deprecated during the W4 bake window in one atomic
+  step; the last release that still supports the removed surfaces is
+  **v0.19.158**. Removed:
+  - `libra code-control` forwarding shim (W5-01) — migrate to
+    `libra code --control stdio` (`--control-url` / `--control-token-file`
+    replace the legacy `--url` / `--token-file`).
+  - Legacy Code TUI startup path, including the bare
+    `--provider codex --resume` TUI resume driver (W5-06) — every
+    `libra code` launch apart from the MCP `--stdio` entry and the
+    `--control stdio` automation client (a client-only shim, no UI boot)
+    launches the Web Code UI; bare codex+resume fails with a usage error
+    plus a migration hint; `--network-access allow` is rejected in every
+    mode until the Plan network-policy gate owns per-execution sandbox
+    network.
+  - `--web` / `--web-only` aliases and the hidden
+    `LIBRA_CODE_LEGACY_TUI` rollback env (W5-07) — the bake-period
+    rollback capability terminates with this release; the env no longer
+    changes any behavior.
+  - Interactive graph TUI entry of `libra graph` / `libra agent graph`
+    (W5-08) — bare invocations fail with `LBR-CLI-002` (exit 129) plus a
+    migration hint; `--json` / `--machine` output is unchanged.
+  The four sub-cards were held as local-only commits under the family's
+  no-push window and are published together here; the family counts as
+  exactly **one** public release. Per-card migration details follow in
+  the W5-01/W5-06/W5-07/W5-08 entries below and in
+  `docs/commands/code.md`, `code-control.md`, and `graph.md`.
+
+### Removed (plan-20260715 W5-01, 2026-08-15, v0.20.0)
+
+- **W5-01 removes the deprecated `libra code-control` forwarding shim.**
+  The binary now rejects `code-control` as an unknown command (stable
+  CLI-error exit 129). The canonical stdio automation client is
+  `libra code --control stdio` (JSON-RPC NDJSON; endpoint discovered from
+  `.libra/code/control.json` by default; `--control-url` /
+  `--control-token-file` replace the legacy `--url` / `--token-file`).
+  Migration: see `docs/commands/code-control.md`.
+
+### Removed (plan-20260715 W5-06, 2026-08-17, v0.20.0)
 
 - **W5-06 removes the legacy Code TUI startup path from `libra code`.**
-  Every non-stdio `libra code` now launches the Web Code UI: the
+  Every `libra code` launch apart from MCP `--stdio` and the
+  `--control stdio` client shim now launches the Web Code UI: the
   `execute_tui` startup path, the `TuiCodeUiAdapter`, terminal
   alternate-screen/panic-hook setup, and the follow-up
   `libra graph --json <thread_id>` printed on TUI exit are gone. Bare
@@ -22,7 +64,7 @@
   `--resume <thread_id>` in the same working directory; approve network
   through the Plan review gate instead of `--network-access allow`.
 
-### Removed (plan-20260715 W5-07, 2026-08-16; ships with the W5-09 breaking minor)
+### Removed (plan-20260715 W5-07, 2026-08-16, v0.20.0)
 
 - **W5-07 removes the deprecated `--web` / `--web-only` aliases and the
   hidden `LIBRA_CODE_LEGACY_TUI` rollback switch from `libra code`.** The
@@ -36,7 +78,7 @@
   `libra code --provider codex --resume <thread_id>` TUI resume driver was
   later removed by W5-06 (see the W5-06 entry above).
 
-### Removed (plan-20260715 W5-08, 2026-08-16; ships with the W5-09 breaking minor)
+### Removed (plan-20260715 W5-08, 2026-08-16, v0.20.0)
 
 - **W5-08 removes the interactive TUI entry of `libra graph` and
   `libra agent graph`.** Bare `libra graph <THREAD_ID>` /

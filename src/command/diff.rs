@@ -3688,8 +3688,12 @@ fn apply_rename_detection(
     }
 
     /// Content provider over diff's loaders. Object (non-worktree) reads go
-    /// through [`ObjectReadBudget`] so WIO-03's cancellable 5s deadline and
-    /// 2 MiB/64 MiB/64-object caps apply the same way as `status` rename.
+    /// through [`ObjectReadBudget`] so WIO-03's cancellable 5s deadline
+    /// applies (a hung store cannot stall diff), but WITHOUT status's
+    /// object-count/byte caps: diff has no comparison budget by contract
+    /// (plan-20260714 §B.7, pinned by `diff_no_comparison_budget_regression`),
+    /// and the 64-object status cap silently unpaired every rename past the
+    /// first 64 blobs (pre-WIO diff read blobs uncapped).
     struct DiffContentSource<'a> {
         first_map: &'a HashMap<PathBuf, ObjectHash>,
         second_map: &'a HashMap<PathBuf, ObjectHash>,
@@ -3724,7 +3728,34 @@ fn apply_rename_detection(
             if let Ok(Some(content)) = preview_object::read(hash) {
                 return rename_detect::ContentOutcome::Content(std::rc::Rc::new(content));
             }
-            self.objects.read_blob(hash)
+            match self.objects.read_blob_tracked(hash) {
+                (rename_detect::ContentOutcome::Content(bytes), _) => {
+                    rename_detect::ContentOutcome::Content(bytes)
+                }
+                // A worker-COMPLETED skip means the store outcome is known
+                // and the object is one the worker structurally cannot
+                // serve — it is local-only and frame-capped (8 MiB), so
+                // remote-only objects under tiered storage and blobs past
+                // the frame cap silently unpaired renames pre-WIO diff
+                // handled (§B.7). Those fall back to the legacy in-process
+                // tiered read (pre-WIO parity, no deadline for this
+                // residual class). A TRANSPORT skip (worker killed at the
+                // deadline, spawn/dispatch/protocol failure) carries no
+                // store outcome — the killable bound stays final there
+                // (WIO-03, Codex r9): retrying it in-process would reopen
+                // exactly the unbounded stall the worker exists to bound.
+                (
+                    rename_detect::ContentOutcome::Skipped(reason),
+                    rename_detect::ObjectReadProvenance::Completed,
+                ) => match load_repo_blob_content(hash) {
+                    Ok(bytes) => rename_detect::ContentOutcome::Content(std::rc::Rc::new(bytes)),
+                    Err(_) => rename_detect::ContentOutcome::Skipped(reason),
+                },
+                (
+                    skip @ rename_detect::ContentOutcome::Skipped(_),
+                    rename_detect::ObjectReadProvenance::Transport,
+                ) => skip,
+            }
         }
     }
 
@@ -3750,7 +3781,14 @@ fn apply_rename_detection(
         first_map,
         second_map,
         worktree_entries,
-        objects: rename_detect::ObjectReadBudget::with_defaults(),
+        // Deadline-only budget: keep the killable worker read (WIO-03) but
+        // no per-object/total/object-count caps — see DiffContentSource docs.
+        objects: rename_detect::ObjectReadBudget::new(
+            u64::MAX,
+            u64::MAX,
+            u32::MAX,
+            rename_detect::OBJECT_READ_DEADLINE,
+        ),
     };
     let config = rename_detect::RenameDetectConfig {
         threshold,
@@ -3772,9 +3810,19 @@ fn apply_rename_detection(
         if let Ok(Some(content)) = preview_object::read(hash) {
             return Some(content);
         }
-        match objects.read_blob(hash) {
-            rename_detect::ContentOutcome::Content(bytes) => Some((*bytes).clone()),
-            rename_detect::ContentOutcome::Skipped(_) => None,
+        match objects.read_blob_tracked(hash) {
+            (rename_detect::ContentOutcome::Content(bytes), _) => Some((*bytes).clone()),
+            // Same fallback rule as detection (see DiffContentSource): only
+            // a worker-COMPLETED skip may recover through the legacy tiered
+            // read; a transport skip stays final (WIO-03, Codex r9).
+            (
+                rename_detect::ContentOutcome::Skipped(_),
+                rename_detect::ObjectReadProvenance::Completed,
+            ) => load_repo_blob_content(hash).ok(),
+            (
+                rename_detect::ContentOutcome::Skipped(_),
+                rename_detect::ObjectReadProvenance::Transport,
+            ) => None,
         }
     };
 

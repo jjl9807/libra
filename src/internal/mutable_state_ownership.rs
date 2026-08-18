@@ -307,8 +307,9 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
     },
     MutableStateSurface {
         table: "approved_permission",
-        owner: StateOwner::Repository,
-        rationale: "approvals and append-only logs (repo-wide by design, §C.4.1.1)",
+        owner: StateOwner::Composite,
+        rationale: "Always-approvals are repository-wide by trust design (§C.4.1.1); W4-07 \
+                    added the worktree_id provenance scope key (audit-only)",
     },
     MutableStateSurface {
         table: "automation_log",
@@ -454,6 +455,7 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "_agent_tombstone_down_guard",
     "agent_capture_scope_down_guard",
     "agent_usage_stats__rebuild",
+    "approved_permission_provenance_down_guard",
     "bisect_state__down_guard_2026072301",
     "head_scope_unique_guard",
     "layer__down_guard_2026072303",

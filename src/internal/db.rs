@@ -113,6 +113,24 @@ pub async fn establish_connection_with_busy_timeout(
     db_path: &str,
     busy_timeout: Duration,
 ) -> Result<DatabaseConnection, IOError> {
+    let conn = open_connection_without_schema_management(db_path, busy_timeout).await?;
+    ensure_database_schema_is_current(&conn).await?;
+    Ok(conn)
+}
+
+/// Open a SQLite connection WITHOUT inspecting or migrating the schema.
+///
+/// For best-effort READ paths that must never mutate the store they read
+/// (W5-09 / Codex r12: the fresh-connection config-cascade reader opens
+/// per-lookup connections with a 200 ms busy timeout — letting that path
+/// apply pending migrations under such a timeout could half-apply or
+/// spuriously fail against a concurrent writer). Callers own the
+/// consequence: a query may fail against an incompatible schema and must
+/// treat that as a read failure, not as "no value".
+pub(crate) async fn open_connection_without_schema_management(
+    db_path: &str,
+    busy_timeout: Duration,
+) -> Result<DatabaseConnection, IOError> {
     if !Path::new(db_path).exists() {
         return Err(IOError::new(
             ErrorKind::NotFound,
@@ -151,11 +169,9 @@ pub async fn establish_connection_with_busy_timeout(
             .busy_timeout(busy_timeout)
             .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
     });
-    let conn = Database::connect(option)
+    Database::connect(option)
         .await
-        .map_err(|err| IOError::other(format!("Database connection error: {err:?}")))?;
-    ensure_database_schema_is_current(&conn).await?;
-    Ok(conn)
+        .map_err(|err| IOError::other(format!("Database connection error: {err:?}")))
 }
 // #[cfg(not(test))]
 // static DB_CONN: OnceCell<DbConn> = OnceCell::const_new();

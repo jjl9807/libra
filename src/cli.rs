@@ -2986,7 +2986,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             crate::internal::operation_wrapper::BoundaryOutcome::Failed
         };
         if let Err(err) = boundary.finish(outcome).await {
-            crate::utils::error::emit_warning(format!(
+            // Post-envelope: see emit_post_envelope_warning.
+            crate::utils::error::emit_post_envelope_warning(format!(
                 "the command finished, but its operation-log record could not be closed: {err}"
             ));
         }
@@ -3029,7 +3030,9 @@ impl BackgroundIndexDrainGuard {
         )
         .await;
         if !drained && !self.command_handles_failures {
-            utils::error::emit_warning(format!(
+            // Post-envelope: the command (and any JSON envelope) already
+            // rendered — stderr is the only channel left (§B.5).
+            utils::error::emit_post_envelope_warning(format!(
                 "cloud object-index updates did not drain within {} seconds; their durable repair markers remain pending and the next repository command will retry them",
                 DRAIN_BUDGET.as_secs()
             ));
@@ -3051,7 +3054,10 @@ fn report_background_index_update_outcome(
     if new_failures == 0 || command_handles_failures {
         return;
     }
-    utils::error::emit_warning(format!(
+    // Post-envelope: the command's envelope has already rendered, so this
+    // must reach stderr in every output mode or an --exit-code-on-warning
+    // exit 9 would have no visible reason (§B.5).
+    utils::error::emit_post_envelope_warning(format!(
         "{new_failures} cloud object-index update(s) remain in the durable repair queue; the next repository command will retry them, and `libra cloud sync` will fail closed until repair succeeds"
     ));
 }

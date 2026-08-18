@@ -790,3 +790,196 @@ async fn web_alias_and_legacy_tui_env_removed() {
          codex/--env-file rejection, got:\n{diag}"
     );
 }
+
+/// W5-09: aggregate breaking-surface guard for the W5-01 family release.
+///
+/// One run pins every deprecated public surface the family deleted, so the
+/// W5-09 release point cannot ship a partially-applied breaking state:
+///   (a) W5-07 — `--web` / `--web-only` fail with a usage error + migration hint;
+///   (b) W5-07 — `LIBRA_CODE_LEGACY_TUI` no longer changes any behavior;
+///   (c) W5-01 — `code-control` is not exposed (unknown command + absent from help);
+///   (d) W5-08 — bare `libra graph` AND bare `libra agent graph` are refused
+///       with the interactive-TUI removal diagnostic while their `--json` /
+///       `--machine` forms stay on the structured path;
+///   (e) W5-06 — bare `libra code --provider codex --resume` fail-closes with a
+///       migration hint (legacy TUI resume driver removed).
+/// The heavy per-surface probes live in `web_alias_and_legacy_tui_env_removed`,
+/// `code_control_command_removed`, and `graph_machine_survives_tui_removal`;
+/// this guard is the cheap pre-push aggregate (Codex R28-P1-2).
+#[test]
+fn breaking_code_surface_migration() {
+    use std::process::Command;
+
+    let libra_bin = env!("CARGO_BIN_EXE_libra");
+    let diag_of = |output: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // (a) + (b): removed aliases still fail with the migration hint even when
+    // the removed rollback env is set — the env cannot resurrect anything.
+    for flag in ["--web", "--web-only"] {
+        let probe_dir = tempfile::tempdir().expect("tempdir for aggregate alias probe");
+        let rejected = Command::new(libra_bin)
+            .args(["code", flag])
+            .current_dir(probe_dir.path())
+            .env("LIBRA_CODE_LEGACY_TUI", "1")
+            .output()
+            .expect("run aggregate alias probe");
+        assert!(
+            !rejected.status.success(),
+            "removed alias {flag} must exit non-zero"
+        );
+        let diag = diag_of(&rejected);
+        assert!(
+            diag.contains("unexpected argument")
+                && diag.contains("already defaults to the Web Code UI"),
+            "{flag} must surface the W5-07 migration error even with the removed env set; got:\n{diag}"
+        );
+    }
+
+    // (c): code-control is an unknown command and absent from root help.
+    let probe_dir = tempfile::tempdir().expect("tempdir for aggregate code-control probe");
+    let rejected = Command::new(libra_bin)
+        .args(["code-control", "--stdio"])
+        .current_dir(probe_dir.path())
+        .output()
+        .expect("run aggregate code-control probe");
+    assert_eq!(
+        rejected.status.code(),
+        Some(129),
+        "removed code-control must use the stable CLI-error exit"
+    );
+    assert!(
+        diag_of(&rejected).contains("'code-control' is not a libra command"),
+        "removed code-control must render the unknown-command diagnostic"
+    );
+    let help = Command::new(libra_bin)
+        .arg("--help")
+        .current_dir(probe_dir.path())
+        .output()
+        .expect("run libra --help");
+    assert!(
+        !diag_of(&help).contains("code-control"),
+        "root --help must not list removed code-control"
+    );
+
+    // (d): bare `libra graph` AND bare `libra agent graph` are refused with
+    // the W5-08 diagnostic (Codex r6: W5-08 removed BOTH interactive entries,
+    // so a partial regression on either surface must fail this guard);
+    // `--json` and `--machine` stay on the structured path — outside a repo
+    // they fail with the stable structured repo error (LBR-REPO-001, exit
+    // 128), NOT with the interactive-removal usage error (LBR-CLI-002, 129).
+    let graph_dir = tempfile::tempdir().expect("tempdir for aggregate graph probe");
+    for graph_cmd in [&["graph"][..], &["agent", "graph"][..]] {
+        let cmd_label = graph_cmd.join(" ");
+        let bare = Command::new(libra_bin)
+            .args(graph_cmd)
+            .arg("11111111-1111-4111-8111-111111111111")
+            .current_dir(graph_dir.path())
+            .output()
+            .expect("run aggregate bare graph probe");
+        let bare_diag = diag_of(&bare);
+        assert!(
+            bare_diag.contains("no longer opens an interactive TUI"),
+            "bare {cmd_label} must surface the W5-08 removal diagnostic; got:\n{bare_diag}"
+        );
+        for structured_flag in ["--json", "--machine"] {
+            let structured = Command::new(libra_bin)
+                .args(graph_cmd)
+                .args([structured_flag, "11111111-1111-4111-8111-111111111111"])
+                .current_dir(graph_dir.path())
+                .output()
+                .expect("run aggregate structured graph probe");
+            let structured_diag = diag_of(&structured);
+            assert_eq!(
+                structured.status.code(),
+                Some(128),
+                "{cmd_label} {structured_flag} must reach the structured repo error, not the removal usage error; got:\n{structured_diag}"
+            );
+            assert!(
+                structured_diag.contains("LBR-REPO-001"),
+                "{cmd_label} {structured_flag} must emit the stable structured error code; got:\n{structured_diag}"
+            );
+            assert!(
+                !structured_diag.contains("no longer opens an interactive TUI"),
+                "{cmd_label} {structured_flag} must not hit the W5-08 removal diagnostic; got:\n{structured_diag}"
+            );
+        }
+    }
+
+    // (e): bare `--provider codex --resume` fail-closes with the W5-06
+    // migration hint. validate_mode_args runs after the worktree gate, so the
+    // probe needs a registered repo (isolated HOME keeps it hermetic).
+    let temp = tempfile::tempdir().expect("tempdir for aggregate codex-resume probe");
+    let home_dir = temp.path().join(".home");
+    let config_home = home_dir.join(".config");
+    std::fs::create_dir_all(&config_home).expect("isolated HOME");
+    let init = Command::new(libra_bin)
+        .args(["init", "--vault=false", "--quiet"])
+        .current_dir(temp.path())
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .output()
+        .expect("libra init");
+    assert!(init.status.success(), "libra init failed");
+    let rejected = Command::new(libra_bin)
+        .args([
+            "code",
+            "--provider",
+            "codex",
+            "--resume",
+            "11111111-1111-4111-8111-111111111111",
+        ])
+        .current_dir(temp.path())
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .output()
+        .expect("run aggregate codex-resume probe");
+    assert!(
+        !rejected.status.success(),
+        "bare codex --resume must exit non-zero"
+    );
+    let diag = diag_of(&rejected);
+    assert!(
+        diag.contains("--resume is not supported with --provider=codex")
+            && diag.contains("legacy TUI resume driver"),
+        "bare codex --resume must surface the W5-06 migration hint; got:\n{diag}"
+    );
+
+    // (b+): the removed rollback env must not alter NORMAL dispatch either
+    // (Codex r5: probing it only on clap-rejected aliases proves nothing
+    // about the dispatch path). With `LIBRA_CODE_LEGACY_TUI=1` set, codex +
+    // `--env-file` must still hit the Web-mode rejection — never a TUI boot.
+    let env_path = temp.path().join(".env.w5-09");
+    std::fs::write(&env_path, "OPENAI_API_KEY=from-env-file\n").expect("write env file");
+    let rejected = Command::new(libra_bin)
+        .args([
+            "code",
+            "--provider",
+            "codex",
+            "--env-file",
+            env_path.to_str().expect("utf8 path"),
+        ])
+        .current_dir(temp.path())
+        .env("HOME", &home_dir)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("USERPROFILE", &home_dir)
+        .env("LIBRA_CODE_LEGACY_TUI", "1")
+        .output()
+        .expect("run aggregate legacy-env dispatch probe");
+    assert!(
+        !rejected.status.success(),
+        "codex + --env-file must remain a Web-mode rejection"
+    );
+    let diag = diag_of(&rejected);
+    assert!(
+        diag.contains("Web Code UI") && diag.contains("--provider=codex"),
+        "the removed env var must not switch dispatch off the Web path; got:\n{diag}"
+    );
+}

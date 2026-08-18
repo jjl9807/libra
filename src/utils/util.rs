@@ -28,7 +28,7 @@ use crate::{
     command::load_object,
     internal::{
         branch::{Branch, BranchStoreError},
-        config::{ConfigKv, LocalIdentityTarget, read_cascaded_config_value},
+        config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
         reflog::Reflog,
@@ -1021,13 +1021,14 @@ fn read_cascaded_config_value_sync(key: &str) -> Option<String> {
             .enable_all()
             .build()
             .ok()?;
-        runtime
-            .block_on(read_cascaded_config_value(
-                LocalIdentityTarget::CurrentRepo,
-                &key,
-            ))
-            .ok()
-            .flatten()
+        // Fresh-connection reader, NOT the cached-pool cascade: this thread
+        // blocks the caller (`join()` below), and when the caller is itself
+        // a runtime thread, the cached pool for the repo/global DB can have
+        // its connection-return task stranded on that frozen runtime — the
+        // acquire here then burns sqlx's full 30 s timeout per lookup (two
+        // ~28.7 s stalls per `add` on the single-threaded test harness,
+        // W5-09). See `read_cascaded_config_value_fresh_conn`.
+        runtime.block_on(crate::internal::config::read_cascaded_config_value_fresh_conn(&key))
     })
     .join()
     .ok()

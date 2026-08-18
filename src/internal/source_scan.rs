@@ -293,6 +293,19 @@ pub fn production_files(extra_excludes: &[&str]) -> Vec<(String, syn::File)> {
     parsed
 }
 
+/// Path-level test-only classification for [`production_files`]. Whole
+/// test-only FILES carry no `#[cfg(test)]` marker of their own — their
+/// parent declares them `#[cfg(test)] mod …;` — so they are excluded by
+/// path: `tests.rs`, anything under a `tests/` directory, and the two
+/// out-of-line module namings this tree uses, `*_test.rs` AND `*_tests.rs`
+/// (e.g. `api_tests.rs`, `ls_remote_tests.rs`).
+fn is_test_only_path(relative: &str) -> bool {
+    relative.ends_with("/tests.rs")
+        || relative.contains("/tests/")
+        || relative.ends_with("_test.rs")
+        || relative.ends_with("_tests.rs")
+}
+
 fn collect(dir: &Path, root: &Path, excludes: &[&str], into: &mut Vec<(String, syn::File)>) {
     for entry in fs::read_dir(dir).expect("source dir must be readable") {
         let path = entry.expect("dir entry").path();
@@ -305,10 +318,7 @@ fn collect(dir: &Path, root: &Path, excludes: &[&str], into: &mut Vec<(String, s
         }
         let relative = path.strip_prefix(root).unwrap_or(&path);
         let relative = format!("src/{}", relative.display());
-        let is_test_file = relative.ends_with("/tests.rs")
-            || relative.contains("/tests/")
-            || relative.ends_with("_test.rs");
-        if is_test_file || excludes.contains(&relative.as_str()) {
+        if is_test_only_path(&relative) || excludes.contains(&relative.as_str()) {
             continue;
         }
         let source = fs::read_to_string(&path).expect("readable source");
@@ -508,5 +518,36 @@ mod tests {
             "production code must survive every marker-shaped construct, and \
              test-only code must not"
         );
+    }
+
+    /// Out-of-line test modules use BOTH `*_test.rs` and `*_tests.rs`
+    /// namings in this tree (`api_tests.rs`, `ls_remote_tests.rs`, …) and
+    /// carry no `#[cfg(test)]` marker of their own — the path predicate is
+    /// the only thing keeping them out of the production corpus (W5-09 /
+    /// Codex r5: a resolver call in such a file would otherwise masquerade
+    /// as a production callsite).
+    #[test]
+    fn test_only_path_predicate_covers_both_out_of_line_namings() {
+        for test_path in [
+            "src/command/tests.rs",
+            "src/command/tests/helper.rs",
+            "src/command/ls_remote_tests.rs",
+            "src/internal/ai/providers/gemini/api_tests.rs",
+        ] {
+            assert!(
+                is_test_only_path(test_path),
+                "{test_path} must classify as test-only"
+            );
+        }
+        for production_path in [
+            "src/command/maintenance.rs",
+            "src/internal/ai/skills/loader.rs",
+            "src/internal/source_scan.rs",
+        ] {
+            assert!(
+                !is_test_only_path(production_path),
+                "{production_path} must stay in the production corpus"
+            );
+        }
     }
 }

@@ -193,13 +193,20 @@ async fn usage_event_session_scope_rollback_refuses_duplicate_event_ids() {
         ),
         "rollback error must provide collision remediation: {error:#}"
     );
+    // `rollback_to` applies each down in its own claim transaction (see
+    // `MigrationRunner::rollback_to` phase 2), so the intervening
+    // 2026081301 provenance down (empty provenance, no linked HEADs in
+    // this fixture) rolls back cleanly BEFORE 2026080403's guard refuses.
+    // The migration under test — the session-scope event migration — must
+    // remain applied; the runner's partial-plan semantics leave the
+    // version at exactly that refused step.
     assert_eq!(
         runner
             .current_version(&conn)
             .await
             .expect("read schema version"),
-        Some(2026081301),
-        "failed rollback must preserve the applied migration"
+        Some(2026080403),
+        "the refused session-scope down must remain applied"
     );
 }
 
@@ -4037,7 +4044,17 @@ async fn head_scope_unique_migration_fails_closed_on_preexisting_duplicates() {
         .expect("a different worktree gets its own HEAD row");
 
     // Now construct the pre-existing-duplicate case: roll the migration back,
-    // seed the duplicate the old schema permitted, and re-apply.
+    // seed the duplicate the old schema permitted, and re-apply. The linked
+    // HEAD rows seeded above must go first: the intervening 2026081301
+    // provenance down migration fails closed on linked-worktree HEAD
+    // evidence (by design, W4-07), and this test's subject is the MAIN-scope
+    // duplicate guard, not that refusal.
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM `reference` WHERE `worktree_id` IS NOT NULL".to_string(),
+    ))
+    .await
+    .expect("clear linked-worktree HEAD fixtures before the rollback");
     runner
         .rollback_to(&conn, 2026072501)
         .await

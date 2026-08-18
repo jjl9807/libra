@@ -1340,6 +1340,23 @@ pub fn emit_warning(message: impl std::fmt::Display) {
     }
 }
 
+/// Emit a warning raised AFTER the command's structured envelope has already
+/// been rendered (e.g. the background object-index drain report, which runs
+/// once the command — envelope included — has finished).
+///
+/// The envelope can no longer carry it, so stderr is the only channel left in
+/// EVERY output mode: suppressing it under `--json` (as [`emit_warning`]
+/// does) would lose the message entirely and leave an
+/// `--exit-code-on-warning` exit 9 with no visible reason. §B.5's
+/// "warnings ride in `data.warnings[]`" rule governs warnings the envelope
+/// could still have carried; a post-envelope warning that is silently
+/// dropped is the exact stderr-only-BYPASS failure mode inverted.
+pub fn emit_post_envelope_warning(message: impl std::fmt::Display) {
+    let message = message.to_string();
+    crate::utils::output::record_warning_message(message.clone());
+    eprintln!("warning: {message}");
+}
+
 /// Emit an advisory warning to stderr WITHOUT tripping the
 /// `--exit-code-on-warning` tracker.
 ///

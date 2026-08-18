@@ -903,13 +903,24 @@ impl Branch {
         // still there), and then loses the branch under it. The same
         // transaction also makes the metadata cascade atomic with the ref
         // delete, which the `_with_conn` form could only document as a gap.
+        // Failing to ACQUIRE the write lock (or to commit) is a failure OF
+        // THE DELETE — e.g. a read-only repository database must surface as
+        // "failed to prune/delete branch X" (IoWriteFailed), not as a
+        // query/list failure: `remote prune` maps `Query` to its LIST error
+        // (LBR-IO-001) and `Delete` to the prune error (LBR-IO-002), and the
+        // probe-first transaction had silently moved the read-only failure
+        // from the DELETE statement to the probe (W5-09 gate regression).
         let txn = crate::internal::db::begin_write_transaction(&db_conn)
             .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+            .map_err(|e| BranchStoreError::Delete {
+                name: branch_name.to_string(),
+                detail: e.to_string(),
+            })?;
         Self::delete_branch_result_with_conn(&txn, branch_name, remote).await?;
-        txn.commit()
-            .await
-            .map_err(|e| BranchStoreError::Query(e.to_string()))
+        txn.commit().await.map_err(|e| BranchStoreError::Delete {
+            name: branch_name.to_string(),
+            detail: e.to_string(),
+        })
     }
 
     /// ATOMIC tip-conditional delete (W2 §C.4.3 `stash branch` rollback):

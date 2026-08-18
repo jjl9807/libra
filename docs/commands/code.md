@@ -1,6 +1,6 @@
 # `libra code`
 
-Launch an interactive AI coding session. Every non-stdio `libra code` launches the Web Code UI (the legacy TUI startup path was removed in the W5 breaking release, W5-06).
+Launch an interactive AI coding session. Every `libra code` launch apart from MCP `--stdio` and the `--control stdio` client shim launches the Web Code UI (the legacy TUI startup path was removed in the W5 breaking release, W5-06).
 
 ## Synopsis
 

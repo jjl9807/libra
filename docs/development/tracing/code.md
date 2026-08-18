@@ -8,7 +8,7 @@
 
 ## 命令实现目标
 
-`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）。W5-07 已删除 W4 烘焙窗口的弃用别名 `--web` / `--web-only` 与隐藏回滚环境变量 `LIBRA_CODE_LEGACY_TUI`：旧 flag 现在以 clap unexpected-argument usage error + 迁移提示被拒绝，env 不再切换模式。W5-06 已删除遗留 TUI 启动路径与裸 `libra code --provider codex --resume <thread_id>` 的 TUI resume driver：该组合现在以 clap usage error + 迁移提示 fail-closed（managed Web `--provider codex` 继续拒绝 `--resume`），所有非 stdio `libra code` 均启动 Web Code UI。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
+`libra code` 的目标是启动人类开发者与 AI agent 协作的受控编码会话。默认模式是 Web Code UI + AgentRuntime（打印 URL / control 信息并前台常驻）。W5-07 已删除 W4 烘焙窗口的弃用别名 `--web` / `--web-only` 与隐藏回滚环境变量 `LIBRA_CODE_LEGACY_TUI`：旧 flag 现在以 clap unexpected-argument usage error + 迁移提示被拒绝，env 不再切换模式。W5-06 已删除遗留 TUI 启动路径与裸 `libra code --provider codex --resume <thread_id>` 的 TUI resume driver：该组合现在以 clap usage error + 迁移提示 fail-closed（managed Web `--provider codex` 继续拒绝 `--resume`），除 MCP `--stdio` 与 `--control stdio` 客户端 shim（纯客户端、不启动 UI）外，所有 `libra code` 启动均进入 Web Code UI。普通请求先进入可审阅的 IntentSpec / 执行计划流程，再由用户确认是否执行。Code 阶段的核心目标不是发明新命令，而是把现有 mode、provider、Web/headless、MCP、session、approval、sandbox 和文档测试契约按源码事实收敛。
 
 ## 对比 Git 与兼容性
 

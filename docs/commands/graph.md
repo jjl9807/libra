@@ -35,13 +35,13 @@ With the global `--json` (or `--machine`) flag, `libra graph` emits the graph as
 
 A missing session is non-fatal (overlay fields stay null/zero). An unreadable or malformed session workflow log is a hard error so an indeterminate reconciliation fence cannot be hidden. On first overlay lookup, Libra may run a one-time thread→session index rebuild under `.libra/.../sessions/.thread_index/` (also performed when `libra code` starts); that migration fails closed if any existing session cannot be loaded or indexed. Pending mutating commands without a live owner surface as `indeterminate_side_effect` even before a runtime restart fences them. The payload also includes a `nodes` array; each node has its `depth`, `kind` (`intent` / `plan` / `task` / `run` / `patchset`), `id`, `label`, `tags`, key/value `detail`, and — when the underlying AI object was loaded — an `object` with its `object_type`, `hash`, `git_object_type`, and a `summary` of key fields.
 
-After a legacy `libra code` TUI session exits, it prints a follow-up command in this form:
+Example — inspect a thread's version graph as structured JSON (the compact form uses `--machine`):
 
 ```bash
 libra graph --json 11111111-1111-4111-8111-111111111111
 ```
 
-The follow-up always includes `--json` (use `--machine` for the compact form): the bare interactive entry was removed in the W5 breaking release (W5-08) and now fails with a usage error plus a migration hint. For an interactive view, open the thread's graph in Web Code UI instead.
+The bare interactive entry was removed in the W5 breaking release (W5-08) and fails with a usage error plus a migration hint; the legacy `libra code` TUI session that printed this follow-up command on exit was removed together with the TUI startup path (W5-06). For an interactive view, open the thread's graph in Web Code UI instead.
 
 ## Arguments
 

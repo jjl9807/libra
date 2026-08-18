@@ -59,12 +59,31 @@ use uuid::Uuid;
 /// Build an in-memory SQLite, create only the `reference` table (the minimum these
 /// tests need), and return the connection. Lighter-weight than running the full
 /// bootstrap SQL because most MCP tests only need head/branch resolution.
+///
+/// `config_kv` is created alongside `reference` because the production
+/// write-transaction helper (`begin_write_transaction`) acquires the SQLite
+/// write lock with a no-op `UPDATE config_kv … WHERE 0` as the first
+/// statement and deliberately fails loudly when the table is missing (see
+/// `src/internal/db.rs`) — a fixture without it dies with "Failed to begin
+/// transaction" on every mutating MCP path.
 async fn setup_test_db() -> sea_orm::DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     let builder = db.get_database_backend();
     let schema = Schema::new(builder);
     let stmt = schema.create_table_from_entity(reference::Entity);
     db.execute_raw(builder.build(&stmt)).await.unwrap();
+    db.execute_raw(sea_orm::Statement::from_string(
+        builder,
+        "CREATE TABLE IF NOT EXISTS `config_kv` (\
+            `id` INTEGER PRIMARY KEY AUTOINCREMENT, \
+            `key` TEXT NOT NULL, \
+            `value` TEXT NOT NULL, \
+            `encrypted` INTEGER NOT NULL DEFAULT 0\
+        )"
+        .to_string(),
+    ))
+    .await
+    .unwrap();
     db
 }
 

@@ -1,0 +1,24 @@
+{
+  "version": "1",
+  "messages": [
+    {
+      "role": "user",
+      "timestamp": "2026-07-03T08:00:00Z",
+      "content": "/review this session's changes"
+    },
+    {
+      "role": "assistant",
+      "model": "claude-sonnet-5",
+      "content": "Reviewing the session changes."
+    },
+    {
+      "role": "user",
+      "timestamp": "2026-07-03T08:02:00Z",
+      "content": "Thanks, list the follow-ups."
+    },
+    {
+      "role": "assistant",
+      "content": "Follow-ups listed."
+    }
+  ]
+}

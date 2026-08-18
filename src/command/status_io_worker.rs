@@ -1013,6 +1013,22 @@ fn write_object_blob_outcome(
 ) -> io::Result<()> {
     match outcome {
         Ok(bytes) => {
+            // Decide the over-cap case BEFORE the Ok header goes out: a
+            // blob past FRAME_CAP used to fail inside `write_raw_frame`
+            // AFTER `Ok` was already written, leaving the parent blocked on
+            // a raw frame that never arrives (indistinguishable from a hung
+            // read until the deadline kill). Reporting `TooLarge` up front
+            // keeps the stream consistent and lets callers with a byte
+            // limit above the frame cap (diff, W5-09) fall back promptly.
+            if bytes.len() > FRAME_CAP {
+                return write_frame(
+                    writer,
+                    &IoEvent::DoneObjectBlob {
+                        status: ObjectBlobStatus::TooLarge,
+                        bytes: None,
+                    },
+                );
+            }
             write_frame(
                 writer,
                 &IoEvent::DoneObjectBlob {

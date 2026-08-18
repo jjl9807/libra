@@ -132,12 +132,18 @@ const CLAUDE_EVENT_VERBS: &[(&str, &str)] = &[
     ("SessionEnd", "session-end"),
 ];
 
-/// Codex-installer forward map pin (providers/codex/settings.rs).
+/// Codex-installer forward map pin (providers/codex/settings.rs
+/// `CODEX_HOOK_FORWARD_MAP`, 11 entries).
 const CODEX_EVENT_VERBS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "tool-use"),
     ("PostToolUse", "tool-use"),
+    ("PermissionRequest", "permission-request"),
+    ("PreCompact", "compaction"),
+    ("PostCompact", "compaction"),
     ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
     ("SubagentStart", "subagent-start"),
     ("SubagentStop", "subagent-end"),
 ];

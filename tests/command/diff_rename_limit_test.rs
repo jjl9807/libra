@@ -144,3 +144,45 @@ fn diff_rename_object_read_budget_timeout_is_cancellable() {
         "base add/delete summary should still render: {stdout}"
     );
 }
+
+/// W5-09 regression (Codex r8): a blob larger than the status I/O worker's
+/// 8 MiB binary-frame cap cannot cross the worker boundary, and the worker
+/// only sees local `.libra/objects` in the first place — diff detection must
+/// fall back to the legacy in-process tiered read for such worker-unservable
+/// objects instead of silently unpairing the rename (plan-20260714 §B.7:
+/// diff has no content budget; pre-WIO parity). The killed/hung-read case
+/// stays bounded — see `diff_rename_object_read_budget_timeout_is_cancellable`.
+#[test]
+fn diff_rename_pairs_blob_larger_than_worker_frame_cap() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    // ~9 MiB in ~9k KILOBYTE-long lines: past the 8 MiB frame cap, but
+    // under the 10,000-line `<LargeFile>` placeholder gate — that gate
+    // reclassifies both sides as "modified" before rename detection runs
+    // (a separate, pre-existing behavior this test must not entangle).
+    let long_line = format!("{}\n", "x".repeat(1023));
+    let mut body = String::with_capacity(9 * 1024 * 1024 + 1100);
+    body.push_str("header line ORIGINAL\n");
+    while body.len() < 9 * 1024 * 1024 {
+        body.push_str(&long_line);
+    }
+    fs::write(root.join("big-old.bin"), &body).expect("write big source");
+    assert_cli_success(&run_libra_command(&["add", "-A"], root), "stage big source");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "big base", "--no-verify"], root),
+        "commit big source",
+    );
+
+    fs::remove_file(root.join("big-old.bin")).expect("remove big source");
+    let changed = body.replacen("ORIGINAL", "CHANGED", 1);
+    fs::write(root.join("big-new.bin"), &changed).expect("write big destination");
+    assert_cli_success(&run_libra_command(&["add", "-A"], root), "stage big rename");
+
+    let output = run_libra_command(&["diff", "--staged", "-M", "--summary"], root);
+    assert_cli_success(&output, "diff big rename");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(" rename ") && stdout.contains("big-new.bin"),
+        "a blob past the 8 MiB worker frame cap must still pair as a rename: {stdout}"
+    );
+}

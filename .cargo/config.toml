@@ -1,0 +1,15 @@
+# Repository-level cargo configuration.
+#
+# RUST_MIN_STACK — thread stack floor for processes cargo launches (tests,
+# build scripts). Debug-build async call chains in this crate carry large
+# stack frames; `command_test`'s switch/detach path crossed the 2 MiB
+# std::thread default and aborted the whole test binary with a stack
+# overflow (first seen 2026-08-18, W5-09 full-suite gate; measured: aborts
+# at the 2 MiB std::thread default, passes at 4 MiB — 16 MiB leaves
+# headroom for further debug-frame growth). This
+# mirrors the production binary's own posture: `src/main.rs` runs the CLI
+# on an explicit 32 MiB thread. Installed release binaries are unaffected
+# (this env applies only to cargo-launched processes; release frames are
+# far smaller).
+[env]
+RUST_MIN_STACK = "16777216"

@@ -308,6 +308,12 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
     ("agent_workspace_scope_audit", ConfigOwner::Repository),
     ("automation_log", ConfigOwner::Repository),
     ("approved_permission", ConfigOwner::Repository),
+    // Migration 2026081301 bookkeeping: blocks the provenance-backfill
+    // down-migration; repo-wide guard row, dropped by the migration itself.
+    (
+        "approved_permission_provenance_down_guard",
+        ConfigOwner::Repository,
+    ),
     // AI thread/scheduler/index/runtime-contract tables: Repository
     // (UUID-keyed rows, no cross-worktree row conflicts).
     ("ai_thread", ConfigOwner::Repository),
@@ -353,10 +359,6 @@ pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
         "a lock, not a cache: serializes FUSE mount handshakes",
     ),
     (
-        "PANIC_RESTORE_THREAD",
-        "process-lifetime panic-hook handle; holds no repository state",
-    ),
-    (
         "WELCOME_ANIMATION_START",
         "TUI animation epoch; holds no repository state",
     ),
@@ -395,8 +397,10 @@ mod tests {
         "Cargo.toml",               // project manifest probing in task workdirs
         ".snapshot.json",           // TUI session snapshot state, written by the runtime
         "capability_packages.json", // agent capability data artifact, not configuration
-        "settings.json",            // EXTERNAL provider settings (e.g. Claude Code's
-                                    // .claude/settings.json) written by `agent enable` — not a .libra surface
+        "pending_revision.json",    // pending plan-revision state written by the headless
+        // runtime (web/headless.rs), not configuration
+        "settings.json", // EXTERNAL provider settings (e.g. Claude Code's
+                         // .claude/settings.json) written by `agent enable` — not a .libra surface
     ];
 
     /// Extract config-file name literals from the PRODUCTION half of one

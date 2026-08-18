@@ -35,13 +35,13 @@ libra --machine graph <THREAD_ID> [--repo <PATH>]
 
 缺少会话是非致命的（覆盖字段保持 null/0）；会话 workflow 日志不可读或畸形则为硬错误，避免隐藏需要 reconciliation 的 indeterminate 栅栏。首次覆盖查找时可能在 `.libra/.../sessions/.thread_index/` 下执行一次性 thread→session 索引重建（`libra code` 启动时也会执行）；任一既有会话无法加载或索引时迁移失败封闭。无活 owner 的 Pending 变更命令在运行时重启写栅栏之前也会显示为 `indeterminate_side_effect`。
 
-`libra code` 的遗留 TUI 会话退出后，会打印如下形式的后续命令：
+示例——以结构化 JSON 查看线程的版本图（紧凑形式用 `--machine`）：
 
 ```bash
 libra graph --json 11111111-1111-4111-8111-111111111111
 ```
 
-该后续命令始终带 `--json`（紧凑形式可用 `--machine`）：裸交互入口已在 W5 breaking 发布中删除（W5-08），现在以 usage error 加迁移提示失败。交互视图请在 Web Code UI 中打开该线程的图。
+裸交互入口已在 W5 breaking 发布中删除（W5-08），以 usage error 加迁移提示失败；退出时打印该后续命令的遗留 `libra code` TUI 会话已随 TUI 启动路径一并删除（W5-06）。交互视图请在 Web Code UI 中打开该线程的图。
 
 ## 参数
 

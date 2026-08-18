@@ -1652,6 +1652,119 @@ async fn skip_global_scope_if_schema_future(db_path: &Path, error: anyhow::Error
     }
 }
 
+/// Best-effort local→global cascade read over FRESH short-lived connections,
+/// for sync callers that drive it from a helper thread with its own runtime
+/// ([`crate::utils::util::optional_cascaded_config_path`]'s worker). The
+/// shared per-path connection cache is deliberately BYPASSED here: a cached
+/// pool's return/notify tasks live on the runtime that created it, and the
+/// sync wrapper blocks that runtime's only thread while this read runs — an
+/// acquire through the cache can then only end by exhausting sqlx's 30 s
+/// acquire timeout (observed as two ~28.7 s stalls per `libra add` under the
+/// single-threaded test harness; the same stranding class
+/// `internal::db`'s pool-size invariant documents). Fresh connections make
+/// the read self-contained on the worker's runtime.
+///
+/// Semantics vs [`read_cascaded_config_value`]: same trim/empty-is-missing
+/// value mapping and the same local→global order. Failure isolation
+/// (Codex r12): only a scope that PROVABLY has no value (store absent, key
+/// absent, or empty after trim) falls through — a local store that exists
+/// but cannot be read (lock contention, corrupt/incompatible schema) or
+/// holds an ENCRYPTED entry ends the whole lookup with `None`, never
+/// letting global override a failing local scope. Schema posture: the open
+/// neither inspects nor migrates — a store whose `config_kv` is still
+/// queryable (including a future schema, whose additive migrations keep the
+/// table readable) answers normally, and a store whose shape broke the
+/// query answers `Unusable` → `None`, silently (the dispatch-level policy
+/// owns the deduplicated future-schema user warning). This path serves
+/// optional plaintext keys such as `core.excludesFile` and is best-effort
+/// by contract.
+pub async fn read_cascaded_config_value_fresh_conn(key: &str) -> Option<String> {
+    let local_db = match try_get_storage_path(None) {
+        Ok(storage) => Some(storage.join(DATABASE)),
+        // Not inside a repository: local scope is genuinely absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        // Repository resolution itself failed: same fail-quiet rule as a
+        // failing local store — do not let global answer for it.
+        Err(_) => return None,
+    };
+    read_cascaded_fresh_conn_at(local_db.as_deref(), global_config_path().as_deref(), key).await
+}
+
+/// Path-parameterised body of [`read_cascaded_config_value_fresh_conn`] so
+/// the failure-isolation matrix is unit-testable without cwd games.
+async fn read_cascaded_fresh_conn_at(
+    local_db: Option<&Path>,
+    global_db: Option<&Path>,
+    key: &str,
+) -> Option<String> {
+    /// Per-scope outcome — the three-way split is the point (Codex r12):
+    /// only a scope that PROVABLY holds no value falls through to the next
+    /// one. A failing local store must not let a configured global value
+    /// take over (the cached-pool cascade would have errored the whole
+    /// lookup there), and an encrypted local entry terminates the cascade
+    /// the same way the old reader's ciphertext value did (the value was
+    /// unusable, but global was never consulted).
+    enum ScopeRead {
+        Value(String),
+        Absent,
+        Unusable,
+    }
+
+    async fn fresh_conn_read(db_path: &Path, key: &str) -> ScopeRead {
+        // `try_exists`, not `exists` (Codex r13): `exists()` answers false
+        // for metadata/access ERRORS too, which would misclassify an
+        // unreadable store as Absent and let global answer for it. Only a
+        // proven NotFound is Absent; any other metadata failure is
+        // Unusable.
+        match db_path.try_exists() {
+            Ok(true) => {}
+            Ok(false) => return ScopeRead::Absent,
+            Err(_) => return ScopeRead::Unusable,
+        }
+        let Some(db_str) = db_path.to_str() else {
+            return ScopeRead::Unusable;
+        };
+        // No schema inspection/migration on open: this best-effort READ
+        // path must never mutate the store it reads (a 200 ms busy timeout
+        // against a concurrent writer could half-apply migrations). An
+        // incompatible schema surfaces as a query error → Unusable.
+        let conn = match crate::internal::db::open_connection_without_schema_management(
+            db_str,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(_) => return ScopeRead::Unusable,
+        };
+        match ConfigKv::get_with_conn(&conn, key).await {
+            Ok(Some(entry)) if entry.encrypted => ScopeRead::Unusable,
+            Ok(Some(entry)) => {
+                let trimmed = entry.value.trim();
+                if trimmed.is_empty() {
+                    ScopeRead::Absent
+                } else {
+                    ScopeRead::Value(trimmed.to_string())
+                }
+            }
+            Ok(None) => ScopeRead::Absent,
+            Err(_) => ScopeRead::Unusable,
+        }
+    }
+
+    if let Some(local) = local_db {
+        match fresh_conn_read(local, key).await {
+            ScopeRead::Value(value) => return Some(value),
+            ScopeRead::Absent => {}
+            ScopeRead::Unusable => return None,
+        }
+    }
+    match fresh_conn_read(global_db?, key).await {
+        ScopeRead::Value(value) => Some(value),
+        ScopeRead::Absent | ScopeRead::Unusable => None,
+    }
+}
+
 /// Read a config value from `db_path`, trimming whitespace and treating empty
 /// strings as missing. Used for non-vault keys where surrounding whitespace
 /// is almost certainly a typo.
@@ -2524,6 +2637,176 @@ mod tests {
         assert!(
             !format!("{error:#}").contains("newer than this Libra binary"),
             "corruption must not be classified as future schema: {error:#}"
+        );
+    }
+
+    /// Helper for the fresh-conn cascade matrix: a config DB with one
+    /// `config_kv` row (optionally flagged encrypted).
+    async fn write_config_db(db_path: &Path, key: &str, value: &str, encrypted: bool) {
+        let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+            .await
+            .expect("create config db");
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, ?)",
+            [key.into(), value.into(), (encrypted as i32).into()],
+        ))
+        .await
+        .expect("insert config value");
+        conn.close().await.expect("close config db");
+    }
+
+    async fn max_schema_version(db_path: &Path) -> i64 {
+        let conn = crate::internal::db::open_connection_without_schema_management(
+            db_path.to_str().expect("utf8 db path"),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("open db");
+        let backend = conn.get_database_backend();
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT MAX(version) AS v FROM schema_versions",
+                [],
+            ))
+            .await
+            .expect("query schema version")
+            .expect("schema_versions row");
+        row.try_get::<Option<i64>>("", "v")
+            .expect("read version column")
+            .expect("non-empty schema_versions")
+    }
+
+    /// W5-09 / Codex r12: the fresh-connection best-effort cascade pins the
+    /// full failure-isolation matrix — only a scope that PROVABLY has no
+    /// value falls through, and nothing on this READ path may mutate the
+    /// store (no migration on open).
+    #[tokio::test]
+    async fn fresh_conn_cascade_pins_precedence_and_failure_isolation() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let key = "core.excludesFile";
+
+        let global_db = temp.path().join("global.db");
+        write_config_db(&global_db, key, "/global/excludes", false).await;
+
+        // (1) Local value wins over global.
+        let local_db = temp.path().join("local-value.db");
+        write_config_db(&local_db, key, "/local/excludes", false).await;
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&local_db), Some(&global_db), key).await,
+            Some("/local/excludes".to_string()),
+            "local value must win"
+        );
+
+        // (2) Local file absent → global answers.
+        let missing = temp.path().join("no-such.db");
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&missing), Some(&global_db), key).await,
+            Some("/global/excludes".to_string()),
+            "an absent local store falls through"
+        );
+
+        // (3) Local key absent → global answers.
+        let local_other = temp.path().join("local-other-key.db");
+        write_config_db(&local_other, "core.attributesFile", "/x", false).await;
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&local_other), Some(&global_db), key).await,
+            Some("/global/excludes".to_string()),
+            "a missing key falls through"
+        );
+
+        // (4) Local empty-after-trim → global answers (trim semantics).
+        let local_empty = temp.path().join("local-empty.db");
+        write_config_db(&local_empty, key, "   ", false).await;
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&local_empty), Some(&global_db), key).await,
+            Some("/global/excludes".to_string()),
+            "an empty value is missing, not a veto"
+        );
+
+        // (5) ENCRYPTED local entry terminates the cascade: global must NOT
+        // override a local scope that holds (unusable) state.
+        let local_encrypted = temp.path().join("local-encrypted.db");
+        write_config_db(&local_encrypted, key, "deadbeef", true).await;
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&local_encrypted), Some(&global_db), key).await,
+            None,
+            "an encrypted local entry must not fall through to global"
+        );
+
+        // (6) A local store that exists but cannot be read terminates the
+        // cascade — a failing local scope never lets global answer for it.
+        let local_corrupt = temp.path().join("local-corrupt.db");
+        std::fs::write(&local_corrupt, b"this is not a sqlite database").expect("write corrupt db");
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&local_corrupt), Some(&global_db), key).await,
+            None,
+            "a corrupt local store must not fall through to global"
+        );
+
+        // (7) No local scope at all (outside a repo) → global answers; and
+        // with no global either, the lookup is None.
+        assert_eq!(
+            read_cascaded_fresh_conn_at(None, Some(&global_db), key).await,
+            Some("/global/excludes".to_string())
+        );
+        assert_eq!(read_cascaded_fresh_conn_at(None, None, key).await, None);
+
+        // (8) A local path whose existence cannot even be DETERMINED
+        // (metadata error — here ENOTDIR from a file used as a directory)
+        // is Unusable, not Absent: global must not answer for it (Codex
+        // r13: `exists()` would have swallowed this into false/Absent).
+        let not_a_dir = temp.path().join("plain-file");
+        std::fs::write(&not_a_dir, b"just a file").expect("write plain file");
+        let unreachable_db = not_a_dir.join("config.db");
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&unreachable_db), Some(&global_db), key).await,
+            None,
+            "a metadata error on the local store must not fall through to global"
+        );
+    }
+
+    /// W5-09 / Codex r12: the fresh-conn reader must not apply pending
+    /// migrations on open — reading through it leaves `schema_versions`
+    /// exactly as found (the 200 ms busy-timeout open would otherwise race
+    /// concurrent writers with a half-applied migration).
+    #[tokio::test]
+    async fn fresh_conn_reader_does_not_migrate_on_open() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let key = "core.excludesFile";
+        let db = temp.path().join("pending-migration.db");
+        write_config_db(&db, key, "/kept/excludes", false).await;
+
+        // Roll the version stamp BACK so a migrating open would have pending
+        // work to apply (the runner would bump MAX(version) right back).
+        let conn = crate::internal::db::open_connection_without_schema_management(
+            db.to_str().expect("utf8 db path"),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("open db");
+        let backend = conn.get_database_backend();
+        conn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM schema_versions WHERE version = (SELECT MAX(version) FROM schema_versions)",
+            [],
+        ))
+        .await
+        .expect("drop latest schema stamp");
+        let downgraded = max_schema_version(&db).await;
+        conn.close().await.expect("close db");
+
+        assert_eq!(
+            read_cascaded_fresh_conn_at(Some(&db), None, key).await,
+            Some("/kept/excludes".to_string()),
+            "the value stays readable without migrating"
+        );
+        assert_eq!(
+            max_schema_version(&db).await,
+            downgraded,
+            "the read must not have applied pending migrations"
         );
     }
 }

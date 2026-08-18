@@ -20,13 +20,18 @@ use std::{
 
 use serde_json::{Value, json};
 
-/// The six Codex events the installer forwards, with their CLI verbs
+/// The eleven Codex events the installer forwards, with their CLI verbs
 /// (pins `CODEX_HOOK_FORWARD_MAP` in codex/settings.rs).
 const CODEX_FORWARDED_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt"),
+    ("PreToolUse", "tool-use"),
     ("PostToolUse", "tool-use"),
+    ("PermissionRequest", "permission-request"),
+    ("PreCompact", "compaction"),
+    ("PostCompact", "compaction"),
     ("Stop", "stop"),
+    ("SessionEnd", "session-end"),
     ("SubagentStart", "subagent-start"),
     ("SubagentStop", "subagent-end"),
 ];

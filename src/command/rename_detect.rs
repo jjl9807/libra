@@ -776,7 +776,22 @@ pub(crate) struct ObjectReadBudget {
 
 enum ContentSlot {
     Content(Rc<Vec<u8>>),
-    Skipped(SkipReason),
+    Skipped(SkipReason, ObjectReadProvenance),
+}
+
+/// Where an object-read skip came from — the worker COMPLETING its attempt
+/// and reporting a store outcome, versus the transport layer failing before
+/// any outcome existed (helper spawn/dispatch/protocol failure, or the
+/// deadline kill). Callers that recover skipped reads through a second,
+/// unbounded path (diff, W5-09) may only do so for `Completed` skips: a
+/// transport failure says nothing about the store, and retrying it in-process
+/// would reopen exactly the unbounded stall the worker exists to bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ObjectReadProvenance {
+    /// The worker ran the read and reported the outcome.
+    Completed,
+    /// The read never produced a worker-reported outcome.
+    Transport,
 }
 
 impl ObjectReadBudget {
@@ -807,7 +822,14 @@ impl ObjectReadBudget {
                 .map(|(oid, slot)| {
                     let slot = match slot {
                         Ok(bytes) => ContentSlot::Content(Rc::new(bytes)),
-                        Err(reason) => ContentSlot::Skipped(reason),
+                        // The carried form drops provenance; resume it as
+                        // Transport — the conservative default that never
+                        // authorizes an unbounded fallback retry. Only
+                        // status uses `resumed`, and status never falls
+                        // back, so this is currently unobservable.
+                        Err(reason) => {
+                            ContentSlot::Skipped(reason, ObjectReadProvenance::Transport)
+                        }
                     };
                     (oid, slot)
                 })
@@ -833,7 +855,7 @@ impl ObjectReadBudget {
                     oid,
                     Ok(Rc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone())),
                 ),
-                ContentSlot::Skipped(reason) => (oid, Err(reason)),
+                ContentSlot::Skipped(reason, _) => (oid, Err(reason)),
             })
             .collect()
     }
@@ -870,17 +892,34 @@ impl ObjectReadBudget {
     /// (WIO-03) so a hung tier/store read can kill the helper within the
     /// remaining batch deadline instead of stalling the whole rename pass.
     pub fn read_blob(&mut self, oid: &ObjectHash) -> ContentOutcome {
+        self.read_blob_tracked(oid).0
+    }
+
+    /// [`Self::read_blob`] plus the skip's [`ObjectReadProvenance`]. The
+    /// provenance for a successful read is `Completed` by construction.
+    pub(crate) fn read_blob_tracked(
+        &mut self,
+        oid: &ObjectHash,
+    ) -> (ContentOutcome, ObjectReadProvenance) {
         if let Some(slot) = self.cache.get(oid) {
             return match slot {
-                ContentSlot::Content(bytes) => ContentOutcome::Content(bytes.clone()),
-                ContentSlot::Skipped(reason) => ContentOutcome::Skipped(*reason),
+                ContentSlot::Content(bytes) => (
+                    ContentOutcome::Content(bytes.clone()),
+                    ObjectReadProvenance::Completed,
+                ),
+                ContentSlot::Skipped(reason, provenance) => {
+                    (ContentOutcome::Skipped(*reason), *provenance)
+                }
             };
         }
         // Budget-exceeded outcomes are NOT cached per-OID: they describe the
         // batch, not the object, and later slices may retry with fresh budgets.
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || self.remaining_objects == 0 || self.remaining_total == 0 {
-            return ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded);
+            return (
+                ContentOutcome::Skipped(SkipReason::ObjectBudgetExceeded),
+                ObjectReadProvenance::Transport,
+            );
         }
 
         // Reserve the object slot up front: failed lookups (missing, corrupt,
@@ -896,10 +935,15 @@ impl ObjectReadBudget {
         let objects_root = match crate::utils::path::try_objects() {
             Ok(path) => path,
             Err(_) => {
-                let outcome = ContentSlot::Skipped(SkipReason::ObjectUnavailable);
-                let result = ContentOutcome::Skipped(SkipReason::ObjectUnavailable);
+                let outcome = ContentSlot::Skipped(
+                    SkipReason::ObjectUnavailable,
+                    ObjectReadProvenance::Transport,
+                );
                 self.cache.insert(*oid, outcome);
-                return result;
+                return (
+                    ContentOutcome::Skipped(SkipReason::ObjectUnavailable),
+                    ObjectReadProvenance::Transport,
+                );
             }
         };
         let outcome = match crate::command::status_io_worker::deadline_read_object_blob(
@@ -909,35 +953,48 @@ impl ObjectReadBudget {
             remaining,
         ) {
             Err(()) => {
-                // Worker killed / timed out mid-read: cache per-OID so the
-                // hung object is not resubmitted, and map to metadata_*
-                // (ObjectUnavailable → metadata_unavailable), not worktree
-                // IoTimeout.
-                ContentSlot::Skipped(SkipReason::ObjectUnavailable)
+                // Worker killed / timed out mid-read, or the transport never
+                // reached a worker (spawn/dispatch failure): cache per-OID so
+                // the hung object is not resubmitted, map to metadata_*
+                // (ObjectUnavailable → metadata_unavailable, not worktree
+                // IoTimeout), and record Transport provenance — no worker
+                // outcome exists for a fallback path to trust.
+                ContentSlot::Skipped(
+                    SkipReason::ObjectUnavailable,
+                    ObjectReadProvenance::Transport,
+                )
             }
             Ok(crate::command::status_io_worker::ObjectBlobOutcome::Bytes(bytes)) => {
                 self.remaining_total = self.remaining_total.saturating_sub(bytes.len() as u64);
                 ContentSlot::Content(Rc::new(bytes))
             }
             Ok(crate::command::status_io_worker::ObjectBlobOutcome::Missing) => {
-                ContentSlot::Skipped(SkipReason::ObjectMissing)
+                ContentSlot::Skipped(SkipReason::ObjectMissing, ObjectReadProvenance::Completed)
             }
             Ok(crate::command::status_io_worker::ObjectBlobOutcome::Corrupt) => {
-                ContentSlot::Skipped(SkipReason::ObjectCorrupt)
+                ContentSlot::Skipped(SkipReason::ObjectCorrupt, ObjectReadProvenance::Completed)
             }
             Ok(crate::command::status_io_worker::ObjectBlobOutcome::Unavailable) => {
-                ContentSlot::Skipped(SkipReason::ObjectUnavailable)
+                ContentSlot::Skipped(
+                    SkipReason::ObjectUnavailable,
+                    ObjectReadProvenance::Completed,
+                )
             }
             Ok(crate::command::status_io_worker::ObjectBlobOutcome::TooLarge) => {
-                ContentSlot::Skipped(SkipReason::ObjectTooLarge)
+                ContentSlot::Skipped(SkipReason::ObjectTooLarge, ObjectReadProvenance::Completed)
             }
             Ok(crate::command::status_io_worker::ObjectBlobOutcome::Failed) => {
-                ContentSlot::Skipped(SkipReason::ObjectIoFailed)
+                ContentSlot::Skipped(SkipReason::ObjectIoFailed, ObjectReadProvenance::Completed)
             }
         };
         let result = match &outcome {
-            ContentSlot::Content(bytes) => ContentOutcome::Content(bytes.clone()),
-            ContentSlot::Skipped(reason) => ContentOutcome::Skipped(*reason),
+            ContentSlot::Content(bytes) => (
+                ContentOutcome::Content(bytes.clone()),
+                ObjectReadProvenance::Completed,
+            ),
+            ContentSlot::Skipped(reason, provenance) => {
+                (ContentOutcome::Skipped(*reason), *provenance)
+            }
         };
         self.cache.insert(*oid, outcome);
         result

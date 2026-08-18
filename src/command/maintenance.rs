@@ -4739,7 +4739,7 @@ mod tests {
             ("rules", "agent rule files (§C.4.1.1 config surface)"),
             (
                 "skills",
-                "agent skill definitions (§C.4.1.1 config surface)",
+                "agent skill definitions (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
             ),
             ("hooks.json", "hook configuration (§C.4.1.1 config surface)"),
             (
@@ -4752,7 +4752,7 @@ mod tests {
             ),
             (
                 "commands",
-                "custom command definitions (§C.4.1.1 config surface)",
+                "custom command definitions (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
             ),
             (
                 "automations.toml",
@@ -4762,7 +4762,10 @@ mod tests {
                 "agents.toml",
                 "agent registry file (§C.4.1.1 config surface)",
             ),
-            ("agents", "agent definition files (§C.4.1.1 config surface)"),
+            (
+                "agents",
+                "agent definition files (§C.4.1.1 config surface; joined via the UnifiedResolver dynamic `storage.join(location)`, see resolver_joined below)",
+            ),
             (
                 "objects",
                 "the object store itself — what GC collects, not a source of roots",
@@ -4867,6 +4870,41 @@ mod tests {
             "the storage-rooted scan looks broken: {found:?}"
         );
 
+        // The literal scanner cannot see DYNAMIC resolver joins: repo-local
+        // config surfaces reach their copy through
+        // `storage.join(location)` in `src/internal/ai/sources/resolver.rs`
+        // (W4-06), driven by callsites such as
+        // `resolved_dir_paths(working_dir, "skills")` or
+        // `resolve_security_file(&request, SANDBOX_CONFIG_FILE)`. Collect the
+        // location argument of every resolver callsite in the production
+        // corpus (literal or single-const indirection) so the staleness
+        // check below reflects what production actually resolves (W5-09 /
+        // Codex r2-r3: `skills`/`commands`/`agents` are exactly this case).
+        // A surface whose loader stops calling the resolver drops out of
+        // this set and must then prove a literal join or lose its exclusion.
+        let resolver_joined = resolver_callsite_locations();
+
+        // Coverage direction (Codex r3): every UnifiedResolver surface
+        // registered in CODE_AGENT_CONFIG_OWNERSHIP must still have an
+        // actual resolver callsite (or a literal join the scanner can see) —
+        // a registry row alone is NOT proof of a production join.
+        for surface in crate::internal::config_ownership::CODE_AGENT_CONFIG_OWNERSHIP {
+            if !matches!(
+                surface.resolution,
+                crate::internal::config_ownership::ReadResolution::UnifiedResolver
+            ) {
+                continue;
+            }
+            assert!(
+                resolver_joined.contains(surface.location) || found.contains(surface.location),
+                "UnifiedResolver surface `{}` ({}) has no resolver callsite and no \
+                 literal storage-root join left in production — fix the loader or \
+                 drop the registration and the NOT_AN_OBJECT_SOURCE entry",
+                surface.location,
+                surface.surface
+            );
+        }
+
         for name in &found {
             let inventoried = classified.iter().any(|entry| entry == name);
             let excluded = NOT_AN_OBJECT_SOURCE.iter().any(|(entry, _)| entry == name);
@@ -4884,7 +4922,20 @@ mod tests {
         // stale, and an entry that is ALSO inventoried is a contradiction —
         // one that HIDES deletions, because the exclusion keeps answering
         // for a row somebody removed. (Found exactly that way: mutating the
-        // `<gitdir>/index` row away left this guard green.)
+        // `<gitdir>/index` row away left this guard green.) Stale entries are
+        // aggregated into ONE failure so a mass decommission (e.g. the W5-06
+        // TUI startup removal dropping several config-surface joins at once)
+        // is reported in a single run instead of one entry per iteration.
+        let stale: Vec<&str> = NOT_AN_OBJECT_SOURCE
+            .iter()
+            .filter(|(name, _)| !found.contains(*name) && !resolver_joined.contains(*name))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "excluded as non-object-sources, but no production code joins them onto a \
+             storage root any more — drop the entries: {stale:?}"
+        );
         for (name, reason) in NOT_AN_OBJECT_SOURCE {
             assert!(
                 !classified.iter().any(|entry| entry == name),
@@ -4893,14 +4944,102 @@ mod tests {
                  inventory row were deleted. Keep one"
             );
             assert!(
-                found.contains(*name),
-                "`{name}` is excluded as a non-object-source, but no production code \
-                 joins it onto a storage root any more — drop the entry"
-            );
-            assert!(
                 reason.len() > 10,
                 "`{name}` is excluded without a substantive reason"
             );
         }
+    }
+
+    /// Location arguments of every unified-resolver callsite in the
+    /// production corpus. Recognizes the resolver entry points
+    /// (`resolved_dir_paths` / `resolved_file_paths` /
+    /// `resolve_security_dir` / `resolve_security_file` and the
+    /// `project_security_*` wrappers), taking the second call argument:
+    /// a string literal directly, or a bare const ident resolved through
+    /// the corpus-wide `const <IDENT>: &str = "<location>"` map (e.g.
+    /// `SANDBOX_CONFIG_FILE`). Built on the AST-based
+    /// [`crate::internal::source_scan::production_files`], which strips
+    /// `#[cfg(test)]` items surgically — a line-truncating scan loses
+    /// production callsites after INLINE `#[cfg(test)]` attributes (the
+    /// `sandbox.toml` callsite in `sandbox/mod.rs` sits after one; the
+    /// UnifiedResolver coverage loop in the guard above is the regression
+    /// pin for that case).
+    fn resolver_callsite_locations() -> std::collections::BTreeSet<String> {
+        use syn::visit::Visit;
+
+        const RESOLVER_FNS: &[&str] = &[
+            "resolved_dir_paths",
+            "resolved_file_paths",
+            "resolve_security_dir",
+            "resolve_security_file",
+            "project_security_dir_paths",
+            "project_security_file_paths",
+        ];
+
+        #[derive(Default)]
+        struct Scan {
+            consts: std::collections::BTreeMap<String, String>,
+        }
+        impl<'ast> Visit<'ast> for Scan {
+            fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+                // The const's own type annotation is irrelevant (&str is a
+                // Type::Reference, not a Type::Path) — a string-literal
+                // initializer is the whole contract.
+                if let syn::Expr::Lit(expr_lit) = &*item.expr
+                    && let syn::Lit::Str(lit) = &expr_lit.lit
+                {
+                    self.consts.insert(item.ident.to_string(), lit.value());
+                }
+                syn::visit::visit_item_const(self, item);
+            }
+        }
+
+        struct Calls<'a>(
+            &'a std::collections::BTreeMap<String, String>,
+            std::collections::BTreeSet<String>,
+        );
+        impl<'ast> Visit<'ast> for Calls<'_> {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                let callee = match &*call.func {
+                    syn::Expr::Path(path) => path
+                        .path
+                        .segments
+                        .last()
+                        .map(|segment| segment.ident.to_string()),
+                    _ => None,
+                };
+                if callee.is_some_and(|name| RESOLVER_FNS.contains(&name.as_str()))
+                    && let Some(arg) = call.args.iter().nth(1)
+                {
+                    match arg {
+                        syn::Expr::Lit(expr_lit) => {
+                            if let syn::Lit::Str(lit) = &expr_lit.lit {
+                                self.1.insert(lit.value());
+                            }
+                        }
+                        syn::Expr::Path(path) => {
+                            if let Some(ident) = path.path.get_ident()
+                                && let Some(value) = self.0.get(&ident.to_string())
+                            {
+                                self.1.insert(value.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+
+        let files = crate::internal::source_scan::production_files(&[]);
+        let mut scan = Scan::default();
+        for (_, ast) in &files {
+            scan.visit_file(ast);
+        }
+        let mut calls = Calls(&scan.consts, std::collections::BTreeSet::new());
+        for (_, ast) in &files {
+            calls.visit_file(ast);
+        }
+        calls.1
     }
 }
