@@ -381,13 +381,14 @@ impl RawLstat {
 
 #[cfg(unix)]
 fn ctime_nsec(stat: &libc::stat) -> i64 {
-    #[cfg(target_os = "linux")]
+    // The Rust `libc` crate flattens Darwin's `st_ctimespec` into
+    // `st_ctime`/`st_ctime_nsec` (same names as Linux); `st_ctimespec`
+    // does not exist on `libc::stat` there — the aarch64-apple-darwin
+    // release build of v0.20.0 was the first cross-target compile since
+    // WIO-02 landed and failed on exactly this field (W5-09).
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     {
         stat.st_ctime_nsec
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        stat.st_ctimespec.tv_nsec
     }
     #[cfg(any(
         target_os = "freebsd",
@@ -415,13 +416,11 @@ fn ctime_nsec(stat: &libc::stat) -> i64 {
 
 #[cfg(unix)]
 fn mtime_nsec(stat: &libc::stat) -> i64 {
-    #[cfg(target_os = "linux")]
+    // See `ctime_nsec`: libc flattens Darwin's timespec pair to
+    // `st_mtime`/`st_mtime_nsec`.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
     {
         stat.st_mtime_nsec
-    }
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        stat.st_mtimespec.tv_nsec
     }
     #[cfg(any(
         target_os = "freebsd",
