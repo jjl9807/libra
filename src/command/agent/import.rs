@@ -34,8 +34,7 @@ use crate::{
                 opencode_export::{
                     ExportLimits, authorized_sandboxed_export, trusted_opencode_binary,
                 },
-                read_dir_pinned_provider_directory, resolve_import_transcript_source_until,
-                resolve_session_file,
+                resolve_import_transcript_source_until, resolve_session_file,
             },
         },
         db,
@@ -675,7 +674,7 @@ fn read_discovery_names(
     scanned: &mut usize,
 ) -> Result<Vec<std::ffi::OsString>> {
     ensure_before_deadline(deadline)?;
-    let read = read_dir_pinned_provider_directory(directory)
+    let read = crate::internal::ai::observed_agents::read_dir_pinned_provider_directory(directory)
         .with_context(|| format!("read pinned {label} directory"))?;
     let mut names = Vec::new();
     for entry in read {
@@ -710,8 +709,9 @@ fn discover_claude(
         return Ok(Vec::new());
     };
     #[cfg(unix)]
-    let entries = read_dir_pinned_provider_directory(&directory)
-        .context("read pinned Claude session directory")?;
+    let entries =
+        crate::internal::ai::observed_agents::read_dir_pinned_provider_directory(&directory)
+            .context("read pinned Claude session directory")?;
     #[cfg(not(unix))]
     let entries = {
         let _ = &directory;

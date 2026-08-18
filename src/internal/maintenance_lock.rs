@@ -104,6 +104,19 @@ type LockKey = LockIdentity;
 #[cfg(not(unix))]
 type LockKey = PathBuf;
 
+/// Duplicate a [`LockKey`] for map insertion while the original is still
+/// needed. Platform-split so neither side trips clippy: the Unix key is a
+/// `Copy` dev/ino identity (`clone_on_copy`), the Windows key is a `PathBuf`
+/// (a real clone).
+#[cfg(unix)]
+fn dup_lock_key(key: &LockKey) -> LockKey {
+    *key
+}
+#[cfg(not(unix))]
+fn dup_lock_key(key: &LockKey) -> LockKey {
+    key.clone()
+}
+
 fn locks() -> std::sync::MutexGuard<'static, std::collections::HashMap<LockKey, RepoState>> {
     LOCKS.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -341,7 +354,7 @@ impl MaintenanceLock {
             return Ok(Self { key });
         }
         locks.insert(
-            key,
+            dup_lock_key(&key),
             RepoState {
                 mode: Mode::Shared,
                 depth: 1,
@@ -357,7 +370,9 @@ impl MaintenanceLock {
         let mut locks = locks();
         let state = locks.get_mut(key)?;
         state.depth += 1;
-        Some(Self { key: *key })
+        Some(Self {
+            key: dup_lock_key(key),
+        })
     }
 
     /// Take the lock EXCLUSIVE for a deletion phase, waiting at most `wait`.
@@ -407,7 +422,7 @@ impl MaintenanceLock {
                         return Ok(None);
                     }
                     locks.insert(
-                        key,
+                        dup_lock_key(&key),
                         RepoState {
                             mode: Mode::Exclusive,
                             depth: 1,

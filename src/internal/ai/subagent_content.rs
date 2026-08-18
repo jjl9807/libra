@@ -36,8 +36,7 @@ use super::{
         claude_project_slug, claude_session_dir, claude_session_id_is_safe_path_component,
         normalize_claude_transcript, normalize_claude_transcript_until,
         open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
-        parse_canon_value, read_dir_pinned_provider_directory, redact_turns_with_report,
-        safe_turn_projection,
+        parse_canon_value, redact_turns_with_report, safe_turn_projection,
     },
 };
 use crate::utils::client_storage::ClientStorage;
@@ -608,7 +607,7 @@ pub(crate) fn discover_claude_subagent_contents(
         };
         let mut names = Vec::new();
         let mut entry_count = 0usize;
-        for entry in read_dir_pinned_provider_directory(&directory)
+        for entry in super::observed_agents::read_dir_pinned_provider_directory(&directory)
             .context("enumerate pinned Claude subagent directory")?
         {
             ensure_before_deadline(deadline)?;

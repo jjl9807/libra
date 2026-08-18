@@ -964,12 +964,12 @@ fn open_windows_nofollow(
     };
 
     use windows_sys::Win32::{
-        Foundation::{HANDLE, INVALID_HANDLE_VALUE, SYNCHRONIZE},
+        Foundation::{HANDLE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
             FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
             FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            GetFileInformationByHandle, OPEN_EXISTING,
+            GetFileInformationByHandle, OPEN_EXISTING, SYNCHRONIZE,
         },
     };
 
@@ -1130,7 +1130,7 @@ fn strip_nt_prefix_path(path: &Path) -> PathBuf {
     if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{rest}"))
     } else if let Some(rest) = rendered.strip_prefix(r"\\?\") {
-        PathBuf::from(rest.as_ref())
+        PathBuf::from(rest)
     } else {
         path.to_path_buf()
     }

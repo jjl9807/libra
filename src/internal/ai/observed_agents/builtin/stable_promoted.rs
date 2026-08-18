@@ -25,9 +25,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 
+#[cfg(unix)]
+use super::super::read_dir_pinned_provider_directory;
 use super::super::{
     adapter::{AgentKind, AgentSessionCtx, AgentStability, ObservedAgent},
-    agent_for, open_provider_directory_for_discovery, read_dir_pinned_provider_directory,
+    agent_for, open_provider_directory_for_discovery,
 };
 
 const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
