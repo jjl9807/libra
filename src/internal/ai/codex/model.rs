@@ -54,7 +54,7 @@ pub struct PlanSnapshot {
 }
 
 /// A single step within a plan. `ordinal` preserves order across reorderings; the
-/// step text is what the user sees in the TUI plan widget.
+/// step text is what the user sees in the Web Code UI plan widget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStepSnapshot {
     pub id: String,

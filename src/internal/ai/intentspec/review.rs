@@ -247,13 +247,13 @@ mod tests {
             IntentDraft {
                 intent: DraftIntent {
                     summary: "Fix the Ollama planner flow".to_string(),
-                    problem_statement: "The TUI skips IntentSpec review".to_string(),
+                    problem_statement: "The Code UI skips IntentSpec review".to_string(),
                     change_type: ChangeType::Bugfix,
                     objectives: vec![Objective {
                         title: "Show IntentSpec review first".to_string(),
                         kind: ObjectiveKind::Implementation,
                     }],
-                    in_scope: vec!["src/internal/tui".to_string()],
+                    in_scope: vec!["src/internal/ai/runtime".to_string()],
                     out_of_scope: vec!["provider rewrite".to_string()],
                     touch_hints: None,
                 },

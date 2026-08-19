@@ -19,10 +19,11 @@ use crate::internal::ai::tools::{
 
 /// Blocking handler that presents questions to the user and awaits their response.
 ///
-/// Communication with the TUI happens through an unbounded channel:
+/// Communication with the session UI happens through an unbounded channel:
 ///
 /// 1. The handler creates a `oneshot` channel for the response.
-/// 2. It sends a `UserInputRequest` (questions + response sender) to the TUI
+/// 2. It sends a `UserInputRequest` (questions + response sender) to the
+///    session UI
 ///    via the `request_tx` channel.
 /// 3. It awaits the response on the `oneshot` receiver.
 /// 4. The user's answers are returned as JSON to the model.
@@ -97,10 +98,10 @@ impl ToolHandler for RequestUserInputHandler {
             response_tx,
         };
 
-        // Send the request to the TUI.
-        self.request_tx
-            .send(request)
-            .map_err(|_| ToolError::ExecutionFailed("TUI is not available".into()))?;
+        // Send the request to the session UI.
+        self.request_tx.send(request).map_err(|_| {
+            ToolError::ExecutionFailed("User input is unavailable for this session".into())
+        })?;
 
         // Block until the user responds.
         let response = response_rx

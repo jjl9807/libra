@@ -1,7 +1,7 @@
 //! UI-neutral serialized turn runtime for `libra code` and future adapters.
 //!
 //! This module owns session-local turn ordering and the observable interaction
-//! state.  It deliberately does not know about TUI, Web, MCP, or a provider:
+//! state.  It deliberately does not know about a terminal UI, Web, MCP, or a provider:
 //! those callers submit typed requests through [`AgentRuntimeHandle`], while a
 //! [`RuntimeTurnExecutor`] adapts the existing provider/tool-loop stack.  A
 //! mutating executor receives the same [`ToolBoundaryRuntime`] that backs the

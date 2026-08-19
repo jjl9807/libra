@@ -12,7 +12,7 @@
 //!   needs comes through [`ProviderBuildOptions`]; the caller resolves env,
 //!   dotenv, and secret-manager layers before invoking `build()`.
 //! - Errors are structured and human-actionable. `UnknownProvider` and
-//!   `UnknownModel` carry suggestion lists so a TUI surface can render them
+//!   `UnknownModel` carry suggestion lists so a UI surface can render them
 //!   directly without re-deriving the candidate set.
 //! - Capability check is **best-effort**: an unknown model on a known
 //!   provider produces an `UnknownModel` error with suggestions, but the
@@ -331,7 +331,7 @@ fn build_fake(
 
 /// Structured failure modes from [`ProviderFactory::build`].
 ///
-/// Each variant carries enough context for a TUI surface to render an
+/// Each variant carries enough context for a UI surface to render an
 /// actionable message without re-deriving suggestion lists or env-var names.
 #[derive(Debug, Error)]
 pub enum ProviderFactoryError {
@@ -545,7 +545,7 @@ mod tests {
     }
 
     /// Scenario (test-provider only): when the `test-provider` feature is
-    /// enabled, `UnknownProvider.available` includes `fake` so a TUI surface
+    /// enabled, `UnknownProvider.available` includes `fake` so a UI surface
     /// can render the full set of dispatchable providers in this build.
     #[cfg(feature = "test-provider")]
     #[test]

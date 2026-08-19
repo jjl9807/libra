@@ -1,7 +1,7 @@
 //! Phase C Code UI projection read-model tests.
 //!
 //! Verifies that `snapshot_from_thread_bundle` (the function powering the `libra code`
-//! TUI / web read model) reads identity, scheduler state, and plan ordering from the
+//! Code UI / web read model) reads identity, scheduler state, and plan ordering from the
 //! projection layer rather than recomputing it locally. Pure unit tests against
 //! constructed `ThreadBundle` fixtures — no I/O or async required.
 //!

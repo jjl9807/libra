@@ -170,7 +170,7 @@ mod tests {
     }
 
     /// The summary must start with `IntentSpec generated.` — this
-    /// header is the contract the TUI greps for to distinguish a
+    /// header is the contract the Code UI greps for to distinguish a
     /// successful spec rendering from any other CLI output.
     #[test]
     fn render_summary_starts_with_generated_header() {

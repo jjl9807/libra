@@ -18,7 +18,7 @@ use uuid::Uuid;
 pub const DEFAULT_CONTROLLER_LEASE_SECS: i64 = 120;
 
 /// The class of a session controller.  This is intentionally independent from
-/// any TUI or HTTP representation so all adapters share one lease owner.
+/// any terminal or HTTP representation so all adapters share one lease owner.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ControllerKind {
@@ -149,8 +149,7 @@ impl ControllerServiceError {
                 "Browser control is disabled for this code session".to_string()
             }
             Self::AutomationControlDisabled => {
-                "Local TUI automation write control is not enabled; start with --control write"
-                    .to_string()
+                "Automation write control is not enabled; start with --control write".to_string()
             }
             Self::InvalidControllerKind(kind) => {
                 format!("Controller kind '{}' cannot attach", kind.as_str())
@@ -229,7 +228,7 @@ impl ControllerService {
     }
 
     /// Admit or renew a remote controller.  A different client can only attach
-    /// after the old lease expires or the local TUI explicitly reclaims it.
+    /// after the old lease expires or is explicitly detached.
     pub async fn attach(
         &self,
         kind: ControllerKind,
@@ -239,8 +238,8 @@ impl ControllerService {
     }
 
     /// Like [`Self::attach`], but reports whether this mint is a lease
-    /// takeover: a prior remote lease expired, was reclaimed, or was detached,
-    /// or this attach replaces an active local TUI owner. Renewals of the same
+    /// takeover: a prior remote lease expired, was reclaimed, or was detached.
+    /// Renewals of the same
     /// client are not takeovers.
     pub async fn attach_with_takeover(
         &self,

@@ -1,4 +1,4 @@
-//! Parser for the `/goal` family of TUI slash commands.
+//! Parser for the `/goal` family of Code control commands.
 //!
 //! Per `docs/development/commands/_general.md` lines 686-693, Goal mode exposes
 //! three primary user-facing slash commands plus one criteria-tweak:
@@ -18,8 +18,8 @@
 //!
 //! This module is the typed parser only. It does not invoke the
 //! supervisor (P6.3) or mutate session state — that lives in the
-//! `app.rs` dispatch arm that calls into this parser. Keeping the
-//! parser separate makes the slash-command grammar testable in
+//! runtime control dispatch that calls into this parser. Keeping the
+//! parser separate makes the command grammar testable in
 //! isolation and stable across UI/CLI/Code-Control surfaces (P6.6
 //! reuses the same shape).
 
@@ -106,9 +106,8 @@ pub enum GoalCommandParseError {
     },
 }
 
-/// Parse `args`, the trimmed argument tail that follows
-/// [`crate::internal::tui::slash_command::BuiltinCommand::Goal`]. The
-/// caller has already split off the leading `/goal` token, so `args`
+/// Parse `args`, the trimmed argument tail that follows a `/goal` command.
+/// The caller has already split off the leading `/goal` token, so `args`
 /// is e.g. `"start ship the feature"` / `"status"` / `"cancel user
 /// changed mind"` / `"criteria add tests pass"`.
 pub fn parse_goal_subcommand(args: &str) -> Result<GoalSubcommand, GoalCommandParseError> {

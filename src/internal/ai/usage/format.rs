@@ -144,7 +144,7 @@ mod tests {
     /// - `>= 1_000_000` → `<X>.<Y>m`
     ///
     /// Pin so a future "comma-separated" or SI-prefix refactor breaks
-    /// this test instead of silently changing the TUI rendering.
+    /// this test instead of silently changing the Code UI rendering.
     #[test]
     fn compact_count_boundary_table() {
         assert_eq!(compact_count(0), "0");
@@ -196,7 +196,7 @@ mod tests {
     }
 
     /// `format_usage_badge` uses dotted-middle (` · `) joiner so the
-    /// monospace TUI cell parses cleanly. Pin the joiner so a future
+    /// monospace UI cell parses cleanly. Pin the joiner so a future
     /// table-style refactor breaks this test loudly.
     #[test]
     fn format_usage_badge_uses_dotted_joiner() {

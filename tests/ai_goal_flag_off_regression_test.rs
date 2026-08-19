@@ -173,7 +173,7 @@ fn no_completion_path_without_explicit_claim_envelope() {
 /// existence.
 #[test]
 fn goal_subcommand_parser_has_no_side_effects() {
-    // The parser is private to the tui module, so we exercise it
+    // The parser is private to the Code command implementation, so we exercise it
     // here through the indirect proof: the session-level
     // schemas (`GoalSpec`, `GoalState`, `GoalEvent`) are present
     // but produce no implicit lifecycle artefacts on their own
@@ -184,7 +184,7 @@ fn goal_subcommand_parser_has_no_side_effects() {
     //
     // Building a fresh GoalSpec + GoalState pair, then asserting
     // the same invariants from above, is the closest approximation
-    // available from outside the tui module without exposing the
+    // available without exposing the
     // parser surface to integration tests. The supervisor's pure
     // `step()` already pins the no-events-without-outcome
     // property in the supervisor lib tests.

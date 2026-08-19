@@ -8,7 +8,7 @@
 //!
 //! Everything in this file is plain data + JSON round-trip helpers. There
 //! is **no** logic that decides whether a Goal *can* be created (that
-//! gating belongs to the CLI/TUI/Control entry points in P6.5/P6.6) and no
+//! gating belongs to the CLI/Code UI/Control entry points in P6.5/P6.6) and no
 //! logic that decides whether the Goal *is done* (that belongs to the
 //! verifier in P6.2). Keeping the schema pure makes it easy to reason
 //! about replay determinism: the same JSON wire bytes always reconstitute
@@ -38,7 +38,7 @@ pub const MAX_OBJECTIVE_LEN: usize = 16 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GoalActor {
-    /// Local interactive user (CLI prompt or TUI).
+    /// Local interactive user (CLI prompt or Code UI).
     User { id: Option<String> },
     /// Code Control automation that holds the current controller lease.
     Automation { agent_id: String, lease_id: String },
@@ -116,7 +116,7 @@ pub enum GoalEvidencePolicy {
 /// Per `docs/development/commands/_general.md` lines 660-661, hitting `hard_cap`
 /// puts the Goal into `Blocked { reason: BudgetApprovalRequired }`,
 /// **never** `Completed` or `Cancelled`. `warn_threshold` is purely
-/// informative: the supervisor surfaces a TUI hint without changing
+/// informative: the supervisor surfaces a UI hint without changing
 /// status.
 ///
 /// Costs are denominated in micro-USD (1e-6 USD) so the schema avoids

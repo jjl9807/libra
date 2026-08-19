@@ -11,7 +11,7 @@
 //!     the dedicated `ai_provider_context_overflow_compact_loop_test`).
 //!
 //! Implementation under test: [`RetryingCompletionModel`] — the
-//! production wrapper that the TUI installs around every concrete
+//! production wrapper that the Code UI installs around every concrete
 //! [`CompletionModel`]. The fixtures here drive a deterministic fake
 //! model so a regression that flips the wrapper's public retry
 //! contract (classes that retry, classes that surface immediately,

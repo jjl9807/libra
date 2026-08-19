@@ -1,4 +1,4 @@
-//! Local TUI automation control file lifecycle.
+//! Local automation control file lifecycle.
 //!
 //! `libra code --control write` uses three files under the ACTING worktree's
 //! local gitdir by default (plan-20260714 §C.8 W4 — for the main worktree the
@@ -483,7 +483,7 @@ impl Drop for ControlLockGuard {
             tracing::debug!(
                 path = %self.lock_path.display(),
                 error = %error,
-                "failed to remove local TUI control lock file"
+                "failed to remove local control lock file"
             );
         }
     }
@@ -669,7 +669,7 @@ pub fn inspect_existing_instance(info_path: &Path) -> Result<Option<LiveInstance
             tracing::debug!(
                 path = %info_path.display(),
                 error = %error,
-                "ignoring malformed local TUI control info file"
+                "ignoring malformed local control info file"
             );
             return Ok(None);
         }
@@ -728,7 +728,7 @@ fn generate_control_token() -> Result<String> {
     let rng = SystemRandom::new();
     let mut token = [0u8; 32];
     rng.fill(&mut token)
-        .map_err(|_| anyhow!("failed to generate secure local TUI control token"))?;
+        .map_err(|_| anyhow!("failed to generate secure local control token"))?;
     Ok(URL_SAFE_NO_PAD.encode(token))
 }
 
@@ -810,7 +810,7 @@ fn writable_token_file(path: &Path, create_new: bool) -> Result<File> {
 /// (that would follow a raced symlink). W3-10 / plan-20260714 §C.8 W4.
 pub fn write_control_info(path: &Path, info: &ControlInfo) -> Result<()> {
     let serialized =
-        serde_json::to_string_pretty(info).context("failed to serialize local TUI control info")?;
+        serde_json::to_string_pretty(info).context("failed to serialize local control info")?;
     // Bare filenames (`--control-info-file control.json`) have an empty parent
     // path. `write_atomic` rejects that, while the historical `fs::write` wrote
     // into the process cwd — normalize to `.` so custom relative paths keep
@@ -1211,7 +1211,7 @@ pub fn cleanup_control_files(paths: &ControlPaths, remove_token: bool, remove_in
             tracing::debug!(
                 path = %path.display(),
                 error = %error,
-                "failed to remove local TUI control file"
+                "failed to remove local control file"
             );
         }
     }

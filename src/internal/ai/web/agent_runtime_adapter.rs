@@ -1,6 +1,6 @@
 //! Code UI bridge for the UI-neutral [`AgentRuntimeHandle`].
 //!
-//! The adapter deliberately owns no TUI state.  Its session is the event
+//! The adapter deliberately owns no terminal-UI state. Its session is the event
 //! projection cache used by the HTTP/SSE surface; commands are admitted,
 //! responded to, and cancelled by the serialized runtime worker.
 //!

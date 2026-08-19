@@ -27,7 +27,7 @@
 //!   plus filesystem/network sandboxing primitives shared by tool handlers.
 //! - **Session / history / projections** ([`session`], [`history`],
 //!   [`projection`]): durable state on disk, message history compaction, and
-//!   read-side projections for the TUI.
+//!   read-side projections for the Web Code UI.
 //! - **Runtime / web / VCS adapters** ([`runtime`], [`web`], [`libra_vcs`],
 //!   [`node_adapter`]): glue that connects the agent to the surrounding
 //!   environment (process supervisor, web UI, Libra repo, workflow DAG nodes).
@@ -91,6 +91,8 @@ pub mod context_budget;
 // OC-Phase 6 Goal mode runtime contract (P6.1 schema only).
 // Schema lives here; supervisor / verifier / tools / CLI land in P6.2-P6.7.
 pub mod goal;
+pub mod goal_command;
+pub mod goal_session;
 // Crate-private helpers for capturing artifacts produced by tool calls.
 pub(crate) mod generated_artifacts;
 // Per-turn coverage claim gate for external-agent checkpoint writers

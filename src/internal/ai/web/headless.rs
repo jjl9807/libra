@@ -11,7 +11,7 @@
 //! Confirmed plan execution still goes through
 //! [`crate::internal::ai::runtime::plan_execution`] /
 //! `ensure_plan_execution_mutating_gate`. Full IntentSpec → Phase 1 → repair
-//! parity with the TUI remains GATE-WEB-PLAN.
+//! parity is pinned by the completed GATE-WEB-PLAN regression gate.
 
 use std::{
     collections::HashMap,
@@ -638,7 +638,7 @@ struct HeadlessTurnExecutor<M: CompletionModel + 'static> {
     /// turn id → browser interaction id. Cleared when the review settles.
     pending_intent_reviews: Arc<Mutex<HashMap<String, String>>>,
     /// After Modify/Revise, the current IntentSpec JSON awaits the next plain
-    /// Phase 0 message (TUI `pending_plan_revision` parity).
+    /// Phase 0 message (legacy `pending_plan_revision` parity).
     pending_intent_revision: Arc<Mutex<Option<PendingIntentRevision>>>,
     /// Optional MCP server for formal Phase 0 `write_intent` persistence.
     mcp_server: Option<Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
@@ -824,7 +824,7 @@ where
         let mut worker_config = AgentRuntimeWorkerConfig::new(executor, tool_boundary);
         worker_config.shutdown_timeout = shutdown_timeout;
         // Goal JSONL store also supplies session_root so task.dispatch can
-        // attach file-history batches (S2-INV-06), matching the TUI `/task` path.
+        // attach file-history batches (S2-INV-06), matching the historical `/task` path.
         let execution_control = Arc::new(
             ExecutionControlService::new(
                 runtime_session_id.clone(),
@@ -1251,7 +1251,7 @@ where
         let prior_history = self.history.lock().await.clone();
         let mut config = (self.config_factory)();
         if turn_mode == WebTurnMode::PlanPhase0 {
-            // Default browser chat uses the TUI Phase 0 allowlist so apply_patch
+            // Default browser chat uses the historical Phase 0 allowlist so apply_patch
             // / shell cannot run before IntentSpec / plan confirmation.
             config = phase0_plan_tool_loop_config(config);
         }
@@ -3054,7 +3054,13 @@ impl super::super::agent::runtime::tool_loop::ToolLoopObserver for HeadlessTurnO
             {
                 session.upsert_plan(plan).await;
             }
-            session.set_status(CodeUiSessionStatus::ExecutingTool).await;
+            // Late-start barrier for the APPROVAL parking path (W5-03):
+            // this task runs unordered relative to an exec-approval /
+            // user-input request that parks the turn — never clobber a
+            // parked AwaitingInteraction gate back to ExecutingTool.
+            session
+                .set_status_unless_awaiting_interaction(CodeUiSessionStatus::ExecutingTool)
+                .await;
         });
         // Record the start task so `on_tool_call_end` can await it before
         // writing terminal state (the ordering barrier for this tool call).

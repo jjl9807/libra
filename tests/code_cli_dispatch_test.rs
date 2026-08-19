@@ -25,7 +25,7 @@
 //! * Provider boot smoke (Wave 10 / PR 10).
 //! * `--plan-mode` default per provider — already covered by
 //!   `effective_plan_mode_*` tests inside `src/command/code.rs`.
-//! * TUI / MCP / Codex runtime — Waves 9/13.
+//! * Code UI / MCP / Codex runtime — Waves 9/13.
 
 use std::path::PathBuf;
 

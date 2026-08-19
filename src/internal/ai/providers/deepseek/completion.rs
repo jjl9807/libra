@@ -559,7 +559,7 @@ impl DeepSeekStreamAccumulator {
     ///   later [`Self::into_response`] can produce a complete final response even
     ///   when fields appear only on the first or last chunk.
     /// - Forwards `TextDelta`, `ThinkingDelta`, and (for completed tool calls)
-    ///   `ToolCallPreview` events to `stream_events`, allowing the TUI to render
+    ///   `ToolCallPreview` events to `stream_events`, allowing the Code UI to render
     ///   characters as they arrive.
     fn push_chunk(
         &mut self,
@@ -1371,7 +1371,7 @@ mod tests {
 
     /// Scenario: a multi-chunk text stream with intermediate reasoning content
     /// and a final `[DONE]` marker must produce a fully-merged response while
-    /// also publishing the per-delta stream events the TUI consumes.
+    /// also publishing the per-delta stream events the Code UI consumes.
     #[test]
     fn test_deepseek_stream_accumulates_text_and_usage() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

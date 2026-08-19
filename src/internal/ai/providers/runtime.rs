@@ -22,7 +22,7 @@
 //! - It does **not** know about [`crate::internal::ai::agent::profile::spec::ModelBinding`]
 //!   string parsing — the factory will glue those layers together.
 //! - It does **not** wire into [`crate::command::code`] yet (OC-Phase 1 P1.3
-//!   migrates the main TUI path).
+//!   migrates the main Code runtime path).
 //!
 //! Adding a new provider requires:
 //! 1. Add a variant to [`AnyCompletionModel`] (the model struct) and to

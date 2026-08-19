@@ -689,7 +689,7 @@ async fn cancel_during_mutation_requires_reconciliation() {
 
 /// W2-02 AC3/AC4: while a Phase 0 IntentSpec review is pending
 /// (`InteractionState::AwaitingIntentReview`), the worker — not
-/// `pending_intent_review` in the TUI — is the durable owner of the mutation
+/// `pending_intent_review` in the retired TUI — is the durable owner of the mutation
 /// fence. A follow-on turn on the same session (e.g. a stray mutating tool
 /// call outside the `phase0_plan_tool_loop_config` allowlist) must queue
 /// rather than execute, because the tracked Phase 0 turn stays active until
@@ -754,7 +754,7 @@ async fn intentspec_review_blocks_mutation() {
     let (handle, worker) =
         AgentRuntimeWorker::spawn(AgentRuntimeWorkerConfig::new(executor, boundary));
 
-    // Track the Phase 0 turn the way the TUI/web adapter does once
+    // Track the Phase 0 turn the way the Web adapter does once
     // `submit_intent_draft` fires: `track_external_turn` keeps it active
     // while the tool loop itself has already exited.
     handle
@@ -894,7 +894,7 @@ async fn intentspec_review_gate_is_non_mutating_after_phase0_terminalizes() {
         .expect("mutating turn queues behind phase0");
     assert_eq!(started.load(Ordering::SeqCst), 0);
 
-    // Mirror the TUI register path: terminalize Phase 0 without releasing the
+    // Mirror the legacy register path: terminalize Phase 0 without releasing the
     // queue, then park a non-mutating review gate in front of it.
     handle
         .finish_external_turn(
@@ -1248,7 +1248,7 @@ async fn plan_review_network_policy_gate() {
 }
 
 /// W2-03 end-to-end fence, mirroring `intentspec_review_blocks_mutation` but
-/// for the full Phase 1 sequence the TUI drives: a mutating Phase 1 turn
+/// for the full Phase 1 sequence the runtime drives: a mutating Phase 1 turn
 /// terminalizes with `CompletedHoldQueued`, a non-mutating Plan review gate
 /// parks in front of the held queue, Execute hands off to a non-mutating
 /// network-policy gate, and only `network-allow` releases the mutation.
@@ -2233,7 +2233,7 @@ async fn plan_review_non_execute_discards_queued_mutations() {
 /// cooperative token. A mutation marker shared with the runtime turns an
 /// ambiguous local cancellation into the durable reconciliation fence.
 #[tokio::test]
-async fn external_tui_turn_cancel_uses_runtime_reconciliation() {
+async fn external_legacy_turn_cancel_uses_runtime_reconciliation() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -2260,7 +2260,7 @@ async fn external_tui_turn_cancel_uses_runtime_reconciliation() {
         SecretRedactor::default_runtime(),
         Arc::new(InMemoryAuditSink::default()),
     );
-    let temp = tempfile::TempDir::new().expect("temporary TUI session JSONL root");
+    let temp = tempfile::TempDir::new().expect("temporary legacy session JSONL root");
     let durability =
         RuntimeCommandDurability::new(SessionJsonlStore::new(temp.path().join("session")));
     let (handle, worker) = AgentRuntimeWorker::spawn(
@@ -2277,12 +2277,12 @@ async fn external_tui_turn_cancel_uses_runtime_reconciliation() {
             Arc::clone(&mutation_started),
         )
         .await
-        .expect("external TUI turn admitted");
+        .expect("external legacy turn admitted");
 
     handle
         .cancel("session", "turn-1")
         .await
-        .expect("runtime accepted TUI cancellation");
+        .expect("runtime accepted legacy cancellation");
     assert!(
         !cancellation.is_cancelled(),
         "a started mutation must not be locally aborted by runtime cancellation"
@@ -2324,7 +2324,7 @@ async fn external_tui_turn_cancel_uses_runtime_reconciliation() {
                 "tui-local",
                 "turn-1",
             ))
-            .expect("durable TUI cancellation result"),
+            .expect("durable legacy cancellation result"),
         CodeCommandRecovery::Existing {
             status: CodeCommandStatus::Indeterminate { .. }
         }
@@ -3246,39 +3246,6 @@ async fn plan_execution_repair_phase1_cancellation_reparks_manual_continuation()
     worker.abort();
 }
 
-/// W2-11 r29: automatic repair Continue writes a durable continuation before
-/// acknowledging the prior gate. Phase 1 admission failures must receive that
-/// ID so their caller can re-park it, rather than clearing only the automatic
-/// pending state and leaving the runtime Idle until restart.
-#[test]
-fn plan_execution_repair_automatic_continuation_reaches_phase1_admission_recovery() {
-    let app_source = include_str!("../src/internal/tui/app.rs");
-    let automatic_repair_start = app_source
-        .find("async fn begin_automatic_execution_plan_repair")
-        .expect("automatic repair entry point");
-    let phase1_start = app_source
-        .find("async fn begin_llm_execution_plan_workflow")
-        .expect("Phase 1 workflow entry point");
-    let automatic_repair = &app_source[automatic_repair_start..phase1_start];
-
-    assert!(
-        automatic_repair.contains(
-            "pending.repair_continuation_interaction_id = continuation_interaction_id.clone();"
-        ),
-        "automatic repair must carry its durable continuation into Phase 1's repair context"
-    );
-    assert!(
-        automatic_repair.contains(
-            "repair_continuation_interaction_id: repair_continuation_interaction_id.clone(),"
-        ),
-        "a rejected Phase 1 admission must retain the continuation ID for re-parking"
-    );
-    assert!(
-        automatic_repair.contains("restore_rejected_repaired_execution_admission("),
-        "Phase 1 admission rejection must re-park the automatic repair continuation"
-    );
-}
-
 /// W2-11 r21: if recovery sees a raised-limit continuation persisted before
 /// its predecessor was acknowledged, it restores the predecessor and retires
 /// the explicitly linked speculative copy. A later successful repair must not
@@ -3426,7 +3393,7 @@ fn plan_execution_repair_recovery_prefers_replan_failure_replacement_before_reti
     );
 }
 
-/// W2-11: the TUI/control adapter parks this delivery on the runtime handle.
+/// W2-11: the Web/control adapter parks this delivery on the runtime handle.
 /// A public interaction response must settle the worker gate and its durable
 /// marker together; otherwise resume would strand the session at the repair
 /// prompt even after Cancel was acknowledged.
@@ -3669,7 +3636,7 @@ async fn plan_execution_repair_failure_registration_recovers_and_continues() {
 
     // This is the production restart adapter sequence: persist the durable
     // marker, then park the runtime interaction before projecting the repaired
-    // state back to the TUI/Code UI.
+    // state back to the Code UI.
     let first_gate_turn = "plan-repair-after-execute-failure";
     let (first_handle, first_worker) = spawn_runtime(boundary());
     persist_and_park_plan_execution_repair_gate(

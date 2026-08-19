@@ -124,7 +124,7 @@ impl ToolLoopCancellation {
 ///
 /// Implementations receive call-by-call notifications without affecting the loop
 /// itself (except for [`Self::on_tool_call_preflight`], which can cancel a tool call).
-/// Used by the TUI to render thoughts/calls/results live, and by tests to assert the
+/// Used by the Web Code UI to render thoughts/calls/results live, and by tests to assert the
 /// expected sequence of events.
 ///
 /// All callbacks are best-effort and must be non-panicking.
@@ -232,7 +232,7 @@ pub struct ToolLoopConfig {
     pub usage_recorder: Option<UsageRecorder>,
     /// Provider/model/thread metadata attached to usage rows.
     pub usage_context: Option<UsageContext>,
-    /// Shared model-turn sequence for cancellation accounting. The TUI records a
+    /// Shared model-turn sequence for cancellation accounting. The Code UI records a
     /// cancellation fallback against the active request's durable event key.
     pub active_model_turn: Option<Arc<AtomicUsize>>,
     /// Optional Source Pool whose enabled handlers are merged into the tool
@@ -254,7 +254,7 @@ pub struct ToolLoopConfig {
     /// when callers want to pin a turn to a specific Goal, matching
     /// the supervisor's [`GoalStopPolicy`] enum.
     ///
-    /// OC-Phase 6 P6.3 contract field: the TUI Goal path binds
+    /// OC-Phase 6 P6.3 contract field: the Code UI Goal path binds
     /// `Some(GoalBound { goal_id })` into this config before calling
     /// the Goal-aware driver. The inner
     /// [`super::run_tool_loop_with_history_and_observer`] entry point
@@ -1076,7 +1076,7 @@ async fn dispatch_task_tool_call<O: ToolLoopObserver>(
             // enforcement (`check_agent`) sees a non-default
             // accumulation. The default observer impl folds this
             // into the parent's anonymous `on_model_usage` bucket;
-            // a TUI observer override routes it through
+            // a UI observer override routes it through
             // `BudgetTracker::accumulate(..., Some(agent_name))`.
             observer.on_sub_agent_completed(&result.agent_name, &result.usage);
             Ok(task_result_output(result))
@@ -1626,7 +1626,7 @@ mod tests {
     };
 
     /// Default `ToolLoopConfig` is the legacy non-Goal shape:
-    /// `goal_stop_policy` is `None`. The TUI Goal path binds
+    /// `goal_stop_policy` is `None`. The Code UI Goal path binds
     /// `GoalStopPolicy::GoalBound { goal_id }` explicitly before it
     /// enters the supervisor-aware driver.
     #[test]
@@ -2387,7 +2387,7 @@ mod tests {
         // so anything observed on the dispatched child can only have
         // come from this `config.runtime_context`, proving the live
         // context is threaded through (S2-INV-06). `file_history`
-        // mirrors what the TUI attaches per turn (the batch that drives
+        // mirrors what the Code UI attaches per turn (the batch that drives
         // child `apply_patch` undo preimage recording).
         let live_runtime_context = ToolRuntimeContext {
             file_history: Some(FileHistoryRuntimeContext {
@@ -2995,7 +2995,7 @@ mod tests {
     }
 
     /// Scenario: Source Pool reloads must take effect on the next tool-loop
-    /// setup, not require a TUI restart. The loop builds an effective registry
+    /// setup, not require a Code UI restart. The loop builds an effective registry
     /// from the current SourcePool snapshot at run start, so a reloaded manifest
     /// changes the next request's tool definitions.
     #[tokio::test]

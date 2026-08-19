@@ -150,7 +150,7 @@ Libra 的优势在另一层：它已经是 AI-agent-native VCS，拥有 `.libra/
 | Patch 应用 | `tools/apply_patch/`（Codex 风格 `*** Begin Patch`，fuzzy seek_sequence）能拿到精确修改区间。 |
 | MCP 平面 | `mcp/server.rs` + `mcp/resource.rs` 暴露 33 个 `#[tool]`（intent/task/run/plan/patchset/evidence/decision/context_frame/… 的 create+list）与 `libra://` 资源（object/objects/history/context）。`mcp/authz.rs` 的 `McpAuthorizer` **当前为 schema-only 占位，尚未接入请求路径（Phase 5）**。 |
 | Skills / sub-agent | `skills/*`（parser/loader/dispatcher，project/user/embedded 三层）；`agent/runtime/sub_agent.rs` 的 `TaskInvocation`/`TaskResult`/`SubAgentDispatcher`，`TaskFailure` 含 13 类（含 PermissionEscalationDenied / SafetyDenied / BudgetExceeded / ApprovalRejected / Timeout），统一权限/预算/安全门。 |
-| Usage / Graph | `command/usage.rs`（report/prune，`--by {Model, Agent, AgentProviderModel}`，`--session`/`--thread` 为过滤，Human/Json/Csv）；`command/graph.rs` 展示 AI thread projection graph（TUI）。 |
+| Usage / Graph | `command/usage.rs`（report/prune，`--by {Model, Agent, AgentProviderModel}`，`--session`/`--thread` 为过滤，Human/Json/Csv）；`command/graph.rs` 展示 AI thread projection graph（JSON/Web Code UI）。 |
 | 宿主集成 installer | `command/agent/`（含 `libra agent hooks`）已有把 capture/hook 装进宿主 agent 的命令面——与 research-git 的 `install <platform>` 同维度的入口已存在。 |
 | 规划中的持久记忆 | `docs/development/memory.md`（2026-06-23，draft）已设计 branch-aware、namespace/path-keyed、review-gated 的 Memory 子系统；但当前源码**还没有 `src/internal/ai/memory` 实现**。 |
 | 唯一现存“research”痕迹 | `prompt/embedded/contexts/research.md` 只是一个 prompt context 模板，**不是** research-memory 基础设施。 |
@@ -165,7 +165,7 @@ Libra 的优势在另一层：它已经是 AI-agent-native VCS，拥有 `.libra/
 | 代码切片 | Python-only `libcst` top-level symbol（窄但闭环） | **已有 tree-sitter Rust 抽取器**，但仅 Rust、未做成通用 slice service | 差距缩小为：把现有 extractor 扩到多语言 + 包成可复用 slice/anchor 服务 + 永远保留 raw diff fallback。 |
 | 召回 | lexical + edge-aware recall（字段加权 + neighbor boost） | Memory 文档规划了 recall；源码无持久 recall；MCP 无 research recall | 缺 capsule 召回工具与排序策略。 |
 | 再生 | `compose` brief + capsule-regenerator（只 author） | 内部 AgentRuntime/subagent 可执行任务，但无 capsule regeneration protocol | 缺把 recalled capsule 变成当前代码 diff 的 workflow。 |
-| 实验分析 | compare / ablation / provenance / metric-dir | `usage` 聚合、graph TUI；无按 feature variant 的 metric lineage | 缺 variant/run/metric/capsule 关系与研究表格。 |
+| 实验分析 | compare / ablation / provenance / metric-dir | `usage` 聚合、graph JSON/Web Code UI；无按 feature variant 的 metric lineage | 缺 variant/run/metric/capsule 关系与研究表格。 |
 | 共享 | MCP query-only（7 tools）+ local subagent | MCP 有 33 objects/resources tools；`McpAuthorizer` 占位未接线 | 缺 research memory 的只读 MCP 工具；且需先把 authorizer 接进请求路径。 |
 | 宿主可发现性 | `install <platform>` 写 managed guidance block 到 4 宿主 | `libra agent hooks` 已能装宿主 capture hook；但 research 能力本身无“默认可用”分发策略 | 思路可借鉴，但 Libra 应通过自身 MCP/skills/hooks 暴露，而非编辑各宿主 CLAUDE.md/AGENTS.md。 |
 | 存储 | `.rgit/graph.db` + objects | `.libra/libra.db` + objects + refs | 需要 Libra-native projection/ref，而不是导入 `.rgit`。 |

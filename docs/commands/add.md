@@ -313,7 +313,7 @@ to review new files before committing can use `libra add --dry-run` followed by
 
 Git's `--patch` mode provides an interactive hunk-by-hunk staging interface within the
 terminal. Libra deliberately omits interactive staging from the CLI `add` command because
-the `libra code` TUI provides a richer, visual staging experience with full file and hunk
+the `libra code` Web Code UI provides a richer, visual staging experience with full file and hunk
 selection. Interactive terminal prompts are also incompatible with AI agent workflows
 (MCP/stdio mode), which are a primary design target for Libra. Keeping `libra add`
 non-interactive ensures it works identically in human, scripted, and agent contexts.
@@ -356,8 +356,8 @@ overrides.
 | Verbose output | `git add -v` | N/A | `libra add -v` |
 | Ignore errors | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A (not implemented) |
-| Interactive patch | `git add -p` / `--patch` | N/A | N/A (use `libra code` TUI) |
-| Interactive select | `git add -i` / `--interactive` | N/A | N/A (use `libra code` TUI) |
+| Interactive patch | `git add -p` / `--patch` | N/A | N/A (use the `libra code` Web Code UI) |
+| Interactive select | `git add -i` / `--interactive` | N/A | N/A (use the `libra code` Web Code UI) |
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
 | Chmod only | `git add --chmod=+x` | N/A | N/A |
 | Sparse checkout paths | `git add --sparse` | N/A | N/A |

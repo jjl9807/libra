@@ -30,7 +30,7 @@ Do not assume the older multi-crate `engine/`, `delta/`, `transport/`, or
 - `src/internal/ai/`: AI runtime, providers, tools, MCP, session storage,
   permissions, sandboxing, context budget, goal mode, orchestration, skills, and
   web projections.
-- `src/internal/tui/`: terminal UI for `libra code`.
+- `src/internal/ai/web/`: Web Code UI runtime, projection, and transport adapters.
 - `src/internal/model/`: Sea-ORM models.
 - `src/internal/protocol/`: Git, HTTPS, SSH, LFS, and local protocol clients.
 - `src/internal/publish/`: publish snapshot/export pipeline.

@@ -12,7 +12,7 @@ libra usage prune [--retention-days <days>]
 ## 说明
 
 `libra usage` 读取由 Libra 的 AI provider runtime 记录的用量行，并按 provider/model、agent 或 agent/provider/model 聚合。报告可按时间范围、session id、thread id，以及是否包含失败的 provider 请求进行过滤。
-当 provider 报告精确 `cost_usd` 时，Libra 会存储并显示该值。否则，它会从内置模型能力定价表或 `.libra/config.toml` 中的仓库覆盖项估算 `cost_estimate_micro_dollars`。一个聚合可以同时包含两种费用；人类可读和 TUI 输出会显示 `$<actual> + ~$<estimate>`，不会让精确小计隐藏估算部分。
+当 provider 报告精确 `cost_usd` 时，Libra 会存储并显示该值。否则，它会从内置模型能力定价表或 `.libra/config.toml` 中的仓库覆盖项估算 `cost_estimate_micro_dollars`。一个聚合可以同时包含两种费用；人类可读和 Web Code UI 输出会显示 `$<actual> + ~$<estimate>`，不会让精确小计隐藏估算部分。
 
 ## 子命令
 

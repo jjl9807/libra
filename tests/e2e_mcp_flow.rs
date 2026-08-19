@@ -164,7 +164,7 @@ async fn test_e2e_mcp_flow() {
 
     // ── 2. Start Server ────────────────────────────────────────────────────────
     // The default Web Code UI launch is headless, so the test can run without a
-    // terminal (no TUI). The MCP server is started identically in TUI and Web modes.
+    // terminal. The MCP server is started by the current Web launch.
     let (mcp_port, web_port) = pick_test_ports();
 
     println!("Starting server on MCP port {mcp_port}, Web port {web_port}");

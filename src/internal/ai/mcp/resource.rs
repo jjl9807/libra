@@ -107,7 +107,7 @@ impl LibraMcpServer {
     /// a `RequestContext`. Falls back to `default_actor()` when no explicit params
     /// are provided.
     ///
-    /// This is used by the TUI bridge handler where no MCP session exists.
+    /// This is used by the legacy bridge path where no MCP session exists.
     pub fn resolve_actor_from_params(
         &self,
         actor_kind: Option<&str>,

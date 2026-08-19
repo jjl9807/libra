@@ -280,7 +280,7 @@ fn resume_with_chat_session_id_restores_prior_transcript() -> Result<()> {
 
 /// Wave 9 §5.16 — SIGTERM-mid-turn resume.
 ///
-/// The TUI saves the session immediately after accepting a user
+/// The Code UI saves the session immediately after accepting a user
 /// message, before the provider finishes the assistant response.
 /// This test holds the fake provider in a delayed response, sends
 /// SIGTERM without `/quit`, then re-spawns with `--resume` and

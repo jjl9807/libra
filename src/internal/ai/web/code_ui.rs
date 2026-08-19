@@ -597,6 +597,29 @@ impl CodeUiSession {
         .await;
     }
 
+    /// Set the status UNLESS an interaction is parked (status
+    /// `AwaitingInteraction` with a pending interaction row). The check and
+    /// the write happen under the same snapshot mutation, so a LATE
+    /// tool-start projection task can never regress a parked approval /
+    /// user-input gate back to `ExecutingTool` (W5-03: the tool-call END
+    /// path already carries this barrier via `start_tasks`; the approval
+    /// parking path raced the independently spawned start task and lost —
+    /// observed as `executing_tool` + a pending interaction that no later
+    /// event corrects).
+    pub async fn set_status_unless_awaiting_interaction(&self, status: CodeUiSessionStatus) {
+        self.mutate(CodeUiEventType::StatusChanged, |snapshot| {
+            let parked = snapshot.status == CodeUiSessionStatus::AwaitingInteraction
+                && snapshot
+                    .interactions
+                    .iter()
+                    .any(|i| i.status == CodeUiInteractionStatus::Pending);
+            if !parked {
+                snapshot.status = status;
+            }
+        })
+        .await;
+    }
+
     pub async fn set_capabilities(&self, capabilities: CodeUiCapabilities) {
         self.mutate(CodeUiEventType::SessionUpdated, |snapshot| {
             snapshot.capabilities = capabilities;
@@ -657,7 +680,7 @@ impl CodeUiSession {
                 // finalized (e.g. by `cancel_turn` flipping the status to
                 // `cancelled`). Re-flagging a settled entry as `streaming`
                 // would resurrect the perpetual typing indicator we just
-                // cleared. The TUI flow uses live statuses like `thinking`
+                // cleared. The Web Code UI flow uses live statuses like `thinking`
                 // alongside `streaming: true` while the agent is still
                 // producing output, so we only short-circuit on terminal
                 // statuses (`completed`, `error`, `cancelled`).
@@ -862,7 +885,7 @@ pub trait CodeUiCommandAdapter: Send + Sync {
     /// Submit with an optional caller-stable `command_id` (wire: `commandId`).
     ///
     /// Adapters that honor durable command identity override this. The default
-    /// fails closed when an id is supplied so TUI/Codex paths cannot silently
+    /// fails closed when an id is supplied so legacy UI/Codex paths cannot silently
     /// ignore retry de-duplication. Callers that do not need identity must
     /// pass `None` (or omit `commandId` on the wire).
     async fn submit_message_with_command_id(
@@ -892,7 +915,7 @@ pub trait CodeUiCommandAdapter: Send + Sync {
 
     /// `task.dispatch` — explicitly run a sub-agent from automation.
     /// Default implementation returns "not supported" for adapters
-    /// that do not expose the local TUI sub-agent runtime.
+    /// that do not expose the session sub-agent runtime.
     async fn task_dispatch(&self, _agent: String, _prompt: String) -> anyhow::Result<String> {
         Err(anyhow!(
             "This libra code session does not support task.dispatch"
@@ -903,7 +926,7 @@ pub trait CodeUiCommandAdapter: Send + Sync {
     /// (OC-Phase 6 P6.6). Returns the rendered status of the new
     /// Goal so callers can echo it without a follow-up
     /// `goal.status`. Default implementation returns "not
-    /// supported" so non-TUI adapters (headless, web-only Codex)
+    /// supported" so adapters without Goal support (headless, web-only Codex)
     /// don't have to opt in until they grow Goal mode support.
     async fn goal_start(&self, _objective: String) -> anyhow::Result<String> {
         Err(anyhow!(
@@ -945,7 +968,7 @@ pub trait CodeUiProviderAdapter: CodeUiReadModel + CodeUiCommandAdapter {}
 impl<T> CodeUiProviderAdapter for T where T: CodeUiReadModel + CodeUiCommandAdapter {}
 
 /// Wire-compatible name for initial controller ownership.  Ownership is
-/// stored by the runtime service, not by a Web or TUI adapter.
+/// stored by the runtime service, not by a Web or terminal-UI adapter.
 pub use crate::internal::ai::runtime::ControllerInitial as CodeUiInitialController;
 
 #[derive(Clone)]
@@ -1210,9 +1233,9 @@ impl CodeUiRuntimeHandle {
 
     /// Release an active controller lease.
     ///
-    /// Both `client_id` and `token` must match the active lease.  Local TUI
-    /// reclaim is a separately scoped runtime operation and is never exposed
-    /// through this remote detach API.
+    /// Both `client_id` and `token` must match the active lease. The removed
+    /// local-controller reclaim path is not exposed through this remote detach
+    /// API.
     ///
     /// The thin `detach_browser_controller` wrapper preserves compatibility for
     /// existing browser callers.
@@ -2480,6 +2503,42 @@ mod tests {
         assert_eq!(interaction.id, "interaction-1");
         assert_eq!(interaction.kind, CodeUiInteractionKind::RequestUserInput);
         assert_eq!(interaction.status, CodeUiInteractionStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn late_tool_start_cannot_regress_pending_interaction_status() {
+        let session = test_session();
+        session
+            .upsert_interaction(CodeUiInteractionRequest {
+                id: "approval-1".to_string(),
+                kind: CodeUiInteractionKind::Approval,
+                status: CodeUiInteractionStatus::Pending,
+                requested_at: Utc::now(),
+                ..CodeUiInteractionRequest::default()
+            })
+            .await;
+        session
+            .set_status(CodeUiSessionStatus::AwaitingInteraction)
+            .await;
+
+        session
+            .set_status_unless_awaiting_interaction(CodeUiSessionStatus::ExecutingTool)
+            .await;
+        assert_eq!(
+            session.snapshot().await.status,
+            CodeUiSessionStatus::AwaitingInteraction,
+            "a late tool-start projection must not hide a pending approval"
+        );
+
+        session.resolve_interaction("approval-1").await;
+        session
+            .set_status_unless_awaiting_interaction(CodeUiSessionStatus::ExecutingTool)
+            .await;
+        assert_eq!(
+            session.snapshot().await.status,
+            CodeUiSessionStatus::ExecutingTool,
+            "normal execution status updates must resume once no interaction is pending"
+        );
     }
 
     /// Wave 2 / PR 2 — error code source-of-truth contract.

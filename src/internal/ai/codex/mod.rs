@@ -4665,7 +4665,7 @@ pub async fn start_code_ui_runtime(
 /// # Legacy stdin loop
 ///
 /// `libra code --provider codex` does not call this path; it starts the default
-/// Libra TUI and uses [`start_code_ui_runtime`] as the managed execution
+/// Libra Web Code UI and uses [`start_code_ui_runtime`] as the managed execution
 /// backend. This function remains only for old internal callers that explicitly
 /// want Codex's stdin/stdout loop.
 ///
@@ -4677,7 +4677,7 @@ pub async fn start_code_ui_runtime(
 /// - WebSocket 连接失败时返回 `anyhow::Error`。
 /// - 内部互斥锁初始化失败时返回 `anyhow::Error`。
 #[deprecated(
-    note = "legacy standalone Codex stdin loop; libra code --provider codex uses the default Libra TUI"
+    note = "legacy standalone Codex stdin loop; libra code --provider codex uses the default Libra Web Code UI"
 )]
 pub async fn execute(
     args: AgentCodexArgs,

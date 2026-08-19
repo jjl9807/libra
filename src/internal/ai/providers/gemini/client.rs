@@ -109,7 +109,7 @@ impl Client {
     /// The `local_target` argument mirrors the
     /// [`super::super::deepseek::client::Client::from_resolved_env`]
     /// contract; pass `LocalIdentityTarget::None` from non-repo entry points
-    /// (the gemini CLI / TUI bootstrap), or `LocalIdentityTarget::CurrentRepo`
+    /// (the Gemini CLI / Code bootstrap), or `LocalIdentityTarget::CurrentRepo`
     /// when running inside a repo where `.libra/libra.db` may carry a
     /// repo-scoped override.
     ///

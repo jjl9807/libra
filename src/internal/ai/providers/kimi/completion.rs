@@ -944,7 +944,7 @@ mod tests {
     }
 
     /// Scenario: Kimi defaults to streaming in Libra so thinking tokens can be
-    /// rendered incrementally in the TUI.
+    /// rendered incrementally in the Code UI.
     #[test]
     fn test_kimi_stream_request_serialization() {
         let request = KimiRequest {

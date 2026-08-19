@@ -627,7 +627,7 @@ async fn live_m5_subagent_boundary_content_attribution() {
 }
 
 /// M6 / DR-07 live acceptance. Render a real indexed capture through the
-/// public JSON command, prove non-TTY calls fail before TUI initialization,
+/// public JSON command, prove non-TTY calls fail before interactive UI initialization,
 /// and compare every capture/import/export catalog row before and after.
 ///
 /// Erased-state rendering is covered by the deterministic L1 fixture because

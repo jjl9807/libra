@@ -2,7 +2,7 @@
 //!
 //! After network policy Allow/Deny, a confirmed plan must enter the same
 //! turn-level serialized worker queue as W1-01 direct turns. Adapters
-//! (TUI today, Web later) supply the execution body; the worker owns when
+//! (Web and Code control adapters) supply the execution body; the worker owns when
 //! that body starts so mutating work cannot bypass queue serialization or
 //! the shared [`crate::internal::ai::runtime::hardening`] boundary.
 //!
@@ -106,7 +106,7 @@ pub async fn submit_repaired_plan_execution(
     submit_confirmed_plan_execution(runtime, executor, session_id, turn_id, runner).await
 }
 
-/// Runner body supplied by an adapter (TUI/Web). The worker invokes it only
+/// Runner body supplied by a Web/control adapter. The worker invokes it only
 /// after the turn has been dequeued, so queue ownership stays with runtime.
 pub type PlanExecutionRunner = Box<
     dyn FnOnce(

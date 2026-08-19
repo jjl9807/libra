@@ -1,10 +1,9 @@
-//! Plain-text formatters for the OC-Phase 5 P5.4 TUI surfaces
+//! Plain-text formatters for the historical OC-Phase 5 P5.4 interactive surfaces
 //! (`/agents`, `/budget`, `/usage --by=agent`).
 //!
-//! The TUI dispatches a slash command and renders the returned string
-//! into an [`AssistantHistoryCell`](
-//! crate::internal::tui::history_cell::AssistantHistoryCell). Keeping
-//! the formatters in the agent layer (not the TUI layer) means the
+//! The retired TUI (removed in W5-03) used to dispatch a slash command
+//! and render the returned string into its AssistantHistoryCell. Keeping
+//! the formatters in the agent layer (not a UI layer) means the
 //! same renderers can be reused by `libra agent status` (CLI), an
 //! external observability pipe, or a future JSON projection without
 //! coupling to ratatui.
@@ -16,7 +15,7 @@
 //!
 //! Stable, monospace-friendly tables with a one-line title. Columns
 //! are aligned with `width` formatting so the output looks correct in
-//! both a 100-col TUI cell and a piped-to-grep terminal. Rows are
+//! both a 100-col UI cell and a piped-to-grep terminal. Rows are
 //! sorted by the leading column (agent name / provider) so
 //! consecutive runs produce identical output for the same data.
 
@@ -166,7 +165,7 @@ pub fn format_budget_status(
 /// [`UsageQuery::aggregate_filtered`](
 /// crate::internal::ai::usage::UsageQuery::aggregate_filtered); this
 /// function only renders. Empty rows produce a documented placeholder
-/// so the TUI never shows a confusing blank cell.
+/// so the UI never shows a confusing blank cell.
 pub fn format_usage_table(rows: &[UsageAggregate]) -> String {
     if rows.is_empty() {
         return "No usage recorded yet.".to_string();
@@ -217,7 +216,7 @@ fn truncate(s: &str, max: usize) -> String {
     // multi-byte codepoints (e.g. a CJK model name slug) cannot panic
     // by slicing mid-codepoint. The 48-char column limit in the
     // agents-table renderer counts characters, which is also closer to
-    // what the operator sees in a monospace TUI cell than byte count.
+    // what the operator sees in a monospace UI cell than byte count.
     let char_count = s.chars().count();
     if char_count <= max {
         return s.to_string();

@@ -1,13 +1,13 @@
 //! Wave 8 / PR 8 — Tool registry ACL coverage for the
 //! `libra code` `--context` modes (§5.9 first bullet).
 //!
-//! The TUI runtime registers ~12 first-party tools plus the
+//! The Code UI runtime registers ~12 first-party tools plus the
 //! semantic / MCP bridge sets (see `src/command/code.rs`). The
 //! `--context` flag maps to a `TaskIntent` (Dev → Feature,
 //! Review → Review, Research → Question), and
 //! `ToolRegistry::filter_by_intent` is the single point of truth
 //! for which tools the agent is allowed to invoke. These tests
-//! pin the TUI tool set against the filter so a future
+//! pin the Code UI tool set against the filter so a future
 //! intent-mapping or registry change can't silently expose
 //! mutating tools to a Review/Research session.
 //!
@@ -33,7 +33,7 @@ use libra::internal::ai::{
 };
 
 /// Build a `ToolRegistry` that mirrors what `src/command/code.rs`
-/// registers for the TUI agent at startup. The set kept in sync
+/// registers for the Code UI agent at startup. The set kept in sync
 /// with the live registration block in `src/command/code.rs:1438-
 /// 1462` (Wave 8 / PR 8 captured this with commit 70619aef);
 /// when adding a new tool there, mirror the registration here so
@@ -52,7 +52,7 @@ use libra::internal::ai::{
 /// surface — Codex pass-1 P2 follow-up calls this out so a
 /// future MCP-bridge tool that names itself `delete_*` doesn't
 /// silently slip into a Review session.
-fn build_tui_like_registry() -> Arc<ToolRegistry> {
+fn build_code_ui_like_registry() -> Arc<ToolRegistry> {
     let dir = tempfile::tempdir().expect("tempdir for ACL test");
     let mut builder = ToolRegistryBuilder::with_working_dir(dir.path().to_path_buf())
         .register("read_file", Arc::new(ReadFileHandler))
@@ -82,7 +82,7 @@ fn build_tui_like_registry() -> Arc<ToolRegistry> {
 /// dev-mode tool.
 #[test]
 fn dev_context_filter_keeps_all_registered_tools() {
-    let registry = build_tui_like_registry();
+    let registry = build_code_ui_like_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Feature);
 
     for required in [
@@ -112,7 +112,7 @@ fn dev_context_filter_keeps_all_registered_tools() {
 /// `shell` into the read-only allowlist would fail loud.
 #[test]
 fn review_context_filter_drops_mutating_tools() {
-    let registry = build_tui_like_registry();
+    let registry = build_code_ui_like_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Review);
 
     for forbidden in [
@@ -149,7 +149,7 @@ fn review_context_filter_drops_mutating_tools() {
 /// can diverge in the future without a shared-test regression.
 #[test]
 fn research_context_filter_drops_mutating_tools() {
-    let registry = build_tui_like_registry();
+    let registry = build_code_ui_like_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Question);
 
     for forbidden in ["apply_patch", "shell"] {
@@ -170,7 +170,7 @@ fn research_context_filter_drops_mutating_tools() {
 /// filtering would defeat that path.
 #[test]
 fn unknown_intent_keeps_all_registered_tools() {
-    let registry = build_tui_like_registry();
+    let registry = build_code_ui_like_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Unknown);
 
     for required in ["apply_patch", "shell", "read_file", "submit_intent_draft"] {
@@ -188,7 +188,7 @@ fn unknown_intent_keeps_all_registered_tools() {
 /// `tool_allowed_for_intent` in `tools/registry.rs`.
 #[test]
 fn command_intent_allows_shell_only_among_mutating_tools() {
-    let registry = build_tui_like_registry();
+    let registry = build_code_ui_like_registry();
     let allowed = registry.filter_by_intent(TaskIntent::Command);
 
     assert!(
@@ -225,7 +225,7 @@ fn command_intent_allows_shell_only_among_mutating_tools() {
 /// it.
 #[test]
 fn mcp_bridge_mutating_tools_are_dropped_in_review_intent() {
-    let registry = build_tui_like_registry();
+    let registry = build_code_ui_like_registry();
     let dev_allowed = registry.filter_by_intent(TaskIntent::Feature);
     let review_allowed = registry.filter_by_intent(TaskIntent::Review);
 

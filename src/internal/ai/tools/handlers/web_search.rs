@@ -153,7 +153,7 @@ fn ensure_network_allowed(invocation: &ToolInvocation) -> ToolResult<()> {
         Ok(())
     } else {
         Err(ToolError::ExecutionFailed(
-            "web_search requires network access, but the current tool runtime has network access disabled. Enable Network: Allow for the plan or start the TUI with network access allowed."
+            "web_search requires network access, but the current tool runtime has network access disabled. Enable Network: Allow for the plan or restart `libra code` with network access allowed."
                 .to_string(),
         ))
     }

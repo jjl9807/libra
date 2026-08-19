@@ -10,7 +10,7 @@
 `libra agent` 和 `libra code` 的边界不得混同：
 
 - `libra agent` 负责 observed external agent 的注册、hook、lifecycle、session/checkpoint、transcript、review/investigate evidence。
-- `libra code` 负责内部 AgentRuntime、TUI/Web/headless/MCP、approval/sandbox/tool gate、workspace mutation。
+- `libra code` 负责内部 AgentRuntime、Web/headless/MCP、approval/sandbox/tool gate、workspace mutation（TUI 已在 W5-03 删除）。
 - review/investigate 的 mutating fix/action 只能桥接回 `libra code` 内部 AgentRuntime；没有源码锚点和测试证据前，必须稳定返回 unsupported。
 
 内部 AgentRuntime / Web-only 迁移的当前事实源是 `docs/development/internal/code-agent-runtime.md`。本计划中的 Code 阶段只消费该文档的内部 runtime/fix-bridge 证据；不得重新链接或恢复旧 `docs/development/code-agent-runtime.md`、`docs/development/agent.md`、`docs/development/web-only.md`。
@@ -1190,7 +1190,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 ### Task C2：Mode and argument contract hardening
 
-**描述**：补齐 `libra code` 三模式（TUI、web-only、stdio）的参数互斥、provider-specific flags、错误消息和 JSON/quiet 行为。
+**描述（历史任务快照）**：本卡原覆盖 `libra code` 的 TUI、web-only、stdio 三模式；当前 TUI 已删除，后续核对只适用于 Web/default 与 stdio 的参数互斥、provider-specific flags、错误消息和 JSON/quiet 行为。
 
 **关联设计文档**：[`code.md`](code.md)。执行时遵循 `code.md` 的 mode、argument、provider-specific flag 和输出/错误契约。
 
@@ -1292,7 +1292,6 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - `src/command/code.rs`
 - `src/command/code_control*.rs`
 - `src/internal/ai/web/*`
-- `src/internal/tui/*`
 - `web/src/lib/code-ui/types.ts`
 - `docs/commands/code.md`
 - `docs/commands/zh-CN/code.md`

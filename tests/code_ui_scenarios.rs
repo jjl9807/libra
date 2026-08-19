@@ -267,7 +267,7 @@ fn browser_attach_rejected_when_control_disabled() -> Result<()> {
 }
 
 /// Once a browser lease expires, the next attempted browser write should
-/// reject the stale token and publish the reclaimed TUI controller state.
+/// reject the stale token and publish the reclaimed controller state.
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial]
@@ -275,7 +275,7 @@ fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Resul
     let mut session = CodeSession::spawn(
         CodeSessionOptions::new("browser-expired-token", fixture("basic_chat"))
             .with_browser_control_loopback()
-            // Headless Web startup is slower than TUI; keep the lease long
+            // Headless Web startup is slower than the retired terminal flow; keep the lease long
             // enough to observe the attached browser controller before expiry.
             .with_lease_duration_ms(500),
     )?;
@@ -290,10 +290,9 @@ fn browser_expired_controller_token_is_rejected_and_releases_snapshot() -> Resul
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error_code(&body), Some("CONTROLLER_CONFLICT"));
 
-    // Web-only headless starts Unclaimed (no local TUI owner); expiry returns
-    // control to `none`. PTY/TUI spawns reclaim to `tui`.
+    // Web-only headless starts Unclaimed; expiry returns control to `none`.
     session.wait_for_snapshot(Duration::from_secs(10), |snapshot| {
-        matches!(controller_kind(snapshot), Some("tui") | Some("none"))
+        controller_kind(snapshot) == Some("none")
     })?;
 
     session.shutdown()
@@ -520,8 +519,8 @@ fn code_ui_scenarios_require_test_provider_feature() {
 
 /// W0-02 baseline skeleton (cargo filter: `plan_workflow`).
 ///
-/// Pins IntentSpec review + post-plan choice labels owned by the TUI today so
-/// later Web harness work can retarget these contracts instead of deleting them.
+/// Pins IntentSpec review + post-plan choice labels owned by the runtime so
+/// later Web harness work retains these contracts instead of deleting them.
 #[test]
 fn plan_workflow_baseline_pins_intent_and_post_plan_choices() {
     use libra::internal::ai::workflow_baseline::{INTENT_REVIEW_CHOICES, POST_PLAN_CHOICES};
@@ -903,7 +902,7 @@ fn user_input_baseline_interaction_kind_is_request_user_input() {
 ///
 /// Pins the SessionEvent kind tag that `/goal` slash commands and Code Control
 /// `goal.*` methods both project. Full Goal state-machine coverage remains in
-/// `ai_goal_state_test`; this filter keeps the TUI-facing wire tag discoverable
+/// `ai_goal_state_test`; this filter keeps the Code UI-facing wire tag discoverable
 /// from the plan's `code_ui_scenarios` verification entry.
 #[test]
 fn goal_task_control_baseline_session_event_kind_tag_is_goal() {

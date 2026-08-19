@@ -518,7 +518,7 @@ async fn plain_message_phase0_parks_intent_review_until_confirm() {
     );
 }
 
-/// Modify must arm TUI-parity revise mode so the next plain message revises
+/// Modify must arm the legacy-interaction-parity revise mode so the next plain message revises
 /// the parked IntentSpec instead of silently abandoning the draft.
 #[tokio::test(flavor = "multi_thread")]
 async fn plain_message_phase0_modify_enters_revision_mode_for_next_turn() {
@@ -2158,7 +2158,7 @@ async fn append_assistant_delta_still_accepts_thinking_status() {
             kind: CodeUiTranscriptEntryKind::AssistantMessage,
             title: None,
             content: Some(String::new()),
-            // The TUI's live assistant row carries `status: "thinking"`
+            // The Code UI's live assistant row carries `status: "thinking"`
             // alongside `streaming: true` until the model finishes —
             // mirror that here.
             status: Some("thinking".to_string()),

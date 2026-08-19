@@ -1,5 +1,5 @@
 //! MCP bridge handler: exposes [`LibraMcpServer`] tools as [`ToolHandler`]
-//! implementations so the TUI agent can call MCP workflow tools without going
+//! implementations so the Code agent can call MCP workflow tools without going
 //! through the HTTP transport.
 //!
 //! CEX-14 keeps this legacy registration API intact while delegating schema,

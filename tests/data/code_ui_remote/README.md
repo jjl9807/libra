@@ -1,6 +1,6 @@
 # Code UI Remote Matrix Test Data
 
-This directory contains machine-readable data for the planned Libra Code TUI Remote L2 matrix tests.
+This directory contains machine-readable data for the Libra Code UI Remote L2 matrix tests.
 
 The JSON files are intentionally separate from `tests/harness/` so adding a new protocol scenario can be a data-only change. Paths in `fixture.path` are repo-root relative.
 

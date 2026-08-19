@@ -137,7 +137,7 @@ Every Libra command accepts the following global flags:
 
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
-| `libra code` | | Interactive TUI with AI agent, web server, and MCP integration | [code.md](code.md) |
+| `libra code` | | Interactive Web Code UI with AI agent, web server, and MCP integration | [code.md](code.md) |
 | `libra code-control` | | **Removed in the W5 breaking release** — use `libra code --control stdio` (breaking-change migration note) | [code-control.md](code-control.md) |
 | Codex data storage | | Link `libra code --provider codex` to Codex app-server and persist Codex session data | [codex-data-storage.md](codex-data-storage.md) |
 | `libra automation` | | List, run, and inspect AI automation rules | [automation.md](automation.md) |

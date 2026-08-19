@@ -68,7 +68,7 @@ EOF
 chmod +x "$fake_bin/curl"
 
 help_out="$work/help.out"
-HOME="$work/help-home" LIBRA_NO_TUI=1 NO_COLOR=1 \
+HOME="$work/help-home" NO_COLOR=1 \
     sh "$installer" --help >"$help_out" 2>&1 || fail "--help failed"
 grep -q -e '--no-alias' "$help_out" || fail "--help does not list --no-alias"
 grep -q 'LIBRA_NO_ALIAS=1' "$help_out" || fail "--help does not list LIBRA_NO_ALIAS=1"
@@ -88,7 +88,6 @@ run_installer() {
         LIBRA_INSTALL_DIR="$install_dir" \
         LIBRA_BASE_URL="https://fixture.invalid/releases" \
         LIBRA_NO_ALIAS="$no_alias" \
-        LIBRA_NO_TUI=1 \
         NO_COLOR=1 \
         FAKE_LIBRA_SOURCE="$fake_libra" \
         PATH="${RUN_PATH:-$fake_bin:$system_path}" \

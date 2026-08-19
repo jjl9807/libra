@@ -44,7 +44,7 @@ pub enum WebTurnMode {
     ExplicitDirect,
 }
 
-/// TUI-equivalent plain-message routing: non-empty text that does not start
+/// Web plain-message routing: non-empty text that does not start
 /// with `/` enters the plan workflow instead of a mutating direct chat turn.
 pub fn should_route_plain_message_to_plan(text: &str) -> bool {
     let trimmed = text.trim_start();

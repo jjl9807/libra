@@ -191,7 +191,6 @@ fn docs_consistency_covers_code_command_router_contracts() {
     let source_and_docs = [
         web_mod.as_str(),
         read_repo_file("src/internal/ai/web/code_ui.rs").as_str(),
-        read_repo_file("src/internal/tui/control.rs").as_str(),
         code_doc.as_str(),
         code_control_doc.as_str(),
     ]

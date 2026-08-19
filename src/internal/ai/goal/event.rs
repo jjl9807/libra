@@ -711,7 +711,7 @@ mod tests {
     }
 
     /// `event_summary()` includes the goal id and the variant name.
-    /// The TUI / audit log surface this verbatim, so a regression that
+    /// The Code UI / audit log surface this verbatim, so a regression that
     /// drops either piece would silently degrade the log signal.
     #[test]
     fn envelope_summary_carries_goal_id_and_variant_label() {

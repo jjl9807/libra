@@ -23,7 +23,7 @@
 //!
 //! Every threshold breach surfaces as
 //! [`StableErrorCode::AgentBudgetExceeded`]
-//! (`LBR-AGENT-001`) so CI scripts and the TUI can branch on the
+//! (`LBR-AGENT-001`) so CI scripts and the Code UI can branch on the
 //! identifier without parsing the human-readable message.
 //!
 //! ## Concurrency
@@ -146,7 +146,7 @@ impl std::fmt::Display for BudgetExceededError {
 
 /// Per-axis warning notification. Emitted exactly once per axis when
 /// the running total first crosses the `warn_*` threshold; the caller
-/// surfaces it through the TUI badge. Subsequent `accumulate` calls
+/// surfaces it through the Code UI badge. Subsequent `accumulate` calls
 /// do NOT re-emit because the operator has already been told.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BudgetWarning {
@@ -340,7 +340,7 @@ impl BudgetTracker {
         check_goal_caps(&self.session_total, &config.budget.goal)
     }
 
-    /// Compute warnings to surface to the TUI for axes that just
+    /// Compute warnings to surface to the Code UI for axes that just
     /// crossed their `warn_*` threshold but haven't yet hit the
     /// `max_*` cap. Idempotent across calls; each axis fires once per
     /// scope. The in-memory `warnings_emitted` table is updated as a
@@ -720,7 +720,7 @@ mod tests {
     }
 
     /// Pin the human-readable shape of a session-scope cost warning.
-    /// The TUI history cell speaks this string verbatim, so a
+    /// The Code UI history projection speaks this string verbatim, so a
     /// regression that drops the scope label or the axis would change
     /// what the user sees mid-session — surface it as a test failure.
     #[test]

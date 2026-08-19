@@ -76,8 +76,8 @@ impl ActiveModelBehavior for ActiveModel {}
 /// Rows with a `NULL` `agent_run_id` — main-session (non sub-agent)
 /// calls — are excluded, so the returned map keys are exactly the run
 /// ids that issued at least one source call, each mapped to its call
-/// count. Consumed by the `/agents` TUI pane to render the per-run
-/// `src` column (CEX-S2-16 验收 (1)).
+/// count. Exposed to UI projections for their per-run `src` column
+/// (CEX-S2-16 验收 (1)); the retired TUI pane was one former consumer.
 pub async fn count_by_agent_run<C>(
     conn: &C,
 ) -> Result<std::collections::HashMap<String, i64>, DbErr>

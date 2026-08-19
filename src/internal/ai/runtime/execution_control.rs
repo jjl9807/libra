@@ -1,7 +1,7 @@
-//! Runtime-owned control commands shared by the TUI and headless Code adapters.
+//! Runtime-owned control commands shared by Code control and headless adapters.
 //!
 //! This module deliberately owns the mutable Goal slot and its JSONL boundary.
-//! Web adapters therefore do not need an `App`/`TuiControlCommand` hop merely
+//! Web adapters therefore do not need a UI-specific relay merely
 //! to start, inspect, or cancel a Goal.  It also keeps explicit `task.dispatch`
 //! on the same `SubAgentDispatcher` gate as `/task` and exposes Code skill
 //! discovery only through the A0-07 projection/registry surface.
@@ -12,15 +12,13 @@ use anyhow::{Context, Result, anyhow};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::internal::{
-    ai::{
-        agent::runtime::{SubAgentToolLoopRuntime, TaskEntryKind, TaskInvocation},
-        goal::{GoalActor, GoalEvent},
-        observed_agents::{AgentKind, SkillEventProjection, SkillQuery, discover_skills},
-        sandbox::{FileHistoryRuntimeContext, ToolRuntimeContext},
-        session::{SessionEvent, SessionJsonlStore},
-    },
-    tui::goal_session::{GoalSession, GoalSessionError, render_goal_status},
+use crate::internal::ai::{
+    agent::runtime::{SubAgentToolLoopRuntime, TaskEntryKind, TaskInvocation},
+    goal::{GoalActor, GoalEvent},
+    goal_session::{GoalSession, GoalSessionError, render_goal_status},
+    observed_agents::{AgentKind, SkillEventProjection, SkillQuery, discover_skills},
+    sandbox::{FileHistoryRuntimeContext, ToolRuntimeContext},
+    session::{SessionEvent, SessionJsonlStore},
 };
 
 /// A Code-facing skill query. The search is executed against an A0-07
@@ -41,7 +39,7 @@ pub struct CodeSkillActivation {
     pub name: String,
 }
 
-/// User-visible Goal control errors shared by headless and TUI adapters.
+/// User-visible Goal control errors shared by headless and Code control adapters.
 #[derive(Debug, thiserror::Error)]
 pub enum GoalControlError {
     #[error("an active Goal already exists in this session")]
@@ -66,7 +64,7 @@ pub struct ExecutionControlService {
     session_id: String,
     goal_store: Option<SessionJsonlStore>,
     /// Session JSONL root used to attach file-history batches on
-    /// `task.dispatch` (matching the TUI `/task` path). Derived from
+    /// `task.dispatch` (matching the historical `/task` workflow). Derived from
     /// [`SessionJsonlStore::session_root`] when a goal store is supplied.
     session_root: Option<PathBuf>,
     goal_session: Arc<Mutex<Option<GoalSession>>>,
@@ -75,7 +73,7 @@ pub struct ExecutionControlService {
 
 impl ExecutionControlService {
     /// Construct the service and fold any existing Goal JSONL envelopes so a
-    /// resumed headless session has the same active Goal snapshot as the TUI.
+    /// resumed headless session has the same active Goal snapshot as any Code client.
     pub fn new(
         session_id: impl Into<String>,
         goal_store: Option<SessionJsonlStore>,
@@ -143,7 +141,7 @@ impl ExecutionControlService {
         }
         let rendered = render_goal_status(&outcome.state);
         // Cancelled Goals are terminal. Clear the active slot so a following
-        // goal.start has identical behavior across headless and TUI paths.
+        // goal.start has identical behavior across headless and Code control paths.
         *slot = None;
         Ok(rendered)
     }
@@ -294,7 +292,8 @@ impl ExecutionControlService {
 }
 
 /// Build the live runtime context for a headless/user-initiated
-/// `task.dispatch`, mirroring the TUI `/task` file-history attachment.
+/// `task.dispatch`, mirroring the historical interactive `/task` file-history
+/// attachment.
 ///
 /// When `session_root` is set, clones the stored parent context (or a
 /// default) and attaches a fresh file-history batch so child
@@ -443,7 +442,7 @@ mod tests {
         assert_eq!(
             file_history.batch_id,
             format!("user-task-{task_id}"),
-            "batch id must match the TUI user-task-{{uuid}} convention"
+            "batch id must match the historical user-task-{{uuid}} convention"
         );
     }
 

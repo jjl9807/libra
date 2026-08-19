@@ -120,7 +120,7 @@ pub enum ToolOutput {
         content: String,
         /// Whether the tool execution succeeded.
         success: Option<bool>,
-        /// Optional structured data for the TUI (not sent to the model).
+        /// Optional structured data for UI projection (not sent to the model).
         metadata: Option<serde_json::Value>,
     },
     /// MCP tool output.
@@ -158,7 +158,7 @@ impl ToolOutput {
         }
     }
 
-    /// Attach structured metadata (for TUI display, not sent to the model).
+    /// Attach structured metadata (for UI display, not sent to the model).
     pub fn with_metadata(mut self, meta: serde_json::Value) -> Self {
         if let ToolOutput::Function {
             ref mut metadata, ..
@@ -195,7 +195,7 @@ impl ToolOutput {
 
     /// Convert this output to a JSON value for sending to the model.
     ///
-    /// The `metadata` field is intentionally excluded — it is for TUI display
+    /// The `metadata` field is intentionally excluded — it is for UI display
     /// only and must not be sent to the model.
     pub fn into_response(self) -> serde_json::Value {
         match self {
@@ -673,14 +673,14 @@ pub struct UserInputResponse {
     pub answers: HashMap<String, UserInputAnswer>,
 }
 
-/// A request sent from the tool handler to the TUI, carrying the questions
+/// A request sent from the tool handler to the session UI, carrying the questions
 /// and a one-shot channel for the user's response.
 pub struct UserInputRequest {
     /// The call_id of the originating tool invocation (for correlation).
     pub call_id: String,
     /// Questions to display.
     pub questions: Vec<UserInputQuestion>,
-    /// Channel the TUI uses to send back the response.
+    /// Channel the session UI uses to send back the response.
     pub response_tx: oneshot::Sender<UserInputResponse>,
 }
 

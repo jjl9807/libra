@@ -94,7 +94,7 @@ Libra 是 Rust 实现的 Git 兼容 VCS，同时加入 AI agent 原生运行时�
 - **Git 协议生态兼容。** smart HTTP、SSH、git://、LFS 是远端互操作基础。
 - **SQLite 管理可变状态。** refs、HEAD、config、reflog、AI runtime contract 等放在 `.libra/libra.db`。
 - **分层对象存储。** 本地 + S3/R2 + LRU + D1/R2 备份 + Cloudflare Worker read-only publish。
-- **AI 原生运行时。** `src/internal/ai/` 下已有 agents、orchestrator、MCP、sandbox、automation、providers、skills、goal/supervisor、usage、session、prompt、TUI `libra code`。
+- **AI 原生运行时。** `src/internal/ai/` 下已有 agents、orchestrator、MCP、sandbox、automation、providers、skills、goal/supervisor、usage、session、prompt、Web Code UI `libra code`。
 
 ### 1.3 设计原则
 

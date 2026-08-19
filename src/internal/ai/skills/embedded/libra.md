@@ -70,7 +70,7 @@ Use these **exact** invocations (they are enforced by CI and the project’s AGE
   `cargo test --test <target> -- --test-threads=1`
 - Preferred test naming in issues/PRs: `target::test_fn`
 - CLI smoke: `cargo run -- <subcommand>`
-- TUI/automation tests (require the hidden test provider):
+- Code UI/automation tests (require the hidden test provider):
   `--features test-provider` + `LIBRA_ENABLE_TEST_PROVIDER=1` + `--test-threads=1`
 - Web embed verification (the one CI job that may **not** skip the web build):
   `pnpm --dir web install --frozen-lockfile && pnpm --dir web lint && pnpm --dir web build`, then `git status --porcelain -- web/out` (must be empty; compat-web-check inlines this drift check)

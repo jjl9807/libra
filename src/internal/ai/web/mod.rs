@@ -1048,7 +1048,7 @@ async fn code_usage_handler(
         Some(tid)
     });
     // Prefer a single durable scope for the SQL filter. When the SPA sends
-    // both snapshot IDs, AND-ing them rejects TUI projections that historically
+    // both snapshot IDs, AND-ing them rejects legacy projections that historically
     // mirrored the thread UUID into sessionId while usage rows store
     // SessionState.id. Thread id is the stable join key once present; session
     // id remains the response echo / session-only fallback.
@@ -1976,7 +1976,7 @@ async fn code_cancel_handler(
         audit_client_id = lease.client_id.clone();
         match lease.kind {
             CodeUiControllerKind::Browser => {
-                // Browser controllers reach parity with the TUI `Esc` cancel
+                // Browser controllers reach parity with the historical `Esc` cancel
                 // path: the lease token alone is enough — no automation
                 // control token required.
             }
@@ -2304,7 +2304,7 @@ fn ensure_automation_control_token(
     let Some(expected) = expected else {
         return Err(WebApiError::forbidden(
             "CONTROL_DISABLED",
-            "Local TUI automation write control is not enabled; start with --control write",
+            "Automation write control is not enabled; start with --control write",
         ));
     };
 
@@ -2410,7 +2410,7 @@ async fn append_control_audit(
     let redacted_summary = match serde_json::to_string(&record) {
         Ok(summary) => redactor.redact(&summary),
         Err(error) => {
-            tracing::warn!(error = %error, "failed to serialize local TUI control audit summary");
+            tracing::warn!(error = %error, "failed to serialize local control audit summary");
             return;
         }
     };
@@ -2436,7 +2436,7 @@ async fn append_control_audit(
         })
         .await
     {
-        tracing::warn!(error = %error, action, "failed to append local TUI control audit event");
+        tracing::warn!(error = %error, action, "failed to append local control audit event");
     }
 }
 

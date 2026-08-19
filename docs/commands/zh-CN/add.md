@@ -267,7 +267,7 @@ Git 的 `--intent-to-add`（`-N`）会为未跟踪文件记录空 blob，使它�
 
 ### 没有 `--patch` / `-p` 交互式暂存
 
-Git 的 `--patch` 模式在终端内提供逐 hunk 的交互式暂存接口。Libra 有意从 CLI `add` 命令中省略交互式暂存，因为 `libra code` TUI 提供更丰富的可视暂存体验，支持完整文件和 hunk 选择。交互式终端提示也不兼容 AI 代理工作流（MCP/stdio 模式），这是 Libra 的主要设计目标。保持 `libra add` 非交互，确保它在人类、脚本和代理上下文中行为一致。
+Git 的 `--patch` 模式在终端内提供逐 hunk 的交互式暂存接口。Libra 有意从 CLI `add` 命令中省略交互式暂存，因为 `libra code` Web Code UI 提供更丰富的可视暂存体验，支持完整文件和 hunk 选择。交互式终端提示也不兼容 AI 代理工作流（MCP/stdio 模式），这是 Libra 的主要设计目标。保持 `libra add` 非交互，确保它在人类、脚本和代理上下文中行为一致。
 
 ### `--refresh` 作为显式标志
 
@@ -299,8 +299,8 @@ Git 或双布局树还包括 `.git/info/exclude`——和 `core.excludesFile`）
 | Verbose 输出 | `git add -v` | N/A | `libra add -v` |
 | 忽略错误 | `git add --ignore-errors` | N/A | `libra add --ignore-errors` |
 | Intent to add | `git add -N` / `--intent-to-add` | N/A | N/A（未实现） |
-| 交互式 patch | `git add -p` / `--patch` | N/A | N/A（使用 `libra code` TUI） |
-| 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（使用 `libra code` TUI） |
+| 交互式 patch | `git add -p` / `--patch` | N/A | N/A（使用 `libra code` Web Code UI） |
+| 交互式选择 | `git add -i` / `--interactive` | N/A | N/A（使用 `libra code` Web Code UI） |
 | 暂存前编辑 diff | `git add -e` / `--edit` | N/A | N/A |
 | 仅 chmod | `git add --chmod=+x` | N/A | N/A |
 | Sparse checkout 路径 | `git add --sparse` | N/A | N/A |

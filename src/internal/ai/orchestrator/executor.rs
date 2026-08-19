@@ -1586,7 +1586,7 @@ fn task_workspace_failure(task: &TaskSpec, err: io::Error) -> TaskResult {
     }
 }
 
-/// Emit a single user-visible TUI note when this task was the first to fail
+/// Emit a single user-visible Code UI note when this task was the first to fail
 /// FUSE provisioning and triggered the session-wide disable. All subsequent
 /// task worktree provisioning will skip FUSE silently.
 fn emit_fuse_disabled_note_if_needed(

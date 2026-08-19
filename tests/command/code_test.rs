@@ -202,8 +202,8 @@ fn code_rejects_deepseek_flags_for_other_providers() {
 }
 
 /// `libra code --help` surfaces the EXAMPLES banner so users see the
-/// most common invocations across the modes (default Web / legacy TUI resume
-/// driver / --stdio) plus observe-only host posture, `--control write`,
+/// most common invocations across the modes (default Web / managed Codex /
+/// `--stdio`) plus observe-only host posture, `--control write`,
 /// `--resume`, `--plan-mode`, and `--env-file` without reading the design doc.
 /// Cross-cutting `--help` EXAMPLES rollout per
 /// `docs/development/commands/_general.md` item B. W5-07 removed the

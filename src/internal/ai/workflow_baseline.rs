@@ -1,10 +1,10 @@
-//! W0-02 frozen workflow contracts (runtime-owned; TUI re-exports).
+//! W0-02 frozen workflow contracts (runtime-owned).
 //!
 //! These labels and repair hints are the machine-readable baseline for
 //! IntentSpec review, Plan review, network policy, and the automatic plan
 //! repair threshold. Code UI Web harness tests (W3-02+) import this module
-//! instead of `internal::tui` so remote matrices do not treat the TUI as
-//! relevant source.
+//! directly; the retired TUI module's duplicate copy died with it
+//! (W5-03), leaving this as the single source.
 
 /// IntentSpec review dialog choices shown while awaiting intent review.
 pub const INTENT_REVIEW_CHOICES: &[&str] = &["Confirm Intent", "Modify Intent", "Cancel"];

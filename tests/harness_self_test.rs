@@ -18,7 +18,7 @@ use serial_test::serial;
 #[cfg(feature = "test-provider")]
 #[test]
 #[serial]
-fn code_session_starts_tui_and_cleans_control_files() -> Result<()> {
+fn code_session_starts_web_and_cleans_control_files() -> Result<()> {
     let mut session = CodeSession::spawn(CodeSessionOptions::new("self", fixture("basic_chat")))?;
     let snapshot = session.snapshot()?;
     assert_eq!(snapshot["provider"]["provider"], "fake");
@@ -46,7 +46,7 @@ fn code_session_sigterm_exits_and_releases_ports() -> Result<()> {
     use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 
     let mut session = CodeSession::spawn(CodeSessionOptions::new(
-        "sigterm-tui",
+        "sigterm-web",
         fixture("basic_chat"),
     ))?;
     let snapshot = session.snapshot()?;
@@ -73,7 +73,7 @@ fn code_session_sigterm_exits_and_releases_ports() -> Result<()> {
             .context("parse mcp_url")?
             .next()
             .ok_or_else(|| anyhow::anyhow!("mcp_url produced no socket addrs"))?,
-        None => bail!("expected MCP url in control info for TUI SIGTERM test"),
+        None => bail!("expected MCP url in control info for Web SIGTERM test"),
     };
 
     session.sigterm_expect_natural_exit(Duration::from_secs(60))?;
@@ -81,10 +81,10 @@ fn code_session_sigterm_exits_and_releases_ports() -> Result<()> {
     wait_for_absent(&info_path, Duration::from_secs(10))?;
 
     TcpListener::bind(web_addr).with_context(|| {
-        format!("web port {web_addr} still held after TUI SIGTERM graceful shutdown")
+        format!("web port {web_addr} still held after Web SIGTERM graceful shutdown")
     })?;
     TcpListener::bind(mcp_addr).with_context(|| {
-        format!("mcp port {mcp_addr} still held after TUI SIGTERM graceful shutdown")
+        format!("mcp port {mcp_addr} still held after Web SIGTERM graceful shutdown")
     })?;
     Ok(())
 }

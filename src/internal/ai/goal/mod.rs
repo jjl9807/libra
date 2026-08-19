@@ -9,7 +9,7 @@
 //! projection (what currently is).
 //!
 //! The schema, deterministic verifier, supervisor loop, Goal protocol tools,
-//! CLI/TUI surface, Code Control NDJSON methods, resume replay, and flag-off
+//! CLI/Web Code UI surface, Code Control NDJSON methods, resume replay, and flag-off
 //! regression coverage all read and write the types defined here. Goal events
 //! must round-trip through JSON cleanly and replay deterministically because
 //! the runtime persists supervisor envelopes in the same session JSONL stream

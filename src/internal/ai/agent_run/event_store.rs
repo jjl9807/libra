@@ -141,8 +141,8 @@ impl AgentRunEventStore {
     ///
     /// The snapshot is the latest materialized [`AgentRun`] record (the
     /// projection of the run's append-only event stream), stored beside
-    /// the run's `{run_id}.jsonl` transcript so the `/agents` TUI pane can
-    /// rebuild itself from disk alone after a cache wipe or restart
+    /// the run's `{run_id}.jsonl` transcript so UI projections can rebuild
+    /// from disk alone after a cache wipe or restart
     /// (CEX-S2-16 验收 (5)).
     fn snapshot_path(&self, thread_id: Uuid, run_id: AgentRunId) -> PathBuf {
         self.sessions_root

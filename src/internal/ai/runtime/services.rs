@@ -3,8 +3,8 @@
 //! CLI adapters choose a launch profile and supply their channels, but they do
 //! not assemble a second tool registry or hardening boundary.  Provider/model
 //! construction remains in the command layer because it owns clap arguments
-//! and the Vault/env lookup; both TUI and headless paths feed that same
-//! provider factory.
+//! and the Vault/env lookup; legacy full-workflow and current Web paths feed
+//! that same provider factory.
 
 use std::{
     path::{Path, PathBuf},
@@ -100,7 +100,9 @@ impl CodeAgentServicesBuilder {
         )
     }
 
-    /// TUI registry with an explicit audit/projection redactor (W3-12).
+    /// Legacy full-workflow registry with an explicit audit/projection redactor
+    /// (W3-12). It has no callers after W5-06; W5-10 removes this historical
+    /// name and variant as part of its zero-`Tui` sweep.
     pub fn tui_baseline_with_redactor(
         working_dir: impl Into<PathBuf>,
         trace_id: Uuid,

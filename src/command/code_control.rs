@@ -196,7 +196,7 @@ fn ensure_loopback_control_url(url: &Url) -> CliResult<()> {
 fn read_control_token(path: &PathBuf) -> CliResult<String> {
     if !path.exists() {
         return Err(CliError::fatal(format!(
-            "CONTROL_TOKEN_MISSING: local TUI control token file '{}' is missing",
+            "CONTROL_TOKEN_MISSING: local control token file '{}' is missing",
             path.display()
         ))
         .with_stable_code(crate::utils::error::StableErrorCode::AuthMissingCredentials));
@@ -211,7 +211,7 @@ fn read_control_token(path: &PathBuf) -> CliResult<String> {
     })?;
     let content = std::fs::read_to_string(path).map_err(|error| {
         CliError::fatal(format!(
-            "CONTROL_TOKEN_MISSING: failed to read local TUI control token file '{}': {error}",
+            "CONTROL_TOKEN_MISSING: failed to read local control token file '{}': {error}",
             path.display()
         ))
         .with_stable_code(crate::utils::error::StableErrorCode::AuthMissingCredentials)
@@ -219,7 +219,7 @@ fn read_control_token(path: &PathBuf) -> CliResult<String> {
     let token = content.trim().to_string();
     if token.is_empty() {
         return Err(CliError::fatal(format!(
-            "CONTROL_TOKEN_MISSING: local TUI control token file '{}' is empty",
+            "CONTROL_TOKEN_MISSING: local control token file '{}' is empty",
             path.display()
         ))
         .with_stable_code(crate::utils::error::StableErrorCode::AuthMissingCredentials));
@@ -370,7 +370,7 @@ async fn dispatch_json_rpc_request(
         }
         "goal.start" => {
             // OC-Phase 6 P6.6 — Goal mode entrypoint for automation.
-            // Same contract as the TUI `/goal start <objective>`
+            // Same contract as the historical interactive `/goal start <objective>`
             // (parses the objective, validates shape, mints
             // `GoalEvent::Created` in the active session).
             let params = match parse_params::<GoalStartParams>(request.params) {

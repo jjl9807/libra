@@ -1,7 +1,7 @@
 //! File-level undo history for AI-authored workspace edits.
 //!
 //! The store captures pre-edit file bytes for each tool-loop batch. Undo uses
-//! those preimages to restore the last batch as one unit, giving TUI users a
+//! those preimages to restore the last batch as one unit, giving Code UI users a
 //! recovery path for uncommitted `apply_patch` edits.
 
 use std::{

@@ -860,7 +860,7 @@ impl CodeSession {
     }
 
     /// Cancel the current turn via the browser write surface (browser leases
-    /// reach parity with the TUI Esc cancel and do not require
+    /// reach parity with the historical Esc cancel and do not require
     /// `X-Libra-Control-Token`).
     pub fn browser_cancel_turn(&self, controller_token: &str) -> Result<(StatusCode, Value)> {
         let response = self
@@ -1345,7 +1345,7 @@ impl CodeSession {
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
-        // Headless Web has no TUI `/quit` reader — SIGTERM the process so
+        // Headless Web has no terminal `/quit` reader — SIGTERM the process so
         // control-file cleanup still runs through the lifecycle owner.
         self.terminate_without_cleanup()
     }
@@ -1434,9 +1434,9 @@ impl CodeSession {
         Ok(())
     }
 
-    /// SIGTERM the TUI and require a natural exit (no SIGKILL fallback).
+    /// SIGTERM the Web Code UI process and require a natural exit (no SIGKILL fallback).
     ///
-    /// Used by W1-08 to prove the ProcessTerminateGate path in `App::run`
+    /// Used by W1-08 to prove the ProcessTerminateGate path
     /// reaches the shared lifecycle owner instead of hanging until force-kill.
     #[cfg(unix)]
     pub fn sigterm_expect_natural_exit(&mut self, timeout: Duration) -> Result<()> {
@@ -1446,7 +1446,7 @@ impl CodeSession {
         };
         let pid = child
             .process_id()
-            .ok_or_else(|| anyhow!("TUI child has no process id for SIGTERM"))?;
+            .ok_or_else(|| anyhow!("libra code child has no process id for SIGTERM"))?;
         let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
         if result != 0 {
             return Err(std::io::Error::last_os_error())
@@ -1467,7 +1467,7 @@ impl CodeSession {
                 self.join_reader();
                 if !status.success() {
                     bail!(
-                        "libra code TUI exited after SIGTERM with failure status {status:?}\n{}",
+                        "libra code exited after SIGTERM with failure status {status:?}\n{}",
                         self.debug_context()
                     );
                 }
@@ -1481,7 +1481,7 @@ impl CodeSession {
         self.child = None;
         self.join_reader();
         bail!(
-            "libra code TUI did not exit naturally within {timeout:?} after SIGTERM; forced SIGKILL\n{}",
+            "libra code did not exit naturally within {timeout:?} after SIGTERM; forced SIGKILL\n{}",
             self.debug_context()
         )
     }

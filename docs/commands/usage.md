@@ -18,7 +18,7 @@ requests should be included.
 When a provider reports an exact `cost_usd`, Libra stores and displays that
 value. Otherwise it estimates `cost_estimate_micro_dollars` from the built-in
 model capability pricing table or a repository override in `.libra/config.toml`.
-An aggregate can contain both kinds of cost. Human and TUI output display both
+An aggregate can contain both kinds of cost. Human-readable and Web Code UI output display both
 components as `$<actual> + ~$<estimate>`; the estimate is not hidden behind the
 exact subtotal.
 

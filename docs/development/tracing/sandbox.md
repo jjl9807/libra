@@ -4,7 +4,7 @@
 
 > 状态：设计提案（Design Proposal）/ 实现路线图
 > 兼容级别：`intentionally-different`（Libra AI 安全运行扩展，非 Git 命令）
-> 适用范围：`libra code`（TUI / headless / web-only 会话）执行 AI agent shell 命令时的进程隔离后端
+> 适用范围：`libra code`（Web Code UI / headless 会话）执行 AI agent shell 命令时的进程隔离后端
 > 关联文档：[`docs/development/commands/sandbox.md`](commands/sandbox.md)（`libra sandbox status` 命令设计）、[`COMPATIBILITY.md`](../../COMPATIBILITY.md)
 > 调研基线：apple/container `1.0.0`、apple/containerization（pre-1.0），均为 Apple Silicon + macOS 26 (Tahoe) 目标；ricccrd/dd `9b950a2`（2026-07-04，`https://github.com/ricccrd/dd`）
 
@@ -138,12 +138,17 @@ shell 工具 → run_shell_command_with_approval (mod.rs:909)
 
 ### 2.4 `libra code` 会话如何接入沙箱
 
-- 入口 `command/code.rs::execute`（`code.rs:696`）→ `execute_tui` / `execute_web_only` / `execute_stdio`。
+**W5-03 更正（2026-08-19）：** 以下早期 TUI anchor 是迁移前的设计快照；
+`execute_tui` / `run_tui_with_model*` 已删除。当前默认入口是 Web Code UI 的
+`execute_web_only` / `build_headless_web_code_ui_runtime`，而保留 `tui` 的 helper
+名称仅为 W5-10 的受控清理对象，不能作为可用 TUI 路径。
+
+- 入口 `command/code.rs::execute` → `execute_web_only` / `execute_stdio`（TUI 分支已在 W5-06/W5-03 删除）。
 - worktree 根由 `resolve_code_working_dir`（`code.rs:2465`，优先级 `--cwd` > `--repo` > `current_dir()`）解析、`validate_code_working_dir` 校验——**这就是未来 VM 的挂载根**。
-- TUI：`execute_tui`（`code.rs:1401`）建 `ToolRegistry`（注册 `shell`=`ShellHandler`、`apply_patch`=`ApplyPatchHandler`），再 `run_tui_with_model`。
-- 每会话 `runtime_context` 在 `run_tui_with_model_inner`（`code.rs:2753`）里由 `default_tui_runtime_context`（`code.rs:3406`）构造；该函数据 `CodeContext` 选策略：`Review|Research` → `ReadOnly`；`Dev|None` → `WorkspaceWrite { writable_roots: vec![working_dir], network_access, … }`（`code.rs:3414-3433`）。
-- **关键现状**：`sandbox_runtime: None` 在 `code.rs:3433` 硬编码——TUI 今天完全靠 env / `.libra/sandbox.toml` 调后端。**VM 后端最干净的接入点就是在这里把 `sandbox_runtime` 填上一个带 VM 句柄的 `SandboxRuntimeConfig`。**
-- 终端恢复用了 `scopeguard::guard`（`code.rs:2810`）；它是 VM 销毁的**位置参考**，但该闭包是同步的、无法 `await` 外部 `container stop && rm`——VM 销毁需用 §7 Phase 2 的**三层保障**（正常路径 await + Drop 内阻塞兜底 + 启动期 PID 感知回收），不能直接照搬。
+- Web Code UI：`execute_web_only` 建 `ToolRegistry`（注册 `shell`=`ShellHandler`、`apply_patch`=`ApplyPatchHandler`）并启动 `build_headless_web_code_ui_runtime`。
+- 每会话 `runtime_context` 由当前 Web runtime 构造；历史命名的 `default_tui_runtime_context` 仍按 `CodeContext` 选策略：`Review|Research` → `ReadOnly`；`Dev|None` → `WorkspaceWrite { writable_roots: vec![working_dir], network_access, … }`，其更名/摘除归 W5-10。
+- **当前接入点**：Web runtime 仍通过 env / `.libra/sandbox.toml` 选择后端。**VM 后端应在 Web runtime 的 `SandboxRuntimeConfig` 装配处持有 VM 句柄，而非恢复已删除的 TUI path。**
+- 历史 `scopeguard` terminal 恢复路径只能作为 VM 销毁的设计参考；VM 销毁需用 §7 Phase 2 的**三层保障**（正常路径 await + Drop 内阻塞兜底 + 启动期 PID 感知回收），不能直接照搬。
 - headless/web 走 `build_headless_web_code_ui_runtime`（`code.rs:1968`），需同等处理。
 
 每个工具调用过 `ToolRegistry::dispatch`（`registry.rs:271`），它把 `invocation.working_dir = self.working_dir` 重新盖章（`registry.rs:286`，“sandbox 单一事实源”）。只有 `ShellHandler`（`shell.rs:73`）会进 `run_shell_command_with_approval`；`ApplyPatchHandler`（`apply_patch.rs:44`）在**宿主进程内直接写文件**，不经 OS 沙箱（这是 §9 要专门处理的一致性点）。
@@ -273,7 +278,7 @@ shell 工具 → run_shell_command_with_approval (mod.rs:909)
 | D6 | **worktree 读写绑挂（host↔guest 共享）** | 解决 `apply_patch`（宿主写）与 shell（guest 写）的一致性（§9）；worktree 外写入留 ephemeral rootfs = 想要的隔离 |
 | D7 | **网络按策略映射到 VM 网络配置**：Denied→`--network none`；Full→默认 NAT 网络；Allowlist→`--internal` 网络 + 宿主代理经 host-gateway 暴露 + guest 默认拒绝（§8） | 让强制力落到**网络层**而非仅 env 提示 |
 | D8 | **失败闭合 / 降级遵循现有 enforcement 三档** | `Required` 平台不满足→`EnforcementFailed`；`PreferStrict`→审批回退；`BestEffort`→降级 seatbelt |
-| D9 | **`SandboxRuntimeConfig` 承载 VM 句柄/配置** | 已 `Clone`、已贯穿 spec→transform 链路；`default_tui_runtime_context` 的 `None`（`code.rs:3433`）改填实例 |
+| D9 | **`SandboxRuntimeConfig` 承载 VM 句柄/配置** | 已 `Clone`、已贯穿 spec→transform 链路；当前 Web runtime 的历史命名 `default_tui_runtime_context` 装配点改填实例 |
 | D10 | **新增配置面三入口**：`LIBRA_SANDBOX_BACKEND` env、`.libra/sandbox.toml [sandbox] backend`、`libra code --sandbox-backend` | 与现有 env/file/flag 三层一致；`auto` 自动探测 |
 
 ### 5.1 后端取值语义
@@ -296,7 +301,7 @@ shell 工具 → run_shell_command_with_approval (mod.rs:909)
 ```mermaid
 flowchart TD
     subgraph Host["宿主 (macOS 26, Apple Silicon) — libra code 进程"]
-      TUI["libra code TUI / headless\nLLM loop 在宿主"]
+      TUI["libra code Web Code UI / headless\nLLM loop 在宿主"]
       REG["ToolRegistry::dispatch\nregistry.rs:271"]
       SH["ShellHandler\nshell.rs:73"]
       AP["ApplyPatchHandler\napply_patch.rs:44\n(宿主内写文件)"]
@@ -324,7 +329,7 @@ flowchart TD
 
 ### 6.2 关键不变量
 
-1. **LLM 循环 + TUI 始终在宿主**；只有 shell 工具执行的命令进 VM。这避免把整个 agent 栈搬进 guest，集成面最小。
+1. **LLM 循环 + Web Code UI 始终在宿主**；只有 shell 工具执行的命令进 VM。这避免把整个 agent 栈搬进 guest，集成面最小。
 2. **worktree 是 host↔guest 共享读写挂载**（guest 路径如 `/workspace`）。`apply_patch` 在宿主写、shell 在 guest 写，双方看到同一份文件。
 3. **worktree 之外的一切（系统、`$HOME`、`/tmp`、`cargo install`、`npm i -g`、`apt install`）落在 ephemeral rootfs**，会话结束随 VM 焚毁——这正是隔离价值。
 4. **VM 生命周期 = `libra code` 会话生命周期**，由 RAII guard 保证销毁（含 panic/早退）。
@@ -448,11 +453,11 @@ pub struct SandboxRuntimeConfig {
    - `create_session_vm`：`container run -d --name libra-code-<host_pid>-<session> --label libra.owner_pid=<host_pid> -v <host_worktree>:/workspace:rw -w /workspace <network-flags> --cpus <n> --memory <m> <image> sleep infinity`，解析返回的 container id。**名字/标签编入宿主 PID**，供并发安全的孤儿回收（见下）。
    - `destroy_session_vm(&handle)`：**async**，`container stop <id>`（带超时）+ `container rm -f <id>`，幂等、吞错、记 evidence。
 2. **销毁的三层保障（不要照搬 proxy 的 `Drop`）**。⚠️ `RunningAllowlistProxy::Drop`（`proxy_runtime.rs:51-59`）只做**进程内同步** `task.abort()`，它**从不 spawn/await 外部进程**；`scopeguard::guard`（`code.rs:2810`）的闭包是**同步 `FnOnce`，不能 await**。而 `destroy_session_vm` 必须 spawn 并**等待** `container stop && rm` 这个**外部子进程**跑完；在多线程 tokio 运行时（`cli.rs:551`）里：worker 线程的 `Drop` 中 `Handle::current().block_on()` 会 **panic**，`Drop` 里 detach 的 `tokio::spawn` 常常**进程退出前跑不完 → 泄漏 VM**。正确做法分三层：
-   - **(a) 正常路径（首选）**：在 `run_tui_with_model_inner` 返回前，于现有 web/mcp/managed 关停序列（`code.rs:3225-3233`）旁边**显式 `destroy_session_vm(&handle).await`**。为覆盖 `code.rs:2820-3025` 间众多早退分支，把会话主体抽到一个内层 `async fn`，外层 `let result = inner().await; if let Some(h)=&vm { destroy_session_vm(h).await; } result`，保证任何 `?` 早退都先 await 清理。
+   - **(a) 正常路径（首选）**：在 Web Code UI runtime 返回前，于当前 web/mcp/managed 关停序列旁边**显式 `destroy_session_vm(&handle).await`**。为覆盖会话主体中的众多早退分支，把会话主体抽到一个内层 `async fn`，外层 `let result = inner().await; if let Some(h)=&vm { destroy_session_vm(h).await; } result`，保证任何 `?` 早退都先 await 清理。
    - **(b) panic / 硬退兜底**：再挂一个 `Drop` guard，但里面用**阻塞 `std::process::Command::new("container").args(["rm","-f",&id])`**（同步、不碰 tokio、`Drop` 任意线程安全），best-effort 吞错。它只是兜底，不替代 (a)。
    - **(c) 启动期 PID 感知孤儿回收（真正的 backstop）**：见下。
 3. `command/code.rs` 接入：
-   - 在 `run_tui_with_model_inner`（`code.rs:2753`）解析出 `backend`，若 `apple-container` 且探针过：`ensure_system_started` → `ensure_image` → `create_session_vm(working_dir)` → 得 `ContainerVmHandle`；填进 `default_tui_runtime_context` 产出的 `SandboxRuntimeConfig.sandbox_runtime`（把 `code.rs:3433` 的 `None` 换成 `Some(cfg_with_vm)`）；按 2(a)/(b) 装清理。
+   - 在 `execute_web_only` / `build_headless_web_code_ui_runtime` 解析出 `backend`，若 `apple-container` 且探针过：`ensure_system_started` → `ensure_image` → `create_session_vm(working_dir)` → 得 `ContainerVmHandle`；填进当前 Web runtime 产出的 `SandboxRuntimeConfig.sandbox_runtime`；按 2(a)/(b) 装清理。
    - headless：`build_headless_web_code_ui_runtime`（`code.rs:1968-2027`）同等处理。
 4. **孤儿回收（PID 感知，并发安全）**：进程启动时 `container ls --format json` 列出 `libra-code-*`，**只回收 `libra.owner_pid` 标签对应进程已死的容器**（用 `kill(pid, 0)` / `/proc` 或 `libc::kill` 探活）。⚠️ 同主机**并发多个 `libra code` 会话是正常场景**——仅靠 `libra-code-*` 名匹配会误杀别的存活会话；必须按 owner PID 存活性判定。做成**启动期静默清理**，不新增 CLI 子命令（避免一串 compat guard 改动，见 §11）。
 4. **CLI flag**：`libra code --sandbox-backend <auto|seatbelt|apple-container|none>`（`CodeArgs`），并入 `--help` EXAMPLES（满足三条 help 契约，见 §11）。
@@ -540,7 +545,7 @@ Allowlist/Full 下 guest 需 DNS。优先用默认网络自带 DNS；若用 `--i
 
 沿用 `proxy_enforcement_from_sandbox`（`runtime.rs:747-753`）：`Required`→代理不可用即 `Reject`（`NetworkEnforcementFailed`）；`PreferStrict`/`BestEffort`→`DegradeToDenied`。
 
-**⚠️ 关键修正：VM 网络模式不能从“会话策略”推出。** `default_tui_runtime_context`（`code.rs:3413-3421`）构造的会话 `SandboxPolicy` 只会是 `ReadOnly` 或 `WorkspaceWrite{Full|Denied}`——`network_access` 经 `from_legacy_bool` 只能得 `Full`/`Denied`，**永远不是 `Allowlist`**。`Allowlist` 仅由 `build_command_from_spec`（`mod.rs:1436-1449`）在**命令级**读 `.libra/sandbox.toml [sandbox.network]` 经 `with_network_restriction`（收紧式）注入。因此**会话创建 VM 时，代码并不知道后续命令会不会是 Allowlist**。
+**⚠️ 关键修正：VM 网络模式不能从“会话策略”推出。** 历史命名的 `default_tui_runtime_context` 构造的会话 `SandboxPolicy` 只会是 `ReadOnly` 或 `WorkspaceWrite{Full|Denied}`——`network_access` 经 `from_legacy_bool` 只能得 `Full`/`Denied`，**永远不是 `Allowlist`**。`Allowlist` 仅由 `build_command_from_spec` 在**命令级**读 `.libra/sandbox.toml [sandbox.network]` 经 `with_network_restriction`（收紧式）注入。因此**会话创建 VM 时，代码并不知道后续命令会不会是 Allowlist**。
 
 v1 的确定性做法：
 
@@ -675,7 +680,7 @@ libra code --sandbox-backend apple-container   # 出网模式由上面的 sandbo
 
 > **关于 `--network-access`**：现有 `CodeNetworkAccess`（`code.rs:388`）只有 `allow` / `deny` 两个取值——`--network-access allowlist` 会**clap 解析失败**。会话级 `WorkspaceWrite.network_access` 因此只可能是 `Full`（allow）或 `Denied`（deny），`Allowlist` **只能**经 `.libra/sandbox.toml [sandbox.network] mode="allowlist"` 在命令级注入（`with_network_restriction`，收紧式）。若希望提供 `--network-access allowlist` 直选，需作为 Phase 4 的**前置任务**给 `CodeNetworkAccess` 增一个 `Allowlist` 变体并贯穿到会话策略——本计划默认走 toml，不改该枚举。
 
-此时：LLM 循环/TUI 在宿主；agent 的每条 `run_shell`（`cargo build`、`cargo test`、装依赖、跑脚本）经 `container exec` 在一次性 VM 内执行；`apply_patch` 写到共享 `/workspace`，VM 内构建立即看到；会话结束 VM 焚毁。`libra sandbox status` 应显示 `sandbox_type: apple-container`、`apple_container_available: true`。
+此时：LLM 循环/Web Code UI 在宿主；agent 的每条 `run_shell`（`cargo build`、`cargo test`、装依赖、跑脚本）经 `container exec` 在一次性 VM 内执行；`apply_patch` 写到共享 `/workspace`，VM 内构建立即看到；会话结束 VM 焚毁。`libra sandbox status` 应显示 `sandbox_type: apple-container`、`apple_container_available: true`。
 
 ### 13.3 模式 B：整跑 Claude Code（或任意 agent）于 VM 内（全隔离）
 
@@ -894,7 +899,7 @@ untrusted automatic backend: apple-container only
 | `resolve_sandbox_backend`（仿 enforcement） | `mod.rs:1831-1850` |
 | `.libra/sandbox.toml` 加 `[sandbox] backend` | `SandboxConfigSection` `mod.rs:1567-1572` |
 | 注入代理 env 重写（host-gateway） | `inject_allowlist_proxy_env` `mod.rs:1533-1553` |
-| 会话起/止 VM 接入 + RAII | `run_tui_with_model_inner` `code.rs:2753`、`scopeguard` `code.rs:2810`、`default_tui_runtime_context` `code.rs:3406-3433`、headless `code.rs:1968-2027` |
+| 会话起/止 VM 接入 + RAII | Web Code UI lifecycle、历史命名 `default_tui_runtime_context` 与 headless runtime（具体锚点需在落地时按 W5-03 后树复核） |
 | worktree 根解析（挂载根） | `resolve_code_working_dir` `code.rs:2465` |
 | `--sandbox-backend` flag | `CodeArgs`（`command/code.rs`） |
 | status 新字段/计算 | `command/sandbox.rs:55-69,123-189,236-316,564-659` |

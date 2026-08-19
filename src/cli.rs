@@ -2034,7 +2034,7 @@ fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
     // Object read policy (lore.md §0.8): the `LIBRA_READ_POLICY` env var is the
     // baseline (auto/offline/local/remote); the `--offline` flag overrides it to
     // local-only. ALWAYS set it (resolving to Auto when nothing is requested) so
-    // a reused process — TUI, tests — never inherits a stale policy. An
+    // a reused process — UI adapters, tests — never inherits a stale policy. An
     // unrecognized env value is a hard error rather than a silent Auto fallback,
     // so a typo cannot quietly re-enable durable-tier reads.
     let read_policy = if args.offline {
@@ -2383,7 +2383,7 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
 /// Functional scope:
 /// 1. Normalises argv (rewrites `log -<n>` shortcuts, strips a leading `--`).
 /// 2. Resets the per-process warning tracker so `--exit-code-on-warning` cannot be
-///    polluted by a previous invocation in long-lived processes (TUI, tests).
+///    polluted by a previous invocation in long-lived processes (UI adapters, tests).
 /// 3. Short-circuits the `help error-codes` topic before clap parsing because it
 ///    would otherwise be treated as an unknown subcommand.
 /// 4. Parses with clap and translates every parse failure into a structured
@@ -3367,7 +3367,7 @@ mod tests {
     }
 
     /// Scenario: the warning tracker is a process-global static. In long-lived
-    /// processes (TUI, tests) a previously-recorded warning would otherwise leak
+    /// processes (UI adapters, tests) a previously-recorded warning would otherwise leak
     /// into the next invocation and silently flip the exit code under
     /// `--exit-code-on-warning`. This test seeds a stale warning, then verifies that
     /// [`prepare_cli_invocation_state`] clears it before dispatch.

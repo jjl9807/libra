@@ -13,7 +13,7 @@
 //!   section of `opencode.md` first.
 //! - The object-safe seams that let tests substitute permission
 //!   askers, provider-option resolvers, and child runners without
-//!   constructing a full TUI session.
+//!   constructing a full terminal-UI session.
 //!
 //! What this module is **not**:
 //! - It does not register the `task` tool — that is OC-Phase 3 P3.1's
@@ -232,7 +232,7 @@ pub struct PermissionAskRequest<'a> {
 
 /// Object-safe trait the [`PermissionService`] delegates to.
 ///
-/// Implementations land in P3.4+ (interactive TUI prompt, automation
+/// Implementations land in P3.4+ (interactive Code UI prompt, automation
 /// API, programmatic always-allow / always-reject for tests). Today the
 /// trait is the contract the dispatcher's step-8 call site speaks.
 pub trait PermissionAsker: Send + Sync {
@@ -249,7 +249,7 @@ pub trait PermissionAsker: Send + Sync {
 /// swapped without touching the dispatch signature. Constructors that
 /// take an explicit asker reflect the doc's contract: there is no safe
 /// default, every production caller must supply an asker that matches
-/// its surface (TUI prompt, automation queue, etc.).
+/// its surface (Code UI prompt, automation queue, etc.).
 pub struct PermissionService {
     asker: std::sync::Arc<dyn PermissionAsker>,
 }
@@ -273,10 +273,10 @@ impl PermissionService {
 }
 
 /// One permission ask flowing across the channel-backed asker
-/// (v0.17.787). The TUI widget receives this on its consumer side,
+/// (v0.17.787). The Code UI widget receives this on its consumer side,
 /// renders the prompt, and sends a `PermissionReply` back through
 /// `reply_tx`. Mirrors the existing exec-approval flow's shape so
-/// the future TUI integration can reuse the same widget skeleton.
+/// a future UI integration can reuse the same widget skeleton.
 ///
 /// `permission`, `patterns`, `thread_id`, `session_id`, `source`
 /// are owned String/clone copies of the original
@@ -294,7 +294,7 @@ pub struct ChannelPermissionAsk {
 }
 
 /// Channel-backed [`PermissionAsker`] that delegates every ask to
-/// a remote consumer (typically the TUI thread). The dispatcher
+/// a remote session-UI consumer. The dispatcher
 /// awaits the consumer's reply via the `oneshot` channel embedded
 /// in each [`ChannelPermissionAsk`].
 ///
@@ -308,7 +308,7 @@ pub struct ChannelPermissionAsk {
 /// ```ignore
 /// let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 /// let asker = ChannelPermissionAsker::new(tx);
-/// // hand `asker` to PermissionService; consume `rx` in the TUI
+/// // hand `asker` to PermissionService; consume `rx` in the session UI
 /// // thread, render the prompt, send the reply via
 /// // `ask.reply_tx.send(PermissionReply::Once)`.
 /// ```
@@ -341,7 +341,7 @@ impl PermissionAsker for ChannelPermissionAsker {
             if send_result.is_err() {
                 return PermissionReply::Reject {
                     feedback: Some(
-                        "permission ask channel closed (TUI consumer dropped); \
+                        "permission ask channel closed (session UI consumer dropped); \
                          dispatch rejected — restart `libra code` to reattach the asker"
                             .to_string(),
                     ),
@@ -349,8 +349,8 @@ impl PermissionAsker for ChannelPermissionAsker {
             }
             reply_rx.await.unwrap_or(PermissionReply::Reject {
                 feedback: Some(
-                    "permission ask reply channel closed before TUI consumer answered; \
-                     dispatch rejected — TUI may have exited during the ask"
+                    "permission ask reply channel closed before the session UI consumer answered; \
+                     dispatch rejected — the session UI may have exited during the ask"
                         .to_string(),
                 ),
             })
@@ -367,7 +367,7 @@ impl PermissionAsker for ChannelPermissionAsker {
 /// LlmInitiated dispatch that needs an escalation fails fast
 /// rather than silently allowing an unreviewed permission.
 ///
-/// A full TUI-bound asker that routes prompts through the same
+/// A full Code UI-bound asker that routes prompts through the same
 /// review widget the existing exec-approval flow uses is the
 /// follow-up; this fallback is intentionally narrow so that
 /// future work has a single replacement target.
@@ -381,7 +381,7 @@ impl PermissionAsker for DenyByDefaultPermissionAsker {
     ) -> futures::future::BoxFuture<'a, PermissionReply> {
         // Log the denied escalation so operators have a discoverable
         // trace of "my sub-agent needs permission X" without needing
-        // an interactive prompt. The TUI follow-up that wires a
+        // an interactive prompt. The Code UI follow-up that wires a
         // real PermissionAsker replaces this asker entirely; the
         // trace is the diagnostic bridge until then.
         tracing::warn!(
@@ -540,7 +540,7 @@ pub struct SafetyDecisionDenial {
 }
 
 /// Why a budget gate fired during dispatch. Each variant carries a short
-/// human-readable label so the TUI surface can render the limit; the
+/// human-readable label so UI projections can render the limit; the
 /// numeric thresholds live on the budget config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BudgetExceededReason {
@@ -1586,7 +1586,7 @@ impl SubAgentToolLoopRuntime {
     ///
     /// `live_runtime_context` lets the caller hand the child the
     /// parent tool loop's *current* per-turn runtime context (sandbox /
-    /// approval / file-history authority). This matters because the TUI
+    /// approval / file-history authority). This matters because the Code UI
     /// attaches per-turn state — most importantly the file-history
     /// batch that drives `apply_patch` undo preimage recording — to the
     /// turn's `ToolLoopConfig.runtime_context`, NOT to the

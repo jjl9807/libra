@@ -2,7 +2,7 @@
 //!
 //! While [`super::Agent`] is intentionally stateless (it is reused by the multi-agent
 //! plan executor where every step needs an isolated context), [`ChatAgent`] is the
-//! type that interactive callers — the TUI, MCP, and `libra code` — own across many
+//! type that interactive callers — the Web Code UI, MCP, and `libra code` — own across many
 //! turns. It records each user/assistant turn so subsequent calls implicitly include
 //! the running conversation.
 

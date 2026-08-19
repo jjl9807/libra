@@ -25,7 +25,7 @@
 //!    to `start_codex_code_ui_runtime` (Web default).
 //! 4. `agent_codex::execute` must keep the `#[deprecated]` marker.
 //! 5. Legacy stdin/stdout primitives must not appear inside
-//!    `src/command/code.rs` or `src/internal/tui/`.
+//!    `src/command/code.rs` (the TUI module was removed in W5-03).
 //!
 //! These checks complement the runtime scenarios in
 //! `tests/code_ui_scenarios.rs`; they fail fast and don't need the
@@ -35,7 +35,6 @@ use std::{fs, path::PathBuf};
 
 const COMMAND_CODE_PATH: &str = "src/command/code.rs";
 const CODEX_MOD_PATH: &str = "src/internal/ai/codex/mod.rs";
-const TUI_DIR: &str = "src/internal/tui";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -164,46 +163,6 @@ fn libra_code_path_has_no_stdin_or_codex_print_loops() {
         }
         line.contains("std::io::stdin") || line.contains("io::stdin(")
     });
-
-    // Inside src/internal/tui/ the TUI must not bypass crossterm by reading
-    // raw stdin either; that would race with the App event loop.
-    walk_rs_files(repo_root().join(TUI_DIR), |path, contents| {
-        assert_no_line_matches(
-            contents,
-            &format!("stdin reader in {}", path.display()),
-            |line| {
-                let trimmed = line.trim_start();
-                if trimmed.starts_with("//") || trimmed.starts_with("///") {
-                    return false;
-                }
-                line.contains("std::io::stdin") || line.contains("io::stdin(")
-            },
-        );
-    });
-}
-
-fn walk_rs_files(root: PathBuf, mut visit: impl FnMut(&PathBuf, &str)) {
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
-                let contents = match fs::read_to_string(&path) {
-                    Ok(text) => text,
-                    Err(_) => continue,
-                };
-                visit(&path, &contents);
-            }
-        }
-    }
 }
 
 /// W5-02 (Codex r18): the managed Codex adapter shares the turn-admission

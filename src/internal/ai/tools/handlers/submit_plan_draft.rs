@@ -13,7 +13,7 @@ use crate::internal::ai::tools::{
 
 /// Planning-only handler for Phase 1 provider drafts.
 ///
-/// The TUI captures this tool as internal planning data. It is intentionally
+/// The runtime captures this tool as internal planning data. It is intentionally
 /// not rendered as the generic checkbox `update_plan` transcript.
 ///
 /// AI user story: let a provider propose ordered step titles before Libra's
@@ -94,7 +94,7 @@ mod tests {
                 "explanation": "split into implementation and verification",
                 "steps": [
                     {"title": "Implement planning draft tool"},
-                    {"title": "Verify TUI review output"}
+                    {"title": "Verify plan review output"}
                 ]
             }"#,
         );

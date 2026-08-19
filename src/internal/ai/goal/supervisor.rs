@@ -3,7 +3,7 @@
 //! Per `docs/development/commands/_general.md` lines 632-668, the supervisor is
 //! the entity that turns a freshly returned `ToolLoopTurn` into the
 //! next loop decision. It does **not** drive `run_tool_loop` itself
-//! (that integration lives in P6.5 / P6.6 — `libra code` CLI/TUI and
+//! (that integration lives in P6.5 / P6.6 — `libra code` CLI/Code UI and
 //! Code Control NDJSON); it consumes the *outcome* of a turn and
 //! produces:
 //!
@@ -70,7 +70,7 @@ pub trait GoalEventClock {
     fn now(&self) -> DateTime<Utc>;
 }
 
-/// Stop policy the caller (P6.5 CLI/TUI / P6.6 Code Control) checks
+/// Stop policy the caller (P6.5 CLI/Code UI / P6.6 Code Control) checks
 /// to decide whether to keep the assistant turn open or release the
 /// session to idle.
 ///

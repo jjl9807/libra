@@ -718,7 +718,7 @@ fn default_execution_revision() -> u32 {
 /// Formal Plan/Task snapshots created during Phase 1 review and reused during execution.
 #[derive(Clone, Debug, Default)]
 pub struct PersistedPlanReviewBundle {
-    /// Execution plan id. Kept as `plan_id` for the existing TUI post-plan
+    /// Execution plan id. Kept as `plan_id` for the legacy post-plan
     /// call sites that still treat the execution plan as the primary plan.
     pub plan_id: String,
     pub test_plan_id: String,

@@ -104,7 +104,7 @@ impl AgentProfile {
     ///   Missing permission frontmatter keeps the default-deny
     ///   [`AgentPermissionSpec`].
     /// - `system_prompt`, `name`, and `description` round-trip verbatim
-    ///   so the TUI surface can render the same text it does today.
+    ///   so UI projections can render the same text.
     pub fn to_execution_spec(&self) -> AgentExecutionSpec {
         AgentExecutionSpec {
             name: self.name.clone(),
@@ -570,7 +570,7 @@ You are an implementation planner.
 
     /// Scenario: legacy aliases like `default` / `fast` / `powerful` do **not**
     /// lift into a binding. They stay in `model_preference` so the existing
-    /// CLI / TUI surfaces that look up a default model by alias keep working.
+    /// CLI / UI surfaces that look up a default model by alias keep working.
     #[test]
     fn test_parse_keeps_legacy_model_aliases_unstructured() {
         for alias in ["default", "fast", "powerful"] {
@@ -845,7 +845,7 @@ You are an implementation planner.
     /// Scenario: a profile with a legacy `model: default` produces a spec
     /// whose `model` field is `None` (no binding). OC-Phase 1 P1.3 still
     /// resolves the default model name from the legacy `model_preference`
-    /// string via the CLI / TUI surface; the spec just records "no
+    /// string via the CLI / UI surface; the spec just records "no
     /// structured binding asked for".
     #[test]
     fn test_to_execution_spec_legacy_alias_carries_no_binding() {
@@ -919,7 +919,7 @@ You are an implementation planner.
 
     /// Scenario: a profile that omits everything optional lifts to a spec
     /// with `mode = Primary`, `tools = Inherit`, and every optional field
-    /// at `None`. This is the shape the TUI sees today for any embedded
+    /// at `None`. This is the shape the Code UI sees for any embedded
     /// profile that does not opt into OC-Phase 2 frontmatter keys.
     #[test]
     fn test_to_execution_spec_minimal_profile_uses_documented_defaults() {

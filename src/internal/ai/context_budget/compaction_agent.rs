@@ -832,7 +832,7 @@ mod tests {
     }
 
     /// Scenario: `Display` impls render every variant with enough
-    /// context to be actionable in a TUI log line.
+    /// context to be actionable in a Code UI log line.
     #[test]
     fn compaction_agent_error_display_renders_each_variant() {
         let empty_input = CompactionAgentError::EmptyInput;
@@ -840,7 +840,7 @@ mod tests {
         assert!(formatted_input.contains("empty"));
         assert!(formatted_input.contains("transcript"));
         // Don't leak the internal parameter name into the
-        // user-facing TUI string.
+        // user-facing Code UI string.
         assert!(
             !formatted_input.contains("frame_contents"),
             "EmptyInput display must not expose internal parameter name, got {formatted_input:?}"

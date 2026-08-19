@@ -28,7 +28,7 @@ use super::worker::{
 use crate::internal::ai::agent::ToolLoopConfig;
 
 /// Scan durable Code workflow events for a Plan review gate that was requested
-/// but never resolved. Used on TUI resume so Execute/Modify/Cancel (and the
+/// but never resolved. Used on session resume so Execute/Modify/Cancel (and the
 /// follow-on network-policy gate) cannot disappear across a crash (W2-03).
 ///
 /// Returns the oldest unresolved
@@ -404,8 +404,8 @@ impl PlanReviewDecision {
         }
     }
 
-    /// Map the TUI's `PendingPostPlan::selected` index
-    /// (0=Execute, 1=Modify, 2=Cancel).
+    /// Map the retired TUI's `PendingPostPlan::selected` index
+    /// (0=Execute, 1=Modify, 2=Cancel) for legacy persisted state.
     pub fn from_choice_index(index: usize) -> Option<Self> {
         match index {
             0 => Some(Self::Execute),
@@ -447,8 +447,8 @@ impl NetworkPolicyDecision {
         }
     }
 
-    /// Map the TUI's `PendingNetworkPolicyChoice::selected` index
-    /// (0=Deny, 1=Allow, 2=Back).
+    /// Map the retired TUI's `PendingNetworkPolicyChoice::selected` index
+    /// (0=Deny, 1=Allow, 2=Back) for legacy persisted state.
     pub fn from_choice_index(index: usize) -> Option<Self> {
         match index {
             0 => Some(Self::Deny),
@@ -772,7 +772,7 @@ pub fn apply_scheduler_mutation(
         SchedulerMutation::StartStage { stage, .. } => {
             // The stage is scheduler metadata, not a structural field.
             // Merge it into `metadata` under a stable "stage" key so
-            // downstream readers (TUI, MCP observability) can pick it up
+            // downstream readers (Web Code UI, MCP observability) can pick it up
             // without needing to introduce a new SchedulerState column.
             let stage_label = match stage {
                 crate::internal::ai::runtime::contracts::DagStage::Execution => "execution",

@@ -51,8 +51,8 @@ pub struct ExecutionFailureEvidence {
     pub max_attempts: u8,
 }
 
-/// Runtime-owned repair-loop status. This is serializable so both TUI and
-/// remote Code UI adapters observe the same decision and evidence.
+/// Runtime-owned repair-loop status. This is serializable so Web Code UI and
+/// remote adapters observe the same decision and evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum PlanExecutionRepairState {
@@ -366,7 +366,7 @@ pub async fn park_plan_execution_repair_gate(
 }
 
 /// Persist and then park an awaiting repair gate using the ordering required by
-/// the TUI's `ExecuteWorkflowComplete` adapter. A crash after persistence can
+/// the historical `ExecuteWorkflowComplete` adapter. A crash after persistence can
 /// be restored; a crash before persistence leaves the prior execution handoff
 /// intact for reconciliation.
 pub async fn persist_and_park_plan_execution_repair_gate(
@@ -396,8 +396,9 @@ pub async fn persist_and_park_plan_execution_repair_gate(
 
 /// Worker-owned acknowledgement for an `AwaitingPlanRepair` interaction.
 ///
-/// The TUI owns the subsequent re-planning UI transition, but the runtime owns
-/// validation and session fencing until the developer chooses continue/cancel.
+/// The Web Code UI owns the subsequent re-planning UI transition, while the
+/// runtime owns validation and session fencing until the developer chooses
+/// continue/cancel.
 #[derive(Clone, Debug, Default)]
 pub struct PlanExecutionRepairAckDelivery;
 

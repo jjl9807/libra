@@ -8,7 +8,7 @@
 //! - [`AgentBuilder`] (in `builder`) — fluent constructor that validates configuration
 //!   before producing an `Agent`.
 //! - [`ChatAgent`] (in `chat`) — stateful counterpart that owns a conversation history
-//!   and is the type the TUI/MCP layers actually drive.
+//!   and is the type current UI/MCP layers drive.
 //!
 //! The lower-level [`tool_loop`] module exposes `run_tool_loop` /
 //! `run_tool_loop_with_history_and_observer` for callers that want full control over

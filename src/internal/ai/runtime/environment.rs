@@ -164,7 +164,7 @@ impl TaskExecutionEnvironment {
     }
 
     /// Outcome of the FUSE mount attempt during provisioning. Callers use
-    /// `JustDisabled` to emit a one-time TUI hint after the first failure.
+    /// `JustDisabled` to emit a one-time Code UI hint after the first failure.
     pub fn fuse_outcome(&self) -> &FuseAttemptOutcome {
         &self.fuse_outcome
     }

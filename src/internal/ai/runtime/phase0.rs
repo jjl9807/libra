@@ -40,7 +40,7 @@ use crate::internal::ai::{
 };
 
 /// Scan durable Code workflow events for an IntentSpec review gate that was
-/// requested but never resolved. Used on TUI resume so confirm/modify/cancel
+/// requested but never resolved. Used on session resume so confirm/modify/cancel
 /// cannot disappear across a crash (W2-02 recovery).
 ///
 /// Returns the oldest unresolved
@@ -95,8 +95,8 @@ pub fn open_intent_review_from_workflow<'a>(
 }
 
 /// Phase 0 planning tool-loop policy shared by every caller that drives the
-/// IntentSpec drafting conversation (TUI today; a future
-/// [`RuntimeTurnExecutor`](super::worker::RuntimeTurnExecutor) adapter).
+/// IntentSpec drafting conversation (Web Code UI and
+/// [`RuntimeTurnExecutor`](super::worker::RuntimeTurnExecutor) adapters).
 /// `submit_intent_draft` is the only terminal tool, matching the AC1
 /// requirement that Phase 0 cannot silently fall through into a mutating
 /// tool before the formal write in [`write_intent`].
@@ -115,7 +115,7 @@ pub fn phase0_plan_tool_loop_config(mut config: ToolLoopConfig) -> ToolLoopConfi
     config
 }
 
-/// Shared Phase 0 planning prompt used by TUI `/plan` and Web PlanPhase0
+/// Shared Phase 0 planning prompt used by Web Code UI PlanPhase0
 /// plain-message admission. Without this wrapper, providers can answer in
 /// prose and never call `submit_intent_draft`.
 pub fn phase0_planning_prompt(request: &str) -> String {
@@ -131,7 +131,7 @@ User request:\n{request}"
     )
 }
 
-/// Help text shown after IntentSpec review chooses Modify/Revise (TUI + Web).
+/// Help text shown after IntentSpec review chooses Modify/Revise.
 pub fn phase0_revision_help_message() -> String {
     "IntentSpec revise mode is active. Describe changes in plain text, use `/intent modify <changes>` to keep revising, or `/intent cancel` to exit.".to_string()
 }
@@ -156,8 +156,8 @@ Requested changes:\n{request}"
 /// ([`super::worker::InteractionState::AwaitingIntentReview`]).
 ///
 /// Stable wire ids ([`Self::wire_id`]) are the contract browser/automation
-/// clients depend on; TUI keyboard-menu copy lives separately in
-/// `crate::internal::tui::workflow_baseline` and may diverge in wording.
+/// clients depend on (the retired TUI module's keyboard-menu copy is
+/// gone since W5-03).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntentReviewDecision {
     /// Accept the IntentSpec as drafted; the caller should hand off toward
@@ -194,9 +194,9 @@ impl IntentReviewDecision {
         }
     }
 
-    /// Map the TUI's `PendingIntentReview::selected` index
-    /// (0=Confirm, 1=Modify, 2=Cancel) onto the same decision so the
-    /// keyboard-menu path and the wire path stay in lockstep.
+    /// Map the retired TUI's `PendingIntentReview::selected` index
+    /// (0=Confirm, 1=Modify, 2=Cancel) onto the same decision so legacy
+    /// persisted state and the wire path stay in lockstep.
     pub fn from_choice_index(index: usize) -> Option<Self> {
         match index {
             0 => Some(Self::Confirm),
@@ -218,10 +218,10 @@ impl IntentReviewDecision {
 /// avoids reporting [`RuntimeWorkerError::Cancelled`] for `Cancel`: that
 /// error path assumes a still-running executor continuation will reconcile
 /// the ambiguous outcome, which does not exist for an externally-tracked
-/// turn (the TUI's Phase 0 background task already finished before the
+/// turn (the retired TUI's Phase 0 background task had already finished before the
 /// review was ever registered) and would otherwise strand the turn in
 /// `Cancelling` forever. The confirm/revise/cancel distinction itself is a
-/// caller-level (TUI/Web) concern carried in the `summary` text and driven
+/// caller-level UI concern carried in the `summary` text and driven
 /// off the same [`IntentReviewDecision`] the caller parsed from the wire
 /// response — the runtime's [`super::worker::InteractionState`] taxonomy has
 /// no "the user declined this business decision" variant, only
@@ -904,8 +904,9 @@ mod tests {
 
     #[test]
     fn intent_review_decision_choice_index_matches_tui_pending_review_layout() {
-        // 0=Confirm, 1=Modify, 2=Cancel — see `PendingIntentReview::selected`
-        // in `crate::internal::tui::app`.
+        // 0=Confirm, 1=Modify, 2=Cancel — the layout the retired TUI's
+        // PendingIntentReview used (module removed in W5-03); the wire
+        // choice indexes stay frozen.
         assert_eq!(
             IntentReviewDecision::from_choice_index(0),
             Some(IntentReviewDecision::Confirm)
@@ -931,7 +932,7 @@ mod tests {
     }
 
     /// End-to-end through a real [`AgentRuntimeWorker`]: an
-    /// externally-tracked Phase 0 turn (mirroring the TUI's
+    /// externally-tracked Phase 0 turn (mirroring the retired TUI's former
     /// `track_external_turn` adapter) registers the IntentSpec review via
     /// [`IntentReviewAckDelivery`], then `confirm` releases the turn as
     /// `Completed` so a follow-up admission (Phase 1, or a new Phase 0 turn

@@ -489,7 +489,7 @@ fn libra_code_serves_both_web_and_mcp_transports_on_same_process() -> Result<()>
 ///   2. subscribe to web SSE before writing;
 ///   3. submit a message through the web automation endpoint;
 ///   4. assert the SSE stream observes that transcript update;
-///   5. poll MCP `tools/call list_tasks` until it sees the TUI
+///   5. poll MCP `tools/call list_tasks` until it sees the runtime
 ///      turn-tracking Task created from the same user text.
 ///
 /// This pins the currently implemented consistency direction.
@@ -529,7 +529,7 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
         Duration::from_secs(10),
     )?;
     assert!(
-        tasks_text.contains(&format!("TUI: {user_text}")) || tasks_text.contains(marker),
+        tasks_text.contains(marker),
         "MCP list_tasks must expose the web-submitted turn text; got:\n{tasks_text}",
     );
     Ok(())
@@ -538,7 +538,7 @@ fn web_message_turn_is_observable_through_sse_and_mcp_task_list() -> Result<()> 
 /// Wave 9 §5.14 item 3 consistency — MCP write → web SSE observe.
 ///
 /// External MCP clients write workflow objects through the same
-/// `LibraMcpServer` instance that the TUI bridge uses. This test
+/// `LibraMcpServer` instance that the legacy bridge used. This test
 /// pins the reverse direction from the web→MCP case above:
 ///
 ///   1. initialize an MCP client against the runtime's `mcpUrl`;

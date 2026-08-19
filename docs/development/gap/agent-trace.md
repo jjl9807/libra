@@ -189,7 +189,7 @@ Claude Code `PostToolUse` hook（`reference/trace-hook.ts:94`）对 `Write` 和 
 
 - `content_hash` 别引 murmur3——**`git-internal::IntegrityHash::compute`** 可用 SHA-256 计算字节哈希，序列化为 `integrity:sha256:<hex>`。⚠️ 此 API 在**外部 pinned crate `git-internal 0.8.1`** 内（非 Libra 仓内可 grep 到），是本文档全部锚点中**唯一无法在本仓树内核验**的一条——落地 P0-0/P1-4 前必须先对照已 vendored 的 crate 源确认其确切签名与序列化语义，不要凭本文档直接调用。
 - `model_id` 规范化几乎免费——**`ModelBinding::to_canonical_string()`**（`src/internal/ai/agent/profile/spec.rs:129`）已能产出 `provider/model[@variant]`，且 `AgentRunEvent::Spawned`、`agent_usage_stats`、`UsageContext` 都已把 provider 与 model **拆开存**，只差在序列化边界拼接。
-- **唯一被低估的资产**：`apply_patch` 已经算好行区间。`src/internal/ai/tools/apply_patch/core.rs` 的 `compute_replacements` 产出精确的 `(start_index, old_len, new_lines)`，handler 还建了 `FileDiff` + unified diff，然后**仅用于 TUI 显示就丢弃**。这是全系统唯一对“AI 写了哪些行”有完美、无竞态认知的地方。
+- **唯一被低估的资产**：`apply_patch` 已经算好行区间。`src/internal/ai/tools/apply_patch/core.rs` 的 `compute_replacements` 产出精确的 `(start_index, old_len, new_lines)`，handler 还建了 `FileDiff` + unified diff，然后**仅用于 UI projection 显示就丢弃**。这是全系统唯一对“AI 写了哪些行”有完美、无竞态认知的地方。
 
 ### 4.3 改进路线图
 
@@ -200,8 +200,8 @@ Claude Code `PostToolUse` hook（`reference/trace-hook.ts:94`）对 `Write` 和 
 | 编号 | 任务 | 触及文件 | 工作量/风险 | 说明 |
 |---|---|---|---|---|
 | **P0-0** | 固定 Libra 的 Agent Trace 交换合同 | `src/internal/publish/contract.rs`、`src/internal/publish/ai_export.rs`、`tests/data/publish/` | S / 低 | 先定义最小 `TraceRecord` fixture，固定 `version="0.1.0"`（严格导出）、MIME `application/vnd.agent-trace.record+json`、`tools.libra.*` metadata key、`trusted`/`source` 规则、hash-kind 标记和外部声明降级策略（接受 "1.0"/"0.1.0"、合成路径、全文件 fallback 均打低 trusted）。同时放一个来自 Cursor 参考实现的 golden trace（含 "1.0" + fallback range）作为导入 roundtrip 测试输入。 |
-| **P0-1** | 在 `apply_patch` 源头采集行区间 | `src/internal/ai/tools/apply_patch/core.rs`、`handlers/apply_patch.rs` | M / 低 | 把 `compute_replacements`（返回 `(start_index, old_len, new_lines)` 1-based 区间）已算出的精确信息从 handler 透出到一个 capture sink（可挂 `RuntimeContext` 或 `UsageContext` 里的 trace collector）。保留现有 `metadata.diffs` 给 TUI，区间数据走另一条持久化路径。`compute_replacements` / `apply_replacements` 目前私有，需沿调用链暴露或在 `ApplyResult` 上增加 `line_ranges: Vec<EditRange>` 结构。 |
-| **P0-2** | 把 model/run/session 身份穿进 `FileHistoryRuntimeContext` | `src/internal/ai/sandbox/mod.rs`、`src/internal/tui/app.rs` | M / 低 | 模型在 dispatch 处已知（`ToolLoopConfig.usage_context` 已带全套身份）；`FileHistoryRuntimeContext` 已能到达 apply_patch handler，只差这几个字段。纯内存，无迁移。 |
+| **P0-1** | 在 `apply_patch` 源头采集行区间 | `src/internal/ai/tools/apply_patch/core.rs`、`handlers/apply_patch.rs` | M / 低 | 把 `compute_replacements`（返回 `(start_index, old_len, new_lines)` 1-based 区间）已算出的精确信息从 handler 透出到一个 capture sink（可挂 `RuntimeContext` 或 `UsageContext` 里的 trace collector）。保留现有 `metadata.diffs` 给 UI projection，区间数据走另一条持久化路径。`compute_replacements` / `apply_replacements` 目前私有，需沿调用链暴露或在 `ApplyResult` 上增加 `line_ranges: Vec<EditRange>` 结构。 |
+| **P0-2** | 把 model/run/session 身份穿进 `FileHistoryRuntimeContext` | `src/internal/ai/sandbox/mod.rs`、`src/internal/ai/web/headless.rs` | M / 低 | 模型在 dispatch 处已知（`ToolLoopConfig.usage_context` 已带全套身份）；`FileHistoryRuntimeContext` 已能到达 apply_patch handler，只差这几个字段。纯内存，无迁移。 |
 | **P0-3** | model_id 规范化到 models.dev | `src/internal/ai/agent/profile/spec.rs`、`usage/format.rs`、`publish/ai_export.rs` | S / 低 | 加 `canonical_model_id(provider, model)` helper，**只在序列化/导出边界**用，不动 DB 列。对 `ollama/llama3` 这类非 models.dev 厂商，规范化只是拼接，不保证联盟有效性。 |
 
 #### P1 — 存储 + 读取（用户可见价值）
@@ -329,7 +329,7 @@ Libra 的 Intent→Plan→Task→Run→PatchSet→Provenance 对象链路不应�
 | 主张 | 锚点 |
 |---|---|
 | hook 把 `tool_input` 塌成布尔丢弃区间 | `src/internal/ai/hooks/runtime.rs`（`append_normalized_event`、`has_tool_input`）；`tool_input` 已在更前处 redact |
-| `apply_patch` 已算出精确区间却仅供 TUI | `src/internal/ai/tools/apply_patch/core.rs`（`compute_replacements`）；`handlers/apply_patch.rs`（`FileDiff` + unified diff） |
+| `apply_patch` 已算出精确区间却仅供 UI projection | `src/internal/ai/tools/apply_patch/core.rs`（`compute_replacements`）；`handlers/apply_patch.rs`（`FileDiff` + unified diff） |
 | 全套归属身份已在 dispatch 处在场 | `src/internal/ai/usage/recorder.rs`（`UsageContext`）；`agent/runtime/tool_loop.rs`（`ToolLoopConfig`） |
 | model 已拆 provider/model，且有规范化器 | `agent/profile/spec.rs:129`（`ModelBinding::to_canonical_string`）；`agent_run/event.rs:267`（`Spawned`）；`agent_usage_stats` |
 | `TouchedFile` 仅文件级计数，无区间 | `git-internal`（外部 crate）`object/patchset.rs`（`lines_added/lines_deleted`） |
@@ -342,7 +342,7 @@ Libra 的 Intent→Plan→Task→Run→PatchSet→Provenance 对象链路不应�
 | ai_export 为对象级，无 files/ranges | `src/internal/publish/ai_export.rs`（Intent/Plan/Task/Run/PatchSet/Provenance）；`associatedIds.tracesCommit` |
 | Agent Trace reference 版本与区间 fallback 不可照搬 | `/Volumes/Data/cursor/agent-trace/schemas.ts`（`version` regex）；`reference/trace-store.ts:151`（`version: "1.0"`）、`:102`（`computeRangePositions` 三级回退 + 合成路径） |
 | `IntegrityHash::compute` 可用 | `git-internal-0.7.4/src/internal/object/integrity.rs:31` |
-| Cursor hook 采集 vs Libra apply_patch | `reference/trace-hook.ts:94`（PostToolUse 走 tool_input 回查）；Libra `apply_patch/handlers/apply_patch.rs:145`（只转 unified diff 给 TUI，区间丢弃） |
+| Cursor hook 采集 vs Libra apply_patch | `reference/trace-hook.ts:94`（PostToolUse 走 tool_input 回查）；Libra `apply_patch/handlers/apply_patch.rs:145`（只转 unified diff 给 UI projection，区间丢弃） |
 | normalized event 丢区间 | `hooks/runtime.rs:1118`（`"has_tool_input": ...`，原始内容已在 redaction 层前丢弃） |
 
 ---
@@ -524,7 +524,7 @@ Agent Trace 联盟成员（README 致谢）大致分两类采集/存储形态，
 - ✏️ `compute_diff` 的调用方是 **`blame.rs` + `log.rs`**（原文 §5 写"仅此处用"已更正）；rebase/cherry-pick 仍 0 命中（结论不变）。
 - ⚠️ `git-internal::IntegrityHash::compute` 位于**外部 pinned crate**，本仓树内 grep 不到，是唯一**未能在树内自证**的锚点——见 §4.2"利好"已加的告警；落地前对照 vendored crate 源确认。
 
-精化的精确锚点（供实现直接跳转）：`BlameLine` @ `blame.rs:72`（`line_number/short_hash/hash/author/date/content`）；`UsageReportBy` @ `usage.rs:94`（`Model`/`Agent`/`AgentProviderModel`）；`compute_replacements` @ `apply_patch/core.rs:285`（私有，兄弟 `apply_replacements` @ `:585` 亦私有）；TUI-only diff 注释 @ `handlers/apply_patch.rs:144`；`append_normalized_event` @ `hooks/runtime.rs:1100`（`has_tool_input` @ `:1118`）；`HookTarget::AgentTraces` Phase-1 stub @ `hooks/runtime.rs:76-83`（运行时 reject "not yet wired"）；`traces_commit` @ `publish/contract.rs:384`；`TRACES_BRANCH` @ `branch.rs:42`；`ModelBinding::to_canonical_string` @ `spec.rs:129`；`vault::pgp_sign` @ `:218` / `signature_to_gpgsig` @ `:658`（无 verify）；`RebaseAppliedCommitOutput` @ `rebase.rs:566`。
+精化的精确锚点（供实现直接跳转）：`BlameLine` @ `blame.rs:72`（`line_number/short_hash/hash/author/date/content`）；`UsageReportBy` @ `usage.rs:94`（`Model`/`Agent`/`AgentProviderModel`）；`compute_replacements` @ `apply_patch/core.rs:285`（私有，兄弟 `apply_replacements` @ `:585` 亦私有）；UI-only diff 注释 @ `handlers/apply_patch.rs:144`；`append_normalized_event` @ `hooks/runtime.rs:1100`（`has_tool_input` @ `:1118`）；`HookTarget::AgentTraces` Phase-1 stub @ `hooks/runtime.rs:76-83`（运行时 reject "not yet wired"）；`traces_commit` @ `publish/contract.rs:384`；`TRACES_BRANCH` @ `branch.rs:42`；`ModelBinding::to_canonical_string` @ `spec.rs:129`；`vault::pgp_sign` @ `:218` / `signature_to_gpgsig` @ `:658`（无 verify）；`RebaseAppliedCommitOutput` @ `rebase.rs:566`。
 
 ---
 
@@ -533,4 +533,4 @@ Agent Trace 联盟成员（README 致谢）大致分两类采集/存储形态，
 - Agent Trace 规范与参考实现（Cursor）：`/Volumes/Data/cursor/agent-trace`（`README.md`、`schemas.ts`、`reference/{trace-store,trace-hook}.ts`、`index.ts` 用于构建 JSON Schema 与站点）。
 - Libra AI 对象模型：[`docs/ai/object-model-reference.md`](../ai/object-model-reference.md)、[`docs/development/code-agent-runtime.md`](code-agent-runtime.md)。
 - 兼容性矩阵：[`COMPATIBILITY.md`](../../COMPATIBILITY.md)。
-- 关键实现锚点：`src/internal/ai/tools/apply_patch/core.rs:285`（compute_replacements）、`src/internal/ai/tools/handlers/apply_patch.rs:145`（仅产 TUI metadata）、`src/internal/ai/hooks/runtime.rs:1100`（append_normalized_event 塌陷）、`src/internal/ai/observed_agents/`（外部采集 + redaction + traces orphan ref）、`src/internal/publish/ai_export.rs`（对象级导出）。
+- 关键实现锚点：`src/internal/ai/tools/apply_patch/core.rs:285`（compute_replacements）、`src/internal/ai/tools/handlers/apply_patch.rs:145`（仅产 UI metadata）、`src/internal/ai/hooks/runtime.rs:1100`（append_normalized_event 塌陷）、`src/internal/ai/observed_agents/`（外部采集 + redaction + traces orphan ref）、`src/internal/publish/ai_export.rs`（对象级导出）。

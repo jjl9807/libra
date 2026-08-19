@@ -154,7 +154,6 @@ set -a; source .env.test; set +a
 | `src/command/*.rs`（非 cloud / code） | 1 | + 2，若涉及 `mod.rs` 共享 helper |
 | `src/command/cloud.rs` | 1 | + 5（需 D1/R2 env） |
 | `src/command/code.rs`、`src/command/code_control*.rs` | 1, 2 | + 4，若动到 provider 接线 |
-| `src/internal/tui/**` | 2 | — |
 | `src/internal/ai/agent/**`、`src/internal/ai/orchestrator/**` | 2 | + 4 |
 | `src/internal/ai/providers/**` | 2 | + 4 |
 | `src/internal/ai/tools/**` | 2 | — |

@@ -48,7 +48,7 @@ pub struct McpToolDefinition {
     pub params_schema: FunctionParameters,
 }
 
-/// Convert rmcp `CallToolResult` into the local TUI/tool-loop output type.
+/// Convert rmcp `CallToolResult` into the local Code UI/tool-loop output type.
 fn call_tool_result_to_output(result: CallToolResult) -> ToolOutput {
     let text: String = result
         .content

@@ -1,4 +1,4 @@
-//! Cross-process test harness for Local TUI Automation Control, plus the
+//! Cross-process test harness for local Code UI automation control, plus the
 //! Task A6.5 local agent-capture smoke driver.
 
 // Unix-only: the smoke driver uses std::os::unix (process groups, file

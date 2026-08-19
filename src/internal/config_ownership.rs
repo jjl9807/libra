@@ -359,10 +359,6 @@ pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
         "a lock, not a cache: serializes FUSE mount handshakes",
     ),
     (
-        "WELCOME_ANIMATION_START",
-        "TUI animation epoch; holds no repository state",
-    ),
-    (
         "BODY",
         "compiled regex/template constant; input-independent",
     ),
@@ -395,7 +391,7 @@ mod tests {
         "package.json",             // embedded web frontend asset
         "manifest.json",            // web asset manifest
         "Cargo.toml",               // project manifest probing in task workdirs
-        ".snapshot.json",           // TUI session snapshot state, written by the runtime
+        ".snapshot.json",           // runtime session snapshot state
         "capability_packages.json", // agent capability data artifact, not configuration
         "pending_revision.json",    // pending plan-revision state written by the headless
         // runtime (web/headless.rs), not configuration
@@ -455,13 +451,11 @@ mod tests {
     /// Code/Agent namespaces without a registry row (or a reviewed allowlist
     /// entry) fails this test. This is the fail-closed half of "新增 mutable
     /// state/cache 未登记则测试失败".
-    /// Namespaces hosting Code/Agent configuration reads. `src/internal/tui`
-    /// is included because the `libra code` TUI reads `.libra/config.toml`
-    /// in production; `agent`/`code_control` are the remaining runtime
-    /// command surfaces.
+    /// Namespaces hosting Code/Agent configuration reads (the retired TUI
+    /// module was removed in W5-03; its config reads died with it);
+    /// `agent`/`code_control` are the remaining runtime command surfaces.
     const SCANNED_NAMESPACES: &[&str] = &[
         "src/internal/ai",
-        "src/internal/tui",
         "src/command/agent",
         "src/command/code.rs",
         "src/command/code_control.rs",

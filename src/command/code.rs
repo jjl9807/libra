@@ -146,7 +146,7 @@ use crate::{
             },
         },
         db::establish_connection,
-        tui::ProcessTerminateGate,
+        process_terminate::ProcessTerminateGate,
     },
     utils::{
         client_storage::ClientStorage,
@@ -226,7 +226,8 @@ pub enum ControlMode {
     Observe,
     /// Enable local automation write control with token and controller checks.
     Write,
-    /// Client-only JSON-RPC NDJSON shim (W4-02 / W4-10). Does not start Web/TUI/MCP.
+    /// Client-only JSON-RPC NDJSON shim (W4-02 / W4-10). Does not start a
+    /// Web server, terminal UI, or MCP server.
     /// Discovers endpoint from `--control-info-file` (default `.libra/code/control.json`);
     /// `--control-url` / `--control-token-file` override.
     Stdio,
@@ -664,12 +665,11 @@ pub struct CodeArgs {
 /// loop to produce a structured plan and wait for an approval before
 /// executing. The approval gate is therefore **Codex's own approval channel**
 /// (per-tool / per-command requests), not Libra's Phase 0 / Phase 1 review
-/// loop. Libra's own intent / plan drafting tool loop (`phase0_plan_tool_loop_config` /
-/// `phase1_plan_tool_loop_config` in `src/internal/tui/app.rs`) requires a
-/// generic `CompletionModel` and is bypassed when `managed_code_ui_runtime`
-/// is set (the Codex runtime is a managed backend, not a completion model —
-/// see the bypass at `src/internal/tui/app.rs` near
-/// `if self.managed_code_ui_runtime.is_none() && should_route_plain_message_to_plan(...)`).
+/// loop. Libra's own intent / plan drafting tool loop is defined by
+/// `runtime::phase0::phase0_plan_tool_loop_config` and
+/// `runtime::phase1::phase1_plan_tool_loop_config`. It requires a generic
+/// `CompletionModel`; managed Codex uses its app-server backend instead of
+/// that generic workflow.
 ///
 /// Combining `--plan-mode=true` with `--approval-policy=allow-all` /
 /// `=never` means Codex still produces the plan, but its approval gate is
@@ -705,7 +705,7 @@ fn warn_deprecated_mcp_stdio() {
 /// Entry point for the `libra code` subcommand.
 ///
 /// Validates CLI flag combinations, then dispatches to:
-/// - `--control stdio`: JSON-RPC NDJSON automation client (no Web/TUI/MCP)
+/// - `--control stdio`: JSON-RPC NDJSON automation client (no server launch)
 /// - `--stdio`: MCP over stdin/stdout
 /// - default: Web Code UI + AgentRuntime
 ///
@@ -725,7 +725,7 @@ fn warn_deprecated_mcp_stdio() {
 /// `docs/development/cli-error-contract-design.md`.
 pub async fn execute(args: CodeArgs, output: &OutputConfig) -> CliResult<()> {
     // Client-only control shim (W4-02) + control-info discovery (W4-10): no
-    // worktree gate, no Web/TUI/MCP boot, no auto-start / port scan.
+    // worktree gate, no Web/MCP boot, no auto-start / port scan.
     if args.control == ControlMode::Stdio {
         validate_mode_args(&args, output).map_err(CliError::command_usage)?;
         let working_dir = std::env::current_dir().map_err(|error| {
@@ -1068,7 +1068,7 @@ async fn shutdown_code_lifecycle(
 }
 
 // ---------------------------------------------------------------------------
-// Mode: Web-only — headless web + MCP servers (no TUI)
+// Mode: Web-only — headless web + MCP servers (no terminal UI)
 // ---------------------------------------------------------------------------
 
 /// Which Code UI runtime the default Web launch dispatches to, decided
@@ -1179,7 +1179,7 @@ fn url_contains_browser_bootstrap_query(url: &str) -> bool {
 async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
     let working_dir = resolve_code_working_dir(args)?;
     // Keep provider bootstrap on the same env-file → process → Vault lookup
-    // chain as the TUI path.  The current Web-only flag policy may reject a
+    // chain as the shared Code runtime. The current Web-only flag policy may reject a
     // non-default file, but that policy no longer creates a second factory.
     let env_file = load_code_env_file(args.env_file.as_deref())?;
     let browser_control = resolve_browser_control_mode(args)?;
@@ -2175,7 +2175,7 @@ impl ControlRuntimeConfig {
         };
         write_control_info(&self.paths.info, &info).map_err(|error| {
             CliError::fatal(format!(
-                "failed to write local TUI control info '{}': {error}",
+                "failed to write local control info '{}': {error}",
                 self.paths.info.display()
             ))
             .with_stable_code(StableErrorCode::IoWriteFailed)
@@ -2239,7 +2239,7 @@ async fn prepare_control_runtime(
             let lock_guard = acquire_control_lock(&paths.lock).map_err(|error| match error {
                 ControlLockError::AlreadyHeld { .. } => CliError::conflict(error.to_string()),
                 ControlLockError::Io(error) => CliError::io(format!(
-                    "failed to acquire local TUI control lock '{}': {error}",
+                    "failed to acquire local control lock '{}': {error}",
                     paths.lock.display()
                 )),
             })?;
@@ -2247,7 +2247,7 @@ async fn prepare_control_runtime(
                 .await
                 .map_err(|error| {
                     CliError::fatal(format!(
-                        "failed to prepare local TUI control token '{}': {error}",
+                        "failed to prepare local control token '{}': {error}",
                         paths.token.display()
                     ))
                     .with_stable_code(StableErrorCode::IoWriteFailed)
@@ -2451,7 +2451,7 @@ fn finalize_code_ui_resume_bootstrap_snapshot(snapshot: &mut CodeUiSessionSnapsh
     snapshot.updated_at = now;
 }
 
-/// Build the legacy/bootstrap Code UI snapshot shared by TUI and headless resume.
+/// Build the legacy/bootstrap Code UI snapshot used by Web resume.
 fn build_code_ui_resume_bootstrap_snapshot(
     working_dir: impl Into<String>,
     session: &SessionState,
@@ -2669,7 +2669,8 @@ pub(crate) async fn attach_indexed_thread_graph(
 /// `browser_write_enabled` should mirror the resolved
 /// [`BrowserControlMode::Loopback`] so the runtime advertises browser writes
 /// in the snapshot capabilities. The initial controller is `Unclaimed` —
-/// the browser is the only writer in headless mode, no TUI to hand off from.
+/// the browser is the only writer in headless mode, with no local interactive
+/// owner to hand off from.
 #[allow(clippy::too_many_arguments)]
 async fn build_headless_web_code_ui_runtime<M>(
     args: &CodeArgs,
@@ -2745,7 +2746,8 @@ where
         (*projection_secret_redactor(&env_file)).clone(),
     );
     // Headless Web explicit `task.dispatch` uses the same dispatcher bundle as
-    // the TUI. Keep its construction here, before the per-turn config factory,
+    // the historical interactive path. Keep its construction here, before the
+    // per-turn config factory,
     // so both model `task` calls and Web controls observe the same budget,
     // approval, depth, and concurrency gates.
     let agents_config = AgentsConfig::load_from_working_dir(working_dir).unwrap_or_else(|err| {
@@ -2907,7 +2909,7 @@ fn build_headless_tool_registry(
 /// back to the read-only placeholder gracefully.
 ///
 /// v0 now routes several non-Codex providers through the same provider-factory
-/// bootstrap used by TUI. This keeps API-key/base-URL resolution centralized and
+/// bootstrap used by the legacy full-workflow path. This keeps API-key/base-URL resolution centralized and
 /// ensures the Web launch stays aligned with existing provider construction.
 ///
 /// The placeholder path is still available for providers that are not in this
@@ -3510,7 +3512,8 @@ fn task_intent_for_context(context: Option<CodeContext>) -> TaskIntent {
     }
 }
 
-/// Constructs the default [`ToolRuntimeContext`] for TUI mode, configuring
+/// Constructs the default [`ToolRuntimeContext`] for the Code UI runtime,
+/// configuring
 /// the sandbox policy based on the operating context:
 ///
 /// - **Dev mode (or no context)**: Workspace-write sandbox allowing modifications
@@ -3573,8 +3576,8 @@ async fn hydrate_tui_approval_runtime(
 /// [`DefaultTuiApprovalConfig`] mapping (C7 criterion 2): `--approval-policy`
 /// maps through `.into()`, `--approval-ttl` through `Duration::from_secs`
 /// (CLI flag wins over the project `approval.ttl`, else `DEFAULT_APPROVAL_TTL`),
-/// and `--approval-policy` also drives `allow_all_commands`. Both the TUI and
-/// headless launch paths derive their approval config from here, so a dropped
+/// and `--approval-policy` also drives `allow_all_commands`. The Web and legacy
+/// full-workflow launch paths derive their approval config from here, so a dropped
 /// or hardcoded flag is a single-point regression the unit test guards.
 fn tui_approval_config_from_args(
     args: &CodeArgs,
@@ -3853,8 +3856,8 @@ async fn build_subagent_runtime_for_session(
     // consumer task that auto-rejects each ask while emitting a
     // structured tracing event with the full ask context. This is
     // the channel-plumbing wire-up that proves the path end-to-end;
-    // the follow-up replaces the auto-reject consumer with a real
-    // TUI prompt widget that surfaces each ask interactively.
+    // the follow-up replaces the auto-reject consumer with a Web Code UI
+    // permission widget that surfaces each ask interactively.
     //
     // The consumer task lives for the entire session — when the
     // session exits, the sender drops, the receiver's `recv()`
@@ -3871,7 +3874,7 @@ async fn build_subagent_runtime_for_session(
                 session_id = %ask.session_id,
                 source = ?ask.source,
                 "permission ask received via ChannelPermissionAsker; \
-                 auto-rejecting until interactive TUI prompt widget lands",
+                 auto-rejecting until interactive Web Code UI permission widget lands",
             );
             // Send may fail if the dispatcher dropped its
             // oneshot receiver (e.g. cancelled mid-await). Ignore
@@ -3881,7 +3884,7 @@ async fn build_subagent_runtime_for_session(
                 feedback: Some(
                     "permission ask auto-rejected by the v0.17.788 channel consumer; \
                      pre-grant the permission via [code.agents.<name>.permission] in \
-                     .libra/agents.toml or wait for the interactive TUI widget"
+                     .libra/agents.toml or wait for the interactive Web Code UI permission widget"
                         .to_string(),
                 ),
             });
@@ -4177,7 +4180,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
             );
         }
         // Managed Codex web owns its own credential/approval surface; these
-        // TUI/headless flags are accepted for non-Codex web but must not be
+        // Legacy/headless flags are accepted for non-Codex web but must not be
         // silently ignored under Codex.
         if args.provider == CodeProvider::Codex && args.env_file.is_some() {
             return Err(
@@ -4207,7 +4210,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
         // --control-url / --control-token-file still override.
         if args.browser_control.is_some() {
             return Err(
-                "`--browser-control` is not supported with `--control stdio` (client-only; no Web/TUI launch)"
+                "`--browser-control` is not supported with `--control stdio` (client-only; no Web launch)"
                     .to_string(),
             );
         }
@@ -4289,7 +4292,7 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
     // Temperature is mode-independent: the C2 web-only relaxation lets
     // `--temperature` reach the headless `ToolLoopConfig` directly, so its
     // documented 0.0–2.0 contract must be enforced here rather than relying on
-    // the TUI-only reject that previously masked out-of-range values (codex C2
+    // the legacy-mode reject that previously masked out-of-range values (codex C2
     // review). NaN/inf are rejected too — they would silently corrupt sampling.
     if let Some(temperature) = args.temperature
         && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
@@ -4381,9 +4384,9 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
     }
 }
 
-/// Rejects TUI-specific flags that are invalid in a non-TUI mode.
+/// Rejects legacy-interactive flags that are invalid in a non-interactive mode.
 ///
-/// Two non-TUI modes reach this helper — the default Web launch and `--stdio`
+/// Two non-interactive modes reach this helper — the default Web launch and `--stdio`
 /// (plus the client-only `--control stdio` shim) — and they receive DIFFERENT
 /// relaxations (plan.md Task C2). The `web_launch` argument selects which set
 /// applies; `--stdio` and `--control stdio` pass `web_launch = false`.
@@ -4396,7 +4399,7 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 ///   `--provider` (all seven providers plus the Codex branch), `--model`,
 ///   `--api-base`, `--temperature`, and the provider-specific tuning flags via
 ///   `build_any_completion_model_for_args` / the headless config factory. Under
-///   the Web launch those are therefore NOT blanket-rejected here as "TUI-only"; they
+///   the Web launch those are therefore NOT blanket-rejected here as legacy-only; they
 ///   flow through to the cross-provider match gate in `validate_mode_args`,
 ///   which still rejects a provider-specific flag that does not match the
 ///   selected provider and still rejects `--api-base` under `--provider=codex`.
@@ -4407,7 +4410,7 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
 /// `--network-access allow`.
 /// MCP `--stdio` also rejects it (no Plan UI).
 /// W3-13: `--env-file`, `--context`, `--approval-policy`, and `--approval-ttl`
-/// are accepted under the Web launch (same semantics as TUI) and remain rejected for
+/// are accepted under the Web launch (same historical semantics) and remain rejected for
 /// MCP `--stdio`.
 /// `--resume` is accepted only for the non-Codex Web headless path; it remains
 /// rejected for MCP stdio and managed Codex, which do not share that session
@@ -4520,7 +4523,7 @@ mod tests {
     #[tokio::test]
     async fn process_terminate_gate_registers_sigterm_listener() {
         let _gate = ProcessTerminateGate::install()
-            .expect("web-only/TUI modes must subscribe to SIGTERM/SIGINT on Unix");
+            .expect("interactive modes must subscribe to SIGTERM/SIGINT on Unix");
     }
 
     #[cfg(unix)]
@@ -4759,8 +4762,8 @@ mod tests {
 
     /// C5: `--resume` is also rejected under `--stdio` (the MCP transport has
     /// no session/resume surface). Pin the actionable message shape — name the
-    /// flag, the mode, and a corrective action — so the TUI-only contract has a
-    /// regression guard on both non-TUI modes.
+    /// flag, the mode, and a corrective action — so the legacy-only contract has a
+    /// regression guard on both non-interactive modes.
     #[test]
     fn rejects_resume_in_stdio_mode() {
         let mut args = base_args();
@@ -4965,7 +4968,7 @@ mod tests {
         assert_eq!(
             folded.snapshot.status,
             CodeUiSessionStatus::IndeterminateSideEffect,
-            "TUI/headless shared fold must retain the reconciliation fence when replay is empty"
+            "legacy/headless shared fold must retain the reconciliation fence when replay is empty"
         );
     }
 
@@ -5088,7 +5091,7 @@ mod tests {
         }
     }
 
-    /// C2 (R4): relaxing the web-only "TUI-only" blanket must NOT weaken the
+    /// C2 (R4): relaxing the web-only legacy-only blanket must NOT weaken the
     /// cross-provider match gate — a provider-specific flag that does not match
     /// the selected provider is still rejected under web-only.
     #[test]
@@ -6188,8 +6191,8 @@ no_cache_unknown_network = true
     fn default_tui_runtime_context_exposes_approval_policy_and_ttl() {
         // Exercise the PRODUCTION mapping (codex C7 review): the args ->
         // DefaultTuiApprovalConfig mapping is now the shared helper
-        // `tui_approval_config_from_args`, which both the TUI and headless
-        // launch paths call. Feeding it parsed CLI args and running the result
+        // `tui_approval_config_from_args`, which both the legacy full-workflow
+        // and Web launch paths call. Feeding it parsed CLI args and running the result
         // through `default_tui_runtime_context` catches a regression where a
         // flag is dropped or hardcoded on the real production path — not just
         // inside the runtime-context builder.
@@ -6413,7 +6416,7 @@ no_cache_unknown_network = true
     /// Scenario: headless web mode now has a browser approval channel, a
     /// ToolRuntimeContext, and snapshot projection for direct plan updates, so
     /// the registry may expose the same guarded network/mutating/basic plan
-    /// tools as TUI without bypassing sandbox, approval, or `--network-access
+    /// tools as the legacy full-workflow path without bypassing sandbox, approval, or `--network-access
     /// deny`.
     #[test]
     fn build_headless_tool_registry_exposes_runtime_guarded_tools() {

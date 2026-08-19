@@ -18,7 +18,7 @@
 //! ## Scope
 //!
 //! P5.1 only delivers the schema, the loader, and validation. Budget
-//! enforcement (P5.3), the usage-stats migration (P5.2), and TUI
+//! enforcement (P5.3), the usage-stats migration (P5.2), and Code UI
 //! command surfaces (P5.4) consume this struct without modifying it.
 //!
 //! ## Validation contract

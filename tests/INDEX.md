@@ -113,7 +113,8 @@
 
 Machine-readable inventory for Checkpoint A. W3-02 Web harness retargets these
 rows onto the default Web launch HTTP/SSE (baselines live in
-`src/internal/ai/workflow_baseline.rs`; TUI re-exports for in-process panes).
+`src/internal/ai/workflow_baseline.rs`; the retired TUI's in-process re-exports
+were removed with W5-03).
 
 | TUI-owned behavior | baseline test name | expected output / assertion |
 |---|---|---|
@@ -158,7 +159,7 @@ targets with
 | `code_tool_acl_test` | 2 | Tool registry ACL & safety classification, consumed through the runtime-owned CodeAgentServices builder | `src/internal/ai/tools/`, `src/internal/ai/runtime/services.rs` |
 | `code_mcp_dual_entry_test` | 2 | MCP stdio + http dual entry parity | `src/internal/ai/mcp/`, `src/command/code.rs` |
 | `code_resume_test` | 2 | Session resume across restarts | `src/internal/ai/session/`, `src/command/code.rs` |
-| `code_codex_default_tui_test` | 2 | W4-01/W5-06/W5-07: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; the TUI resume driver was removed in W5-06 and bare `--provider codex --resume` is rejected with a usage error plus a migration hint) | `src/command/code.rs`, `src/internal/ai/codex/`, `src/internal/tui/` |
+| `code_codex_default_tui_test` | 2 | W4-01/W5-06/W5-07: default `libra code` routes to Web Code UI; `--provider codex` still uses managed runtime (legacy stdin loop unreachable; the TUI resume driver was removed in W5-06 and bare `--provider codex --resume` is rejected with a usage error plus a migration hint) | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `code_codex_runtime_test` | 2 | `--provider codex` WS runtime boot: `--codex-port` validation, managed app-server initialize/thread-start, approval-interaction regression, W3-04 `AgentEvent` envelope normalize, W3-07 cancel/interrupt + sequential approval ownership | `src/command/code.rs`, `src/internal/ai/codex/` |
 | `ai_code_ui_headless_test` | 2 | Headless Code UI runtime and projection coverage | `src/internal/ai/web/headless.rs` |
 | `ai_code_ui_projection_test` | 2 | Projection snapshot replication; W3-14 10k-event fold bound + release p95 (`large_session_projection_smoke`); W4-04 null `thread_graph` delta fold | `src/internal/ai/history.rs`, `src/internal/ai/web/code_ui_projection.rs` |
@@ -301,7 +302,7 @@ dedicated feature-on steps.
 |---|---|---|---|
 | `ai_agent_test` | 4 | Live LLM agent loop smoke | `src/internal/ai/agent/`, `src/internal/ai/providers/` |
 | `ai_chat_agent_test` | 4 | Live LLM chat-mode agent | `src/internal/ai/agent/` |
-| `code_ui_remote_model_generation_matrix` | 4 | Live model generation matrix (ignored by default) | `src/internal/ai/providers/`, `src/internal/tui/` |
+| `code_ui_remote_model_generation_matrix` | 4 | Live model generation matrix (ignored by default) | `src/internal/ai/providers/` |
 | `ai_ollama_live_gate_test` | 4 | Ollama live-gate smoke | `src/internal/ai/providers/ollama/` |
 
 ## Wave 5 — Live Cloud (test-live-cloud / D1+R2)
@@ -317,7 +318,7 @@ dedicated feature-on steps.
 
 | target | wave | one-line purpose | relevant src |
 |---|---|---|---|
-| `code_ui_perf_smoke_test` | 6 | Code UI perf / SSE soak smoke | `src/command/code.rs`, `src/internal/tui/`, `src/internal/ai/web/` |
+| `code_ui_perf_smoke_test` | 6 | Code UI perf / SSE soak smoke | `src/command/code.rs`, `src/internal/ai/web/` |
 
 ---
 

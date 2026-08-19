@@ -533,7 +533,7 @@ mod tests {
 
     /// Pins the manual `Display` impl on `ContextPriority` — used in
     /// telemetry labels and the retention-rank tooltip surfaced in
-    /// the TUI context budget badge.
+    /// the Code UI context budget badge.
     #[test]
     fn context_priority_display_pins_each_variant() {
         assert_eq!(ContextPriority::Critical.to_string(), "critical");

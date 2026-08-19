@@ -82,8 +82,8 @@ impl UsageQuery {
 }
 
 /// Grain at which the query layer aggregates `agent_usage_stats`. The
-/// three variants map 1:1 to the surfaces the TUI `/usage` slash
-/// command (P5.4) supports.
+/// three variants map 1:1 to the surfaces the Code UI `/usage` command
+/// (P5.4) supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageGrouping {
     /// `(provider, model)` — pre-OC-Phase-5 shape; preserved for

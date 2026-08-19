@@ -557,7 +557,7 @@ pub fn apply(state: &mut GoalState, envelope: &GoalEventEnvelope) -> Result<(), 
                 // `AwaitingScopeChange` is a special case: it
                 // semantically means "waiting on the user", not
                 // "blocked by external state". Surface it as
-                // `AwaitingUser` so the TUI can render the right
+                // `AwaitingUser` so the Code UI can render the right
                 // affordance (single question + reply).
                 GoalBlockReason::AwaitingScopeChange { .. } => GoalStatus::AwaitingUser,
                 _ => GoalStatus::Blocked,
@@ -620,7 +620,7 @@ pub fn apply(state: &mut GoalState, envelope: &GoalEventEnvelope) -> Result<(), 
             // Verifier said no — drop the pending claim so future
             // events do not see stale rejected work as "claimed".
             // The accompanying blocker carries the verifier's
-            // rejection reason for the TUI / continuation prompt.
+            // rejection reason for the Code UI / continuation prompt.
             state.pending_claim = None;
             state.blockers.push(GoalBlocker {
                 reason: GoalBlockReason::CompletionRejected {

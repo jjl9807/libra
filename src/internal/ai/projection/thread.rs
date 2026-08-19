@@ -407,7 +407,7 @@ impl ThreadProjection {
 
     /// List active, non-archived threads ordered by most recent update time.
     ///
-    /// Use this for UI/TUI entry points that need to render a thread picker or
+    /// Use this for UI entry points that need to render a thread picker or
     /// resume list.
     ///
     /// ```no_run
@@ -470,7 +470,7 @@ impl ThreadProjection {
         let mut projections = Vec::with_capacity(rows.len());
         // This is intentionally an N+1 read path today: one query for the
         // active thread ids, then one full reconstruction per thread. That is
-        // acceptable for the current small UI/TUI working set, but should move
+        // acceptable for the current small UI working set, but should move
         // to a batched loader if active thread counts grow materially.
         // TODO(perf): switch to `find_by_ids_with_conn` batching before active
         // thread lists regularly exceed low double digits (roughly 20-50 rows).

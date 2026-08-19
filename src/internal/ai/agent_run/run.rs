@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::{AgentRunId, AgentTaskId};
 
 /// Lifecycle status of an `AgentRun`. Five reachable states matching
-/// CEX-S2-16 TUI agent pane requirements.
+/// CEX-S2-16 agent projection requirements.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

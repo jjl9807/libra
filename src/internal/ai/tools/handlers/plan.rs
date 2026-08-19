@@ -14,8 +14,8 @@ use crate::internal::ai::tools::{
 /// Fire-and-forget handler for plan updates.
 ///
 /// The handler itself simply validates the arguments and returns "Plan updated".
-/// The TUI intercepts the `ToolCallBegin` event and renders a specialised
-/// `PlanUpdateHistoryCell` with checkbox UI.
+/// The Web Code UI intercepts the `ToolCallBegin` event and renders a
+/// specialised plan-update projection with checkbox UI.
 ///
 /// AI user story: let the agent expose its current multi-step plan to the human
 /// and keep progress synchronized during longer tasks without mutating project

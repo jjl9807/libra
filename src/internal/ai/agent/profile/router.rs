@@ -2,8 +2,9 @@
 //! one based on free-form user input.
 //!
 //! The router is the bridge between the profile authoring format ([`super::parser`])
-//! and the agent runtime ([`super::super::runtime`]). The TUI dispatches a chat turn to
-//! the matched profile so the LLM sees the right system prompt and tool whitelist.
+//! and the agent runtime ([`super::super::runtime`]). The Code UI dispatches a
+//! chat turn to the matched profile so the LLM sees the right system prompt and
+//! tool whitelist.
 
 use super::parser::AgentProfile;
 
@@ -71,7 +72,8 @@ impl AgentProfileRouter {
 
     /// Get all registered profiles.
     ///
-    /// Used by the TUI to render an "/agents" menu and by introspection helpers.
+    /// Used by UI projections that render an "/agents" menu and by introspection
+    /// helpers. The retired TUI was a former consumer.
     pub fn profiles(&self) -> &[AgentProfile] {
         &self.profiles
     }
@@ -90,7 +92,7 @@ impl AgentProfileRouter {
     /// runtime-shaped agent contract instead of the parser-shaped
     /// [`AgentProfile`]. The two coexist deliberately:
     ///
-    /// - [`Self::get`] returns the parsed profile so legacy callers (TUI
+    /// - [`Self::get`] returns the parsed profile so legacy callers (former UI
     ///   prompt assembly, slash-command surfaces) keep working unchanged.
     /// - [`Self::execution_spec`] materialises a fresh spec on every call.
     ///   Materialising on demand keeps the router cheap to construct and

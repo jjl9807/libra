@@ -1,11 +1,12 @@
-//! In-memory Goal session state owned by the TUI App.
+//! In-memory Goal session state, now a UI-neutral session construct under
+//! `internal::ai` after the W5-03 module retirement.
 //!
 //! Per `docs/development/commands/_general.md` lines 540-700, an active Goal
 //! is a session-level construct: there is at most one Goal in flight
 //! per `libra code` session, and its events flow into the same
 //! JSONL stream as the rest of the session (P6.7 wires the
-//! persistence side). This module defines the in-memory handle the
-//! App holds while a Goal is active.
+//! persistence side). This module defines the in-memory handle the runtime
+//! control service holds while a Goal is active.
 //!
 //! The handle is intentionally thin:
 //!
@@ -22,9 +23,8 @@
 //!   `Blocked`, `ProgressRecorded`) through
 //!   [`GoalSession::append_supervisor_events`].
 //!
-//! User-facing surfaces (TUI `/goal` slash commands and Code Control
-//! NDJSON `goal.*` methods) both bottom out in the App methods that
-//! own a single `Option<GoalSession>` field — the contract is shared.
+//! User-facing Code control methods bottom out in the runtime service that
+//! owns a single `Option<GoalSession>` field — the contract is shared.
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -55,7 +55,7 @@ fn validate_goal_objective(objective: &str) -> Result<(), GoalSpecError> {
     }
 }
 
-/// In-memory handle for one active Goal session. The App holds
+/// In-memory handle for one active Goal session. The runtime service holds
 /// `Option<GoalSession>`; `None` means "no active Goal".
 #[derive(Debug, Clone)]
 pub struct GoalSession {
@@ -69,13 +69,12 @@ pub struct GoalSession {
 }
 
 /// Errors returned by [`GoalSession`] mutators. The error variants
-/// are designed to flow into both the TUI slash-command response
-/// cell and the Code Control NDJSON error response. The
-/// "already-active" gate lives one layer up (in the App) because
+/// are designed to flow into both text and Code Control NDJSON responses. The
+/// "already-active" gate lives one layer up (in the runtime service) because
 /// `GoalSession::create` builds a fresh handle from scratch — only
-/// the App holds the `Option<GoalSession>` slot that can be
+/// the runtime service holds the `Option<GoalSession>` slot that can be
 /// occupied; that's where `GoalAlreadyActive` is checked, against
-/// `TuiControlError::GoalAlreadyActive`.
+/// `the goal-already-active control error`.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum GoalSessionError {
     /// `status` / `cancel` was called when no Goal is active.
@@ -96,7 +95,7 @@ pub enum GoalSessionError {
 }
 
 /// Snapshot of one cancellation outcome. The mutator returns this
-/// so callers (TUI cell, NDJSON response) can render the new state
+/// so callers (text or NDJSON response) can render the new state
 /// without a follow-up read.
 #[derive(Debug, Clone)]
 pub struct GoalCancelOutcome {
@@ -109,7 +108,7 @@ impl GoalSession {
         &self.state
     }
 
-    /// Read-only access to the cumulative event log. The TUI flushes
+    /// Read-only access to the cumulative event log. The runtime service flushes
     /// new envelopes to the session JSONL whenever a Goal mutation
     /// succeeds; tests also use this to assert the schema-floor event
     /// order.
@@ -325,8 +324,8 @@ impl GoalSession {
     }
 }
 
-/// Render `state` as a compact one-line indicator for the TUI
-/// bottom pane. Per `docs/development/commands/_general.md` line 723 the
+/// Render `state` as a compact one-line indicator for the Web Code UI and
+/// text control responses. Per `docs/development/commands/_general.md` line 723 the
 /// active Goal must surface its id short code + status + progress
 /// without requiring the user to invoke `/goal status` every turn.
 ///
@@ -431,7 +430,7 @@ fn compact_goal_step_label(step: &GoalPlanStep) -> String {
 }
 
 /// Render `state` as a multi-line human-readable summary — used by
-/// both the TUI `/goal status` cell and the NDJSON `goal.status`
+/// both the Web Code UI status projection and the NDJSON `goal.status`
 /// response body. Stable shape for golden tests.
 pub fn render_goal_status(state: &GoalState) -> String {
     let mut out = String::new();
@@ -777,7 +776,7 @@ mod tests {
 
     /// `from_replay` rejects a stream that does not start with a
     /// `Created` envelope — the underlying `goal::state::replay`
-    /// guard. The session slot stays empty so the resumed TUI
+    /// guard. The session slot stays empty so the resumed Code session
     /// behaves as if no Goal was active.
     #[test]
     fn from_replay_returns_none_when_first_envelope_is_not_created() {

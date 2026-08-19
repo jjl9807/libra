@@ -1,6 +1,6 @@
 //! Replayable Code UI projection over the additive session workflow stream.
 //!
-//! This is deliberately a pure fold: the live Web/TUI adapters may cache the
+//! This is deliberately a pure fold: live Web adapters may cache the
 //! resulting snapshot, but they do not become the authority for transcript,
 //! interaction, plan, task, tool-call, or patchset state.  A caller supplies a
 //! legacy/bootstrap snapshot for immutable session metadata, then applies the

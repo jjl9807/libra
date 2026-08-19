@@ -9,7 +9,7 @@
 //! 2. Each of the three agents records usage with a distinct
 //!    `agent_name` (P5.2). The query layer aggregates at three grains
 //!    (`(provider, model)`, `(agent)`, `(agent, provider, model)`)
-//!    and surfaces the agent dimension to the TUI table renderer.
+//!    and surfaces the agent dimension to the Code UI table renderer.
 //! 3. Setting `max_session_cost_usd` low forces the budget tracker
 //!    (P5.3) to fail with `BudgetExceededError` whose
 //!    `stable_code() == StableErrorCode::AgentBudgetExceeded`
@@ -284,7 +284,7 @@ fn s7_session_cost_cap_breach_surfaces_agent_budget_exceeded_code() {
 
 /// S7 phase 3b: a tight per-agent cap must fail only the named
 /// agent bucket, not the whole session. This pins the P5.3
-/// attribution path that `SubAgentUsageUpdated` feeds in the TUI:
+/// attribution path that `SubAgentUsageUpdated` feeds in the Code UI:
 /// usage is accumulated with `Some(agent_name)` and `check_agent`
 /// returns `LBR-AGENT-001` with `BudgetScope::Agent`.
 #[test]

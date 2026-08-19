@@ -126,7 +126,7 @@ const FUSE_HEALTH_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 /// the disable signal persists across orchestrator runs in the same process —
 /// not just across replans within a single run. Without this persistence the
 /// orchestrator would re-attempt (and re-fail) FUSE on every new intent the
-/// user submits in the same TUI session.
+/// user submits in the same Code UI session.
 #[derive(Clone, Debug)]
 pub struct FuseProvisionState {
     disabled: Arc<AtomicBool>,
@@ -143,7 +143,7 @@ impl Default for FuseProvisionState {
 impl FuseProvisionState {
     /// Atomically mark FUSE disabled for this session. Returns `true` iff this
     /// call was the first to flip the flag; the caller is then responsible for
-    /// emitting the one-time TUI note.
+    /// emitting the one-time Code UI note.
     pub fn disable_first_time(&self) -> bool {
         self.disabled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -178,7 +178,7 @@ pub enum FuseAttemptOutcome {
     /// FUSE was already disabled by an earlier failure; copy backend used.
     AlreadyDisabled,
     /// This task was the first to fail FUSE — it triggered the session disable.
-    /// The caller must emit the one-time "FUSE disabled" TUI note.
+    /// The caller must emit the one-time "FUSE disabled" Code UI note.
     JustDisabled { reason: String },
     /// Platform without FUSE support (non-unix); copy backend used.
     Unsupported,
