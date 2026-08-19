@@ -2597,10 +2597,7 @@ mod tests {
             ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
             false,
             true,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: None,
-            },
+            CodeUiInitialController::Unclaimed,
         )
         .await
     }
@@ -2641,10 +2638,7 @@ mod tests {
             ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
             false,
             true,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: None,
-            },
+            CodeUiInitialController::Unclaimed,
         )
         .await;
         let redactor = Arc::new(
@@ -3497,10 +3491,7 @@ mod tests {
             ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
             false,
             true,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: None,
-            },
+            CodeUiInitialController::Unclaimed,
         )
         .await;
         let audit_sink = Arc::new(InMemoryAuditSink::default());
@@ -4460,14 +4451,7 @@ mod tests {
         ));
         let runtime = CodeUiRuntimeHandle::build_with_options_and_lifecycle(
             ReadOnlyCodeUiAdapter::new(session, CodeUiCapabilities::default()),
-            CodeUiRuntimeOptions::new(
-                true,
-                false,
-                CodeUiInitialController::LocalTui {
-                    owner_label: "Terminal UI".to_string(),
-                    reason: None,
-                },
-            ),
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed),
             Some(Arc::new(LifecycleHub(hub))),
         )
         .await;

@@ -51,10 +51,6 @@ pub enum ControllerInitial {
         owner_label: String,
         reason: Option<String>,
     },
-    LocalTui {
-        owner_label: String,
-        reason: Option<String>,
-    },
 }
 
 #[derive(Debug)]
@@ -89,7 +85,6 @@ pub struct ControllerSnapshot {
 #[derive(Debug)]
 struct ControllerRuntimeState {
     fixed: Option<FixedController>,
-    local_tui_owner: Option<FixedController>,
     active_lease: Option<ControllerLease>,
     /// True once any remote lease has been minted. Subsequent attaches after
     /// expiry/reclaim/detach are takeovers (W4-13).
@@ -207,37 +202,22 @@ pub struct ControllerService {
 
 impl ControllerService {
     pub fn new(options: ControllerServiceOptions) -> Self {
-        let (fixed, local_tui_owner) = match options.initial_controller {
-            ControllerInitial::Unclaimed => (None, None),
+        let fixed = match options.initial_controller {
+            ControllerInitial::Unclaimed => None,
             ControllerInitial::Fixed {
                 kind,
                 owner_label,
                 reason,
-            } => (
-                Some(FixedController {
-                    kind,
-                    owner_label,
-                    reason,
-                }),
-                None,
-            ),
-            ControllerInitial::LocalTui {
+            } => Some(FixedController {
+                kind,
                 owner_label,
                 reason,
-            } => (
-                None,
-                Some(FixedController {
-                    kind: ControllerKind::Tui,
-                    owner_label,
-                    reason,
-                }),
-            ),
+            }),
         };
 
         Self {
             state: Arc::new(Mutex::new(ControllerRuntimeState {
                 fixed,
-                local_tui_owner,
                 active_lease: None,
                 ever_had_remote_lease: false,
                 pending_approval_invalidation: false,
@@ -299,7 +279,7 @@ impl ControllerService {
             return Ok((existing.clone(), false));
         }
 
-        let is_takeover = state.ever_had_remote_lease || state.local_tui_owner.is_some();
+        let is_takeover = state.ever_had_remote_lease;
         let lease = ControllerLease {
             kind,
             client_id: client_id.to_string(),
@@ -400,23 +380,6 @@ impl ControllerService {
         Self::snapshot_from_state(&state, self.browser_write_enabled)
     }
 
-    /// Local TUI reclaim is deliberately scoped to sessions that were started
-    /// with a local TUI owner.  Other callers cannot force-clear a lease.
-    ///
-    /// Returns whether a remote lease was actually cleared so callers can
-    /// invalidate prior-controller approvals only after a real takeover.
-    pub async fn reclaim_local_tui(&self) -> Result<bool, ControllerServiceError> {
-        let mut state = self.state.lock().await;
-        if state.local_tui_owner.is_none() {
-            return Err(ControllerServiceError::Conflict(
-                "This session does not have a local TUI controller to reclaim".to_string(),
-            ));
-        }
-        let had_remote_lease = state.active_lease.is_some();
-        state.active_lease = None;
-        Ok(had_remote_lease)
-    }
-
     /// Process-level shutdown release. Clears any active remote/local lease so
     /// a restarted controller cannot reuse a fence from this process. Idempotent.
     pub async fn release_for_process_shutdown(&self) {
@@ -450,15 +413,6 @@ impl ControllerService {
                 reason: None,
             };
         }
-        if let Some(local) = state.local_tui_owner.as_ref() {
-            return ControllerSnapshot {
-                kind: local.kind,
-                owner_label: Some(local.owner_label.clone()),
-                can_write: false,
-                lease_expires_at: None,
-                reason: local.reason.clone(),
-            };
-        }
         if let Some(fixed) = state.fixed.as_ref() {
             return ControllerSnapshot {
                 kind: fixed.kind,
@@ -489,47 +443,55 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn permit_fences_reclaim_until_dispatch_completes() {
+    async fn permit_fences_detach_until_dispatch_completes() {
+        // W5-02 refit: the deleted local-TUI reclaim was the original
+        // contested mutation; the controller's own DETACH exercises the
+        // same fence (the permit holds the controller-state lock, so no
+        // attach/detach mutation may interleave with an in-flight
+        // authorized dispatch).
         let service = ControllerService::new(ControllerServiceOptions::new(
-            false,
             true,
-            ControllerInitial::LocalTui {
-                owner_label: "TUI".to_string(),
-                reason: None,
-            },
+            true,
+            ControllerInitial::Unclaimed,
         ));
         let lease = service
-            .attach(ControllerKind::Automation, "automation-a")
+            .attach(ControllerKind::Browser, "browser-a")
             .await
-            .expect("automation controller should attach");
+            .expect("browser controller should attach");
         let permit = service
             .acquire_write_permit(Some(&lease.token))
             .await
             .expect("active controller should acquire a permit");
 
-        let service_for_reclaim = service.clone();
-        let reclaim = tokio::spawn(async move { service_for_reclaim.reclaim_local_tui().await });
+        let service_for_detach = service.clone();
+        let token = lease.token.clone();
+        let detach = tokio::spawn(async move {
+            service_for_detach
+                .detach(ControllerKind::Browser, "browser-a", &token)
+                .await
+        });
         tokio::task::yield_now().await;
         assert!(
-            !reclaim.is_finished(),
-            "reclaim must not interleave after controller authorization"
+            !detach.is_finished(),
+            "detach must not interleave after controller authorization"
         );
         drop(permit);
-        reclaim
-            .await
-            .expect("reclaim task should join")
-            .expect("local TUI should reclaim after dispatch boundary");
+        assert!(
+            detach
+                .await
+                .expect("detach task should join")
+                .expect("controller should detach after the dispatch boundary"),
+            "detach should clear the active lease"
+        );
 
         let error = service
             .authorize_write(Some(&lease.token))
             .await
-            .expect_err("reclaimed controller must be fenced out");
-        assert_eq!(
-            error,
-            ControllerServiceError::Conflict(
-                "No client currently controls this session".to_string()
-            )
-        );
+            .expect_err("detached controller must be fenced out");
+        match error {
+            ControllerServiceError::Conflict(_) | ControllerServiceError::InvalidToken => {}
+            other => panic!("unexpected error after detach: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -550,32 +512,6 @@ mod tests {
         assert_ne!(first.token, replacement.token);
         assert_ne!(first.fence, replacement.fence);
         assert_eq!(replacement.client_id, "browser-b");
-    }
-
-    #[tokio::test]
-    async fn first_remote_attach_from_local_tui_is_takeover() {
-        let service = ControllerService::new(ControllerServiceOptions::new(
-            true,
-            false,
-            ControllerInitial::LocalTui {
-                owner_label: "TUI".to_string(),
-                reason: None,
-            },
-        ));
-        let (_, is_takeover) = service
-            .attach_with_takeover(ControllerKind::Browser, "browser-a")
-            .await
-            .expect("first remote attach from local TUI");
-        assert!(
-            is_takeover,
-            "replacing local TUI control must drop prior-controller approvals"
-        );
-
-        let (_, renewal) = service
-            .attach_with_takeover(ControllerKind::Browser, "browser-a")
-            .await
-            .expect("same-client renewal");
-        assert!(!renewal, "lease renewal must not be a takeover");
     }
 
     #[tokio::test]

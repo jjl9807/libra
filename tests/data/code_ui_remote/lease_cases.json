@@ -151,7 +151,7 @@
       ]
     },
     {
-      "name": "lease_detach_releases_to_local_tui",
+      "name": "lease_detach_releases_to_none",
       "priority": "P0",
       "steps": [
         {
@@ -180,7 +180,7 @@
           "op": "waitSnapshot",
           "expect": {
             "assertions": [
-              "controller_kind_tui_or_none",
+              "controller_kind_none",
               "controller_can_write_false"
             ]
           }

@@ -35,7 +35,7 @@ use super::{
         TurnInputSource,
     },
     chatwidget::ChatWidget,
-    control::{CancelSource, TuiControlCommand, TuiControlError},
+    control::{CancelSource, TuiControlError},
     diff::FileChange,
     history_cell::{
         AssistantHistoryCell, DiffHistoryCell, HistoryCell, OrchestratorResultHistoryCell,
@@ -668,8 +668,6 @@ pub struct AppConfig {
     pub code_ui_session: Option<Arc<CodeUiSession>>,
     /// Optional Code UI runtime handle for local controller operations.
     pub code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
-    /// Optional local automation command receiver.
-    pub code_control_rx: Option<UnboundedReceiver<TuiControlCommand>>,
     /// Optional managed provider runtime controlled through the same TUI.
     pub managed_code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
     /// Runtime control plane for non-managed local tool-loop turns.
@@ -997,8 +995,6 @@ pub struct App<M: CompletionModel> {
     code_ui_session: Option<Arc<CodeUiSession>>,
     /// Provider-agnostic web runtime state shared with the browser UI.
     code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
-    /// Receiver for local automation commands from the Code UI adapter.
-    code_control_rx: Option<UnboundedReceiver<TuiControlCommand>>,
     /// Managed provider runtime for providers that own their own tool loop.
     managed_code_ui_runtime: Option<Arc<CodeUiRuntimeHandle>>,
     /// Runtime cancellation and reconciliation authority for local tool loops.
@@ -1200,7 +1196,6 @@ where
             active_turn_run_id: None,
             code_ui_session: app_config.code_ui_session,
             code_ui_runtime: app_config.code_ui_runtime,
-            code_control_rx: app_config.code_control_rx,
             managed_code_ui_runtime: app_config.managed_code_ui_runtime,
             local_turn_runtime: app_config.local_turn_runtime,
             local_turn_runtime_task: app_config.local_turn_runtime_task,
@@ -3693,53 +3688,6 @@ where
         self.schedule_draw();
     }
 
-    async fn handle_tui_control_command(&mut self, command: TuiControlCommand) {
-        match command {
-            TuiControlCommand::SubmitMessage { text, ack } => {
-                let result = self.submit_message_from_code_ui(text).await;
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::RespondInteraction {
-                interaction_id,
-                response,
-                ack,
-            } => {
-                let result = self
-                    .respond_pending_interaction_from_code_ui(&interaction_id, response)
-                    .await;
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::CancelCurrentTurn { ack } => {
-                let result = self.cancel_current_turn(CancelSource::Automation).await;
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::DropPendingAfterLeaseTakeover { ack } => {
-                self.drop_pending_after_lease_takeover().await;
-                let _ = ack.send(Ok(()));
-            }
-            TuiControlCommand::TaskDispatch { agent, prompt, ack } => {
-                let result = self.task_dispatch_from_control(agent, prompt).await;
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::ReclaimController { ack } => {
-                let result = self.reclaim_local_controller().await;
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::GoalStart { objective, ack } => {
-                let result = self.goal_session_start_from_control(objective);
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::GoalStatus { ack } => {
-                let result = self.goal_session_status_from_control();
-                let _ = ack.send(result);
-            }
-            TuiControlCommand::GoalCancel { reason, ack } => {
-                let result = self.goal_session_cancel_from_control(reason);
-                let _ = ack.send(result);
-            }
-        }
-    }
-
     /// `goal.start { objective }` — create an active Goal mirroring
     /// `/goal start <objective>`. Refuses if a Goal is already
     /// active in this session. The Code Control client receives
@@ -4131,25 +4079,6 @@ where
                 .controller
                 .lease_expires_at
                 .is_some_and(|expires_at| expires_at > Utc::now())
-    }
-
-    async fn reclaim_local_controller(&mut self) -> Result<(), TuiControlError> {
-        let Some(runtime) = self.code_ui_runtime.clone() else {
-            return Err(TuiControlError::ControllerConflict);
-        };
-        runtime
-            .reclaim_local_tui_controller()
-            .await
-            .map_err(|error| {
-                if error.code == "CONTROLLER_CONFLICT" {
-                    TuiControlError::ControllerConflict
-                } else {
-                    TuiControlError::Internal(error.message)
-                }
-            })?;
-        self.sync_mux_input_context();
-        self.schedule_draw();
-        Ok(())
     }
 
     async fn respond_pending_interaction_from_code_ui(
@@ -8988,26 +8917,12 @@ where
                 self.schedule_draw();
             }
             BuiltinCommand::Control => {
-                if args.trim().eq_ignore_ascii_case("reclaim") {
-                    match self.reclaim_local_controller().await {
-                        Ok(()) => {
-                            self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                                "Local TUI control reclaimed.".to_string(),
-                            )));
-                        }
-                        Err(error) => {
-                            self.widget
-                                .add_cell(Box::new(AssistantHistoryCell::new(format!(
-                                    "Unable to reclaim control: {}",
-                                    error.message()
-                                ))));
-                        }
-                    }
-                } else {
-                    self.widget.add_cell(Box::new(AssistantHistoryCell::new(
-                        "Usage: /control reclaim".to_string(),
-                    )));
-                }
+                // W5-02: the controller reclaim chain was deleted with the
+                // control bridge; this dead handler only reports the removal
+                // until W5-03 retires the module.
+                self.widget.add_cell(Box::new(AssistantHistoryCell::new(
+                    "Local TUI control was removed in the W5 breaking release.".to_string(),
+                )));
                 self.schedule_draw();
             }
             BuiltinCommand::Approvals => {

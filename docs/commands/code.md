@@ -270,6 +270,7 @@ Code UI API errors use `{ error: { code, message } }`:
 | `INVALID_CONTROLLER_KIND` | 400 | Controller attach requested an unsupported kind. |
 | `CONTROLLER_CONFLICT` | 409 | Another live controller owns the lease, or the session is busy. |
 | `INTERACTION_NOT_ACTIVE` | 409 | Respond targeted an interaction with no active runtime turn. |
+| `SESSION_BUSY` | 409 | Submit while a turn is already running, or cancel with no turn in flight (W5-02: UI-neutral successor to the removed TUI bridge code). |
 | `BROWSER_CONTROL_DISABLED` | 403 | Browser write control is disabled. |
 | `AUTOMATION_CONTROLLER_REQUIRED` | 403 | An automation-only path was called with a non-automation lease. |
 | `CODE_UI_UNAVAILABLE` | 404 | No active `libra code` session is attached to the web server. |

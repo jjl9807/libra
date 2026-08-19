@@ -1,84 +1,24 @@
-//! TUI automation control command channel.
+//! Residual types of the retired TUI control bridge (W5-02).
 //!
-//! `TuiControlCommand` is deliberately independent of `AppEvent`. `AppEvent` carries
-//! turn-scoped events (each variant exposes a `turn_id`), whereas automation
-//! respond / cancel / reclaim are control-plane commands that may span turns or
-//! occur when no turn is active. Mixing them would break the turn-scoped invariant
-//! and complicate the App event bus.
+//! The bridge proper — `TuiControlCommand`, its `code_control_rx` channel
+//! into the App event loop, and the `TuiCodeUiAdapter` HTTP relay — was
+//! deleted by W5-02/W5-06: `libra code --control stdio` talks to the
+//! runtime/Web control API directly and no TUI hop exists on any path.
 //!
-//! The App main loop consumes these commands through an additional branch in its
-//! `tokio::select!` (`code_control_rx.recv()`). Each command carries a `oneshot`
-//! ack so the HTTP handler can await acceptance or rejection (e.g. `Busy`,
-//! `InteractionNotActive`) without blocking the App event loop. The default ack
-//! timeout in the adapter is 30 seconds; the App must send the ack before that
-//! deadline or the automation client receives a timeout error.
+//! What remains here is MIGRATION-PERIOD residue for the dying
+//! `internal::tui` module only (module retirement is W5-03's axis):
+//! - [`TuiControlError`] — kept solely as the error type of `app.rs`'s
+//!   dead (`#[allow(dead_code)]`) turn machinery and as the historical
+//!   wire-code fixture its unit tests pin. Nothing constructs or
+//!   downcasts it outside this module; the live wire produces its codes
+//!   from the UI-neutral `CodeUiApiError` catalog (`web::code_ui`), where
+//!   `INTERACTION_NOT_ACTIVE` is the surviving member — `SESSION_BUSY`,
+//!   `GOAL_*` and `TASK_INVALID_REQUEST` left the wire when goal/task
+//!   control moved to the runtime APIs (W2/W3).
+//! - [`CancelSource`] — turn-cancel bookkeeping of the dead TUI event
+//!   loop, not part of the control bridge; dies with the module (W5-03).
 
 use std::fmt;
-
-use tokio::sync::oneshot;
-
-use crate::internal::ai::web::code_ui::CodeUiInteractionResponse;
-
-pub enum TuiControlCommand {
-    SubmitMessage {
-        text: String,
-        ack: oneshot::Sender<Result<(), TuiControlError>>,
-    },
-    RespondInteraction {
-        interaction_id: String,
-        response: CodeUiInteractionResponse,
-        ack: oneshot::Sender<Result<(), TuiControlError>>,
-    },
-    CancelCurrentTurn {
-        ack: oneshot::Sender<Result<(), TuiControlError>>,
-    },
-    /// W4-13: drop parked tool-approval / user-input interactions after a
-    /// controller lease takeover. Intent/Plan/network-policy gates stay.
-    DropPendingAfterLeaseTakeover {
-        ack: oneshot::Sender<Result<(), TuiControlError>>,
-    },
-    ReclaimController {
-        ack: oneshot::Sender<Result<(), TuiControlError>>,
-    },
-    /// `goal.start { objective }` — create an active Goal in the
-    /// session, mirroring `/goal start <objective>` (OC-Phase 6
-    /// P6.6). The acknowledgement carries the rendered status of
-    /// the freshly created Goal so the Code Control client can
-    /// surface the goal id without a follow-up `goal.status`.
-    GoalStart {
-        objective: String,
-        ack: oneshot::Sender<Result<String, TuiControlError>>,
-    },
-    /// `goal.status` — render the active Goal's snapshot. The
-    /// acknowledgement carries the formatted multi-line summary
-    /// (or an `InteractionNotActive`-equivalent status if no Goal
-    /// is in flight). Read-only; no controller-token required at
-    /// the HTTP layer (loopback observer mode).
-    GoalStatus {
-        ack: oneshot::Sender<Result<String, TuiControlError>>,
-    },
-    /// `goal.cancel { reason }` — explicit cancellation. Mirrors
-    /// `/goal cancel <reason>` and emits `GoalEvent::Cancelled`
-    /// into the session's event log.
-    GoalCancel {
-        reason: String,
-        ack: oneshot::Sender<Result<String, TuiControlError>>,
-    },
-    /// `task.dispatch { agent, prompt }` — user-initiated sub-agent
-    /// dispatch through the `task` tool, mirroring `/task <agent>
-    /// <prompt>`. The acknowledgement carries the rendered task
-    /// message so the Code Control client can show the task id and
-    /// summary without a follow-up status poll. Refuses with `Busy`
-    /// when the session is mid-turn / awaiting interaction, and
-    /// with `TaskInvalidRequest` when the `agent`+`prompt` pair
-    /// fails the dispatcher's shape rules (unknown agent, empty
-    /// prompt, oversized payload, etc.).
-    TaskDispatch {
-        agent: String,
-        prompt: String,
-        ack: oneshot::Sender<Result<String, TuiControlError>>,
-    },
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TuiControlError {

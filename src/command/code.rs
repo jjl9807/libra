@@ -3052,7 +3052,6 @@ async fn start_codex_code_ui_runtime(
             kind: CodeUiControllerKind::Cli,
             ..
         } => Some("cli".to_string()),
-        CodeUiInitialController::LocalTui { .. } => Some("managed-tui".to_string()),
         _ => Some("web".to_string()),
     };
     let plan_mode = effective_plan_mode(args);

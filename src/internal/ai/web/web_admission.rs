@@ -198,9 +198,15 @@ impl WebCodeUiAdmission {
                 }
                 .into());
             }
-            return Err(anyhow!(
-                "A turn is already running; cancel it or wait for the assistant to finish before sending another message"
-            ));
+            // W5-02: typed 409 SESSION_BUSY (UI-neutral successor to the
+            // removed TUI bridge's error) — a bare anyhow here fell through
+            // to the 422 UNSUPPORTED_OPERATION fallback and broke the
+            // state-matrix wire contract.
+            return Err(super::code_ui::CodeUiApiError::conflict(
+                "SESSION_BUSY",
+                "A turn is already running; cancel it or wait for the assistant to finish before sending another message",
+            )
+            .into());
         }
 
         let user_entry_id = format!("user-{}", Uuid::new_v4());
@@ -434,7 +440,14 @@ impl WebCodeUiAdmission {
             slot.as_ref().map(|turn| turn.runtime_turn_id.clone())
         };
         let Some(runtime_turn_id) = runtime_turn_id else {
-            return Ok(());
+            // W5-02: cancel with no turn in flight is a state conflict, not
+            // a silent success — the state matrix pins 409 SESSION_BUSY
+            // (the wire contract the TUI bridge used to serve).
+            return Err(super::code_ui::CodeUiApiError::conflict(
+                "SESSION_BUSY",
+                "No turn is currently running; there is nothing to cancel",
+            )
+            .into());
         };
         let runtime_interaction_id = runtime
             .snapshot(self.runtime_session_id.clone())
@@ -502,9 +515,14 @@ impl WebCodeUiAdmission {
             }
         }
         if mutation_in_progress {
-            return Err(anyhow!(
-                "A mutating tool is already running; cancellation waits for its determinate result and cannot safely abort it"
-            ));
+            // W5-02 / ADR-CODE-05 (W1-04): the cooperative cancellation was
+            // already requested from the runtime above; a mutating tool is
+            // never hard-aborted, the turn settles once the tool reports a
+            // determinate result. Refusing HERE misreported an accepted
+            // cooperative cancel as an HTTP error and broke the pinned
+            // `state_cancel_while_executing_tool_settles_running_tool_call`
+            // matrix case — acceptance is the contract.
+            return Ok(());
         }
         // Parked IntentSpec review (and other WaitingActive gates) finish
         // synchronously in the worker with no executor path left to call

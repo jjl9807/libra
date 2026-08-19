@@ -1908,12 +1908,14 @@ fn evaluate_snapshot_assertion(
     _lease_timestamps: &HashMap<String, chrono::DateTime<chrono::Utc>>,
 ) -> Result<bool> {
     match assertion {
-        "controller_kind_tui_or_none" => {
+        "controller_kind_none" => {
+            // W5-02: the LocalTui initial controller no longer exists — a
+            // released session settles to `none`, never `tui`.
             let kind = snapshot
                 .pointer("/controller/kind")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            Ok(kind == "tui" || kind == "none")
+            Ok(kind == "none")
         }
         "controller_can_write_false" => {
             let can_write = snapshot
@@ -2091,13 +2093,14 @@ fn evaluate_event_assertion(assertion: &str, event: &SseEvent, payload: &Value) 
                 bail!("expected /data/controller.kind == 'automation', got '{kind}'");
             }
         }
-        "event_data_controller_kind_tui_or_none" => {
+        "event_data_controller_kind_none" => {
+            // W5-02: see `controller_kind_none`.
             let kind = payload
                 .pointer("/data/controller/kind")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if kind != "tui" && kind != "none" {
-                bail!("expected /data/controller.kind in {{tui, none}}, got '{kind}'");
+            if kind != "none" {
+                bail!("expected /data/controller.kind 'none', got '{kind}'");
             }
         }
         other if other.starts_with("event_transcript_contains:") => {

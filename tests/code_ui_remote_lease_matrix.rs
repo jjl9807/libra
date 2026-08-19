@@ -70,7 +70,7 @@ lease_case!(lease_attach_renew_with_same_client_id_extends_expiry);
 lease_case!(lease_attach_conflict_when_other_client_holds);
 
 #[cfg(feature = "test-provider")]
-lease_case!(lease_detach_releases_to_local_tui);
+lease_case!(lease_detach_releases_to_none);
 
 #[cfg(feature = "test-provider")]
 lease_case!(lease_detach_with_wrong_controller_token_is_rejected);

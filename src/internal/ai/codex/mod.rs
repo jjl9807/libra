@@ -2494,8 +2494,11 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
             lock_or_warn(&self.tracked_turn_id, "codex tracked turn before start")
                 .and_then(|guard| guard.clone());
         if already_tracked.is_some() {
+            // W5-02: SESSION_BUSY is the shared turn-admission contract
+            // across headless and managed adapters (r18: the former
+            // Codex-private busy code split the wire surface).
             return Err(anyhow!(CodeUiApiError::conflict(
-                "TURN_ALREADY_ACTIVE",
+                "SESSION_BUSY",
                 "a Codex turn is already in progress; wait for it to finish or cancel first"
             )));
         }
@@ -2654,8 +2657,11 @@ impl CodeUiCommandAdapter for CodexCodeUiAdapter {
             .and_then(|guard| guard.clone());
         let declined_pending_approval = self.decline_pending_codex_approvals().await;
         let Some(turn_id) = turn_id else {
+            // W5-02: idle-cancel is SESSION_BUSY (shared admission
+            // contract); the interaction-scoped conflict code stays
+            // reserved for pending interaction responses.
             return Err(anyhow!(CodeUiApiError::conflict(
-                "INTERACTION_NOT_ACTIVE",
+                "SESSION_BUSY",
                 "no active Codex turn to cancel"
             )));
         };

@@ -172,7 +172,11 @@ fn state_cancel_while_executing_tool_settles_running_tool_call() -> Result<()> {
                         )
                 });
                 let assistant_settled = entries.iter().any(|entry| {
-                    entry.get("id").and_then(|value| value.as_str()) == Some("turn-1-assistant")
+                    // W5-02: match by KIND — the headless admission ids
+                    // assistant entries as `assistant-<uuid>`; the old
+                    // `turn-1-assistant` literal was the TUI adapter's id
+                    // scheme and died with it.
+                    entry.get("kind").and_then(|value| value.as_str()) == Some("assistant_message")
                         && entry.get("streaming").and_then(|value| value.as_bool()) != Some(true)
                         && !matches!(
                             entry.get("status").and_then(|value| value.as_str()),

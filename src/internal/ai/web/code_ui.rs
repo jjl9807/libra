@@ -1462,19 +1462,6 @@ impl CodeUiRuntimeHandle {
         result
     }
 
-    pub async fn reclaim_local_tui_controller(&self) -> Result<(), CodeUiApiError> {
-        let had_remote_lease = self
-            .controller_service
-            .reclaim_local_tui()
-            .await
-            .map_err(CodeUiApiError::from_controller_service)?;
-        if had_remote_lease && let Err(error) = self.adapter.on_controller_lease_takeover().await {
-            return Err(CodeUiApiError::unsupported_from_error(error));
-        }
-        self.sync_controller_snapshot().await;
-        Ok(())
-    }
-
     async fn acquire_controller_write_permit(
         &self,
         token: Option<&str>,
@@ -1621,15 +1608,6 @@ impl CodeUiApiError {
         if let Some(api_error) = error.downcast_ref::<CodeUiApiError>() {
             return api_error.clone();
         }
-        if let Some(control_error) =
-            error.downcast_ref::<crate::internal::tui::control::TuiControlError>()
-        {
-            return Self {
-                status: control_error.status(),
-                code: control_error.code().to_string(),
-                message: control_error.message(),
-            };
-        }
         if let Some(crate::internal::ai::runtime::RuntimeWorkerError::ReconciliationRequired {
             session_id,
         }) = error.downcast_ref::<crate::internal::ai::runtime::RuntimeWorkerError>()
@@ -1712,6 +1690,9 @@ pub fn code_ui_error_codes() -> &'static [(&'static str, u16)] {
         ("INVALID_CONTROLLER_KIND", 400),
         ("CONTROLLER_CONFLICT", 409),
         ("INTERACTION_NOT_ACTIVE", 409),
+        // Turn admission (W5-02: UI-neutral successor to the TUI bridge's
+        // SESSION_BUSY — submit while a turn runs, cancel with none running).
+        ("SESSION_BUSY", 409),
         ("BROWSER_CONTROL_DISABLED", 403),
         ("AUTOMATION_CONTROLLER_REQUIRED", 403),
         // Tail: read-side and runtime-availability errors.
@@ -2864,10 +2845,7 @@ mod tests {
             adapter.clone(),
             true,
             false,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: Some("Local TUI owns this session".to_string()),
-            },
+            CodeUiInitialController::Unclaimed,
         )
         .await;
 
@@ -2877,8 +2855,9 @@ mod tests {
             .expect("browser should attach");
         assert_eq!(
             adapter.takeover_count(),
-            1,
-            "TUI to remote attach is a takeover"
+            0,
+            "first attach from an unclaimed session is not a takeover (W5-02: \
+             the local-TUI initial owner no longer exists)"
         );
 
         runtime
@@ -2887,22 +2866,16 @@ mod tests {
             .expect("browser should detach");
         assert_eq!(
             adapter.takeover_count(),
-            2,
-            "detach must drop remote session approvals before TUI resumes"
+            1,
+            "detach must drop remote session approvals"
         );
     }
 
     #[tokio::test]
     async fn expired_remote_lease_invokes_takeover_hook_on_snapshot() {
         let adapter = RecordingCodeUiAdapter::new(test_session());
-        let mut options = CodeUiRuntimeOptions::new(
-            true,
-            false,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: Some("Local TUI owns this session".to_string()),
-            },
-        );
+        let mut options =
+            CodeUiRuntimeOptions::new(true, false, CodeUiInitialController::Unclaimed);
         options.lease_duration = Some(Duration::milliseconds(1));
         let runtime = CodeUiRuntimeHandle::build_with_options(adapter.clone(), options).await;
 
@@ -2910,15 +2883,19 @@ mod tests {
             .attach_browser_controller("browser-a")
             .await
             .expect("browser should attach");
-        assert_eq!(adapter.takeover_count(), 1);
+        assert_eq!(
+            adapter.takeover_count(),
+            0,
+            "first attach from an unclaimed session is not a takeover (W5-02)"
+        );
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let snapshot = runtime.snapshot().await;
-        assert_eq!(snapshot.controller.kind, CodeUiControllerKind::Tui);
+        assert_eq!(snapshot.controller.kind, CodeUiControllerKind::None);
         assert_eq!(
             adapter.takeover_count(),
-            2,
-            "expiry must drop remote session approvals before local TUI resumes"
+            1,
+            "expiry must drop remote session approvals"
         );
     }
 
@@ -3090,81 +3067,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_tui_owner_allows_automation_takeover_and_reclaim() {
-        let adapter = RecordingCodeUiAdapter::new(test_session());
-        let runtime = CodeUiRuntimeHandle::build_with_control(
-            adapter.clone(),
-            false,
-            true,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: Some("Local TUI owns this session".to_string()),
-            },
-        )
-        .await;
-
-        let initial = runtime.snapshot().await;
-        assert_eq!(initial.controller.kind, CodeUiControllerKind::Tui);
-        assert!(!initial.controller.can_write);
-
-        let attach = runtime
-            .attach_controller(CodeUiControllerKind::Automation, "automation-a")
-            .await
-            .expect("automation should attach");
-        assert_eq!(attach.controller.kind, CodeUiControllerKind::Automation);
-        assert!(attach.controller.can_write);
-        assert_eq!(
-            adapter.takeover_count(),
-            1,
-            "first remote attach from local TUI must invalidate TUI-issued approvals"
-        );
-
-        let lease = runtime
-            .ensure_controller_write_access(Some(&attach.controller_token))
-            .await
-            .expect("automation token should authorize writes");
-        assert_eq!(lease.kind, CodeUiControllerKind::Automation);
-
-        runtime
-            .reclaim_local_tui_controller()
-            .await
-            .expect("local TUI should reclaim controller");
-        assert_eq!(
-            adapter.takeover_count(),
-            2,
-            "reclaim must invalidate prior-controller approvals"
-        );
-        runtime
-            .reclaim_local_tui_controller()
-            .await
-            .expect("redundant reclaim should succeed");
-        assert_eq!(
-            adapter.takeover_count(),
-            2,
-            "redundant reclaim must not drop current-controller approvals"
-        );
-
-        let reclaimed = runtime.snapshot().await;
-        assert_eq!(reclaimed.controller.kind, CodeUiControllerKind::Tui);
-        assert!(!reclaimed.controller.can_write);
-
-        let stale = runtime
-            .ensure_controller_write_access(Some(&attach.controller_token))
-            .await
-            .expect_err("automation token must be invalid after reclaim");
-        assert_eq!(stale.status, 409);
-        assert_eq!(stale.code, "CONTROLLER_CONFLICT");
-    }
-
-    #[tokio::test]
     async fn automation_attach_is_disabled_without_control_mode() {
         let runtime = CodeUiRuntimeHandle::build(
             ReadOnlyCodeUiAdapter::new(test_session(), CodeUiCapabilities::default()),
             false,
-            CodeUiInitialController::LocalTui {
-                owner_label: "Terminal UI".to_string(),
-                reason: None,
-            },
+            CodeUiInitialController::Unclaimed,
         )
         .await;
 

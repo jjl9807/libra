@@ -176,7 +176,7 @@
           "timeoutMs": 5000,
           "expect": {
             "assertions": [
-              "event_data_controller_kind_tui_or_none"
+              "event_data_controller_kind_none"
             ]
           }
         }

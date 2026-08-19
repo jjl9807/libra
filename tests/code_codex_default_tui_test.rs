@@ -205,3 +205,40 @@ fn walk_rs_files(root: PathBuf, mut visit: impl FnMut(&PathBuf, &str)) {
         }
     }
 }
+
+/// W5-02 (Codex r18): the managed Codex adapter shares the turn-admission
+/// wire contract — busy submit and idle cancel are `SESSION_BUSY`, never a
+/// Codex-private code. `INTERACTION_NOT_ACTIVE` stays scoped to pending
+/// interaction responses.
+#[test]
+fn codex_adapter_uses_shared_session_busy_contract() {
+    let source = read_file("src/internal/ai/codex/mod.rs");
+    assert!(
+        !source.contains("TURN_ALREADY_ACTIVE"),
+        "managed Codex must not mint a private busy code; use SESSION_BUSY"
+    );
+    // Branch 1: busy submit — the SESSION_BUSY code adjacent to the
+    // in-progress message.
+    let busy_submit = source
+        .find("a Codex turn is already in progress")
+        .expect("busy-submit message present");
+    let submit_window = &source[busy_submit.saturating_sub(200)..busy_submit];
+    assert!(
+        submit_window.contains("\"SESSION_BUSY\""),
+        "busy submit must map to SESSION_BUSY"
+    );
+    // Branch 2: idle cancel — the SESSION_BUSY code adjacent to the
+    // nothing-to-cancel message.
+    let idle_cancel = source
+        .find("no active Codex turn to cancel")
+        .expect("idle-cancel message present");
+    let cancel_window = &source[idle_cancel.saturating_sub(200)..idle_cancel];
+    assert!(
+        cancel_window.contains("\"SESSION_BUSY\""),
+        "idle cancel must map to SESSION_BUSY, not INTERACTION_NOT_ACTIVE"
+    );
+    assert!(
+        !cancel_window.contains("INTERACTION_NOT_ACTIVE"),
+        "idle cancel must not be reported as INTERACTION_NOT_ACTIVE"
+    );
+}

@@ -212,16 +212,18 @@ command id，故该 adapter 临时使用 worker turn id；W3 的 versioned contr
 ### W1-07 Controller lease 与 fencing boundary
 
 `runtime::ControllerService` 是每个 Code session 的 controller owner：它持有 remote
-browser/automation lease、TTL、opaque fence generation 与 local-TUI reclaim state。Web、TUI
-和 control client 只能请求 attach/detach/reclaim 或将现有 token 交给 service；它们不保存
+browser/automation lease、TTL 与 opaque fence generation（W5-02 起不再有 local-TUI
+reclaim state——控制权变更只余 attach/detach/expiry 三径）。Web 和 control client
+只能请求 attach/detach 或将现有 token 交给 service；它们不保存
 可写 owner 的第二份本地状态。每次 mutating adapter dispatch 都先取得
 `ControllerWritePermit`，permit 在 dispatch 边界内保持 controller-state lock，因此
-detach、expiry replacement 或 local-TUI reclaim 不能在「token 校验成功」与「开始写入」之间
-插入。permit 释放后旧 token 即不可再写入。
+detach 或 expiry replacement 不能在「token 校验成功」与「开始写入」之间插入
+（W5-02 前还包括 local-TUI reclaim,现已删除）。permit 释放后旧 token 即不可再写入。
 
 remote attach 只接受 browser/automation；同一 client 的 attach 只续期，其他 live owner 返回
 稳定 `CONTROLLER_CONFLICT`。detach 必须同时匹配 controller kind、client ID 与 lease token；
-local reclaim 仅对以 `LocalTui` 启动的 runtime 开放。该内存内 runtime fence 不替代
+local reclaim（`LocalTui` 初始控制器专属）已随 W5-02 的 control bridge 删除一并移除——
+`LocalTui` 变体、`reclaim_local_tui_controller` 链与 `/control reclaim` 均不复存在。该内存内 runtime fence 不替代
 W3-10 的跨 worktree sidecar/file fence，且不承担 turn serialization（仍归 W1-01）。
 
 ### W1-06 projection/resume 当前边界（进行中）
@@ -267,7 +269,7 @@ W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际
 |---|---|---|
 | `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`（W5-08 已随 interactive 入口删除一并移除）。 | W4-04/W5-08 → W5-10（仅余依赖摘除）。 |
 | `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI（W5-08 已一并移除）。 | W5-08 已解耦；W5-10 负责依赖摘除与守卫。 |
-| `src/internal/ai/web/code_ui.rs:1266` | `TuiControlError` downcast 是 Web API 的编译期耦合。 | W5-02 先迁为 UI-neutral error。 |
+| `src/internal/ai/web/code_ui.rs`（原 `:1266` downcast） | `TuiControlError` downcast 曾是 Web API 的编译期耦合（W5-02 已删除；wire code 由 UI-neutral `CodeUiApiError` 目录产生，`TuiControlError` 仅存于垂死 tui 模块作迁移期 fixture）。 | W5-02 已完成；类型本体随 W5-03 模块退场消亡。 |
 | `src/command/code.rs` `execute_tui`（原 `:1561`） | Code TUI startup/adapter（W5-06 已删除）。 | W5-06 已随 TUI 启动路径一并删除。 |
 | `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 清理链接即可。 |
 

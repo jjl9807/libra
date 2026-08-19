@@ -52,8 +52,9 @@ mod agent_run_pane;
 mod app;
 // Typed bus carrying events between agent and UI.
 mod app_event;
-// Local automation control commands formerly consumed by the TUI event loop;
-// `TuiControlError` is still downcast by `web::code_ui` (W5-02 scope).
+// W5-02 retired the control bridge (`TuiControlCommand` + the `web::code_ui`
+// downcast); only migration-period residue for the dying module remains here
+// and dies with it in W5-03.
 pub mod control;
 // Composer, popups, focus state machine.
 #[allow(dead_code)]
