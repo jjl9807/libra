@@ -6,9 +6,12 @@
 //! [`super::agent_runtime_adapter::AgentRuntimeCodeUiAdapter`] owns the
 //! browser write path.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -34,6 +37,15 @@ use crate::internal::ai::runtime::{
 /// `headless_direct_turn` kind so default Web `--resume` retries of a prior
 /// `commandId` still match the stored `CodeCommandIntent` (idempotent ACK).
 pub const CODE_UI_WEB_TURN_KIND: &str = "headless_direct_turn";
+
+/// A turn is durable-admitted before the executor may run tools. This compact
+/// state lets cancellation win while the executor is waiting on admission's
+/// mutex without making graceful shutdown wait for slow session storage.
+pub(crate) const PRE_START_UNSTARTED: u8 = 0;
+pub(crate) const PRE_START_CANCELLED: u8 = 1;
+pub(crate) const PRE_START_STARTED: u8 = 2;
+
+pub(crate) type PreStartTurn = Arc<Mutex<Option<(String, Arc<AtomicU8>)>>>;
 
 /// How a browser message is admitted into the worker executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +91,10 @@ pub(crate) struct InFlightTurn {
 /// Shared admission state for web-owned Code UI command writes.
 pub struct WebCodeUiAdmission {
     pub(crate) in_flight: Arc<Mutex<Option<InFlightTurn>>>,
+    /// Bounded one-turn handoff used only while admission has not opened the
+    /// executor start gate. A new admission overwrites the prior terminal
+    /// entry, so it cannot grow with session history.
+    pub(crate) pre_start_turn: PreStartTurn,
     pub(crate) admitted_command_inputs: Arc<Mutex<std::collections::HashMap<String, String>>>,
     pub(crate) next_turn_id: Arc<AtomicU64>,
     pub(crate) active_turn_mutations:
@@ -97,12 +113,14 @@ impl WebCodeUiAdmission {
         runtime_session_id: String,
         persistence: Option<HeadlessSessionPersistence>,
         in_flight: Arc<Mutex<Option<InFlightTurn>>>,
+        pre_start_turn: PreStartTurn,
         active_turn_mutations: Arc<Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>>,
         pending_intent_reviews: Arc<Mutex<std::collections::HashMap<String, String>>>,
         shutting_down: Arc<AtomicBool>,
     ) -> Arc<Self> {
         Arc::new(Self {
             in_flight,
+            pre_start_turn,
             admitted_command_inputs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             active_turn_mutations,
@@ -236,6 +254,7 @@ impl WebCodeUiAdmission {
         };
         let start_gate = Arc::new(tokio::sync::Notify::new());
         let start_open = Arc::new(AtomicBool::new(false));
+        let pre_start_state = Arc::new(AtomicU8::new(PRE_START_UNSTARTED));
         let completion = Arc::new(tokio::sync::Notify::new());
         let completion_for_rollback = completion.clone();
         *slot = Some(InFlightTurn {
@@ -247,6 +266,8 @@ impl WebCodeUiAdmission {
             start_open: start_open.clone(),
             completion,
         });
+        *self.pre_start_turn.lock().await =
+            Some((runtime_turn_id.clone(), pre_start_state.clone()));
 
         if let Err(error) = runtime
             .submit(TurnRequest::new(
@@ -324,7 +345,6 @@ impl WebCodeUiAdmission {
             }
         }
 
-        drop(slot);
         if let Some(persistence) = self.persistence.as_ref() {
             let mut durable_snapshot = session.snapshot().await;
             durable_snapshot.transcript.push(user_entry.clone());
@@ -335,6 +355,10 @@ impl WebCodeUiAdmission {
                 .record_user_message(durable_snapshot, &text)
                 .await
             {
+                // The executor needs this slot to observe the closed start
+                // gate and release it after cancellation. Do not retain the
+                // admission lock while waiting for that completion.
+                drop(slot);
                 self.cancel_gated_runtime_turn(runtime, &runtime_turn_id, completion_for_rollback)
                     .await?;
                 return Err(anyhow!(
@@ -342,11 +366,106 @@ impl WebCodeUiAdmission {
                 ));
             }
         }
-        session.upsert_transcript_entry(user_entry).await;
-        session.upsert_transcript_entry(assistant_entry).await;
+        if self.shutting_down.load(Ordering::Acquire)
+            || pre_start_state.load(Ordering::Acquire) == PRE_START_CANCELLED
+        {
+            // Shutdown cancelled the worker while the durable admission write
+            // was in flight. Its executor returned without acquiring this
+            // lock, so admission owns the one terminal browser/durable
+            // projection and must not publish a fresh Thinking turn.
+            pre_start_state.store(PRE_START_CANCELLED, Ordering::Release);
+            drop(slot);
+            self.settle_cancelled_before_start(
+                session,
+                user_entry,
+                assistant_entry,
+                &runtime_turn_id,
+            )
+            .await?;
+            return Ok(());
+        }
+        session.upsert_transcript_entry(user_entry.clone()).await;
+        session
+            .upsert_transcript_entry(assistant_entry.clone())
+            .await;
         session.set_status(CodeUiSessionStatus::Thinking).await;
+        if pre_start_state
+            .compare_exchange(
+                PRE_START_UNSTARTED,
+                PRE_START_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // Cancellation won while live projections were being appended.
+            // Do not open the tool gate; replace the just-published streaming
+            // entry with the one terminal no-tool result.
+            drop(slot);
+            self.settle_cancelled_before_start(
+                session,
+                user_entry,
+                assistant_entry,
+                &runtime_turn_id,
+            )
+            .await?;
+            return Ok(());
+        }
         start_open.store(true, Ordering::Release);
         start_gate.notify_waiters();
+        // Keep the admission slot locked until the durable and live
+        // projections are both visible and the start gate is open. An executor
+        // cancelled while waiting for this lock returns promptly; the
+        // shutdown branch above then commits the sole terminal projection
+        // instead of letting this tail republish Thinking.
+        drop(slot);
+        Ok(())
+    }
+
+    /// Commit a terminal, no-tool cancellation when cancellation wins before
+    /// admission opens the executor start gate. The worker cannot safely
+    /// write this projection because it was cancelled before obtaining the
+    /// admission slot.
+    async fn settle_cancelled_before_start(
+        &self,
+        session: &Arc<CodeUiSession>,
+        user_entry: CodeUiTranscriptEntry,
+        mut assistant_entry: CodeUiTranscriptEntry,
+        runtime_turn_id: &str,
+    ) -> anyhow::Result<()> {
+        assistant_entry.content = Some("(turn cancelled before execution started)".to_string());
+        assistant_entry.status = Some("cancelled".to_string());
+        assistant_entry.streaming = false;
+        assistant_entry.updated_at = Utc::now();
+        session.upsert_transcript_entry(user_entry).await;
+        session.upsert_transcript_entry(assistant_entry).await;
+        session.set_status(CodeUiSessionStatus::Idle).await;
+
+        if let Some(persistence) = self.persistence.as_ref()
+            && let Err(error) = persistence.persist_snapshot(session.snapshot().await).await
+        {
+            // The durable admission projection is still Thinking if this
+            // correction cannot be written. Do not let the in-memory Idle
+            // state imply that it is safe to resume: fence the session and
+            // make one best-effort durable record of that reconciliation
+            // boundary before returning the admission error.
+            session
+                .set_status(CodeUiSessionStatus::IndeterminateSideEffect)
+                .await;
+            if let Err(reconciliation_error) =
+                persistence.persist_snapshot(session.snapshot().await).await
+            {
+                tracing::error!(
+                    error = %reconciliation_error,
+                    "failed to persist reconciliation state after shutdown-cancelled web admission"
+                );
+            }
+            release_web_turn(&self.in_flight, runtime_turn_id).await;
+            return Err(anyhow!(
+                "Unable to persist the shutdown-cancelled headless web turn; the durable session may still show a running turn and requires reconciliation before resuming: {error}"
+            ));
+        }
+        release_web_turn(&self.in_flight, runtime_turn_id).await;
         Ok(())
     }
 
@@ -375,19 +494,41 @@ impl WebCodeUiAdmission {
         let response_payload = serde_json::to_string(&response).map_err(|error| {
             anyhow!("Unable to encode the interaction response for AgentRuntime delivery: {error}")
         })?;
-        runtime
-            .respond(
-                self.runtime_session_id.clone(),
-                runtime_turn_id,
-                crate::internal::ai::runtime::InteractionResponse::new(
-                    interaction_id,
-                    response_payload,
-                ),
-            )
-            .await
-            .map_err(|error| {
-                anyhow!("Unable to deliver the interaction response to AgentRuntime: {error}")
-            })?;
+        // The executor projects the pending interaction before the worker
+        // commits its `AwaitingInteraction` state. A browser can therefore
+        // reply during that one actor turn. `UnknownInteraction` is
+        // indistinguishable from a stale browser id at this boundary, so use
+        // one documented, bounded registration-race window for that error
+        // only; every other runtime error fails closed immediately.
+        const INTERACTION_REGISTRATION_RETRIES: u8 = 50;
+        const INTERACTION_REGISTRATION_RETRY_DELAY: Duration = Duration::from_millis(10);
+        let mut attempts = 0;
+        loop {
+            match runtime
+                .respond(
+                    self.runtime_session_id.clone(),
+                    runtime_turn_id.clone(),
+                    crate::internal::ai::runtime::InteractionResponse::new(
+                        interaction_id,
+                        response_payload.clone(),
+                    ),
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(RuntimeWorkerError::UnknownInteraction { .. })
+                    if attempts < INTERACTION_REGISTRATION_RETRIES =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(INTERACTION_REGISTRATION_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "Unable to deliver the interaction response to AgentRuntime: {error}"
+                    ));
+                }
+            }
+        }
         // Persist workflow InteractionResolved + Code UI snapshot only after
         // the worker accepted an IntentSpec review response (terminal durability
         // succeeded). Ordinary user-input / approval responses are already
@@ -597,12 +738,30 @@ impl WebCodeUiAdmission {
         runtime_turn_id: &str,
         completion: Arc<tokio::sync::Notify>,
     ) -> anyhow::Result<()> {
+        // Register before sending cancellation: Notify does not retain a
+        // broadcast for a future, unregistered waiter. Bound the wait as a
+        // second line of defence so a damaged worker cannot leave admission
+        // wedged after a failed durable preflight.
         let cancellation_finished = completion.notified();
+        tokio::pin!(cancellation_finished);
+        cancellation_finished.as_mut().enable();
         match runtime
             .cancel(self.runtime_session_id.clone(), runtime_turn_id.to_string())
             .await
         {
-            Ok(()) => cancellation_finished.await,
+            Ok(()) => {
+                const GATED_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+                if tokio::time::timeout(GATED_CANCEL_SETTLE_TIMEOUT, cancellation_finished.as_mut())
+                    .await
+                    .is_err()
+                {
+                    release_web_turn(&self.in_flight, runtime_turn_id).await;
+                    return Err(anyhow!(
+                        "The cancelled AgentRuntime turn did not settle within {} seconds; its browser admission was released and the runtime should be inspected before retrying",
+                        GATED_CANCEL_SETTLE_TIMEOUT.as_secs()
+                    ));
+                }
+            }
             Err(RuntimeWorkerError::UnknownTurn { .. }) => {
                 release_web_turn(&self.in_flight, runtime_turn_id).await;
             }
@@ -646,16 +805,22 @@ pub(crate) async fn wait_for_web_turn_start(
     cancellation: tokio_util::sync::CancellationToken,
 ) -> bool {
     loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
         if start_open.load(Ordering::Acquire) {
             return true;
         }
         let notified = start_gate.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if start_open.load(Ordering::Acquire) {
             return true;
         }
         tokio::select! {
-            _ = notified => {}
+            biased;
             _ = cancellation.cancelled() => return false,
+            _ = &mut notified => {}
         }
     }
 }

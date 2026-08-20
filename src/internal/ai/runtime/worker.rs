@@ -277,7 +277,7 @@ pub enum RuntimeTurnExecution {
     Completed {
         summary: String,
     },
-    /// Finish the active turn as [`Completed`], but cancel every turn already
+    /// Finish the active turn as `Completed`, but cancel every turn already
     /// queued for the session instead of admitting them via
     /// [`AgentRuntimeWorker::start_next_if_idle`].
     ///
@@ -287,7 +287,7 @@ pub enum RuntimeTurnExecution {
     CompletedDiscardQueued {
         summary: String,
     },
-    /// Finish the active turn as [`Completed`] without admitting the next
+    /// Finish the active turn as `Completed` without admitting the next
     /// queued turn, and keep [`SessionQueue::hold_queued_admission`] set until a
     /// follow-up gate turn is tracked. Used when an adapter is about to park
     /// the next human gate (Plan review → network policy, IntentSpec review,

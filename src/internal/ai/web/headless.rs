@@ -45,7 +45,8 @@ use super::{
     },
     sse_wire::CodeUiWorkflowHub,
     web_admission::{
-        CODE_UI_WEB_TURN_KIND, InFlightTurn, WebCodeUiAdmission, WebTurnMode, release_web_turn,
+        CODE_UI_WEB_TURN_KIND, InFlightTurn, PRE_START_CANCELLED, PRE_START_STARTED,
+        PRE_START_UNSTARTED, PreStartTurn, WebCodeUiAdmission, WebTurnMode, release_web_turn,
         wait_for_web_turn_start,
     },
 };
@@ -140,11 +141,83 @@ pub struct HeadlessSessionPersistence {
     durability_session_id: String,
     /// Fan-out for SSE wire v2 (same durable sequence as projection appends).
     workflow_hub: Arc<CodeUiWorkflowHub>,
+    #[cfg(feature = "test-provider")]
+    record_user_message_hook: Option<HeadlessRecordUserMessageHook>,
 }
 
 struct HeadlessProjectionCheckpoint {
     snapshot: CodeUiSessionSnapshot,
     sequence: u64,
+}
+
+/// Deterministic test-provider hook for pausing the durable admission write.
+///
+/// This is feature-gated so production code has no test timing surface. It
+/// lets the Code UI regression suite prove that shutdown cannot finalize a
+/// turn between durable admission and opening the executor start gate.
+#[cfg(feature = "test-provider")]
+#[derive(Clone)]
+pub struct HeadlessRecordUserMessageHook {
+    entered: Arc<AtomicBool>,
+    released: Arc<AtomicBool>,
+    entered_notify: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(feature = "test-provider")]
+impl HeadlessRecordUserMessageHook {
+    pub fn new() -> Self {
+        Self {
+            entered: Arc::new(AtomicBool::new(false)),
+            released: Arc::new(AtomicBool::new(false)),
+            entered_notify: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub async fn wait_until_entered(&self) {
+        loop {
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.entered_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+        loop {
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[cfg(feature = "test-provider")]
+impl Default for HeadlessRecordUserMessageHook {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HeadlessSessionPersistence {
@@ -176,7 +249,16 @@ impl HeadlessSessionPersistence {
             durability_repo_id: state.working_dir.clone(),
             durability_session_id: state.id.clone(),
             workflow_hub,
+            #[cfg(feature = "test-provider")]
+            record_user_message_hook: None,
         })
+    }
+
+    /// Add a deterministic durable-admission pause for test-provider tests.
+    #[cfg(feature = "test-provider")]
+    pub fn with_record_user_message_hook(mut self, hook: HeadlessRecordUserMessageHook) -> Self {
+        self.record_user_message_hook = Some(hook);
+        self
     }
 
     /// SSE wire v2 durable fan-out for this session.
@@ -208,6 +290,10 @@ impl HeadlessSessionPersistence {
         snapshot: CodeUiSessionSnapshot,
         content: &str,
     ) -> io::Result<()> {
+        #[cfg(feature = "test-provider")]
+        if let Some(hook) = self.record_user_message_hook.as_ref() {
+            hook.wait().await;
+        }
         let sequence = self.persist_projection_deltas(&snapshot).await?;
         let mut state = self.state.lock().await;
         state.add_user_message(content);
@@ -589,7 +675,7 @@ impl RuntimeInteractionDelivery for HeadlessInteractionDelivery {
                 session
                     .resolve_interaction(&interaction.interaction_id)
                     .await;
-                session.set_status(CodeUiSessionStatus::Idle).await;
+                set_status_if_recoverable(&session, CodeUiSessionStatus::Idle).await;
                 pending_intent_reviews.lock().await.remove(&request.turn_id);
                 active_turn_mutations.lock().await.remove(&request.turn_id);
                 release_web_turn(&in_flight, &request.turn_id).await;
@@ -627,6 +713,7 @@ struct HeadlessTurnExecutor<M: CompletionModel + 'static> {
     config_factory:
         Arc<dyn Fn() -> super::super::agent::runtime::tool_loop::ToolLoopConfig + Send + Sync>,
     in_flight: Arc<Mutex<Option<InFlightTurn>>>,
+    pre_start_turn: PreStartTurn,
     active_turn_mutations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     shutdown_timed_out: Arc<AtomicBool>,
     /// A browser interaction response or request could not be durably
@@ -642,6 +729,65 @@ struct HeadlessTurnExecutor<M: CompletionModel + 'static> {
     pending_intent_revision: Arc<Mutex<Option<PendingIntentRevision>>>,
     /// Optional MCP server for formal Phase 0 `write_intent` persistence.
     mcp_server: Option<Arc<crate::internal::ai::mcp::server::LibraMcpServer>>,
+}
+
+impl<M: CompletionModel + 'static> HeadlessTurnExecutor<M> {
+    /// A late terminal result must not erase an earlier reconciliation
+    /// boundary merely because the worker eventually returned.
+    async fn preserve_reconciliation(&self) -> bool {
+        self.shutdown_timed_out.load(Ordering::Acquire)
+            || self.interaction_persistence_failed.load(Ordering::Acquire)
+            || matches!(
+                self.session.snapshot().await.status,
+                CodeUiSessionStatus::IndeterminateSideEffect
+            )
+    }
+
+    async fn set_terminal_status_if_recoverable(&self, status: CodeUiSessionStatus) {
+        if !self.preserve_reconciliation().await {
+            set_status_if_recoverable(&self.session, status).await;
+        }
+    }
+
+    /// Return whether cancellation won before admission committed the start
+    /// gate. This state is independent of `in_flight`, so shutdown does not
+    /// need to wait for a slow durable admission write merely to learn it.
+    async fn cancellation_precedes_start(&self, turn_id: &str) -> bool {
+        let signal = self
+            .pre_start_turn
+            .lock()
+            .await
+            .as_ref()
+            .filter(|(candidate_turn_id, _)| candidate_turn_id == turn_id)
+            .map(|(_, signal)| signal.clone());
+        let Some(signal) = signal else {
+            return false;
+        };
+        match signal.compare_exchange(
+            PRE_START_UNSTARTED,
+            PRE_START_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(PRE_START_CANCELLED) => true,
+            Err(PRE_START_STARTED) => false,
+            Err(_) => true,
+        }
+    }
+}
+
+/// A delayed terminal callback must never turn an existing reconciliation
+/// boundary back into a superficially healthy terminal state. Callers that
+/// have additional in-flight failure markers use
+/// `HeadlessTurnExecutor::set_terminal_status_if_recoverable`; standalone
+/// interaction callbacks use this snapshot guard.
+async fn set_status_if_recoverable(session: &CodeUiSession, status: CodeUiSessionStatus) {
+    if !matches!(
+        session.snapshot().await.status,
+        CodeUiSessionStatus::IndeterminateSideEffect
+    ) {
+        session.set_status(status).await;
+    }
 }
 
 pub struct HeadlessCodeRuntime<M: CompletionModel + 'static> {
@@ -778,6 +924,7 @@ where
     ) -> anyhow::Result<Arc<Self>> {
         let (shutdown_result_tx, _) = watch::channel(None);
         let in_flight = Arc::new(Mutex::new(None));
+        let pre_start_turn = Arc::new(Mutex::new(None));
         let history = Arc::new(Mutex::new(initial_history));
         let shutdown_timed_out = Arc::new(AtomicBool::new(false));
         let interaction_persistence_failed = Arc::new(AtomicBool::new(false));
@@ -813,6 +960,7 @@ where
             registry,
             config_factory,
             in_flight: in_flight.clone(),
+            pre_start_turn: pre_start_turn.clone(),
             active_turn_mutations: active_turn_mutations.clone(),
             shutdown_timed_out: shutdown_timed_out.clone(),
             interaction_persistence_failed: interaction_persistence_failed.clone(),
@@ -866,6 +1014,7 @@ where
             runtime_session_id.clone(),
             persistence.clone(),
             in_flight.clone(),
+            pre_start_turn,
             active_turn_mutations.clone(),
             pending_intent_reviews.clone(),
             shutting_down.clone(),
@@ -972,7 +1121,7 @@ where
         Ok(runtime)
     }
 
-    /// Production write-path adapter mounted on [`CodeUiRuntimeHandle`].
+    /// Production write-path adapter mounted on `CodeUiRuntimeHandle`.
     pub fn command_adapter(&self) -> Arc<AgentRuntimeCodeUiAdapter> {
         self.runtime_bridge.clone()
     }
@@ -1187,7 +1336,7 @@ where
                 updated_at: Utc::now(),
             })
             .await;
-        self.session.set_status(CodeUiSessionStatus::Idle).await;
+        set_status_if_recoverable(&self.session, CodeUiSessionStatus::Idle).await;
         Ok(())
     }
 }
@@ -1203,8 +1352,34 @@ where
         request: TurnRequest,
         context: RuntimeExecutionContext,
     ) -> Result<RuntimeTurnExecution, RuntimeWorkerError> {
+        let cancellation = context.cancellation();
         let (assistant_entry_id, start_gate, start_open, turn_mode) = {
-            let slot = self.in_flight.lock().await;
+            let maybe_slot = {
+                let slot_lock = self.in_flight.lock();
+                tokio::pin!(slot_lock);
+                tokio::select! {
+                    slot = &mut slot_lock => Some(slot),
+                    _ = cancellation.cancelled() => None,
+                }
+            };
+            let slot = match maybe_slot {
+                Some(slot) => slot,
+                None if self.cancellation_precedes_start(&request.turn_id).await => {
+                    // Admission owns the durable correction when shutdown
+                    // wins before its start gate opens, but it cannot clear
+                    // this slot while holding the admission mutex. Release
+                    // asynchronously so the queued worker's cancellation is
+                    // observable to the preflight rollback and a follow-up
+                    // browser turn can never remain stuck behind it.
+                    let in_flight = self.in_flight.clone();
+                    let runtime_turn_id = request.turn_id.clone();
+                    tokio::spawn(async move {
+                        release_web_turn(&in_flight, &runtime_turn_id).await;
+                    });
+                    return Err(RuntimeWorkerError::Cancelled);
+                }
+                None => self.in_flight.lock().await,
+            };
             let turn = slot
                 .as_ref()
                 .filter(|turn| turn.runtime_turn_id == request.turn_id)
@@ -1222,7 +1397,40 @@ where
             )
         };
 
-        if !wait_for_web_turn_start(&start_gate, &start_open, context.cancellation()).await {
+        if !wait_for_web_turn_start(&start_gate, &start_open, cancellation.clone()).await {
+            let assistant_is_published = self
+                .session
+                .snapshot()
+                .await
+                .transcript
+                .iter()
+                .any(|entry| entry.id == assistant_entry_id);
+            if assistant_is_published {
+                // This cancellation arrived after live admission but before
+                // a tool boundary. A durability-preflight rollback has no
+                // live entry and deliberately leaves persistence untouched.
+                finalize_assistant_entry(
+                    &self.session,
+                    &assistant_entry_id,
+                    "(turn cancelled before execution started)",
+                    "cancelled",
+                )
+                .await;
+                self.set_terminal_status_if_recoverable(CodeUiSessionStatus::Idle)
+                    .await;
+                if let Some(persistence) = self.persistence.as_ref()
+                    && let Err(error) = persistence
+                        .persist_snapshot(self.session.snapshot().await)
+                        .await
+                {
+                    mark_persistence_failure(
+                        &self.session,
+                        "failed to persist headless web turn cancelled before execution",
+                        error,
+                    )
+                    .await;
+                }
+            }
             release_web_turn(&self.in_flight, &request.turn_id).await;
             return Err(RuntimeWorkerError::Cancelled);
         }
@@ -1272,7 +1480,6 @@ where
             context.cancellation(),
             mutation_started,
         ));
-        let cancellation = context.cancellation();
         let request_input = if turn_mode == WebTurnMode::PlanPhase0 {
             let pending_revision = self.pending_intent_revision.lock().await.take();
             if let Some(pending) = pending_revision {
@@ -1387,7 +1594,8 @@ where
                         "completed",
                     )
                     .await;
-                    self.session.set_status(CodeUiSessionStatus::Idle).await;
+                    self.set_terminal_status_if_recoverable(CodeUiSessionStatus::Idle)
+                        .await;
                     if let Some(persistence) = self.persistence.as_ref()
                         && let Err(error) = persistence
                             .record_assistant_message(
@@ -1431,7 +1639,8 @@ where
                         "cancelled",
                     )
                     .await;
-                    self.session.set_status(CodeUiSessionStatus::Idle).await;
+                    self.set_terminal_status_if_recoverable(CodeUiSessionStatus::Idle)
+                        .await;
                     if let Some(persistence) = self.persistence.as_ref()
                         && let Err(error) = persistence
                             .persist_snapshot(self.session.snapshot().await)
@@ -1450,7 +1659,8 @@ where
                     let message = format_completion_error(&error);
                     finalize_assistant_entry(&self.session, &assistant_entry_id, &message, "error")
                         .await;
-                    self.session.set_status(CodeUiSessionStatus::Error).await;
+                    self.set_terminal_status_if_recoverable(CodeUiSessionStatus::Error)
+                        .await;
                     if let Some(persistence) = self.persistence.as_ref()
                         && let Err(error) = persistence
                             .persist_snapshot(self.session.snapshot().await)
@@ -1671,7 +1881,8 @@ where
         self.session
             .resolve_interaction(&interaction.interaction_id)
             .await;
-        self.session.set_status(CodeUiSessionStatus::Idle).await;
+        self.set_terminal_status_if_recoverable(CodeUiSessionStatus::Idle)
+            .await;
 
         self.pending_intent_reviews
             .lock()
@@ -2124,7 +2335,7 @@ async fn deliver_headless_exec_approval_response(
         ));
     }
     if request.response_tx.send(decision).is_err() {
-        session.set_status(CodeUiSessionStatus::Error).await;
+        set_status_if_recoverable(session, CodeUiSessionStatus::Error).await;
         if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
             interaction_persistence_failed.store(true, Ordering::Release);
             mark_persistence_failure(
@@ -2168,7 +2379,7 @@ async fn deliver_headless_user_input_response(
         ));
     }
     if response_tx.send(user_input_response).is_err() {
-        session.set_status(CodeUiSessionStatus::Error).await;
+        set_status_if_recoverable(session, CodeUiSessionStatus::Error).await;
         if let Err(error) = persist_headless_interaction_snapshot(persistence, session).await {
             interaction_persistence_failed.store(true, Ordering::Release);
             mark_persistence_failure(
@@ -2464,7 +2675,7 @@ where
             "headless user-input request arrived without an active runtime turn; closing fail-closed"
         );
         self.session.clear_interaction(&interaction_id).await;
-        self.session.set_status(CodeUiSessionStatus::Error).await;
+        set_status_if_recoverable(&self.session, CodeUiSessionStatus::Error).await;
         drop(request.response_tx);
     }
 
@@ -2523,7 +2734,7 @@ where
             "headless exec approval arrived without an active runtime turn; denying fail-closed"
         );
         self.session.clear_interaction(&interaction_id).await;
-        self.session.set_status(CodeUiSessionStatus::Error).await;
+        set_status_if_recoverable(&self.session, CodeUiSessionStatus::Error).await;
         let _ = request.response_tx.send(ReviewDecision::Denied);
     }
 
@@ -2556,7 +2767,7 @@ where
                 "failed to register a live headless interaction with AgentRuntime; closing the interaction fail-closed"
             );
             self.session.clear_interaction(interaction_id).await;
-            self.session.set_status(CodeUiSessionStatus::Error).await;
+            set_status_if_recoverable(&self.session, CodeUiSessionStatus::Error).await;
         }
     }
 

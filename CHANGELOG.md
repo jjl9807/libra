@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Removed (plan-20260715 W5-10, 2026-08-20, v0.20.3)
+
+- **W5-10 removes the retired terminal-UI dependency surface.** Direct
+  `ratatui` and `crossterm` dependencies, together with the now-unreachable
+  terminal-specific Code runtime branch, are gone. The active Code UI remains
+  the Web UI; persisted legacy controller value `"tui"` is only decoded so it
+  can be rejected fail-closed and is never emitted for a new session. The
+  Rust `internal` module tree is an implementation detail rather than the
+  patch-compatible external embedding API. This internal cleanup is not a
+  Cargo semver surface and is intentionally released as the v0.20.3 patch.
+
+### Fixed (plan-20260715 W5-10, 2026-08-20, v0.20.3)
+
+- **Web runtime cancellation and ACL hardening.** A browser turn cancelled
+  before execution now settles through a bounded admission path; an uncertain
+  durable correction fences the session as `indeterminate_side_effect` rather
+  than treating it as safe to resume. Interaction-registration retries are
+  bounded, and dynamically prefixed SourcePool tools remain default-denied in
+  Review and Research contexts.
+
 ### Breaking (plan-20260715 W5-09, 2026-08-17, v0.20.0)
 
 - **v0.20.0 is the single breaking release of the W5-01 family**

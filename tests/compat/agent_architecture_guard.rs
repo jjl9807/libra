@@ -436,6 +436,68 @@ fn code_web_only_completion_gate() {
     }
 }
 
+/// W5-10: once the internal terminal UI module is retired, neither its direct
+/// dependencies nor its production symbol names may return unnoticed.
+#[test]
+fn terminal_ui_dependencies_and_production_symbols_remain_retired() {
+    let manifest = fs::read_to_string(repo_root().join("Cargo.toml")).expect("read Cargo.toml");
+    let manifest: toml::Value = manifest.parse().expect("parse Cargo.toml");
+
+    fn manifest_mentions_dependency(value: &toml::Value, dependency: &str) -> bool {
+        let Some(table) = value.as_table() else {
+            return false;
+        };
+        table.iter().any(|(key, value)| {
+            key == dependency
+                || value
+                    .as_table()
+                    .and_then(|value| value.get("package"))
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|package| package == dependency)
+                || manifest_mentions_dependency(value, dependency)
+        })
+    }
+
+    for dependency in ["ratatui", "crossterm"] {
+        let present = manifest_mentions_dependency(&manifest, dependency);
+        assert!(
+            !present,
+            "Cargo.toml must not restore the retired direct {dependency} dependency"
+        );
+    }
+
+    fn visit_source_tree(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read production source directory") {
+            let entry = entry.expect("read production source entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit_source_tree(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let mut sources = Vec::new();
+    visit_source_tree(&repo_root().join("src"), &mut sources);
+    let library_root = fs::read_to_string(repo_root().join("src/lib.rs")).expect("read lib.rs");
+    assert!(
+        library_root.contains("supported, patch-compatible embedding API")
+            && library_root.contains("`internal` is an implementation detail"),
+        "the public internal module must remain documented as an unstable implementation detail",
+    );
+    for source in sources {
+        let contents = fs::read_to_string(&source).expect("read production Rust source");
+        for forbidden in ["ratatui", "crossterm", "internal::tui", "Tui"] {
+            assert!(
+                !contents.contains(forbidden),
+                "{} reintroduced retired terminal-UI token {forbidden:?}",
+                source.display()
+            );
+        }
+    }
+}
+
 /// W0-01: retain the source-grounded conflict and A0-consumption records
 /// needed to prevent a future Code migration from silently recreating an
 /// Agent-side queue, trust policy, or artifact store.

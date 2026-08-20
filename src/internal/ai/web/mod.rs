@@ -1780,6 +1780,15 @@ async fn code_controller_attach_handler(
     let runtime = code_ui_runtime(&state)?;
     let kind = resolve_controller_attach_kind(body.kind, &headers);
     let result = async {
+        if !matches!(
+            kind,
+            CodeUiControllerKind::Browser | CodeUiControllerKind::Automation
+        ) {
+            return Err(WebApiError::from(CodeUiApiError::bad_request(
+                "INVALID_CONTROLLER_KIND",
+                format!("Controller kind '{}' cannot attach", kind.as_str()),
+            )));
+        }
         if kind == CodeUiControllerKind::Browser {
             ensure_browser_origin_for_write(&state, &headers)?;
             ensure_browser_bootstrap_token(&headers, state.browser_bootstrap_token.as_ref())?;

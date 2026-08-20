@@ -32,11 +32,14 @@ use libra::internal::{
         usage::{UsageContext, UsageQueryFilter, UsageRecorder},
         web::{
             code_ui::{
-                CodeUiApplyToFuture, CodeUiCommandAdapter, CodeUiInteractionKind,
+                CodeUiApiError, CodeUiApplyToFuture, CodeUiCommandAdapter, CodeUiInteractionKind,
                 CodeUiInteractionResponse, CodeUiInteractionStatus, CodeUiProviderInfo,
                 CodeUiReadModel, CodeUiSession, CodeUiSessionStatus, initial_snapshot,
             },
-            headless::{HeadlessCodeRuntime, HeadlessSessionPersistence, headless_capabilities},
+            headless::{
+                HeadlessCodeRuntime, HeadlessRecordUserMessageHook, HeadlessSessionPersistence,
+                headless_capabilities,
+            },
         },
     },
     db::migration::run_builtin_migrations,
@@ -1066,10 +1069,28 @@ async fn submit_message_is_owned_by_agent_runtime_worker() {
         "the delayed browser turn must be visible in AgentRuntime worker state"
     );
 
-    runtime
-        .cancel_turn()
-        .await
-        .expect("runtime-owned delayed turn must remain cancellable");
+    match runtime.cancel_turn().await {
+        Ok(()) => {}
+        Err(error) => {
+            // The worker may complete after the active-state observation but
+            // before this independent cancel request reaches admission. That
+            // is a valid natural completion, not a failed cancellation path.
+            let session_busy = error
+                .downcast_ref::<CodeUiApiError>()
+                .expect("a naturally completed turn must report typed SESSION_BUSY");
+            assert_eq!(session_busy.status, 409);
+            assert_eq!(session_busy.code, "SESSION_BUSY");
+            assert!(
+                runtime
+                    .runtime_snapshot()
+                    .await
+                    .expect("worker snapshot after natural completion")
+                    .active_turn_id
+                    .is_none(),
+                "SESSION_BUSY is valid here only after the observed turn completed"
+            );
+        }
+    }
 }
 
 /// `submit_message("")` must fail loud rather than silently appending an
@@ -1126,10 +1147,13 @@ async fn submit_rejects_unpersistable_turn_before_live_session_mutation() {
     std::fs::create_dir(&events_path)
         .expect("replace the durable event file with a directory to force append failure");
 
-    let error = runtime
-        .submit_message("must not start".to_string())
-        .await
-        .expect_err("an unpersistable browser turn must be rejected");
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        runtime.submit_message("must not start".to_string()),
+    )
+    .await
+    .expect("unpersistable admission must fail rather than wait indefinitely")
+    .expect_err("an unpersistable browser turn must be rejected");
     assert!(
         error.to_string().contains("no turn was started"),
         "the error must make retry safety explicit: {error:#}",
@@ -1842,7 +1866,68 @@ async fn repeated_shutdown_joins_the_same_terminal_result() {
     first.expect("the first shutdown caller should see clean completion");
     second.expect("the second shutdown caller must join the same clean completion");
 
-    assert_eq!(runtime.snapshot().await.status, CodeUiSessionStatus::Idle);
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.status, CodeUiSessionStatus::Idle);
+    assert!(snapshot.transcript.iter().any(|entry| {
+        entry.kind == libra::internal::ai::web::code_ui::CodeUiTranscriptEntryKind::AssistantMessage
+            && entry.status.as_deref() == Some("cancelled")
+            && !entry.streaming
+    }));
+}
+
+/// Shutdown can race with the durable `record_user_message` admission write.
+/// The worker must cancel without waiting for that write, and admission must
+/// later commit one cancelled projection instead of republishing `Thinking`.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_durable_admission_cannot_republish_thinking() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let storage = tempfile::tempdir().expect("tempdir for session storage");
+    let store = Arc::new(SessionStore::from_storage_path(storage.path()));
+    let state = SessionState::new(&workdir.path().to_string_lossy());
+    let admission_hook = HeadlessRecordUserMessageHook::new();
+    let persistence = HeadlessSessionPersistence::new(store, state)
+        .expect("attach workflow hub")
+        .with_record_user_message_hook(admission_hook.clone());
+    let (runtime, _, _) = build_runtime_with_persistence(
+        "delayed_chat",
+        workdir.path().to_path_buf(),
+        Vec::new(),
+        Some(persistence),
+    )
+    .await;
+
+    let submit_runtime = Arc::clone(&runtime);
+    let submit = tokio::spawn(async move {
+        submit_runtime
+            .submit_message("/slow durable-admission shutdown".to_string())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), admission_hook.wait_until_entered())
+        .await
+        .expect("submit must pause in the durable admission write");
+
+    let shutdown_runtime = Arc::clone(&runtime);
+    let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
+    tokio::time::timeout(Duration::from_secs(3), shutdown)
+        .await
+        .expect("shutdown must not wait for the paused durable admission write")
+        .expect("shutdown task must not panic")
+        .expect("shutdown must cancel the unstarted worker turn");
+
+    admission_hook.release();
+    tokio::time::timeout(Duration::from_secs(3), submit)
+        .await
+        .expect("submit must complete after the durable admission pause releases")
+        .expect("submit task must not panic")
+        .expect("durable admission must complete after the pause releases");
+
+    let snapshot = runtime.snapshot().await;
+    assert_eq!(snapshot.status, CodeUiSessionStatus::Idle);
+    assert!(snapshot.transcript.iter().any(|entry| {
+        entry.kind == libra::internal::ai::web::code_ui::CodeUiTranscriptEntryKind::AssistantMessage
+            && entry.status.as_deref() == Some("cancelled")
+            && !entry.streaming
+    }));
 }
 
 /// A shutdown timeout during a started mutation is an indeterminate-side-effect
@@ -1970,11 +2055,11 @@ async fn shutdown_timeout_persists_indeterminate_state() {
     );
 }
 
-/// Once a handler that may mutate has begun, cancellation must refuse to
-/// hard-abort its task. The caller receives a determinate error, the handler
-/// stays alive until its own completion, and the turn can then settle normally.
+/// Once a handler that may mutate has begun, cancellation must be accepted
+/// cooperatively without hard-aborting its task. The handler stays alive until
+/// its own completion, and the turn can then settle normally.
 #[tokio::test(flavor = "multi_thread")]
-async fn cancel_does_not_abort_started_mutating_headless_tool() {
+async fn cancel_accepts_started_mutating_headless_tool_without_abort() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
@@ -2019,22 +2104,28 @@ async fn cancel_does_not_abort_started_mutating_headless_tool() {
         .await
         .expect("the blocking mutation handler should begin");
 
-    let error = runtime
+    runtime
         .cancel_turn()
         .await
-        .expect_err("cancellation must not abort an already-started mutation");
-    assert!(
-        error.to_string().contains("cannot safely abort"),
-        "the error must make the indeterminate-side-effect boundary explicit: {error:#}",
+        .expect("cancellation must be accepted cooperatively after a mutation starts");
+    assert_eq!(
+        runtime
+            .runtime_snapshot()
+            .await
+            .expect("worker snapshot after cooperative cancellation")
+            .interaction,
+        InteractionState::Cancelling,
+        "the accepted cancellation must be visible in the worker-owned lifecycle before the mutation completes",
     );
     let second_submit = runtime
         .submit_message("/must wait for mutation".to_string())
         .await
         .expect_err("the still-running mutation must retain the turn slot");
-    assert!(
-        second_submit.to_string().contains("already running"),
-        "a started mutation must retain the active-turn slot: {second_submit:#}",
-    );
+    let session_busy = second_submit
+        .downcast_ref::<CodeUiApiError>()
+        .expect("a started mutation must retain the typed SESSION_BUSY wire error");
+    assert_eq!(session_busy.status, 409);
+    assert_eq!(session_busy.code, "SESSION_BUSY");
 
     // If `cancel_turn` had retained the old JoinHandle::abort() behavior, the
     // handler would never observe this release and the turn would not complete.
@@ -2062,6 +2153,18 @@ async fn cancel_does_not_abort_started_mutating_headless_tool() {
         snapshot.status,
         CodeUiSessionStatus::Idle,
         "the preserved mutating tool must let the turn reach a determinate result",
+    );
+    assert!(
+        snapshot.transcript.iter().any(|entry| {
+            entry.kind
+                == libra::internal::ai::web::code_ui::CodeUiTranscriptEntryKind::AssistantMessage
+                && entry.status.as_deref() == Some("completed")
+                && entry
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("mutation completed"))
+        }),
+        "the preserved mutating tool must publish its completed assistant result; snapshot={snapshot:#?}",
     );
 }
 
@@ -2201,7 +2304,7 @@ async fn respond_interaction_unknown_id() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() {
+async fn request_user_input_request_is_reflected_and_immediately_responded_to() {
     let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
     let (runtime, user_input_tx, _) =
         build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
@@ -2268,6 +2371,9 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
     assert_eq!(questions[0]["isSecret"], false);
     assert_eq!(questions[0]["kind"], "text");
 
+    // Reply in the same scheduler turn that first observes the projection.
+    // This is the registration-race success path: callers must not need to
+    // sleep and retry after the browser has been told an interaction is ready.
     runtime
         .respond_interaction(
             &interaction_id,
@@ -2303,6 +2409,89 @@ async fn request_user_input_request_is_reflected_in_snapshot_and_responded_to() 
             .iter()
             .all(|interaction| interaction.status != CodeUiInteractionStatus::Pending),
         "all pending interactions should be resolved",
+    );
+
+    runtime
+        .cancel_turn()
+        .await
+        .expect("cancelling the delayed turn is cooperative");
+}
+
+/// A stale id can look identical to the narrow registration race at the
+/// AgentRuntime boundary. The adapter may retry that one error briefly, but
+/// it must return a typed failure within the documented bounded window instead
+/// of keeping a browser request open forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_interaction_id_exhausts_bounded_registration_retry() {
+    let workdir = tempfile::tempdir().expect("tempdir for headless workdir");
+    let (runtime, user_input_tx, _) =
+        build_runtime("delayed_chat", workdir.path().to_path_buf()).await;
+
+    runtime
+        .submit_message("/slow turn with stale interaction response".to_string())
+        .await
+        .expect("delayed turn starts");
+    await_worker_running(&runtime).await;
+
+    let live_interaction_id = "registration-window-live".to_string();
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel::<UserInputResponse>();
+    user_input_tx
+        .send(UserInputRequest {
+            call_id: live_interaction_id.clone(),
+            questions: vec![UserInputQuestion {
+                id: "answer".to_string(),
+                header: "Answer".to_string(),
+                question: "Provide an answer".to_string(),
+                is_other: false,
+                is_secret: false,
+                options: None,
+            }],
+            response_tx,
+        })
+        .expect("request_user_input request should enqueue in runtime");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if runtime
+            .snapshot()
+            .await
+            .interactions
+            .iter()
+            .any(|interaction| {
+                interaction.id == live_interaction_id
+                    && interaction.status == CodeUiInteractionStatus::Pending
+            })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        runtime
+            .snapshot()
+            .await
+            .interactions
+            .iter()
+            .any(|interaction| {
+                interaction.id == live_interaction_id
+                    && interaction.status == CodeUiInteractionStatus::Pending
+            }),
+        "a live interaction is required to distinguish a stale id from idle delivery",
+    );
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.respond_interaction(
+            "registration-window-stale",
+            CodeUiInteractionResponse::default(),
+        ),
+    )
+    .await
+    .expect("stale interaction delivery must remain bounded")
+    .expect_err("stale interaction ids must fail closed after the retry window");
+    assert!(
+        error.to_string().contains("not pending"),
+        "stale delivery must retain AgentRuntime's stale-delivery error, got {error:#}",
     );
 
     runtime

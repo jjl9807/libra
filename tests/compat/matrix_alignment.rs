@@ -295,18 +295,41 @@ fn docs_consistency_covers_code_command_router_contracts() {
     }
     assert_contains(
         &workflow,
-        "Run TUI automation scenarios",
+        "Run Code UI automation scenarios",
+        ".github/workflows/base.yml",
+    );
+    assert_contains(
+        &workflow,
+        "Check Rustdoc intra-doc links",
+        ".github/workflows/base.yml",
+    );
+    assert_contains(
+        &workflow,
+        "RUSTDOCFLAGS=\"-D rustdoc::broken_intra_doc_links\" cargo doc --no-deps --all-features",
         ".github/workflows/base.yml",
     );
     assert!(
-        !workflow.contains("RUST_LOG:"),
-        "Run TUI automation scenarios must not set global RUST_LOG in CI"
+        !workflow.contains("paths-ignore:"),
+        ".github/workflows/base.yml must run the compatibility guards for workflow and command-documentation-only pull requests",
     );
+    assert!(
+        !workflow.contains("RUST_LOG:"),
+        "Run Code UI automation scenarios must not set global RUST_LOG in CI"
+    );
+    for target in [
+        "--test code_codex_default_web_test",
+        "--test ai_code_ui_headless_test",
+        "--test code_codex_runtime_test",
+    ] {
+        assert_contains(&workflow, target, ".github/workflows/base.yml");
+    }
 
     for path in [
         "tests/harness/scenario.rs",
         "tests/diagnostics_redaction_test.rs",
-        "tests/code_codex_default_tui_test.rs",
+        "tests/code_codex_default_web_test.rs",
+        "tests/ai_code_ui_headless_test.rs",
+        "tests/code_codex_runtime_test.rs",
     ] {
         assert!(
             repo_root().join(path).exists(),

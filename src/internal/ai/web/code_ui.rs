@@ -1186,7 +1186,7 @@ impl CodeUiRuntimeHandle {
     /// Errors:
     /// - `BROWSER_CONTROL_DISABLED` / `CONTROL_DISABLED` when the kind is not enabled.
     /// - `CONTROLLER_CONFLICT` when another client already holds an active lease.
-    /// - `INVALID_CONTROLLER_KIND` for `None`, `Tui`, or `Cli`.
+    /// - `INVALID_CONTROLLER_KIND` for `None`, `LegacyLocal`, or `Cli`.
     ///
     /// The lease TTL defaults to `DEFAULT_CONTROLLER_LEASE_SECS` (120s).
     /// Renew by calling again with the same `client_id`.
@@ -1436,7 +1436,7 @@ impl CodeUiRuntimeHandle {
             })
     }
 
-    /// Process-level adapter shutdown used by [`LifecycleShutdownOwner`].
+    /// Process-level adapter shutdown used by `LifecycleShutdownOwner`.
     /// Closes provider/runtime admission first; the controller lease is
     /// released separately after listeners drain so a browser cannot attach
     /// and submit during teardown.

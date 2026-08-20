@@ -1,7 +1,7 @@
 //! Phase 1 Plan — formal write helpers.
 //!
 //! The Code UI Phase Workflow models Phase 1 as the **Plan** phase: the
-//! Phase 0 [`IntentSpec`] gets compiled into an `ExecutionPlanSpec` which is
+//! Phase 0 `IntentSpec` gets compiled into an `ExecutionPlanSpec` which is
 //! persisted as a paired execution / test plan revision and then folded into
 //! the scheduler state machine.
 //!

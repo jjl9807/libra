@@ -79,7 +79,7 @@ queue。新的 worker 在执行 mutating tool 前必须复用现有 `ToolRegistr
 | Phase 1 Plan | `phase1.rs:401` 的 `write_plan_set` 委派 orchestrator persistence。 | Plan review/approval 通过 worker 后调用该入口；不得写新的 plan 表。 |
 | Phase 2 Attempt | `phase2.rs:160,191` 的 start/finish；orchestrator `persistence.rs:727,859` 已桥接。 | worker/executor lifecycle 只经这些 bridge 记录 attempt。 |
 | Phase 3 / Phase 4 | `phase3`/`phase4` ValidationReportStore / FinalDecisionStore 仍为 formal write 面。 | validation/terminal decision 继续由既有 store 写入；worker 只发布 normalized event/snapshot。 |
-| Adapter ownership | non-Codex Web Code UI browser submit 已经 `AgentRuntimeWorker::spawn`（`headless.rs:718`）；workflow interaction 已收敛至 runtime。managed Codex 的 app-server interaction 仍依 DEFER-07 保持其明确的外部 owner。共享面拆分：`CodeAgentServicesBuilder`（`code.rs:1616,2338`）统一 **tool registry + hardening boundary**；provider/env/model 仍经 `build_any_completion_model_for_args`（`:1209`）；sandbox/approval 仍经保留的历史命名 helper `tui_approval_config_from_args`（`:3832`）与 `default_tui_runtime_context`（`:3730`，返回 `ToolRuntimeContext`）。无调用者的 `CodeAgentServicesBuilder::tui_baseline*` / `TuiBaseline` 是 W5-06 后遗留，已登记给 W5-10 的 zero-`Tui` sweep，禁止重新实例化。不得把后两类历史命名误并入 builder 所有权。 | W1-04/W1-06/W1-08 与 W2 已将 cancel/projection/shutdown/workflow 收敛到 runtime-only；禁止新增平行状态机或第三条 bootstrap。 |
+| Adapter ownership | non-Codex Web Code UI browser submit 已经 `AgentRuntimeWorker::spawn`（`headless.rs:718`）；workflow interaction 已收敛至 runtime。managed Codex 的 app-server interaction 仍依 DEFER-07 保持其明确的外部 owner。共享面拆分：`CodeAgentServicesBuilder`（`code.rs:1616,2338`）统一 **tool registry + hardening boundary**；provider/env/model 仍经 `build_any_completion_model_for_args`（`:1209`）；sandbox/approval 由 `approval_config_from_args` 与 `default_runtime_context`（返回 `ToolRuntimeContext`）装配。W5-10 已删除无调用者的旧 full-workflow builder 分支和所有源码 `Tui` 类型名，不得重新实例化第二条 registry/bootstrap 路径。 | W1-04/W1-06/W1-08 与 W2 已将 cancel/projection/shutdown/workflow 收敛到 runtime-only；禁止新增平行状态机或第三条 bootstrap。 |
 
 三态所有权图：
 
@@ -109,7 +109,7 @@ defer 项；不能把 direct-chat 链路当作该 bridge 完成证据。
 |---|---|---|---|
 | C1 | `src/command/code.rs:694-707` 三路分发；`ControlMode`/`BrowserControlMode`/`WebOnlyRuntimeKind` 在 `:233/:248/:790`。 | 直接改默认分支会绕开既有行为矩阵。 | W4-01；默认切换是 public 行为变更。 |
 | C2 | web-only 已可选 provider，且 non-Codex headless 已接受 `--resume` / `--env-file` / `--context` / `--approval-policy` / `--approval-ttl`（W3-13）；仍拒绝 `--network-access allow`（`reject_non_tui_flags`，直到 Plan gate 拥有 per-execution sandbox network）。 | Web default 切默认时不得再丢这些可配置能力。 | W4-01；若删除 flag 必须 breaking migration。 |
-| C3 | Web Code UI/headless 共享三层 bootstrap：`CodeAgentServicesBuilder` → registry/hardening；`build_any_completion_model_for_args` → env/model；保留历史命名的 `tui_approval_config_from_args` + `default_tui_runtime_context` → approval/sandbox。 | Web-only 已公开接受 `--env-file`（W3-13），优先级仍为 env-file > process/vault。 | W4-01 默认路径复用同一断言。 |
+| C3 | Web Code UI/headless 共享三层 bootstrap：`CodeAgentServicesBuilder` → registry/hardening；`build_any_completion_model_for_args` → env/model；`approval_config_from_args` + `default_runtime_context` → approval/sandbox。 | Web-only 已公开接受 `--env-file`（W3-13），优先级仍为 env-file > process/vault。 | W4-01 默认路径复用同一断言。 |
 | C4 | `code_ui.rs:674-685` `broadcast_snapshot` 仍发送完整 `CodeUiSessionSnapshot`；browser control/SSE 是公开 wire。 | 全量 snapshot 与有界 cursor/replay 目标不相容。 | W3-01/W3-06/W3-08；v2 须保留 v1 兼容窗口。 |
 | C5 | non-Codex headless 已经由公开 Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）进入 JSONL fold；stdio 与 managed Codex 仍不共享该协议。 | Web workflow recovery 已收敛至 runtime；managed Codex 仍依 DEFER-07 保持外部 owner，graph 仅为独立 read-model consumer。 | W1-06 → W3-03、W4-01/W4-05。 |
 | C6 | `code --stdio`（`execute_stdio`）是弃用的 MCP-only legacy transport（tools/resources；stderr 警告；非 turn control）；canonical automation client 是 `code --control stdio`（`ControlMode::Stdio` + `run_control_stdio_client` + W4-10 control-info discovery）；`code-control --stdio` 是 W4-09 弃用转发 shim（已于 W5-01 物理删除）；独立 `libra mcp --stdio` 为 DEFER-02。 | MCP 与 control client 不可混作 turn control plane；discovery/attach fail-closed（`CONTROL_*` / JSON-RPC `-32000`）。 | W4-02/W4-03/W4-09/W4-10；breaking command migration。 |
@@ -252,26 +252,26 @@ headless shutdown 现先关闭 adapter admission，再等待 active turn 的 ter
 shutdown owner、Web/MCP/provider child 的资源 owner 合并，不能作为 W1-08 完成证据。
 
 这仍不是 W1-06 完成证据：Web `--resume`（原 `--web-only --resume`，W5-07 删除别名）现已让非 Codex headless 路径可达，但
-TUI/managed-Codex 的 live projection 与 graph read model 尚未接入同一 fold，`CodeUiSession`
+legacy/managed-Codex 的 live projection 与 graph read model 尚未接入同一 fold，`CodeUiSession`
 仍保留内存 cache 供现有 SSE 使用。因此不得以 headless resume 已通就宣称所有 Code UI
 projection 已事件化。
 
-### 非 Code TUI 消费者登记
+### 非 Code UI 消费者审计（已完成）
 
-W5-03（模块退场）与 W5-10（依赖摘除）必须覆盖下列当前实际命中（2026-08-09 `rg`
-重验）；它们不是 W1 的删除范围。`agent/graph.rs` 仍是额外编译期 consumer，不能因旧
-清单漏列而被静默遗忘。**2026-08-17 更新**：W5-08 删除 interactive graph 公开入口时，
-两处 graph 模块内的 ratatui/crossterm 渲染器与 TUI-only 结构随之移除（保留即为死代码，
-无法过 clippy `-D warnings`），故 helper 解耦轴实际由 W5-08 吸收；W5-10 保留
-`Cargo.toml`/`Cargo.lock` 依赖摘除、`format.rs` doc-link 清理与零命中守卫。
+W5-03（模块退场）与 W5-10（依赖摘除）覆盖了下列 2026-08-09 `rg` 基线；它们不是 W1
+的删除范围。`agent/graph.rs` 是额外编译期 consumer，不能因旧清单漏列而被静默遗忘。
+**2026-08-19 收口**：W5-08 删除 interactive graph 公开入口时，两处 graph 模块内的
+ratatui/crossterm 渲染器与 terminal-only 结构已一并移除；W5-10 随后删除
+`Cargo.toml`/`Cargo.lock` 依赖、清理残余源码类型名，并以 rustdoc 和零命中守卫复核
+`format.rs` doc-link。
 
 | 路径 | 当前依赖 | 后续 owner |
 |---|---|---|
-| `src/command/graph.rs:12-13,34,1129` | 直接 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`（W5-08 已随 interactive 入口删除一并移除）。 | W4-04/W5-08 → W5-10（仅余依赖摘除）。 |
-| `src/command/agent/graph.rs:16-17,31,721` | 同样直接创建 TUI（W5-08 已一并移除）。 | W5-08 已解耦；W5-10 负责依赖摘除与守卫。 |
+| `src/command/graph.rs:12-13,34,1129` | 曾直接使用 `crossterm`/`ratatui` 与 `internal::tui::{Tui,tui_init,tui_restore}`；W5-08 已随 interactive 入口删除一并移除。 | W4-04/W5-08 解耦；W5-10 依赖摘除与守卫已完成。 |
+| `src/command/agent/graph.rs:16-17,31,721` | 曾同样直接创建 TUI；W5-08 已一并移除。 | W5-08 解耦；W5-10 依赖摘除与守卫已完成。 |
 | `src/internal/ai/web/code_ui.rs`（原 `:1266` downcast） | `TuiControlError` downcast 曾是 Web API 的编译期耦合（W5-02 已删除；wire code 由 UI-neutral `CodeUiApiError` 目录产生，`TuiControlError` 仅存于垂死 tui 模块作迁移期 fixture）。 | W5-02 已完成；类型本体随 W5-03 模块退场消亡。 |
 | `src/command/code.rs` `execute_tui`（原 `:1561`） | Code TUI startup/adapter（W5-06 已删除）。 | W5-06 已随 TUI 启动路径一并删除。 |
-| `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 已清理链接；W5-10 仅将该零命中作为 rustdoc 验证。 |
+| `src/internal/ai/agent/format.rs:6` | 仅 rustdoc intra-doc link，非编译依赖。 | W5-03 已清理链接；W5-10 rustdoc 验证已通过。 |
 
 ## Web-only completion gate（W0-03）
 

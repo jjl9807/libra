@@ -6,8 +6,11 @@
 //! 2. Embedders (integration tests, the Web Code UI, and external Rust crates that drive
 //!    Libra programmatically) call [`exec`] or [`exec_async`] with a pre-built argv.
 //!
-//! All public re-exports below are part of the embedding API and should remain
-//! source-compatible across patch releases.
+//! The supported, patch-compatible embedding API is [`exec`], [`exec_async`],
+//! and the public `Cli*` result/error types re-exported below. The public module
+//! tree exists for the binary, integration tests, and in-tree adapters; in
+//! particular, `internal` is an implementation detail and is not a stable
+//! external embedding surface.
 
 pub mod cli;
 pub mod command;

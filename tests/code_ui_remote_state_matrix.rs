@@ -95,7 +95,7 @@ fn state_detach_while_thinking_allows_turn_to_settle() -> Result<()> {
         let controller_released = snapshot
             .pointer("/controller/kind")
             .and_then(|v| v.as_str())
-            .is_some_and(|kind| kind == "tui" || kind == "none");
+            .is_some_and(|kind| kind == "none");
         let transcript = snapshot
             .get("transcript")
             .and_then(|v| serde_json::to_string(v).ok())

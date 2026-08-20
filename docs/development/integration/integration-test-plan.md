@@ -217,7 +217,8 @@ cargo test --features test-provider \
   --test code_tool_acl_test \
   --test code_mcp_dual_entry_test \
   --test code_resume_test \
-  --test code_codex_default_tui_test \
+  --test code_codex_default_web_test \
+  --test ai_code_ui_headless_test \
   --test code_codex_runtime_test \
   -- --test-threads=1
 ```

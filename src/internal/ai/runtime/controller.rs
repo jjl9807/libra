@@ -26,7 +26,10 @@ pub enum ControllerKind {
     None,
     Browser,
     Automation,
-    Tui,
+    /// Historical local interactive owner. This preserves the `"tui"` wire
+    /// value for old snapshots while remaining invalid for new leases.
+    #[serde(rename = "tui")]
+    LegacyLocal,
     Cli,
 }
 
@@ -36,7 +39,7 @@ impl ControllerKind {
             Self::None => "none",
             Self::Browser => "browser",
             Self::Automation => "automation",
-            Self::Tui => "tui",
+            Self::LegacyLocal => "tui",
             Self::Cli => "cli",
         }
     }

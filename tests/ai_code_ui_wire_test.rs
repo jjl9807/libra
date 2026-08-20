@@ -373,20 +373,25 @@ fn interaction_kinds_use_snake_case_values() {
     }
 }
 
-/// Controller kinds the API layer accepts on attach/detach must keep the same
-/// snake_case tags the frontend embeds in request bodies.
+/// Controller kinds serialized into snapshots must keep stable snake_case
+/// tags; the retired local-interaction value remains decodable for old
+/// snapshots even though new leases reject it.
 #[test]
 fn controller_kinds_use_snake_case_values() {
     for (variant, expected) in [
         (CodeUiControllerKind::None, "none"),
         (CodeUiControllerKind::Browser, "browser"),
         (CodeUiControllerKind::Automation, "automation"),
-        (CodeUiControllerKind::Tui, "tui"),
+        (CodeUiControllerKind::LegacyLocal, "tui"),
         (CodeUiControllerKind::Cli, "cli"),
     ] {
         let value = serde_json::to_value(variant).unwrap();
         assert_eq!(value, Value::String(expected.into()));
     }
+
+    let legacy: CodeUiControllerKind = serde_json::from_value(Value::String("tui".into()))
+        .expect("legacy controller tag must remain decodable");
+    assert_eq!(legacy, CodeUiControllerKind::LegacyLocal);
 }
 
 /// Apply-to-future enum is one of the few request-side enums the frontend
