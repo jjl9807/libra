@@ -2690,8 +2690,41 @@ where
 
     let HeadlessWebSessionBootstrap {
         store: session_store,
-        state: session_state,
+        state: bootstrap_session_state,
     } = session_bootstrap;
+    // The initial lookup identifies the durable session. It is not safe to
+    // build a writable projection from that pre-lease snapshot: another
+    // process may append after the lookup and before releasing its writer
+    // lease. Acquire first, then reload and fold exclusively under the lease.
+    let session_lease = HeadlessSessionPersistence::acquire_session_lease(
+        &session_store,
+        &bootstrap_session_state.id,
+    )
+    .map_err(|error| {
+        CliError::fatal(format!(
+            "failed to acquire the writable Code session lease for '{}': {error}",
+            bootstrap_session_state.id
+        ))
+    })?;
+    let requested_session_id = bootstrap_session_state.id.clone();
+    let session_state = match session_store.load(&requested_session_id) {
+        Ok(state) => state,
+        Err(error) if args.resume.is_none() && error.kind() == std::io::ErrorKind::NotFound => {
+            bootstrap_session_state
+        }
+        Err(error) => {
+            return Err(CliError::fatal(format!(
+                "failed to reload Code session '{}' after acquiring its writer lease: {error}",
+                bootstrap_session_state.id
+            )));
+        }
+    };
+    if session_state.id != requested_session_id {
+        return Err(CliError::fatal(format!(
+            "reloaded Code session identity '{}' does not match leased session '{}'; repair the session log before resuming",
+            session_state.id, requested_session_id
+        )));
+    }
     let HeadlessApprovalChannels {
         exec_approval_tx,
         exec_approval_rx,
@@ -2831,11 +2864,12 @@ where
             ..Default::default()
         });
 
-    let persistence = HeadlessSessionPersistence::with_projection_checkpoint(
+    let persistence = HeadlessSessionPersistence::with_projection_checkpoint_and_lease(
         session_store,
         session_state,
         snapshot,
         projection_sequence,
+        session_lease,
     )
     .map_err(|error| {
         CliError::fatal(format!(

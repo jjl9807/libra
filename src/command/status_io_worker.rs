@@ -27,7 +27,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-/// Hidden argv token. Must be argv[1] exactly; parsed in `main` before CLI.
+/// Hidden argv token. Must be the second argv element; parsed in `main` before CLI.
 pub const STATUS_IO_WORKER_ARG: &str = "--libra-internal-status-io-worker";
 /// Capability token env. Worker exits 2 if missing or mismatched.
 pub const STATUS_IO_WORKER_CAP_ENV: &str = "LIBRA_INTERNAL_STATUS_IO_CAP";

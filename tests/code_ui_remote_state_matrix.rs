@@ -1,8 +1,8 @@
 //! Wave 7 / PR 7 — `code_ui_remote_state` matrix runner.
 //!
 //! Loads `tests/data/code_ui_remote/state_cases.json` and runs the
-//! P1 concurrency / size-limit cases through a real `libra code`
-//! PTY session:
+//! P1 concurrency / size-limit cases through a real non-TTY `libra code`
+//! Web process:
 //!
 //! 1. serial detach → re-attach issues a fresh controllerToken,
 //! 2. parallel attach yields exactly one 200 + one 409

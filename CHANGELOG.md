@@ -2,6 +2,103 @@
 
 ## [Unreleased]
 
+### Fixed (plan-20260715 W2-03 repair, 2026-08-21, v0.20.4)
+
+- **Default-Web IntentSpec revision is durable and fail-closed.** IntentSpec
+  Modify consumes either the next accepted plain-text message or canonical
+  `/intent modify <changes>` exactly once. The additive public
+  `intent_revision` binding contains only the interaction id and sidecar
+  digest; an HMAC-authenticated local Prepared/Active/Claiming/Consuming
+  sidecar carries the private recovery copy. Claiming fsyncs the complete
+  consumer command binding before Runtime admission, and promotion binds its
+  exact event id/sequence before the executor start gate opens. Fresh explicit
+  direct commands receive `409 SESSION_BUSY` while revision authority is
+  active, but exact terminal/live `commandId` retries remain idempotent
+  acknowledgements. Exact raw `/intent cancel` uses the same claim and exact
+  consumption receipt before deleting the sidecar, then exits without calling
+  a provider or tool; padded spellings receive no privileged handling, its
+  terminal retry appends nothing, and restart does not revive the revision.
+  A Modify consumer is committed only after exactly one successful
+  `submit_intent_draft` call and the replacement IntentSpec review marker are
+  durable; zero or multiple submissions preserve the revision and fail closed.
+  The 16 KiB Modify suffix is validated before Claiming, and only that suffix
+  is sent as the provider change request. Crash recovery never reruns a
+  provider after durable replacement proof, repairs stale transcript/tool
+  projection, permanently closes the receipt's exact retry lineage, and
+  rejects conflicting marker/terminal ordering. Plan Modify separately retains
+  its next-plain-text replacement-Plan behavior. The
+  revision protocol never copies the raw note into a workflow terminal,
+  receipt, or dedicated SSE payload. Ordinary transcript and session-snapshot
+  retention remain unchanged. Consumption is committed by the additive
+  `intent_revision_consumption` receipt and projected through the dedicated
+  SSE v2 `intent_revision_consumed` kind without masquerading as a second gate
+  resolution. Crash, retry, stale-authority, and malformed-replay paths now
+  either recover the exact revision or require reconciliation.
+  Startup builds one shared linear `ValidatedIntentRevisionReceiptIndex` for
+  source terminals, receipts, consumer status, review-marker proof, and retry
+  lineage instead of rescanning the workflow once per receipt. A 5,000-event
+  regression with 700 receipts caps indexed relationship visits at four times
+  the replay size.
+- **Network Allow preserves the W2-03/W2-04 boundary.** Until a later release
+  restores the default-Web confirmed-plan handoff, Allow returns typed
+  `409 PLAN_EXECUTION_NOT_AVAILABLE`, leaves the same network-policy gate
+  pending, and starts no mutation; Deny, Back, and crash/resume remain usable.
+- **Fresh repositories can enter Phase 1 safely.** A named unborn HEAD after
+  `libra init` is now captured as a valid checkout binding with no object id;
+  detached checkouts and existing branches still require an exact valid id.
+- **Phase 1 workspace drift is recoverable without weakening Execute.** Review
+  contexts retain an exact content fingerprint for Execute and add a
+  body-read-free `metadata-v1:<sha256>` token for fast resume projection and
+  determinate pre-write validation/retry signals. It never authorizes Execute.
+  New bindings use metadata-before/exact-before/exact-after/metadata-after
+  scans and refuse any exact or metadata mismatch rather than pairing
+  mismatched authority and drift state, including on platforms with coarse
+  file metadata.
+  Every scan enforces cooperative 30-second, 1,000,000-traversed-entry, and
+  128-MiB encoded-path-name budgets; it streams and caps directory entries
+  before deterministic sorting and checks the deadline after blocking calls
+  and final EOF. Path-name enumeration remains an ignore-aware walk and is not
+  trusted as read authority. On Unix, authoritative entry reads use pinned
+  root/parent descriptors with `openat`/`fstatat`/`readlinkat`,
+  no-follow/nonblocking opens, and descriptor/path identity revalidation. On
+  Windows, pinned handles, `FILE_FLAG_OPEN_REPARSE_POINT`, final-path/file-
+  identity checks, and `FSCTL_GET_REPARSE_POINT` protect regular files and
+  reparse targets. Other platforms fail closed because secure workspace reads
+  are unsupported. A rename, symlink, FIFO, parent/root replacement, or
+  reparse race therefore cannot hash content outside the checkout. Legacy
+  contexts without the additive token remain readable and fall back to exact
+  content comparison. Resume projects
+  `workspaceDrifted` / `workspaceWarning`; a
+  metadata-only warning may pass Execute's exact recheck, while stale content
+  returns
+  `409 PHASE1_WORKSPACE_CHANGED` without fencing, resolving the gate, or
+  mutating files. Modify recaptures a new HEAD only within the same repository;
+  repository replacement requires a new IntentSpec review. Failed recapture
+  leaves the note unconsumed, while an empty note returns
+  `400 PLAN_REVISION_NOTE_REQUIRED` and keeps revision authority pending.
+- **Headless resume has one process-lifetime session writer.** A dedicated
+  Phase 1 writer lease is acquired before session reload or projection fold,
+  is bound to the exact SessionStore and session id, and lets cloned lease
+  tokens construct only one persistence graph. It is distinct from the
+  short-lived workflow append lock and from browser controller leases. Unix
+  opens use `O_NOFOLLOW | O_NONBLOCK` plus device/inode checks; Windows rejects
+  reparse points and verifies volume/file identity. Process exit releases the
+  advisory lock immediately, while the persistent lock file is never unlinked.
+- **Crash resume uses an ABA-safe workflow append lock.** The append lock is a
+  persistent regular file protected by an OS advisory lock; process exit
+  releases it immediately, while a live owner is never reclaimed by age.
+  Guards never unlink the path, Unix opens use `O_NOFOLLOW`, and symlink or
+  special lock entries fail closed without truncating their targets.
+- **Phase 1 recovery rejects incomplete authority before cleanup.** Startup
+  uses one committed workflow replay for gate validation and context GC;
+  sequence gaps or a cut replay window fail closed before authority selection,
+  event-log rewriting, or irreversible sidecar deletion.
+- **Runtime-owned interaction histories keep their selected durability mode.**
+  Deliveries that defer audit to the combined terminal row no longer emit an
+  intermediate standalone resolution, while legacy executor responses and
+  mutating user-input/approval continuations retain their required checkpoint
+  paths.
+
 ### Removed (plan-20260715 W5-10, 2026-08-20, v0.20.3)
 
 - **W5-10 removes the retired terminal-UI dependency surface.** Direct

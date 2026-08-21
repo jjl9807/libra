@@ -32,7 +32,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `bisect_subcommand_surface.rs` | C4 | `bisect --help` lists `run` / `view`; EXAMPLES banner is wired |
 | `worktree_delete_dir.rs` | C5 | `worktree remove` with and without `--delete-dir`; dirty-worktree refusal |
 | `checkout_alias_help.rs` | C5 | top-level `--help` includes `checkout`; the help banner mentions `switch` / `restore` |
-| `matrix_alignment.rs` | C2 / Web Phase E / P2-04 | `COMPATIBILITY.md` ↔ `src/cli.rs::Commands` enum drift detection; explicit no-CLI/no-SMTP `send-email` policy with EN/zh/dev docs; `docs/commands/code.md` docs script coverage for every `/api/code/*` router endpoint; Web CI checks `web/out` drift after static export |
+| `matrix_alignment.rs` | C2 / Web Phase E / P2-04 / W2-03 | `COMPATIBILITY.md` ↔ `src/cli.rs::Commands` enum drift detection; explicit no-CLI/no-SMTP `send-email` policy; Code UI route docs; W2-03 digest-only revision receipt/privacy and Network-Allow 409 release/plan/index alignment; Web CI static-export drift |
 | `install_alias_test.rs` + `install_alias_smoke.sh` | IX-01 (Issue #437) | 隔离 HOME + 假 downloader 驱动完整 installer：默认相对 `lba -> libra`、same-version 缺失修复/幂等、CLI/env opt-out、regular/foreign-symlink 不覆盖、无 symlink 能力时告警但安装成功 |
 | `live_compat_workflow.rs` | C2 | optional `compat-live-ai` / `compat-live-cloud` workflow stays manual/scheduled, secret-gated, and outside `base.yml` |
 | `branch_lossy_wrapper_guard.rs` | branch follow-up | `src/` production code must use branch `*_result` APIs instead of lossy compatibility wrappers |

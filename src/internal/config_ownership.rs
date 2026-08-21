@@ -395,8 +395,9 @@ mod tests {
         "capability_packages.json", // agent capability data artifact, not configuration
         "pending_revision.json",    // pending plan-revision state written by the headless
         // runtime (web/headless.rs), not configuration
-        "settings.json", // EXTERNAL provider settings (e.g. Claude Code's
-                         // .claude/settings.json) written by `agent enable` — not a .libra surface
+        "pending-start.json", // crash-recovery seed for a Phase 1 attempt, not configuration
+        "settings.json",      // EXTERNAL provider settings (e.g. Claude Code's
+                              // .claude/settings.json) written by `agent enable` — not a .libra surface
     ];
 
     /// Extract config-file name literals from the PRODUCTION half of one
