@@ -14,10 +14,20 @@ DeepSeek Harness 的公开定位是“一切皆插件”：模型、工具、技
 - [Libra Agent hook 适配器](../../../src/command/agent/hooks.rs)
 - [Libra Code 控制协议](../../../docs/commands/code.md)
 
-本文档以本地 DeepSeek Harness checkout 的 `dsh-v0.1.0-rc.7`
-（commit `99f6f02fecdb7dff40c3fbc9470f5907c29f74ca`）为事实基线；事件名、
-`sessionPersistence`、`agent.inject()` 和 `--dump-config` 均以该版本为准。
+### 1.0 事实基线与可执行边界（2026-08-21 核对）
+
+| 基线 | 当前状态 | 证据 |
+| --- | --- | --- |
+| DeepSeek Harness pin | `dsh-v0.1.0-rc.7` / `99f6f02fecdb7dff40c3fbc9470f5907c29f74ca` | 上游 tag `dsh-v0.1.0-rc.7`；架构文档确认 `web`/`headless` profile、`--dump-config`、`agent.inject()`、`sessionPersistence`、`ctx.codeRuntime` |
+| Harness 生命周期事件 | `session/created`、`session/event`、`session/flush`、`session/disposed`、`agent/created`、`agent/disposed`、`subagent/start`、`subagent/end`、`agent/turn-stopping` 均存在；`tool/result` 是 session event 变体，不是独立 Cordis dispatch 事件 | pin 的 `docs/event-producer-consumer.md` / `docs/architecture.md` |
+| Libra bridge 入口 | **目标态**；`AgentSubcommand` 尚无 `Bridge` | `src/command/agent/mod.rs`（约 `123-195`） |
+| Libra Code 控制面 | `libra code --control stdio` 已是 JSON-RPC NDJSON **client**，控制已有 Code session，不是 Harness ingress | `docs/commands/code.md`（约 `96-115`） |
+| Libra worktree | linked worktree 共享 common storage（db/objects）与分支 ref 目录；**HEAD/index 已按 `worktree_id` 作用域隔离**；真正的分支隔离仍需独立 clone 或显式 branch scope | `src/internal/worktree_scope.rs`；`docs/development/libra-worktree-architecture.md` |
+| Actor 兼容风险 | 低层 AI/MCP adapter 仍接受调用方自报 `actor_kind`/`actor_id`；bridge 不得沿用该模型 | `src/internal/ai/mcp/resource.rs` |
+| 实施计划 | Libra Rust 与 TypeScript 插件分仓落地 | [`plan-20260818.md`](../plan/plan-20260818.md)（Libra）；兄弟仓 `deepseek-harness-libra-plugin/docs/plan/plan-20260818.md` |
+
 本文档中标为“目标态”“提议契约”或“待实现”的接口不是当前已存在的 Libra API。
+跨仓库发布顺序固定为 **`REL-LB-01`（Rust bridge + authoritative schema/fixture）→ `REL-TS-01`（`@libra/dsh-bundle`）**；不得用 TypeScript 自造第二份 server schema。
 
 ### 1.1 事实源边界
 
@@ -65,16 +75,16 @@ flowchart LR
 通过 JSON-RPC NDJSON 将 session、workspace、checkpoint、evidence 和 provenance
 操作发送给 Libra 的 Agent ingress/runtime。
 
-建议将集成拆成多个可独立启停的 npm 包，而不是一个不可拆分的“大插件”：
+逻辑上按能力拆分，但 **v1 只对外发布一个 npm 包 `@libra/dsh-bundle`**（内部 `packages/{protocol,bridge-client,session,tools,workspace,context,ui}` 分层，可独立启停）。稳定后再拆独立 npm 子包；不要在 bridge schema 未冻结时增加多包发布面。
 
-| 包 | 责任 |
+| 逻辑包 / 内部 package | 责任 |
 | --- | --- |
-| `@libra/dsh-tools` | 模型可见的高层 VCS、checkpoint、历史和 review 工具 |
-| `@libra/dsh-session` | Harness session/event 到 Libra 的批量投影、outbox 和断点续传 |
-| `@libra/dsh-workspace` | session/subagent 与 Libra worktree、workspace lease 的绑定 |
-| `@libra/dsh-context` | Libra skill、历史摘要、decision 和 evidence 的按需上下文 |
-| `@libra/dsh-ui` | checkpoint、diff、commit、evidence 的 Harness UI 卡片 |
-| `@libra/dsh-bundle` | 一份可直接启用的 Harness profile/bundle |
+| `packages/tools`（逻辑名 `@libra/dsh-tools`） | 模型可见的高层 VCS、checkpoint、历史和 review 工具 |
+| `packages/session`（逻辑名 `@libra/dsh-session`） | Harness session/event 到 Libra 的批量投影、outbox 和断点续传 |
+| `packages/workspace`（逻辑名 `@libra/dsh-workspace`） | session/subagent 与 Libra worktree、workspace lease 的绑定 |
+| `packages/context`（逻辑名 `@libra/dsh-context`） | Libra skill、历史摘要、decision 和 evidence 的按需上下文 |
+| `packages/ui`（逻辑名 `@libra/dsh-ui`） | checkpoint、diff、commit、evidence 的 Harness UI 卡片 |
+| `@libra/dsh-bundle`（唯一 v1 发布物） | 可直接启用的 Harness profile/bundle，并启动 bridge child |
 
 ## 3. 第一阶段：Agent Bridge 能力插件
 
@@ -120,19 +130,28 @@ Harness 插件可以将模型可见工具映射为 bridge 方法，但模型不�
 - `libra_review`：针对指定 checkpoint 执行只读 review。
 - `libra_restore_checkpoint`：恢复前必须经过人工确认。
 
-对应 bridge 方法可以按以下命名分组：
+对应 bridge 方法按以下命名分组。**模型可见工具**只映射高层子集；**完整 v1 allowlist**（20 个 method，与两份 `plan-20260818.md` 及 Rust protocol fixture 权威一致）如下：
 
 ```text
-context.get
-status.get / diff.get / history.search
-workspace.claim / workspace.release
-session.open / session.flush / session.close
-checkpoint.create / checkpoint.list / checkpoint.restore
-checkpoint.show
+# handshake / session ingress
+initialize
+session.open / event.append / session.flush / session.close
+
+# projection
 evidence.append / provenance.append
-commit.create
-review.run
+
+# model-visible / read
+context.get / status.get / diff.get / history.search
+checkpoint.create / checkpoint.list / checkpoint.show / checkpoint.restore
+
+# mutation / review
+commit.create / review.run
+
+# workspace lease
+workspace.claim / workspace.renew / workspace.release
 ```
+
+模型可见 facade 名称（`libra_context`、`libra_status`、…）只是上述 method 的工具层别名；实现与测试必须以 allowlist 字面名为准，不得另发明 method。
 
 `create_intent`、`create_task`、`create_run` 等低层对象操作只作为 Rust ingress
 内部 service 使用，不应直接暴露给模型。否则会增加 schema token、工具组合错误和错误恢复复杂度。
@@ -221,7 +240,7 @@ linked-per-subagent 每个并行 subagent 独立工作区
 - 插件不得静默切换用户当前工作区。
 - 创建、切换、释放 worktree 必须有明确的 session scope。
 - lease 过期、进程崩溃和 workspace 身份不一致时 fail-closed。
-- 并行 Agent 不应仅依赖 Libra linked worktree；linked worktree 共享 common storage（SQLite 数据库和对象）以及分支 refs，但 HEAD 已按 worktree 作用域隔离，因此真正的分支隔离仍应使用独立 clone 或显式 branch scope。参见 [worktree scope 实现](../../../src/internal/worktree_scope.rs)。
+- 并行 Agent 不应仅依赖 Libra linked worktree：它们共享 common storage（SQLite / objects）和分支 ref 命名空间；`reference`/HEAD 与 index 已按 `worktree_id` 隔离。**同一分支不得被多个 worktree 同时 checkout**——冲突 fail-closed（`LBR-CONFLICT-002` / `CheckedOutElsewhere`）。真正的并行隔离仍应使用独立 clone，或为每个 session/subagent 分配显式唯一分支 scope。参见 [worktree scope 实现](../../../src/internal/worktree_scope.rs) 与 [worktree 架构](../libra-worktree-architecture.md)。
 - 子 Agent 完成后产出 checkpoint/patchset，由父 Agent 选择合并，而不是直接改写父工作区。
 
 ## 6. 第四阶段：工程治理和可验证结果
@@ -295,18 +314,24 @@ profile，而不是假设 Harness 已经内置 Libra 专用 profile。
 
 ## 9. 建议实现顺序
 
-### MVP
+落地任务卡以日期计划为准，不要只按本节口号开卡：
 
-1. 独立的 `libra agent bridge --stdio` 入口；若新增顶层 Libra 命令或 `agent` 子命令，必须同时更新 `COMPATIBILITY.md` 命令行、对应 `docs/commands/<cmd>.md`（含 `Examples`）、CLI `*_EXAMPLES`/root command groups，以及相关 compat guards；新增稳定错误码还要同步 `docs/error-codes.md`。
-2. `libra_context`、`libra_status`、`libra_diff`、`libra_history_search`、`libra_checkpoint`。
-3. `session/event` 的批量投影、outbox、幂等和断点续传。
-4. `libra_commit` / `commit.create` 与 Harness session/checkpoint/evidence 关联。
-5. 双层 approval；危险操作默认关闭。
+- Libra Rust：[`docs/development/plan/plan-20260818.md`](../plan/plan-20260818.md)（`LB-01`…`LB-07` / `REL-LB-01`）
+- TypeScript 插件：兄弟仓 `deepseek-harness-libra-plugin/docs/plan/plan-20260818.md`（`TS-01`…`TS-09` / `REL-TS-01`）
 
-### 第二个版本
+### MVP（对应 LB-01…LB-06 + TS-01…TS-06 的最小可写且可治理切片）
 
-1. per-session/per-subagent workspace lease。
-2. compaction-aware context anchor。
+1. 独立的 `libra agent bridge --stdio` 入口；若新增顶层 Libra 命令或 `agent` 子命令，必须同时更新 `COMPATIBILITY.md`、对应 `docs/commands/<cmd>.md`（含 `Examples`）、CLI `*_EXAMPLES`/root command groups，以及相关 compat guards；新增稳定错误码还要同步 `docs/error-codes.md`。
+2. Rust authoritative schema/fixture：含完整 20-method allowlist、frame/batch limits、`last_acked_seq`、稳定错误码（TypeScript 只接收，不发明）。
+3. `context.get` / `status.get` / `diff.get` / `history.search` / `checkpoint.*` 只读方法与模型可见 facade。
+4. `session.open` / `event.append` / `session.flush` / `session.close` 的批量投影、outbox、幂等和断点续传。
+5. `commit.create` 与 Harness session/checkpoint/evidence 关联；双层 approval；危险操作默认关闭。
+6. `workspace.claim` / `workspace.renew` / `workspace.release` 与 session/subagent actor lineage（对应 `LB-06` / `TS-05`）——MVP 安全边界的一部分，不得延后到“第二个版本”才有 lease。
+
+### 第二个版本（在 MVP lease/ingress 已可用之后）
+
+1. linked-per-session / linked-per-subagent 的自动 worktree 物化与更完整的并行策略（MVP 可先 `reuse-current` + 显式 claim）。
+2. compaction-aware context anchor（`agent.inject()` + token 预算）。
 3. review/evidence 自动记录。
 4. checkpoint、diff、commit、evidence 的 UI card。
 5. session fork、checkpoint restore 和验证重跑。
@@ -317,17 +342,19 @@ profile，而不是假设 Harness 已经内置 Libra 专用 profile。
 2. 跨仓库历史和 skill 检索。
 3. cloud backup/publish 的显式 opt-in 集成。
 4. 更完整的 Harness session persistence adapter。
+5. 将内部 package 拆成多个独立 npm 发布物（仅在 schema 与生命周期稳定后）。
 
 ## 10. 验收标准
 
 ### 协议与数据
 
-- 先通过 `dsh plugin --profile libra add <libra-bundle-spec>` 创建并安装自定义 profile；随后
+- 先通过 `dsh plugin --profile libra add <libra-bundle-spec>` 创建并安装自定义 profile（Harness 随附的是 `web`/`headless`；`libra` 必须显式创建）；随后
   `dsh --profile libra --dump-config` 可输出完整、可重放的插件组合。
 - JSON-RPC bridge stdout 只包含协议帧，日志全部写 stderr 或 Harness logger。
 - 同一事件重试不会生成重复 session、checkpoint 或 evidence。
-- 杀掉任一进程后重启，事件可从最后确认序号继续同步。
-- Libra 不可用时，失败状态可见且不会静默丢失数据。
+- 杀掉任一进程后重启，事件可从最后确认序号（bridge 返回的 `last_acked_seq`）继续同步。
+- Libra 不可用时，失败状态可见且不会静默丢失数据（插件 outbox + 服务端 durable projection）。
+- v1 contract limits（与两份 `plan-20260818.md` 一致）：frame/event/result ≤ 256 KiB；batch ≤ 64 events 且 ≤ 256 KiB；in-flight ≤ 64；request deadline 默认 30 s；history/checkpoint page ≤ 100。
 
 ### 安全与权限
 
