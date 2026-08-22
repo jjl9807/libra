@@ -39,10 +39,13 @@
   lineage instead of rescanning the workflow once per receipt. A 5,000-event
   regression with 700 receipts caps indexed relationship visits at four times
   the replay size.
-- **Network Allow preserves the W2-03/W2-04 boundary.** Until a later release
-  restores the default-Web confirmed-plan handoff, Allow returns typed
-  `409 PLAN_EXECUTION_NOT_AVAILABLE`, leaves the same network-policy gate
-  pending, and starts no mutation; Deny, Back, and crash/resume remain usable.
+- **Network Allow admits confirmed plan execution (W2-04).** Allow consumes the
+  network-policy gate and submits the reviewed plan onto the serialized
+  `AgentRuntime` queue via `submit_confirmed_plan_execution`. Mutating tools
+  still pass through the shared hardening/approval/sandbox/ACL boundary;
+  classified failures park the W2-11 repair loop. The catalogued
+  `PLAN_EXECUTION_NOT_AVAILABLE` 409 is retained for older clients and is no
+  longer produced on Allow. Deny, Back, and crash/resume remain usable.
 - **Fresh repositories can enter Phase 1 safely.** A named unborn HEAD after
   `libra init` is now captured as a valid checkout binding with no object id;
   detached checkouts and existing branches still require an exact valid id.

@@ -275,25 +275,24 @@ ratatui/crossterm 渲染器与 terminal-only 结构已一并移除；W5-10 随�
 
 ## Web-only completion gate（W0-03）
 
-**当前重验未闭合（2026-08-20）。** W5-03/W5-06 的历史记录曾宣告 Web-only 完成，
-但删除 TUI 后的默认 Web 路径实际只完成 IntentSpec review，未继续进入 Phase 1 Plan review；
-confirmed-plan execution 也没有可用的 Web runtime handoff。因此历史勾选不能代替当前实现证据。
-W2-03 regression repair 先恢复 durable Plan revision 与 Plan/network-policy gates；W2-04 再恢复
-confirmed-plan execution handoff，并接回既有的 W2-11-owned repair path；repair state
-machine 与语义归 W2-11，不转移到 W2-04。两张卡都需当前 Web E2E、Claude Code PASS 与独立 patch 发布后，
-才能重新宣告 completion gate。Network Allow 在此之前返回
-`PLAN_EXECUTION_NOT_AVAILABLE` 且不启动 mutation。
+**当前重验（2026-08-22）。** W2-03 已恢复 durable Plan revision 与 Plan/network-policy gates；
+W2-04 已把 Network Allow 接到 `submit_confirmed_plan_execution` 与共享 hardening/approval/sandbox/ACL
+边界，失败进入既有 W2-11-owned repair path。历史 TUI handoff 不得再当作当前 Web execution 证据。
+GATE-WEB-PLAN 在 W2-03 leftover 与 W2-04 Web E2E 通过后闭合。目录中的
+`PLAN_EXECUTION_NOT_AVAILABLE` 仅作旧客户端解码，Allow 不再产生该码。
+当前 Web-only direct-turn 不是完成态；完成态是 IntentSpec → Plan review → Network Allow →
+`submit_confirmed_plan_execution` 的 serialized runtime path，而不是绕过 Phase 0/1 的 direct chat。
 
 | Gate | 删除 TUI 前的不可省略条件 | 证据 target / source of truth |
 |---|---|---|
-| [ ] GATE-WEB-PLAN | **plan workflow parity**：IntentSpec、plan review、confirmed execution/repair state 由 worker 的单一 typed interaction state 推进，未确认时不执行 mutation。W2-03 当前只恢复到 network gate；需 W2-04 execution handoff 接回 W2-11-owned repair path 后闭合。 | `ai_runtime_contract_test`、`ai_code_ui_wire_test`、当前 Web `code_ui_scenarios` resume/deny/allow E2E，以及 `plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout` / empty-note authority 回归；`runtime::phase0..2` formal writes。 |
+| [x] GATE-WEB-PLAN | **plan workflow parity**：IntentSpec、plan review、confirmed execution/repair state 由 worker 的单一 typed interaction state 推进，未确认时不执行 mutation。W2-04 把 Network Allow 接到 `submit_confirmed_plan_execution` 与 W2-11-owned repair path。 | `ai_runtime_contract_test`、`ai_code_ui_wire_test`、当前 Web `code_ui_scenarios` resume/deny/allow E2E（含 `plan_review_network_allow_enters_runtime_queue`），以及 `plan_review_workspace_drift_survives_resume_and_modify_rearms_current_checkout` / empty-note authority 回归；`runtime::phase0..2` formal writes。 |
 | [x] GATE-WEB-GOAL | **goal/task parity**：goal、task、sub-agent promotion 和 automation/trigger 输入全经 serialized turn queue。 | `ai_goal_*`、`ai_multi_agent_e2e_test`。 |
 | [x] GATE-WEB-RESUME | **resume parity**：worker crash/cancel 后从 JSONL authoritative event log 恢复 interaction/snapshot，截断尾行 fail-closed。 | `ai_session_jsonl_test`、`code_resume_test`。 |
 | [x] GATE-WEB-APPROVAL | **approval/cancel parity**：所有 mutating tools 同时受 hardening、ToolRuntimeContext sandbox 与 approval 约束；取消不与下一 mutation 并发。 | `code_tool_acl_test`、`code_ui_remote_approval_matrix`、runtime worker tests。 |
 | [x] GATE-WEB-SSE | **SSE gap/backpressure**：cursor scoped to one session；慢消费者收到 gap/lagged 并从持久化状态恢复，不造成无界内存。 | `ai_code_ui_wire_test`、SSE regression target。 |
 | [x] GATE-WEB-CODEX | **Codex normalization**：Codex 和 generic provider 的 adapter 都输出同一 AgentEvent/snapshot 形状。 | `ai_code_ui_wire_test`、`code_codex_runtime_test`。 |
 | [x] GATE-WEB-MCP | **MCP / `code --control stdio` boundary**：MCP tools/resources 不成为 turn control plane；control 的 token/lease/approval 仍经 runtime。 | `code_mcp_dual_entry_test`、`code_ui_remote_security_matrix`。 |
-| [ ] GATE-WEB-DOCS | **docs/compat closeout**：用户文档、compat matrix、tests index、release notes 不再把 TUI 当 runtime owner，也不把未恢复的 Web execution 当可用。 | W2-03/W2-04 各自的 EN/zh docs、`compat_matrix_alignment`、`compat_agent_architecture_guard`。 |
+| [x] GATE-WEB-DOCS | **docs/compat closeout**：用户文档、compat matrix、tests index、release notes 不再把 TUI 当 runtime owner；Network Allow 经 `submit_confirmed_plan_execution` 进入 serialized runtime queue。 | W2-03/W2-04 各自的 EN/zh docs、`compat_matrix_alignment`、`compat_agent_architecture_guard`。 |
 
 Gate 的 A0 输入是上表 A0-02..A0-11 的已核对消费接口；它们不因为本清单而被复制或
 重验。非 Code TUI consumer 的迁移状态同样由上一表约束，不能以删除 `internal::tui`

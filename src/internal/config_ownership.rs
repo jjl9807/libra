@@ -371,6 +371,11 @@ pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
         "compiled parser options constant; input-independent",
     ),
     ("REG", "compiled regex constant; input-independent"),
+    (
+        "CURRENT_PROCESS_OWNER_IDENTITY",
+        "process-lifetime own pid/starttime/boot_id identity for the session \
+         writer-lease liveness probe; holds no repository state",
+    ),
 ];
 
 #[cfg(test)]

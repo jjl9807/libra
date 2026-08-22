@@ -448,7 +448,7 @@ fn mtime_nsec(stat: &libc::stat) -> i64 {
 
 #[cfg(not(unix))]
 fn system_time_parts(time: Option<std::time::SystemTime>) -> (i64, i64) {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::UNIX_EPOCH;
     let Some(time) = time else {
         return (0, 0);
     };
