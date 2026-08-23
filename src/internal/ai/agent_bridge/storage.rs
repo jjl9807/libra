@@ -488,6 +488,32 @@ pub async fn get_operation_status<C: ConnectionTrait>(
         .and_then(|r| r.try_get::<String>("", "status").ok()))
 }
 
+/// Read an operation's `(status, result_digest)` pair.
+///
+/// A replayed non-idempotent mutation (`review.run`) uses this to return the
+/// ORIGINAL result instead of executing a second time — the failure-recovery
+/// contract for "mutation applied but the response was lost" (plan-20260818
+/// 故障恢复矩阵: "以 operation id 查询并返回原结果").
+pub async fn get_operation_result<C: ConnectionTrait>(
+    conn: &C,
+    operation_id: &str,
+) -> Result<Option<(String, Option<String>)>, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT status, result_digest FROM agent_bridge_operation WHERE operation_id = ?",
+        [operation_id.into()],
+    );
+    let rows = conn.query_all_raw(stmt).await?;
+    Ok(rows.into_iter().next().map(|r| {
+        (
+            r.try_get::<String>("", "status").unwrap_or_default(),
+            r.try_get::<Option<String>>("", "result_digest")
+                .ok()
+                .flatten(),
+        )
+    }))
+}
+
 /// Outcome of an association-link insert, mirroring the event/operation
 /// idempotency + conflict discipline (GC-LB-09): a retry that points the same
 /// source at the same target is a success no-op; pointing it at a DIFFERENT
@@ -503,9 +529,45 @@ pub enum LinkOutcome {
     Conflict { stored_target_id: String },
 }
 
-/// Insert an association link idempotently. A stable (source_type, source_id)
-/// may only ever point at one target; a conflicting target is reported as
-/// `LinkOutcome::Conflict` (never silently dropped).
+/// How many targets one association source may point at.
+///
+/// The `agent_bridge_link` table stores edges keyed by
+/// `(source_type, source_id, target_type, target_id)`, so the *cardinality* of
+/// a relation is a service-level decision. Getting it wrong in either direction
+/// is a real defect: too strict and legitimate provenance (a checkpoint's
+/// several evidence ids) is refused as a conflict; too loose and a silent
+/// retarget replaces the recorded truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkSingularity {
+    /// At most one target for this source, whatever its type. Used by
+    /// `evidence.append` / `provenance.append`, whose contract is that one
+    /// evidence source names exactly one object.
+    BySource,
+    /// At most one target per relation kind: a mutation result has one
+    /// operation, one workspace, one parent session — but the relation kinds
+    /// coexist.
+    ByRelation,
+    /// Many targets are legitimate (a result's evidence ids).
+    Multi,
+}
+
+/// Insert an association link idempotently, honouring the relation's
+/// cardinality.
+///
+/// Re-inserting exactly the same edge is always an idempotent no-op. Pointing a
+/// *singular* relation at a different target is reported as
+/// `LinkOutcome::Conflict` and never silently overwrites (GC-LB-09).
+///
+/// # Arguments
+///
+/// * `singularity` - How many targets this relation may have.
+///
+/// # Returns
+///
+/// `Inserted` for a new edge, `Existing` for an exact replay, or `Conflict`
+/// carrying the target already recorded for a singular relation.
+// Explicit scope parameters as in `open_session` (GC-LB-06).
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_link<C: ConnectionTrait>(
     conn: &C,
     bridge_session_id: &str,
@@ -513,14 +575,50 @@ pub async fn insert_link<C: ConnectionTrait>(
     source_id: &str,
     target_type: &str,
     target_id: &str,
+    singularity: LinkSingularity,
     now_ms: i64,
 ) -> Result<LinkOutcome, DbErr> {
+    if singularity != LinkSingularity::Multi {
+        // Singular relation: an already-recorded target decides the outcome
+        // before anything is written.
+        let (sql, values): (&str, Vec<Value>) = match singularity {
+            LinkSingularity::BySource => (
+                "SELECT target_id FROM agent_bridge_link WHERE source_type = ? AND source_id = ?",
+                vec![source_type.into(), source_id.into()],
+            ),
+            _ => (
+                "SELECT target_id FROM agent_bridge_link \
+                 WHERE source_type = ? AND source_id = ? AND target_type = ?",
+                vec![source_type.into(), source_id.into(), target_type.into()],
+            ),
+        };
+        let rows = conn
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await?;
+        if let Some(stored) = rows
+            .into_iter()
+            .next()
+            .and_then(|r| r.try_get::<String>("", "target_id").ok())
+        {
+            return Ok(if stored == target_id {
+                LinkOutcome::Existing
+            } else {
+                LinkOutcome::Conflict {
+                    stored_target_id: stored,
+                }
+            });
+        }
+    }
     let insert = Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "INSERT INTO agent_bridge_link \
          (bridge_session_id, source_type, source_id, target_type, target_id, created_at) \
          VALUES (?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source_type, source_id) DO NOTHING",
+         ON CONFLICT(source_type, source_id, target_type, target_id) DO NOTHING",
         [
             bridge_session_id.into(),
             source_type.into(),
@@ -531,30 +629,11 @@ pub async fn insert_link<C: ConnectionTrait>(
         ],
     );
     let affected = conn.execute_raw(insert).await?;
-    if affected.rows_affected() > 0 {
-        return Ok(LinkOutcome::Inserted);
-    }
-    // Existing row: compare the stored target to distinguish replay from conflict.
-    let stmt = Statement::from_sql_and_values(
-        DatabaseBackend::Sqlite,
-        "SELECT target_id FROM agent_bridge_link \
-         WHERE source_type = ? AND source_id = ?",
-        [source_type.into(), source_id.into()],
-    );
-    let rows = conn.query_all_raw(stmt).await?;
-    let stored: Option<String> = rows
-        .into_iter()
-        .next()
-        .and_then(|r| r.try_get::<String>("", "target_id").ok());
-    match stored {
-        Some(stored) if stored == target_id => Ok(LinkOutcome::Existing),
-        Some(stored) => Ok(LinkOutcome::Conflict {
-            stored_target_id: stored,
-        }),
-        None => Ok(LinkOutcome::Conflict {
-            stored_target_id: target_id.to_string(),
-        }),
-    }
+    Ok(if affected.rows_affected() > 0 {
+        LinkOutcome::Inserted
+    } else {
+        LinkOutcome::Existing
+    })
 }
 
 /// Register a bridge checkpoint, optionally linking it to an existing

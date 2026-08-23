@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub mod bridge;
-mod checkpoint;
+pub(crate) mod checkpoint;
 mod clean;
 mod doctor;
 mod graph;

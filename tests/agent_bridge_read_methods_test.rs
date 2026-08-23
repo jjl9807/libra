@@ -222,16 +222,38 @@ async fn checkpoint_show_missing_is_error_not_empty() {
     assert_eq!(err.code, 1006);
 }
 
+/// `diff.get` is wired to the real diff service (see `agent_bridge_vcs_test`
+/// for the live-repository behaviour). With no working repository in scope —
+/// which is exactly this in-memory context — it fails closed with a scope
+/// error, never an empty diff that a caller could mistake for "no changes".
 #[tokio::test]
-async fn diff_get_is_bounded_not_implemented() {
+async fn diff_get_without_a_repository_fails_closed_on_scope() {
     let c = ctx().await;
     let err = read_dispatch(
         &c,
         &request(r#"{"jsonrpc":"2.0","method":"diff.get","params":{},"id":1}"#),
     )
     .await
-    .expect_err("diff.get is not implemented in this build");
-    assert_eq!(err.stable_code, "LBR-AGENT-030");
+    .expect_err("diff.get must not report an empty diff outside a repository");
+    assert_eq!(err.stable_code, "LBR-AGENT-032");
+}
+
+/// `diff.get` selectors are typed and validated BEFORE the diff service is
+/// reached, so an unknown mode or an escaping path is an invalid-params
+/// refusal rather than a repository error (GC-LB-03).
+#[tokio::test]
+async fn diff_get_selectors_are_validated_before_the_service() {
+    let c = ctx().await;
+    for frame in [
+        r#"{"jsonrpc":"2.0","method":"diff.get","params":{"mode":"HEAD~1"},"id":1}"#,
+        r#"{"jsonrpc":"2.0","method":"diff.get","params":{"paths":["../escape"]},"id":2}"#,
+        r#"{"jsonrpc":"2.0","method":"diff.get","params":{"paths":[":(exclude)x"]},"id":3}"#,
+    ] {
+        let err = read_dispatch(&c, &request(frame))
+            .await
+            .expect_err("untyped selector must be refused");
+        assert_eq!(err.stable_code, "LBR-AGENT-027", "frame {frame}");
+    }
 }
 
 /// `status.get` event/checkpoint totals must be scoped to the caller's

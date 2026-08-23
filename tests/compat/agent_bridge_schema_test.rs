@@ -6,17 +6,50 @@
 //! bumping the version pin without adding a migration) surfaces here as well
 //! as in `db_migration_test`/`agent_bridge_migration_test`.
 
-use libra::internal::db::migration::builtin_runner;
+use libra::internal::db::migration::{builtin_migrations, builtin_runner};
 
+/// The migration that creates the bridge durable projection (LB-02).
 const BRIDGE_MIGRATION_VERSION: i64 = 2026081801;
+/// The follow-up that turns `agent_bridge_link` into a real relation graph so
+/// one mutation result can carry its operation, workspace, parent-session and
+/// evidence associations (LB-04/LB-05 VCS wiring).
+const BRIDGE_LINK_RELATIONS_VERSION: i64 = 2026082401;
 
 #[test]
-fn bridge_migration_is_registered_and_is_the_latest() {
+fn bridge_migrations_are_registered_and_link_relations_is_the_latest() {
     let runner = builtin_runner().expect("builtin registry builds clean");
+    assert!(
+        builtin_migrations()
+            .iter()
+            .any(|migration| migration.version == BRIDGE_MIGRATION_VERSION),
+        "2026081801_agent_bridge_capture must stay registered"
+    );
     assert_eq!(
         runner.max_registered_version(),
-        Some(BRIDGE_MIGRATION_VERSION),
-        "2026081801_agent_bridge_capture must be the latest registered migration"
+        Some(BRIDGE_LINK_RELATIONS_VERSION),
+        "2026082401_agent_bridge_link_relations must be the latest registered migration"
+    );
+}
+
+#[test]
+fn bridge_link_relations_sql_widens_the_edge_key_and_source_kinds() {
+    let up = include_str!("../../sql/migrations/2026082401_agent_bridge_link_relations.sql");
+    // Edge-level uniqueness: without target_type/target_id in the key a result
+    // could only ever record ONE association (LB-05 AC4 regression guard).
+    assert!(
+        up.contains("UNIQUE(`source_type`, `source_id`, `target_type`, `target_id`)"),
+        "uniqueness must key the full edge, not just the source"
+    );
+    for kind in ["'commit'", "'restore'", "'review'"] {
+        assert!(
+            up.contains(kind),
+            "the mutation result source kind {kind} must be allowed"
+        );
+    }
+    let down = include_str!("../../sql/migrations/2026082401_agent_bridge_link_relations_down.sql");
+    assert!(
+        down.contains("_down_guard") && down.contains("CHECK"),
+        "down must freeze (refuse) while link rows exist"
     );
 }
 

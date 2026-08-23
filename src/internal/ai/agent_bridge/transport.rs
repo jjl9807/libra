@@ -20,7 +20,13 @@ use tokio::time::timeout;
 
 use super::protocol::{BridgeError, BridgeRequest, BridgeResponse, JSONRPC_VERSION, MAX_INFLIGHT};
 
-#[async_trait]
+// `?Send`: a handler may reach the real VCS services, whose internals use
+// thread-local `Rc`/`RefCell` caches across awaits (see `command::diff`). The
+// bridge drives exactly one request future at a time on the stdio loop's own
+// task and never spawns it, so a `Send` future buys nothing here — while
+// requiring it would force those services to be rewritten purely to satisfy a
+// bound the transport does not use. The handler VALUE stays `Send + Sync`.
+#[async_trait(?Send)]
 pub trait BridgeHandler: Send + Sync {
     /// Handle one validated request and produce a response (or `None` for a
     /// notification that produces no reply). Failures should be returned as a
@@ -34,7 +40,7 @@ pub trait BridgeHandler: Send + Sync {
 /// full dispatcher (LB-03..LB-06) replaces it.
 pub struct HandshakeHandler;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl BridgeHandler for HandshakeHandler {
     async fn handle(&self, request: &BridgeRequest) -> Result<Option<BridgeResponse>, BridgeError> {
         crate::internal::ai::agent_bridge::protocol::dispatch_handshake(request)
@@ -422,7 +428,7 @@ mod tests {
     /// handler (the transport rejects unknown methods before dispatch).
     struct PanicHandler;
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl BridgeHandler for PanicHandler {
         async fn handle(
             &self,
@@ -470,7 +476,7 @@ mod tests {
     /// enforced (the loop fails the request instead of blocking forever).
     struct StalledHandler;
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl BridgeHandler for StalledHandler {
         async fn handle(
             &self,
@@ -510,7 +516,7 @@ mod tests {
     /// cap is enforced fail-closed (no oversized NDJSON frame on stdout).
     struct BigResultHandler;
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl BridgeHandler for BigResultHandler {
         async fn handle(
             &self,

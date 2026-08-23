@@ -50,23 +50,76 @@ pub fn build_provenance(
     })
 }
 
+/// The relation kinds a mutation result may be associated with.
+///
+/// Each names one edge from the result to a scope object. `Evidence` is the
+/// only multi-valued relation: a result may cite several evidence ids, but it
+/// has exactly one operation, one workspace and one parent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relation {
+    /// The operation that produced this result.
+    Operation,
+    /// The workspace the producing session was bound to.
+    Workspace,
+    /// The parent session in the agent lineage (GC-LB-07).
+    ParentSession,
+    /// One evidence id the result cites.
+    Evidence,
+}
+
+impl Relation {
+    /// The stored `target_type`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operation => "operation",
+            Self::Workspace => "workspace",
+            Self::ParentSession => "parent_session",
+            Self::Evidence => "evidence",
+        }
+    }
+
+    /// How many targets this relation may have.
+    fn singularity(self) -> storage::LinkSingularity {
+        match self {
+            Self::Evidence => storage::LinkSingularity::Multi,
+            _ => storage::LinkSingularity::ByRelation,
+        }
+    }
+}
+
+/// One association edge to persist: the result's kind and id, the relation, and
+/// the scope object it points at.
+pub struct Association<'a> {
+    /// What produced the association (`checkpoint`, `commit`, `restore`, `review`).
+    pub source_type: &'a str,
+    /// The result's stable identity.
+    pub source_id: &'a str,
+    /// The relation kind.
+    pub relation: Relation,
+    /// The scope object the result is associated with.
+    pub target_id: &'a str,
+}
+
 /// Persist the association links of a mutation into `agent_bridge_link`.
-/// Returns a fail-closed `digest_conflict` if any association source is
-/// already pinned to a different target (R1-P1-2 discipline).
+///
+/// Replaying the same edge is an idempotent no-op. Pointing a **singular**
+/// relation at a different target is a fail-closed `digest_conflict`: the
+/// recorded provenance is never silently overwritten (R1-P1-2 discipline).
 pub async fn record_links(
     ctx: &BridgeContext,
     session_id: &str,
-    links: &[(&str, &str, &str)], // (source_type, source_id, target_id)
+    links: &[Association<'_>],
     now_ms: i64,
 ) -> Result<(), BridgeError> {
-    for (source_type, source_id, target_id) in links {
+    for link in links {
         let outcome = storage::insert_link(
             &ctx.conn,
             session_id,
-            source_type,
-            source_id,
-            "operation",
-            target_id,
+            link.source_type,
+            link.source_id,
+            link.relation.as_str(),
+            link.target_id,
+            link.relation.singularity(),
             now_ms,
         )
         .await
@@ -75,7 +128,11 @@ pub async fn record_links(
             storage::LinkOutcome::Inserted | storage::LinkOutcome::Existing => {}
             storage::LinkOutcome::Conflict { stored_target_id } => {
                 return Err(BridgeError::digest_conflict(format!(
-                    "provenance association {source_type}:{source_id} already points at '{stored_target_id}', not '{target_id}'; refusing"
+                    "provenance association {}:{} ({}) already points at '{stored_target_id}', not '{}'; refusing",
+                    link.source_type,
+                    link.source_id,
+                    link.relation.as_str(),
+                    link.target_id
                 )));
             }
         }

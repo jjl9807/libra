@@ -55,7 +55,7 @@ impl IngressBridgeHandler {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl BridgeHandler for IngressBridgeHandler {
     async fn handle(&self, request: &BridgeRequest) -> Result<Option<BridgeResponse>, BridgeError> {
         // One tracing span per request (GC-LB-10). It carries only stable,
@@ -132,14 +132,24 @@ pub async fn execute_safe(args: BridgeArgs, _output: &OutputConfig) -> CliResult
     let handler = IngressBridgeHandler::new(ctx);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let _frames = run(
-        stdin.lock(),
-        stdout.lock(),
-        &handler,
-        std::time::Duration::from_secs(crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS),
-    )
-    .await
-    .map_err(|error| {
+    let outcome = {
+        let stdout = stdout.lock();
+        run(
+            stdin.lock(),
+            stdout,
+            &handler,
+            std::time::Duration::from_secs(
+                crate::internal::ai::agent_bridge::REQUEST_DEADLINE_SECS,
+            ),
+        )
+        .await
+    };
+    // GC-LB-10: whatever ended the loop — EOF, broken pipe, or a fatal I/O
+    // error — no review run this bridge started may outlive it. Cancel and
+    // drain them (bounded) BEFORE returning, so a client disconnect can never
+    // leave orphaned reviewer process groups behind.
+    crate::internal::ai::agent_bridge::vcs::supervisor::shutdown().await;
+    outcome.map_err(|error| {
         crate::utils::error::CliError::fatal(format!(
             "libra agent bridge: fatal I/O error on the stdio transport: {error}"
         ))

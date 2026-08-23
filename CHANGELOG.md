@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.21.1] — 2026-08-24
+
+### Added: the bridge's remaining VCS methods (plan-20260818 LB-04/LB-05, closes DEFER-LB-07)
+
+`0.21.0` shipped `libra agent bridge --stdio` with `diff.get` returning a stable
+not-implemented error and `commit.create` / `review.run` / `checkpoint.restore`
+passing admission but failing closed before any VCS service. All four are now
+wired through a typed adapter (`src/internal/ai/agent_bridge/vcs.rs`), so the
+v1 20-method allowlist is implemented end to end.
+
+- **`diff.get`** returns the real working-tree, staged, or checkpoint-scoped
+  diff. Selectors stay typed: a closed `mode` enum (`worktree` / `staged` /
+  `checkpoint`) plus validated repository-relative `paths` — never a free-form
+  revision or pathspec magic. `checkpoint` mode resolves its revision from the
+  bridge's own `agent_bridge_checkpoint` row (or its linked
+  `agent_checkpoint.parent_commit`), so a request can never name an arbitrary
+  commit. The diff forces `--no-ext-diff` / `--no-textconv`, so repository
+  configuration cannot turn a bridge read into process execution (GC-LB-03).
+  Results are bounded by the page cap and a shared patch budget, with explicit
+  `diff_truncated` / `diff_patch_budget_exhausted` warnings.
+- **`commit.create`** commits the current index — no `-a`, no pathspec, no
+  amend, no author override — and records its association graph (operation,
+  workspace, parent session, evidence ids) as `agent_bridge_link` rows rather
+  than splicing metadata into the commit message. An optional `expected_head`
+  is verified before the commit is created.
+- **`checkpoint.restore`** restores the working tree to the commit a bridge
+  checkpoint pins, reusing the same typed path as
+  `libra agent checkpoint rewind --apply`. It requires an explicit
+  `expected_head` fence **and** a clean index/worktree, and never moves HEAD.
+- **`review.run`** validates the reviewer roster against the launchable
+  capability matrix, resolves an optional checkpoint scope and takes an
+  agent-run admission slot — all before any run directory exists — then runs the
+  read-only review under a supervisor. When the bridge's stdio loop ends the
+  supervisor cancels and drains every live run, so no reviewer process group
+  outlives the bridge (GC-LB-10).
+- **Non-idempotent replay is safe.** Replaying a recorded `operation_id` for
+  `commit.create`, `checkpoint.restore` or `review.run` returns the ORIGINAL
+  result (and, for a review, its current run state) instead of executing a
+  second time — the "response was lost, query by operation id" recovery path.
+
+### Fixed
+
+- **A bridge mutation can record more than one association.**
+  `agent_bridge_link` was keyed `UNIQUE(source_type, source_id)`, which allowed
+  exactly one association per result: every workspace / parent-session /
+  evidence link after the first was reported as a retarget conflict, so the
+  rich provenance LB-05 promises could never be persisted.
+
+### Added
+
+- `LBR-AGENT-038` — a bridge mutation's fence drifted (HEAD moved, or the
+  index/worktree is dirty where the operation requires a clean one). Refused
+  **before** any write, so nothing is partially applied.
+
+### Migration
+
+- `2026082401_agent_bridge_link_relations` rebuilds `agent_bridge_link` with
+  edge-level uniqueness `(source_type, source_id, target_type, target_id)` and
+  adds the `commit` / `restore` / `review` source kinds. Every existing edge is
+  copied verbatim. The down path is forward-only: it freezes while any link row
+  exists and never deletes recorded provenance (ER-LB-04).
+
 ## [0.21.0] — 2026-08-23
 
 ### Added: DeepSeek Harness bridge (`agent bridge --stdio`, plan-20260818 LB-01..LB-06)
@@ -32,7 +94,8 @@
   digest-conflict fail-closed), binds the trusted session/actor scope, and
   enforces a default-deny approval gate for dangerous actions. `commit.create`,
   `review.run` and `checkpoint.restore` pass admission but fail closed with a
-  stable "not wired to the VCS service" error until the service plumbing lands.
+  stable "not wired to the VCS service" error until the service plumbing lands
+  (wired in `0.21.1`).
 - **Workspace lease** (LB-06): `workspace.claim`/`renew`/`release` route through
   the existing `WorkspaceStore` (owner + monotonic fence); the lease owner is
   derived from the authenticated bridge session identity (never a self-reported

@@ -483,6 +483,7 @@ pub const MIGRATION_ONLY_TABLES: &[&str] = &[
     "_agent_tombstone_down_guard",
     "agent_capture_scope_down_guard",
     "agent_bridge_capture_down_guard",
+    "agent_bridge_link_relations_down_guard",
     "agent_usage_stats__rebuild",
     "approved_permission_provenance_down_guard",
     "bisect_state__down_guard_2026072301",

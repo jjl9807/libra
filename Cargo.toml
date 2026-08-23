@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.21.0"
+version = "0.21.1"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -391,6 +391,12 @@ path = "tests/agent_bridge_approval_test.rs"
 [[test]]
 name = "agent_bridge_checkpoint_test"
 path = "tests/agent_bridge_checkpoint_test.rs"
+
+# plan-20260818 LB-04/LB-05: the bridge's real VCS wiring (diff.get,
+# commit.create, checkpoint.restore, review.run) against a temp repository.
+[[test]]
+name = "agent_bridge_vcs_test"
+path = "tests/agent_bridge_vcs_test.rs"
 
 [[test]]
 name = "compat_subface_labels"

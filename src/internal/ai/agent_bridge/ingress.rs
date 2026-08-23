@@ -358,6 +358,10 @@ async fn evidence_append(
         &source_id,
         &target_type,
         &target_id,
+        // `evidence.append` / `provenance.append` keep their established
+        // one-source-one-target contract: a relink to a different object is a
+        // conflict, whatever the target's type.
+        storage::LinkSingularity::BySource,
         now_ms(),
     )
     .await

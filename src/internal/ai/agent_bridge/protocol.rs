@@ -228,6 +228,9 @@ pub mod code {
     pub const DENIED: i64 = 1009;
     /// A request did not complete within its deadline.
     pub const TIMEOUT: i64 = 1010;
+    /// A mutation's pre-checked fence (HEAD / index / worktree) drifted, so the
+    /// operation was refused before any write.
+    pub const STALE_FENCE: i64 = 1011;
 }
 
 /// A structured bridge error combining a JSON-RPC code, a stable `LBR-*`
@@ -376,6 +379,15 @@ impl BridgeError {
     /// Standard JSON-RPC internal error (DB / VCS / generic failure).
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(code::INTERNAL_ERROR, "LBR-AGENT-037", message)
+    }
+
+    /// A mutation's pre-checked fence drifted between admission and execution:
+    /// HEAD moved, or the index/worktree is dirty when the operation requires a
+    /// clean one (LB-05). Fail-closed **before** any write, so nothing is
+    /// partially applied. Not retryable as-is: the caller must re-read the
+    /// current state and re-issue with a fresh fence.
+    pub fn stale_fence(message: impl Into<String>) -> Self {
+        Self::new(code::STALE_FENCE, "LBR-AGENT-038", message).resource("worktree")
     }
 }
 
@@ -603,7 +615,7 @@ mod tests {
     }
 
     /// Every bridge stable error code maps to exactly one semantic, matching
-    /// `docs/error-codes.md` LBR-AGENT-024..037 (and the pre-existing
+    /// `docs/error-codes.md` LBR-AGENT-024..038 (and the pre-existing
     /// workspace lease codes LBR-AGENT-022/023, reused per LB-06). This pins
     /// the protocol-authority contract so a future renumbering cannot silently
     /// drift from the docs the TypeScript plugin consumes (GC-LB-02). The
@@ -614,7 +626,7 @@ mod tests {
         // (constructor, expected code) — one row per bridge error. The
         // workspace lease codes 022/023 are pre-existing StableErrorCode
         // values reused by the bridge (LB-06) and are included here so their
-        // uniqueness is pinned against the bridge's own 024..037 catalogue.
+        // uniqueness is pinned against the bridge's own 024..038 catalogue.
         let pairs: &[(&'static str, &str)] = &[
             (BridgeError::parse_error("x").stable_code, "LBR-AGENT-024"),
             (
@@ -648,6 +660,7 @@ mod tests {
             (BridgeError::denied("x").stable_code, "LBR-AGENT-035"),
             (BridgeError::timeout("x").stable_code, "LBR-AGENT-036"),
             (BridgeError::internal("x").stable_code, "LBR-AGENT-037"),
+            (BridgeError::stale_fence("x").stable_code, "LBR-AGENT-038"),
             // LB-06 workspace lease codes (pre-existing StableErrorCode).
             (
                 BridgeError::workspace_lease_held("x").stable_code,

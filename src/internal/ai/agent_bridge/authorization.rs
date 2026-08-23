@@ -32,7 +32,7 @@ pub enum ActionClass {
 pub fn classify(action: &str) -> ActionClass {
     match action {
         "checkpoint.create" | "checkpoint.list" | "checkpoint.show" | "evidence.append"
-        | "provenance.append" | "context.get" | "status.get" | "history.search" => {
+        | "provenance.append" | "context.get" | "status.get" | "history.search" | "diff.get" => {
             ActionClass::Normal
         }
         // Default deny for anything that can change working state / refs /

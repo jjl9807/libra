@@ -314,6 +314,10 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
         ConfigOwner::RepositoryWithWorkspaceSessionScope,
     ),
     (
+        "agent_bridge_link_relations_down_guard",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
         "agent_subagent_content_claim",
         ConfigOwner::RepositoryWithWorkspaceSessionScope,
     ),
@@ -402,6 +406,13 @@ pub const CODE_AGENT_PROCESS_CACHES: &[(&str, &str)] = &[
         "CURRENT_PROCESS_OWNER_IDENTITY",
         "process-lifetime own pid/starttime/boot_id identity for the session \
          writer-lease liveness probe; holds no repository state",
+    ),
+    (
+        "BRIDGE_LIVE_REVIEW_RUNS",
+        "not a cache: the live-run registry `libra agent bridge --stdio` uses to \
+         cancel and drain the review runs IT started when the stdio loop ends \
+         (GC-LB-10). Keyed by run id, holds only cancel/join handles for this \
+         process's own runs, and is emptied by the shutdown drain",
     ),
 ];
 

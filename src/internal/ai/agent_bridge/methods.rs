@@ -5,8 +5,10 @@
 //! the bridge durable projection, with a unified result envelope
 //! (`schema_version`, `repository_id`, `workspace_id`, `operation_id`,
 //! `status`, `data`, `warnings`). Scope is derived from the trusted context,
-//! never from the request body (GC-LB-06). `diff.get` requires real VCS diff
-//! wiring and returns a stable, documented not-yet-implemented error for now.
+//! never from the request body (GC-LB-06). `diff.get` is wired to the real VCS
+//! diff service through the typed [`super::vcs`] adapter: the request selects
+//! a closed mode enum plus validated repository-relative paths, never a
+//! free-form revision or pathspec.
 //!
 //! Unknown methods, unknown fields and arbitrary SQL/path/ref selectors are
 //! rejected fail-closed; results are bounded by the v1 page/result caps.
@@ -17,6 +19,7 @@ use serde_json::{Value, json};
 use super::{
     ingress::BridgeContext,
     protocol::{BridgeError, BridgeRequest, BridgeResponse, JSONRPC_VERSION, MAX_PAGE},
+    vcs::{self, DiffMode},
 };
 
 /// The v1 result envelope schema version (fixed, additive).
@@ -77,7 +80,11 @@ pub async fn dispatch(
             resp.id = id;
             Ok(Some(resp))
         }
-        "diff.get" => Err(BridgeError::not_implemented("diff.get")),
+        "diff.get" => {
+            let mut resp = diff_get(ctx, request).await?;
+            resp.id = id;
+            Ok(Some(resp))
+        }
         _ => Ok(None),
     }
 }
@@ -236,6 +243,92 @@ async fn checkpoint_show(
         "",
         json!([]),
     ))
+}
+
+/// `diff.get` — the working-tree, staged, or checkpoint-scoped diff, bounded
+/// by the v1 file page and patch budget.
+///
+/// The comparison sides come from a closed `mode` enum; `mode: "checkpoint"`
+/// resolves its revision from the bridge's own `agent_bridge_checkpoint` row
+/// (or its linked `agent_checkpoint.parent_commit`), so a request can never
+/// name an arbitrary revision. Paths are validated repository-relative
+/// selectors, never pathspec magic (GC-LB-03).
+async fn diff_get(
+    ctx: &BridgeContext,
+    request: &BridgeRequest,
+) -> Result<BridgeResponse, BridgeError> {
+    let (mode, paths) = vcs::parse_diff_params(&request.params)?;
+    let (limit, mut warnings) = page_limit(&request.params);
+    let against = if mode == DiffMode::Checkpoint {
+        let checkpoint_id = param_str(&request.params, "checkpoint_id").ok_or_else(|| {
+            BridgeError::invalid_params("diff.get mode 'checkpoint' requires checkpoint_id")
+        })?;
+        Some(resolve_checkpoint_commit(ctx, &checkpoint_id).await?)
+    } else {
+        None
+    };
+    let (data, mut diff_warnings) = vcs::diff_data(mode, against, paths, limit).await?;
+    warnings.append(&mut diff_warnings);
+    Ok(ok_envelope(ctx, data, "", json!(warnings)))
+}
+
+/// Resolve the commit a bridge checkpoint pins, scoped to this repository.
+///
+/// Prefers the bridge checkpoint's own `target_oid`; falls back to the linked
+/// `agent_checkpoint.parent_commit` (the snapshot `checkpoint rewind` restores
+/// to). A checkpoint that pins no commit is a fail-closed error, never an
+/// empty diff.
+pub(super) async fn resolve_checkpoint_commit(
+    ctx: &BridgeContext,
+    checkpoint_id: &str,
+) -> Result<git_internal::hash::ObjectHash, BridgeError> {
+    let row = get_checkpoint(&ctx.conn, &ctx.repository_id, checkpoint_id)
+        .await
+        .map_err(db_error("resolve checkpoint commit"))?;
+    let Some((_, _, agent_checkpoint_id, target_oid)) = row else {
+        return Err(BridgeError::scope_mismatch(format!(
+            "bridge checkpoint '{checkpoint_id}' does not exist in this repository"
+        )));
+    };
+    if let Some(oid) = target_oid.filter(|v| !v.trim().is_empty()) {
+        return vcs::parse_stored_commit_oid(&oid, "the bridge checkpoint");
+    }
+    let Some(agent_checkpoint_id) = agent_checkpoint_id else {
+        return Err(BridgeError::invalid_params(format!(
+            "bridge checkpoint '{checkpoint_id}' pins no commit (no target_oid and no linked \
+             agent checkpoint); it cannot be used as a diff or restore target"
+        )));
+    };
+    let parent = agent_checkpoint_parent_commit(&ctx.conn, &agent_checkpoint_id)
+        .await
+        .map_err(db_error("resolve linked agent checkpoint"))?;
+    let Some(parent) = parent.filter(|v| !v.trim().is_empty()) else {
+        return Err(BridgeError::invalid_params(format!(
+            "bridge checkpoint '{checkpoint_id}' links agent checkpoint \
+             '{agent_checkpoint_id}', which recorded no parent_commit (unborn HEAD at ingest); \
+             it cannot be used as a diff or restore target"
+        )));
+    };
+    vcs::parse_stored_commit_oid(&parent, "the linked agent checkpoint")
+}
+
+/// Read `agent_checkpoint.parent_commit` for one catalog row.
+async fn agent_checkpoint_parent_commit(
+    conn: &DatabaseConnection,
+    agent_checkpoint_id: &str,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    let rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT parent_commit FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
+            [agent_checkpoint_id.into()],
+        ))
+        .await?;
+    Ok(rows.into_iter().next().and_then(|r| {
+        r.try_get::<Option<String>>("", "parent_commit")
+            .ok()
+            .flatten()
+    }))
 }
 
 fn db_error(context: &'static str) -> impl Fn(sea_orm::DbErr) -> BridgeError {

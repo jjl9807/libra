@@ -114,12 +114,17 @@ async fn actor_spoof_fails_closed() {
     assert_eq!(err.stable_code, "LBR-AGENT-032");
 }
 
+/// The VCS side-effect mutations validate everything they can BEFORE the
+/// repository is touched: approval first, then their own typed params. This
+/// runs against an in-memory store with no repository behind it, so every case
+/// here must fail before any real VCS call — a regression that reordered the
+/// checks would surface as a repository error instead of these stable codes.
 #[tokio::test]
-async fn vcs_side_effect_mutations_fail_closed_not_wired() {
+async fn vcs_side_effect_mutations_validate_before_touching_the_repository() {
     let c = ctx().await;
     open_session(&c, "s1").await;
 
-    // Dangerous mutation without approval -> denied.
+    // Dangerous mutation without approval -> denied, before anything else.
     let err = mutation_dispatch(
         &c,
         &request(r#"{"jsonrpc":"2.0","method":"checkpoint.restore","params":{"operation_id":"op-3","session_id":"s1","checkpoint_id":"cp-1"},"id":1}"#),
@@ -128,15 +133,56 @@ async fn vcs_side_effect_mutations_fail_closed_not_wired() {
     .expect_err("restore requires approval");
     assert_eq!(err.stable_code, "LBR-AGENT-035"); // denied
 
-    // commit.create with approval passes admission but is not wired -> stable
-    // not-implemented (never a fabricated commit).
+    // commit.create with approval but no message -> invalid params, never an
+    // empty commit.
     let err = mutation_dispatch(
         &c,
         &request(r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-4","session_id":"s1","approval":{"decision":"approved","approver":"reviewer-1"}},"id":2}"#),
     )
     .await
-    .expect_err("commit.create not wired");
-    assert_eq!(err.stable_code, "LBR-AGENT-030");
+    .expect_err("commit.create requires a message");
+    assert_eq!(err.stable_code, "LBR-AGENT-027");
+
+    // checkpoint.restore with approval but an unknown checkpoint -> scope
+    // mismatch, resolved from the bridge's own tables (never a guess).
+    let err = mutation_dispatch(
+        &c,
+        &request(r#"{"jsonrpc":"2.0","method":"checkpoint.restore","params":{"operation_id":"op-5","session_id":"s1","checkpoint_id":"nope","expected_head":"0000","approval":{"decision":"approved","approver":"reviewer-1"}},"id":3}"#),
+    )
+    .await
+    .expect_err("unknown checkpoint must fail closed");
+    assert_eq!(err.stable_code, "LBR-AGENT-032");
+
+    // review.run with approval but a reviewer that is not launchable ->
+    // invalid params, before any run directory exists.
+    let err = mutation_dispatch(
+        &c,
+        &request(r#"{"jsonrpc":"2.0","method":"review.run","params":{"operation_id":"op-6","session_id":"s1","agents":["definitely-not-an-agent"],"approval":{"decision":"approved","approver":"reviewer-1"}},"id":4}"#),
+    )
+    .await
+    .expect_err("unlaunchable reviewer must fail closed");
+    assert_eq!(err.stable_code, "LBR-AGENT-027");
+}
+
+/// `checkpoint.restore` requires an explicit `expected_head` fence: without it
+/// a caller could overwrite a working tree that moved since it decided to
+/// restore (LB-05 AC5).
+#[tokio::test]
+async fn checkpoint_restore_requires_an_explicit_head_fence() {
+    let c = ctx().await;
+    open_session(&c, "s1").await;
+    let err = mutation_dispatch(
+        &c,
+        &request(r#"{"jsonrpc":"2.0","method":"checkpoint.restore","params":{"operation_id":"op-fence","session_id":"s1","checkpoint_id":"cp-1","approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#),
+    )
+    .await
+    .expect_err("expected_head is mandatory");
+    assert_eq!(err.stable_code, "LBR-AGENT-027");
+    assert!(
+        err.message.contains("expected_head"),
+        "the error must name the missing fence: {}",
+        err.message
+    );
 }
 
 /// A denied dangerous mutation leaves a durable operation trace (terminal

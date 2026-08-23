@@ -9,12 +9,19 @@
 //!     digest drift = fail-closed conflict);
 //!  5. records auditable provenance association links.
 //!
-//! `checkpoint.create` is fully wired to the durable bridge checkpoint
-//! store. The VCS side-effect methods (`commit.create`, `review.run`,
-//! `checkpoint.restore`) run the full admission/authorization pipeline and
-//! then fail closed with a stable "not wired to the VCS service in this
-//! build" error rather than fabricating a result — their actual service
-//! plumbing is the LB-05/LB-06 write-set remainder.
+//! `checkpoint.create` is wired to the durable bridge checkpoint store. The
+//! VCS side-effect methods (`commit.create`, `review.run`,
+//! `checkpoint.restore`) run the same admission/authorization pipeline and
+//! then reach the real services through the typed [`super::vcs`] adapter:
+//!
+//!  - `commit.create` commits the current index (no `-a`, no pathspec, no
+//!    amend, no author override) after an optional `expected_head` fence;
+//!  - `checkpoint.restore` restores the working tree to the commit a bridge
+//!    checkpoint pins, and refuses on HEAD drift or a dirty index/worktree so
+//!    nothing is destroyed or partially applied;
+//!  - `review.run` admits and starts a read-only review run and returns its
+//!    identifiers; replaying the same `operation_id` reports that run's state
+//!    instead of starting a second one.
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,11 +29,10 @@ use sha2::{Digest, Sha256};
 use super::{
     authorization::{Approval, bind_actor, enforce},
     ingress::BridgeContext,
+    methods::resolve_checkpoint_commit,
     protocol::{BridgeError, BridgeRequest, BridgeResponse, SOURCE_DEEPSEEK_HARNESS},
-    provenance, storage,
+    provenance, storage, vcs,
 };
-
-const NOT_WIRED_VCS: &str = "not wired to the VCS service in this build";
 
 /// Returns `Ok(Some(response))` when `method` is a mutation handled here, or
 /// `Ok(None)` for non-mutations (so the read/ingress dispatchers can try).
@@ -147,49 +153,356 @@ async fn dispatch_mutation(
         return Err(e);
     }
 
-    // 6. Route to the underlying writer. Every path must reach a terminal
+    // 6. Replay short-circuit for the NON-idempotent services. `commit.create`,
+    //    `review.run` and `checkpoint.restore` each have a real side effect;
+    //    replaying a recorded `operation_id` must report the ORIGINAL result,
+    //    never execute a second time (plan 故障恢复矩阵: "commit/checkpoint 后
+    //    response 丢失 → 以 operation id 查询并返回原结果"). `checkpoint.create`
+    //    is intrinsically idempotent and re-runs instead, so its replay keeps
+    //    reporting `created: false`.
+    if !fresh && replays_recorded_result(method) {
+        let recorded = storage::get_operation_result(&ctx.conn, &operation_id)
+            .await
+            .map_err(|e| BridgeError::internal(format!("read bridge operation: {e}")))?;
+        match recorded {
+            Some((status, Some(result_digest))) if status == "applied" => {
+                return Ok(ok_result(
+                    replayed_result(method, &result_digest, &session_id)?,
+                    id,
+                ));
+            }
+            Some((status, _)) if status == "pending" => {
+                return Err(BridgeError::denied(format!(
+                    "operation '{operation_id}' ({method}) is still in flight; wait for it to \
+                     finish before replaying"
+                ))
+                .retryable());
+            }
+            // `failed` / `quarantined` (or an applied row with no recorded
+            // result): a corrected retry is allowed to run again.
+            _ => {}
+        }
+    }
+
+    // 7. Route to the underlying writer. Every path must reach a terminal
     //    operation status so a failed/poisoned `operation_id` is never left
     //    `pending` and never permanently blocks a corrected retry (LB-05).
-    let result = match method {
+    let outcome = match method {
         "checkpoint.create" => {
-            match checkpoint_create(ctx, &session, &session_id, &operation_id, request).await {
-                Ok(value) => value,
-                Err(e) => {
-                    storage::finish_operation(&ctx.conn, &operation_id, "failed", None, now_ms())
-                        .await
-                        .map_err(|err| {
-                            BridgeError::internal(format!("finish bridge operation: {err}"))
-                        })?;
-                    return Err(e);
-                }
-            }
+            checkpoint_create(ctx, &session, &session_id, &operation_id, request).await
         }
-        // VCS side-effect methods: full admission/authorization passed; the
-        // service plumbing is the LB-05/LB-06 remainder. Fail closed, never
-        // fabricate a commit/restore/review result.
-        "checkpoint.restore" | "commit.create" | "review.run" => {
-            storage::finish_operation(&ctx.conn, &operation_id, "quarantined", None, now_ms())
-                .await
-                .map_err(|e| BridgeError::internal(format!("finish bridge operation: {e}")))?;
-            return Err(BridgeError::not_implemented(&format!(
-                "{method} passed admission/authorization but is {NOT_WIRED_VCS}"
-            )));
+        "commit.create" => commit_create(ctx, &session, &session_id, &operation_id, request).await,
+        "checkpoint.restore" => {
+            checkpoint_restore(ctx, &session, &session_id, &operation_id, request).await
         }
+        "review.run" => review_run(ctx, &session, &session_id, &operation_id, request).await,
         // INVARIANT: `is_mutation` (above) mirrors exactly the match arms in
         // `dispatch_mutation`, so every allowlisted mutation method that
         // reaches this dispatcher is one of the handled arms. This arm is
         // unreachable by construction.
         _ => unreachable!("is_mutation guards the match"),
     };
+    let result = match outcome {
+        Ok(value) => value,
+        Err(e) => {
+            storage::finish_operation(&ctx.conn, &operation_id, "failed", None, now_ms())
+                .await
+                .map_err(|err| BridgeError::internal(format!("finish bridge operation: {err}")))?;
+            return Err(e);
+        }
+    };
 
     // Populate the result digest so `agent_bridge_operation.result_digest` is
-    // meaningful (same-params-different-result safety net for future
-    // non-deterministic mutations like commit/review).
-    let result_digest = result.get("checkpoint_id").and_then(Value::as_str);
+    // meaningful AND replayable: it is the stable identity of what the
+    // mutation produced (bridge checkpoint id, commit oid, restored commit
+    // oid, review run id), which is exactly what `replayed_result` reads back.
+    let result_digest = result_identity(method, &result);
+    let result_digest = result_digest.as_deref();
     storage::finish_operation(&ctx.conn, &operation_id, "applied", result_digest, now_ms())
         .await
         .map_err(|e| BridgeError::internal(format!("finish bridge operation: {e}")))?;
     Ok(ok_result(result, id))
+}
+
+/// Whether a replayed `operation_id` must report the recorded result instead
+/// of executing again. True for every mutation with a non-idempotent service
+/// side effect.
+fn replays_recorded_result(method: &str) -> bool {
+    matches!(
+        method,
+        "commit.create" | "review.run" | "checkpoint.restore"
+    )
+}
+
+/// The stable identity of a mutation result, stored as the operation's
+/// `result_digest` and read back on replay.
+fn result_identity(method: &str, result: &Value) -> Option<String> {
+    let key = match method {
+        "checkpoint.create" => "checkpoint_id",
+        "commit.create" => "commit",
+        "checkpoint.restore" => "target_commit",
+        "review.run" => "run_id",
+        _ => return None,
+    };
+    result.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Rebuild the response for a replayed operation from its recorded identity.
+fn replayed_result(
+    method: &str,
+    result_digest: &str,
+    session_id: &str,
+) -> Result<Value, BridgeError> {
+    match method {
+        "commit.create" => Ok(json!({
+            "commit": result_digest,
+            "session_id": session_id,
+            "replayed": true,
+        })),
+        "checkpoint.restore" => Ok(json!({
+            "target_commit": result_digest,
+            "session_id": session_id,
+            "head_moved": false,
+            "replayed": true,
+        })),
+        "review.run" => {
+            let mut state = vcs::review_state(result_digest)?;
+            if let Some(object) = state.as_object_mut() {
+                object.insert("replayed".to_string(), json!(true));
+                object.insert("session_id".to_string(), json!(session_id));
+            }
+            Ok(state)
+        }
+        // INVARIANT: only `replays_recorded_result` methods reach here.
+        _ => Err(BridgeError::internal(format!(
+            "method '{method}' has no replay projection"
+        ))),
+    }
+}
+
+/// `commit.create` — commit the current index and record the association graph.
+///
+/// The commit itself carries no bridge metadata (LB-05 AC4): session, actor,
+/// workspace, parent lineage and evidence ids are recorded as
+/// `agent_bridge_link` rows keyed by the commit oid, so the association is
+/// queryable without parsing a commit message.
+async fn commit_create(
+    ctx: &BridgeContext,
+    session: &storage::BridgeSessionRow,
+    session_id: &str,
+    operation_id: &str,
+    request: &BridgeRequest,
+) -> Result<Value, BridgeError> {
+    let message = vcs::parse_commit_message(&request.params)?;
+    let signoff = param_bool(&request.params, "signoff");
+    let allow_empty = param_bool(&request.params, "allow_empty");
+
+    // HEAD fence: when the caller states the head it prepared against, a drift
+    // means another writer committed in between, so we refuse before writing.
+    if let Some(expected) = param_str(&request.params, "expected_head") {
+        let fence = vcs::read_fence().await;
+        vcs::check_head_fence(&fence, &expected)?;
+    }
+
+    let mut result = vcs::commit_create(&message, signoff, allow_empty).await?;
+    let commit = result
+        .get("commit")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::internal("commit.create produced no commit id".to_string()))?
+        .to_string();
+
+    let evidence_ids = evidence_ids(request);
+    record_association_links(
+        ctx,
+        session,
+        session_id,
+        operation_id,
+        "commit",
+        &commit,
+        &evidence_ids,
+    )
+    .await?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("session_id".to_string(), json!(session_id));
+        object.insert(
+            "provenance".to_string(),
+            provenance::build_provenance(
+                ctx,
+                session_id,
+                operation_id,
+                Some(SOURCE_DEEPSEEK_HARNESS),
+                session.agent_id.as_deref(),
+                session.parent_session_id.as_deref(),
+                session.workspace_id.as_deref(),
+                None,
+                &evidence_ids,
+            ),
+        );
+    }
+    Ok(result)
+}
+
+/// `checkpoint.restore` — restore the working tree to a bridge checkpoint's
+/// commit.
+///
+/// Dangerous by classification, so an explicit approval has already been
+/// enforced. On top of that the fence is verified here: HEAD must still be
+/// where the caller expects, and the index/worktree must be clean, so no
+/// uncommitted work is destroyed and nothing is partially applied (LB-05 AC5).
+async fn checkpoint_restore(
+    ctx: &BridgeContext,
+    session: &storage::BridgeSessionRow,
+    session_id: &str,
+    operation_id: &str,
+    request: &BridgeRequest,
+) -> Result<Value, BridgeError> {
+    // Params first: everything the request must carry is checked before the
+    // bridge reads any store or touches the repository.
+    let checkpoint_id = provenance::require_param_str(&request.params, "checkpoint_id")?;
+    let expected_head = param_str(&request.params, "expected_head").ok_or_else(|| {
+        BridgeError::invalid_params(
+            "checkpoint.restore requires 'expected_head' (the HEAD commit the caller prepared \
+             against) so a concurrent move is detected before the working tree is overwritten",
+        )
+    })?;
+    let target = resolve_checkpoint_commit(ctx, &checkpoint_id).await?;
+
+    // Fence, in fail-closed order: HEAD first (cheap, exact), then the
+    // index/worktree cleanliness the restore would overwrite.
+    let fence = vcs::read_fence().await;
+    vcs::check_head_fence(&fence, &expected_head)?;
+    vcs::check_clean_worktree_fence().await?;
+
+    let mut result = vcs::checkpoint_restore(&target).await?;
+    let evidence_ids = evidence_ids(request);
+    record_association_links(
+        ctx,
+        session,
+        session_id,
+        operation_id,
+        "restore",
+        &format!("{checkpoint_id}@{target}"),
+        &evidence_ids,
+    )
+    .await?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("checkpoint_id".to_string(), json!(checkpoint_id));
+        object.insert("session_id".to_string(), json!(session_id));
+    }
+    Ok(result)
+}
+
+/// `review.run` — admit and start a read-only review run.
+///
+/// Validation (launchable reviewers, checkpoint scope, HEAD, run admission)
+/// happens before any side effect; the reviewers themselves outlive the v1
+/// request deadline, so the run is supervised in the background and the caller
+/// polls it by replaying the same `operation_id`.
+async fn review_run(
+    ctx: &BridgeContext,
+    session: &storage::BridgeSessionRow,
+    session_id: &str,
+    operation_id: &str,
+    request: &BridgeRequest,
+) -> Result<Value, BridgeError> {
+    let review = vcs::parse_review_params(&request.params)?;
+    let (run_id, mut state) = vcs::review_start(&review).await?;
+    let evidence_ids = evidence_ids(request);
+    record_association_links(
+        ctx,
+        session,
+        session_id,
+        operation_id,
+        "review",
+        &run_id,
+        &evidence_ids,
+    )
+    .await?;
+    if let Some(object) = state.as_object_mut() {
+        object.insert("session_id".to_string(), json!(session_id));
+    }
+    Ok(state)
+}
+
+/// Record the durable association graph for one mutation result.
+///
+/// `source_id` is the result's stable identity (commit oid, review run id, …).
+/// Each association is an `agent_bridge_link` row, so replay is idempotent and
+/// a relink to a different target fails closed.
+async fn record_association_links(
+    ctx: &BridgeContext,
+    session: &storage::BridgeSessionRow,
+    session_id: &str,
+    operation_id: &str,
+    source_type: &str,
+    source_id: &str,
+    evidence_ids: &[String],
+) -> Result<(), BridgeError> {
+    use provenance::{Association, Relation};
+
+    let mut links: Vec<Association<'_>> = vec![Association {
+        source_type,
+        source_id,
+        relation: Relation::Operation,
+        target_id: operation_id,
+    }];
+    if let Some(ws) = session.workspace_id.as_deref() {
+        links.push(Association {
+            source_type,
+            source_id,
+            relation: Relation::Workspace,
+            target_id: ws,
+        });
+    }
+    if let Some(parent) = session.parent_session_id.as_deref() {
+        links.push(Association {
+            source_type,
+            source_id,
+            relation: Relation::ParentSession,
+            target_id: parent,
+        });
+    }
+    for evidence in evidence_ids {
+        links.push(Association {
+            source_type,
+            source_id,
+            relation: Relation::Evidence,
+            target_id: evidence,
+        });
+    }
+    provenance::record_links(ctx, session_id, &links, now_ms()).await
+}
+
+/// The optional `evidence_ids` array of a mutation request.
+fn evidence_ids(request: &BridgeRequest) -> Vec<String> {
+    request
+        .params
+        .as_ref()
+        .and_then(|p| p.get("evidence_ids"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn param_bool(params: &Option<Value>, key: &str) -> bool {
+    params
+        .as_ref()
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn param_str(params: &Option<Value>, key: &str) -> Option<String> {
+    params
+        .as_ref()
+        .and_then(|p| p.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 async fn checkpoint_create(
@@ -239,23 +552,16 @@ async fn checkpoint_create(
     // workspace, actor and evidence ids — never encoded into a commit
     // message). Each association is an `agent_bridge_link` row keyed by a
     // stable source, so replay is idempotent and the graph is queryable.
-    let mut links: Vec<(&str, &str, &str)> = vec![
-        // checkpoint -> operation (the operation that produced it).
-        ("checkpoint", checkpoint_id.as_str(), operation_id),
-    ];
-    // checkpoint -> workspace (the workspace the session was bound to).
-    if let Some(ws) = session.workspace_id.as_deref() {
-        links.push(("checkpoint", checkpoint_id.as_str(), ws));
-    }
-    // checkpoint -> parent session lineage (GC-LB-07).
-    if let Some(parent) = session.parent_session_id.as_deref() {
-        links.push(("checkpoint", checkpoint_id.as_str(), parent));
-    }
-    // checkpoint -> evidence ids (each evidence association).
-    for ev in &evidence_ids {
-        links.push(("checkpoint", checkpoint_id.as_str(), ev));
-    }
-    provenance::record_links(ctx, session_id, &links, now_ms()).await?;
+    record_association_links(
+        ctx,
+        session,
+        session_id,
+        operation_id,
+        "checkpoint",
+        &checkpoint_id,
+        &evidence_ids,
+    )
+    .await?;
 
     Ok(json!({
         "checkpoint_id": checkpoint_id,
