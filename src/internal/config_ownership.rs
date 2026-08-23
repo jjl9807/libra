@@ -286,6 +286,33 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
         "agent_checkpoint_prune_tombstone",
         ConfigOwner::RepositoryWithWorkspaceSessionScope,
     ),
+    // Bridge durable projection (plan-20260818 LB-02): repository-scoped rows
+    // carrying repository_id/worktree_id/workspace_id scope (bridge session,
+    // event, operation, checkpoint, link and the migration guard).
+    (
+        "agent_bridge_session",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_event",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_operation",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_checkpoint",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_link",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
+    (
+        "agent_bridge_capture_down_guard",
+        ConfigOwner::RepositoryWithWorkspaceSessionScope,
+    ),
     (
         "agent_subagent_content_claim",
         ConfigOwner::RepositoryWithWorkspaceSessionScope,

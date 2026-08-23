@@ -22,6 +22,7 @@ libra agent workspace list [--limit <n>] [--cursor <token>] [--state <state>]...
 libra agent workspace show <workspace-id>
 libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
+libra agent bridge --stdio
 ```
 
 ## Description
@@ -86,6 +87,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | `rpc trust --dir <path>` | Register a trusted directory (`agent.external_agents.trusted_dirs`, default `~/.libra/agents`): external binaries are only trustable when their canonical path lives under one. The path is canonicalized and must be an existing, non-world-writable directory |
 | `rpc untrust <slug>` | Revoke trust; the binary returns to quarantine (always available, even while external agents are disabled) |
 | `rpc invoke` | Invoke one JSON-RPC method on a trusted `libra-agent-*` binary |
+| `bridge --stdio` | Run the repository-scoped DeepSeek Harness bridge over stdin/stdout (JSON-RPC 2.0 NDJSON). The **only** standard inbound write transport for Harness; it is not `libra code --control` and not an MCP server. stdout carries exactly one protocol frame per response; diagnostics go to stderr. Protocol v1: 20-method allowlist, 256 KiB frame cap, 64 in-flight requests, 30 s default deadline. Implemented: `initialize` handshake, `session.open`, `event.append` (batch ack / idempotent / digest-conflict / server-side redaction), `session.flush`, `session.close`, `evidence.append`, `provenance.append`, the read methods `context.get`, `status.get`, `history.search`, `checkpoint.list`, `checkpoint.show`, and `checkpoint.create` (with `operation_id` idempotency, actor binding and approval gating). An ack only means the redacted projection is durable, never that the Harness raw transcript has been migrated. Not a Git command. |
 
 ## Common Options
 
@@ -508,6 +510,10 @@ libra agent rpc list
 
 # Invoke a single JSON-RPC method on a libra-agent-<slug> binary
 libra agent rpc invoke <slug> <method> --params '<json>'
+
+# Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON);
+# feed it a fixture and read one frame per response on stdout
+libra agent bridge --stdio < bridge-initialize.ndjson
 
 # Structured JSON envelope for agents
 libra agent --json status

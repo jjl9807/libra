@@ -55,6 +55,8 @@ when the object is missing.
 
 Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2-8) described in the migration section below. When this variable is unset or `0`, Libra uses the Git-standard codes shown above.
 
+Bridge `LBR-AGENT-024..037` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly.
+
 ## Migration From Fine-Grained Exit Codes
 
 Libra previously used fine-grained exit codes (2-8) to distinguish failure categories.
@@ -135,6 +137,20 @@ structured report is always present.
 | `128` | `LBR-AGENT-021` | `internal` | Requested captured-agent session is absent from both the session catalog and local erasure tombstones | `libra agent graph unknown-session` |
 | `128` | `LBR-AGENT-022` | `internal` | Agent workspace lease refused: another live workspace record already claims the linked worktree identity or the canonical directory | two agents requesting a writable lease on the same linked worktree, or on an alias of an already-leased path |
 | `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after the expired lease was reclaimed with a higher fence by its workspace owner |
+| `frame` | `LBR-AGENT-024` | `internal` | Bridge protocol frame failed JSON parsing (JSON-RPC `-32700`) | a peer writes a non-JSON NDJSON line to `libra agent bridge --stdio` |
+| `frame` | `LBR-AGENT-025` | `internal` | Bridge request is not a valid JSON-RPC 2.0 object (JSON-RPC `-32600`) | a peer sends a frame missing `jsonrpc`/`method`, or with an unsupported `jsonrpc` version |
+| `frame` | `LBR-AGENT-026` | `internal` | Bridge method is not in the v1 20-method allowlist (JSON-RPC `-32601`) | invoking `create_intent` or another low-level method over the bridge |
+| `frame` | `LBR-AGENT-027` | `internal` | Bridge method params failed schema/limit validation (JSON-RPC `-32602`) | `event.append` with a batch over 64 events or 256 KiB |
+| `frame` | `LBR-AGENT-028` | `internal` | Bridge request exceeded the v1 frame byte cap (256 KiB) and was refused | a peer writes an NDJSON line larger than 256 KiB |
+| `frame` | `LBR-AGENT-029` | `internal` | Bridge connection already has the maximum in-flight requests (64) | a peer floods requests without waiting for responses |
+| `frame` | `LBR-AGENT-030` | `internal` | Bridge method is allowlisted but not implemented by this build | invoking a session/workspace method before its card (LB-03..LB-06) ships |
+| `frame` | `LBR-AGENT-031` | `internal` | Bridge protocol major mismatch — the peer's declared major differs from this build's, so every request is refused | a peer speaks protocol `2.x` against this `1.x` bridge |
+| `frame` | `LBR-AGENT-032` | `internal` | Bridge scope conflict — a self-reported/stale repository, worktree, workspace or actor disagrees with the trusted handshake/context (fail-closed) | a peer self-reports a repository id that differs from the bridge's trusted repo |
+| `frame` | `LBR-AGENT-033` | `internal` | Bridge payload digest conflict — a duplicate `(session_id,event_seq)` or `operation_id` carried a different payload hash | a peer replays an event sequence with altered payload |
+| `frame` | `LBR-AGENT-034` | `internal` | Bridge redaction or payload-size validation could not be satisfied; the original payload was refused (no raw fallback) | a peer sends a payload that cannot be safely redacted |
+| `frame` | `LBR-AGENT-035` | `internal` | Bridge mutating operation denied by policy or approval | `checkpoint.restore` without the required approval |
+| `frame` | `LBR-AGENT-036` | `internal` | Bridge request exceeded its deadline (default 30 s) | a `commit.create` that stalls past the request deadline |
+| `frame` | `LBR-AGENT-037` | `internal` | Bridge internal error (JSON-RPC `-32603`) — a database/VCS/generic failure that cannot be attributed to the peer | the bridge's SQLite store returns a transient error during `event.append` |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
@@ -235,6 +251,20 @@ structured report is always present.
 | `LBR-AGENT-021` | Requested captured-agent session does not exist in this repository |
 | `LBR-AGENT-022` | Another live workspace record already leases this linked worktree or directory |
 | `LBR-AGENT-023` | The presented workspace lease owner/fence is stale; the lease was reclaimed or already released |
+| `LBR-AGENT-024` | Bridge protocol frame failed JSON parsing |
+| `LBR-AGENT-025` | Bridge request is not a valid JSON-RPC 2.0 object |
+| `LBR-AGENT-026` | Bridge method is not in the v1 20-method allowlist |
+| `LBR-AGENT-027` | Bridge method params failed schema/limit validation |
+| `LBR-AGENT-028` | Bridge request exceeded the v1 frame byte cap (256 KiB) and was refused |
+| `LBR-AGENT-029` | Bridge connection already has the maximum in-flight requests (64) |
+| `LBR-AGENT-030` | Bridge method is allowlisted but not implemented by this build |
+| `LBR-AGENT-031` | Bridge protocol major mismatch; every request is refused |
+| `LBR-AGENT-032` | Bridge scope conflict; a self-reported/stale scope disagrees with the trusted context |
+| `LBR-AGENT-033` | Bridge payload digest conflict on a duplicate `(session_id,event_seq)` or `operation_id` |
+| `LBR-AGENT-034` | Bridge redaction or payload-size validation could not be satisfied; payload refused |
+| `LBR-AGENT-035` | Bridge mutating operation denied by policy or approval |
+| `LBR-AGENT-036` | Bridge request exceeded its deadline |
+| `LBR-AGENT-037` | Bridge internal error (DB/VCS/generic failure) |
 
 ### Unsupported
 
