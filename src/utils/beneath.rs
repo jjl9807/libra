@@ -723,7 +723,7 @@ fn reject_dotdot(rel: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn rel_cstring(rel: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(rel.as_os_str().as_bytes()).map_err(|_| {
