@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.21.0] — 2026-08-23
+
+### Added: DeepSeek Harness bridge (`agent bridge --stdio`, plan-20260818 LB-01..LB-06)
+
+- **`libra agent bridge --stdio`** — the repository-scoped DeepSeek Harness JSON-RPC
+  2.0 NDJSON ingress. The ONLY standard inbound write transport for the Harness
+  plugin; intentionally different from `libra code --control stdio` (a client
+  controlling a live Code session) and from any MCP transport. Protocol v1: a
+  20-method allowlist, 256 KiB frame cap, 64 in-flight requests, 64-event /
+  256 KiB batch, 30 s default request deadline.
+- **Durable ingress** (`agent_bridge_session/event/operation/checkpoint/link`
+  tables, migration `2026081801`): idempotent `session.open`, bounded
+  `event.append` with per-event accepted/duplicate/digest-conflict status and
+  monotonic `last_acked_seq`, `session.flush`/`session.close`, and
+  `evidence.append`/`provenance.append` association links. Ack means the
+  redacted projection is durable — never that Harness took over Libra's raw
+  transcript.
+- **Server-side redaction** (GC-LB-08): only a bounded, redacted projection is
+  persisted; raw prompts/reasoning/tokens/secrets never land in the store, and
+  a payload that cannot be safely redacted is refused fail-closed with no raw
+  fallback.
+- **Typed read methods** (LB-04): `context.get`, `status.get`,
+  `history.search`, `checkpoint.list`, `checkpoint.show` over the bridge
+  projection with a unified `{schema_version, repository_id, workspace_id,
+  operation_id, status, data, warnings}` envelope, bounded pagination, and
+  repository-scoped queries (a cross-repository `status.get` cannot leak
+  another repo's totals).
+- **Mutation admission + approval + actor binding** (LB-05): `checkpoint.create`
+  is fully wired; every mutation requires an `operation_id` (idempotent replay,
+  digest-conflict fail-closed), binds the trusted session/actor scope, and
+  enforces a default-deny approval gate for dangerous actions. `commit.create`,
+  `review.run` and `checkpoint.restore` pass admission but fail closed with a
+  stable "not wired to the VCS service" error until the service plumbing lands.
+- **Workspace lease** (LB-06): `workspace.claim`/`renew`/`release` route through
+  the existing `WorkspaceStore` (owner + monotonic fence); the lease owner is
+  derived from the authenticated bridge session identity (never a self-reported
+  value), so a stale owner or a forged `agent_id` cannot reclaim another
+  session's lease. Dedicated error codes `LBR-AGENT-022` (lease held) and
+  `LBR-AGENT-023` (lease lost).
+- **Protocol authority** (GC-LB-02): the schema, method allowlist, limits,
+  error catalogue and frame shapes live only in
+  `src/internal/ai/agent_bridge/protocol.rs`; the TypeScript plugin consumes
+  the fixture published from it and must not define a second schema.
+
+### Migration
+
+- `2026081801_agent_bridge_capture` creates the five bridge durable tables.
+  Down-migration is forward-only: it freezes while any bridge row exists and
+  never deletes acked events/evidence (GC-LB-09 / ER-LB-04).
+
 ## [Unreleased]
 
 ### Fixed (plan-20260715 W2-03 repair, 2026-08-21, v0.20.4)
