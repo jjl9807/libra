@@ -111,7 +111,7 @@ EXAMPLES:
     libra agent rpc trust --dir <path>              Register a trusted directory (binaries must live under one)
     libra agent rpc untrust <slug>                  Revoke trust (binary returns to quarantine)
     libra agent rpc invoke <slug> <method>          Invoke a single JSON-RPC method (use --params '<json>' for arguments)
-    libra agent bridge --stdio                     Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)
+    libra agent bridge --stdio                      Run the DeepSeek Harness bridge over stdio (JSON-RPC 2.0 NDJSON)
     libra --json agent status                       Structured JSON output for agents";
 
 #[derive(Args, Debug)]
