@@ -11,6 +11,10 @@ pub mod environment;
 pub mod event;
 pub mod execution_control;
 pub mod fix_bridge;
+mod fix_control;
+pub mod fix_execution;
+mod fix_protocol;
+mod fix_response;
 pub mod hardening;
 pub mod lifecycle;
 pub mod phase0;
@@ -40,8 +44,12 @@ pub use event::{Event, audit_action_for};
 pub use execution_control::{
     CodeSkillActivation, CodeSkillSearch, ExecutionControlService, GoalControlError,
 };
-pub use fix_bridge::{
-    REVIEW_FIX_ADMISSION_MESSAGE, ReviewFixBridgeError, ReviewFixInput, admit_review_fix,
+pub use fix_bridge::{REVIEW_FIX_ADMISSION_MESSAGE, ReviewFixBridgeError, ReviewFixInput};
+pub use fix_execution::{
+    ReviewFixExecutionOutcome, ReviewFixInteractionResponder, execute_review_fix,
+};
+pub use fix_protocol::{
+    ReviewFixInteraction, ReviewFixInteractionKind, ReviewFixInteractionResponse, ReviewFixQuestion,
 };
 pub use hardening::{
     AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,

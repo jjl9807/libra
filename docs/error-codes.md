@@ -55,7 +55,7 @@ when the object is missing.
 
 Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2-8) described in the migration section below. When this variable is unset or `0`, Libra uses the Git-standard codes shown above.
 
-Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly.
+Bridge `LBR-AGENT-024..038` errors are **frame errors**: `libra agent bridge --stdio` answers them as JSON-RPC 2.0 error frames on stdout and keeps serving the next NDJSON line — the bridge process does not exit with `128`. Their exit-code column is marked `frame` accordingly. `LBR-AGENT-039..040` are normal `review --fix` CLI outcomes and exit `128`.
 
 ## Migration From Fine-Grained Exit Codes
 
@@ -152,6 +152,8 @@ structured report is always present.
 | `frame` | `LBR-AGENT-036` | `internal` | Bridge request exceeded its deadline (default 30 s) | a `commit.create` that stalls past the request deadline |
 | `frame` | `LBR-AGENT-037` | `internal` | Bridge internal error (JSON-RPC `-32603`) — a database/VCS/generic failure that cannot be attributed to the peer | the bridge's SQLite store returns a transient error during `event.append` |
 | `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
+| `128` | `LBR-AGENT-039` | `internal` | `review --fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied | answering `deny` to a pending tool or sandbox approval |
+| `128` | `LBR-AGENT-040` | `internal` | `review --fix` stopped without a clean patch or deterministic repair outcome; inspect the Code session and worktree | an invalid terminal response, an unexpected runtime state, a patch observed before a later denial, or controlled-execution timeout |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
@@ -267,6 +269,8 @@ structured report is always present.
 | `LBR-AGENT-036` | Bridge request exceeded its deadline |
 | `LBR-AGENT-037` | Bridge internal error (DB/VCS/generic failure) |
 | `LBR-AGENT-038` | Bridge mutation fence drifted (HEAD moved or the index/worktree is dirty); refused before any write |
+| `LBR-AGENT-039` | `review --fix` was denied at an existing Code-runtime tool or sandbox approval gate; no patch was applied |
+| `LBR-AGENT-040` | `review --fix` stopped without a clean patch or deterministic repair outcome; inspect the Code session and worktree |
 
 ### Unsupported
 
