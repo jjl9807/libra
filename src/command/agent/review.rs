@@ -20,8 +20,8 @@
 //! - findings are provenance=untrusted — `review show` always renders
 //!   them through [`render_untrusted_findings`] (ANSI/control stripped),
 //!   never raw;
-//! - `--fix` fails closed with `LBR-AGENT-010` until the internal
-//!   AgentRuntime fix bridge lands (never fake success).
+//! - `--fix` admits only a fixed, non-mutating planning request to an active
+//!   AgentRuntime; it never sends observed reviewer findings into that runtime.
 
 use std::time::Duration;
 
@@ -42,6 +42,7 @@ use crate::{
                 cancel_orphaned_run, is_launchable_reviewer, render_untrusted_findings, run_review,
             },
             run_admission::{self, RejectedAdmission},
+            runtime::{ReviewFixBridgeError, ReviewFixInput, admit_review_fix},
         },
         head::Head,
     },
@@ -70,8 +71,9 @@ EXAMPLES:
     libra review clean --all                         Remove every finished run directory
     libra review attach <run_id> <file>              Attach an external file to a run (provenance=manual)
 
-    `libra review --fix` is not supported yet: it requires the internal
-    AgentRuntime fix bridge and fails with LBR-AGENT-010 until that lands.";
+    `libra review --fix` requires an active authorized `libra code --control write`
+    session. It admits a non-mutating planning request; controlled patch execution
+    remains deferred and unavailable.";
 
 // ---------------------------------------------------------------------------
 // Clap surface (agent.md §5 exact)
@@ -101,7 +103,11 @@ pub struct ReviewRunCliArgs {
 
     /// Review the changes since this revision (recorded scope
     /// `<rev>..HEAD`). Default scope is the last commit (HEAD~1..HEAD).
-    #[arg(long, value_name = "REV", conflicts_with = "checkpoint")]
+    #[arg(
+        long,
+        value_name = "REV",
+        conflicts_with_all = ["checkpoint", "fix"]
+    )]
     pub since: Option<String>,
 
     /// Review the content captured by an agent checkpoint (see
@@ -109,12 +115,12 @@ pub struct ReviewRunCliArgs {
     /// checkpoint's materialized transcript/metadata (read-only), never
     /// the current worktree. A missing or non-materializable checkpoint
     /// fails closed before any run is created.
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", conflicts_with = "fix")]
     pub checkpoint: Option<String>,
 
-    /// Apply reviewer findings via the internal fix bridge. Not
-    /// available yet — always fails with LBR-AGENT-010.
-    #[arg(long)]
+    /// Admit a non-mutating review-fix planning request to an active internal
+    /// runtime. Controlled patch execution is not available yet.
+    #[arg(long, conflicts_with_all = ["since", "checkpoint"])]
     pub fix: bool,
 }
 
@@ -252,17 +258,31 @@ fn build_review_prompt(target_scope: &str) -> String {
     )
 }
 
-/// The stable `--fix` refusal (plan.md:949): the internal serialized fix
-/// bridge has no source anchor yet, so the flag must fail closed with
-/// `LBR-AGENT-010` — never fake success. A8 (`investigate fix`) reuses
-/// this semantic.
+/// Stable refusal for a missing or unauthorized active Code runtime.
 fn fix_bridge_unavailable_error() -> CliError {
     CliError::fatal(
-        "review --fix requires the internal AgentRuntime fix bridge, which has not \
-         landed yet; re-run without --fix for a read-only review (findings stay \
-         available via `libra review show <run_id>`)",
+        "review --fix requires an active authorized internal AgentRuntime. Start \
+         `libra code --control write` in this repository, then retry; this command \
+         only admits a non-mutating plan and does not apply a patch",
     )
     .with_stable_code(StableErrorCode::AgentFixBridgeUnavailable)
+}
+
+/// External-agent seeds are never allowed through the review-fix admission
+/// bridge. DF-09 owns the later controlled-execution contract.
+fn untrusted_seed_for_mutation_error() -> CliError {
+    CliError::fatal(
+        "untrusted seed content cannot enter a mutating review-fix workflow without \
+         explicit approval; inspect the read-only review findings instead",
+    )
+    .with_stable_code(StableErrorCode::AgentUntrustedSeedForMutation)
+}
+
+fn map_fix_bridge_error(error: ReviewFixBridgeError) -> CliError {
+    match error {
+        ReviewFixBridgeError::Unavailable => fix_bridge_unavailable_error(),
+        ReviewFixBridgeError::UntrustedSeed => untrusted_seed_for_mutation_error(),
+    }
 }
 
 /// PD-02 checkpoint-scoped prompt: the reviewers' workspace is the
@@ -428,10 +448,6 @@ fn run_queue_full_error(rejected: RejectedAdmission) -> CliError {
 }
 
 async fn run(args: ReviewRunCliArgs, output: &OutputConfig) -> CliResult<()> {
-    if args.fix {
-        return Err(fix_bridge_unavailable_error());
-    }
-
     // Dedupe while preserving request order: duplicate slugs would race
     // on the same reviewer identity for no benefit.
     let mut agents: Vec<String> = Vec::with_capacity(args.agents.len());
@@ -459,6 +475,32 @@ async fn run(args: ReviewRunCliArgs, output: &OutputConfig) -> CliResult<()> {
                 launchable_review_slugs().join(", ")
             )));
         }
+    }
+
+    if args.fix {
+        let working_dir = std::env::current_dir().map_err(|error| {
+            CliError::fatal(format!(
+                "cannot resolve the working directory for review --fix admission: {error}"
+            ))
+        })?;
+        admit_review_fix(&working_dir, ReviewFixInput::TrustedAdmission)
+            .await
+            .map_err(map_fix_bridge_error)?;
+        if output.is_json() {
+            let payload = serde_json::json!({
+                "schema_version": PAGE_SCHEMA_VERSION,
+                "admitted": true,
+                "execution": "deferred",
+                "patch_applied": false,
+            });
+            return emit_json_data("review_fix_admission", &payload, output);
+        }
+        if !output.quiet {
+            println!(
+                "review --fix admitted a non-mutating plan to the active AgentRuntime; no patch was applied"
+            );
+        }
+        return Ok(());
     }
 
     // PD-02 checkpoint scope: resolve and validate the checkpoint BEFORE
@@ -1210,7 +1252,11 @@ mod tests {
             StableErrorCode::AgentFixBridgeUnavailable
         );
         assert_eq!(error.stable_code().as_str(), "LBR-AGENT-010");
-        assert!(error.to_string().contains("fix bridge"));
+        assert!(
+            error
+                .to_string()
+                .contains("active authorized internal AgentRuntime")
+        );
     }
 
     #[test]

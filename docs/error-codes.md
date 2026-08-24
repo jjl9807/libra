@@ -123,8 +123,8 @@ structured report is always present.
 | `128` | `LBR-AGENT-007` | `internal` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed | a binary floods stderr past the 64 KiB cap |
 | `128` | `LBR-AGENT-008` | `internal` | Hook envelope failed validation before checkpoint persistence | a provider hook posts malformed JSON to `libra agent hooks` |
 | `128` | `LBR-AGENT-009` | `internal` | Agent checkpoint store inconsistent across ref/DB/object-index | `agent_checkpoint` row points at a missing traces object; run `libra agent doctor` |
-| `128` | `LBR-AGENT-010` | `internal` | `review --fix` / `investigate fix` requires the internal AgentRuntime fix bridge, which is not available | `libra review --fix` before the fix bridge lands |
-| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content cannot enter a mutating workflow without explicit approval | an issue-link seed attempting to drive a mutating fix |
+| `128` | `LBR-AGENT-010` | `internal` | `review --fix` could not discover or authorize an active `libra code --control write` AgentRuntime; `investigate fix` remains unavailable pending its later bridge wiring | `libra review --fix` with no live authorized Code control session |
+| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content was rejected before it could enter the review-fix admission or a later mutating workflow | an issue-link seed attempting to drive a mutating fix |
 | `128` | `LBR-AGENT-012` | `internal` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed | a trusted `libra-agent-*` binary exits before answering the invoked method |
 | `128` | `LBR-AGENT-013` | `internal` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` | `libra agent checkpoint export --raw` (or equivalent) without `--allow-raw` |
 | `128` | `LBR-AGENT-014` | `internal` | A `review`/`investigate` run was refused because the shared run queue is full — more than `agent.max_concurrent_runs` runs are active and the wait queue is at its cap (10) | starting an 11th queued `libra review`/`libra investigate` run while the concurrency budget is saturated |
@@ -238,8 +238,8 @@ structured report is always present.
 | `LBR-AGENT-007` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed |
 | `LBR-AGENT-008` | Hook envelope failed validation before checkpoint persistence |
 | `LBR-AGENT-009` | Agent checkpoint store inconsistent across ref/DB/object-index |
-| `LBR-AGENT-010` | `review --fix` / `investigate fix` requires the internal AgentRuntime fix bridge, which is not available |
-| `LBR-AGENT-011` | Untrusted seed content cannot enter a mutating workflow without explicit approval |
+| `LBR-AGENT-010` | `review --fix` could not discover or authorize an active `libra code --control write` AgentRuntime; `investigate fix` remains unavailable pending its later bridge wiring |
+| `LBR-AGENT-011` | Untrusted seed content was rejected before it could enter the review-fix admission or a later mutating workflow |
 | `LBR-AGENT-012` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed |
 | `LBR-AGENT-013` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` |
 | `LBR-AGENT-014` | A `review`/`investigate` run was refused because the shared run queue is full (over `agent.max_concurrent_runs` active and the wait queue at its cap) |

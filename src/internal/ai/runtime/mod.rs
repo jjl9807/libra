@@ -10,6 +10,7 @@ pub mod durability;
 pub mod environment;
 pub mod event;
 pub mod execution_control;
+pub mod fix_bridge;
 pub mod hardening;
 pub mod lifecycle;
 pub mod phase0;
@@ -38,6 +39,9 @@ pub use durability::{
 pub use event::{Event, audit_action_for};
 pub use execution_control::{
     CodeSkillActivation, CodeSkillSearch, ExecutionControlService, GoalControlError,
+};
+pub use fix_bridge::{
+    REVIEW_FIX_ADMISSION_MESSAGE, ReviewFixBridgeError, ReviewFixInput, admit_review_fix,
 };
 pub use hardening::{
     AuditEvent, AuditSink, BoundaryDecision, InMemoryAuditSink, PrincipalContext, PrincipalRole,

@@ -15,15 +15,15 @@
 //! - `fake_reviewers_cover_success_error_cancel_and_slow_output`
 //! - `review_sink_is_not_blocked_by_high_frequency_reviewer`
 //! - `review_read_only_emits_findings_manifest_and_manual_attach`
+//! - `review_fix_bridge_admission`
 //! - `review_fix_returns_unsupported_until_bridge_ready`
 //! - `cancel_releases_reviewer_processes_and_locks`
 //!
 //! plus the plan.md:961 stress case (cancel during pending output) and
 //! the 强制补强项 #5 keyset-pagination envelope through the real CLI.
-//! (`review_fix_bridge_enters_agent_runtime_mutating_path` is the
-//! matrix's fix-bridge alternative; it only lands once the internal fix
-//! bridge has a source anchor — until then the unsupported pin below is
-//! the mandatory one.)
+//! `review_fix_bridge_admission` verifies authenticated admission to an
+//! existing Code runtime. The retained unsupported scenario covers the
+//! no-runtime fallback; neither scenario claims a patch was applied.
 //!
 //! No test changes the process working directory or process
 //! environment, so none of them need `#[serial]`.
@@ -31,18 +31,97 @@
 #![cfg(unix)]
 
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
 use libra::internal::ai::review::{
     REVIEW_SINK_BUFFER_BYTES, REVIEW_SINK_TRUNCATION_MARKER, ReviewCancelHandle, ReviewRunOutcome,
     ReviewRunRequest, ReviewRunStore, ReviewTerminalState, ReviewerCommand, ReviewerOutcome,
     ReviewerSource, UNTRUSTED_FINDINGS_CLOSE, UNTRUSTED_FINDINGS_OPEN_PREFIX, process_start_ticks,
     run_review,
 };
+use tokio::sync::Mutex;
+
+#[derive(Clone, Debug)]
+struct FixBridgeControlRequest {
+    path: &'static str,
+    control_token: Option<String>,
+    controller_token: Option<String>,
+    body: serde_json::Value,
+}
+
+#[derive(Clone, Default)]
+struct FixBridgeControlCapture {
+    requests: Arc<Mutex<Vec<FixBridgeControlRequest>>>,
+}
+
+async fn record_fix_bridge_request(
+    capture: &FixBridgeControlCapture,
+    path: &'static str,
+    headers: HeaderMap,
+    body: serde_json::Value,
+) {
+    capture.requests.lock().await.push(FixBridgeControlRequest {
+        path,
+        control_token: headers
+            .get("x-libra-control-token")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        controller_token: headers
+            .get("x-code-controller-token")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        body,
+    });
+}
+
+async fn fix_bridge_attach(
+    State(capture): State<FixBridgeControlCapture>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    record_fix_bridge_request(&capture, "attach", headers, body).await;
+    Json(serde_json::json!({ "controllerToken": "bridge-controller-token" }))
+}
+
+async fn fix_bridge_submit(
+    State(capture): State<FixBridgeControlCapture>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    record_fix_bridge_request(&capture, "submit", headers, body).await;
+    Json(serde_json::json!({ "accepted": true }))
+}
+
+async fn fix_bridge_detach(
+    State(capture): State<FixBridgeControlCapture>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    record_fix_bridge_request(&capture, "detach", headers, body).await;
+    Json(serde_json::json!({ "detached": true }))
+}
+
+fn write_owner_only_control_token(path: &Path, token: &str) {
+    let _ = std::fs::remove_file(path);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .expect("create control token");
+    use std::io::Write as _;
+    file.write_all(token.as_bytes())
+        .expect("write control token");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .expect("set control token permissions");
+}
 
 /// The fake `sk-` credential `reviewer-success.sh` assembles at run time
 /// (never a literal in the fixture); it must never survive redaction.
@@ -533,12 +612,11 @@ async fn review_read_only_emits_findings_manifest_and_manual_attach() {
 }
 
 // ---------------------------------------------------------------------------
-// Pinned scenario 4: --fix fails closed with LBR-AGENT-010
+// Pinned scenario 4: --fix runtime admission / fail-closed fallback
 // ---------------------------------------------------------------------------
 
-/// `libra review --agent codex --fix` fails closed with the stable
-/// `LBR-AGENT-010` code (exit 128) until the internal AgentRuntime fix
-/// bridge lands — never fake success (plan.md:950).
+/// Without a running authorized Code session, `review --fix` still fails
+/// closed with stable `LBR-AGENT-010` and preserves its JSON error shape.
 #[test]
 fn review_fix_returns_unsupported_until_bridge_ready() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -558,8 +636,8 @@ fn review_fix_returns_unsupported_until_bridge_ready() {
         "stderr must carry the stable code: {stderr}"
     );
     assert!(
-        stderr.contains("fix bridge"),
-        "the refusal must name the missing fix bridge: {stderr}"
+        stderr.contains("active authorized internal AgentRuntime"),
+        "the refusal must name the required runtime: {stderr}"
     );
 
     // Structured JSON error surface.
@@ -579,6 +657,163 @@ fn review_fix_returns_unsupported_until_bridge_ready() {
         serde_json::from_str(stderr[json_start..].trim()).expect("JSON error report parses");
     assert_eq!(report["error_code"], "LBR-AGENT-010");
     assert_eq!(report["exit_code"], 128);
+}
+
+/// Scope selection describes a read-only review run and must never be silently
+/// discarded by the admission-only `--fix` request.
+#[test]
+fn review_fix_refuses_scope_flags() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_repo(temp.path());
+
+    for args in [
+        vec!["review", "--agent", "codex", "--fix", "--since", "HEAD~1"],
+        vec![
+            "review",
+            "--agent",
+            "codex",
+            "--fix",
+            "--checkpoint",
+            "checkpoint-id",
+        ],
+    ] {
+        let output = run_libra(&args, &repo, &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(129),
+            "scope flags must be rejected rather than ignored: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// `review --fix` discovers a live write-control session, uses its existing
+/// authenticated Code admission path, and submits only the fixed planning
+/// message. No reviewer finding or seed crosses this boundary; no patch is
+/// claimed or applied by this DF-03 admission card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_fix_bridge_admission() {
+    use libra::{
+        command::code_control_files::{
+            CONTROL_INFO_VERSION, ControlInfo, current_pid_starttime, resolve_control_paths,
+            write_control_info,
+        },
+        internal::ai::runtime::REVIEW_FIX_ADMISSION_MESSAGE,
+    };
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_repo(temp.path());
+    let repo_id_output = run_libra(&["config", "get", "libra.repoid"], &repo, &[]);
+    assert_cli_success(&repo_id_output, "read repo id");
+    let repo_id = String::from_utf8_lossy(&repo_id_output.stdout)
+        .trim()
+        .to_string();
+
+    let capture = FixBridgeControlCapture::default();
+    let app = Router::new()
+        .route("/api/code/controller/attach", post(fix_bridge_attach))
+        .route("/api/code/messages", post(fix_bridge_submit))
+        .route("/api/code/controller/detach", post(fix_bridge_detach))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind control server");
+    let addr = listener.local_addr().expect("control server address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("control server must remain healthy");
+    });
+
+    let paths = resolve_control_paths(&repo, None, None);
+    std::fs::create_dir_all(paths.info.parent().expect("control info parent"))
+        .expect("create control directory");
+    write_owner_only_control_token(&paths.token, "review-fix-control-token\n");
+    write_control_info(
+        &paths.info,
+        &ControlInfo {
+            version: CONTROL_INFO_VERSION,
+            mode: "write".to_string(),
+            pid: std::process::id(),
+            base_url: format!("http://{addr}"),
+            mcp_url: None,
+            working_dir: repo.clone(),
+            thread_id: None,
+            started_at: chrono::Utc::now(),
+            repo_id: Some(repo_id),
+            worktree_id: None,
+            workspace_id: None,
+            lease_fence: None,
+            pid_starttime: current_pid_starttime(),
+        },
+    )
+    .expect("write live control discovery");
+
+    let repo_for_cli = repo.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        run_libra(
+            &["--json", "review", "--agent", "codex", "--fix"],
+            &repo_for_cli,
+            &[],
+        )
+    })
+    .await
+    .expect("review CLI task");
+    assert_cli_success(&output, "review --fix admission");
+    let response: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("admission JSON output");
+    assert_eq!(response["command"], "review_fix_admission");
+    assert_eq!(
+        response["data"],
+        serde_json::json!({
+            "schema_version": 1,
+            "admitted": true,
+            "execution": "deferred",
+            "patch_applied": false,
+        }),
+        "admission must not claim a patch or controlled execution: {response}"
+    );
+
+    let requests = capture.requests.lock().await.clone();
+    server.abort();
+    let _ = server.await;
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path)
+            .collect::<Vec<_>>(),
+        ["attach", "submit", "detach"],
+        "the bridge must use the existing controller admission lifecycle"
+    );
+    for request in &requests {
+        assert_eq!(
+            request.control_token.as_deref(),
+            Some("review-fix-control-token"),
+            "every control request must carry the local control token"
+        );
+    }
+    assert!(requests[0].controller_token.is_none());
+    assert_eq!(
+        requests[0].body["kind"], "automation",
+        "the bridge must use the existing automation controller kind"
+    );
+    assert_eq!(
+        requests[1].controller_token.as_deref(),
+        Some("bridge-controller-token")
+    );
+    assert_eq!(requests[1].body["text"], REVIEW_FIX_ADMISSION_MESSAGE);
+    assert!(
+        !requests[1].body["text"]
+            .as_str()
+            .expect("fixed text")
+            .contains("codex"),
+        "external reviewer identity must not cross into the runtime request"
+    );
+    assert_eq!(
+        requests[2].controller_token.as_deref(),
+        Some("bridge-controller-token")
+    );
+    assert_eq!(requests[2].body["clientId"], requests[0].body["clientId"]);
 }
 
 // ---------------------------------------------------------------------------

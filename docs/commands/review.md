@@ -6,6 +6,7 @@ Run read-only code reviews with external agent CLIs (AG-22).
 
 ```bash
 libra review --agent <slug>... [--since <rev>] [--checkpoint <id>] [--json]
+libra review --agent <slug>... --fix [--json]
 libra review list [--json] [--limit <n>] [--cursor <token>]
 libra review show <run_id> [--json]
 libra review cancel <run_id>
@@ -87,10 +88,24 @@ DESC`. The JSON envelope carries `schema_version`, `items`,
 
 ### `--fix`
 
-`libra review --fix` requires the internal AgentRuntime fix bridge,
-which has not landed yet. It always fails with the stable error code
-`LBR-AGENT-010` — it never fakes success. Read-only findings stay
-available via `libra review show`.
+`libra review --fix` requires an active, authorized `libra code --control
+write` session for the same worktree. It reuses that session's loopback-only,
+token-authenticated controller admission path to submit one fixed planning
+request to the existing serialized AgentRuntime; it does not create another
+mutation queue. Reviewer findings, transcripts, environment values, and other
+external seeds are never included in that request.
+
+`--fix` conflicts with `--since` and `--checkpoint`: those options select the
+input to a read-only review run and are never silently ignored by admission.
+
+A successful command means only that the non-mutating plan was admitted. It
+reports `patch_applied: false` in JSON and does not start controlled execution
+or modify the worktree. Controlled approval, sandbox, tool execution, and final
+fix outcomes remain deferred to DF-09. If no authorized session is available, it fails
+closed with `LBR-AGENT-010`; an untrusted seed is rejected before the control
+endpoint is discovered with `LBR-AGENT-011` by the shared helper. The current
+`review --fix` CLI has no seed parameter, so that error is not a reachable CLI
+outcome yet.
 
 ## Examples
 
@@ -109,6 +124,10 @@ libra review --agent codex --checkpoint <checkpoint_id>
 
 # Structured run result (terminal state, per-reviewer outcomes)
 libra review --agent codex --json
+
+# Admit a non-mutating review-fix plan to an already running Code session
+libra code --control write
+libra review --agent codex --fix
 
 # List runs, then fetch the next page
 libra review list
@@ -140,11 +159,12 @@ overrunning the budget. Raise the limit with
 ## Exit Status
 
 - `0` — the run reached `success`, `partial`, `timeout`, or `cancelled`
-  (the terminal state is reported in the output); subcommands succeeded.
+  (the terminal state is reported in the output); subcommands succeeded; or
+  `--fix` admitted its non-mutating plan (`patch_applied: false`).
 - non-zero — usage errors, a run that ended in the `error` terminal
   state, unknown run ids, an unknown or non-materializable
-  `--checkpoint` (refused before any run is created), `--fix` (stable
-  code `LBR-AGENT-010`), or a full run queue (stable code
+  `--checkpoint` (refused before any run is created), `--fix` without an
+  authorized active Code session (stable code `LBR-AGENT-010`), or a full run queue (stable code
   `LBR-AGENT-014`).
 
 ## See Also

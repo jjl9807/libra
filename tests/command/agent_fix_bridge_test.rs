@@ -1,8 +1,7 @@
-//! A0-05: the mutating `review --fix` / `investigate fix` paths stay
-//! fail-closed with the stable `LBR-AGENT-010` code (the internal AgentRuntime
-//! fix bridge is a deferred, plan-accepted follow-up — they must never fake
-//! success). This command-layer guard pins both the human and structured-JSON
-//! error surfaces for the two verbs.
+//! DF-03 admits `review --fix` only to an active, authorized Code runtime; its
+//! no-runtime path, and all current `investigate fix` paths, stay fail-closed
+//! with stable `LBR-AGENT-010`. This command-layer guard pins their human and
+//! structured-JSON error surfaces without claiming controlled execution.
 
 use super::{
     create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command,

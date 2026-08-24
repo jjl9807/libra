@@ -6,6 +6,7 @@
 
 ```bash
 libra review --agent <slug>... [--since <rev>] [--checkpoint <id>] [--json]
+libra review --agent <slug>... --fix [--json]
 libra review list [--json] [--limit <n>] [--cursor <token>]
 libra review show <run_id> [--json]
 libra review cancel <run_id>
@@ -75,9 +76,21 @@ reviewer findings 是**不可信自由文本**。`libra review show` 在渲染
 
 ### `--fix`
 
-`libra review --fix` 依赖内部 AgentRuntime fix bridge，该 bridge 尚未落地。
-它总是返回稳定错误码 `LBR-AGENT-010`，绝不伪装成功。只读 findings 仍可通过
-`libra review show` 查看。
+`libra review --fix` 要求同一 worktree 中已有活跃且获授权的
+`libra code --control write` 会话。它复用该会话仅 loopback、token 鉴权的
+controller admission 路径，把一条固定的计划请求交给既有的串行
+AgentRuntime；它不会创建第二个 mutation queue。reviewer findings、transcript、
+环境变量和其它外部 seed 都不会进入该请求。
+
+`--fix` 与 `--since`、`--checkpoint` 冲突：后二者只用于选择只读 review run
+的输入，admission 不会静默忽略它们。
+
+命令成功只表示非 mutating 的计划已被接纳。JSON 会报告
+`patch_applied: false`，不会启动受控执行或修改工作树。受控 approval、sandbox、
+工具执行和最终 fix 结局仍由 DF-09 延后实现。没有获授权会话时，命令以
+`LBR-AGENT-010` fail-closed；untrusted seed 会在发现 control endpoint 之前以
+`LBR-AGENT-011` 拒绝。当前 `review --fix` CLI 没有接收 seed 的参数，因此该错误码
+暂不是可触达的 CLI 结局。
 
 ## Examples
 
@@ -96,6 +109,10 @@ libra review --agent codex --checkpoint <checkpoint_id>
 
 # 结构化 run 结果（terminal state、逐 reviewer 结果）
 libra review --agent codex --json
+
+# 把不修改工作树的 review-fix 计划交给一个已运行的 Code 会话
+libra code --control write
+libra review --agent codex --fix
 
 # 列出 run，再取下一页
 libra review list
@@ -124,10 +141,12 @@ libra review clean --all
 ## 退出状态
 
 - `0` —— run 落在 `success`、`partial`、`timeout` 或 `cancelled`（terminal
-  state 会在输出中报告）；子命令执行成功。
+  state 会在输出中报告）；子命令执行成功；或 `--fix` 已接纳非 mutating 计划
+  （`patch_applied: false`）。
 - 非零 —— 用法错误、run 落在 `error` terminal state、未知 run id、
-  未知或不可物化的 `--checkpoint`（在创建任何 run 之前拒绝）、
-  `--fix`（稳定错误码 `LBR-AGENT-010`），或 run 队列已满（`LBR-AGENT-014`）。
+  未知或不可物化的 `--checkpoint`（在创建任何 run 之前拒绝）、没有获授权活跃
+  Code 会话的 `--fix`（稳定错误码 `LBR-AGENT-010`），或 run 队列已满
+  （`LBR-AGENT-014`）。
 
 ## 另请参阅
 
