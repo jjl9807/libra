@@ -117,7 +117,18 @@ same identity count by simulating coverage removal in a rolled-back transaction.
   session/event/operation storage (LB-02), the session/event ingress (LB-03),
   the typed read methods (LB-04), mutation admission/approval/actor binding
   (LB-05) and workspace lease claim/renew/release over `WorkspaceStore`
-  (LB-06). `commit.create`/`review.run`/`checkpoint.restore` pass the
-  admission/approval gate but fail closed until the VCS service is wired.
+  (LB-06). As of `v0.21.1` all 20 v1 methods are implemented:
+  `diff.get`/`commit.create`/`review.run`/`checkpoint.restore` reach the real
+  services through the typed `agent_bridge/vcs.rs` adapter instead of failing
+  closed behind the admission/approval gate.
 - **Preflight:** the bridge uses the standard repository preflight (it is
   repo-scoped). It must never start without `--stdio`.
+- **Publish lock:** `commit.create` takes `MaintenanceLock::shared` itself, for
+  the span of that one commit. `command_holds_shared_maintenance_lock`
+  (`src/cli.rs`) excludes the whole `agent` surface because an agent's VCS
+  mutations are supposed to spawn `libra` as a subprocess and let the child
+  hold the lock — which stopped being true once LB-05 called `run_commit`
+  in-process. The hold is per mutation, never for the session lifetime (§C.10),
+  so a bridge session cannot starve a deletion phase while still being ordered
+  against one (§C.4.3 writer-vs-deleter). Regression:
+  `agent_bridge_vcs_test::commit_create_waits_for_a_deletion_phase_before_publishing`.

@@ -376,6 +376,10 @@ libra agent rpc list
 # 在 libra-agent-<slug> 二进制文件上调用单个 JSON-RPC 方法
 libra agent rpc invoke <slug> <method> --params '<json>'
 
+# 在 stdio 上运行 DeepSeek Harness 桥接（JSON-RPC 2.0 NDJSON）；
+# 喂入一个 fixture，stdout 每条响应恰好一帧
+libra agent bridge --stdio < bridge-initialize.ndjson
+
 # 面向代理的结构化 JSON 信封
 libra agent --json status
 ```

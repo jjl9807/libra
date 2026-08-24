@@ -471,3 +471,127 @@ async fn review_run_refuses_unlaunchable_reviewers_without_residue() {
         "a refused review.run must not create a run directory"
     );
 }
+
+// ---------------------------------------------------------------------------
+// LB-05 publisher-vs-deleter
+// ---------------------------------------------------------------------------
+
+/// Kill a spawned child when the test leaves, however it leaves.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `commit.create` publishes under the shared maintenance hold (§C.4.3).
+///
+/// The bridge is the one writer that reaches the repository IN-PROCESS while
+/// living outside the CLI's command-level hold:
+/// `command_holds_shared_maintenance_lock` (`src/cli.rs`) excludes the whole
+/// `agent` surface because an agent's VCS mutations are supposed to spawn
+/// `libra` as a subprocess, and the child takes the hold. LB-05 made
+/// `commit.create` call `run_commit` directly, so without an explicit hold a
+/// concurrent `gc` / `prune` / `repack -d` could unlink payloads between
+/// writing an object and publishing the reference that pins it.
+///
+/// A deletion phase in ANOTHER process holds the lock exclusively (same
+/// process would join its own hold instead of blocking). The
+/// `publication-barrier` sentinel is written from inside the acquisition only
+/// when a shared take would block, so its existence proves the bridge waited
+/// rather than merely being slow — there is no sleep here to be wrong about.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn commit_create_waits_for_a_deletion_phase_before_publishing() {
+    use std::io::{BufRead, BufReader, Write as _};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+
+    // Fixture setup runs on its own runtime so the cwd guard is dropped before
+    // the bridge subprocess starts: the child gets the repository through
+    // `current_dir`, not through this process's cwd.
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let _guard = repo_with_initial_commit(&root).await;
+        write_file(&root, "staged.txt", "to be committed\n");
+        stage(&["staged.txt"]).await;
+    });
+
+    // A deletion phase, in another process, holding the lock exclusively.
+    let lock_path = root.join(".libra").join("maintenance.lock");
+    let script = format!(
+        "import fcntl, sys, time\n\
+         f = open({path:?}, 'a+')\n\
+         fcntl.flock(f, fcntl.LOCK_EX)\n\
+         sys.stdout.write('locked\\n')\n\
+         sys.stdout.flush()\n\
+         time.sleep(600)\n",
+        path = lock_path.to_string_lossy().to_string()
+    );
+    let mut deleter = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the deleter holding the lock"),
+    );
+    let mut ready = String::new();
+    BufReader::new(deleter.0.stdout.take().expect("stdout"))
+        .read_line(&mut ready)
+        .expect("deleter ready");
+    assert_eq!(ready.trim(), "locked");
+
+    // Drive a real bridge session up to `commit.create`.
+    let frames = concat!(
+        r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":0}},"id":1}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"session.open","params":{"session_id":"s-lock"},"id":2}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-lock","session_id":"s-lock","message":"feat: publish under the hold","approval":{"decision":"approved","approver":"reviewer-1"}},"id":3}"#,
+        "\n",
+    );
+    let mut bridge = ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["agent", "bridge", "--stdio"])
+            .current_dir(&root)
+            .env("LIBRA_TEST", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the bridge"),
+    );
+    bridge
+        .0
+        .stdin
+        .take()
+        .expect("bridge stdin")
+        .write_all(frames.as_bytes())
+        .expect("feed bridge frames");
+
+    let barrier = root.join(".libra").join("publication-barrier");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !barrier.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "commit.create never reached the publication barrier — it published \
+             without taking the shared maintenance hold"
+        );
+        assert!(
+            bridge.0.try_wait().expect("poll").is_none(),
+            "the bridge exited before reaching the publication barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // The sentinel is written only after the bridge observed that a shared
+    // acquisition would block, so reaching here already proves the wait.
+    assert!(
+        bridge.0.try_wait().expect("poll").is_none(),
+        "commit.create must wait for the deletion phase, not publish underneath it"
+    );
+}

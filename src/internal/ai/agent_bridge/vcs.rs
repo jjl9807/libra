@@ -411,6 +411,33 @@ pub async fn commit_create(
         allow_empty,
         ..CommitArgs::default()
     };
+
+    // Publish under the shared maintenance hold (§C.4.3 writer-vs-deleter).
+    //
+    // `libra commit` takes this hold at CLI dispatch, but
+    // `command_holds_shared_maintenance_lock` (`src/cli.rs`) excludes the whole
+    // `agent` surface, and states why: an agent's VCS mutations reach the
+    // repository by spawning `libra` as a SUBPROCESS, so the child takes the
+    // hold. That stopped being true here when LB-05 wired `commit.create` to
+    // `run_commit` IN-PROCESS — this call writes blobs, trees, a commit and a
+    // ref inside the long-lived bridge process, which holds nothing. Without
+    // the hold, a concurrent `gc` / `prune` / `repack -d` deletion phase can
+    // unlink payloads in the window between writing an object and publishing
+    // the reference that pins it.
+    //
+    // Taking it here rather than at bridge startup keeps §C.10's rule that no
+    // ordinary command holds a maintenance lock for its lifetime: a bridge
+    // session runs for hours, and a session-long hold would starve every
+    // deletion phase. The guard drops when this commit returns, before the
+    // next NDJSON frame is read.
+    let storage = crate::utils::util::try_get_storage_path(None).map_err(|e| {
+        BridgeError::internal(format!("commit.create: resolve repository storage: {e}"))
+    })?;
+    let _publish_lock = crate::internal::maintenance_lock::MaintenanceLock::shared(&storage)
+        .map_err(|e| {
+            BridgeError::internal(format!("commit.create: take repository publish lock: {e}"))
+        })?;
+
     let output = run_commit(args, &service_output())
         .await
         .map_err(|e| BridgeError::internal(format!("commit.create: {e}")))?;

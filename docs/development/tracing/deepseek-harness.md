@@ -26,7 +26,10 @@ DeepSeek Harness 的公开定位是“一切皆插件”：模型、工具、技
 | Actor 兼容风险 | 低层 AI/MCP adapter 仍接受调用方自报 `actor_kind`/`actor_id`；bridge 不得沿用该模型 | `src/internal/ai/mcp/resource.rs` |
 | 实施计划 | Libra Rust 与 TypeScript 插件分仓落地 | [`plan-20260818.md`](../plan/plan-20260818.md)（Libra）；兄弟仓 `deepseek-harness-libra-plugin/docs/plan/plan-20260818.md` |
 
-本文档中标为“目标态”“提议契约”或“待实现”的接口不是当前已存在的 Libra API。
+本文档中标为“提议契约”或“待实现”的接口不是当前已存在的 Libra API。
+**Libra 侧的 bridge 已不在此列**：`libra agent bridge --stdio` 与 protocol v1 的全部 20 个
+method 自 `v0.21.1` 起已实现并发布（plan-20260818 LB-01..LB-07），下文凡描述 bridge 行为处
+均为现状而非目标态；仍属目标态的是 TypeScript 侧的 `@libra/dsh-bundle` 与 Harness profile。
 跨仓库发布顺序固定为 **`REL-LB-01`（Rust bridge + authoritative schema/fixture）→ `REL-TS-01`（`@libra/dsh-bundle`）**；不得用 TypeScript 自造第二份 server schema。
 
 ### 1.1 事实源边界
@@ -71,7 +74,7 @@ flowchart LR
     BRIDGE --> LIBRA
 ```
 
-标准写入入口是目标态的 `libra agent bridge --stdio`。Harness
+标准写入入口是 `libra agent bridge --stdio`（已实现，`v0.21.1`）。Harness
 通过 JSON-RPC NDJSON 将 session、workspace、checkpoint、evidence 和 provenance
 操作发送给 Libra 的 Agent ingress/runtime。
 
@@ -88,8 +91,9 @@ flowchart LR
 
 ## 3. 第一阶段：Agent Bridge 能力插件
 
-Harness 不直接访问 Libra 数据库，也不再以旧的工具服务器传输作为标准写入路径。目标态由
-`@libra/dsh-bundle` 启动一个受 Libra 管理的 JSON-RPC NDJSON bridge：
+Harness 不直接访问 Libra 数据库，也不再以旧的工具服务器传输作为标准写入路径。Libra 侧的
+bridge 已就绪；仍待实现的是由 `@libra/dsh-bundle` 启动这个受 Libra 管理的 JSON-RPC NDJSON
+bridge（TypeScript 侧 `REL-TS-01`）：
 
 ```yaml
 - id: libra
